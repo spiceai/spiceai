@@ -56,8 +56,9 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
-    SortOrderPushdownResult, expressions::PhysicalSortExpr,
+    ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    InputDistributionRequirements, PhysicalExpr, PlanProperties, ReplaceChildrenOptions,
+    SortOrderPushdownResult, StatisticsArgs, StatisticsContext, expressions::PhysicalSortExpr,
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
@@ -223,6 +224,35 @@ impl IcebergScanExec {
     }
 }
 
+impl IcebergScanExec {
+    fn with_no_children(
+        self: Arc<Self>,
+        children: &[Arc<dyn ExecutionPlan>],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Execution(
+                "IcebergScanExec expects no children".to_string(),
+            ))
+        }
+    }
+
+    /// Statistics of the wrapped Iceberg scan. It is not exposed as a child (see
+    /// `children`), so its statistics are computed here rather than requested
+    /// through `child_stats_requests`. A deferred scan has not been planned yet,
+    /// so its statistics are unknown.
+    fn scan_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        match &self.source {
+            ScanSource::Planned(inner) => StatisticsContext::new().compute(
+                inner.as_ref(),
+                &StatisticsArgs::new().with_partition(partition),
+            ),
+            ScanSource::Deferred { .. } => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
+        }
+    }
+}
+
 impl DisplayAs for IcebergScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "IcebergScanExec table_ref=[{}]", self.table_ref)?;
@@ -278,6 +308,15 @@ impl ExecutionPlan for IcebergScanExec {
         vec![]
     }
 
+    /// A leaf: no children, so no distribution requirements.
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![])
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![]
     }
@@ -290,23 +329,43 @@ impl ExecutionPlan for IcebergScanExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         // Leaf node: the inner Iceberg scan is reconstructed from the serialized
         // recipe, never traversed or serialized as a child.
         vec![]
     }
 
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_no_children(&children)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            Err(DataFusionError::Execution(
-                "IcebergScanExec expects no children".to_string(),
-            ))
-        }
+        self.with_no_children(&children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_no_children(&children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -373,10 +432,20 @@ impl ExecutionPlan for IcebergScanExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        match &self.source {
-            ScanSource::Planned(inner) => inner.partition_statistics(partition),
-            ScanSource::Deferred { .. } => Ok(Arc::new(Statistics::new_unknown(&self.schema))),
-        }
+        self.scan_statistics(partition)
+    }
+
+    /// A leaf: there are no children whose statistics to request.
+    fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
+        Vec::new()
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        self.scan_statistics(args.partition())
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -432,5 +501,14 @@ impl ExecutionPlan for IcebergScanExec {
         _order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         Ok(SortOrderPushdownResult::Unsupported)
+    }
+
+    /// `None` defers to Spice's physical extension codec, which serializes this
+    /// node as its scan recipe (table reference, projection, filters, snapshot).
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }

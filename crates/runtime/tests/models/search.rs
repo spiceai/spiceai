@@ -27,7 +27,7 @@ use crate::{init_tracing, utils::init_tracing_with_task_history};
 use anyhow::Context;
 use app::{App, AppBuilder};
 #[cfg(feature = "s3_vectors")]
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use http::HeaderValue;
 use http::header::{ACCEPT, CONTENT_TYPE};

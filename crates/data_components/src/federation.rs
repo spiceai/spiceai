@@ -27,9 +27,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::Result as DataFusionResult,
     physical_plan::{PhysicalExpr, SendableRecordBatchStream},
-    sql::{TableReference, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
@@ -112,13 +113,27 @@ impl<T: 'static, P: 'static> SQLExecutor for DenyFunctionsSqlExecutor<T, P> {
 /// `function_support` deny-list (e.g. `json_get_str`) falls back to local
 /// `DataFusion` evaluation instead of being unparsed into the remote engine's
 /// SQL.
+///
+/// The same policy is installed on the `SqlTable` itself, which is why the table
+/// is taken by value. The executor's policy only decides whether a *plan*
+/// federates, and a filtered scan never reaches that decision: the filter is
+/// pushed into the scan first, through the adaptor's `supports_filters_pushdown`,
+/// which asks the `SqlTable` — and the `SqlTable` then unparses it into the
+/// `WHERE` clause it sends. Without its own copy of the policy, `WHERE
+/// json_get_str(payload, 'k') = 'x'` reached the remote engine even though the
+/// same call in a projection stayed local (#13664). A table that already
+/// carries a policy keeps it when `function_support` is `None`.
 #[must_use]
 pub fn create_spice_federated_table_provider<T: 'static, P: 'static>(
-    table: Arc<SqlTable<T, P>>,
+    table: SqlTable<T, P>,
     schema: SchemaRef,
     table_reference: TableReference,
     function_support: Option<FunctionSupport>,
 ) -> FederatedTableProviderAdaptor {
+    let table = Arc::new(match &function_support {
+        Some(policy) => table.with_function_support(Some(policy.clone())),
+        None => table,
+    });
     let executor: Arc<dyn SQLExecutor> = Arc::new(DenyFunctionsSqlExecutor::new(
         Arc::clone(&table),
         function_support,
@@ -139,16 +154,30 @@ mod tests {
 
     use crate::function_support::{FunctionRestriction, FunctionSupport};
     use async_trait::async_trait;
+    use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
+    use datafusion::catalog::Session;
     use datafusion::common::Column;
+    use datafusion::common::TableReference;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::DefaultTableSource;
     use datafusion::datasource::TableProvider;
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::context::SessionContext;
     use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
+    use datafusion::logical_expr::TableType;
     use datafusion::logical_expr::{
         ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
         TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
         expr::ScalarFunction,
     };
+    use datafusion::logical_expr::{DmlStatement, WriteOp};
+    use datafusion::logical_expr::{exists, not_exists};
+    use datafusion::optimizer::analyzer::AnalyzerRule;
+    use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
@@ -156,6 +185,7 @@ mod tests {
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
         MySqlDialect, PostgreSqlDialect, SqliteDialect,
     };
+    use datafusion_federation::FederationAnalyzerRule;
     use datafusion_federation::sql::SQLExecutor;
     use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
@@ -193,19 +223,21 @@ mod tests {
     }
 
     fn test_sql_table() -> Arc<SqlTable<(), &'static dyn ToString>> {
+        Arc::new(owned_test_sql_table())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool: each test chooses the policy it exercises"
+    )]
+    fn owned_test_sql_table() -> SqlTable<(), &'static dyn ToString> {
         let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
             Arc::new(MockPool {});
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
         ]));
-        Arc::new(SqlTable::new_with_schema(
-            "test",
-            &pool,
-            schema,
-            TableReference::bare("t"),
-            None,
-        ))
+        SqlTable::new_with_schema("test", &pool, schema, TableReference::bare("t"), None)
     }
 
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
@@ -313,10 +345,10 @@ mod tests {
     fn create_spice_federated_table_provider_wires_deny_list() {
         // Regression test for #10703: building the federated adaptor must route
         // logical optimization through the deny-list wrapper.
-        let table = test_sql_table();
+        let table = owned_test_sql_table();
         let schema = table.schema();
         let adaptor = create_spice_federated_table_provider(
-            Arc::clone(&table),
+            table,
             Arc::clone(&schema),
             TableReference::bare("t"),
             Some(deny_support(&["json_get_str"])),
@@ -328,6 +360,106 @@ mod tests {
 
         // Federation source schema must match the SqlTable schema verbatim.
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
+    }
+
+    /// The SQL `plan`'s only remote node would send: a `SqlExec` when the scan
+    /// serves the table itself, a `VirtualExecutionPlan` when the plan federated.
+    fn pushed_sql(plan: &Arc<dyn ExecutionPlan>) -> String {
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("SqlExec") || line.contains("VirtualExecutionPlan"))
+            .unwrap_or_else(|| panic!("expected a remote scan in:\n{rendered}"));
+        line.split_once("sql=").map_or_else(
+            || panic!("expected the scan to render its SQL: {line}"),
+            |(_, sql)| sql.trim().to_string(),
+        )
+    }
+
+    /// Regression test for the filter half of #13664: a Spice-only function in a
+    /// `WHERE` clause must be evaluated locally, not unparsed into the SQL the
+    /// remote scan sends.
+    ///
+    /// The executor's deny-list only decides whether a *plan* federates, and a
+    /// filtered scan never reaches that decision: the federation analyzer's
+    /// filter pushdown moves the predicate into the scan first, through the
+    /// adaptor's `supports_filters_pushdown`, which asks the wrapped `SqlTable`.
+    /// A `SqlTable` built without its own copy of the policy answers `Exact` for
+    /// anything the dialect can spell, so the remote engine was sent `WHERE
+    /// json_get_str(...) = 'x'` and failed with an unknown-function error — on
+    /// every `PostgreSQL`, Snowflake and `ClickHouse` table built through this
+    /// helper. A built-in the remote engine does have keeps pushing down.
+    #[tokio::test]
+    async fn a_denied_function_in_a_where_clause_is_not_pushed_into_the_scan() {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::functions::string::expr_fn::upper;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion_federation::FederatedQueryPlanner;
+
+        let table = owned_test_sql_table();
+        let schema = table.schema();
+        let provider = Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            TableReference::bare("t"),
+            Some(deny_support(&["json_get_str"])),
+        ));
+
+        let denied = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf("json_get_str"),
+            vec![col("val")],
+        ))
+        .eq(lit("x"));
+        let allowed = upper(col("val")).eq(lit("X"));
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&denied, &allowed])
+                .expect("pushdown verdicts"),
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact
+            ],
+            "the deny-listed call must stay local; the built-in must still push down"
+        );
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(stub_udf("json_get_str").as_ref().clone());
+        ctx.register_table("t", provider)
+            .expect("register the federated table");
+
+        let denied_plan = ctx
+            .sql("SELECT id FROM t WHERE json_get_str(val) = 'x'")
+            .await
+            .expect("plan the denied query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the denied query");
+        assert_eq!(
+            pushed_sql(&denied_plan),
+            "SELECT id, val FROM t",
+            "the remote scan must not be asked to evaluate json_get_str: it returns `val` and \
+             the filter runs locally"
+        );
+
+        let allowed_plan = ctx
+            .sql("SELECT id FROM t WHERE upper(val) = 'X'")
+            .await
+            .expect("plan the control query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the control query");
+        assert_eq!(
+            pushed_sql(&allowed_plan),
+            "SELECT t.id FROM t WHERE (upper(t.val) = 'X')",
+            "a built-in the remote engine has must keep pushing down"
+        );
     }
 
     /// Unparse a plan the way a federated connector would, and demand it
@@ -763,6 +895,588 @@ mod tests {
     /// boundary adds: upstream pins these fixes against its own default dialect, so
     /// asserting that spelling here would restate an upstream assertion and pass by
     /// construction.
+    /// `t1(c)` as the build side of a `RightMark` join against `t2(c, d)` on
+    /// `t1.c = t2.c`, projected to `t2.d` and filtered on the mark, bounded on
+    /// the build side only when asked. `RightMark` returns a row for each row of
+    /// the *right* input, so the outer query has to read `t2` and the `EXISTS`
+    /// body `t1` — the same swap `RightSemi` and `RightAnti` take.
+    fn a_right_mark_join(build_fetch: Option<usize>) -> LogicalPlan {
+        let build = LogicalPlanBuilder::scan_with_filters_fetch(
+            "t1",
+            table_source(exists_fetch_fields()),
+            Some(vec![0]),
+            vec![],
+            build_fetch,
+        )
+        .expect("scan build side")
+        .build()
+        .expect("build build side");
+        let probe = exists_scan("t2").build().expect("build probe side");
+
+        LogicalPlanBuilder::from(build)
+            .join_on(probe, JoinType::RightMark, [col("t1.c").eq(col("t2.c"))])
+            .expect("right mark join")
+            .project(vec![col("t2.d")])
+            .expect("project")
+            .filter(col("mark").or(col("t2.d").lt(lit(0))))
+            .expect("filter on the mark")
+            .build()
+            .expect("build plan")
+    }
+
+    /// Regression test for #13022, fixed by fork PR #230: a `RightMark` join was
+    /// left out of the unparser's input swap, so the outer query was built from
+    /// the build side and the `EXISTS` body from the probe — `SELECT t1.c, t1.d
+    /// FROM t1` for a join that returns `t2`'s rows: the wrong relation, no mark
+    /// column, and no `EXISTS` at all. That SQL binds, so a federated pushdown
+    /// answers from it rather than failing.
+    ///
+    /// Pinned in both bounds, because the swap and the build-side scope are decided
+    /// together: the outer `FROM` names the probe at the top level, the build
+    /// relation is read only inside the `EXISTS`, and a build-side bound lands
+    /// inside that body rather than on the outer query.
+    #[test]
+    fn a_right_mark_join_reads_the_relation_it_returns() {
+        for (bound, fetch) in [("unbounded", None), ("bounded", Some(5))] {
+            let sql = federated_sql(&a_right_mark_join(fetch)).replace('"', "");
+            let probe_at = first_offset_of(&sql, "FROM t2");
+            assert_eq!(
+                paren_depth_at(&sql, probe_at),
+                0,
+                "{bound}: t2 is read inside a subquery rather than by the outer query: {sql}"
+            );
+            let exists_at = first_offset_of(&sql, "EXISTS (SELECT 1 FROM ");
+            let build_at = first_offset_of(&sql, "FROM t1");
+            assert!(
+                build_at > exists_at && paren_depth_at(&sql, build_at) >= 1,
+                "{bound}: t1 has to be read by the EXISTS body, not the outer query: {sql}"
+            );
+            if fetch.is_none() {
+                assert!(!sql.contains("LIMIT"), "{bound}: no bound to emit: {sql}");
+            } else {
+                let limit_at = first_offset_of(&sql, "LIMIT 5");
+                assert!(
+                    limit_at > exists_at && paren_depth_at(&sql, limit_at) >= 2,
+                    "{bound}: the build-side bound has to sit in the EXISTS body's own \
+                     derived table, not on the outer query: {sql}"
+                );
+            }
+        }
+    }
+
+    /// Regression test for #13493, fixed by fork PR #232: `SELECT 1` replaces the
+    /// build side's projection when it becomes an `EXISTS` body, so a join key that
+    /// projection renamed — `b.x AS p.c` — no longer exists there, and a spelling
+    /// that also names the probe binds to the probe instead: `WHERE (p.c = p.c)`,
+    /// which is always true, so a semi join returns every row and an anti join
+    /// none. The unparser refuses such a key rather than emit it; a key the body
+    /// answers to — a column of its relation, or of the scan an alias is pushed
+    /// down onto — still federates.
+    #[test]
+    fn an_exists_refuses_a_build_key_only_the_build_projection_binds() {
+        /// The refusal fork PR #232 reports such a key through, mirroring
+        /// [`assert_captured_correlation_refused`]: matched on the whole phrase so
+        /// a refusal for another reason cannot pass for it.
+        fn assert_build_key_refused(plan: &LogicalPlan, context: &str) {
+            let err = federated_sql_result(plan).expect_err(context);
+            assert!(
+                err.to_string()
+                    .contains("names an output only the build side's projection binds"),
+                "{context}, got: {err}"
+            );
+        }
+        let probe = || {
+            LogicalPlanBuilder::scan("p", table_source(exists_fetch_fields()), Some(vec![0, 1]))
+                .expect("scan probe")
+                .build()
+                .expect("build probe")
+        };
+        let build_x = || {
+            LogicalPlanBuilder::scan(
+                "b",
+                table_source(vec![Field::new("x", DataType::Int32, false)]),
+                Some(vec![0]),
+            )
+            .expect("scan build")
+        };
+        let renamed_onto_probe = || {
+            build_x()
+                .project(vec![col("b.x").alias_qualified(Some("p"), "c")])
+                .expect("project the build key under the probe's qualifier")
+                .build()
+                .expect("build")
+        };
+
+        for join_type in [JoinType::LeftSemi, JoinType::LeftAnti, JoinType::LeftMark] {
+            let plan = LogicalPlanBuilder::from(probe())
+                .join(
+                    renamed_onto_probe(),
+                    join_type,
+                    (vec!["p.c"], vec!["p.c"]),
+                    None,
+                )
+                .expect("exists-style join")
+                .build()
+                .expect("build plan");
+            assert_build_key_refused(
+                &plan,
+                &format!("{join_type:?} must refuse a key only the build projection binds"),
+            );
+        }
+
+        // The swapped family: the build side is the left input.
+        let plan = LogicalPlanBuilder::from(renamed_onto_probe())
+            .join(
+                probe(),
+                JoinType::RightSemi,
+                (vec!["p.c"], vec!["p.c"]),
+                None,
+            )
+            .expect("right semi join")
+            .build()
+            .expect("build plan");
+        assert_build_key_refused(
+            &plan,
+            "RightSemi must refuse a key only the build projection binds",
+        );
+
+        // The keep direction: a key naming a column the build relation has binds
+        // inside the body whatever its projection did.
+        let plan = LogicalPlanBuilder::from(probe())
+            .join(
+                build_x()
+                    .project(vec![col("b.x")])
+                    .expect("project")
+                    .build()
+                    .expect("build"),
+                JoinType::LeftSemi,
+                (vec!["p.c"], vec!["b.x"]),
+                None,
+            )
+            .expect("semi join")
+            .build()
+            .expect("build plan");
+        assert_exists_pushdown_kept(&plan, "a key the build relation answers to must federate");
+    }
+
+    /// One `Utf8` column, `id`, for the `FULL JOIN` shapes below.
+    fn id_source() -> Arc<dyn TableSource> {
+        table_source(vec![Field::new("id", DataType::Utf8, false)])
+    }
+
+    /// A scan of `name(id)` carrying `name.id = 'x'` as a scan filter, and one
+    /// without, for the `FULL JOIN` shapes below.
+    fn filtered_id_scan(name: &str) -> LogicalPlan {
+        LogicalPlanBuilder::scan_with_filters(
+            name,
+            id_source(),
+            Some(vec![0]),
+            vec![col(format!("{name}.id")).eq(lit("x"))],
+        )
+        .expect("filtered scan")
+        .build()
+        .expect("build filtered scan")
+    }
+
+    fn plain_id_scan(name: &str) -> LogicalPlan {
+        LogicalPlanBuilder::scan(name, id_source(), Some(vec![0]))
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    fn id_join(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        join_type: JoinType,
+        keys: (&str, &str),
+    ) -> LogicalPlan {
+        LogicalPlanBuilder::from(left)
+            .join(right, join_type, (vec![keys.0], vec![keys.1]), None)
+            .expect("join")
+            .build()
+            .expect("build join")
+    }
+
+    /// Regression test for #12593, fixed by fork PR #231: a `FULL JOIN` input that
+    /// is itself a join had its scan filters lifted onto the enclosing query's
+    /// `WHERE`, which SQL evaluates *after* the `FULL JOIN` — so the rows the join
+    /// null-extends from its other input are discarded, and the remote engine
+    /// returns fewer rows than the plan (1 where the plan returns 2, measured
+    /// on `SQLite`). Each filtered scan keeps its filter in a derived table of
+    /// its own, whatever the nested join's type and depth; a predicate on such an
+    /// input that no scan applies has no clause that keeps the rows, and is
+    /// refused rather than emitted.
+    #[test]
+    fn a_full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() {
+        let shapes = [
+            (
+                "nested inner join, both scans filtered",
+                id_join(
+                    id_join(
+                        filtered_id_scan("a"),
+                        filtered_id_scan("b"),
+                        JoinType::Inner,
+                        ("a.id", "b.id"),
+                    ),
+                    plain_id_scan("c"),
+                    JoinType::Full,
+                    ("a.id", "c.id"),
+                ),
+            ),
+            (
+                "nested left join, both scans filtered",
+                id_join(
+                    id_join(
+                        filtered_id_scan("a"),
+                        filtered_id_scan("b"),
+                        JoinType::Left,
+                        ("a.id", "b.id"),
+                    ),
+                    plain_id_scan("c"),
+                    JoinType::Full,
+                    ("a.id", "c.id"),
+                ),
+            ),
+            (
+                "nested right join, left scan filtered",
+                id_join(
+                    id_join(
+                        filtered_id_scan("a"),
+                        plain_id_scan("b"),
+                        JoinType::Right,
+                        ("a.id", "b.id"),
+                    ),
+                    plain_id_scan("c"),
+                    JoinType::Full,
+                    ("a.id", "c.id"),
+                ),
+            ),
+            (
+                "two joins down",
+                id_join(
+                    id_join(
+                        id_join(
+                            filtered_id_scan("a"),
+                            plain_id_scan("b"),
+                            JoinType::Inner,
+                            ("a.id", "b.id"),
+                        ),
+                        plain_id_scan("c"),
+                        JoinType::Inner,
+                        ("b.id", "c.id"),
+                    ),
+                    plain_id_scan("d"),
+                    JoinType::Full,
+                    ("c.id", "d.id"),
+                ),
+            ),
+        ];
+        for (shape, plan) in shapes {
+            let sql = federated_sql(&plan);
+            assert!(
+                sql.contains("FULL JOIN"),
+                "{shape}: the FULL JOIN is gone: {sql}"
+            );
+            for (at, _) in sql.match_indices("WHERE ") {
+                assert!(
+                    paren_depth_at(&sql, at) >= 1,
+                    "{shape}: a scan filter reached the enclosing query's WHERE, where it is \
+                     evaluated after the FULL JOIN and discards the rows the join preserves: {sql}"
+                );
+                // The scope has to be the scan's own: a derived table around the
+                // nested join would still evaluate the filter after that join.
+                let scope_start = sql[..at].rfind("(SELECT ").unwrap_or(0);
+                assert!(
+                    !sql[scope_start..at].contains(" JOIN "),
+                    "{shape}: a scan filter is applied by a scope holding a join rather than by \
+                     its own scan's derived table, so it still runs after that join: {sql}"
+                );
+            }
+            assert_eq!(
+                sql.matches("WHERE ").count(),
+                sql.matches("= 'x'").count(),
+                "{shape}: every scan filter has to be applied in its own scan's derived table: {sql}"
+            );
+        }
+
+        // A predicate above the nested join, reading both of its sides: no scan
+        // applies it and the enclosing WHERE would discard rows, so it is refused.
+        let filtered_join = LogicalPlanBuilder::from(id_join(
+            plain_id_scan("a"),
+            plain_id_scan("b"),
+            JoinType::Left,
+            ("a.id", "b.id"),
+        ))
+        .filter(col("a.id").not_eq(col("b.id")))
+        .expect("filter over the nested join")
+        .build()
+        .expect("build");
+        let plan = id_join(
+            filtered_join,
+            plain_id_scan("c"),
+            JoinType::Full,
+            ("a.id", "c.id"),
+        );
+        let err = federated_sql_result(&plan)
+            .expect_err("a predicate no scan of a FULL JOIN input applies must be refused");
+        assert!(
+            err.to_string().contains(
+                "predicate on a FULL JOIN input that is not applied by one of its table scans"
+            ),
+            "refused for another reason: {err}"
+        );
+    }
+
+    /// A scan of `name(id)` holding `ids`. Unlike `id_source`'s, `DataFusion` can
+    /// execute it, so a guard can set what the plan returns beside what its
+    /// unparsed SQL returns from a real engine.
+    fn id_table(name: &str, ids: &[&str]) -> LogicalPlan {
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::datasource::{MemTable, provider_as_source};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("build the id batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the id table");
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(table)), Some(vec![0]))
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    /// `id_table(name, ids)` keeping only the row whose `id` is `kept`.
+    fn id_table_where(name: &str, ids: &[&str], kept: &str) -> LogicalPlan {
+        LogicalPlanBuilder::from(id_table(name, ids))
+            .filter(col(format!("{name}.id")).eq(lit(kept)))
+            .expect("filter")
+            .build()
+            .expect("build filter")
+    }
+
+    /// Sorted rows as text, with `None` for NULL, so two engines' answers compare
+    /// as multisets.
+    #[cfg(feature = "sqlite")]
+    type Rows = Vec<Vec<Option<String>>>;
+
+    /// What `DataFusion` returns for `plan`: the oracle the unparsed SQL is held
+    /// to. Executing a plan shares no code with unparsing it.
+    #[cfg(feature = "sqlite")]
+    async fn datafusion_rows(plan: &LogicalPlan) -> Rows {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::compute::cast;
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan.clone())
+            .await
+            .expect("plan the oracle")
+            .collect()
+            .await
+            .expect("execute the oracle");
+        let mut rows = Rows::new();
+        for batch in batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| cast(column, &DataType::Utf8).expect("render a column as text"))
+                .collect::<Vec<_>>();
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.as_string::<i32>();
+                            (!column.is_null(row)).then(|| column.value(row).to_string())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// What `SQLite` returns for `sql` over `tables`, each `name(id TEXT)`.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_rows(tables: &[(&str, &[&str])], sql: &str) -> Rows {
+        let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+        for (name, ids) in tables {
+            conn.execute(&format!("CREATE TABLE {name} (id TEXT NOT NULL)"), [])
+                .expect("create a table");
+            for id in *ids {
+                conn.execute(&format!("INSERT INTO {name} VALUES (?1)"), [id])
+                    .expect("insert a row");
+            }
+        }
+        let mut statement = conn
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+        let width = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_else(|error| panic!("SQLite could not run {sql}: {error}"))
+            .collect::<Result<Rows, _>>()
+            .unwrap_or_else(|error| panic!("SQLite failed reading the rows of {sql}: {error}"));
+        rows.sort();
+        rows
+    }
+
+    /// Unparses `plan` for `SQLite`, runs it over `tables`, and demands the rows
+    /// `DataFusion` returns for the plan itself.
+    #[cfg(feature = "sqlite")]
+    async fn assert_sqlite_returns_the_plans_rows(
+        shape: &str,
+        plan: &LogicalPlan,
+        tables: &[(&str, &[&str])],
+    ) {
+        let expected = datafusion_rows(plan).await;
+        assert!(
+            expected.len() > 1,
+            "{shape}: the plan returns {} row(s), too few for a wrong scope to change",
+            expected.len()
+        );
+        let sql = unparse_with("sqlite", &SqliteDialect {}, plan);
+        assert_eq!(
+            sqlite_rows(tables, &sql),
+            expected,
+            "{shape}: SQLite returned other rows than the plan for: {sql}"
+        );
+    }
+
+    /// Regression test for #14373, fixed by fork PR #233: a join that is the
+    /// *right* input of another join was linearised into the enclosing `FROM`
+    /// with its right side first — `a ⋈ (b ⋈ c)` came out as
+    /// `FROM a INNER JOIN c ON b.id = c.id … JOIN b ON a.id = b.id`, naming `b`
+    /// before it is in scope. `PostgreSQL`, `DuckDB` and `SQLite` reject it, and an
+    /// engine that binds lazily runs a different join tree. The nested join stays
+    /// a parenthesised joined table on the right, and a LEFT JOIN folds a filter
+    /// from inside it into its own `ON`, since the shared `WHERE` would discard
+    /// the left rows the LEFT JOIN preserves.
+    #[tokio::test]
+    async fn a_join_that_is_another_joins_right_input_stays_on_its_right() {
+        let a: &[&str] = &["1", "2", "3"];
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1", "2", "4"];
+        let nested = |b_input: LogicalPlan, outer: JoinType| {
+            LogicalPlanBuilder::from(id_table("a", a))
+                .join(
+                    id_join(b_input, id_table("c", c), JoinType::Inner, ("b.id", "c.id")),
+                    outer,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )
+                .expect("outer join")
+                .project(vec![col("a.id"), col("b.id"), col("c.id")])
+                .expect("projection")
+                .build()
+                .expect("build")
+        };
+        let shapes = [
+            (
+                "a INNER JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Inner),
+            ),
+            (
+                "a FULL JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Full),
+            ),
+            (
+                "a LEFT JOIN (b[id = '1'] JOIN c)",
+                nested(id_table_where("b", b, "1"), JoinType::Left),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("a", a), ("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            // `b` has to be in scope where the outer join's `ON` names it, so the
+            // nested join is introduced, parenthesised, before that `ON`.
+            assert_precedes(&sql, "JOIN (b", "ON a.id = b.id");
+            assert!(
+                !sql.contains("WHERE"),
+                "{shape}: a filter from the nested input reached the enclosing WHERE: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14375, fixed by fork PR #234: a `Limit` that is a join
+    /// input got a scope of its own only when the enclosing `SELECT` already had a
+    /// `WHERE` or a projection. Without either, its `LIMIT` landed on the enclosing
+    /// query and bounded the join's output instead of one input — with
+    /// `b = {1, 2}` and `c = {1}`, `b FULL JOIN (c LIMIT 1)` returns two rows and
+    /// the SQL returned one. The limited input is derived under its scan's own
+    /// name, which the join's `ON` and the select list already use.
+    #[tokio::test]
+    async fn a_limit_on_a_join_input_bounds_that_input_rather_than_the_join() {
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1"];
+        let limited = |name: &str, ids: &[&str]| {
+            LogicalPlanBuilder::from(id_table(name, ids))
+                .limit(0, Some(1))
+                .expect("limit")
+                .build()
+                .expect("build limit")
+        };
+        let shapes = [
+            (
+                "b FULL JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Full,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "b LEFT JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Left,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "(c LIMIT 1) RIGHT JOIN b",
+                id_join(
+                    limited("c", c),
+                    id_table("b", b),
+                    JoinType::Right,
+                    ("c.id", "b.id"),
+                ),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            assert!(
+                paren_depth_at(&sql, first_offset_of(&sql, "LIMIT 1")) >= 1,
+                "{shape}: the input's LIMIT bounds the whole join instead of a derived table \
+                 of its own: {sql}"
+            );
+        }
+    }
+
     fn federation_dialects() -> Vec<(&'static str, Arc<dyn Dialect>)> {
         vec![
             ("default", Arc::new(DefaultDialect {})),
@@ -1549,6 +2263,15 @@ mod tests {
             for (scope_kind, plan, relation) in derived_scope_shapes(&inner, output_name) {
                 for (dialect_name, dialect) in federation_dialects() {
                     let arm = format!("{dialect_name}/{output_kind}/{scope_kind}");
+                    if refused_where_the_engine_flattens_the_scope(
+                        dialect_name,
+                        dialect.as_ref(),
+                        output_kind == "volatile",
+                        scope_kind,
+                        &plan,
+                    ) {
+                        continue;
+                    }
                     let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
 
                     // The shape the issue is about only exists once the projection is a
@@ -1602,6 +2325,15 @@ mod tests {
             Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]));
         for (scope_kind, plan, _) in derived_scope_shapes(&volatile, "random()") {
             for (dialect_name, dialect) in federation_dialects() {
+                if refused_where_the_engine_flattens_the_scope(
+                    dialect_name,
+                    dialect.as_ref(),
+                    true,
+                    scope_kind,
+                    &plan,
+                ) {
+                    continue;
+                }
                 let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
                 // The call renders as `random()`; a reference to its output renders as
                 // a quoted identifier, so counting the unquoted call counts evaluations.
@@ -1805,6 +2537,212 @@ mod tests {
                 !bindings.iter().any(|b| b.to_lowercase() == key),
                 "{dialect_name}: the qualified key and the output alias are the same identifier, so naming the output captured the key: {sql}"
             );
+        }
+    }
+
+    /// The fragment every refusal of a volatile-output scope carries, on a dialect
+    /// whose engine flattens the derived table (fork PR #227).
+    const VOLATILE_SCOPE_REFUSAL: &str =
+        "projection output that cannot be repeated is not supported for this dialect";
+
+    /// Whether this arm is one fork PR #227 refuses on `dialect`, asserting the
+    /// refusal when it is.
+    ///
+    /// An engine that flattens a derived table into the query selecting from it
+    /// evaluates a volatile output again for a predicate reading it, so the scope
+    /// that repairs the filtered shape everywhere else returns rows the predicate
+    /// excluded there — `SQLite` measured (492 of 990 returned rows below the bound
+    /// on 3.51; 476 of 974 through `spiced`), `MySQL` documented (bugs.mysql.com/106198).
+    /// Such a dialect answers `false` to `derived_table_evaluates_volatile_outputs_once`
+    /// and the unparser refuses the arm rather than emit it, which costs the pushdown
+    /// and never a row. Asked of the dialect rather than of its name, so a dialect
+    /// that opts out later is covered without editing this list.
+    fn refused_where_the_engine_flattens_the_scope(
+        dialect_name: &str,
+        dialect: &dyn Dialect,
+        volatile: bool,
+        scope_kind: &str,
+        plan: &LogicalPlan,
+    ) -> bool {
+        if dialect.derived_table_evaluates_volatile_outputs_once()
+            || !volatile
+            || scope_kind != "filtered"
+        {
+            return false;
+        }
+        assert_volatile_scope_refused(dialect_name, dialect, plan);
+        true
+    }
+
+    /// Asserts `dialect` refuses `plan` with the volatile-scope refusal of fork PR
+    /// #227 — [`assert_captured_correlation_refused`] for the dialect-taking unparse
+    /// path, matched on the whole phrase so a refusal for another reason cannot
+    /// pass for it.
+    fn assert_volatile_scope_refused(context: &str, dialect: &dyn Dialect, plan: &LogicalPlan) {
+        let err = Unparser::new(dialect)
+            .plan_to_sql(plan)
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{context}: a filter on a volatile output read through a derived table \
+                     the engine does not fix must be refused"
+                )
+            });
+        assert!(
+            err.to_string().contains(VOLATILE_SCOPE_REFUSAL),
+            "{context}: refused for another reason: {err}"
+        );
+    }
+
+    /// The volatile call every scope below reads.
+    fn random_call() -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(volatile_udf("random"), vec![]))
+    }
+
+    /// `Projection(t.a, random() AS r)` over `t`, left as a builder so each shape
+    /// below stacks its own clause on it.
+    fn volatile_projection() -> LogicalPlanBuilder {
+        LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .project(vec![col("t.a"), random_call().alias("r")])
+            .expect("project")
+    }
+
+    /// [`volatile_projection`] with `r > 0.5` applied directly on it — the shape
+    /// `SELECT * FROM (SELECT a, random() AS r FROM t) WHERE r > 0.5` plans to,
+    /// since the optimizer cannot push a filter through a volatile projection.
+    fn filter_on_volatile_projection() -> LogicalPlan {
+        volatile_projection()
+            .filter(col("r").gt(lit(0.5)))
+            .expect("filter")
+            .build()
+            .expect("build")
+    }
+
+    /// Regression test for #12751 and #13445, fixed by fork PR #227: a `Filter`
+    /// directly over a `Projection` is folded into one `SELECT`, whose `WHERE` binds
+    /// against the relations read rather than against the `SELECT` list. A
+    /// predicate reading a volatile output therefore has nowhere to bind in that
+    /// `SELECT`: the alias is not visible from `WHERE` (`PostgreSQL` and `MySQL`
+    /// reject `WHERE (r > 0.5)`), and inlining `random()` draws a second value —
+    /// which is exactly how the engines that do accept the alias resolve it
+    /// (measured on `SQLite`: 517 of 990 returned rows had `r` below the bound).
+    ///
+    /// The repair moves the projection into a derived table and applies the
+    /// predicate from the `SELECT` above it, by name, so the expression is
+    /// evaluated once. This guard pins the two halves of that: the `WHERE` sits
+    /// outside the derived table, and the volatile call is rendered exactly once.
+    #[test]
+    fn a_filter_on_a_volatile_projection_output_is_applied_above_the_projection() {
+        let plan = filter_on_volatile_projection();
+        for (dialect_name, dialect) in federation_dialects() {
+            if refused_where_the_engine_flattens_the_scope(
+                dialect_name,
+                dialect.as_ref(),
+                true,
+                "filtered",
+                &plan,
+            ) {
+                continue;
+            }
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+
+            let derived_at = first_offset_of(&sql, "FROM (SELECT ");
+            let where_at = last_offset_of(&sql, "WHERE ");
+            assert!(
+                where_at > derived_at && paren_depth_at(&sql, where_at) == 0,
+                "{dialect_name}: the predicate has to be applied from the SELECT that reads the \
+                 derived table, not inside it beside the SELECT list it cannot see: {sql}"
+            );
+            // The output is named `r`, so every `random()` in the SQL is a call.
+            let evaluations = sql.matches("random()").count();
+            assert_eq!(
+                evaluations, 1,
+                "{dialect_name}: the volatile call is evaluated {evaluations} times, so the \
+                 predicate can observe a value the SELECT list never showed: {sql}"
+            );
+        }
+    }
+
+    /// The other half of the same fold, fixed by the same fork PR: a predicate
+    /// reading an *aliased* output the projection can repeat — `t.a + t.b AS s`,
+    /// filtered as `s > 1` — used to be emitted as `WHERE (s > 1)`, which
+    /// `PostgreSQL` rejects (`column "s" does not exist`). The expression is now
+    /// inlined the way an unnamed output's always was, so the `WHERE` reads the
+    /// relation's own columns.
+    #[test]
+    fn a_filter_on_an_aliased_projection_output_is_inlined() {
+        let plan = LogicalPlanBuilder::scan("t", two_column_source(), None)
+            .expect("scan t")
+            .project(vec![(col("t.a") + col("t.b")).alias("s")])
+            .expect("project")
+            .filter(col("s").gt(lit(1)))
+            .expect("filter")
+            .build()
+            .expect("build");
+        for (dialect_name, dialect) in federation_dialects() {
+            let sql = unparse_with(dialect_name, dialect.as_ref(), &plan);
+            let where_clause = &sql[last_offset_of(&sql, "WHERE ")..];
+            assert!(
+                where_clause.contains(") > 1"),
+                "{dialect_name}: the WHERE has to compare the inlined expression, not the \
+                 SELECT-list alias no engine lets it see: {sql}"
+            );
+            for alias_reference in ["s > 1", "\"s\" > 1", "`s` > 1"] {
+                assert!(
+                    !where_clause.contains(alias_reference),
+                    "{dialect_name}: the WHERE still reads the alias `s`, which binds to \
+                     nothing there: {sql}"
+                );
+            }
+        }
+    }
+
+    /// The `SQLite` side of the same fork PR, spelled out for every route to the
+    /// scope: the filter that would build it, a filter already above a derived
+    /// projection, and the alias pushdown that would otherwise decline into one.
+    /// Each is refused rather than emitted, because `SQLite` flattens the derived
+    /// table and evaluates the volatile call again.
+    #[test]
+    fn sqlite_refuses_every_route_to_a_volatile_output_scope() {
+        let scoped_here = filter_on_volatile_projection();
+        let already_derived = LogicalPlanBuilder::from(scoped_here.clone())
+            .project(vec![col("t.a")])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        let aliased = LogicalPlanBuilder::from(scoped_here.clone())
+            .alias("sq")
+            .expect("alias")
+            .build()
+            .expect("build");
+        // The shape Spice's federation path presents for
+        // `SELECT * FROM (SELECT a, random() AS r FROM t) sq WHERE sq.r > 0.5`:
+        // the filter above the alias, under the outer projection the path keeps.
+        // Measured through `spiced` on the previous pin: 481 of 1009 rows returned
+        // had `r <= 0.5` on `SQLite`.
+        let above_the_alias = volatile_projection()
+            .alias("sq")
+            .expect("alias")
+            .filter(col("sq.r").gt(lit(0.5)))
+            .expect("filter")
+            .project(vec![col("sq.a"), col("sq.r")])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        for (route, plan) in [
+            ("the filter that would build the scope", scoped_here),
+            (
+                "a filter already above a derived projection",
+                already_derived,
+            ),
+            ("the alias pushdown", aliased),
+            (
+                "a filter above the alias under a taken SELECT list",
+                above_the_alias,
+            ),
+        ] {
+            assert_volatile_scope_refused(&format!("sqlite, {route}"), &SqliteDialect {}, &plan);
         }
     }
 
@@ -2357,5 +3295,705 @@ mod tests {
                  {default_sql}"
             );
         }
+    }
+
+    /// A federated batch that does not fit its declared schema must fail, not come
+    /// back with a NULL where the value was.
+    ///
+    /// `SchemaCastScanExec` coerces every batch a remote returns to the schema the
+    /// plan declared, through `datafusion_federation`'s `try_cast_to`. Arrow's
+    /// default cast is the *safe* one: a value the target type cannot hold becomes
+    /// NULL instead of an error. So a federated column read one width too narrow —
+    /// a remote `BIGINT` the plan typed `INT`, which is what a schema inferred from
+    /// one driver and used against another gives — returns NULLs where the remote
+    /// returned numbers, on a query that reports success. The fork casts with
+    /// `safe: false` instead (federation PR #67), which makes it a failed query.
+    ///
+    /// The overflow arm is the point: the whole value of the patch is that the case
+    /// stops being silent. The in-range arm is the control, because a cast that
+    /// refused everything would satisfy the first assertion by itself.
+    #[test]
+    fn a_federated_value_too_wide_for_its_declared_type_is_an_error_not_a_null() {
+        use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch};
+        use datafusion_federation::schema_cast::record_convert::try_cast_to;
+
+        let remote = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let declared = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+
+        let overflowing = Int64Array::from(vec![i64::from(i32::MAX) + 1]);
+
+        // The counterfactual, run here rather than asserted in prose: Arrow's
+        // default cast is the one `try_cast_to` used before the patch, and it
+        // answers this very value with a NULL and no error. Without this arm the
+        // assertion below would also hold on a build where nothing could overflow.
+        let safe = datafusion::arrow::compute::cast(&overflowing, &DataType::Int32)
+            .expect("arrow's safe cast reports no error at all");
+        assert_eq!(
+            safe.null_count(),
+            1,
+            "the safe cast is the behaviour the patch replaces: it turns the overflow into a NULL"
+        );
+
+        let batch = RecordBatch::try_new(Arc::clone(&remote), vec![Arc::new(overflowing) as _])
+            .expect("an Int64 batch matching its own schema");
+        assert!(
+            try_cast_to(batch, Arc::clone(&declared)).is_err(),
+            "one past i32::MAX has to fail the cast; the safe cast above hands it back as NULL, \
+             so the query answers with a NULL where the remote sent a number and reports no error"
+        );
+
+        let in_range = RecordBatch::try_new(
+            Arc::clone(&remote),
+            vec![Arc::new(Int64Array::from(vec![7_i64]))],
+        )
+        .expect("an Int64 batch matching its own schema");
+        let cast = try_cast_to(in_range, declared).expect("7 is representable as an i32");
+        assert_eq!(
+            cast.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("the column was cast to Int32")
+                .value(0),
+            7,
+            "a value the target type holds still has to come through it"
+        );
+    }
+
+    /// A `TableSource` the federation analyzer recognises as federated, so a plan
+    /// built on it is one the analyzer will try to wrap.
+    fn federated_table_source() -> Arc<dyn TableSource> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        Arc::new(DefaultTableSource::new(Arc::new(
+            create_spice_federated_table_provider(
+                owned_test_sql_table(),
+                schema,
+                TableReference::bare("t"),
+                None,
+            ),
+        )))
+    }
+
+    /// Nothing under a DML plan may be federated.
+    ///
+    /// The analyzer federates the largest sub-tree that draws on one provider,
+    /// and the input of a `DELETE` over a federated table is such a sub-tree. It
+    /// must be left alone: the unparser has no `dml_to_sql`, so a federated node
+    /// under a `Dml` cannot be rendered at all, and `DataFusion`'s physical
+    /// planner dispatches `delete_from`/`update` by matching `LogicalPlan::Dml`,
+    /// which it cannot do once the rows it owns have been replaced by an
+    /// extension node. The fork returns a DML plan untouched (federation PR #73).
+    ///
+    /// The assertion is on the *input*, not on the root, because the root is a
+    /// `Dml` either way — losing the patch federates what is under it rather than
+    /// replacing it. And the input has to be a shape the analyzer really does
+    /// federate, or the assertion holds for the wrong reason; the control
+    /// establishes that, and a `Limit` is used rather than a filter because a
+    /// filter is pushed into the scan before federation runs, collapsing the plan
+    /// to a bare `TableScan` that the adaptor serves itself and the analyzer
+    /// leaves alone.
+    ///
+    /// The fork gives a third reason for the patch — that a wrapped `Dml` is
+    /// invisible to a write-permission validator that walks for it. That is the
+    /// fork's rationale rather than something reproduced here:
+    /// `validate_sql_query_operations` runs on the plan `create_logical_plan`
+    /// returns, and analyzer rules have not run at that point.
+    #[test]
+    fn nothing_under_a_dml_plan_is_federated_by_the_analyzer() {
+        let source = federated_table_source();
+        let rows_to_delete = || {
+            LogicalPlanBuilder::scan("t", Arc::clone(&source), None)
+                .expect("scan the federated table")
+                .limit(0, Some(3))
+                .expect("limit the scan")
+                .build()
+                .expect("build the input plan")
+        };
+
+        let control = FederationAnalyzerRule::new()
+            .analyze(rows_to_delete(), &ConfigOptions::default())
+            .expect("the analyzer accepts a federated plan");
+        assert!(
+            contains_a_federated_node(&control),
+            "the control: this shape is one the analyzer does federate, which is what gives \
+             the assertion below teeth. Shape was:\n{}",
+            control.display_indent()
+        );
+
+        let dml = LogicalPlan::Dml(DmlStatement::new(
+            TableReference::bare("t"),
+            Arc::clone(&source),
+            WriteOp::Delete,
+            Arc::new(rows_to_delete()),
+        ));
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(dml, &ConfigOptions::default())
+            .expect("the analyzer accepts a DML plan");
+
+        let LogicalPlan::Dml(statement) = &analyzed else {
+            panic!(
+                "a Dml plan has to stay a Dml plan, got:\n{}",
+                analyzed.display_indent()
+            );
+        };
+        assert!(
+            !contains_a_federated_node(statement.input.as_ref()),
+            "a federated node under a Dml is a DELETE that can be neither rendered nor \
+             dispatched. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// Whether any node of `plan` is an extension node, which is what federation
+    /// wraps a sub-tree in.
+    fn contains_a_federated_node(plan: &LogicalPlan) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if matches!(node, LogicalPlan::Extension(_)) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        found
+    }
+
+    /// A `Limit` over a scan of the federated table: the subquery both `EXISTS`
+    /// guards below put inside their predicate.
+    ///
+    /// A `Limit` rather than a bare scan or a filter, for the reason the DML guard
+    /// above gives: a bare scan is served by the `FederatedTableProviderAdaptor`
+    /// itself and never wrapped, and a filter is pushed into the scan before
+    /// federation runs, collapsing to the same thing.
+    fn federated_subquery() -> Arc<LogicalPlan> {
+        Arc::new(
+            LogicalPlanBuilder::scan("t", federated_table_source(), None)
+                .expect("scan the federated table")
+                .limit(0, Some(1))
+                .expect("limit the scan")
+                .build()
+                .expect("build the subquery"),
+        )
+    }
+
+    /// A scan of a table that is *not* federated, filtered by `predicate`.
+    ///
+    /// The outer table is deliberately local. That way the statement cannot
+    /// federate as one unit, so the only thing that can carry a federated node is
+    /// the subquery itself, and the assertions cannot be satisfied by the outer
+    /// plan being wrapped instead.
+    fn statement_filtered_by(predicate: Expr) -> LogicalPlan {
+        // A real provider, not a `LogicalTableSource`: the analyzer resolves every
+        // scan through `source_as_provider`, which refuses anything else outright
+        // ("TableSource was not DefaultTableSource").
+        let local: Arc<dyn TableSource> =
+            Arc::new(DefaultTableSource::new(Arc::new(EmptyTable::new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            ))));
+        LogicalPlanBuilder::scan("local", local, None)
+            .expect("scan the local table")
+            .filter(predicate)
+            .expect("filter on the subquery predicate")
+            .build()
+            .expect("build the statement")
+    }
+
+    /// An `EXISTS` subquery over a federated table has to be federated.
+    ///
+    /// `Expr::Exists` fell through the analyzer's expression walk, so the tables
+    /// inside an `EXISTS` subquery were invisible to the provider verdict and the
+    /// subquery was never federated. It then runs locally — one scan per table
+    /// reference, every join and aggregate evaluated here — while the statement
+    /// around it federates. Fork PR #74 handles the expression in both halves of
+    /// the walk: counting the subquery's tables toward the verdict, and federating
+    /// the subquery's own plan.
+    #[test]
+    fn an_exists_subquery_over_a_federated_table_is_federated() {
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(
+                statement_filtered_by(exists(federated_subquery())),
+                &ConfigOptions::default(),
+            )
+            .expect("the analyzer accepts a statement with an EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped — otherwise the assertion below could be met by the wrong node. \
+             Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert_eq!(
+            federated_exists_negation(&analyzed),
+            Some(false),
+            "the subquery's only table is federated, so the subquery has to be pushed to \
+             that provider rather than run here a scan at a time. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// The same, for `NOT EXISTS`, which has to come back still negated.
+    ///
+    /// The patch does not wrap the existing expression — it rebuilds it, carrying
+    /// `negated` across by hand. Reconstructing it with the flag reset federates
+    /// exactly as well and returns the complement of the rows asked for, which the
+    /// guard above cannot see: it builds only the non-negated shape, and a
+    /// federated node is present either way. So this asserts the flag, not just
+    /// the wrapping.
+    #[test]
+    fn a_not_exists_subquery_is_federated_and_stays_negated() {
+        let analyzed = FederationAnalyzerRule::new()
+            .analyze(
+                statement_filtered_by(not_exists(federated_subquery())),
+                &ConfigOptions::default(),
+            )
+            .expect("the analyzer accepts a statement with a NOT EXISTS subquery");
+
+        assert!(
+            !contains_a_federated_node(&analyzed),
+            "the outer table is not federated, so nothing outside the subquery may be \
+             wrapped. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+        assert_eq!(
+            federated_exists_negation(&analyzed),
+            Some(true),
+            "a federated NOT EXISTS that comes back as EXISTS returns the complement of the \
+             rows the statement asked for, and reports success doing it. Shape was:\n{}",
+            analyzed.display_indent()
+        );
+    }
+
+    /// A provider that reports which of its methods was reached, and nothing else.
+    ///
+    /// An error rather than a plan because the call arriving is the whole
+    /// observation — building a real `ExecutionPlan` would add machinery the
+    /// assertion does not read.
+    #[derive(Debug)]
+    struct RecordingDmlProvider {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl TableProvider for RecordingDmlProvider {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "scan reached the inner provider".to_string(),
+            ))
+        }
+
+        async fn delete_from(
+            &self,
+            _state: &dyn Session,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "delete_from reached the inner provider".to_string(),
+            ))
+        }
+
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(
+                "update reached the inner provider".to_string(),
+            ))
+        }
+    }
+
+    /// The adaptor has to forward `delete_from` and `update` to the provider it
+    /// wraps.
+    ///
+    /// The fork PR that returns DML plans unwrapped carries these two delegations
+    /// as well, and they are independent of it: a re-cut could keep the analyzer's
+    /// early return and drop either method. `TableProvider` defaults both to
+    /// reporting the operation unsupported, so losing one compiles — and the
+    /// `DELETE` or `UPDATE` it stops is exactly the one the early return exists to
+    /// keep working, which is why the guard above cannot stand in for this. The
+    /// fork's own `delete_from_delegates_to_inner_provider` and
+    /// `update_delegates_to_inner_provider` leave with the branch that gets
+    /// re-cut.
+    #[tokio::test]
+    async fn the_adaptor_forwards_dml_to_the_provider_it_wraps() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let executor: Arc<dyn SQLExecutor> =
+            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_schema(
+            Arc::new(SQLFederationProvider::new(executor)),
+            RemoteTableRef::from(TableReference::bare("t")),
+            Arc::clone(&schema),
+        ));
+        let adaptor = FederatedTableProviderAdaptor::new_with_provider(
+            source,
+            Arc::new(RecordingDmlProvider { schema }),
+        );
+        let state = SessionContext::new().state();
+
+        let deleted = adaptor
+            .delete_from(&state, vec![])
+            .await
+            .expect_err("the recording provider reports the call rather than planning it");
+        assert!(
+            deleted
+                .to_string()
+                .contains("delete_from reached the inner provider"),
+            "the adaptor did not forward `delete_from`, so a DELETE against a federated \
+             table is refused as unsupported: {deleted}"
+        );
+
+        let updated = adaptor
+            .update(&state, vec![], vec![])
+            .await
+            .expect_err("the recording provider reports the call rather than planning it");
+        assert!(
+            updated
+                .to_string()
+                .contains("update reached the inner provider"),
+            "the adaptor did not forward `update`, so an UPDATE against a federated table \
+             is refused as unsupported: {updated}"
+        );
+    }
+
+    /// The `negated` flag of the first `EXISTS` subquery in `plan` that came back
+    /// federated, or `None` when no `EXISTS` subquery was federated at all.
+    ///
+    /// One accessor for both halves of the contract: that the subquery reached the
+    /// provider, and that it still asks the question it was written to ask.
+    fn federated_exists_negation(plan: &LogicalPlan) -> Option<bool> {
+        let mut negated = None;
+        plan.apply(|node| {
+            for expr in node.expressions() {
+                expr.apply(|e| {
+                    if let Expr::Exists(exists) = e
+                        && contains_a_federated_node(exists.subquery.subquery.as_ref())
+                    {
+                        negated = Some(exists.negated);
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walking an expression cannot fail");
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walking a logical plan cannot fail");
+        negated
+    }
+
+    /// `products AS p LEFT JOIN categories AS c`, where both relations expose a
+    /// column called `name`, so a projection passing both through has two outputs no
+    /// bare name tells apart.
+    fn products_left_join_categories() -> LogicalPlanBuilder {
+        let products = LogicalPlanBuilder::scan(
+            "products",
+            table_source(vec![
+                Field::new("category_id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("price", DataType::Int32, false),
+            ]),
+            None,
+        )
+        .expect("scan products")
+        .alias("p")
+        .expect("alias products")
+        .build()
+        .expect("build products");
+        let categories = LogicalPlanBuilder::scan(
+            "categories",
+            table_source(vec![
+                Field::new("category_id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+            ]),
+            None,
+        )
+        .expect("scan categories")
+        .alias("c")
+        .expect("alias categories")
+        .build()
+        .expect("build categories");
+        LogicalPlanBuilder::from(products)
+            .join(
+                categories,
+                JoinType::Left,
+                (vec!["p.category_id"], vec!["c.category_id"]),
+                None,
+            )
+            .expect("join products to categories")
+    }
+
+    /// Whether the outermost `SELECT` list of `sql` qualifies a column by
+    /// `relation` while the outermost `FROM` does not bring `relation` into scope.
+    ///
+    /// Matched on nesting depth rather than on a rendered string, so it holds across
+    /// the dialects' quoting: `p.`, `"p".` and `` `p`. `` are all the same
+    /// reference, and `AS p`, `AS "p"` and `` AS `p` `` the same declaration.
+    fn outer_select_reads_an_out_of_scope_relation(sql: &str, relation: &str) -> bool {
+        let Some(from_at) = sql
+            .match_indices(" FROM ")
+            .map(|(at, _)| at)
+            .find(|at| paren_depth_at(sql, *at) == 0)
+        else {
+            panic!("expected a top-level FROM in: {sql}");
+        };
+        let spellings = [
+            relation.to_string(),
+            format!("\"{relation}\""),
+            format!("`{relation}`"),
+        ];
+        let select_list = &sql[..from_at];
+        let referenced = spellings.iter().any(|spelling| {
+            select_list
+                .match_indices(&format!("{spelling}."))
+                .any(|(at, _)| {
+                    select_list[..at]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+                })
+        });
+        let declared = spellings.iter().any(|spelling| {
+            sql[from_at..]
+                .match_indices(&format!("AS {spelling}"))
+                .any(|(at, _)| paren_depth_at(sql, from_at + at) == 0)
+        });
+        referenced && !declared
+    }
+
+    /// Prepares `sql` against an in-memory `DuckDB` holding the two tables the
+    /// plans below read, which binds every reference without running anything.
+    #[cfg(feature = "duckdb")]
+    fn duckdb_binds(sql: &str) -> Result<(), duckdb::Error> {
+        let conn = duckdb::Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE products (category_id INTEGER NOT NULL, name VARCHAR NOT NULL, \
+             price INTEGER NOT NULL); \
+             CREATE TABLE categories (category_id INTEGER NOT NULL, name VARCHAR NOT NULL);",
+        )?;
+        conn.prepare(sql).map(|_| ())
+    }
+
+    /// Regression test for the `spiceai/datafusion` fork's Date32 literal fix
+    /// (spiceai/datafusion#237, refs spiceai/spiceai#14491): the unparser spelled
+    /// every date literal `CAST('…' AS DATE)`, which `SQLite` reads as the number
+    /// `1994`, so a date range pushed to `SQLite` compared text against a number and
+    /// matched no row. The literal's cast must use the dialect's date type, as a
+    /// plain cast already did.
+    #[test]
+    fn a_date_range_unparsed_for_sqlite_keeps_the_rows_it_selects() {
+        let date = |days: i32| lit(ScalarValue::Date32(Some(days)));
+        // 1994-01-01 and 1995-01-01 as days since the Unix epoch.
+        let (from, to) = (8766, 9131);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new("d", DataType::Date32, false)]),
+            None,
+        )
+        .expect("scan events")
+        .filter(col("d").gt_eq(date(from)).and(col("d").lt(date(to))))
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("sqlite", &SqliteDialect {}, &plan);
+        assert!(
+            !sql.contains("AS DATE"),
+            "a date literal must not be cast to DATE for SQLite, which reads it as a number: {sql}"
+        );
+
+        #[cfg(feature = "sqlite")]
+        {
+            let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+            conn.execute_batch(
+                "CREATE TABLE events (d TEXT NOT NULL); \
+                 INSERT INTO events VALUES ('1993-12-31'), ('1994-01-01'), ('1994-06-30'), \
+                 ('1994-12-31'), ('1995-01-01');",
+            )
+            .expect("create events");
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+            assert_eq!(
+                count, 3,
+                "SQLite must keep the three 1994 rows the filter selects: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for the unparser's `rescope_projection_over_projection`,
+    /// carried by the `spiceai/datafusion` fork (upstream's
+    /// apache/datafusion#22961): common subexpression elimination leaves a
+    /// `Projection` directly over another `Projection`, and the unparser renders the
+    /// inner one as an unaliased derived table. The outer one's references still name
+    /// the relations the inner one reads — `p`, `c` — which that derived table hides,
+    /// so without the fix the federated statement is
+    /// `SELECT p."name" … FROM (SELECT … FROM products AS p LEFT JOIN …)`, and the
+    /// remote engine refuses it (`DuckDB`: "Referenced table p not found").
+    ///
+    /// Three arms, because the fix makes three different decisions: outputs whose
+    /// names are unique are read from the derived table by name; two same-named
+    /// outputs (`p.name`, `c.name`), which no name in the derived table addresses,
+    /// merge the two projections so the qualifiers are in scope again; and a merge
+    /// that would repeat a volatile expression is refused rather than rendered.
+    #[test]
+    fn a_projection_over_a_derived_projection_reads_only_relations_in_scope() {
+        let unique_outputs = products_left_join_categories()
+            .project(vec![
+                (col("p.price") + lit(1)).alias("__common_expr_1"),
+                col("p.name"),
+            ])
+            .expect("inner projection")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("__common_expr_1"),
+            ])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        let same_named_outputs = products_left_join_categories()
+            .project(vec![
+                (col("p.price") + lit(1)).alias("__common_expr_1"),
+                col("p.name"),
+                col("c.name"),
+            ])
+            .expect("inner projection")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("c.name").alias("category_name"),
+                (col("__common_expr_1") * lit(2)).alias("doubled"),
+                col("__common_expr_1"),
+            ])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+
+        for (shape, plan) in [
+            ("unique outputs", &unique_outputs),
+            ("same-named outputs", &same_named_outputs),
+        ] {
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), plan);
+                for relation in ["p", "c"] {
+                    assert!(
+                        !outer_select_reads_an_out_of_scope_relation(&sql, relation),
+                        "{dialect_name}/{shape}: the outer SELECT qualifies a column by '{relation}', \
+                         which the derived table below it hides, so the remote engine cannot bind \
+                         the statement: {sql}"
+                    );
+                }
+                for output in ["product_name", "__common_expr_1"] {
+                    assert!(
+                        sql[..first_offset_of(&sql, " FROM ")].contains(output),
+                        "{dialect_name}/{shape}: the outer SELECT lost its `{output}` output: {sql}"
+                    );
+                }
+            }
+
+            #[cfg(feature = "duckdb")]
+            {
+                let sql = unparse_with("duckdb", &DuckDBDialect::new(), plan);
+                if let Err(error) = duckdb_binds(&sql) {
+                    panic!(
+                        "duckdb/{shape}: DuckDB refused the federated statement: {error}: {sql}"
+                    );
+                }
+            }
+        }
+
+        let over_a_volatile_output = products_left_join_categories()
+            .project(vec![
+                datafusion::functions::expr_fn::random().alias("r"),
+                col("p.name"),
+                col("c.name"),
+            ])
+            .expect("inner projection")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("c.name").alias("category_name"),
+                col("r"),
+            ])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        match federated_sql_result(&over_a_volatile_output) {
+            Err(DataFusionError::NotImplemented(_)) => {}
+            other => panic!(
+                "merging the projections would evaluate `random()` once per reference rather \
+                 than once per row, and no name addresses the same-named outputs, so the plan \
+                 has to be refused as unsupported; got {other:?}"
+            ),
+        }
+    }
+
+    /// Regression test for `SchemaCastScanExec` forwarding its input's statistics
+    /// through `DataFusion` 55's `StatisticsContext`, carried by the
+    /// `spiceai/datafusion-federation` fork. 55 derives plan statistics through
+    /// `ExecutionPlan::statistics_from_inputs` and its built-in nodes no longer
+    /// implement the deprecated `partition_statistics`, so a cast node that still
+    /// forwards the latter reports an unknown row count over a scan that knows its
+    /// own, and join sizing and statistics-answered aggregates above a federated scan
+    /// lose it.
+    #[test]
+    fn a_schema_cast_scan_reports_its_inputs_statistics() {
+        use datafusion::arrow::array::{Int32Array, RecordBatch};
+        use datafusion::common::stats::Precision;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
+        use datafusion_federation::schema_cast::SchemaCastScanExec;
+
+        let input_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("build the input batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None)
+            .expect("build the input scan");
+        let input_rows = StatisticsContext::new()
+            .compute(input.as_ref(), &StatisticsArgs::new())
+            .expect("the input's statistics")
+            .num_rows;
+        assert_eq!(
+            input_rows,
+            Precision::Exact(3),
+            "the input has to know its own row count, or this guard proves nothing"
+        );
+
+        let cast = SchemaCastScanExec::new(
+            input,
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        let stats = StatisticsContext::new()
+            .compute(&cast, &StatisticsArgs::new())
+            .expect("the cast node's statistics");
+        assert_eq!(
+            stats.num_rows, input_rows,
+            "casting changes column types, not row counts, so the cast node has to report \
+             its input's row count"
+        );
     }
 }

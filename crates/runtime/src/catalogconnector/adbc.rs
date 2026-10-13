@@ -36,15 +36,15 @@ use data_components::adbc_helpers::{
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
-use runtime_datafusion::function_support::bigquery_can_evaluate_expression;
+use runtime_datafusion::function_support::expression_support_for_engine;
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
@@ -53,7 +53,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub const PREFIX: &str = "adbc";
-const BIGQUERY_DRIVER: &str = "bigquery";
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("driver")
@@ -169,14 +168,11 @@ impl CatalogConnector for AdbcCatalog {
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let connector_component = ConnectorComponent::from(catalog);
 
-        let (driver_name, pool) = create_pool(&self.params).await.map_err(|e| {
-            super::Error::UnableToGetCatalogProvider {
-                connector: PREFIX.to_string(),
-                connector_component: connector_component.clone(),
-                source: Box::new(e),
-            }
-        })?;
-
+        // Validated before the driver is loaded, as the ADBC dataset connector
+        // does: an invalid value is a configuration error no retry fixes, and
+        // checking it after `create_pool` let an unloadable driver or an
+        // unreachable database report itself instead — a retryable error that
+        // hid the parameter the user has to change.
         let federation_enabled =
             is_query_federation_enabled(&self.params.parameters).map_err(|e| {
                 super::Error::InvalidConfigurationNoSource {
@@ -185,6 +181,14 @@ impl CatalogConnector for AdbcCatalog {
                     message: e.to_string(),
                 }
             })?;
+
+        let (driver_name, pool) = create_pool(&self.params).await.map_err(|e| {
+            super::Error::UnableToGetCatalogProvider {
+                connector: PREFIX.to_string(),
+                connector_component: connector_component.clone(),
+                source: Box::new(e),
+            }
+        })?;
 
         let table_factory =
             build_table_factory(Arc::clone(&pool), federation_enabled, &driver_name);
@@ -234,6 +238,10 @@ impl CatalogConnector for AdbcCatalog {
 /// themselves require: an abandoned query is cancelled through the statement, so
 /// a driver whose statements cannot be cancelled cannot back either type.
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "installs `deny_spice_functions_for_table_providers()`, plus the engine's expression gate, with `with_function_support`"
+)]
 pub fn build_table_factory<D>(
     pool: Arc<ADBCPool<D>>,
     federation_enabled: bool,
@@ -245,12 +253,13 @@ where
     <D::ConnectionType as adbc_core::Connection>::StatementType:
         datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
+    // The engine's per-expression gate rides on the plain policy: a cast the
+    // engine evaluates differently from DataFusion stays local on this route
+    // as on the engine's own connector (issue #14482).
     let function_support = deny_spice_functions_for_table_providers();
-    let function_support = match driver_name {
-        BIGQUERY_DRIVER => {
-            function_support.with_expression_support(Arc::new(bigquery_can_evaluate_expression))
-        }
-        _ => function_support,
+    let function_support = match expression_support_for_engine(driver_name) {
+        Some(gate) => function_support.with_expression_support(gate),
+        None => function_support,
     };
     AdbcTableFactory::new(pool)
         .with_federation_enabled(federation_enabled)
@@ -636,5 +645,62 @@ mod tests {
 
         let err = Error::MissingUri;
         assert_eq!(err.to_string(), "Missing required parameter: uri");
+    }
+
+    /// An invalid `query_federation` is reported as the configuration error that
+    /// names the parameter, before any driver is loaded — not hidden behind
+    /// whatever the driver or the database says first. The driver named here
+    /// does not exist, so if the value were checked after `create_pool` the
+    /// catalog would fail with a retryable driver-load error instead.
+    #[tokio::test]
+    async fn an_invalid_query_federation_is_reported_before_the_driver_is_loaded() {
+        use crate::builder::RuntimeBuilder;
+        use crate::component::catalog::CatalogBuilder;
+        use app::AppBuilder;
+        use datafusion_table_providers::util::secrets::to_secret_map;
+        use tokio::runtime::Handle;
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let catalog = CatalogBuilder::try_new("adbc".to_string(), "adbc_cat")
+            .expect("valid catalog builder")
+            .with_app(Arc::new(AppBuilder::new("test").build()))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid catalog");
+
+        let params = HashMap::from([
+            (
+                "driver".to_string(),
+                "spice_test_no_such_adbc_driver".to_string(),
+            ),
+            ("uri".to_string(), "grpc://127.0.0.1:1".to_string()),
+            ("query_federation".to_string(), "off".to_string()),
+        ]);
+        let connector = AdbcCatalog::new_connector(ConnectorParams {
+            parameters: crate::parameters::Parameters::new(
+                to_secret_map(params).into_iter().collect(),
+                PREFIX,
+                PARAMETERS,
+            ),
+            unsupported_type_action: None,
+            component: ConnectorComponent::from(&catalog),
+            io_runtime: Handle::current(),
+        });
+
+        let Err(err) = connector
+            .refreshable_catalog_provider(runtime, &catalog)
+            .await
+        else {
+            panic!("an invalid `query_federation` must fail catalog setup");
+        };
+        assert!(
+            err.is_configuration_error(),
+            "expected the non-retryable configuration error, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Cannot setup the catalog adbc_cat (adbc) with an invalid configuration. \
+             Invalid `query_federation` value 'off'. Expected 'enabled' or 'disabled'."
+        );
     }
 }

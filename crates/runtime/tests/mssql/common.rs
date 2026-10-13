@@ -48,12 +48,11 @@ const MSSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_mssql_docker_container(
-    container_name: &'static str,
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
+    container_name: &str,
+) -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image("mcr.microsoft.com/mssql/server:2022-latest".to_string())
-        .add_port_binding(1433, port)
+        .publish_port(1433)
         .add_env_var("MSSQL_SA_PASSWORD", MSSQL_ROOT_PASSWORD)
         .add_env_var("ACCEPT_EULA", "Y")
         .healthcheck(HealthConfig {
@@ -73,6 +72,11 @@ pub async fn start_mssql_docker_container(
         .run(Some(MSSQL_CONTAINER_START_TIMEOUT))
         .await?;
 
-    wait_for_tcp_port("127.0.0.1", port, MSSQL_HOST_PORT_READY_TIMEOUT).await?;
+    wait_for_tcp_port(
+        "127.0.0.1",
+        running_container.host_port(1433)?,
+        MSSQL_HOST_PORT_READY_TIMEOUT,
+    )
+    .await?;
     Ok(running_container)
 }

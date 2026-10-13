@@ -60,13 +60,27 @@ pub enum Error {
     InvalidConfigurationNoSource { component: String, message: String },
 }
 
+/// Whether building [`Parameters`] warns about the user's parameters it ignores or that
+/// are deprecated.
+///
+/// A component's parameters are reported once, where the component is created; code
+/// that re-resolves the same parameters later (an accelerator's sidecar, say) suppresses
+/// the warnings rather than repeat them each time it resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diagnostics {
+    Report,
+    Suppress,
+}
+
 impl Parameters {
     fn validate_and_format_key(
         all_params: &[ParameterSpec],
         prefix: &'static str,
         key: &str,
         component_name: &str,
+        diagnostics: Diagnostics,
     ) -> Option<String> {
+        let report = diagnostics == Diagnostics::Report;
         let full_prefix = format!("{prefix}_");
         let mut key_to_use = key;
         let mut prefix_removed = false;
@@ -75,10 +89,20 @@ impl Parameters {
             key_to_use = &key[full_prefix.len()..];
         }
 
+        // A retired key is dropped here, in its prefixed and unprefixed spelling, and
+        // reported by the component that owns it, so the generic "not supported"
+        // warning does not repeat it.
+        if all_params
+            .iter()
+            .any(|p| p.is_retired() && (p.display_name(prefix) == key || p.name == key))
+        {
+            return None;
+        }
+
         // Find the non-deprecated spec matching the unprefixed key name
         let spec = all_params
             .iter()
-            .find(|p| p.name == key_to_use && p.deprecation_message.is_none());
+            .find(|p| p.name == key_to_use && p.deprecation_message.is_none() && !p.is_retired());
 
         // Find deprecated spec matching the unprefixed key name (for backwards compat)
         // e.g., component("tools").deprecated(...) allows "openai_tools" to work
@@ -92,21 +116,27 @@ impl Parameters {
         }
 
         let Some(spec) = spec else {
-            let suggestion = closest_param_suggestion(all_params, prefix, key);
-            if let Some(candidate) = suggestion {
-                tracing::warn!(
-                    "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
-                );
-            } else {
-                tracing::warn!("Ignoring parameter `{key}`: not supported for {component_name}.");
+            if report {
+                let suggestion = closest_param_suggestion(all_params, prefix, key);
+                if let Some(candidate) = suggestion {
+                    tracing::warn!(
+                        "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
+                    );
+                } else {
+                    tracing::warn!(
+                        "Ignoring parameter `{key}`: not supported for {component_name}."
+                    );
+                }
             }
             return None;
         };
 
         if !prefix_removed && spec.r#type.is_prefixed() {
-            tracing::warn!(
-                "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-            );
+            if report {
+                tracing::warn!(
+                    "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+                );
+            }
             return None;
         }
 
@@ -115,9 +145,11 @@ impl Parameters {
             if deprecated_spec.is_some() {
                 return Some(key_to_use.to_string());
             }
-            tracing::warn!(
-                "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
-            );
+            if report {
+                tracing::warn!(
+                    "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
+                );
+            }
             return None;
         }
 
@@ -134,16 +166,43 @@ impl Parameters {
         secrets: Arc<RwLock<Secrets>>,
         all_params: &'static [ParameterSpec],
     ) -> AnyErrorResult<Self> {
+        Self::try_new_with_diagnostics(
+            component_name,
+            params,
+            prefix,
+            secrets,
+            all_params,
+            Diagnostics::Report,
+        )
+        .await
+    }
+
+    /// [`Self::try_new`], choosing whether ignored and deprecated parameters are warned
+    /// about.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when supplied parameters do not satisfy the provided `ParameterSpec`.
+    pub async fn try_new_with_diagnostics(
+        component_name: &str,
+        params: Vec<(String, SecretString)>,
+        prefix: &'static str,
+        secrets: Arc<RwLock<Secrets>>,
+        all_params: &'static [ParameterSpec],
+        diagnostics: Diagnostics,
+    ) -> AnyErrorResult<Self> {
         // Check for deprecated parameters using the original user-provided keys
         // before normalization strips prefixes.
-        let original_keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
-        for parameter in all_params {
-            if let Some(deprecation_message) = parameter.deprecation_message {
-                let user_key = parameter.display_name(prefix);
-                if original_keys.contains(&user_key.as_str()) {
-                    tracing::warn!(
-                        "Parameter '{user_key}' is deprecated for {component_name}: {deprecation_message}",
-                    );
+        if diagnostics == Diagnostics::Report {
+            let original_keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+            for parameter in all_params {
+                if let Some(deprecation_message) = parameter.deprecation_message {
+                    let user_key = parameter.display_name(prefix);
+                    if original_keys.contains(&user_key.as_str()) {
+                        tracing::warn!(
+                            "Parameter '{user_key}' is deprecated for {component_name}: {deprecation_message}",
+                        );
+                    }
                 }
             }
         }
@@ -152,7 +211,7 @@ impl Parameters {
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
             .filter_map(|(key, value)| {
-                Self::validate_and_format_key(all_params, prefix, &key, component_name)
+                Self::validate_and_format_key(all_params, prefix, &key, component_name, diagnostics)
                     .map(|k| (k, value))
             })
             .collect();
@@ -523,7 +582,7 @@ fn closest_param_suggestion(
 ) -> Option<String> {
     let candidates: Vec<String> = all_params
         .iter()
-        .filter(|p| p.deprecation_message.is_none())
+        .filter(|p| p.deprecation_message.is_none() && !p.is_retired())
         .map(|p| p.display_name(prefix))
         .collect();
     util::levenshtein::closest_match(typo, &candidates)
@@ -598,6 +657,33 @@ mod test {
     }
 
     #[test]
+    fn test_retired_param_is_dropped_and_not_suggested() {
+        let specs = [
+            ParameterSpec::component("tuning").moved_to("runtime.adaptive_tuning"),
+            ParameterSpec::component("host"),
+        ];
+        let format = |key| {
+            Parameters::validate_and_format_key(&specs, "pg", key, "dataset", Diagnostics::Suppress)
+        };
+        assert_eq!(
+            format("pg_tuning"),
+            None,
+            "a retired key must not be applied"
+        );
+        assert_eq!(
+            format("tuning"),
+            None,
+            "the unprefixed spelling of a retired key must not be applied either"
+        );
+        assert_eq!(format("pg_host"), Some("host".to_string()));
+        assert_ne!(
+            closest_param_suggestion(&specs, "pg", "pg_tunin"),
+            Some("pg_tuning".to_string()),
+            "a retired key must not be offered as a suggestion"
+        );
+    }
+
+    #[test]
     fn test_describe_missing_parameter_empty_spec_is_empty_suffix() {
         let spec = ParameterSpec::component("host");
         assert_eq!(describe_missing_parameter(&spec), "");
@@ -658,7 +744,8 @@ mod test {
                 &[ParameterSpec::component("endpoint")],
                 "databricks",
                 "databricks_endpoint",
-                "connector databricks"
+                "connector databricks",
+                Diagnostics::Report
             ),
             Some("endpoint".to_string())
         );
@@ -669,7 +756,8 @@ mod test {
                 &[ParameterSpec::component("endpoint")],
                 "not_databricks",
                 "databricks_endpoint",
-                "connector databricks"
+                "connector databricks",
+                Diagnostics::Report
             ),
             None
         );
@@ -680,7 +768,8 @@ mod test {
                 &[ParameterSpec::runtime("endpoint")], // deliberately `runtime` not `component`.
                 "databricks",
                 "databricks_endpoint",
-                "connector databricks"
+                "connector databricks",
+                Diagnostics::Report
             ),
             None
         );
@@ -691,7 +780,8 @@ mod test {
                 &[ParameterSpec::runtime("file_format")],
                 "file",
                 "file_format",
-                "connector file"
+                "connector file",
+                Diagnostics::Report
             ),
             Some("file_format".to_string())
         );
@@ -702,7 +792,8 @@ mod test {
                 &[ParameterSpec::component("file_format")],
                 "file",
                 "file_format",
-                "connector file"
+                "connector file",
+                Diagnostics::Report
             ),
             Some("file_format".to_string())
         );
@@ -713,7 +804,8 @@ mod test {
                 &[ParameterSpec::component("format")],
                 "file",
                 "file_format",
-                "connector file"
+                "connector file",
+                Diagnostics::Report
             ),
             Some("format".to_string())
         );
@@ -723,10 +815,54 @@ mod test {
                 &[ParameterSpec::runtime("file_format")],
                 "not_file",
                 "file_format",
-                "accelerator not_file"
+                "accelerator not_file",
+                Diagnostics::Report
             ),
             Some("file_format".to_string())
         );
+    }
+
+    /// Suppressing diagnostics silences the warnings only: the parameters a component
+    /// resolves are the same either way, so a sidecar that suppresses them still sees
+    /// exactly what the component was created with.
+    #[tokio::test]
+    async fn suppressed_diagnostics_resolve_the_same_parameters() {
+        static SPECS: &[ParameterSpec] = &[
+            ParameterSpec::component("host"),
+            ParameterSpec::runtime("pool_size").default("10"),
+        ];
+        async fn resolve(diagnostics: Diagnostics) -> Vec<(String, String)> {
+            let params = Parameters::try_new_with_diagnostics(
+                "accelerator test",
+                vec![
+                    ("test_host".to_string(), SecretString::from("db.internal")),
+                    ("test_unknown".to_string(), SecretString::from("ignored")),
+                ],
+                "test",
+                Arc::new(RwLock::new(Secrets::new())),
+                SPECS,
+                diagnostics,
+            )
+            .await
+            .expect("parameters resolve");
+            let mut pairs: Vec<(String, String)> = params
+                .to_secret_map()
+                .into_iter()
+                .map(|(k, v)| (k, v.expose_secret().to_string()))
+                .collect();
+            pairs.sort();
+            pairs
+        }
+
+        let reported = resolve(Diagnostics::Report).await;
+        assert_eq!(
+            reported,
+            vec![
+                ("host".to_string(), "db.internal".to_string()),
+                ("pool_size".to_string(), "10".to_string()),
+            ]
+        );
+        assert_eq!(resolve(Diagnostics::Suppress).await, reported);
     }
 
     #[tokio::test]

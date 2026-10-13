@@ -191,11 +191,10 @@ pub mod deferred;
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
 // Only the ADBC catalog connector reads the `query_federation` parameter today,
-// because only its dataset connector offers one. The MySQL, DuckLake and
-// Snowflake catalogs install their deny-list with no opt-out, matching theirs.
-// The PostgreSQL catalog installs none: `PostgresTableFactory`'s read path
-// carries no function-support seam at the pinned table-providers rev, so
-// closing it needs a change there. See #13664.
+// because only its dataset connector offers one. The MySQL, PostgreSQL, DuckLake
+// and Snowflake catalogs install their deny-list with no opt-out, matching
+// theirs. Offering the PostgreSQL catalog the parameter is user-facing surface
+// and needs a signed-off Enhancement first -- see #14228.
 #[cfg(feature = "adbc")]
 mod federation;
 pub mod glue;

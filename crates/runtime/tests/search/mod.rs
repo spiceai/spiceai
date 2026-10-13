@@ -465,15 +465,12 @@ async fn test_megascience_permutations(
     let _es_container;
     let es_endpoint: String;
     if matches!(text_engine, TextEngineOptions::Elasticsearch) {
-        // Pick a random high port to avoid collisions with other parallel test runs.
-        let port = {
-            use rand::RngExt;
-            let mut rng = rand::rng();
-            rng.random_range(19200_u16..19300_u16)
-        };
-        let container = elasticsearch::start_elasticsearch_docker_container(port)
+        let container = elasticsearch::start_elasticsearch_docker_container()
             .await
             .expect("failed to start Elasticsearch Docker container");
+        let port = container
+            .host_port(9200)
+            .expect("Elasticsearch container must publish TCP port 9200");
         es_endpoint = elasticsearch::elasticsearch_endpoint(port);
         _es_container = Some(container);
     } else {

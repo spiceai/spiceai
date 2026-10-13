@@ -27,7 +27,8 @@ use crate::opentelemetry::create_metrics_service;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
-use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
+use arrow::error::ArrowError;
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
@@ -38,7 +39,10 @@ use arrow_flight::{
 };
 use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 use bytes::Bytes;
-use cache::result::{CacheStatus, query::QueryResult};
+use cache::result::{
+    CacheStatus,
+    query::{QueryResult, QueryResultSource, SendableCachedRawStream},
+};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -82,6 +86,7 @@ mod handshake;
 pub(crate) mod metrics;
 pub mod middleware;
 mod mtls;
+pub mod server_timing;
 mod session;
 pub(crate) mod session_auth;
 mod traced_ticket;
@@ -93,7 +98,7 @@ pub use session::SessionStore;
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
 /// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
-pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
+pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive};
 
 pub struct Service {
     data_update_broadcaster: DataUpdateBroadcaster,
@@ -233,8 +238,10 @@ impl Service {
             .read_only(read_only)
             .build();
 
-        let (dataset_schema, parameter_schema) =
-            query.get_schema().await.map_err(handle_datafusion_error)?;
+        let (dataset_schema, parameter_schema) = query
+            .get_schema()
+            .await
+            .map_err(|e| handle_datafusion_error(&e))?;
 
         // The logical plan may report Utf8View/BinaryView, but the physical
         // execution (with `expand_views_at_output = true`) will produce
@@ -332,7 +339,15 @@ impl Service {
     ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages.
         let options = ipc_write_options;
-        let raw_schema = query_result.data.schema();
+        let cache_status = query_result.cache_status;
+        let (raw_schema, data_stream) = match query_result.into_source() {
+            QueryResultSource::CachedRaw { data, schema, .. } => {
+                (schema, FlightBatchStream::Shared(data))
+            }
+            QueryResultSource::Stream { data, .. } => {
+                (data.schema(), FlightBatchStream::Owned(data))
+            }
+        };
 
         let needs_view_cast = raw_schema
             .fields()
@@ -349,7 +364,7 @@ impl Service {
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
-        let compression_context = CompressionContext::default();
+        let compression_context = IpcWriteContext::default();
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
@@ -366,8 +381,6 @@ impl Service {
             ..Default::default()
         };
 
-        let cache_status = query_result.cache_status;
-
         // The schema is ready immediately. Batches are encoded as the Flight
         // response is polled so a ready result is never drained through `None`
         // at construction — that poll is what finishes query telemetry.
@@ -378,7 +391,7 @@ impl Service {
         account.reserve_now(flight_data_size(&schema_flight_data));
         let stream = InlineFlightStream {
             pending: VecDeque::from([Ok(schema_flight_data)]),
-            data_stream: Some(query_result.data),
+            data_stream: Some(data_stream),
             spawned: None,
             taken_bytes: 0,
             taken_batches: 0,
@@ -448,9 +461,50 @@ struct FlightEncodeArgs {
     encoder: IpcDataGenerator,
     dict_tracker: DictionaryTracker,
     options: IpcWriteOptions,
-    compression_context: CompressionContext,
+    compression_context: IpcWriteContext,
     cpu_runtime: Option<Handle>,
     request_context: Arc<RequestContext>,
+}
+
+enum ServedFlightBatch {
+    Owned(RecordBatch),
+    Shared(Arc<RecordBatch>),
+}
+
+impl ServedFlightBatch {
+    fn as_record_batch(&self) -> &RecordBatch {
+        match self {
+            Self::Owned(batch) => batch,
+            Self::Shared(batch) => batch,
+        }
+    }
+
+    fn array_memory_size(&self) -> usize {
+        self.as_record_batch().get_array_memory_size()
+    }
+}
+
+enum FlightBatchStream {
+    Owned(datafusion::execution::SendableRecordBatchStream),
+    Shared(SendableCachedRawStream),
+}
+
+impl Stream for FlightBatchStream {
+    type Item = Result<ServedFlightBatch, DataFusionError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Owned(stream) => Pin::new(stream)
+                .poll_next(cx)
+                .map(|item| item.map(|result| result.map(ServedFlightBatch::Owned))),
+            Self::Shared(stream) => Pin::new(stream)
+                .poll_next(cx)
+                .map(|item| item.map(|result| result.map(ServedFlightBatch::Shared))),
+        }
+    }
 }
 
 /// Flight response that encodes ready batches on the request task as the
@@ -464,7 +518,7 @@ struct FlightEncodeArgs {
 /// encode path, including when this stream falls back to it.
 struct InlineFlightStream {
     pending: VecDeque<Result<FlightData, Status>>,
-    data_stream: Option<datafusion::execution::SendableRecordBatchStream>,
+    data_stream: Option<FlightBatchStream>,
     spawned: Option<FlightEncodeStream>,
     taken_bytes: usize,
     taken_batches: usize,
@@ -486,7 +540,7 @@ impl InlineFlightStream {
         Some(message)
     }
 
-    fn spawn_remaining(&mut self, prepend: Option<RecordBatch>) -> Result<(), Status> {
+    fn spawn_remaining(&mut self, prepend: Option<ServedFlightBatch>) -> Result<(), Status> {
         let Some(data_stream) = self.data_stream.take() else {
             return Err(Status::internal(
                 "Flight encode has no remaining record-batch stream to spawn",
@@ -538,7 +592,7 @@ impl Stream for InlineFlightStream {
             };
             match Pin::new(data_stream).poll_next(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
-                    this.taken_bytes += batch.get_array_memory_size();
+                    this.taken_bytes += batch.array_memory_size();
                     this.taken_batches += 1;
                     if inline_encode_budget_exhausted(this.taken_bytes, this.taken_batches) {
                         if let Err(status) = this.spawn_remaining(Some(batch)) {
@@ -578,7 +632,7 @@ impl Stream for InlineFlightStream {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.data_stream = None;
-                    return Poll::Ready(Some(Err(handle_datafusion_error(find_datafusion_root(
+                    return Poll::Ready(Some(Err(handle_datafusion_error(&find_datafusion_root(
                         e,
                     )))));
                 }
@@ -616,7 +670,7 @@ impl Stream for InlineFlightStream {
 /// dedicated CPU runtime that overlap is free; on the shared IO-runtime
 /// fallback the spawn costs one scheduling hop before the first byte.
 fn spawn_flight_encode_stream(
-    data_stream: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    data_stream: BoxStream<'static, Result<ServedFlightBatch, DataFusionError>>,
     args: FlightEncodeArgs,
     account: Arc<EgressAccount>,
 ) -> FlightEncodeStream {
@@ -674,7 +728,7 @@ fn spawn_flight_encode_stream(
                     },
                     Err(e) => {
                         let e = find_datafusion_root(e);
-                        let _ = tx.send(Err(handle_datafusion_error(e))).await;
+                        let _ = tx.send(Err(handle_datafusion_error(&e))).await;
                         return;
                     }
                 }
@@ -691,28 +745,37 @@ fn spawn_flight_encode_stream(
     }
 }
 
-/// Encode one [`RecordBatch`] into its Flight dictionary + record-batch
+/// Encode one served batch into its Flight dictionary + record-batch
 /// messages, applying the `Utf8View`/`BinaryView` → `Large*` cast when the
 /// advertised schema was expanded.
+///
+/// [`ServedFlightBatch::Owned`] is moved into the cast so a non-cache Flight
+/// query does not pay `RecordBatch::clone` before `cast_view_columns`.
+/// [`ServedFlightBatch::Shared`] clones only when that cast is required.
 fn encode_flight_batch(
-    batch: RecordBatch,
+    batch: ServedFlightBatch,
     needs_view_cast: bool,
     schema: &Arc<Schema>,
     encoder: &IpcDataGenerator,
     dict_tracker: &mut DictionaryTracker,
     options: &IpcWriteOptions,
-    compression_context: &mut CompressionContext,
+    compression_context: &mut IpcWriteContext,
 ) -> Result<(Vec<FlightData>, FlightData), Status> {
-    // Cast view columns to match the expanded schema we advertised.
+    let cast;
     let batch = if needs_view_cast {
-        arrow_tools::schema::cast_view_columns(batch, schema)
-            .map_err(|e| Status::internal(e.to_string()))?
+        let owned = match batch {
+            ServedFlightBatch::Owned(batch) => batch,
+            ServedFlightBatch::Shared(batch) => RecordBatch::clone(batch.as_ref()),
+        };
+        cast = arrow_tools::schema::cast_view_columns(owned, schema)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        &cast
     } else {
-        batch
+        batch.as_record_batch()
     };
 
     let (dicts, batch_data) = encoder
-        .encode(&batch, dict_tracker, options, compression_context)
+        .encode(batch, dict_tracker, options, compression_context)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     Ok((
@@ -889,7 +952,7 @@ where
 fn handle_query_error(e: query::Error) -> Status {
     match e {
         query::Error::BindingParameters { source }
-        | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(&source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
         _ => to_tonic_err(e),
@@ -903,7 +966,7 @@ pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Sta
     use query::TransactionError;
     match error {
         TransactionError::Rejected(message) => Status::invalid_argument(message),
-        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(e),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(&e),
         TransactionError::Query(e) => handle_query_error(e),
         TransactionError::Conflict { table } => Status::aborted(format!(
             "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
@@ -914,18 +977,20 @@ pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Sta
     }
 }
 
-pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
-    if query::is_cancellation_error(&e) {
+/// A failure caused by the query or by the values it computes is a client error;
+/// `Internal` is kept for failures of the runtime itself.
+pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
+    if query::is_cancellation_error(e) {
         return Status::cancelled(e.to_string());
     }
-    if query::is_timeout_error(&e) {
+    if query::is_timeout_error(e) {
         return Status::deadline_exceeded(e.to_string());
     }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
         }
-        DataFusionError::SQL(sql_err, _) => match *sql_err {
+        DataFusionError::SQL(sql_err, _) => match sql_err.as_ref() {
             ParserError::RecursionLimitExceeded => {
                 Status::invalid_argument("Recursion limit exceeded")
             }
@@ -953,37 +1018,37 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
                         error.metadata_mut().insert("spiceai-retryable", 1.into());
                         error
                     }
-                    _ => to_tonic_err(e),
+                    _ => Status::internal(e.to_string()),
                 }
             } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
                 match err {
                     llms::embeddings::Error::RateLimited { .. } => {
                         Status::unavailable(err.to_string())
                     }
-                    _ => to_tonic_err(e),
+                    _ => Status::internal(e.to_string()),
                 }
             } else {
-                to_tonic_err(e)
+                Status::internal(e.to_string())
             }
         }
         DataFusionError::ResourcesExhausted(source) => Status::resource_exhausted(source),
         DataFusionError::Diagnostic(_, source) | DataFusionError::Context(_, source) => {
-            handle_datafusion_error(*source)
+            handle_datafusion_error(source)
         }
-        DataFusionError::Shared(source) => {
-            // Optimize: avoid string allocation for common case
-            Status::internal(format!("Shared DataFusion error: {source}"))
-        }
-        DataFusionError::Collection(sources) => {
-            // Handle first error efficiently without collecting all
-            if let Some(first_error) = sources.into_iter().next() {
-                handle_datafusion_error(first_error)
-            } else {
+        // `RepartitionExec` and joins share one input failure with every consuming
+        // partition, so the wrapped error decides the status.
+        DataFusionError::Shared(source) => handle_datafusion_error(source),
+        DataFusionError::Collection(sources) => match sources.first() {
+            Some(first_error) => handle_datafusion_error(first_error),
+            None => {
                 Status::internal("Several DataFusion errors occurred, but no details available")
             }
-        }
+        },
         DataFusionError::NotImplemented(message) => {
             Status::invalid_argument(format!("Unsupported Query. {message}"))
+        }
+        DataFusionError::ArrowError(source, _) if is_query_arrow_error(source) => {
+            Status::invalid_argument(source.to_string())
         }
         DataFusionError::Internal(_)
         | DataFusionError::ArrowError(..)
@@ -993,14 +1058,31 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
         | DataFusionError::Substrait(_)
         | DataFusionError::Configuration(_)
         | DataFusionError::Ffi(_)
-        | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
+        | DataFusionError::ExecutionJoin(_) => Status::internal(e.to_string()),
     }
+}
+
+/// Whether a compute kernel rejected the values the query asked it to compute — a
+/// cast the data cannot satisfy, a division by zero, an overflow, an unparsable
+/// string — rather than failing on runtime state.
+fn is_query_arrow_error(e: &ArrowError) -> bool {
+    matches!(
+        e,
+        ArrowError::CastError(_)
+            | ArrowError::DivideByZero
+            | ArrowError::ArithmeticOverflow(_)
+            | ArrowError::ParseError(_)
+    )
 }
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to register parquet file: {source}"))]
-    RegisterParquet { source: crate::datafusion::Error },
+    RegisterParquet {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(crate::datafusion::Error, Box::new)))]
+        source: Box<crate::datafusion::Error>,
+    },
 
     #[snafu(display("{source}"))]
     DataFusion {
@@ -1322,6 +1404,28 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let (response, _) = Service::query_result_to_flight_stream(
             QueryResult::new(data, CacheStatus::CacheHit),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+        response
+    }
+
+    /// Same as [`respond`], but the batches arrive as a Raw cache hit.
+    fn respond_cached_raw(
+        schema: &SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> BoxStream<'static, Result<FlightData, Status>> {
+        use cache::result::query::wrap_raw_batches;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(batches),
+                Arc::clone(schema),
+                CacheStatus::CacheHit,
+            ),
             IpcWriteOptions::default(),
             None,
             &pool,
@@ -1845,5 +1949,183 @@ mod tests {
         assert!(error.is_none(), "{error:?}");
         assert!(!messages.is_empty());
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A Raw cache hit must produce the same Flight messages as the owned
+    /// stream for the success cases the encode path already covers.
+    #[tokio::test]
+    async fn cached_raw_flight_sends_what_the_owned_stream_sends() {
+        let plain: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let views: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            true,
+        )]));
+        let dictionary: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "vendor",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rows = |ids: Vec<Option<i64>>, names: Vec<Option<&str>>| {
+            batch(
+                &plain,
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                ],
+            )
+        };
+
+        let cases: Vec<(&str, &SchemaRef, Vec<RecordBatch>)> = vec![
+            (
+                "several batches, one empty, with NULLs",
+                &plain,
+                vec![
+                    rows(vec![Some(1), None], vec![Some("a"), None]),
+                    rows(vec![], vec![]),
+                    rows(vec![Some(3)], vec![Some("c")]),
+                ],
+            ),
+            ("an empty result", &plain, vec![]),
+            (
+                "view columns cast to the advertised types",
+                &views,
+                vec![batch(
+                    &views,
+                    vec![Arc::new(StringViewArray::from(vec![
+                        Some("x"),
+                        None,
+                        Some("a string longer than twelve bytes"),
+                    ])) as ArrayRef],
+                )],
+            ),
+            (
+                "a dictionary column",
+                &dictionary,
+                vec![batch(
+                    &dictionary,
+                    vec![Arc::new(DictionaryArray::<Int32Type>::from_iter([
+                        Some("alpha"),
+                        None,
+                        Some("alpha"),
+                        Some("bravo"),
+                    ])) as ArrayRef],
+                )],
+            ),
+        ];
+
+        for (case, schema, batches) in cases {
+            let owned_items: Vec<Result<RecordBatch, DataFusionError>> =
+                batches.iter().cloned().map(Ok).collect();
+            let owned = sent(respond(schema, owned_items, true)).await;
+            let cached = sent(respond_cached_raw(schema, batches)).await;
+            assert!(!owned.0.is_empty(), "{case}: the schema is always sent");
+            assert_eq!(owned, cached, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_raw_inline_flight_charges_queued_messages_against_the_memory_pool() {
+        use cache::result::query::wrap_raw_batches;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let batches = vec![batch(
+            &schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef],
+        )];
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024));
+        let (response, _) = Service::query_result_to_flight_stream(
+            QueryResult::from_cached_raw(
+                wrap_raw_batches(batches),
+                Arc::clone(&schema),
+                CacheStatus::CacheHit,
+            ),
+            IpcWriteOptions::default(),
+            None,
+            &pool,
+            Arc::new(RequestContext::builder(Protocol::FlightSQL).build()),
+        );
+
+        assert!(
+            pool.reserved() > 0,
+            "the schema queued at construction must be charged against runtime.query.memory_limit"
+        );
+
+        let (messages, error) = sent(response).await;
+        assert!(
+            error.is_none(),
+            "the cached-raw result must encode: {error:?}"
+        );
+        assert!(
+            messages.len() >= 2,
+            "schema plus at least one batch must be sent"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "every queued FlightData reservation must be released once the response is consumed"
+        );
+    }
+
+    /// A failure `RepartitionExec` shared with its output partitions keeps the status
+    /// of the failure it wraps: an HTTP origin's 404 is the query's problem, a
+    /// runtime bug stays a runtime bug.
+    #[test]
+    fn a_shared_failure_takes_the_status_of_its_cause() {
+        let origin_404 =
+            "Failed to fetch http://127.0.0.1 for dataset 'origin': the origin answered 404";
+        let status = handle_datafusion_error(&DataFusionError::Shared(Arc::new(
+            DataFusionError::Plan(origin_404.to_string()),
+        )));
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::InvalidArgument, origin_404)
+        );
+
+        let status = handle_datafusion_error(&DataFusionError::Shared(Arc::new(
+            DataFusionError::Internal("bug".to_string()),
+        )));
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.message().starts_with("Internal error: bug"),
+            "{}",
+            status.message()
+        );
+    }
+
+    /// Only an Arrow failure on the values the query computes is the client's; one
+    /// raised by the runtime's own buffers stays `Internal`.
+    #[test]
+    fn arrow_failures_outside_the_computed_values_stay_internal() {
+        let status = handle_datafusion_error(&DataFusionError::ArrowError(
+            Box::new(ArrowError::ArithmeticOverflow(
+                "Overflow happened on: 9223372036854775807 + 1".to_string(),
+            )),
+            None,
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                tonic::Code::InvalidArgument,
+                "Arithmetic overflow: Overflow happened on: 9223372036854775807 + 1"
+            )
+        );
+
+        let status = handle_datafusion_error(&DataFusionError::ArrowError(
+            Box::new(ArrowError::MemoryError("buffer too small".to_string())),
+            None,
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                tonic::Code::Internal,
+                "Arrow error: Memory error: buffer too small"
+            )
+        );
     }
 }

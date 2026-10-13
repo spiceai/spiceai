@@ -28,6 +28,15 @@
 # the convergence binaries must keep `retries = 0` (so a real failure is never
 # retried into a pass) *and* keep an explicit ceiling (so a timeout is not a hard
 # gate failure).
+#
+# A third coupling crosses files. A binary that runs as its own workflow step
+# has that step's `timeout-minutes` as a hard outer bound, and a retry budget
+# the step cannot hold is spent without ever reporting: the step times out
+# mid-attempt and the failure names the action rather than the test. That is
+# #13512 — `retention_oom` inherited six attempts at 360s, 36 minutes, inside a
+# 20-minute step, and the step timed out fourteen times in the merge queue. For
+# each binary in STEP_BUDGETS this guard reads the step's bound out of the
+# workflow and requires `(retries + 1) x ceiling + startup` to fit inside it.
 """Validate the repository's nextest slow-timeout ceilings against measured runtimes."""
 
 from __future__ import annotations
@@ -38,19 +47,28 @@ import sys
 import tomllib
 from pathlib import Path
 
-# Slowest observed duration for each long-running test binary on a QUIET pool.
+# Slowest observed duration for each long-running test set on a QUIET pool.
 #
 # Source: `Remote Sign-off` run 30833882620 (trunk @ 7b98c234), which ran with no
-# other sign-off in flight. Value is the slowest single test in that binary.
+# other sign-off in flight. Value is the slowest single test in that set.
+#
+# A key is either a binary name, matched by a `binary(=name)` filter term, or
+# `package::binary::module` for one module of a test binary that holds many,
+# matched by a `(binary_id(=package::binary) & test(/^module::/))` term. Cayenne's
+# integration tests are modules of its single `integration` binary.
 QUIET_BASELINE_SECONDS = {
-    "mutation_property_test": 239.5,  # prop_concurrent_mixed_position_sqlite
-    "partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
-    "layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
-    "mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_sqlite
+    "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position_sqlite
+    "cayenne::integration::partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
+    "cayenne::integration::layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
+    "cayenne::integration::mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_sqlite
     # tpcds_and_clickbench_parity_vs_duckdb, measured with fixtures already on
     # disk. CI regenerates them with `dsdgen` on every fresh runner, so the
     # baseline is rounded up from the observed 127.7s to cover that.
-    "result_correctness_vs_duckdb_test": 180.0,
+    "cayenne::integration::result_correctness_vs_duckdb_test": 180.0,
+    # tpcds_full_result_parity_vs_sqlite at SF 0.1: 166.9s locally with the
+    # fixture on disk, plus the 25.4s `tpcdsgen` takes to write it on a fresh
+    # runner, rounded up.
+    "cayenne::integration::result_correctness_vs_sqlite_test": 200.0,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
@@ -58,7 +76,7 @@ QUIET_BASELINE_SECONDS = {
 # Source: sign-off run 31239284344, where
 # `mutation_property_test prop_concurrent_upsert_only_key_sqlite` passed at
 # 422.1s against a 92.0s quiet baseline in run 30833882620. Contention on this
-# pool is shared-machine CPU starvation, so it applies to any binary here.
+# pool is shared-machine CPU starvation, so it applies to any test set here.
 CONTENTION_FACTOR = 4.6
 
 # Multiplier applied on top of `CONTENTION_FACTOR` when sizing a ceiling.
@@ -73,21 +91,38 @@ CONTENTION_FACTOR = 4.6
 # cost.
 CONTENTION_HEADROOM = 1.25
 
-# Binaries whose failures must never be retried: they assert that the accelerated
+# Test sets whose failures must never be retried: they assert that the accelerated
 # table converges to a reference model, so a retry that happens to pass hides a
 # real race rather than working around flakiness. Each must ALSO carry its own
 # `slow-timeout` — with `retries = 0`, the ceiling is the difference between a
 # recoverable timeout and a hard merge-queue failure.
 ZERO_RETRY_BINARIES = frozenset(
     {
-        "mutation_property_test",
-        "cdc_compaction_delete_race_test",
-        "maintained_aggregate_filter_test",
+        "cayenne::integration::mutation_property_test",
+        "cayenne::integration::cdc_compaction_delete_race_test",
+        "cayenne::integration::maintained_aggregate_filter_test",
         # Engine-vs-engine parity: a mismatch is deterministic, so a retry buys
-        # nothing but five more runs of a ~250s binary before the same failure.
-        "result_correctness_vs_duckdb_test",
+        # nothing but repeated runs of ~250s of tests before the same failure.
+        "cayenne::integration::result_correctness_vs_duckdb_test",
+        "cayenne::integration::result_correctness_vs_sqlite_test",
     }
 )
+
+# Binaries that run as their own workflow step, with the workflow (relative to
+# the repository root) and the step's `name:`. The guard requires the binary's
+# worst-case wall clock — every attempt killed at the ceiling — to fit inside
+# that step's `timeout-minutes`, or the step reports no verdict at all.
+STEP_BUDGETS = {
+    "retention_oom": (".github/workflows/integration.yml", "Run retention OOM regression test"),
+}
+
+# What nextest spends inside the step before the first attempt starts —
+# extracting the archive and listing the binary. Measured at 3.2 minutes on the
+# `Run retention OOM regression test` step of run 34948795744 (job
+# 104347595558: step started 11:07:51Z, attempt 1 started 11:11:04Z), rounded
+# up. The per-attempt backoff (2s to 30s) and the kill grace period are small
+# against this and are covered by the same rounding.
+STEP_STARTUP_SECONDS = 240
 
 # The global ceiling every other test gets. Pinned so that a future timeout is
 # not "fixed" by raising this: it applies to the whole workspace and would hide
@@ -97,11 +132,17 @@ EXPECTED_GLOBAL_SLOW_TIMEOUT = {"period": "120s", "terminate-after": 3}
 _DURATION = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>ms|s|m|h)$")
 _UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
-# The only binary-filter spelling this guard resolves. `binary(~x)`, `binary(/re/)`
-# and `binary-id(...)` would each need different matching, so they are rejected
-# rather than silently treated as non-matching.
+# The only binary-filter spellings this guard resolves: `binary(=name)` for a
+# whole binary, and the parenthesized conjunction below for one module of a
+# binary. `binary(~x)`, `binary(/re/)`, `binary-id(...)` and any other `&`
+# conjunction would each need different matching, so they are rejected rather
+# than silently treated as non-matching.
 _BINARY_EQ_TERM = re.compile(r"binary\(=([A-Za-z0-9_]+)\)")
-_OTHER_BINARY_TERM = re.compile(r"binary(?:-id)?\((?!=[A-Za-z0-9_]+\))")
+_MODULE_TERM = re.compile(
+    r"\(\s*binary_id\(=([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)"
+    r"\s*&\s*test\(/\^([A-Za-z0-9_]+)::/\)\s*\)"
+)
+_OTHER_BINARY_TERM = re.compile(r"binary(?:-id|_id)?\((?!=[A-Za-z0-9_]+\))")
 
 
 def parse_duration(text: str) -> float:
@@ -139,22 +180,117 @@ def ceiling_seconds(slow_timeout: object) -> float | None:
     return parse_duration(period) * terminate_after
 
 
-def binaries_matched(filter_expr: str) -> set[str]:
-    """Return the binaries a filter expression matches by exact name.
+def retry_count(retries: object) -> int:
+    """Return the number of retries a `retries` value configures.
 
-    Only `binary(=name)` terms are understood. A filter selecting tests by name
-    (for example `test(=mysql::…)`) matches no binary here, which is correct: it
-    cannot be resolved to a binary without knowing that binary's test names.
+    nextest accepts a bare count or a table with a `count` key; absent means
+    zero. Anything else is a config problem, reported like the others here.
     """
-    if _OTHER_BINARY_TERM.search(filter_expr):
+    if retries is None:
+        return 0
+    if isinstance(retries, bool):
+        raise ValueError(f"retries is a boolean, not a count: {retries!r}")
+    if isinstance(retries, dict):
+        count = retries.get("count")
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise ValueError(f"retries table has a non-integer count: {retries!r}")
+    elif isinstance(retries, int):
+        count = retries
+    else:
+        raise ValueError(f"unexpected retries value: {retries!r}")
+    if count < 0:
+        # A negative count would make the budget arithmetic below vanish
+        # rather than fail, so it is refused like any other malformed value.
+        raise ValueError(f"retries count is negative: {retries!r}")
+    return count
+
+
+# A workflow step's `- name: <step>` line, then its `timeout-minutes: N` among
+# the step's own keys. Read with a scan rather than a YAML parser so the guard
+# needs nothing beyond the standard library, the same reason it reads TOML with
+# `tomllib`; the two lines it needs are fixed-form in the files it reads.
+def step_timeout_minutes(workflow_text: str, step_name: str) -> int | None:
+    """Return the `timeout-minutes` of the named step, or `None` if it has none.
+
+    The step's keys are the lines indented exactly one level deeper than its
+    `- name:` line; the scan stops at the first non-blank line indented no
+    deeper than that line, which is the next step, the next job key, or the
+    next job — whether or not it starts with `- name:`. A `timeout-minutes`
+    nested deeper (a `with:` input, say) is not the step's bound.
+
+    Raises `ValueError` when the step is not in the workflow at all, so a
+    renamed step is a config problem rather than a silently unguarded budget,
+    and when it appears more than once, since the two could carry different
+    bounds and the guard cannot tell which one runs the binary.
+    """
+    lines = workflow_text.splitlines()
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(rf"^\s*-\s+name:\s*{re.escape(step_name)}\s*$", line)
+    ]
+    if not matches:
+        raise ValueError(f"step {step_name!r} not found in the workflow")
+    if len(matches) > 1:
+        raise ValueError(
+            f"step {step_name!r} appears {len(matches)} times in the workflow; "
+            "the guard needs the name to identify one step"
+        )
+    (index,) = matches
+    step_line = lines[index]
+    step_indent = len(step_line) - len(step_line.lstrip())
+    # The step's keys sit under the `- ` list marker: two columns in.
+    key_indent = step_indent + 2
+    for later in lines[index + 1 :]:
+        if not later.strip():
+            continue
+        later_indent = len(later) - len(later.lstrip())
+        if later_indent <= step_indent:
+            break
+        match = re.match(r"^\s*timeout-minutes:\s*(\d+)\s*$", later)
+        if match and later_indent == key_indent:
+            return int(match.group(1))
+    return None
+
+
+def selectors_matched(filter_expr: str) -> set[str]:
+    """Return the test-set keys a filter expression matches exactly.
+
+    A `binary(=name)` term yields `name`; a
+    `(binary_id(=p::b) & test(/^module::/))` term yields `p::b::module`.
+    A filter selecting tests by name alone (for example `test(=mysql::…)`)
+    matches nothing here, which is correct: it cannot be resolved to a test set
+    without knowing every binary's test names.
+    """
+    selectors = {
+        f"{package}::{binary}::{module}"
+        for package, binary, module in _MODULE_TERM.findall(filter_expr)
+    }
+    rest = _MODULE_TERM.sub("", filter_expr)
+    if _OTHER_BINARY_TERM.search(rest) or (
+        "&" in rest and _BINARY_EQ_TERM.search(rest)
+    ):
         raise ValueError(
             f"unsupported binary filter spelling, cannot resolve a ceiling: {filter_expr!r}"
         )
-    return set(_BINARY_EQ_TERM.findall(filter_expr))
+    return selectors | set(_BINARY_EQ_TERM.findall(rest))
+
+
+def selected(key: str, filter_expr: str) -> bool:
+    """Return whether the filter expression selects the test set `key`.
+
+    A `package::binary::module` key is also selected by a `binary(=binary)` term,
+    which selects every module of that binary, as nextest applies it.
+    """
+    selectors = selectors_matched(filter_expr)
+    if key in selectors:
+        return True
+    parts = key.split("::")
+    return len(parts) == 3 and parts[1] in selectors
 
 
 def resolve(config: dict, binary: str, setting: str) -> object | None:
-    """Resolve `setting` for `binary` the way nextest does.
+    """Resolve `setting` for the test set `binary` the way nextest does.
 
     nextest evaluates precedence per setting: the first override that matches and
     configures that setting wins, and the profile default applies if none do.
@@ -163,15 +299,22 @@ def resolve(config: dict, binary: str, setting: str) -> object | None:
     for override in profile.get("overrides", []):
         if setting not in override:
             continue
-        if binary in binaries_matched(override.get("filter", "")):
+        if selected(binary, override.get("filter", "")):
             return override[setting]
     return profile.get(setting)
 
 
-def check_config(config_path: Path) -> list[str]:
-    """Return a list of problems with the nextest config at `config_path`."""
+def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
+    """Return a list of problems with the nextest config at `config_path`.
+
+    `repo_root` is where the workflows in STEP_BUDGETS are read from; it
+    defaults to the parent of the config's own directory, which is the
+    repository root for `.config/nextest.toml`.
+    """
     if not config_path.is_file():
         return [f"{config_path}: not found"]
+    if repo_root is None:
+        repo_root = config_path.resolve().parent.parent
     try:
         # utf-8-sig so a stray BOM reports as a config problem, not a crash.
         config = tomllib.loads(config_path.read_text(encoding="utf-8-sig"))
@@ -184,7 +327,7 @@ def check_config(config_path: Path) -> list[str]:
     profile = config.get("profile", {}).get("default", {})
     try:
         for override in profile.get("overrides", []):
-            binaries_matched(override.get("filter", ""))
+            selectors_matched(override.get("filter", ""))
     except ValueError as exc:
         # Every check below resolves settings per binary, so an unresolvable
         # filter would make the rest of this run meaningless rather than merely
@@ -247,13 +390,49 @@ def check_config(config_path: Path) -> list[str]:
                 "infrastructure failure rather than a test one. Set terminate-after."
             )
 
+    for binary, (workflow, step) in sorted(STEP_BUDGETS.items()):
+        workflow_path = repo_root / workflow
+        try:
+            budget = step_timeout_minutes(
+                workflow_path.read_text(encoding="utf-8-sig"), step
+            )
+            attempts = retry_count(resolve(config, binary, "retries")) + 1
+            ceiling = ceiling_seconds(resolve(config, binary, "slow-timeout"))
+        except (OSError, ValueError) as exc:
+            problems.append(f"{name}: {binary}: {workflow}: {exc}")
+            continue
+        if budget is None:
+            problems.append(
+                f"{name}: {binary} runs as the step {step!r} in {workflow}, which has no "
+                "timeout-minutes. Give the step a bound: without one the job's own bound "
+                "is what ends a hung attempt, and the failure names the job."
+            )
+            continue
+        if ceiling is None:
+            problems.append(
+                f"{name}: {binary} runs as the step {step!r} in {workflow} "
+                f"({budget} min) but has no slow-timeout ceiling, so a hung attempt "
+                "runs until the step kills it and no attempt after it is ever reported."
+            )
+            continue
+        worst = attempts * ceiling + STEP_STARTUP_SECONDS
+        if worst > budget * 60:
+            problems.append(
+                f"{name}: {binary} can spend {worst:.0f}s — {attempts} attempt(s) x "
+                f"{ceiling:.0f}s plus {STEP_STARTUP_SECONDS}s of nextest startup — but the "
+                f"step {step!r} in {workflow} is bounded at {budget} min ({budget * 60}s). "
+                "A run that needs every attempt times out mid-attempt with no verdict and "
+                "the failure names the action, not the test. Lower the retries or the "
+                "ceiling in nextest.toml, or raise the step's timeout-minutes. See #13512."
+            )
+
     return problems
 
 
 def has_override_setting(config: dict, binary: str, setting: str) -> bool:
     """Return whether an override — not the profile default — supplies `setting`."""
     return any(
-        setting in override and binary in binaries_matched(override.get("filter", ""))
+        setting in override and selected(binary, override.get("filter", ""))
         for override in config.get("profile", {}).get("default", {}).get("overrides", [])
     )
 
@@ -266,9 +445,16 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(__file__).resolve().parents[2] / ".config" / "nextest.toml",
         help="path to nextest.toml (default: the repository's .config/nextest.toml)",
     )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="repository root the STEP_BUDGETS workflows are read from "
+        "(default: the parent of the config's directory)",
+    )
     args = parser.parse_args(argv)
 
-    problems = check_config(args.config)
+    problems = check_config(args.config, args.repo_root)
     if problems:
         print(f"FAIL: {len(problems)} problem(s) in {args.config}:", file=sys.stderr)
         for problem in problems:
@@ -277,8 +463,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"OK: {args.config.name} keeps every measured binary's kill ceiling above "
-        f"its quiet baseline x {CONTENTION_FACTOR} x {CONTENTION_HEADROOM}, and the "
-        "convergence binaries keep retries = 0 with an explicit ceiling"
+        f"its quiet baseline x {CONTENTION_FACTOR} x {CONTENTION_HEADROOM}, the "
+        "convergence binaries keep retries = 0 with an explicit ceiling, and every "
+        "binary that runs as its own workflow step fits its retry budget inside "
+        "that step's bound"
     )
     return 0
 

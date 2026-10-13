@@ -420,7 +420,7 @@ fn append_value_to_builder(
                     )),
                 })?;
             match value {
-                Some(AttributeValue::S(s)) => {
+                Some(AttributeValue::S(s)) if crate::filter::fits_layout(s, time_format) => {
                     if let Some(ts) = parse_datetime(s, time_format) {
                         match ts {
                             ParsedDateTime::Naive(ts) => {
@@ -465,10 +465,23 @@ fn append_value_to_builder(
     Ok(())
 }
 
+/// Whether `s` is written `YYYY-MM-DD`, digit for digit. chrono also reads a
+/// field padded with a space, such as `2024- 1-01`, which sorts apart from the
+/// date it names and so from the strings a pushed-down comparison selects.
+fn is_yyyy_mm_dd(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
 fn parse_date_yyyy_mm_dd(s: &str) -> Option<i32> {
-    // Parse YYYY-MM-DD format
-    if s.len() == 10
-        && s.chars().filter(|c| *c == '-').count() == 2
+    if is_yyyy_mm_dd(s)
         && let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
     {
         // Convert to days since Unix epoch (1970-01-01)
@@ -1088,6 +1101,34 @@ mod tests {
             .expect("array");
         assert!(!date_array.is_null(0));
         // Value would depend on parse_date_yyyy_mm_dd implementation
+    }
+
+    #[test]
+    fn a_date_is_read_only_when_written_digit_for_digit() {
+        // chrono also reads a space-padded field, which sorts apart from the
+        // canonical string a pushed-down comparison is written against.
+        let schema = create_test_schema(vec![Field::new("d", DataType::Date32, true)]);
+        let items: Vec<_> = [
+            "2024-01-15",
+            "2024- 1-15",
+            "2024-01- 5",
+            "2024-1-15",
+            "2024-13-01",
+        ]
+        .iter()
+        .map(|d| HashMap::from([("d".to_string(), AttributeValue::S((*d).to_string()))]))
+        .collect();
+        let result = dynamodb_items_to_arrow(&items, schema, "2006-01-02T15:04:05.000Z07:00")
+            .expect("record_batch");
+        let dates = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .expect("array");
+        assert_eq!(dates.value(0), 19_737);
+        for row in 1..items.len() {
+            assert!(dates.is_null(row), "row {row}");
+        }
     }
 
     #[test]

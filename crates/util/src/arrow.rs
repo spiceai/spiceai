@@ -155,8 +155,19 @@ mod tests {
     #[test]
     fn test_repeat_mismatched_lengths() {
         let arr: ArrayRef = Arc::new(StringArray::from(vec!["foo", "bar"]));
-        let repeats = vec![1, 2, 3];
-        let _ =
-            repeat(&arr, &repeats).expect_err("should error if lengths of inputs are mismatched");
+        // More repeats than values, and fewer. `take`'s bounds check would refuse only the
+        // first and silently truncate the second; the explicit length check refuses both.
+        for repeats in [vec![1, 2, 3], vec![2]] {
+            let err = repeat(&arr, &repeats)
+                .expect_err("should error if lengths of inputs are mismatched");
+            assert!(
+                matches!(
+                    &err,
+                    ArrowError::ComputeError(message)
+                        if message == "repeats.len() must equal arr.len()"
+                ),
+                "{repeats:?}: {err:?}"
+            );
+        }
     }
 }

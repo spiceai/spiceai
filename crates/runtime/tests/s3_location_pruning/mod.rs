@@ -65,15 +65,14 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     use std::time::Duration;
     use tracing::instrument;
 
-    const ENDPOINT_PORT: u16 = 19123;
     const TEST_BUCKET: &str = "data";
     const TEST_FILE_PATH: &str = "hive_partitioned_data/year=2023/month=4/day=1/data_3.parquet";
 
     #[instrument]
-    async fn start_rustfs_container() -> Result<RunningContainer<'static>, anyhow::Error> {
+    async fn start_rustfs_container() -> Result<RunningContainer, anyhow::Error> {
         let running_container = ContainerRunnerBuilder::new("spice_test_rustfs_location_pruning")
             .image("rustfs/rustfs:latest".to_string())
-            .add_port_binding(9000, ENDPOINT_PORT)
+            .publish_port(9000)
             .add_env_var("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
             .add_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)
             .command(["/data"])
@@ -155,7 +154,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     // Start the rustfs container
     let container = start_rustfs_container().await?;
 
-    let endpoint = format!("http://127.0.0.1:{ENDPOINT_PORT}");
+    let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
 
     // Setup test data using object_store crate
     if let Err(e) = setup_test_data(&endpoint).await {

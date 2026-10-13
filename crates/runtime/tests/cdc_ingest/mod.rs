@@ -76,6 +76,52 @@ fn cdc_orders_dataset() -> Dataset {
     dataset
 }
 
+/// `write_mode: acceleration` is refused with a change stream, including the one a
+/// `cdc:` source refreshes by when `refresh_mode` is omitted: the source's changes
+/// would overwrite writes kept only in the acceleration.
+#[tokio::test]
+async fn write_mode_acceleration_is_refused_with_a_default_change_stream() {
+    use runtime::status::ComponentStatus;
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let mut dataset = cdc_orders_dataset();
+            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                acceleration.refresh_mode = None;
+                acceleration.on_conflict = HashMap::new();
+                acceleration.write_mode = spicepod::acceleration::WriteMode::Acceleration;
+            }
+            let app = AppBuilder::new("cdc_write_mode_acceleration")
+                .with_dataset(dataset)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            // A refused dataset is retried, so loading never finishes: watch its status.
+            let load = tokio::spawn(Arc::clone(&rt).load_components());
+            let name = datafusion::common::TableReference::from("orders");
+            let refused = wait_until_true(Duration::from_secs(30), || async {
+                matches!(
+                    rt.status().get_dataset_statuses().get(&name),
+                    Some(ComponentStatus::Error(_))
+                )
+            })
+            .await;
+            let status = rt.status().get_dataset_statuses().get(&name).cloned();
+            assert!(refused, "the dataset should fail to load, got {status:?}");
+            let Some(ComponentStatus::Error(Some(message))) = status else {
+                panic!("expected an error message, got {status:?}");
+            };
+            assert!(
+                message.contains(
+                    "Dataset 'orders' sets `acceleration.write_mode: acceleration` and refreshes by `changes`"
+                ),
+                "{message}"
+            );
+            load.abort();
+        })
+        .await;
+}
+
 async fn start_http(rt: Arc<Runtime>) -> String {
     let http_listener =
         std::net::TcpListener::bind(SocketAddr::new(LOCALHOST, 0)).expect("bind http");

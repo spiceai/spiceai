@@ -310,7 +310,7 @@ tables:
     /// telemetry writer buys nothing, so the knob is not offered at all.
     #[test]
     fn runtime_block_rejects_on_delivery_error() {
-        yaml::from_str::<RuntimeDrasi>(
+        let err = yaml::from_str::<RuntimeDrasi>(
             r"
 source_id: spice-runtime
 on_delivery_error: block
@@ -319,6 +319,10 @@ tables:
 ",
         )
         .expect_err("on_delivery_error is not part of the runtime surface");
+        assert_eq!(
+            err.to_string(),
+            "unknown field `on_delivery_error`, expected one of `source_id`, `forwarding`, `tables`, `transport`, `params`"
+        );
     }
 
     /// Nothing is forwarded until a table is named.
@@ -448,7 +452,8 @@ delivery: queued
 
     #[test]
     fn source_id_is_required() {
-        yaml::from_str::<Drasi>("labels: [orders]")
+        let err = yaml::from_str::<Drasi>("labels: [orders]")
             .expect_err("source_id has no default and must be rejected when absent");
+        assert_eq!(err.to_string(), "missing field `source_id`");
     }
 }

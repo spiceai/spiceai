@@ -130,15 +130,19 @@ impl std::fmt::Display for OnSchemaChange {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ReadyState {
-    /// The table is ready once the initial load completes.
+    /// The table is ready once the initial load completes, or immediately when an existing
+    /// acceleration from a previous run can serve it.
     #[default]
     OnLoad,
-    /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
+    /// The table is ready immediately on registration. Until the initial load completes, queries
+    /// are served from an existing acceleration if there is one, and otherwise fall back to the
+    /// federated source.
     OnRegistration,
     /// The table is ready once the federated source's schema has been resolved (which also implies access
     /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
-    /// fall back to the federated source until the initial load completes. Subsequent refresh failures are
-    /// still reported via dataset status and metrics.
+    /// are served from an existing acceleration if there is one, and otherwise fall back to the federated
+    /// source until the initial load completes. Subsequent refresh failures are still reported via dataset
+    /// status and metrics.
     OnSchemaResolved,
 }
 
@@ -838,7 +842,14 @@ mod tests {
             time_format: invalid_format
         ";
         let result: Result<Dataset, _> = yaml::from_str(yaml);
-        result.expect_err("invalid time_format should fail to parse");
+        // The accepted values are listed by the custom `TimeFormat` deserializer, so
+        // they are pinned here exactly as a user sees them.
+        assert_eq!(
+            result
+                .expect_err("invalid time_format should fail to parse")
+                .to_string(),
+            "unknown variant `invalid_format`, expected one of `timestamp`, `timestamptz`, `unix_seconds`, `unix_millis`, `unix_nanos`, `ISO8601`, `date`"
+        );
     }
 
     #[test]

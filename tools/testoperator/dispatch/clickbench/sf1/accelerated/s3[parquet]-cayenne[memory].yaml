@@ -1,0 +1,9 @@
+# No query_overrides, as for `s3[parquet]-cayenne[file]`: Cayenne reads the binary columns
+# the `duckdb` set casts as strings, so the published ClickBench SQL runs unchanged.
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-cayenne[memory].yaml
+    query_set: clickbench
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1800
+    validate_results: true

@@ -31,6 +31,9 @@ use spicepod::{
 };
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
+/// Default polling interval for snapshot readers, including initial bootstrap.
+pub const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
+
 /// Errors that can occur when parsing acceleration configuration.
 #[derive(Debug, Snafu)]
 pub enum ParseError {
@@ -247,7 +250,9 @@ impl Display for StorageProfile {
 pub enum RefreshOnStartup {
     /// Always start a new refresh when Spice starts.
     Always,
-    /// Only start a refresh if an existing acceleration is not available.
+    /// Keep the refresh schedule across restarts: refresh at startup only when there
+    /// is no existing acceleration, or when `refresh_check_interval` has elapsed since
+    /// its last refresh.
     #[default]
     Auto,
 }
@@ -466,6 +471,11 @@ impl Display for StaleIfError {
 
 // ── Acceleration struct ───────────────────────────────────────────────────────
 
+/// Why snapshots are neither created nor restored for an acceleration that
+/// [uses a Cayenne datalake tier](Acceleration::uses_cayenne_datalake), worded as the
+/// cause that follows a log line's consequence.
+pub const CAYENNE_DATALAKE_SNAPSHOT_REASON: &str = "it uses a Cayenne datalake tier, which snapshots do not cover: a snapshot refers to datalake files that the instance that created it later deletes, and a copy restored from it would share that instance's datalake, where each instance's cleanup deletes the other's files. See: https://spiceai.org/docs/components/data-accelerators/cayenne";
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
@@ -596,6 +606,30 @@ pub fn classify_durable_write_back_key(columns: &[String]) -> DurableWriteBackKe
 }
 
 impl Acceleration {
+    /// Whether this is a Cayenne acceleration with a datalake (cold object-store) tier.
+    ///
+    /// Snapshots do not cover the datalake tier. A snapshot's metastore slice refers to
+    /// datalake files by URL, the instance that owns the datalake deletes the files it
+    /// supersedes, and a copy restored from the snapshot inherits the owner's table id —
+    /// and with it the same datalake prefix, whose cleanup each instance runs against its
+    /// own file list, deleting the other's files. Snapshot creation and bootstrap are
+    /// therefore skipped for these accelerations.
+    /// See [`CAYENNE_DATALAKE_SNAPSHOT_REASON`] for the wording that explains it.
+    #[must_use]
+    pub fn uses_cayenne_datalake(&self) -> bool {
+        self.engine == Engine::Cayenne && self.cayenne_datalake_location().is_some()
+    }
+
+    /// The `cayenne_datalake_location` parameter, trimmed, when it is set. A non-empty
+    /// location is what enables a Cayenne acceleration's datalake tier.
+    #[must_use]
+    pub fn cayenne_datalake_location(&self) -> Option<&str> {
+        self.params
+            .get("cayenne_datalake_location")
+            .map(|location| location.trim())
+            .filter(|location| !location.is_empty())
+    }
+
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
@@ -612,8 +646,13 @@ impl Acceleration {
     }
 
     /// Returns whether this configuration resolves to durable federated
-    /// write-back: a Cayenne `write_mode: write_back` dataset that declares an
-    /// `on_conflict` key and is CDC-fed (`refresh_mode: changes`).
+    /// write-back: a Cayenne `write_mode: write_back` dataset that is CDC-fed
+    /// (`refresh_mode: changes`).
+    ///
+    /// `on_conflict` plays no part: Cayenne keeps one row per primary key
+    /// whatever it says, and a transactional commit records its markers from the
+    /// keys it validated against that primary key. The key itself is judged at
+    /// registration over the declared `primary_key`.
     ///
     /// Such a dataset marks every committed write's primary keys so a delivery
     /// worker can reconcile them to the federated source. Delivery mutates the
@@ -638,12 +677,9 @@ impl Acceleration {
     /// cannot come to mean one thing to the check and another to what the user is
     /// told to add. Naming the settings only — the sentence around them belongs to
     /// the error that renders it.
-    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 3] {
+    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 2] {
         [
             (self.engine != Engine::Cayenne).then_some("acceleration.engine: cayenne"),
-            self.on_conflict
-                .is_empty()
-                .then_some("an 'acceleration.on_conflict' upsert on the primary key"),
             (self.refresh_mode != Some(RefreshMode::Changes))
                 .then_some("acceleration.refresh_mode: changes"),
         ]
@@ -891,6 +927,22 @@ impl Acceleration {
         }
     }
 
+    /// Whether a refresh keeps the newest version of each key by the dataset's
+    /// `time_column` rather than the last to arrive: a Cayenne acceleration with a
+    /// time column, refreshed `full` or `append` (#14576). A change stream applies
+    /// changes in order. The refresh still keeps the last arrival when its table has
+    /// no primary key, its key holds the time column, or the rows it reads lack it.
+    #[must_use]
+    pub fn orders_versions_by_time(
+        &self,
+        time_column: Option<&str>,
+        refresh_mode: RefreshMode,
+    ) -> bool {
+        self.engine == Engine::Cayenne
+            && time_column.is_some()
+            && matches!(refresh_mode, RefreshMode::Full | RefreshMode::Append)
+    }
+
     /// Returns the `UpsertOptions` if the `on_conflict` behavior is `Upsert`.
     /// Returns `UpsertOptions::default()` if no `on_conflict` is set.
     #[must_use]
@@ -955,7 +1007,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let mut params = acceleration.params.clone();
 
-        let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+        let engine_str = acceleration
+            .engine
+            .as_deref()
+            .unwrap_or(spicepod_acceleration::DEFAULT_ENGINE);
         let engine = match Engine::try_from(engine_str).map_err(|_| {
             ParseError::AcceleratorEngineNotAvailable {
                 name: engine_str.to_string(),
@@ -1368,6 +1423,38 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use spicepod::param::ParamValue;
     use std::sync::Arc;
+
+    #[test]
+    fn only_a_cayenne_acceleration_with_a_datalake_location_uses_the_datalake() {
+        let mut acceleration = Acceleration {
+            engine: Engine::Cayenne,
+            ..Acceleration::default()
+        };
+        assert!(
+            !acceleration.uses_cayenne_datalake(),
+            "no location configured"
+        );
+
+        acceleration
+            .params
+            .insert("cayenne_datalake_location".to_string(), "  ".to_string());
+        assert!(
+            !acceleration.uses_cayenne_datalake(),
+            "a blank location leaves the tier disabled"
+        );
+
+        acceleration.params.insert(
+            "cayenne_datalake_location".to_string(),
+            "s3://lake/prefix".to_string(),
+        );
+        assert!(acceleration.uses_cayenne_datalake());
+
+        acceleration.engine = Engine::Arrow;
+        assert!(
+            !acceleration.uses_cayenne_datalake(),
+            "only Cayenne has a datalake tier"
+        );
+    }
 
     /// The three connectors that override `DataConnector::resolve_refresh_mode`, plus
     /// the default. Asserted directly rather than only through a caller, because a
@@ -1785,8 +1872,35 @@ mod tests {
     }
 
     #[test]
+    fn an_acceleration_without_an_engine_uses_the_default_engine() {
+        let parsed = Acceleration::try_from(spicepod_acceleration::Acceleration::default())
+            .expect("acceleration should parse");
+        assert_eq!(parsed.engine, Engine::default());
+        #[cfg(not(windows))]
+        assert_eq!(parsed.engine, Engine::Cayenne);
+        #[cfg(windows)]
+        assert_eq!(parsed.engine, Engine::Arrow);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_partitioned_acceleration_without_an_engine_uses_cayenne() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            partition_by: vec![PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket(4, id)".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+        assert_eq!(parsed.engine, Engine::Cayenne);
+    }
+
+    #[test]
     fn test_hash_index_param_is_ignored() {
         let acceleration = spicepod_acceleration::Acceleration {
+            engine: Some("arrow".to_string()),
             params: Some(Params::from_string_map(HashMap::from([(
                 "hash_index".to_string(),
                 "enabled".to_string(),
@@ -1997,15 +2111,9 @@ mod tests {
 
     /// The exact configuration that turns durable federated write-back on.
     fn durable_write_back_acceleration() -> Acceleration {
-        let mut on_conflict = HashMap::new();
-        on_conflict.insert(
-            ColumnReference::try_from("id").expect("valid column reference"),
-            OnConflictBehavior::Upsert(UpsertOptions::default()),
-        );
         Acceleration {
             engine: Engine::Cayenne,
             write_mode: spicepod_acceleration::WriteMode::WriteBack,
-            on_conflict,
             refresh_mode: Some(RefreshMode::Changes),
             ..Acceleration::default()
         }
@@ -2037,6 +2145,29 @@ mod tests {
         assert!(durable_write_back_acceleration().resolves_to_durable_write_back());
     }
 
+    /// Regression test for #14886: Cayenne keeps one row per primary key without
+    /// `on_conflict`, so write-back must neither require it nor change its answer
+    /// when it is set.
+    #[test]
+    fn durable_write_back_does_not_depend_on_on_conflict() {
+        let without = durable_write_back_acceleration();
+        assert!(without.on_conflict.is_empty());
+        assert!(without.resolves_to_durable_write_back());
+        assert_eq!(without.unmet_durable_write_back_prerequisites(), None);
+
+        let mut on_conflict = HashMap::new();
+        on_conflict.insert(
+            ColumnReference::try_from("id").expect("valid column reference"),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
+        );
+        let with = Acceleration {
+            on_conflict,
+            ..durable_write_back_acceleration()
+        };
+        assert!(with.resolves_to_durable_write_back());
+        assert_eq!(with.unmet_durable_write_back_prerequisites(), None);
+    }
+
     /// Every conjunct must be load-bearing: if dropping one still reports
     /// durable write-back, the registration gate would fire on datasets that
     /// never mark keys (or, worse, stay silent on ones that do).
@@ -2058,15 +2189,6 @@ mod tests {
         assert!(
             !not_write_back.resolves_to_durable_write_back(),
             "write-through commits to the source directly, with no delivery worker"
-        );
-
-        let no_on_conflict = Acceleration {
-            on_conflict: HashMap::new(),
-            ..durable_write_back_acceleration()
-        };
-        assert!(
-            !no_on_conflict.resolves_to_durable_write_back(),
-            "without on_conflict there is no key to reconcile"
         );
 
         for refresh_mode in [

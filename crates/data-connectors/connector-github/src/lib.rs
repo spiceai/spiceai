@@ -106,7 +106,12 @@ static GITHUB_CONCURRENCY_LIMITS: LazyLock<Mutex<GitHubConcurrencyLimits>> =
 #[derive(Clone)]
 struct GitHubAuthRateControl {
     controller: Arc<RateController>,
+    /// GraphQL primary (`graphql` resource) plus the token-wide `retry-after`.
     limiter: Arc<GitHubRateLimiter>,
+    /// REST primary (`core` resource) plus the same `retry-after`. One handle
+    /// per auth context: GitHub meters `core` on the token, so every REST
+    /// dataset must clone this rather than `split_primary_quotas()`.
+    rest_limiter: Arc<GitHubRateLimiter>,
 }
 
 static GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS: LazyLock<
@@ -148,20 +153,24 @@ async fn get_github_auth_rate_control(auth_context: String) -> GitHubAuthRateCon
         ))
         .build();
 
+    let limiter = GitHubRateLimiter::new();
+    let rest_limiter = limiter.split_primary_quotas();
     let control = GitHubAuthRateControl {
         controller,
-        limiter: Arc::new(GitHubRateLimiter::new()),
+        limiter: Arc::new(limiter),
+        rest_limiter: Arc::new(rest_limiter),
     };
     rate_controllers.insert(auth_context, control.clone());
     control
 }
 
-const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 10;
+const GITHUB_DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 4;
 
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
     rate_limiter: Arc<GitHubRateLimiter>,
+    rest_limiter: Arc<GitHubRateLimiter>,
     semaphore: Arc<Semaphore>,
 }
 
@@ -171,6 +180,7 @@ impl std::fmt::Debug for Github {
             .field("params", &self.params)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .field("rate_limiter", &self.rate_limiter)
+            .field("rest_limiter", &self.rest_limiter)
             .field("semaphore", &"<Semaphore>")
             .finish()
     }
@@ -629,10 +639,12 @@ impl Github {
         }
 
         // REST spends `core`; the GraphQL client spends `graphql`. GitHub meters
-        // them separately, so they must not wait on each other's quota.
+        // them separately, so they must not wait on each other's quota. Clone the
+        // auth-context REST handle: `split_primary_quotas` here would give each
+        // dataset a private `core` map while GitHub still meters the token.
         GithubRestClient::new(
             token,
-            Arc::new(self.rate_limiter.split_primary_quotas()) as Arc<dyn RateLimiter>,
+            Arc::clone(&self.rest_limiter) as Arc<dyn RateLimiter>,
         )
         .map_err(Into::into)
     }
@@ -995,12 +1007,13 @@ impl DataConnectorFactory for GithubFactory {
                 || UNAUTHENTICATED_AUTH_CONTEXT.to_string(),
                 |token| token.dyn_hash(),
             );
-            let rate_limiter = get_github_auth_rate_control(auth_context).await.limiter;
+            let control = get_github_auth_rate_control(auth_context).await;
 
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
-                rate_limiter,
+                rate_limiter: control.limiter,
+                rest_limiter: control.rest_limiter,
                 semaphore,
             }) as Arc<dyn DataConnector>)
         })
@@ -2354,6 +2367,23 @@ mod tests {
                 "'{resource_type}' has an owner-level match arm but no path entry"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_github_uses_connector_default_concurrency_when_unset() {
+        let (params, params_context) = github_connector_params(
+            "github_default_concurrency",
+            "github-default-concurrency-token",
+            &[],
+        )
+        .await;
+
+        let connector = GithubFactory::new()
+            .create(params, &params_context)
+            .await
+            .expect("GitHub connector should be created");
+
+        assert_eq!(github_available_permits(&connector), 4);
     }
 
     #[tokio::test]

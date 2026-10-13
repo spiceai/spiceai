@@ -22,9 +22,9 @@ use std::{
 use super::SampleFrom;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
+    common::TableReference,
     error::DataFusionError,
     sql::{
-        TableReference,
         parser::{DFParser, Statement},
         sqlparser::{
             ast::{

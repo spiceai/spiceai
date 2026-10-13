@@ -239,6 +239,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         .await
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -252,12 +253,13 @@ async fn duckdb_regexp() -> Result<(), String> {
                 .expect("failed to write sample file");
 
             let mut other_dataset = make_duckdb_acceleration_dataset(
-                "csv_test_arrow",
+                "csv_test_cayenne",
                 "csv",
                 &format!("'{}'", temp_file.path().display()),
             );
             other_dataset.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("cayenne".to_string()),
                 ..Default::default()
             });
 
@@ -290,20 +292,20 @@ async fn duckdb_regexp() -> Result<(), String> {
             let regex_metachar_semantics = r"
                 WITH duckdb_regex AS (
                     SELECT region FROM csv_test WHERE regexp_like(region, 'A.*A')
-                ), arrow_regex AS (
-                    SELECT region FROM csv_test_arrow WHERE regexp_like(region, 'A.*A')
+                ), cayenne_regex AS (
+                    SELECT region FROM csv_test_cayenne WHERE regexp_like(region, 'A.*A')
                 ), missing_in_duckdb AS (
-                    SELECT region FROM arrow_regex
+                    SELECT region FROM cayenne_regex
                     EXCEPT
                     SELECT region FROM duckdb_regex
-                ), missing_in_arrow AS (
+                ), missing_in_cayenne AS (
                     SELECT region FROM duckdb_regex
                     EXCEPT
-                    SELECT region FROM arrow_regex
+                    SELECT region FROM cayenne_regex
                 )
                 SELECT region FROM missing_in_duckdb
                 UNION ALL
-                SELECT region FROM missing_in_arrow
+                SELECT region FROM missing_in_cayenne
             ";
 
             let regex_semantic_diff: Vec<RecordBatch> = rt
@@ -321,7 +323,7 @@ async fn duckdb_regexp() -> Result<(), String> {
             assert_eq!(
                 regex_semantic_diff.iter().map(RecordBatch::num_rows).sum::<usize>(),
                 0,
-                "regexp_like regex metacharacter semantics diverged between DuckDB and Arrow"
+                "regexp_like regex metacharacter semantics diverged between DuckDB and Cayenne"
             );
 
             let cases = vec![
@@ -353,11 +355,11 @@ async fn duckdb_regexp() -> Result<(), String> {
                     "test_regexp_results_match",
                     "WITH duckdb_regexp_like AS (
                         SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')
-                    ), arrow_regexp_like AS (
-                        SELECT * FROM csv_test_arrow WHERE regexp_like(region, 'america', 'i')
+                    ), cayenne_regexp_like AS (
+                        SELECT * FROM csv_test_cayenne WHERE regexp_like(region, 'america', 'i')
                     )
 
-                    SELECT * FROM duckdb_regexp_like d JOIN arrow_regexp_like a ON d.region = a.region",
+                    SELECT * FROM duckdb_regexp_like d JOIN cayenne_regexp_like a ON d.region = a.region",
                 ),
             ];
 
@@ -1527,6 +1529,403 @@ async fn duckdb_federated_inner_product_nulls_a_non_finite_result() -> Result<()
                      non-finite result comes back NULL rather than topping the ranking:\n{line}"
                 );
             }
+
+            Ok(())
+        })
+        .await
+}
+
+/// `EXPLAIN` a statement and return the formatted plan.
+async fn formatted_explain(rt: &Runtime, sql: &str) -> Result<String, String> {
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(&format!("EXPLAIN {sql}"))
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("explain for `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("explain for `{sql}` collect failed: {e}"))?;
+
+    Ok(arrow::util::pretty::pretty_format_batches(&batches)
+        .map_err(|e| format!("failed to format the plan for `{sql}`: {e}"))?
+        .to_string())
+}
+
+/// Run a statement and return its single `Int64` column, sorted.
+async fn sorted_int64_column(rt: &Runtime, sql: &str) -> Result<Vec<i64>, String> {
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| format!("`{sql}` did not return an Int64 column"))?;
+        values.extend(column.iter().flatten());
+    }
+    values.sort_unstable();
+    Ok(values)
+}
+
+/// A `DuckDB` accelerator with an `indexes` entry must rewrite a scan whose
+/// `WHERE` covers the indexed column plus at least one other column into a
+/// materialized CTE bound to that index.
+///
+/// `DuckDBIntermediateIndexMaterializationOptimizer` reads the index list off the
+/// `DuckSqlExec` the accelerator's table builds, and returns the plan untouched
+/// when that list is empty. So the rule can be switched off end to end by a change
+/// on either side of the table/exec boundary, with nothing to show for it but a
+/// slower plan — no error, no wrong rows, and no failing test until this one.
+///
+/// Three things about the query shape are load-bearing:
+///
+/// * `query_federation: disabled` is what puts a `DuckSqlExec` in the plan at all.
+///   With acceleration federation on, the scan is handed to the federation
+///   provider's own SQL executor and there is no exec node for the rule to rewrite.
+/// * Two predicates, only one of them on the indexed column. A single predicate on
+///   the indexed column alone is the already-optimal case the rule declines.
+/// * No `ORDER BY`: the materialization is not currently supported alongside a
+///   sort that reaches the scan, so a sorted query would not exercise the rewrite.
+///
+/// The unindexed dataset is the control: it pins that the CTE comes from the index
+/// rather than from something the accelerator does to every query, and that the
+/// rewrite returns the same rows as the plan it replaces.
+#[tokio::test]
+async fn duckdb_accelerator_materializes_an_indexed_filter_into_a_cte() -> Result<(), String> {
+    use spicepod::acceleration::IndexType;
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+
+    fn accelerated_csv_dataset(
+        ds_name: &str,
+        csv_path: &std::path::Path,
+        indexes: HashMap<String, IndexType>,
+    ) -> Dataset {
+        let mut dataset = Dataset::new(format!("file:{}", csv_path.display()), ds_name.to_string());
+        dataset.name = ds_name.to_string();
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            mode: Mode::Memory,
+            refresh_mode: Some(RefreshMode::Full),
+            indexes,
+            params: Some(Params::from_string_map(HashMap::from([(
+                "query_federation".to_string(),
+                "disabled".to_string(),
+            )]))),
+            ..Acceleration::default()
+        });
+        dataset
+    }
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = std::env::temp_dir().join("spiced_duckdb_index_cte_test");
+            std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+            defer! {
+                std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
+            }
+
+            let csv_path = temp_dir.join("trips.csv");
+            let rows = (0..200)
+                .map(|id| {
+                    let city = if id % 2 == 0 { "sf" } else { "nyc" };
+                    let status = if id % 3 == 0 { "open" } else { "closed" };
+                    format!("{id},{city},{status}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&csv_path, format!("id,city,status\n{rows}\n"))
+                .expect("failed to write csv");
+
+            let app = AppBuilder::new("duckdb_index_cte_test")
+                .with_dataset(accelerated_csv_dataset(
+                    "trips_indexed",
+                    &csv_path,
+                    HashMap::from([("city".to_string(), IndexType::Enabled)]),
+                ))
+                .with_dataset(accelerated_csv_dataset(
+                    "trips_unindexed",
+                    &csv_path,
+                    HashMap::new(),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = |table: &str| {
+                format!("SELECT id FROM {table} WHERE city = 'sf' AND status = 'open'")
+            };
+
+            let indexed_plan = formatted_explain(&rt, &query("trips_indexed")).await?;
+            assert!(
+                indexed_plan.contains("DuckSqlExec"),
+                "the accelerated scan must reach DuckDB through a DuckSqlExec, which is the node \
+                 carrying the index list; plan was:\n{indexed_plan}"
+            );
+            assert!(
+                indexed_plan.contains("_intermediate_materialize"),
+                "the filter on the indexed column must be materialized into a CTE; \
+                 plan was:\n{indexed_plan}"
+            );
+
+            let unindexed_plan = formatted_explain(&rt, &query("trips_unindexed")).await?;
+            assert!(
+                !unindexed_plan.contains("_intermediate_materialize"),
+                "a dataset with no index must not get the CTE, or the assertion above \
+                 says nothing about the index; plan was:\n{unindexed_plan}"
+            );
+
+            // The rewrite must not change the answer.
+            let indexed_rows = sorted_int64_column(&rt, &query("trips_indexed")).await?;
+            let unindexed_rows = sorted_int64_column(&rt, &query("trips_unindexed")).await?;
+            assert_eq!(
+                unindexed_rows, indexed_rows,
+                "the CTE rewrite returned different rows than the plan it replaced"
+            );
+            assert!(
+                !indexed_rows.is_empty(),
+                "the query must match rows, or neither plan is exercised"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// The `id`s a query returns, in order, with `parameters` bound positionally.
+async fn binary_filter_ids(
+    rt: &Runtime,
+    sql: &str,
+    parameters: Option<datafusion::common::ParamValues>,
+) -> Result<Vec<i32>, String> {
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(sql)
+        .parameters(parameters)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
+    let mut ids = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column_by_name("id")
+            .ok_or_else(|| format!("query `{sql}` returned no `id` column"))?;
+        let column = arrow::compute::cast(column, &arrow::datatypes::DataType::Int32)
+            .map_err(|e| format!("query `{sql}` returned an `id` that is not an integer: {e}"))?;
+        let column = column
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .ok_or_else(|| format!("query `{sql}` returned a non-Int32 `id`"))?;
+        ids.extend(column.iter().flatten());
+    }
+    Ok(ids)
+}
+
+/// A filter on a binary literal answers the same through `DuckDB` as it does
+/// locally, on every row: a one-byte value, the empty blob, NULL, a multi-byte
+/// value with a non-UTF-8 byte, the three bytes `xff`, and the one byte `x`.
+///
+/// The unparser spells a binary literal `X'ff'`, and `DuckDB` reads that as the
+/// *text* `'xff'`: compared against a BLOB column it matched the row holding
+/// the bytes `xff` instead of the byte `0xFF`, with no error. The literal
+/// therefore must not reach `DuckDB` in that spelling, whether it was written
+/// as a literal, folded from a cast, or bound as a parameter, and whether the
+/// table is `DuckDB`-federated or `DuckDB`-accelerated.
+#[tokio::test]
+async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(), String> {
+    use datafusion::common::{ParamValues, ScalarValue};
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let db_dir = tempfile::tempdir().expect("should create temp dir");
+            let db_path = db_dir.path().join("blobs.db");
+            {
+                let conn = duckdb::Connection::open(&db_path)
+                    .map_err(|e| format!("failed to open duckdb file: {e}"))?;
+                conn.execute_batch(
+                    "CREATE TABLE blobs (id INTEGER, b BLOB);
+                     INSERT INTO blobs VALUES
+                       (1, '\\xFF'::BLOB),
+                       (2, ''::BLOB),
+                       (3, NULL),
+                       (4, '\\x00\\x41\\xC3\\xA9'::BLOB),
+                       (5, 'xff'::BLOB),
+                       (6, 'x'::BLOB);",
+                )
+                .map_err(|e| format!("failed to seed duckdb file: {e}"))?;
+            }
+
+            let dataset = |name: &str, engine: Option<&str>| {
+                let mut dataset = Dataset::new("duckdb:blobs", name);
+                dataset.params = Some(spicepod::param::Params::from_string_map(
+                    vec![("duckdb_open".to_string(), db_path.display().to_string())]
+                        .into_iter()
+                        .collect(),
+                ));
+                dataset.acceleration = engine.map(|engine| Acceleration {
+                    enabled: true,
+                    engine: Some(engine.to_string()),
+                    mode: Mode::Memory,
+                    refresh_mode: Some(RefreshMode::Full),
+                    ..Acceleration::default()
+                });
+                dataset
+            };
+
+            let app = AppBuilder::new("duckdb_binary_literal_filters")
+                .with_dataset(dataset("federated", None))
+                .with_dataset(dataset("duckdb_accelerated", Some("duckdb")))
+                .with_dataset(dataset("local", Some("arrow")))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let byte_ff = || {
+                Some(ParamValues::List(vec![
+                    ScalarValue::Binary(Some(vec![0xff])).into(),
+                ]))
+            };
+            let cases: Vec<(&str, Option<ParamValues>, Vec<i32>)> = vec![
+                ("b = X'ff'", None, vec![1]),
+                ("b = X''", None, vec![2]),
+                ("b = X'0041c3a9'", None, vec![4]),
+                ("b <> X'ff'", None, vec![2, 4, 5, 6]),
+                ("b IN (X'ff', X'')", None, vec![1, 2]),
+                ("b >= X'78'", None, vec![1, 5, 6]),
+                ("b = CAST('xff' AS BYTEA)", None, vec![5]),
+                ("b = $1", byte_ff(), vec![1]),
+                ("b IS NULL", None, vec![3]),
+            ];
+
+            for (predicate, parameters, expected) in cases {
+                let local = binary_filter_ids(
+                    &rt,
+                    &format!("SELECT id FROM local WHERE {predicate} ORDER BY id"),
+                    parameters.clone(),
+                )
+                .await?;
+                assert_eq!(
+                    local, expected,
+                    "local evaluation of `{predicate}` is the reference"
+                );
+
+                for table in ["federated", "duckdb_accelerated"] {
+                    let sql = format!("SELECT id FROM {table} WHERE {predicate} ORDER BY id");
+                    let ids = binary_filter_ids(&rt, &sql, parameters.clone()).await?;
+                    let plan = if parameters.is_none() {
+                        formatted_explain(&rt, &sql).await?
+                    } else {
+                        String::from("(parameterized: no EXPLAIN)")
+                    };
+                    eprintln!("binary filter `{sql}` -> {ids:?}\n{plan}");
+                    assert_eq!(
+                        ids, expected,
+                        "`{predicate}` on `{table}` must return the rows local evaluation \
+                         does; plan was:\n{plan}"
+                    );
+                    assert!(
+                        !plan.contains("X'"),
+                        "a binary literal must not reach DuckDB as X'..', which it reads as \
+                         text; plan was:\n{plan}"
+                    );
+                }
+            }
+
+            // In a projection the literal is a value rather than a predicate:
+            // read as text, it would come back as the bytes of `x00ff`.
+            let projection = "SELECT id, b = X'ff' AS is_ff, X'00ff' AS literal \
+                              FROM {table} ORDER BY id";
+            let mut rendered = Vec::new();
+            for table in ["local", "federated", "duckdb_accelerated"] {
+                let sql = projection.replace("{table}", table);
+                let batches: Vec<RecordBatch> = rt
+                    .datafusion()
+                    .query_builder(&sql)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{sql}` failed: {e}"))?
+                    .data
+                    .try_collect()
+                    .await
+                    .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
+                rendered.push(
+                    arrow::util::pretty::pretty_format_batches(&batches)
+                        .map_err(|e| format!("failed to format `{sql}`: {e}"))?
+                        .to_string(),
+                );
+            }
+            assert_eq!(
+                rendered[0],
+                [
+                    "+----+-------+---------+",
+                    "| id | is_ff | literal |",
+                    "+----+-------+---------+",
+                    "| 1  | true  | 00ff    |",
+                    "| 2  | false | 00ff    |",
+                    "| 3  |       | 00ff    |",
+                    "| 4  | false | 00ff    |",
+                    "| 5  | false | 00ff    |",
+                    "| 6  | false | 00ff    |",
+                    "+----+-------+---------+",
+                ]
+                .join("\n"),
+                "local evaluation of the projection is the reference"
+            );
+            assert_eq!(
+                rendered[1], rendered[0],
+                "federated projection must agree with local"
+            );
+            assert_eq!(
+                rendered[2], rendered[0],
+                "accelerated projection must agree with local"
+            );
 
             Ok(())
         })

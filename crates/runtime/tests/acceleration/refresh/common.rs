@@ -350,8 +350,8 @@ pub(crate) async fn test_append_timestamp_for_engine(
 ) -> Result<(), anyhow::Error> {
     crate::utils::test_request_context()
         .scope(async {
-            let port: usize = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
             let db_conn = initialize_postgres(port).await?;
 
             let mut config = get_acceleration_config_append(engine, accel_params);
@@ -398,8 +398,8 @@ pub(crate) async fn test_append_unix_seconds_for_engine(
 ) -> Result<(), anyhow::Error> {
     crate::utils::test_request_context()
         .scope(async {
-            let port: usize = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
             let db_conn = initialize_postgres_unix_time(port).await?;
 
             let mut config = get_acceleration_config_append(engine, accel_params);
@@ -452,8 +452,8 @@ pub(crate) async fn test_append_iso8601_for_engine(
 ) -> Result<(), anyhow::Error> {
     crate::utils::test_request_context()
         .scope(async {
-            let port: usize = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
             let db_conn = initialize_postgres_iso8601(port).await?;
 
             let mut config = get_acceleration_config_append(engine, accel_params);

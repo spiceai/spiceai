@@ -433,13 +433,9 @@ fn is_v2_or_later(tag: &str) -> bool {
         .is_some_and(|major| major >= 2)
 }
 
-/// Map Go arch names to Rust target names.
+/// Architecture name shared by the Rust target and the release asset.
 fn get_rust_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => other,
-    }
+    std::env::consts::ARCH
 }
 
 /// Detect hardware accelerator (Metal on macOS, CUDA on Linux).

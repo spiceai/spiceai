@@ -23,7 +23,7 @@ use cache::{
     KeyHasher, LruCache, SimpleCache, Sizeable, StaleRejectionReason, get_hash_builder,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use rand::distr::Alphanumeric;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -89,6 +89,7 @@ fn all_hash_algorithms() -> Vec<(&'static str, HashingAlgorithm)> {
 fn all_caching_policies() -> Vec<(&'static str, CachingPolicy)> {
     vec![
         ("lru", CachingPolicy::Lru),
+        ("lfu", CachingPolicy::Lfu),
         ("tinylfu", CachingPolicy::TinyLfu),
     ]
 }

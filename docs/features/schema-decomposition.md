@@ -231,18 +231,21 @@ FROM tvmaze_show
 WHERE request_path = '/shows/1';
 ```
 
-> **Note.** `request_path` is not present in the decomposed schema, so
-> this query shape requires the decomposition-less default HTTP schema.
-> To combine path filtering with decomposition, point `from:` directly at
-> the specific resource URL (e.g. `https://api.tvmaze.com/shows/1`) per
-> dataset.
+> **Note.** `request_path` is not present in the decomposed schema unless
+> you declare it in `columns:`. To combine path filtering with
+> decomposition without declaring it, point `from:` directly at the
+> specific resource URL (e.g. `https://api.tvmaze.com/shows/1`) per
+> dataset instead.
 
 ### Behavior
 
 - When at least one `columns:` entry has `metadata.json_object: "*"`, the
   HTTP provider swaps its default fixed schema for one built from
-  `columns:` in declaration order. All decomposed columns are `Utf8`
-  (nullable).
+  `columns:` in declaration order. A body-derived column defaults to
+  `Utf8` (nullable) unless you declare its `type`/`nullable`; a metadata
+  column (`response_status`, `_fetched_at`, …) instead keeps its fixed
+  type from the default HTTP schema (e.g. `response_status` is
+  non-nullable `UInt16`) regardless of what you declare for it.
 - Each row from the response is decomposed:
   - JSON arrays are flattened to one row per element (same as default
     HTTP connector behavior).
@@ -258,10 +261,15 @@ WHERE request_path = '/shows/1';
   - JSON string → the string (unquoted)
   - JSON null → SQL `NULL`
   - JSON number / boolean / array / object → JSON text
-- The `content`, `request_path`, `response_status`, … metadata columns
-  are **not** available when decomposition is enabled. If you need them,
-  don't enable decomposition — use a view on top of the default schema
-  instead.
+- The `content`, `request_path`, `request_query`, `request_body`,
+  `request_headers`, `response_headers`, … metadata columns are only
+  present when explicitly declared in `columns:` — decomposition does not
+  add them automatically, with two exceptions: `_fetched_at` and
+  `response_status` are always added even when you don't declare them.
+  The runtime needs both to work correctly under decomposition —
+  `_fetched_at` for caching TTL eviction and `time_column`, and
+  `response_status` to tell a real (if empty) result apart from an origin
+  failure (`caching_stale_if_error`, and the SQL results cache).
 
 ## Building a normalized attributes view
 
@@ -284,5 +292,5 @@ full-text search.
 | `Multiple columns have 'json_object' metadata defined: …`               | Only one column may be marked. Remove the extra `json_object: "*"` entries.                                                                        |
 | `Column 'X' has invalid 'json_object' value: …. Only '*' is supported.` | Change the marker to the string `"*"`. Other patterns/selectors aren't supported yet.                                                              |
 | `Columns not found in table schema: …` (DynamoDB)                       | A declared static column doesn't exist in the sampled DynamoDB items. Fix the name or raise `schema_infer_max_records`.                            |
-| HTTP `content`/`response_status` columns are missing                    | Expected — decomposition replaces the default HTTP schema. Remove the `json_object` marker, or project those fields from a non-decomposed dataset. |
+| HTTP `content`/`request_path` columns are missing                       | Expected unless declared — decomposition replaces the default HTTP schema, and only auto-adds `_fetched_at` and `response_status`. Add the field to `columns:` to get it back. |
 | Catch-all column is `NULL`                                              | The row had no keys outside the declared static columns. This is correct behavior.                                                                 |

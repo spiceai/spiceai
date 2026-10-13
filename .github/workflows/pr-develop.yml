@@ -59,7 +59,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -98,7 +98,7 @@ jobs:
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
-          BRANCH: spiceai-54
+          BRANCH: spiceai-55
 
       - name: Show sccache stats
         if: always() && (runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '')
@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-check-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -140,7 +140,7 @@ jobs:
       - name: Set up spiceio
         if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@2ff3b86989e1b6e142673201100420274ef78c8f # v0.11.0
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -185,7 +185,7 @@ jobs:
           # Intersected with the gate's own filterset by the Makefile. Passing it
           # as a second `-E` would union with that filterset and widen the run,
           # because that is how nextest composes repeated `-E` flags.
-          NEXTEST_FILTER_EXTRA: "not (package(aws-sdk-credential-bridge) | package(object_store_occ))"
+          NEXTEST_FILTER_EXTRA: "not package(aws-sdk-credential-bridge)"
 
       - name: Build testoperator
         env:
@@ -216,7 +216,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-build-logs
           path: ${{ runner.temp }}/spiceio.log

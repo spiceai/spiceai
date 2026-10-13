@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:
@@ -106,6 +106,16 @@ on:
         required: false
         type: boolean
         default: true
+      postgres_version:
+        description: 'PostgreSQL release line of the local source: postgres_tpch (TPC-H/TPC-DS SF1/SF10) or the CH-benCH source; one of its versions in test/source_versions.json'
+        required: false
+        type: string
+        default: '16'
+      layout:
+        description: 'Acceleration layout to configure on every accelerated dataset (testoperator --layout): features from primary_key, indexes, sort, cluster, time_column, partition, joined by commas; empty = the spicepod as written'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   run-bench:
@@ -136,11 +146,13 @@ jobs:
       # postgres-source configs, which read the pre-loaded hits data on the
       # hosted cluster (too large to seed inline).
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && 'postgres:16' || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && format('postgres:{0}', github.event.inputs.postgres_version || '16') || '' }}
         ports:
           - 5432:5432
         env:
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          # Byte-order collation, matching Spice; the image default (en_US.utf8) sorts strings case-insensitively.
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
         # --shm-size: postgres's default 64MB /dev/shm (Docker's own default)
         # is too small for parallel-worker queries against TPC-H/TPC-DS data;
         # several queries fail with "could not resize shared memory segment"
@@ -186,6 +198,18 @@ jobs:
           fi
 
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      # The postgres_tpch service has already started by now; this refuses a line
+      # the version list does not carry (a typo, or a retired release) before any
+      # result is reported against it.
+      - name: Check the PostgreSQL version is supported
+        env:
+          POSTGRES_VERSION: ${{ github.event.inputs.postgres_version || '16' }}
+        run: |
+          if ! jq -e --arg v "${POSTGRES_VERSION}" '.postgres.versions | map(.version) | index($v)' test/source_versions.json > /dev/null; then
+            echo "::error::PostgreSQL ${POSTGRES_VERSION} is not a supported version; use one of: $(jq -r '[.postgres.versions[].version] | join(", ")' test/source_versions.json)"
+            exit 1
+          fi
 
       - name: Validate spicepod file exists
         run: |
@@ -306,7 +330,7 @@ jobs:
             exit 0
           fi
 
-          # SF1/SF10 always run against the self-contained postgres:16 service
+          # SF1/SF10 always run against the self-contained postgres_tpch service
           # container (PGHOST=127.0.0.1), so generating fresh data inline is
           # cheap and expected. Anything larger targets the shared hosted
           # cluster - generating+loading that inline risks a multi-hour job
@@ -345,7 +369,7 @@ jobs:
           echo "Seed complete: $DB_NAME on $PGHOST."
 
       # Postgres-accelerator spicepods need a *_accelerated database that the
-      # empty postgres:16 container doesn't have yet - create it before spiced
+      # empty postgres_tpch container doesn't have yet - create it before spiced
       # starts (idempotent), matching the PGHOST the spicepod will connect to.
       - name: Create postgres acceleration databases
         if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -405,16 +429,25 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         if: ${{ github.event.inputs.query_set == 'chbench' }}
         uses: ./.github/actions/setup-chbench-postgres
+        with:
+          version: ${{ github.event.inputs.postgres_version || '16' }}
 
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
-          docker run -d --name minio \
+          # MinIO no longer publishes images or binaries: quay.io/minio/minio and minio/minio refuse
+          # anonymous pulls and dl.min.io answers 410. Chainguard builds the same server from the
+          # upstream source; it runs as a non-root user that cannot create /data, hence --user.
+          image=cgr.dev/chainguard/minio:latest
+          if ! docker run -d --name minio --user 0:0 \
             -p 9000:9000 \
             -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data --console-address ':9001'
+            "$image" server /data --console-address ':9001'; then
+            echo "::error::Could not start MinIO from $image. If the pull was refused, the image is no longer published there; point this step at a registry that still serves MinIO."
+            exit 1
+          fi
 
       - name: Wait for local MinIO
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -432,7 +465,12 @@ jobs:
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
-          python -m pip install --upgrade duckdb minio
+          # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
+          # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
+          # runtime's extension rejects: "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported".
+          duckdb_version=$(awk -F'"' '/^duckdb = "/ { print $2; exit }' Cargo.toml)
+          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from Cargo.toml'; exit 1; }
+          python -m pip install --upgrade "duckdb==$duckdb_version" minio
 
           python <<'PY'
           import duckdb
@@ -497,6 +535,44 @@ jobs:
           connection.close()
           PY
 
+      # The Databricks cluster auto-terminates when idle. A run that arrives while it is still starting
+      # fails every dataset with "The cluster is in unexpected state Pending, while waiting for RUNNING",
+      # and spiced never reaches ready. Bring it up and wait before launching spiced.
+      - name: Start the Databricks cluster
+        if: ${{ contains(github.event.inputs.spicepod_path, 'spark') }}
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+        run: |
+          # The Clusters API takes cluster_id as a query/body parameter; a path segment such as
+          # /clusters/<id>/start returns ENDPOINT_NOT_FOUND.
+          base="https://${DATABRICKS_HOST}/api/2.1/clusters"
+          auth="Authorization: Bearer ${DATABRICKS_TOKEN}"
+
+          state() {
+            curl -s "${base}/get?cluster_id=${DATABRICKS_CLUSTER_ID}" -H "$auth" | jq -r '.state // .message'
+          }
+
+          state_now=$(state)
+          echo "cluster ${DATABRICKS_CLUSTER_ID} state: ${state_now}"
+          if [ "$state_now" = "TERMINATED" ]; then
+            curl -s -X POST "${base}/start" -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"cluster_id\":\"${DATABRICKS_CLUSTER_ID}\"}" > /dev/null
+          fi
+
+          for _ in $(seq 1 80); do
+            state_now=$(state)
+            echo "cluster ${DATABRICKS_CLUSTER_ID} state: ${state_now}"
+            case "$state_now" in
+              RUNNING) exit 0 ;;
+              ERROR) echo "cluster ${DATABRICKS_CLUSTER_ID} is ERROR"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "cluster ${DATABRICKS_CLUSTER_ID} did not reach RUNNING"
+          exit 1
+
       # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
       # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
       # default with a one-second `item_ttl`, and the harness runs one warmup query
@@ -519,9 +595,11 @@ jobs:
             --disable-progress-bars \
             --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
+            ${LAYOUT:+--layout "$LAYOUT"} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
+          LAYOUT: ${{ github.event.inputs.layout }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}

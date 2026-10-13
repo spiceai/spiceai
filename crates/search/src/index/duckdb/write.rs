@@ -123,7 +123,12 @@ async fn embed_column(
         .await
         .context(FailedToEmbedSnafu)?;
 
-    Ok(distribute_nulls(embedded, nulls))
+    // `embed` yields the cache's shared handle; `distribute_nulls` consumes an
+    // owned Vec, so take it out of the Arc as the shared write helper does.
+    Ok(distribute_nulls(
+        std::sync::Arc::unwrap_or_clone(embedded),
+        nulls,
+    ))
 }
 
 fn update_embedding_column_in_batch(

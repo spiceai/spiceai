@@ -213,7 +213,7 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             // Verify the dataset is Ready in RuntimeStatus
             let status = rt.status();
             let dataset_statuses = status.get_dataset_statuses();
-            let dataset_ref = datafusion::sql::TableReference::bare("test_dataset");
+            let dataset_ref = datafusion::common::TableReference::bare("test_dataset");
             let runtime_status = dataset_statuses
                 .get(&dataset_ref)
                 .expect("test_dataset should have a status");

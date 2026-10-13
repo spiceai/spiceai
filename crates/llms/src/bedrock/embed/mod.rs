@@ -296,11 +296,11 @@ where
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> EmbedResult<CreateEmbeddingResponse> {
-        if let Some(CachedEmbeddingResult::Response(cached)) =
-            self.get_cached_embed((&req).into()).await
+    ) -> EmbedResult<Arc<CreateEmbeddingResponse>> {
+        if let Some(cached) = self.get_cached_embed((&req).into()).await
+            && let CachedEmbeddingResult::Response(response) = cached.as_ref()
         {
-            return Ok(cached);
+            return Ok(std::sync::Arc::clone(response));
         }
 
         let texts = Self::convert_input_to_texts(&req.input);
@@ -330,13 +330,17 @@ where
             },
         };
 
-        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
-            .await;
+        let resp = std::sync::Arc::new(resp);
+        self.put_cached_embed(
+            (&req).into(),
+            CachedEmbeddingResult::Response(std::sync::Arc::clone(&resp)),
+        )
+        .await;
 
         Ok(resp)
     }
 
-    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Arc<Vec<Vec<f32>>>> {
         let cache_key: Option<CacheKey> = self.embedding_input_cache_key(&input);
 
         let cached_response = if let Some(key) = cache_key {
@@ -345,8 +349,10 @@ where
             None
         };
 
-        if let Some(CachedEmbeddingResult::Vector(cached)) = cached_response {
-            return Ok(cached);
+        if let Some(cached) = cached_response
+            && let CachedEmbeddingResult::Vector(vectors) = cached.as_ref()
+        {
+            return Ok(std::sync::Arc::clone(vectors));
         }
 
         let texts = Self::convert_input_to_texts(&input);
@@ -357,7 +363,7 @@ where
 
         if texts.is_empty() {
             tracing::debug!("Embedding input is empty, returning empty vector");
-            return Ok(vec![]);
+            return Ok(std::sync::Arc::new(vec![]));
         }
 
         let (vectors, _num_tokens) = self.embed_texts(texts).await.boxed().map_err(|err| {
@@ -373,9 +379,13 @@ where
             self.config.model_id()
         );
 
+        let vectors = std::sync::Arc::new(vectors);
         if let Some(key) = cache_key {
-            self.put_cached_embed(key, CachedEmbeddingResult::Vector(vectors.clone()))
-                .await;
+            self.put_cached_embed(
+                key,
+                CachedEmbeddingResult::Vector(std::sync::Arc::clone(&vectors)),
+            )
+            .await;
         }
 
         Ok(vectors)

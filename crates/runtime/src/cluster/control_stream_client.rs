@@ -507,10 +507,9 @@ async fn handle_scheduler_message(
             for task in cmd.tasks {
                 match executor
                     .cancel_task(
-                        task.task_id as usize,
                         task.job_id.clone().into(),
                         task.stage_id as usize,
-                        task.partition_id as usize,
+                        task.task_id as usize,
                     )
                     .await
                 {
@@ -785,22 +784,6 @@ mod tests {
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
         assert_eq!(manager.executor_id, "executor-1");
-    }
-
-    #[test]
-    fn test_control_stream_manager_new_with_metrics_reader() {
-        let reader = MetricsReader::new();
-        let manager = ControlStreamManager::new(
-            "executor-2".to_string(),
-            "executor-2".to_string(),
-            None,
-            Some(reader),
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(manager.metrics_reader.is_some());
     }
 
     #[test]

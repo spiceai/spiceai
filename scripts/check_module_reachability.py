@@ -25,13 +25,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+from rust_guard_common import REPO, cargo_metadata
 
 # `mod name;` / `mod name { … }`, with the leading `pub`, `pub(crate)`, `unsafe`
 # and `async` qualifiers Rust allows in front of it. Matched against a source
@@ -45,33 +43,6 @@ MOD_RE = re.compile(
 # value is read from the blanked text's companion literal table, not from here.
 PATH_ATTR_RE = re.compile(r"\bpath\s*=\s*(?P<lit>\x00L(?P<idx>\d+)\x00)")
 
-
-
-def run_cargo_metadata() -> dict:
-    """Workspace manifest as cargo sees it — the authority on targets and paths."""
-    try:
-        out = subprocess.run(
-            ["cargo", "metadata", "--no-deps", "--format-version", "1"],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except FileNotFoundError:
-        # Exit 2 (tooling error), never 1 — 1 means an actual unreachable file.
-        print(
-            "error: `cargo` not found on PATH, so the workspace layout cannot be read.",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-    except subprocess.CalledProcessError as e:
-        print(f"error: `cargo metadata` failed:\n{e.stderr}", file=sys.stderr)
-        raise SystemExit(2)
-    try:
-        return json.loads(out.stdout)
-    except json.JSONDecodeError as e:
-        print(f"error: `cargo metadata` emitted invalid JSON: {e}", file=sys.stderr)
-        raise SystemExit(2)
 
 
 # Openers for everything that can hide a `mod` token. Ordinary code is skipped by
@@ -338,7 +309,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    metadata = run_cargo_metadata()
+    metadata = cargo_metadata()
     workspace_ids = set(metadata.get("workspace_members", []))
 
     violations: list[tuple[str, Path]] = []

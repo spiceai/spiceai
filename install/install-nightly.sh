@@ -93,9 +93,13 @@ getSystemInfo() {
             USE_SUDO="true"
         fi
     else
-        # Directory doesn't exist, check parent directory
+        # Directory doesn't exist: check the nearest existing ancestor, which is
+        # where mkdir -p starts.
         local parent_dir
         parent_dir=$(dirname "$SPICED_INSTALL_DIR")
+        while [[ ! -e "$parent_dir" ]]; do
+            parent_dir=$(dirname "$parent_dir")
+        done
         if [[ ! -w "$parent_dir" ]]; then
             USE_SUDO="true"
         fi

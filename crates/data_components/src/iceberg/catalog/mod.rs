@@ -44,13 +44,18 @@ pub enum Error {
     #[snafu(display(
         "Failed to connect to the Iceberg catalog or object store at {url}: {source}. Verify the Iceberg catalog is accessible and try again."
     ))]
-    FailedToConnect { url: String, source: iceberg::Error },
+    FailedToConnect {
+        url: String,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
+    },
 
     #[snafu(display("TLS/SSL certificate error connecting to {}: {}", url, detail))]
     CertificateError {
         url: String,
         detail: String,
-        source: iceberg::Error,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
     },
 
     #[snafu(display(

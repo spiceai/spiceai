@@ -81,6 +81,11 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    // Unlike the other `UnableToConnect*` variants, this is a transient (retriable)
+    // condition: connectors report a source that is down or still starting (the
+    // connection refused or timed out) this way, and the dataset load must keep
+    // retrying until it is reachable rather than failing permanently. See
+    // `is_retriable`.
     #[snafu(display(
         "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
     ))]
@@ -327,7 +332,6 @@ impl DataConnectorError {
                 | Self::InvalidGlobPattern { .. }
                 | Self::InvalidTableName { .. }
                 | Self::InsufficientPermissions { .. }
-                | Self::UnableToConnectInvalidHostOrPort { .. }
                 | Self::UnableToConnectInvalidUsernameOrPassword { .. }
                 | Self::UnableToConnectTlsError { .. }
                 | Self::UnsupportedTypeAction { .. }

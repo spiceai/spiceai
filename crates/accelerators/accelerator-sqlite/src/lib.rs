@@ -29,8 +29,7 @@ use data_accelerator_api::{FilePathError, spice_data_base_path};
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
-    logical_expr::CreateExternalTable,
+    catalog::TableProviderFactory, datasource::TableProvider, logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
@@ -50,7 +49,8 @@ use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, os::raw::c_char, path::PathBuf, time::Duration};
 
 use data_accelerator_api::{
-    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, upsert_dedup,
+    AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator, keep_first,
+    upsert_dedup,
 };
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_checkpoint_api::CheckpointError;
@@ -271,6 +271,30 @@ impl SqliteAccelerator {
         let file_path: Arc<str> = sqlite_file.into();
         let busy_timeout = self.effective_busy_timeout(source, storage)?;
 
+        // A snapshot restore that crashed after parking the WAL leaves the
+        // committed rows only in that parked file. Put them back, or drop them
+        // when the replacement database is already in place, before any
+        // connection opens the file.
+        if matches!(
+            mode,
+            datafusion_table_providers::sql::db_connection_pool::Mode::File
+        ) {
+            let dataset_name = source.name().to_string();
+            let database = std::path::Path::new(file_path.as_ref());
+            // Do not open the file while a restore has its WAL parked. A
+            // connection in that interval creates a `-wal` that the restore
+            // then deletes, and the next connection fails to open the file.
+            runtime_acceleration::snapshot::engine::wait_for_sqlite_restore(database).await;
+            runtime_acceleration::snapshot::engine::recover_interrupted_sqlite_restore(
+                database,
+                &dataset_name,
+            )
+            .await
+            .map_err(|source| Error::AccelerationCreationFailed {
+                source: source.into(),
+            })?;
+        }
+
         let pool = self
             .sqlite_factory
             .get_or_init_instance(Arc::clone(&file_path), mode, busy_timeout)
@@ -426,10 +450,39 @@ impl DataAccelerator for SqliteAccelerator {
         )))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !source.is_file_accelerated() {
+            return Ok(());
+        }
+        let path = self.file_path(source)?;
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("sqlite_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
         }
@@ -440,22 +493,19 @@ impl DataAccelerator for SqliteAccelerator {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
+
+            // Before a snapshot download or a connection opens the file. See
+            // `get_shared_pool` for the same recovery on every other open.
+            let dataset_name = source.name().to_string();
+            runtime_acceleration::snapshot::engine::recover_interrupted_sqlite_restore(
+                std::path::Path::new(&path),
+                &dataset_name,
+            )
+            .await
+            .map_err(|source| Error::AccelerationInitializationFailed {
+                source: source.into(),
+            })?;
 
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
@@ -492,9 +542,12 @@ impl DataAccelerator for SqliteAccelerator {
                 None,
                 resolved_refresh_mode(source, acceleration),
             )
-            .await;
+            .await?;
 
-            self.get_shared_pool(source).await?;
+            // A pending bootstrap must restore the file before any connection opens it.
+            if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                self.get_shared_pool(source).await?;
+            }
 
             return Ok(bootstrap_status);
         }
@@ -536,12 +589,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .iter()
                 .filter_map(|spicepod_ds| {
                     let acceleration = spicepod_ds.acceleration.as_ref()?;
-                    let engine_str = acceleration
-                        .engine
-                        .as_deref()
-                        .unwrap_or("arrow")
-                        .to_lowercase();
-                    if engine_str != "sqlite" {
+                    if !acceleration.engine_name().eq_ignore_ascii_case("sqlite") {
                         return None;
                     }
                     if !matches!(
@@ -571,7 +619,7 @@ impl DataAccelerator for SqliteAccelerator {
             }
         }
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let table_provider = TableProviderFactory::create(&self.sqlite_factory, &ctx.state(), &cmd)
             .await
             .context(UnableToCreateTableSnafu)
@@ -589,6 +637,16 @@ impl DataAccelerator for SqliteAccelerator {
             sqlite_writer,
             &cmd.options,
             cmd.constraints.clone(),
+        );
+        // The per-batch uniqueness check refuses a key repeated within one
+        // write before `ON CONFLICT DO NOTHING` can drop it, so `drop` keeps
+        // the first copy here.
+        let write_provider = keep_first::wrap_with_keep_first_if_needed(
+            write_provider,
+            &cmd.options,
+            cmd.schema.as_arrow(),
+            &cmd.constraints,
+            keep_first::NanKey::Null,
         );
 
         let table_provider =
@@ -789,12 +847,13 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray},
+        array::{Date32Array, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Schema},
+        util::pretty::pretty_format_batches,
     };
     use data_accelerator_api::DataAccelerator;
     use datafusion::{
-        common::{Constraints, TableReference, ToDFSchema},
+        common::{Constraint, Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
@@ -818,7 +877,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -871,6 +930,181 @@ mod tests {
             .expect("deletion should be successful");
     }
 
+    fn id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    fn id_v_batch(rows: &[(i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch should be created")
+    }
+
+    async fn id_v_table(
+        name: &str,
+        on_conflict: &str,
+        constraints: Vec<Constraint>,
+    ) -> Arc<dyn datafusion::datasource::TableProvider> {
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(id_v_schema()).expect("df schema"),
+            name: TableReference::bare(name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: [("on_conflict".to_string(), on_conflict.to_string())]
+                .into_iter()
+                .collect(),
+            constraints: Constraints::new_unverified(constraints),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created")
+    }
+
+    async fn write_id_v(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+        batches: Vec<RecordBatch>,
+        op: InsertOp,
+    ) {
+        let ctx = SessionContext::new();
+        let exec = MockExec::new(batches.into_iter().map(Ok).collect(), id_v_schema());
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), op)
+            .await
+            .expect("insertion should be planned");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("a repeated key must not fail a drop write");
+    }
+
+    /// `(id, v)` rows the table holds, ordered by `id`.
+    async fn id_v_rows(
+        table: &Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Vec<(i64, String)> {
+        let ctx = SessionContext::new();
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should be planned");
+        let mut rows = Vec::new();
+        for batch in collect(scan, ctx.task_ctx()).await.expect("scan") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("v is Utf8");
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), vals.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Regression test for #14629: under `on_conflict: drop`, a write that
+    /// repeats a key keeps its first copy, whether the repeat is within one
+    /// record batch (which the per-batch uniqueness check used to refuse) or
+    /// in a later one.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_a_write_repeats() {
+        let table = id_v_table(
+            "drop_repeats",
+            "do_nothing:id",
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![
+                id_v_batch(&[(1, "a"), (2, "b"), (1, "c")]),
+                id_v_batch(&[(2, "d"), (3, "e")]),
+            ],
+            InsertOp::Overwrite,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![
+                (1, "a".to_string()),
+                (2, "b".to_string()),
+                (3, "e".to_string())
+            ]
+        );
+    }
+
+    /// `SQLite` matches an `on_conflict` target to its column ignoring case, so
+    /// `do_nothing:ID` over a column `id` keeps the first copy of an `id`.
+    #[tokio::test]
+    async fn drop_resolves_a_target_spelled_in_another_case() {
+        let table = id_v_table(
+            "drop_target_case",
+            "do_nothing:ID",
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// With `drop` on two constraints, an append must not drop a row because of
+    /// a key carried by an earlier incoming row that the table itself rejects:
+    /// `(1, 'b')` conflicts with the stored `(1, 'a')`, so it is never written,
+    /// and `(2, 'b')` then conflicts with nothing.
+    #[tokio::test]
+    async fn drop_on_every_constraint_appends_rows_only_a_rejected_row_conflicted_with() {
+        let table = id_v_table(
+            "drop_all_append",
+            "do_nothing_all",
+            vec![Constraint::PrimaryKey(vec![0]), Constraint::Unique(vec![1])],
+        )
+        .await;
+        write_id_v(&table, vec![id_v_batch(&[(1, "a")])], InsertOp::Overwrite).await;
+        write_id_v(
+            &table,
+            vec![id_v_batch(&[(1, "b")]), id_v_batch(&[(2, "b")])],
+            InsertOp::Append,
+        )
+        .await;
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
     /// Regression test for the DF53 / table-providers v0.11 `SQLite` Decimal
     /// round-trip. A `Decimal128`/`Decimal256` column accelerated into `SQLite`
     /// must read back as a decimal, not fail with
@@ -900,7 +1134,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("decimal_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -994,7 +1228,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("list_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1113,7 +1347,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("dict_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1179,5 +1413,124 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "should have 3 rows");
+    }
+    /// Regression test for [#14491](https://github.com/spiceai/spiceai/issues/14491):
+    /// a date filter the `SQLite` scan takes must select the same rows as local
+    /// evaluation. The scan renders a `Date32` literal as a cast, and `SQLite`
+    /// gives the type name `DATE` numeric affinity, so `CAST('1994-01-01' AS
+    /// DATE)` is the integer `1994`; the stored dates are `YYYY-MM-DD` text,
+    /// which compares greater than every number, so a literal rendered that way
+    /// matches no row and the query silently answers too few rows. The dialect
+    /// renders the cast as `TEXT`, and the literal has to take the same type.
+    ///
+    /// The filter is written in SQL rather than handed to `scan` directly so it
+    /// reaches the accelerator the way a query does: simplified to a `Date32`
+    /// literal by the optimizer, then pushed into the `SQLite` scan.
+    #[tokio::test]
+    async fn a_date_filter_pushed_into_the_sqlite_scan_selects_the_same_rows_as_local_evaluation() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("l_shipdate", DataType::Date32, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("lineitem"),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        // Days since the epoch: 1993-12-31, 1994-01-01, 1994-06-15, 1994-12-31,
+        // 1995-01-01 -- one row on each side of both bounds and one inside.
+        let ids = Int64Array::from(vec![1, 2, 3, 4, 5]);
+        let dates = Date32Array::from(vec![8765, 8766, 8931, 9130, 9131]);
+        let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(dates)])
+            .expect("data should be created");
+        let exec = MockExec::new(vec![Ok(data)], schema);
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        ctx.register_table("lineitem", table)
+            .expect("table should register");
+        let query = "SELECT id FROM lineitem \
+                     WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' \
+                     ORDER BY id";
+
+        // The plan is the artifact: it carries the SQL the scan sends to SQLite.
+        let plan = ctx
+            .sql(&format!("EXPLAIN {query}"))
+            .await
+            .expect("explain should plan")
+            .collect()
+            .await
+            .expect("explain should run");
+        let plan = pretty_format_batches(&plan)
+            .expect("plan should format")
+            .to_string();
+        let batches = ctx
+            .sql(query)
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should run");
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column should be Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        // The rows are the user-visible failure; the plan says why.
+        assert_eq!(
+            ids,
+            vec![2, 3, 4],
+            "the scan should select the 1994 rows and only those, got plan:\n{plan}"
+        );
+        // `SQLiteSqlExec` is in every plan over this table, so the filter's
+        // presence has to be read off the SQL it carries, and the absence of a
+        // local `FilterExec` pins that the engine did not re-apply it above.
+        let pushed_sql = plan
+            .lines()
+            .find(|line| line.contains("SQLiteSqlExec sql="))
+            .expect("the plan should scan through SQLiteSqlExec");
+        assert!(
+            pushed_sql.contains("WHERE") && pushed_sql.contains("l_shipdate"),
+            "the date filter should be pushed into the SQLite scan, got plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("FilterExec"),
+            "the date filter should not be re-applied locally above the scan, got plan:\n{plan}"
+        );
+        assert!(
+            plan.contains("AS TEXT)") && !plan.contains("AS DATE)"),
+            "SQLite reads a DATE cast as a number, so the scan must render the literal's cast as \
+             TEXT, got plan:\n{plan}"
+        );
     }
 }

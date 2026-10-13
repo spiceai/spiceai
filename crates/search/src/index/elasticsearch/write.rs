@@ -459,7 +459,12 @@ async fn embed_column(
             index: es_index.to_string(),
         })?;
 
-    Ok(distribute_nulls(embedded, nulls))
+    // `embed` yields the cache's shared handle; `distribute_nulls` consumes an
+    // owned Vec, so take it out of the Arc as the shared write helper does.
+    Ok(distribute_nulls(
+        std::sync::Arc::unwrap_or_clone(embedded),
+        nulls,
+    ))
 }
 
 fn update_embedding_column_in_batch(
@@ -1022,7 +1027,7 @@ mod tests {
             async fn embed(
                 &self,
                 _input: llms::embeddings::EmbeddingInput,
-            ) -> llms::embeddings::Result<Vec<Vec<f32>>> {
+            ) -> llms::embeddings::Result<std::sync::Arc<Vec<Vec<f32>>>> {
                 panic!("build_documents must not embed");
             }
 

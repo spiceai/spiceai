@@ -166,17 +166,46 @@ mod tests {
     async fn missing_path_produces_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does_not_exist.yaml");
-        load_pod(&missing)
+        let err = load_pod(&missing)
             .await
             .expect_err("missing path should fail to load");
+        // The I/O failure is surfaced with the path attached, which is what
+        // `spice validate` prints, rather than replaced by a vaguer message.
+        assert!(
+            matches!(&err, spicepod::Error::UnableToOpenSpicepod { path, .. } if *path == missing),
+            "{err:?}"
+        );
+        assert!(err.is_spicepod_missing(), "{err:?}");
+        let prefix = format!(
+            "Unable to open spicepod {missing}: Unable to open path {missing}: ",
+            missing = missing.display()
+        );
+        assert!(err.to_string().starts_with(&prefix), "{err}");
     }
 
     #[tokio::test]
     async fn invalid_yaml_produces_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_pod(&dir, "spicepod.yaml", "not: [valid, yaml: for: a spicepod");
-        load_pod(&path)
+        let err = load_pod(&path)
             .await
             .expect_err("invalid yaml should fail to load");
+        // A parse failure, not an open or resolve failure, with the guidance
+        // `spice validate` surfaces.
+        assert!(
+            matches!(err, spicepod::Error::UnableToParseSpicepod { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Failed to parse spicepod.yaml: "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                "See: https://docs.spiceai.org/reference/spicepod for the complete schema reference."
+            ),
+            "{message}"
+        );
     }
 }

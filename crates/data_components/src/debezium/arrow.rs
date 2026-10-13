@@ -594,28 +594,98 @@ mod tests {
         assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
+    /// Every `arrow_tools` decimal error must surface as its own Debezium error: the Debezium
+    /// message is what a CDC user sees for a malformed decimal value. The `arrow_tools` tests pin
+    /// which inputs fail; this pins what each failure says once it reaches the Debezium reader.
     #[test]
-    fn test_target_scale_too_low() {
-        let n: i128 = 1;
-        let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, 38, -1);
-        result.expect_err("Should fail for too low target scale");
-    }
+    fn decimal_errors_map_to_their_debezium_messages() {
+        let one = i128_to_base64(1);
+        let seventeen_bytes = BASE64_STANDARD.encode([0_u8; 17]);
+        let cases = [
+            (
+                "target scale below 0",
+                json!(one),
+                38,
+                -1,
+                "Invalid decimal JSON: target_scale must be in 0..=38",
+            ),
+            (
+                "target scale above 38",
+                json!(one),
+                38,
+                39,
+                "Invalid decimal JSON: target_scale must be in 0..=38",
+            ),
+            (
+                "decimal object without a scale",
+                json!({"value": one}),
+                38,
+                2,
+                "Missing the `scale` parameter for VariableScaleDecimal",
+            ),
+            (
+                "decimal object with a non-integer scale",
+                json!({"scale": "abc", "value": one}),
+                38,
+                2,
+                "scale must be integer",
+            ),
+            (
+                "decimal object without a value",
+                json!({"scale": 2}),
+                38,
+                2,
+                "Missing the `value` parameter for VariableScaleDecimal",
+            ),
+            (
+                "boolean",
+                json!(true),
+                38,
+                2,
+                "VariableScaleDecimal expects either string or object, got: boolean",
+            ),
+            (
+                "array",
+                json!([1, 2, 3]),
+                38,
+                2,
+                "VariableScaleDecimal expects either string or object, got: array",
+            ),
+            (
+                "source scale 127 cannot be rescaled to 38",
+                json!({"scale": 127, "value": one}),
+                38,
+                38,
+                "Overflow during decimal parsing",
+            ),
+            (
+                "value wider than 16 bytes",
+                json!(seventeen_bytes),
+                38,
+                2,
+                "Decimal value is not 16 bytes. Got: 17 bytes",
+            ),
+            (
+                "value too wide for the declared precision",
+                json!(i128_to_base64(12_345)),
+                4,
+                2,
+                "Failed to ingest a change event: decimal value 12345 is too wide for the column's declared precision 4. Widen the column's decimal precision in the source schema, or exclude the column. See: https://spiceai.org/docs/components/data-connectors/debezium",
+            ),
+        ];
 
-    #[test]
-    fn test_target_scale_too_high() {
-        let n: i128 = 1;
-        let input = json!(i128_to_base64(n));
-        let result = convert_json_to_decimal(&input, 38, 39);
-        result.expect_err("Should fail for too high target scale");
-    }
+        for (case, input, precision, target_scale, expected) in cases {
+            let err = convert_json_to_decimal(&input, precision, target_scale).expect_err(case);
+            assert_eq!(err.to_string(), expected, "{case}");
+        }
 
-    #[test]
-    fn test_object_missing_scale() {
-        let n: i128 = 12_345;
-        let input = json!({"value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 38, 2);
-        result.expect_err("Should fail for missing scale");
+        // The decoder's own message is not ours to pin; the variant is.
+        let err = convert_json_to_decimal(&json!("not base64!"), 38, 2)
+            .expect_err("a value that is not base64 must be rejected");
+        assert!(
+            matches!(err, Error::UnableToDecodeBase64 { .. }),
+            "a value that is not base64 must surface as a base64 decode error, got: {err:?}"
+        );
     }
 
     // decimal.handling.mode=double — plain JSON numbers
@@ -664,31 +734,6 @@ mod tests {
         let input = json!(0);
         let result = convert_json_to_decimal(&input, 38, 2);
         assert_eq!(result.ok().flatten(), Some(0));
-    }
-
-    #[test]
-    fn test_object_scale_not_integer() {
-        let n: i128 = 12_345;
-        let input = json!({"scale": "abc", "value": i128_to_base64(n)});
-        let result = convert_json_to_decimal(&input, 38, 2);
-        result.expect_err("Should fail for non-integer scale");
-    }
-
-    #[test]
-    fn test_object_missing_value() {
-        let input = json!({"scale": 2});
-        let result = convert_json_to_decimal(&input, 38, 2);
-        result.expect_err("Should fail for missing value");
-    }
-
-    #[test]
-    fn test_wrong_json_type() {
-        // Bool and Array are genuinely unsupported types.
-        let result = convert_json_to_decimal(&json!(true), 38, 2);
-        result.expect_err("Should fail for boolean JSON type");
-
-        let result = convert_json_to_decimal(&json!([1, 2, 3]), 38, 2);
-        result.expect_err("Should fail for array JSON type");
     }
 
     #[test]
@@ -754,10 +799,15 @@ mod tests {
 
         // Message is missing the required "status" field
         let value = json!({"id": 42});
-        let result = append_value_to_struct_builder(value, &mut builder);
+        let err = append_value_to_struct_builder(value, &mut builder)
+            .expect_err("Should fail when required field is missing");
         assert!(
-            result.is_err(),
-            "Should fail when required field is missing"
+            matches!(
+                &err,
+                Error::MissingFieldInValue { field_name, value }
+                    if field_name == "status" && *value == json!({"id": 42})
+            ),
+            "the missing non-nullable `status` column must be named, with the message it was missing from, got: {err:?}"
         );
     }
 

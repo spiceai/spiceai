@@ -211,6 +211,13 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;
             insta::assert_snapshot!("explain_met_last_modified_filtered", explain_met_last_modified_filtered);
 
+            run_query_and_snapshot(
+                &rt,
+                "SELECT id FROM met_last_modified WHERE _last_modified = '2024-10-10T05:37:00Z' ORDER BY id",
+                "met_last_modified_filtered",
+            )
+            .await;
+
             let mut query_result = rt
                 .datafusion()
                 .query_builder("EXPLAIN SELECT * FROM met_size WHERE _size = 2319 ORDER BY id, _size")

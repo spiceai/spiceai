@@ -29,6 +29,8 @@ use datafusion_table_providers::{
 use crate::{init_tracing, utils::test_request_context};
 
 #[cfg(feature = "postgres")]
+pub mod aggregate_clause_pushdown;
+#[cfg(feature = "postgres")]
 pub mod catalog;
 #[cfg(feature = "postgres")]
 pub mod catalog_changes;
@@ -57,8 +59,8 @@ async fn test_postgres_types() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context().scope(async {
-        let port = common::get_random_port()?;
-        let running_container = common::start_postgres_docker_container(port).await?;
+        let running_container = common::start_postgres_docker_container().await?;
+        let port = usize::from(running_container.host_port(5432)?);
 
         let ctx = SessionContext::new();
         let pool = common::get_postgres_connection_pool(port, None).await?;
@@ -86,6 +88,10 @@ async fn test_postgres_types() -> Result<(), anyhow::Error> {
             )
             .await.expect("inserted data");
         let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the type round trip is what this test exercises, and its query names no function"
+        )]
         let table = SqlTable::new("postgres", &sqltable_pool, "test", None)
             .await
             .expect("table can be created");
@@ -141,8 +147,8 @@ async fn test_postgres_unsupported_type_action() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let ctx = SessionContext::new();
             let pool =
@@ -167,6 +173,10 @@ CREATE TABLE test_jsonb (
                 .expect("table is created");
 
             let sqltable_pool: Arc<DynPostgresConnectionPool> = Arc::new(pool);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the type round trip is what this test exercises, and its query names no function"
+            )]
             let table = SqlTable::new("postgres", &sqltable_pool, "test_jsonb", None)
                 .await
                 .expect("table can be created");

@@ -32,8 +32,8 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
     write_back::WriteBackDeliverer,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::postgres::{DynPostgresConnectionPool, PostgresTableFactory};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -347,6 +347,10 @@ impl DataConnectorFactory for PostgresFactory {
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
                     let pool = Arc::new(pool);
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "serves only the write path, whose `PostgresTableWriter` neither federates nor pushes filters, and the write-back schema probe, which reads only `schema()`; reads go through `federated_postgres_table_provider`"
+                    )]
                     let factory = PostgresTableFactory::new(Arc::clone(&pool));
                     Ok(Arc::new(Postgres {
                         factory,
@@ -1011,17 +1015,19 @@ async fn federated_postgres_table_provider(
 ) -> std::result::Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
 {
     let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
-    let sql_table = Arc::new(
-        SqlTable::new(
-            "postgres",
-            &dyn_pool,
-            table_reference.clone(),
-            Some(Engine::Postgres),
-        )
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-        .with_dialect(Arc::new(PostgreSqlDialect {})),
-    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "routed through `create_spice_federated_table_provider` with `deny_spice_functions_for_postgres_table_providers()` below"
+    )]
+    let sql_table = SqlTable::new(
+        "postgres",
+        &dyn_pool,
+        table_reference.clone(),
+        Some(Engine::Postgres),
+    )
+    .await
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+    .with_dialect(Arc::new(PostgreSqlDialect {}));
 
     let schema = sql_table.schema();
     Ok(Arc::new(create_spice_federated_table_provider(
@@ -1030,6 +1036,22 @@ async fn federated_postgres_table_provider(
         table_reference,
         Some(deny_spice_functions_for_postgres_table_providers()),
     )))
+}
+
+/// Rejects a `refresh_mode: changes` dataset that has no key to apply UPDATE and
+/// DELETE events by, when it loads instead of after its changes stream starts.
+fn ensure_changes_primary_key(
+    dataset: &DatasetSpec,
+    provider: &Arc<dyn TableProvider>,
+) -> DataConnectorResult<()> {
+    if replication::changes_dataset_lacks_primary_key(dataset, provider) {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "postgres".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: replication::missing_primary_key_message(dataset),
+        });
+    }
+    Ok(())
 }
 
 /// The `on_conflict` upsert target to bind to the write-back writer, or `None`
@@ -1275,10 +1297,10 @@ impl DataConnector for Postgres {
             )
             .await
         {
-            Ok(provider) => Some(Ok(enrich_with_postgres_metadata(
-                &self.pool, dataset, provider,
-            )
-            .await)),
+            Ok(provider) => {
+                let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
+                Some(ensure_changes_primary_key(dataset, &provider).map(|()| provider))
+            }
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {
@@ -1323,7 +1345,11 @@ impl DataConnector for Postgres {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
         {
-            Ok(provider) => Ok(enrich_with_postgres_metadata(&self.pool, dataset, provider).await),
+            Ok(provider) => {
+                let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
+                ensure_changes_primary_key(dataset, &provider)?;
+                Ok(provider)
+            }
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {

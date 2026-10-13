@@ -1,0 +1,3 @@
+# Independent test oracles only; never linked into Spice.
+slatedb==0.17.0
+redis==6.4.0

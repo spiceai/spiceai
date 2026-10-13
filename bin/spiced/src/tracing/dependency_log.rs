@@ -166,7 +166,7 @@ fn s3_read_retry_message(diagnostic: &str) -> Option<String> {
         let value = values.next()?;
         values.next().is_none().then_some(value)
     };
-    if context_value("service")? != "s3" || context_value("called")? != "http_util::Client::send" {
+    if context_value("service")? != "s3" || context_value("called")? != "reqwest::send" {
         return None;
     }
 
@@ -204,7 +204,7 @@ mod tests {
 
     fn diagnostic(url: &str) -> String {
         format!(
-            "will retry Read (attempt 1) after 1s because: Unexpected (temporary) at read => send http request\n\nContext:\n   url: {url}\n   called: http_util::Client::send\n   service: s3\n   path: team_app/task_history/metadata/test-m0.avro\n   range: 0-\n\nSource:\n   error sending request for url ({url}): client error (SendRequest): connection closed before message completed\n"
+            "will retry Read (attempt 1) after 1s because: Unexpected (temporary) at read => send http request\n\nContext:\n   url: {url}\n   called: reqwest::send\n   service: s3\n   path: team_app/task_history/metadata/test-m0.avro\n   range: 0-\n\nSource:\n   error sending request for url ({url}): client error (SendRequest): connection closed before message completed\n"
         )
     }
 
@@ -268,7 +268,7 @@ mod tests {
             original.replace("   url:", "   uri:"),
             original.replace("   url:", &format!("   url: {URL}\n   url:")),
             original.replace("   service:", "   service: s3\n   service:"),
-            original.replace("http_util::Client::send", "a different caller"),
+            original.replace("reqwest::send", "a different caller"),
             original.replace("client error (SendRequest)", "another error"),
             original.replace(
                 "before message completed",

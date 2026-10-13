@@ -39,6 +39,7 @@ pub use routes::get_api_doc;
 mod mtls;
 mod response_outcome;
 mod routes;
+mod server_timing;
 
 pub mod v1;
 
@@ -341,11 +342,7 @@ mod tests {
     use futures::future;
     use http::StatusCode;
     use std::time::Duration;
-    use tokio::{
-        net::TcpListener,
-        sync::watch,
-        time::{sleep, timeout},
-    };
+    use tokio::{net::TcpListener, sync::watch, time::timeout};
 
     // Router that immediately responds with "ok"
     fn ok_router() -> Router {
@@ -388,8 +385,16 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         drop(client);
-        // Add extra delay to ensure enough time for the connection to be closed
-        sleep(Duration::from_millis(500)).await;
+        // The connection task holds a shutdown receiver for as long as the
+        // connection is open, so `closed()` resolves exactly when it has ended.
+        timeout(Duration::from_secs(2), shutdown_notify.closed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the connection should close once the client is dropped; {} connection(s) still open",
+                    shutdown_notify.receiver_count()
+                )
+            });
 
         assert_eq!(
             shutdown_notify.receiver_count(),

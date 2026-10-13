@@ -36,34 +36,20 @@ const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 
 #[instrument]
 pub async fn start_kafka_docker_container(
-    port: u16,
     topics: &[&str],
-) -> Result<(RunningContainer<'static>, FutureProducer), anyhow::Error> {
-    let container_name = format!("{KAFKA_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
+) -> Result<(RunningContainer, FutureProducer), anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(KAFKA_DOCKER_CONTAINER)
         // Use Redpanda (Kafka-API compatible) as for dev/test purpose:
         // single binary (no JVM), fast startup, smaller CPU/RAM footprint
         // than apache/kafka - ideal for CI and local tests.
         .image(REDPANDA_IMAGE.to_string())
+        // Docker owns the published port before the broker advertises it. The
+        // internal listener serves in-container rpk; the external listener serves clients.
+        .entrypoint(["/bin/sh", "-c"])
         .command([
-            "redpanda",
-            "start",
-            "--set",
-            "redpanda.enable_sasl=true",
-            "--set",
-            &format!(r#"redpanda.superusers=["{KAFKA_SASL_USERNAME}"]"#),
-            "--smp",
-            "1",
-            "--overprovisioned",
-            "--node-id",
-            "0",
-            "--mode",
-            "dev-container",
-            &format!("--kafka-addr=SASL_PLAINTEXT://0.0.0.0:{port}"),
-            &format!("--advertise-kafka-addr=SASL_PLAINTEXT://127.0.0.1:{port}"),
+            format!(r#"while [ ! -f /tmp/kafka-host-port ]; do sleep 0.1; done; exec rpk redpanda start --set redpanda.enable_sasl=true --set 'redpanda.superusers=["{KAFKA_SASL_USERNAME}"]' --smp 1 --overprovisioned --node-id 0 --mode dev-container --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 --advertise-kafka-addr internal://127.0.0.1:9092,external://127.0.0.1:$(cat /tmp/kafka-host-port)"#),
         ])
-        .add_port_binding(port, port)
+        .publish_port(19092)
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
@@ -76,11 +62,24 @@ pub async fn start_kafka_docker_container(
             start_interval: None,
         })
         .build()?
-        .run(Some(KAFKA_CONTAINER_START_TIMEOUT))
+        .start()
+        .await?;
+    let port = running_container.host_port(19092)?;
+    running_container
+        .exec([
+            "sh",
+            "-c",
+            &format!(
+                "printf '%s' '{port}' > /tmp/kafka-host-port.tmp && mv /tmp/kafka-host-port.tmp /tmp/kafka-host-port"
+            ),
+        ])
+        .await?;
+    running_container
+        .wait_healthy(Some(KAFKA_CONTAINER_START_TIMEOUT))
         .await?;
 
     tracing::debug!("Kafka user creation command result: {}", running_container.exec_cmd(
-        &format!("rpk acl user create {KAFKA_SASL_USERNAME} -p {KAFKA_SASL_PASSWORD} --mechanism {KAFKA_SASL_MECHANISM} -X brokers=localhost:{port}"),
+        &format!("rpk acl user create {KAFKA_SASL_USERNAME} -p {KAFKA_SASL_PASSWORD} --mechanism {KAFKA_SASL_MECHANISM} -X brokers=localhost:9092"),
     )
     .await?);
 
@@ -90,7 +89,7 @@ pub async fn start_kafka_docker_container(
             running_container
                 .exec_cmd(&format!(
                     "rpk topic create {topic} \
-                --brokers localhost:{port} \
+                --brokers localhost:9092 \
                 --user {KAFKA_SASL_USERNAME} \
                 --password {KAFKA_SASL_PASSWORD} \
                 --sasl-mechanism {KAFKA_SASL_MECHANISM}"
@@ -106,7 +105,7 @@ pub async fn start_kafka_docker_container(
     )?;
 
     // Verify broker is ready to accept connections by fetching metadata
-    verify_broker_ready(&producer, topics).await?;
+    verify_broker_ready(&producer, topics, port).await?;
 
     Ok((running_container, producer))
 }
@@ -141,6 +140,7 @@ pub fn create_kafka_producer(
 async fn verify_broker_ready(
     producer: &FutureProducer,
     topics: &[&str],
+    port: u16,
 ) -> Result<(), anyhow::Error> {
     const MAX_RETRIES: u32 = 10;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -149,6 +149,13 @@ async fn verify_broker_ready(
     for attempt in 1..=MAX_RETRIES {
         match producer.client().fetch_metadata(None, METADATA_TIMEOUT) {
             Ok(metadata) => {
+                anyhow::ensure!(
+                    !metadata.brokers().is_empty()
+                        && metadata.brokers().iter().all(|broker| {
+                            broker.host() == "127.0.0.1" && broker.port() == i32::from(port)
+                        }),
+                    "Kafka metadata must advertise this fixture's published endpoint 127.0.0.1:{port}"
+                );
                 // Verify that all expected topics exist
                 let available_topics: Vec<&str> = metadata
                     .topics()
@@ -163,7 +170,7 @@ async fn verify_broker_ready(
 
                 if missing_topics.is_empty() {
                     tracing::debug!(
-                        "Broker ready: found {} brokers and {} topics",
+                        "Broker ready at 127.0.0.1:{port}: found {} brokers and {} topics",
                         metadata.brokers().len(),
                         metadata.topics().len()
                     );
@@ -352,7 +359,7 @@ pub async fn send_message_to_kafka_partition(
 
 /// Create a Kafka topic with a specific number of partitions.
 pub async fn create_kafka_topic_with_partitions(
-    running_container: &crate::docker::RunningContainer<'static>,
+    running_container: &crate::docker::RunningContainer,
     port: u16,
     topic: &str,
     partitions: i32,
@@ -361,7 +368,7 @@ pub async fn create_kafka_topic_with_partitions(
         .exec_cmd(&format!(
             "rpk topic create {topic} \
             --partitions {partitions} \
-            --brokers localhost:{port} \
+            --brokers localhost:9092 \
             --user {KAFKA_SASL_USERNAME} \
             --password {KAFKA_SASL_PASSWORD} \
             --sasl-mechanism {KAFKA_SASL_MECHANISM}"

@@ -83,6 +83,32 @@ impl TypeRewriteRule for MapEntriesNonNullable {
     }
 }
 
+/// Rewrites `DataType::Map(entries, _)` → `DataType::List(entries)`, keeping `entries` exactly
+/// as it was declared.
+///
+/// A map *is* a list of key/value structs — the two share one layout, and `arrow-ipc` builds
+/// both through the same code path from the same buffers. What separates them is the pair of
+/// rules Arrow puts on a map alone: `entries` must be declared non-nullable, and it must hold no
+/// nulls. `ArrayData::validate` enforces the first and `validate_nulls` the second, both inside
+/// the decode, so a producer that declared `entries` nullable writes bytes that will not decode
+/// back — and the failure names neither the column nor which of the two rules it broke.
+///
+/// Reading those same buffers as the list they are lets the decode complete under full
+/// validation, leaving [`crate::map_entries::MapEntriesNormalizer`] to say which rule was
+/// broken, name the column, and rebuild the column as the map it describes. Nothing here is a
+/// judgement about the data: it is the label the decoder is given, and it is put back before the
+/// batch is handed on.
+#[derive(Debug)]
+pub struct MapAsList;
+impl TypeRewriteRule for MapAsList {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Map(entries, _) => Some(DataType::List(Arc::clone(entries))),
+            _ => None,
+        }
+    }
+}
+
 /// Rewrites `DataType::Null` → `DataType::Int32`.
 ///
 /// `DuckDB` has no Null type and silently coerces it to INT32 when creating tables.
@@ -1056,7 +1082,7 @@ fn relabel_changes_meaning(source: &DataType, target: &DataType) -> ArrowError {
 /// This mirrors `ArrayData`'s own `validate_child_data`, and it has to cover every
 /// child-bearing type [`rewrite_data_type`] descends into: a type this misses is one whose
 /// parent gets rebuilt while its children keep the old type, which `build` then rejects.
-fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
+pub(crate) fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
     match target_type {
         DataType::List(field)
         | DataType::LargeList(field)
@@ -1107,12 +1133,15 @@ mod tests {
             )),
             false,
         );
-        let map = ArrayData::builder(map_type)
+        let map_builder = ArrayData::builder(map_type)
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0i32, 2]))
-            .add_child_data(entries)
-            .build()
-            .expect("a map with nullable entries decodes even though Arrow forbids it");
+            .add_child_data(entries);
+        // SAFETY: the offsets, buffers and child data are all well formed. The only
+        // thing `ArrayData::validate` objects to is the `entries` nullability
+        // declaration, which is exactly what this fixture exists to reproduce — the
+        // IPC reader builds such a map without either check.
+        let map = unsafe { map_builder.build_unchecked() };
         let target = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -1693,8 +1722,7 @@ mod tests {
 
     /// Answering a question about a `Dictionary` means materializing it, and `make_array` recurses
     /// into its values — so a map still awaiting the [`MapEntriesNonNullable`] correction ends up
-    /// there too. That is safe: `MapArray::try_new` refuses a nullable `entries` field, but
-    /// `make_array` goes through `MapArray::from`, which does not.
+    /// there too.
     ///
     /// This pins the fact rather than the reasoning. The dictionary holds no null, so the narrowing
     /// is admitted; if a future arrow-rs made `MapArray::from` validate, this would abort instead —
@@ -1705,28 +1733,39 @@ mod tests {
         let (map, _) = map_with_nullable_entries();
         let dictionary_type =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(map.data_type().clone()));
-        let dictionary = ArrayData::builder(dictionary_type.clone())
+        let dictionary_builder = ArrayData::builder(dictionary_type.clone())
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0_i32]))
-            .add_child_data(map)
-            .build()
-            .expect("one key over a one-entry dictionary of maps");
-        let source = ArrayData::builder(DataType::List(Arc::new(Field::new(
+            .add_child_data(map);
+        // SAFETY: validation recurses into the map child, whose `entries` declaration
+        // is the shape under test; the dictionary itself is well formed.
+        let dictionary = unsafe { dictionary_builder.build_unchecked() };
+        let source_builder = ArrayData::builder(DataType::List(Arc::new(Field::new(
             "item",
             dictionary_type.clone(),
             true,
         ))))
         .len(1)
         .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
-        .add_child_data(dictionary)
-        .build()
-        .expect("a list of one dictionary");
+        .add_child_data(dictionary);
+        // SAFETY: validation recurses to the map at the bottom of the chain, whose
+        // `entries` declaration is the shape under test; the list is well formed.
+        let source = unsafe { source_builder.build_unchecked() };
         let target = DataType::List(Arc::new(Field::new("item", dictionary_type, false)));
 
-        let relabelled = relabel_array_data(source, &target)
-            .expect("the dictionary holds no null, so narrowing the item is admitted");
+        // Arrow validates a map's `entries` declaration in `ArrayData::validate`, which
+        // `relabel_validated_array_data` builds through. Relabelling anything above a map
+        // that still declares `entries` nullable is therefore refused, whatever the
+        // relabel itself asks for — the narrowing of the list item here is admissible on
+        // its own. `MapEntriesNonNullable` has to have corrected the map first, which is
+        // why `MapEntriesNormalizer` runs at ingress rather than on demand.
+        let err = relabel_array_data(source, &target)
+            .expect_err("a map still declaring nullable entries cannot be rebuilt");
 
-        assert_eq!(relabelled.data_type(), &target);
+        assert!(
+            err.to_string().contains("map entries"),
+            "the error must name the entries declaration it refused, got: {err}"
+        );
     }
 
     /// `UnionArray::logical_nulls` reports its values' whole buffer rather than the union's own
@@ -1867,11 +1906,10 @@ mod tests {
             .null_bit_buffer(Some(Buffer::from([0b0000_0001])))
             .build()
             .expect("a struct may carry a null bitmap");
-        let malformed = map
-            .into_builder()
-            .child_data(vec![nulled_entries])
-            .build()
-            .expect("the map shape is unchanged");
+        let malformed_builder = map.into_builder().child_data(vec![nulled_entries]);
+        // SAFETY: the shape is unchanged from the map above; the entries declaration
+        // and the entry-level nulls are what this fixture exists to present.
+        let malformed = unsafe { malformed_builder.build_unchecked() };
 
         let err = relabel_array_data(malformed, &target).expect_err(
             "entries holding a null cannot be republished as the non-nullable field Arrow requires",

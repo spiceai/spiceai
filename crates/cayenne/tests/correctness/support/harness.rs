@@ -93,6 +93,10 @@ where
 
 /// Assert that every `ParityOutcome` is Pass or justified Excluded; panic with
 /// detail otherwise. Integration tests call this so a human never “grades” logs.
+///
+/// An empty agreement fails here. A review accepts one only on the fixture it
+/// names, which these labels do not carry; a lane with reviewed-empty queries
+/// reports through [`super::report::unexplained`] instead.
 pub fn assert_all_pass_or_excluded(results: &[(String, ParityOutcome)], context: &str) {
     let fails: Vec<_> = results
         .iter()
@@ -117,7 +121,9 @@ pub fn assert_modes_agree_on_actual_results(
     let (ref_mode, ref_batches) = mode_batches[0];
     for (mode, batches) in mode_batches.iter().skip(1) {
         let outcome = compare_actual_results(query, ref_batches, batches);
-        if !matches!(outcome, ParityOutcome::Pass) {
+        // Two modes that both returned nothing agree; whether nothing was the
+        // right answer is the per-mode comparison's to report.
+        if !matches!(outcome, ParityOutcome::Pass | ParityOutcome::Vacuous { .. }) {
             return ParityOutcome::Fail {
                 detail: format!(
                     "load modes disagree on actual results for {}: {ref_mode} vs {mode}: {outcome:?}",

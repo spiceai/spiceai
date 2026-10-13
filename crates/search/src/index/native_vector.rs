@@ -40,7 +40,7 @@ use crate::index::{SearchIndex, VectorIndex};
 use arrow::array::RecordBatch;
 use arrow_schema::Field;
 use async_trait::async_trait;
-use datafusion::{error::DataFusionError, logical_expr::LogicalPlan, sql::TableReference};
+use datafusion::{common::TableReference, error::DataFusionError, logical_expr::LogicalPlan};
 use spice_table::{GroupPruning, Index};
 
 /// A vector index that scores rows in-table via Spice's SIMD similarity UDFs.

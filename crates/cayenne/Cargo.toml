@@ -6,6 +6,7 @@ license = "Apache-2.0"
 name = "cayenne"
 repository = "https://github.com/spiceai/spiceai"
 version.workspace = true
+autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
@@ -35,10 +36,14 @@ datafusion-expr = { workspace = true }
 datafusion-functions-aggregate-common = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto = { workspace = true }
 datafusion-pruning = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
+key-index = { path = "../key-index" }
 im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
@@ -114,6 +119,7 @@ result-correctness-chdb = ["dep:chdb-rust"]
 
 [dev-dependencies]
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+tpcdsgen = { workspace = true }
 tpchgen = { workspace = true }
 vortex-io = { workspace = true }
 # Kept only for the `row_converter` byte-identity equivalence test; Cayenne's runtime no
@@ -137,6 +143,7 @@ test-framework = { path = "../test-framework" }
 test-log = { version = "0.2", features = ["trace"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
 tokio-stream = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 # The `compaction_io_hygiene` bench reproduces the Linux-only fadvise/fsync
 # primitives (`sync_file_range`, `posix_fadvise`, `mincore`) directly. cayenne
@@ -157,6 +164,10 @@ loom = { workspace = true }
 [[bench]]
 harness = false
 name = "in_list_query_e2e"
+
+[[bench]]
+harness = false
+name = "lookup_index_freshness"
 
 [[bench]]
 harness = false
@@ -484,6 +495,10 @@ name = "mem_tier_seal_cadence"
 
 [[bench]]
 harness = false
+name = "metastore_manifest_rewrite"
+
+[[bench]]
+harness = false
 name = "publish_metadata_wall"
 
 [[bench]]
@@ -510,43 +525,22 @@ name = "pk_keyset_present_path"
 harness = false
 name = "scan_view_reuse_qps"
 
-# Result *correctness* (not perf): inventory completeness + pure compare path.
-[[test]]
-name = "result_correctness_inventory_test"
-path = "tests/result_correctness_inventory_test.rs"
+[lints]
+workspace = true
 
-# Static comparison-cell census over the inventory. Links no engines; prints the
-# planned-coverage ceiling as markdown. Not a gate — it asserts nothing.
 [[test]]
-name = "result_correctness_census_test"
-path = "tests/result_correctness_census_test.rs"
+name = "integration"
+path = "tests/integration.rs"
 
-# Result correctness vs DuckDB on SF1 suites + SQLLancer. Not a Criterion bench.
+# Process-wide heap measurements share one counting global allocator.
 [[test]]
-name = "result_correctness_vs_duckdb_test"
-path = "tests/result_correctness_vs_duckdb_test.rs"
-required-features = ["result-correctness-duckdb"]
+name = "isolated"
+path = "tests/isolated.rs"
 
-# Result correctness vs chDB (SQLLancer + micro). Separate process from DuckDB
-# — the engines cannot co-link. Not a Criterion bench.
+# Result correctness vs chDB (SQLLancer + micro). Its own binary because chDB and
+# DuckDB cannot be linked into one process, and the DuckDB lanes are modules of
+# `integration`.
 [[test]]
 name = "result_correctness_vs_chdb_test"
 path = "tests/result_correctness_vs_chdb_test.rs"
 required-features = ["result-correctness-chdb"]
-
-# Result correctness vs SQLite (SSB + SQLLancer + micro). Always linked
-# (rusqlite is a cayenne dependency). Not a Criterion bench.
-[[test]]
-name = "result_correctness_vs_sqlite_test"
-path = "tests/result_correctness_vs_sqlite_test.rs"
-
-# Out-of-Spice oracle baseline: standalone DuckDB ↔ standalone SQLite (no
-# Cayenne / no Spice accelerators). Validates external engines agree before
-# accelerator-vs-oracle gates. Requires DuckDB feature for one side.
-[[test]]
-name = "result_correctness_standalone_engines_test"
-path = "tests/result_correctness_standalone_engines_test.rs"
-required-features = ["result-correctness-duckdb"]
-
-[lints]
-workspace = true

@@ -399,7 +399,7 @@ impl McpToolCatalog {
                     )
                     .await;
                 }
-                immediate_already_refreshed = tool_cache_clone.read().ok().is_some_and(|cache| {
+                immediate_already_refreshed = tool_cache_clone.read().is_ok_and(|cache| {
                     matches!(cache.expires_at, ListCacheExpiry::ImmediatelyStale)
                 });
             }
@@ -451,8 +451,7 @@ impl McpToolCatalog {
     fn cache_is_fresh(&self) -> bool {
         self.tool_cache
             .read()
-            .ok()
-            .is_some_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
+            .is_ok_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
     }
 
     fn cached_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -718,8 +717,7 @@ fn ttl_wait(
 fn listed_cache_is_stale(cache: &StdRwLock<ToolListCache>) -> bool {
     !cache
         .read()
-        .ok()
-        .is_some_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
+        .is_ok_and(|cache| list_cache_is_fresh(cache.expires_at, Instant::now()))
 }
 
 /// `try_get` must not return a listed spec after `ttlMs` expires.
@@ -2015,39 +2013,6 @@ mod tests {
             }
             other => panic!("expected Auto lifecycle, got {other:?}"),
         }
-    }
-
-    /// The reconnect write-lock-across-await bug: a 50 ms timeout is
-    /// not enough for a reader while the writer is still in its awaited
-    /// probe.
-    #[tokio::test]
-    async fn write_lock_held_across_await_blocks_readers() {
-        let slot = Arc::new(RwLock::new(0_u32));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let slot_writer = Arc::clone(&slot);
-        let writer = tokio::spawn(async move {
-            let mut guard = slot_writer.write().await;
-            started_tx
-                .send(())
-                .expect("reader is waiting for the write lock to be held");
-            release_rx
-                .await
-                .expect("test must release the held write lock");
-            *guard = 1;
-        });
-        started_rx
-            .await
-            .expect("writer must take the write lock before the reader races");
-        let blocked = tokio::time::timeout(Duration::from_millis(50), slot.read()).await;
-        assert!(
-            blocked.is_err(),
-            "reader_wait: a write lock held across await must block concurrent readers"
-        );
-        release_tx
-            .send(())
-            .expect("writer is waiting to drop the write lock");
-        writer.await.expect("writer should finish after release");
     }
 
     /// Await `fetch` without the write lock, then publish `new_value`.

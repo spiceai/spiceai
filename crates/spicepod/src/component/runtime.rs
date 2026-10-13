@@ -25,7 +25,7 @@ use super::{
 use crate::metric::Metrics;
 use crate::param::Params;
 #[cfg(feature = "schemars")]
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
@@ -55,6 +55,11 @@ pub struct Runtime {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub params: HashMap<String, String>,
+
+    /// Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives
+    /// Cayenne's knobs statically; `enabled` also runs its closed-loop controller.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adaptive_tuning: AdaptiveTuning,
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
@@ -100,6 +105,14 @@ pub struct Runtime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
+    /// Shared object-store location for runtime state (`file://`, `s3://`,
+    /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
+    /// source rate control, and distributed query state. Each feature writes
+    /// under its own folder: `results-cache/`, `rate-control/` and `cluster/`.
+    /// A `runtime.scheduler.state_location` overrides it for the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
 
@@ -111,6 +124,39 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Scheduler tuning config. When only `runtime.state` is set, the scheduler
+    /// runs with default tuning. [`Self::scheduler_state`] gives where the
+    /// scheduler keeps its state.
+    #[must_use]
+    pub fn resolved_scheduler(&self) -> Option<Scheduler> {
+        match (&self.scheduler, &self.state) {
+            (Some(scheduler), _) => Some(scheduler.clone()),
+            (None, Some(_)) => Some(Scheduler::default()),
+            (None, None) => None,
+        }
+    }
+
+    /// Where the scheduler keeps cluster state: `runtime.scheduler.state_location`
+    /// when set, else `runtime.state`. `runtime.scheduler.params`, when set,
+    /// apply to either location.
+    #[must_use]
+    pub fn scheduler_state(&self) -> Option<StateLocation> {
+        let scheduler = self.scheduler.as_ref();
+        let params = scheduler.and_then(|scheduler| scheduler.params.as_ref());
+        if let Some(location) = scheduler.and_then(|scheduler| scheduler.state_location.as_ref()) {
+            return Some(StateLocation {
+                location: location.clone(),
+                params: params.cloned(),
+                source: StateSource::FeatureSetting,
+            });
+        }
+        self.state.as_ref().map(|state| StateLocation {
+            location: state.location.clone(),
+            params: params.or(state.params.as_ref()).cloned(),
+            source: StateSource::RuntimeState,
+        })
+    }
+
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
         if let Some(timeout_str) = &self.shutdown_timeout {
             let duration = duration_parse::parse_duration(timeout_str)
@@ -140,6 +186,86 @@ pub enum RuntimeReadyState {
     /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
     /// as long as none is `ShuttingDown`.
     OnRegistration,
+}
+
+/// Turns adaptive tuning on or off for the whole runtime.
+///
+/// `disabled` (the default) derives Cayenne's knobs statically from the host and, where
+/// available, the inferred schema. `enabled` additionally runs Cayenne's closed-loop
+/// controller, which moves them within the statically derived bounds. The
+/// `runtime.params.target_*` setpoints steer the controller and never turn it on.
+///
+/// Only the exact values `enabled` and `disabled` are accepted, matching the published
+/// schema. Anything else, including a different case or surrounding whitespace, fails the
+/// Spicepod load.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveTuning {
+    /// Derive the knobs statically. No closed loop.
+    #[default]
+    Disabled,
+    /// Run the closed-loop controller (preview).
+    Enabled,
+}
+
+impl AdaptiveTuning {
+    /// Resolve a raw value. Only `enabled` and `disabled` are valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns a user-facing error naming the invalid value as written.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(invalid_tuning_message(raw)),
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+// Not derived, so an invalid value reports the documented message rather than serde's
+// generic unknown-variant or type text. A scalar that is not a string (`true`, `1`) is
+// reported as written; `true`/`false` are deliberately not accepted as aliases.
+impl<'de> Deserialize<'de> for AdaptiveTuning {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AdaptiveTuningVisitor;
+
+        impl serde::de::Visitor<'_> for AdaptiveTuningVisitor {
+            type Value = AdaptiveTuning;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`enabled` or `disabled`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                AdaptiveTuning::parse(value).map_err(E::custom)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+        }
+
+        deserializer.deserialize_any(AdaptiveTuningVisitor)
+    }
 }
 
 /// Controls registration and execution surfaces for Spicepod user-defined functions.
@@ -497,6 +623,124 @@ impl Default for TelemetryConfig {
             otel_exporter: None,
         }
     }
+}
+
+/// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
+pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
+
+/// The runtime-wide targets the adaptive controller steers toward, under `runtime.params`.
+/// They steer the closed loop and never turn it on.
+pub const TUNING_TARGET_PARAMS: &[&str] = &[
+    "target_replication_lag",
+    "target_freshness",
+    "target_query_latency",
+    "target_convergence_window",
+    "target_qph",
+];
+
+/// Whether `runtime.params` sets any of [`TUNING_TARGET_PARAMS`].
+#[must_use]
+pub fn tuning_targets_set<S: std::hash::BuildHasher>(params: &HashMap<String, String, S>) -> bool {
+    TUNING_TARGET_PARAMS
+        .iter()
+        .any(|key| params.contains_key(*key))
+}
+
+/// Dataset acceleration parameters that moved to `runtime.params` and are no longer read.
+///
+/// Each is listed in its prefixed and unprefixed spelling, since a user may write either.
+pub const RETIRED_DATASET_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
+
+/// Catalog parameters that moved to `runtime.params` and are no longer read.
+pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
+
+/// `runtime.params` keys renamed without the `cayenne_` prefix, as `(old, new)`. The old
+/// names are no longer read.
+pub const RENAMED_RUNTIME_TUNING_PARAMS: &[(&str, &str)] = &[
+    ("cayenne_goal_replication_lag", "target_replication_lag"),
+    ("cayenne_goal_freshness", "target_freshness"),
+    ("cayenne_goal_query_latency", "target_query_latency"),
+    (
+        "cayenne_goal_convergence_window",
+        "target_convergence_window",
+    ),
+    ("cayenne_goal_qph", "target_qph"),
+];
+
+/// One warning for each of `retired` that `params` still sets on a dataset or catalog.
+///
+/// `kind` is `"dataset"` or `"catalog"` and `name` the component's name. The result is
+/// ordered as `retired` is, so the log is stable.
+#[must_use]
+pub fn retired_tuning_param_warnings<S: std::hash::BuildHasher>(
+    kind: &str,
+    name: &str,
+    params: &HashMap<String, String, S>,
+    retired: &[&str],
+) -> Vec<String> {
+    retired
+        .iter()
+        .filter(|key| params.contains_key(**key))
+        .map(|key| {
+            let bare = key.strip_prefix("cayenne_").unwrap_or(key);
+            let replacement = if bare == "tuning" {
+                "runtime.adaptive_tuning".to_string()
+            } else if let Some(target) = bare.strip_prefix("goal_") {
+                format!("runtime.params.target_{target}")
+            } else {
+                format!("runtime.params.{bare}")
+            };
+            let mut subject = kind.to_string();
+            if let Some(first) = subject.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!(
+                "{subject} '{name}' sets `{key}`, which is no longer a {kind} parameter, so it has no effect. Set `{replacement}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+            )
+        })
+        .collect()
+}
+
+/// The warning for a `runtime.params` key that was renamed to `new_name`.
+#[must_use]
+pub fn renamed_runtime_param_warning(old_name: &str, new_name: &str) -> String {
+    format!(
+        "`runtime.params.{old_name}` has been renamed, so it has no effect. Set `runtime.params.{new_name}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
+}
+
+/// The error for an unrecognized `runtime.adaptive_tuning` value.
+#[must_use]
+pub fn invalid_tuning_message(value: &str) -> String {
+    format!(
+        "Invalid `runtime.adaptive_tuning` value '{value}': expected `enabled` or `disabled`. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
 }
 
 /// Validate `runtime.telemetry.metric_prefix` against OpenTelemetry instrument
@@ -870,11 +1114,39 @@ pub struct ApiKeyAuth {
 ///
 /// All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
 /// constant-time comparison via the `subtle` crate to prevent timing attacks.
+///
+/// YAML/JSON configuration accepts a string. Optional `:ro` (default) or `:rw`
+/// suffix selects capability (for example `sk_live:rw`).
 #[derive(Clone)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub enum ApiKey {
     ReadOnly { key: String },
     ReadWrite { key: String },
+}
+
+/// Aligns the generated Spicepod JSON Schema with [`Deserialize`] / [`Serialize`],
+/// which accept and emit API keys as strings (not externally-tagged enum objects).
+#[cfg(feature = "schemars")]
+impl JsonSchema for ApiKey {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ApiKey".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::ApiKey").into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "description": "API key for authentication. Keys can be read-only or read-write.
+The key value is redacted in Debug output to prevent credential leakage.
+
+Pass the key as a string. Optional `:ro` (default) or `:rw` suffix selects capability.
+
+All comparisons (both `ApiKey` to `ApiKey` and `ApiKey` to `&str`) use
+constant-time comparison via the `subtle` crate to prevent timing attacks.",
+        })
+    }
 }
 
 /// Constant-time comparison for `ApiKey` to `ApiKey`.
@@ -1300,12 +1572,61 @@ pub enum SpillCompression {
     Uncompressed,
 }
 
+/// Shared object-store location for runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct RuntimeState {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).
+    pub location: String,
+
+    /// Optional object store params (for example S3 `s3_region` / `s3_auth`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+}
+
+/// An object-store location for one feature's shared state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateLocation {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).
+    pub location: String,
+
+    /// Object store params for the location.
+    pub params: Option<Params>,
+
+    /// The setting that gave the location.
+    pub source: StateSource,
+}
+
+impl From<&RuntimeState> for StateLocation {
+    fn from(state: &RuntimeState) -> Self {
+        Self {
+            location: state.location.clone(),
+            params: state.params.clone(),
+            source: StateSource::RuntimeState,
+        }
+    }
+}
+
+/// The setting that gave a feature its state location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSource {
+    /// `runtime.state`. Each feature keeps its objects in its own folder under
+    /// the location.
+    RuntimeState,
+    /// The feature's own setting, such as `runtime.scheduler.state_location`.
+    /// The feature keeps its objects at the location root.
+    FeatureSetting,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
-    /// Root URI for shared cluster state.
-    pub state_location: String,
+    /// Root URI for shared cluster state. Optional when [`Runtime::state`]
+    /// provides the location (see [`Runtime::scheduler_state`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
 
     /// Optional object store params for the shared cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1328,19 +1649,26 @@ pub struct Scheduler {
     pub partition_discovery_timeout: String,
 }
 
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self {
+            state_location: None,
+            params: None,
+            partition_assignment_interval: default_partition_assignment_interval(),
+            max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
+            ),
+            max_partitions_per_executor: default_max_partitions_per_executor(),
+            partition_discovery_timeout: default_partition_discovery_timeout(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SourceRateControl {
-    /// Root URI for globally persisted source rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_location: Option<String>,
-
-    /// Optional object store params for source rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Params>,
-
-    /// How often each runtime refreshes and persists per-source rate-control state in object storage.
+    /// How often each runtime refreshes and persists per-source rate-control
+    /// state at `runtime.state.location`.
     #[serde(default = "default_rate_control_refresh_interval")]
     pub refresh_interval: String,
 
@@ -1352,8 +1680,6 @@ pub struct SourceRateControl {
 impl Default for SourceRateControl {
     fn default() -> Self {
         Self {
-            state_location: None,
-            params: None,
             refresh_interval: default_rate_control_refresh_interval(),
             github_concurrent_connections_limit: None,
         }
@@ -1407,6 +1733,11 @@ pub struct RuntimeDeserializer {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub params: HashMap<String, String>,
+
+    /// Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives
+    /// Cayenne's knobs statically; `enabled` also runs its closed-loop controller.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adaptive_tuning: AdaptiveTuning,
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1446,6 +1777,8 @@ pub struct RuntimeDeserializer {
     pub cpu: Option<Cpu>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RuntimeState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1512,6 +1845,10 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             validate_metric_prefix(prefix)?;
         }
 
+        if let Some(sql_results) = &caching.sql_results {
+            crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
+        }
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -1519,6 +1856,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             tracing: deserializer.tracing,
             telemetry: deserializer.telemetry,
             params: deserializer.params,
+            adaptive_tuning: deserializer.adaptive_tuning,
             task_history: deserializer.task_history,
             drasi: deserializer.drasi,
             auth: deserializer.auth,
@@ -1535,6 +1873,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             },
             cpu: deserializer.cpu,
             metrics: deserializer.metrics,
+            state: deserializer.state,
             scheduler: deserializer.scheduler,
             source_rate_control: deserializer.source_rate_control,
             functions: deserializer.functions,
@@ -1546,6 +1885,41 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 mod tests {
     use super::*;
     use yaml;
+
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn test_api_key_json_schema_is_string() {
+        use schemars::schema_for;
+        let schema = schema_for!(ApiKey);
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        assert_eq!(
+            value.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "ApiKey JSON Schema must match string Deserialize/Serialize: {value}"
+        );
+        assert!(
+            value.get("oneOf").is_none(),
+            "ApiKey must not use externally-tagged object oneOf: {value}"
+        );
+    }
+
+    #[test]
+    fn test_runtime_rejects_warmup_with_sql_cache_key_type() {
+        let yaml = r"
+            caching:
+              sql_results:
+                enabled: true
+                cache_key_type: sql
+                warmup: on_first_refresh
+        ";
+        let err = yaml::from_str::<Runtime>(yaml)
+            .expect_err("warmup + cache_key_type: sql must fail spicepod load");
+        let message = err.to_string();
+        assert!(
+            message.contains("cache_key_type: plan") || message.contains("warmup"),
+            "error must name the corrective action, got: {message}"
+        );
+    }
 
     #[test]
     fn test_deserialize_api_keys() {
@@ -1702,9 +2076,12 @@ mod tests {
           unknown_field: value
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown fields in mcp section should be rejected due to deny_unknown_fields"
+        // Rejected by the mcp section's `deny_unknown_fields`, naming the one valid key.
+        assert_eq!(
+            result
+                .expect_err("unknown fields in the mcp section must be rejected")
+                .to_string(),
+            "unknown field `unknown_field`, expected `allowed_hosts`"
         );
     }
 
@@ -2440,9 +2817,11 @@ datasets:
                     temporality: nonsense
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown temporality value must fail to parse"
+        assert_eq!(
+            result
+                .expect_err("unknown temporality value must fail to parse")
+                .to_string(),
+            "unknown variant `nonsense`, expected one of `delta`, `cumulative`, `low_memory`"
         );
     }
 
@@ -2455,6 +2834,183 @@ datasets:
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.telemetry.metric_prefix, None);
+    }
+
+    #[test]
+    fn test_adaptive_tuning_defaults_to_disabled() {
+        let runtime: Runtime = yaml::from_str("params: {}").expect("unset tuning must parse");
+        assert_eq!(runtime.adaptive_tuning, AdaptiveTuning::Disabled);
+        assert!(!runtime.adaptive_tuning.is_enabled());
+    }
+
+    #[test]
+    fn test_adaptive_tuning_accepts_enabled_and_disabled() {
+        for (value, expected) in [
+            ("disabled", AdaptiveTuning::Disabled),
+            ("enabled", AdaptiveTuning::Enabled),
+        ] {
+            let yaml = format!("adaptive_tuning: \"{value}\"\n");
+            let runtime: Runtime = yaml::from_str(&yaml).expect("valid tuning must parse");
+            assert_eq!(runtime.adaptive_tuning, expected, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_is_matched_exactly() {
+        for value in ["ENABLED", "Disabled", " enabled", "disabled "] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: \"{value}\"\n"))
+                .expect_err("only the exact schema values may load");
+            assert!(
+                error.to_string().contains(&invalid_tuning_message(value)),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_invalid_value_fails_load() {
+        let error = yaml::from_str::<Runtime>("adaptive_tuning: enablde\n")
+            .expect_err("an invalid tuning value must fail the load");
+        assert!(
+            error
+                .to_string()
+                .contains(&invalid_tuning_message("enablde")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            invalid_tuning_message("enablde"),
+            "Invalid `runtime.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_scalars_with_the_documented_message() {
+        for (yaml_value, rendered) in [("true", "true"), ("false", "false"), ("1", "1")] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: {yaml_value}\n"))
+                .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {yaml_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_json_scalars_with_the_documented_message() {
+        for (json_value, rendered) in [
+            ("true", "true"),
+            ("false", "false"),
+            ("1", "1"),
+            ("1.5", "1.5"),
+        ] {
+            let error =
+                serde_json::from_str::<Runtime>(&format!(r#"{{"adaptive_tuning": {json_value}}}"#))
+                    .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {json_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_params_adaptive_tuning_does_not_enable_it() {
+        let runtime: Runtime = yaml::from_str("params:\n  adaptive_tuning: enabled\n")
+            .expect("an unrecognized runtime param must still parse");
+        assert_eq!(runtime.adaptive_tuning, AdaptiveTuning::Disabled);
+    }
+
+    #[test]
+    fn test_adaptive_tuning_serializes_only_when_set() {
+        let enabled = Runtime {
+            adaptive_tuning: AdaptiveTuning::Enabled,
+            ..Runtime::default()
+        };
+        let yaml = yaml::to_string(&enabled).expect("serialize");
+        assert!(yaml.contains("adaptive_tuning: enabled"), "{yaml}");
+        let yaml = yaml::to_string(&Runtime::default()).expect("serialize");
+        assert!(!yaml.contains("adaptive_tuning"), "{yaml}");
+    }
+
+    #[test]
+    fn test_retired_tuning_param_warning_text() {
+        let params = HashMap::from([("cayenne_tuning".to_string(), "enabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([("cayenne_goal_freshness".to_string(), "5s".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("tuning".to_string(), "enabled".to_string()),
+            ("goal_freshness".to_string(), "5s".to_string()),
+            ("cayenne_goal_qph".to_string(), "100".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec![
+                "Dataset 'orders' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `cayenne_goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
+        );
+        let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("cayenne_goal_freshness".to_string(), "5s".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec![
+                "Catalog 'lake' sets `cayenne_goal_freshness`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Catalog 'lake' sets `goal_qph`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
+        );
+        assert!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &HashMap::new(),
+                RETIRED_DATASET_TUNING_PARAMS
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_renamed_runtime_param_warning_text() {
+        assert_eq!(
+            renamed_runtime_param_warning("cayenne_goal_freshness", "target_freshness"),
+            "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
     }
 
     #[test]
@@ -2672,8 +3228,17 @@ datasets:
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
         };
-        let result = config.push_interval_duration();
-        let _ = result.expect_err("Expected an error for invalid push_interval");
+        let err = config
+            .push_interval_duration()
+            .expect_err("Expected an error for invalid push_interval");
+        // The parse failure, naming the setting and its value, with the duration
+        // parser's own reason after it.
+        let parse_error = duration_parse::parse_duration("invalid")
+            .expect_err("the duration parser rejects the same value");
+        assert_eq!(
+            err.to_string(),
+            format!("Failed to parse 'push_interval' value 'invalid': {parse_error}")
+        );
     }
 
     #[test]
@@ -3190,9 +3755,11 @@ datasets:
               client_auth_mode: requuired
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "expected unknown client_auth_mode value to be rejected"
+        assert_eq!(
+            result
+                .expect_err("expected unknown client_auth_mode value to be rejected")
+                .to_string(),
+            "unknown variant `requuired`, expected one of `none`, `request`, `required`"
         );
     }
 

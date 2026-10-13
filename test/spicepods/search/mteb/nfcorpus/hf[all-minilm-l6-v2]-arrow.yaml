@@ -10,6 +10,7 @@ datasets:
     name: corpus
     acceleration:
       enabled: true
+      engine: arrow
     columns:
       - name: text
         embeddings:
@@ -21,11 +22,13 @@ datasets:
     name: test_queries
     acceleration:
       enabled: true
+      engine: arrow
 
   - from: file:./data.parquet
     name: relevance_data
     acceleration:
       enabled: true
+      engine: arrow
 
 embeddings:
   - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2

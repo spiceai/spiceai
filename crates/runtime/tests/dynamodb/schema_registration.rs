@@ -44,19 +44,6 @@ use super::streams::{
     run_and_snapshot_query, start_dynamodb_docker_container, wait_for_dynamodb_source_rows,
 };
 
-// Ports 8020-8030 reserved for this module; 8001-8014 are used by streams.rs / dml.rs.
-const PORT_NO_ACCEL_NO_SCHEMA_NO_TABLE: u16 = 8020;
-const PORT_NO_ACCEL_NO_SCHEMA_EMPTY: u16 = 8031;
-const PORT_NO_ACCEL_SCHEMA_NO_TABLE_EMPTY_RESULT: u16 = 8022;
-const PORT_NO_ACCEL_SCHEMA_NO_TABLE_WITH_ROWS: u16 = 8023;
-const PORT_NO_ACCEL_SCHEMA_EMPTY_IMMEDIATE: u16 = 8024;
-const PORT_STREAMS_NO_SCHEMA_NO_TABLE: u16 = 8025;
-const PORT_STREAMS_NO_SCHEMA_NO_STREAMS: u16 = 8026;
-const PORT_STREAMS_NO_SCHEMA_EMPTY: u16 = 8027;
-const PORT_STREAMS_SCHEMA_NO_TABLE: u16 = 8028;
-const PORT_STREAMS_SCHEMA_NO_STREAMS: u16 = 8029;
-const PORT_STREAMS_SCHEMA_EMPTY_IMMEDIATE: u16 = 8030;
-
 const ACCESS_KEY: &str = "foo";
 const SECRET_KEY: &str = "bar";
 
@@ -133,17 +120,13 @@ async fn no_accel_no_schema_table_not_found_then_created_with_rows() -> anyhow::
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_NO_ACCEL_NO_SCHEMA_NO_TABLE).await?;
-            let client = get_client(PORT_NO_ACCEL_NO_SCHEMA_NO_TABLE, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Do NOT create the table yet — connector must retry.
             let ds = make_dynamodb_dataset(
-                table_name,
-                PORT_NO_ACCEL_NO_SCHEMA_NO_TABLE,
-                ACCESS_KEY,
-                SECRET_KEY,
-                false, // no acceleration
+                table_name, port, ACCESS_KEY, SECRET_KEY, false, // no acceleration
             );
 
             let app = AppBuilder::new("no_accel_no_schema_no_table")
@@ -201,20 +184,14 @@ async fn no_accel_no_schema_empty_table_then_rows_added() -> anyhow::Result<()> 
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_NO_ACCEL_NO_SCHEMA_EMPTY).await?;
-            let client = get_client(PORT_NO_ACCEL_NO_SCHEMA_EMPTY, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Create table but leave it empty — connector must retry.
             create_table(&client, table_name).await;
 
-            let ds = make_dynamodb_dataset(
-                table_name,
-                PORT_NO_ACCEL_NO_SCHEMA_EMPTY,
-                ACCESS_KEY,
-                SECRET_KEY,
-                false,
-            );
+            let ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, false);
 
             let app = AppBuilder::new("no_accel_no_schema_empty")
                 .with_dataset(ds)
@@ -273,21 +250,11 @@ async fn no_accel_declared_schema_table_not_found_then_created_empty() -> anyhow
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_NO_ACCEL_SCHEMA_NO_TABLE_EMPTY_RESULT).await?;
-            let client = get_client(
-                PORT_NO_ACCEL_SCHEMA_NO_TABLE_EMPTY_RESULT,
-                ACCESS_KEY,
-                SECRET_KEY,
-            );
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
-            let mut ds = make_dynamodb_dataset(
-                table_name,
-                PORT_NO_ACCEL_SCHEMA_NO_TABLE_EMPTY_RESULT,
-                ACCESS_KEY,
-                SECRET_KEY,
-                false,
-            );
+            let mut ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, false);
             ds.columns = declared_columns();
 
             let app = AppBuilder::new("no_accel_schema_no_table_empty")
@@ -345,21 +312,11 @@ async fn no_accel_declared_schema_table_not_found_then_created_with_rows() -> an
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_NO_ACCEL_SCHEMA_NO_TABLE_WITH_ROWS).await?;
-            let client = get_client(
-                PORT_NO_ACCEL_SCHEMA_NO_TABLE_WITH_ROWS,
-                ACCESS_KEY,
-                SECRET_KEY,
-            );
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
-            let mut ds = make_dynamodb_dataset(
-                table_name,
-                PORT_NO_ACCEL_SCHEMA_NO_TABLE_WITH_ROWS,
-                ACCESS_KEY,
-                SECRET_KEY,
-                false,
-            );
+            let mut ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, false);
             ds.columns = declared_columns();
 
             let app = AppBuilder::new("no_accel_schema_no_table_rows")
@@ -423,20 +380,14 @@ async fn no_accel_declared_schema_empty_table_registers_immediately() -> anyhow:
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_NO_ACCEL_SCHEMA_EMPTY_IMMEDIATE).await?;
-            let client = get_client(PORT_NO_ACCEL_SCHEMA_EMPTY_IMMEDIATE, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Table exists but empty — declared schema allows immediate registration.
             create_table(&client, table_name).await;
 
-            let mut ds = make_dynamodb_dataset(
-                table_name,
-                PORT_NO_ACCEL_SCHEMA_EMPTY_IMMEDIATE,
-                ACCESS_KEY,
-                SECRET_KEY,
-                false,
-            );
+            let mut ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, false);
             ds.columns = declared_columns();
 
             let app = AppBuilder::new("no_accel_schema_empty_immediate")
@@ -501,16 +452,12 @@ async fn streams_no_schema_table_not_found_then_created() -> anyhow::Result<()> 
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_STREAMS_NO_SCHEMA_NO_TABLE).await?;
-            let client = get_client(PORT_STREAMS_NO_SCHEMA_NO_TABLE, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             let ds = make_dynamodb_dataset(
-                table_name,
-                PORT_STREAMS_NO_SCHEMA_NO_TABLE,
-                ACCESS_KEY,
-                SECRET_KEY,
-                true, // changes acceleration
+                table_name, port, ACCESS_KEY, SECRET_KEY, true, // changes acceleration
             );
 
             let app = AppBuilder::new("streams_no_schema_no_table")
@@ -569,22 +516,16 @@ async fn streams_no_schema_streams_not_enabled_then_enabled() -> anyhow::Result<
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_STREAMS_NO_SCHEMA_NO_STREAMS).await?;
-            let client = get_client(PORT_STREAMS_NO_SCHEMA_NO_STREAMS, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Table exists with rows, but no streams.
             create_table_without_streams(&client, table_name).await;
             insert_rows(&client, table_name, 0..3).await;
             wait_for_dynamodb_source_rows(&client, table_name, 3, 30).await?;
 
-            let ds = make_dynamodb_dataset(
-                table_name,
-                PORT_STREAMS_NO_SCHEMA_NO_STREAMS,
-                ACCESS_KEY,
-                SECRET_KEY,
-                true,
-            );
+            let ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, true);
 
             let app = AppBuilder::new("streams_no_schema_no_streams")
                 .with_dataset(ds)
@@ -638,20 +579,14 @@ async fn streams_no_schema_empty_table_then_rows_added() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_STREAMS_NO_SCHEMA_EMPTY).await?;
-            let client = get_client(PORT_STREAMS_NO_SCHEMA_EMPTY, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Table with streams, but no rows yet.
             create_table(&client, table_name).await;
 
-            let ds = make_dynamodb_dataset(
-                table_name,
-                PORT_STREAMS_NO_SCHEMA_EMPTY,
-                ACCESS_KEY,
-                SECRET_KEY,
-                true,
-            );
+            let ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, true);
 
             let app = AppBuilder::new("streams_no_schema_empty")
                 .with_dataset(ds)
@@ -710,17 +645,11 @@ async fn streams_declared_schema_table_not_found_then_created() -> anyhow::Resul
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_STREAMS_SCHEMA_NO_TABLE).await?;
-            let client = get_client(PORT_STREAMS_SCHEMA_NO_TABLE, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
-            let mut ds = make_dynamodb_dataset(
-                table_name,
-                PORT_STREAMS_SCHEMA_NO_TABLE,
-                ACCESS_KEY,
-                SECRET_KEY,
-                true,
-            );
+            let mut ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, true);
             ds.columns = declared_columns();
 
             let app = AppBuilder::new("streams_schema_no_table")
@@ -786,22 +715,16 @@ async fn streams_declared_schema_streams_not_enabled_then_enabled() -> anyhow::R
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_STREAMS_SCHEMA_NO_STREAMS).await?;
-            let client = get_client(PORT_STREAMS_SCHEMA_NO_STREAMS, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Table with rows but no streams.
             create_table_without_streams(&client, table_name).await;
             insert_rows(&client, table_name, 0..3).await;
             wait_for_dynamodb_source_rows(&client, table_name, 3, 30).await?;
 
-            let mut ds = make_dynamodb_dataset(
-                table_name,
-                PORT_STREAMS_SCHEMA_NO_STREAMS,
-                ACCESS_KEY,
-                SECRET_KEY,
-                true,
-            );
+            let mut ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, true);
             ds.columns = declared_columns();
 
             let app = AppBuilder::new("streams_schema_no_streams")
@@ -864,21 +787,15 @@ async fn streams_declared_schema_empty_table_registers_immediately() -> anyhow::
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_STREAMS_SCHEMA_EMPTY_IMMEDIATE).await?;
-            let client = get_client(PORT_STREAMS_SCHEMA_EMPTY_IMMEDIATE, ACCESS_KEY, SECRET_KEY);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, ACCESS_KEY, SECRET_KEY);
 
             // Empty table with streams — declared schema lets the connector
             // initialize without any rows.
             create_table(&client, table_name).await;
 
-            let mut ds = make_dynamodb_dataset(
-                table_name,
-                PORT_STREAMS_SCHEMA_EMPTY_IMMEDIATE,
-                ACCESS_KEY,
-                SECRET_KEY,
-                true,
-            );
+            let mut ds = make_dynamodb_dataset(table_name, port, ACCESS_KEY, SECRET_KEY, true);
             ds.columns = declared_columns();
 
             let app = AppBuilder::new("streams_schema_empty_immediate")

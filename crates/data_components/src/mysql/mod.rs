@@ -17,7 +17,7 @@ limitations under the License.
 pub mod provider;
 
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use datafusion_table_providers::mysql::MySQLTableFactory;
 use std::sync::Arc;
 

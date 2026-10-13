@@ -1709,8 +1709,12 @@ binary: !!binary |
   R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
 ";
         let value: Value = from_str(yaml).expect("should parse binary data");
-        // Binary data is typically returned as a string
-        assert!(value.get("binary").is_some());
+        // A `!!binary` literal block is kept as its text, base64 and all, with the
+        // block's single trailing newline — never decoded or coerced.
+        assert_eq!(
+            value.get("binary").and_then(Value::as_str),
+            Some("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\n")
+        );
     }
 
     #[test]
@@ -1722,10 +1726,19 @@ date2: 2024-01-15T10:30:00Z
 date3: 2024-01-15 10:30:00 -05:00
 ";
         let value: Value = from_str(yaml).expect("should parse timestamps");
-        // Timestamps are typically returned as strings in yaml-rust2
-        assert!(value.get("date1").is_some());
-        assert!(value.get("date2").is_some());
-        assert!(value.get("date3").is_some());
+        // Date-like Spicepod values stay the exact strings written, never coerced.
+        assert_eq!(
+            value.get("date1").and_then(Value::as_str),
+            Some("2024-01-15")
+        );
+        assert_eq!(
+            value.get("date2").and_then(Value::as_str),
+            Some("2024-01-15T10:30:00Z")
+        );
+        assert_eq!(
+            value.get("date3").and_then(Value::as_str),
+            Some("2024-01-15 10:30:00 -05:00")
+        );
     }
 
     #[test]
@@ -2018,9 +2031,17 @@ data:
         // YAML §6.1: "tab characters must not be used in indentation"
         let yaml = "key:\n\t- value1\n\t- value2";
         let result: Result<Value> = from_str(yaml);
-        assert!(
-            result.is_err(),
-            "should reject tab characters used for indentation"
+        let err = result.expect_err("should reject tab characters used for indentation");
+        // Diagnosed as tab indentation, on the first tab-indented line. The prefix
+        // column is the location's own (see `test_error_on_invalid_yaml`).
+        let location = err.location().expect("a parse error carries its location");
+        assert_eq!(location.line(), 2);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "YAML parse error at line 2, column {}: tabs disallowed within this context (block indentation) at byte 6 line 2 column 2",
+                location.column()
+            )
         );
     }
 
@@ -2034,10 +2055,18 @@ parent:
 ";
         let result: Result<Value> = from_str(yaml);
         // Inconsistent indentation among siblings should be an error
-        // (child2 is indented more than child1 but both are children of parent)
-        assert!(
-            result.is_err(),
-            "should reject inconsistent sibling indentation"
+        // (child2 is indented more than child1 but both are children of parent).
+        // The over-indented line reads as a continuation of `a`, so the error lands
+        // on the `child2: b` line, at its `:`.
+        let err = result.expect_err("should reject inconsistent sibling indentation");
+        let location = err.location().expect("a parse error carries its location");
+        assert_eq!(location.line(), 4, "the `child2: b` line");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "YAML parse error at line 4, column {}: mapping values are not allowed in this context at byte 31 line 4 column 11",
+                location.column()
+            )
         );
     }
 
@@ -2049,46 +2078,53 @@ parent:
     fn test_yaml_control_characters_allowed() {
         // TAB (x09), LF (x0A), CR (x0D) ARE allowed
         let yaml = "key: val\tue";
+        let value: Value = from_str(yaml).expect("should allow tab character in value");
+        assert_eq!(
+            value.get("key").and_then(Value::as_str),
+            Some("val\tue"),
+            "the tab must survive parsing"
+        );
+    }
+
+    /// Asserts `yaml` is rejected on line 1 with exactly `diagnosis`, the scanner's
+    /// own message. The prefix column is the location's (see
+    /// `test_error_on_invalid_yaml`).
+    fn assert_rejected_on_line_one(yaml: &str, diagnosis: &str) {
         let result: Result<Value> = from_str(yaml);
-        assert!(result.is_ok(), "should allow tab character in value");
+        let err = result.expect_err(yaml);
+        let location = err.location().expect("a parse error carries its location");
+        assert_eq!(location.line(), 1, "{yaml}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "YAML parse error at line 1, column {}: {diagnosis}",
+                location.column()
+            ),
+            "{yaml}"
+        );
     }
 
     #[test]
     fn test_yaml_invalid_escape_character() {
-        // YAML §5.7 Example 5.14: Invalid escaped characters
-        let yaml = r#"bad: "\c""#;
-        let result: Result<Value> = from_str(yaml);
-        assert!(result.is_err(), "should reject invalid escape \\c");
-
-        let yaml = r#"bad: "\m""#;
-        let result: Result<Value> = from_str(yaml);
-        assert!(result.is_err(), "should reject invalid escape \\m");
-
-        let yaml = r#"bad: "\w""#;
-        let result: Result<Value> = from_str(yaml);
-        assert!(result.is_err(), "should reject invalid escape \\w");
+        // YAML §5.7 Example 5.14: Invalid escaped characters. Each is reported at the
+        // opening quote of the scalar that holds it.
+        for yaml in [r#"bad: "\c""#, r#"bad: "\m""#, r#"bad: "\w""#] {
+            assert_rejected_on_line_one(
+                yaml,
+                "while parsing a quoted scalar, found unknown escape character at byte 5 line 1 column 6",
+            );
+        }
     }
 
     #[test]
     fn test_yaml_invalid_hex_escape() {
-        // YAML §5.7: Invalid hex digits in escape sequences
-        let yaml = r#"bad: "\xZZ""#;
-        let result: Result<Value> = from_str(yaml);
-        assert!(result.is_err(), "should reject invalid hex escape \\xZZ");
-
-        let yaml = r#"bad: "\uGGGG""#;
-        let result: Result<Value> = from_str(yaml);
-        assert!(
-            result.is_err(),
-            "should reject invalid unicode escape \\uGGGG"
-        );
-
-        let yaml = r#"bad: "\UZZZZZZZZ""#;
-        let result: Result<Value> = from_str(yaml);
-        assert!(
-            result.is_err(),
-            "should reject invalid 32-bit unicode escape"
-        );
+        // YAML §5.7: Invalid hex digits in escape sequences, for each escape width.
+        for yaml in [r#"bad: "\xZZ""#, r#"bad: "\uGGGG""#, r#"bad: "\UZZZZZZZZ""#] {
+            assert_rejected_on_line_one(
+                yaml,
+                "while parsing a quoted scalar, did not find expected hexadecimal number at byte 5 line 1 column 6",
+            );
+        }
     }
 
     #[test]

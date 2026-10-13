@@ -461,7 +461,7 @@ async fn s3_schema_source_path_authenticated() -> Result<(), anyhow::Error> {
 
             let schema = arrow::util::pretty::pretty_format_batches(&batches)
             .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-            insta::assert_snapshot!(format!("s3_schema_source_path_authenticated_parts"), schema);
+            insta::assert_snapshot!("s3_schema_source_path_authenticated_parts", schema);
 
             Ok(())
         })

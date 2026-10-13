@@ -84,12 +84,7 @@ async fn databricks_delta_lake_m2m_integration_test() -> Result<(), anyhow::Erro
                 .build();
 
             configure_test_datafusion();
-            let mut rt =
-                Runtime::builder()
-                    .with_app(app)
-                    .build()
-                    .await
-            ;
+            let mut rt = Runtime::builder().with_app(app).build().await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -114,11 +109,11 @@ async fn databricks_delta_lake_m2m_integration_test() -> Result<(), anyhow::Erro
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("databricks_delta_lake_m2m_select"), results);
+                        insta::assert_snapshot!("databricks_delta_lake_m2m_select", results);
                     });
                 })),
             )];

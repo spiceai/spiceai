@@ -306,8 +306,10 @@ pub(crate) struct MemSegment {
     /// set separate from the scalar lets the key SET be built off the publish
     /// lock. Cheap to carry: the sets are `im::HashMap` (O(1) structural clone).
     pub(crate) tombstones: SegmentTombstones,
-    /// This segment's measured byte cost (`get_array_memory_size`), for budget
-    /// release accounting on a partial clear.
+    /// This segment's resident byte cost ([`RetainedBytes`]), for budget release
+    /// accounting on a partial clear.
+    ///
+    /// [`RetainedBytes`]: arrow_tools::batch_bytes::RetainedBytes
     pub(crate) bytes: u64,
     /// This segment's row count.
     pub(crate) rows: u64,
@@ -360,7 +362,7 @@ pub(crate) struct MemTier {
     /// an O(1) `Arc` bump of the HAMT root — the accumulated corpus is never
     /// deep-copied per append (the prior O(tier) write tax).
     pub(crate) tombstones: InMemTombstones,
-    /// Sum of `get_array_memory_size()` across all retained batches — the cap
+    /// Sum of the segments' resident bytes ([`MemSegment::bytes`]) — the cap
     /// dimension checked against the per-table + global byte budget.
     pub(crate) bytes: u64,
     /// Total retained rows (observability + the row cap).
@@ -603,10 +605,7 @@ impl MemTier {
             }
 
             removed_rows = removed_rows.saturating_add(segment_removed);
-            let segment_bytes: u64 = kept
-                .iter()
-                .map(|b| b.get_array_memory_size() as u64)
-                .fold(0, u64::saturating_add);
+            let segment_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&kept);
             let segment_rows: u64 = kept
                 .iter()
                 .map(|b| b.num_rows() as u64)

@@ -6,6 +6,7 @@ license-file.workspace = true
 name = "llms"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -16,6 +17,7 @@ async-openai.workspace = true
 chat-api = { path = "../chat-api" }
 embed-api = { path = "../embed-api" }
 rerank-api = { path = "../rerank-api" }
+evaluate-api = { path = "../evaluate-api" }
 async-stream.workspace = true
 async-trait.workspace = true
 aws-config.workspace = true
@@ -69,6 +71,7 @@ token_provider = { path = "../token_provider" }
 model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "55fef28a3556895b20204634b788f7c836b610bc", optional = true } # branch: spiceai
 
 [dev-dependencies]
+wiremock = "0.6"
 anyhow.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
@@ -79,6 +82,13 @@ paste.workspace = true
 rstest = "0.26.1"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`);
+# `model2vec_hf_cache` is compiled only with `local_embed`, which `llms::model2vec`
+# needs.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [features]
 cuda = [

@@ -15,6 +15,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 globset.workspace = true
 snafu.workspace = true
+util = { path = "../util" }
 
 [lints]
 workspace = true

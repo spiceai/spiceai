@@ -111,8 +111,8 @@ cmd_resolve() {
   # Compare our mode against trunk's, not the first line `git ls-files --stage`
   # prints -- that is stage 1, the base's mode. `cp` copies content and leaves
   # the destination's mode alone, which breaks two ways: a symlink destination
-  # is followed and written *through* (resolving CLAUDE.md that way overwrites
-  # .github/copilot-instructions.md while the link still looks untouched), and a
+  # is followed and written *through* (resolving a former alias such as CLAUDE.md
+  # that way overwrites AGENTS.md while the link still looks untouched), and a
   # 100644-vs-100755 disagreement silently drops an executable bit. Comparing
   # stage 2 to stage 3 covers both, plus a missing stage, in one test.
   local ours_mode theirs_mode

@@ -21,15 +21,12 @@ inputs:
   minio_endpoint:
     description: 'MinIO endpoint for sccache'
     required: false
-    type: string
   minio_access_key:
     description: 'MinIO access key for sccache'
     required: false
-    type: string
   minio_secret_key:
     description: 'MinIO secret key for sccache'
     required: false
-    type: string
 
 outputs:
   cache-hit:
@@ -140,7 +137,6 @@ runs:
       uses: ./.github/actions/setup-sccache
       with:
         minio_endpoint: ${{ inputs.minio_endpoint }}
-        os: ${{ steps.detect-os.outputs.os }}
         minio_access_key: ${{ inputs.minio_access_key }}
         minio_secret_key: ${{ inputs.minio_secret_key }}
 
@@ -201,7 +197,7 @@ runs:
 
     - name: Upload testoperator artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: testoperator-${{ steps.detect-os.outputs.os }}
         path: target/release/testoperator${{ steps.detect-os.outputs.ext }}

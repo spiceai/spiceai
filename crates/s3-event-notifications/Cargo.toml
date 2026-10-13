@@ -1,0 +1,24 @@
+[package]
+description = "Consume Amazon S3 Event Notifications delivered to SQS"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "s3-event-notifications"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+aws-sdk-sqs.workspace = true
+percent-encoding.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

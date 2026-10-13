@@ -49,7 +49,6 @@ use datafusion::common::{DataFusionError, ParamValues, TableReference};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::{ast::Statement as SqlStatement, dialect::PostgreSqlDialect};
-use futures::TryStreamExt;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Error as QueryError, QueryBuilder, ResultsCacheMode};
@@ -208,33 +207,23 @@ pub async fn run_transaction(
             };
 
         let cache_status = query_res.cache_status;
-        let mut data = query_res.data;
         // Every statement must run to completion so its writes stage and any error
         // (including a gate abort) surfaces before the next statement — and before
         // COMMIT. Only the FINAL statement's batches are kept: its result can be
         // emitted to the caller only once the commit is confirmed (a conflict must
         // surface as an error, never as a truncated result), so it is materialized
         // here and returned after commit. Intermediate statements (the gate,
-        // earlier writes) are drained without materializing their batches.
-        if index + 1 == statement_count {
-            match data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => last = Some((batches, cache_status)),
-                Err(e) => {
-                    abort_transaction(handle.as_ref()).await;
-                    return Err(TransactionError::Stream(e));
-                }
-            }
+        // earlier writes) are drained without keeping their batches.
+        let consume = if index + 1 == statement_count {
+            query_res.collect_batches().await.map(|batches| {
+                last = Some((batches, cache_status));
+            })
         } else {
-            loop {
-                match data.try_next().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(e) => {
-                        abort_transaction(handle.as_ref()).await;
-                        return Err(TransactionError::Stream(e));
-                    }
-                }
-            }
+            query_res.drain().await
+        };
+        if let Err(e) = consume {
+            abort_transaction(handle.as_ref()).await;
+            return Err(TransactionError::Stream(e));
         }
     }
 
@@ -370,7 +359,7 @@ async fn prepare_transaction(
         let table_name = table_ref.table();
         let Some(provider) = resolve_cayenne_staged(df, table_name).await else {
             return Err(TransactionError::Rejected(format!(
-                "transaction target '{table_name}' must be an accelerator-only, non-partitioned Cayenne dataset (configure on_conflict without CDC); other modes route writes to the federated source"
+                "transaction target '{table_name}' must be a non-partitioned Cayenne dataset with 'acceleration.write_mode: acceleration', or 'write_mode: write_back' with 'refresh_mode: changes'; other modes route writes to the federated source"
             )));
         };
         let token = provider.transaction_write_token().await;
@@ -432,7 +421,9 @@ fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReferenc
         LogicalPlan::Dml(dml) => Some(match &dml.op {
             WriteOp::Insert(_) | WriteOp::Update => Ok(dml.table_name.clone()),
             WriteOp::Delete => Err("DELETE"),
-            WriteOp::Ctas | WriteOp::Truncate => Err("this operation"),
+            // `WriteOp` is non-exhaustive (DataFusion 55 added MERGE INTO): any
+            // other write cannot be staged atomically, so it aborts the transaction.
+            _ => Err("this operation"),
         }),
         LogicalPlan::Extension(ext) => {
             let dml = ext

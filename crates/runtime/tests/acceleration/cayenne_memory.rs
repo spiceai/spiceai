@@ -36,7 +36,7 @@ use anyhow::ensure;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use datafusion::{assert_batches_eq, sql::TableReference};
+use datafusion::{assert_batches_eq, common::TableReference};
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
@@ -217,7 +217,7 @@ mod dml {
     /// `mode`, over a five-row CSV, and assert the two preconditions every DML case
     /// below depends on.
     ///
-    /// `primary_key` + `on_conflict` is what routes writes to the accelerator alone
+    /// `write_mode: acceleration` is what routes writes to the accelerator alone
     /// (`select_accelerated_write_mode`), which is how a client statement reaches
     /// Cayenne rather than the file source.
     ///
@@ -271,6 +271,7 @@ mod dml {
             params,
             primary_key: Some("id".to_string()),
             on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+            write_mode: spicepod::acceleration::WriteMode::Acceleration,
             ..Acceleration::default()
         });
 
@@ -322,12 +323,12 @@ mod dml {
             cayenne.is_memory_resident_mode()
         );
         // Premise: client writes go to the accelerator, so the statements below are
-        // Cayenne's and not the file connector's. `on_conflict` is what buys that
-        // routing (`select_accelerated_write_mode`); without it a client write is
-        // sent WriteThrough to the source and never reaches this code at all.
+        // Cayenne's and not the file connector's. `write_mode: acceleration` is what
+        // buys that routing (`select_accelerated_write_mode`); without it a client
+        // write is sent WriteThrough to the source and never reaches this code at all.
         ensure!(
             accelerated_table.is_accelerator_only(),
-            "precondition: on_conflict must route client writes to the accelerator alone, \
+            "precondition: write_mode: acceleration must route client writes to the accelerator alone, \
              otherwise the statements below never reach Cayenne"
         );
 

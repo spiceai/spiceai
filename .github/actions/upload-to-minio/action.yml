@@ -5,23 +5,18 @@ inputs:
   minio_endpoint:
     description: 'MinIO endpoint'
     required: true
-    type: string
   minio_access_key:
     description: 'MinIO access key'
     required: true
-    type: string
   minio_secret_key:
     description: 'MinIO secret key'
     required: true
-    type: string
   source_path:
     description: 'Path to the file to upload'
     required: true
-    type: string
   destination_path:
     description: 'Destination path in MinIO (e.g., spice-minio/bucket/path/)'
     required: true
-    type: string
 
 runs:
   using: 'composite'

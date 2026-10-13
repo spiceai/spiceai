@@ -10,8 +10,9 @@
 # credentials: a stub `df` on PATH reports whatever free space a case needs, and a
 # stub `make` prints whatever a case needs the watcher to read.
 #
-# `failure_kind` names four further causes with the same consequence — a run that
-# was signalled and so judged nothing at all, a branch whose Makefile has no rule
+# `failure_kind` names five further causes with the same consequence — a run that
+# was signalled and so judged nothing at all, a step budget that expired without
+# the runner ever signalling the script, a branch whose Makefile has no rule
 # for a target the gate invokes, so nothing was compiled, a test binary the
 # runner's loader will not execute, so nothing was run, and a linker that died of
 # a signal, so nothing was built — so their cases live here too, alongside
@@ -122,13 +123,16 @@ assert_preflight() {
   echo "  ok: $name"
 }
 
-assert_failure_kind() {
-  local name="$1" check_status="$2" want="$3"
-  shift 3
+# Drives failure_kind with the exit status and the elapsed seconds the run would
+# report; the budget reading is the one classification that depends on the
+# clock rather than on a status or a recorded flag.
+assert_failure_kind_at() {
+  local name="$1" check_status="$2" elapsed="$3" want="$4"
+  shift 4
   tests_run=$((tests_run + 1))
 
   local result rc output
-  result="$(call_subject "failure_kind ${check_status}" "$@")"
+  result="$(call_subject "failure_kind ${check_status} ${elapsed}" "$@")"
   rc="${result%%|*}"
   output="${result#*|}"
 
@@ -141,6 +145,14 @@ assert_failure_kind() {
     return
   fi
   echo "  ok: $name"
+}
+
+assert_failure_kind() {
+  local name="$1" check_status="$2" want="$3"
+  shift 3
+  # No elapsed: the snippet is then `failure_kind <status>`, the call every
+  # reading but the clock is classified from.
+  assert_failure_kind_at "$name" "$check_status" "" "$want" "$@"
 }
 
 echo "free_disk_gib"
@@ -1386,6 +1398,66 @@ assert_failure_kind "keeps a rewritten lockfile distinct with a cache hit record
 # ...and, as for every other named cause, "no verdict" still outranks it.
 assert_failure_kind "a signalled run stays signalled, not a rewritten lockfile" 73 "signalled" \
   SIGNOFF_SIGNALLED=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A step budget that expires is never delivered as a signal: the runner reaps the
+# step's `make` first and this script last, so the script sees a small failing
+# status with no signal recorded, and only the clock can tell that from a
+# failing recipe (#13843). The deadline the workflow declares is threaded in,
+# and a run that ends within the grace of it is signalled. The elapsed values
+# are the ones dying runs reported against the 353-minute (21180 s) budget.
+assert_failure_kind_at "calls a run that ended at its step budget signalled" 101 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The script's clock starts a few seconds into the step, so the elapsed it reads
+# when the kill lands can be short of the budget by about that much.
+assert_failure_kind_at "sees an expiry the clock reads as just short of the budget" 101 21170 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "sees an expiry whose teardown ran well past the budget" 101 21225 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The grace is a boundary, not a band around the budget: it opens exactly one
+# grace before the budget and never closes, since a run that outlives its
+# budget is still a run nothing judged.
+assert_failure_kind_at "the grace opens exactly one grace before the budget" 101 21060 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a failure one second before the grace is still the branch's" 101 21059 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a failure early in the run is still the branch's under a budget" 101 7200 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a grace of zero fires at the budget itself and not before" 101 21180 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=0 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a grace of zero leaves the second before the budget to the branch" 101 21179 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=0 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# No budget — a local run — leaves the clock out of it entirely, however long
+# the checks took.
+assert_failure_kind_at "no configured budget leaves the clock out of the classification" 101 21225 "checks" \
+  SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A budget that is not a whole number of minutes must be inert rather than turn
+# every failure into an expiry; the same for the grace, and for an elapsed the
+# caller did not pass.
+assert_failure_kind_at "a malformed budget is inert, not an expiry" 101 21225 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=soon SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "a malformed grace is inert, not an expiry" 101 21225 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=2m SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# Two shapes `^[0-9]+$` would admit and bash's arithmetic would misread: a
+# leading zero is octal there (`0353` is 235 minutes, a budget that fires two
+# hours early) and a value past 2^63 wraps negative (every failure an expiry).
+# 14100 s is exactly where the octal reading would fire.
+assert_failure_kind_at "a leading-zero budget is read in base 10, not as octal" 101 14100 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=0353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an overlong budget is inert, not an expiry" 101 1 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=9223372036854775807 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an overlong grace is inert, not an expiry" 101 1 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_STEP_BUDGET_GRACE_SECONDS=99999999999999999999 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind "a budget with no elapsed to read is inert" 101 "checks" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# "No verdict" outranks naming a cause, exactly as a recorded signal does: a
+# teardown that reaps a compiler subprocess first leaves the crash signature
+# behind, and that, the disk hit and the preflight's refusal are each no more a
+# verdict on the branch than the expiry is.
+assert_failure_kind_at "an expiry outranks a crashed compiler subprocess the teardown reaped" 101 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an expiry outranks a disk hit" 101 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_failure_kind_at "an expiry outranks the disk preflight's refusal" 70 21203 "signalled" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 STUB_FREE_KB="$(gib_to_kb 60)"
 # The other direction matters just as much: a real defect on a tight disk must
 # not be excused as infrastructure, or a broken branch signs off as "re-dispatch
 # me". 10 GiB is under the 25 GiB preflight floor and well over the critical bar.
@@ -1650,11 +1722,11 @@ assert_describe "still publishes the unreachable-cache verdict" 101 \
 # indistinguishable from a test that genuinely failed. It also has to name the
 # remedy, since the reader who needs it is not going to open the log.
 assert_describe "says an unloadable test binary could not complete, not that checks failed" 104 \
-  "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
+  "Test binary would not load after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "the checks did not complete" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "tells the author to re-dispatch rather than to read the log" 104 \
-  "Sign-off could not complete after 21195s — a test binary on the runner would not load; re-dispatch (triggered by someone)" \
+  "Test binary would not load after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
   "re-dispatch" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # A compiler subprocess that died of a signal has to say so in the commit status
@@ -1669,6 +1741,26 @@ assert_describe "says a crashed compiler subprocess could not complete, not that
 assert_describe_lacks "does not call a crashed compiler subprocess a check failure" 101 \
   "checks failed" \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The budget expiry publishes nothing, like the signal it stands in for: either
+# verdict it could otherwise reach — "Sign-off checks failed" or, when the
+# teardown reaped a compiler first, "Compiler subprocess crashed" — would
+# disqualify a commit nothing judged (#13843). The 21195 s every describe case
+# runs at is inside the 353-minute budget's grace.
+assert_describe "publishes no verdict when the step budget expired without a signal" 101 "" \
+  "the checks reached no verdict" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not call a budget expiry a check failure" 101 \
+  "checks failed" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_lacks "does not call a budget expiry a crashed compiler subprocess" 101 \
+  "Compiler subprocess crashed" \
+  SIGNOFF_STEP_BUDGET_MINUTES=353 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# A budget the run did not reach changes nothing: 358 minutes puts 21195 s
+# outside the grace, so the crash verdict is published as before.
+assert_describe "still publishes the crash verdict for a run that did not reach its budget" 101 \
+  "Compiler subprocess crashed after 21195s — checks did not complete, re-dispatch (triggered by someone)" \
+  "the checks did not complete" \
+  SIGNOFF_STEP_BUDGET_MINUTES=358 SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
 # What a verdict must still say once GitHub is done with the line.
 #
 # post_commit_status cuts the description at STATUS_DESC_MAX_CHARS and the
@@ -1720,12 +1812,91 @@ assert_describe_fits() {
     fail_test "$name: the verdict must carry the whole login: '${output}'"
     return
   fi
+  # Fitting is not enough: the helper cuts an over-long message at a word
+  # boundary, which keeps the verdict inside the cap while silently dropping
+  # its tail — the remedy. The verdict at the longest login has to be the
+  # short-login verdict with only the login swapped.
+  local short
+  short="$(call_subject \
+    "describe_check_failure ${check_status} 999999 someone
+     printf '%s' \"\$SIGNOFF_FAILURE_STATUS_DESC\"" \
+    "$@")"
+  short="${short#*|}"
+  local desc="${output#*DESC[}"; desc="${desc%]*}"
+  if [[ "$desc" != "${short/(triggered by someone)/(triggered by ${login})}" ]]; then
+    fail_test "$name: the verdict is cut at the longest login — its message must fit whole: '${desc}' vs '${short}'"
+    return
+  fi
   echo "  ok: $name"
 }
 readonly LONGEST_LOGIN_LEN=39
 
 assert_describe_fits "the crash verdict fits a commit status with the longest login GitHub issues" 101 \
   SIGNOFF_DISK_WATCH=1 SIGNOFF_TOOLCHAIN_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+# The same property for every other verdict that names a cause. Four of these
+# lost the attribution at the boundary (#14076), and `stale-lockfile` lost it
+# for the two logins that actually sign off; none is exempt now.
+assert_describe_fits "the out-of-disk verdict fits with the longest login" 101 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_DISK_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the unreachable-cache verdict fits with the longest login" 101 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_CACHE_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the unloadable-binary verdict fits with the longest login" 104 \
+  SIGNOFF_DISK_WATCH=1 SIGNOFF_ARTIFACT_HIT=1 STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the missing-target verdict fits with the longest login" 71 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the stale-lockfile verdict fits with the longest login" 72 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the rewritten-lockfile verdict fits with the longest login" 73 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+assert_describe_fits "the generic check-failure verdict fits with the longest login" 101 \
+  STUB_FREE_KB="$(gib_to_kb 200)"
+
+# The helper's contract, pinned on its own: a message longer than the budget is
+# what gets cut, and the whole attribution survives. Driven with a message that
+# cannot fit so the cut is exercised, which no arm does once they all fit.
+tests_run=$((tests_run + 1))
+long_message="$(printf "%0200d" 0 | tr 0 m)"
+long_login="$(printf "%0${LONGEST_LOGIN_LEN}d" 0 | tr 0 a)"
+result="$(call_subject \
+  "failure_status_desc '${long_message}' '${long_login}'" STUB_FREE_KB="$(gib_to_kb 200)")"
+rc="${result%%|*}"
+output="${result#*|}"
+if [[ "$rc" -ne 0 ]]; then
+  fail_test "an over-long verdict: expected exit 0, got ${rc} (output: ${output})"
+elif [[ "$output" != *"(triggered by ${long_login})" ]]; then
+  fail_test "an over-long verdict must end with the whole attribution: '${output}'"
+elif (( ${#output} != 140 )); then
+  fail_test "an over-long verdict must be cut to exactly the cap, got ${#output}: '${output}'"
+elif [[ "$output" != "mmmm"* ]]; then
+  fail_test "an over-long verdict keeps the head of its message: '${output}'"
+else
+  echo "  ok: an over-long verdict loses the tail of its message, never the attribution"
+fi
+
+# The cut lands on a word boundary: a byte-counting locale would otherwise be
+# able to leave a partial multi-byte character — the em dash every arm carries
+# — at the end of the message, and GitHub rejects a description that is not
+# valid UTF-8. The message here puts a three-byte dash right where the slice
+# falls, and the whole verdict is measured in bytes so the case is strict.
+tests_run=$((tests_run + 1))
+worded_message="$(printf 'word %.0s' $(seq 1 16))abc— tail of the message"   # 83 chars, then a three-byte dash straddling the 85-byte budget
+result="$(call_subject \
+  "failure_status_desc '${worded_message}' '${long_login}'" LC_ALL=C STUB_FREE_KB="$(gib_to_kb 200)")"
+rc="${result%%|*}"
+output="${result#*|}"
+if [[ "$rc" -ne 0 ]]; then
+  fail_test "a word-boundary cut: expected exit 0, got ${rc} (output: ${output})"
+elif [[ "$output" != *"(triggered by ${long_login})" ]]; then
+  fail_test "a word-boundary cut must end with the whole attribution: '${output}'"
+elif (( $(printf '%s' "$output" | LC_ALL=C wc -c) > 140 )); then
+  fail_test "a word-boundary cut must stay inside the cap in bytes: '${output}'"
+elif ! printf '%s' "$output" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+  fail_test "a word-boundary cut left a partial multi-byte character behind: '${output}'"
+elif [[ "$output" != "word word "* ]]; then
+  fail_test "a word-boundary cut keeps the head of its message: '${output}'"
+else
+  echo "  ok: an over-long verdict is cut at a word boundary, never inside a character"
+fi
 
 assert_describe "still publishes a genuine check failure" 101 \
   "Sign-off checks failed after 21195s (triggered by someone)" \
@@ -1742,10 +1913,10 @@ assert_describe "publishes no verdict when a signalled run's make returned an or
 # failure it is indistinguishable from a lint denial. It also has to carry the
 # remedy, because the reader who needs it is not going to open the log.
 assert_describe "says a missing make target could not run, not that checks failed" 71 \
-  "Sign-off could not run after 21195s — branch predates a make target the gate needs; merge trunk in (triggered by someone)" \
+  "Gate make target missing after 21195s — checks did not run, merge trunk in (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "tells the author to merge trunk in" 71 \
-  "Sign-off could not run after 21195s — branch predates a make target the gate needs; merge trunk in (triggered by someone)" \
+  "Gate make target missing after 21195s — checks did not run, merge trunk in (triggered by someone)" \
   "merge trunk in and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 
 # The two above use a status the signal reading must not claim. A run signalled
@@ -1760,10 +1931,10 @@ assert_describe "declines the missing-target verdict for a signalled run" 71 "" 
 # as a check failure it sends them looking for a lint denial in a log containing
 # no compilation. The remedy has to be in the description itself.
 assert_describe "says a stale lockfile could not run, not that checks failed" 72 \
-  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; cargo update --workspace, commit (triggered by someone)" \
   "the checks did not run" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "names the command that regenerates the lockfile" 72 \
-  "Sign-off could not run after 21195s — Cargo.lock is missing or out of date; run 'cargo update --workspace' and commit it (triggered by someone)" \
+  "Cargo.lock stale after 21195s — checks not run; cargo update --workspace, commit (triggered by someone)" \
   "run 'cargo update --workspace', commit it, then sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # And, as for missing-target, "no verdict" outranks naming a cause.
 assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" \
@@ -1773,10 +1944,10 @@ assert_describe "declines the stale-lockfile verdict for a signalled run" 72 "" 
 # whole reason for having a status of its own is that the two must read
 # differently. Both halves are asserted: what it does say, and what it must not.
 assert_describe "says a rewritten lockfile passed its checks, not that they failed" 73 \
-  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "Checks passed in 21195s but rewrote Cargo.lock — commit the regenerated Cargo.lock (triggered by someone)" \
   "the checks passed" STUB_FREE_KB="$(gib_to_kb 200)"
 assert_describe "names committing the regenerated lockfile as the remedy" 73 \
-  "Checks passed in 21195s but Cargo.lock was rewritten, so it cannot be attested; commit the regenerated Cargo.lock (triggered by someone)" \
+  "Checks passed in 21195s but rewrote Cargo.lock — commit the regenerated Cargo.lock (triggered by someone)" \
   "commit the regenerated Cargo.lock and sign off again" STUB_FREE_KB="$(gib_to_kb 200)"
 # The regression this distinction exists to prevent, stated as a contract: the
 # post-check must never publish the preflight's "did not run" wording.

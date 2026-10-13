@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 //! `runtime.params.cayenne_segment_cache_mb=0` has to mean *off*, not "off
-//! globally, on per table". Its own binary because the decision is a process-wide
-//! `OnceLock` and cannot be undone.
+//! globally, on per table". It needs a process of its own because the decision is
+//! a process-wide `OnceLock` and cannot be undone (see
+//! `crate::require_process_per_test`).
 
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
@@ -24,6 +25,9 @@ use vortex_datafusion::{VortexFormat, VortexTableOptions, install_process_segmen
 
 #[test]
 fn a_disabled_process_cache_is_not_replaced_by_private_per_table_caches() {
+    crate::require_process_per_test(
+        "this test installs the process-wide segment cache, which cannot be undone",
+    );
     assert!(
         install_process_segment_cache(0),
         "zero installs the disabled decision"

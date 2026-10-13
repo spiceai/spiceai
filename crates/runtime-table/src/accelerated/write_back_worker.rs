@@ -93,7 +93,7 @@ use data_connector_api::write_back::WriteBackDeliverer;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use opentelemetry::KeyValue;
 use parking_lot::Mutex;
@@ -408,8 +408,10 @@ impl WriteBackWorker {
         // provider's SHARED RuntimeEnv (object-store registrations for S3, memory
         // pool, caches) — a fresh `SessionContext::new()` would lose them and fail
         // object-store-backed scans.
-        let ctx =
-            SessionContext::new_with_config_rt(SessionConfig::new(), self.provider.runtime_env());
+        let ctx = SessionContext::new_with_config_rt(
+            util::session_state::session_config(),
+            self.provider.runtime_env(),
+        );
         // `Arc<CayenneTableProvider>` coerces to the `Arc<dyn TableProvider>`
         // `read_table` expects at the call argument below.
         let accelerator = Arc::clone(&self.provider);
@@ -729,16 +731,34 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![Some("x")]))])
                 .expect("batch"),
         ];
-        deliverable_markers("id", &markers(&[1]), &keys(&[1]), &current)
+        let err = deliverable_markers("id", &markers(&[1]), &keys(&[1]), &current)
             .expect_err("a missing pk column must error rather than withhold every key");
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Execution(message)
+                    if message == "durable write-back: primary-key column 'id' missing from the accelerator read"
+            ),
+            "expected the missing primary-key column to be reported, got: {err}"
+        );
     }
 
     /// Markers and decoded keys pair by position, so a decode that does not cover
     /// the claim must error rather than clear a marker for another key.
     #[test]
     fn a_decode_that_does_not_cover_every_claimed_marker_is_an_error() {
-        deliverable_markers("id", &markers(&[1, 2]), &keys(&[1]), &[id_batch(vec![1])])
+        let err = deliverable_markers("id", &markers(&[1, 2]), &keys(&[1]), &[id_batch(vec![1])])
             .expect_err("fewer decoded keys than claimed markers must error");
+        // The length guard is what fired, before any marker could pair with the
+        // wrong key — not a failure further on.
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Internal(message)
+                    if message == "durable write-back decoded 1 primary key(s) for 2 claimed marker(s)"
+            ),
+            "expected the decode-length guard, got: {err}"
+        );
     }
 
     /// The read filter is `pk IN (keys…)`: the point-scan that decides which

@@ -137,8 +137,7 @@ impl RateLimiter for HttpRateLimiter {
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
-            let retry_after = *self.retry_after.read().await;
-            let Some(retry_after) = retry_after else {
+            let Some(retry_after) = *self.retry_after.read().await else {
                 return Ok(());
             };
 

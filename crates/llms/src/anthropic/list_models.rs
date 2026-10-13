@@ -41,18 +41,18 @@ struct Model {
 }
 
 /// Anthropic model lister that fetches available models from the API.
-#[expect(clippy::struct_field_names)]
 pub struct AnthropicModelLister {
     api_key: SecretString,
     api_base: String,
     api_version: String,
+    workspace_id: Option<String>,
 }
 
 impl AnthropicModelLister {
     /// Creates a new model lister from parameters.
     ///
     /// Required parameter: `anthropic_api_key`
-    /// Optional parameters: `anthropic_api_base`, `anthropic_api_version`
+    /// Optional parameters: `anthropic_api_base`, `anthropic_api_version`, `anthropic_workspace_id`
     pub fn from_params(params: &HashMap<String, SecretString>) -> ListModelsResult<Self> {
         let api_key = get_required_param(params, "anthropic_api_key")?.clone();
         let api_base = params
@@ -63,10 +63,15 @@ impl AnthropicModelLister {
             |s| s.expose_secret().to_string(),
         );
 
+        let workspace_id = params
+            .get("anthropic_workspace_id")
+            .map(|s| s.expose_secret().to_string());
+
         Ok(Self {
             api_key,
             api_base,
             api_version,
+            workspace_id,
         })
     }
 
@@ -81,6 +86,7 @@ impl AnthropicModelLister {
             api_key,
             api_base: api_base.unwrap_or_else(|| API_BASE.to_string()),
             api_version: api_version.unwrap_or_else(|| API_VERSION.to_string()),
+            workspace_id: None,
         }
     }
 }
@@ -99,10 +105,14 @@ impl ListModels for AnthropicModelLister {
 
         let url = format!("{}/models", self.api_base.trim_end_matches('/'));
 
-        let response = client
+        let mut request = client
             .get(&url)
             .header("x-api-key", self.api_key.expose_secret())
-            .header("anthropic-version", &self.api_version)
+            .header("anthropic-version", &self.api_version);
+        if let Some(workspace_id) = &self.workspace_id {
+            request = request.header("anthropic-workspace-id", workspace_id);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| ListModelsError::NetworkError {
@@ -153,7 +163,25 @@ mod tests {
             "anthropic_api_key".to_string(),
             SecretString::from("test-key"),
         );
-        let result = AnthropicModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = AnthropicModelLister::from_params(&params).expect("should succeed");
+        assert_eq!(lister.api_key.expose_secret(), "test-key");
+        assert_eq!(lister.api_base, "https://api.anthropic.com/v1");
+        assert_eq!(lister.api_version, "2023-06-01");
+
+        // An explicit base and version replace the defaults, so the key goes to
+        // the configured host rather than to `api.anthropic.com`.
+        params.insert(
+            "anthropic_api_base".to_string(),
+            SecretString::from("https://anthropic.example.com/v1"),
+        );
+        params.insert(
+            "anthropic_api_version".to_string(),
+            SecretString::from("2024-01-01"),
+        );
+        let lister =
+            AnthropicModelLister::from_params(&params).expect("should succeed with overrides");
+        assert_eq!(lister.api_key.expose_secret(), "test-key");
+        assert_eq!(lister.api_base, "https://anthropic.example.com/v1");
+        assert_eq!(lister.api_version, "2024-01-01");
     }
 }

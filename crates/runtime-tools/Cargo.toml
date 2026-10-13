@@ -67,6 +67,7 @@ openapi = ["dep:utoipa"]
 [dev-dependencies]
 bytes.workspace = true
 http-body-util = "0.1"
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

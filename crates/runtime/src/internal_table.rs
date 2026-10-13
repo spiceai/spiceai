@@ -18,8 +18,8 @@ use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 

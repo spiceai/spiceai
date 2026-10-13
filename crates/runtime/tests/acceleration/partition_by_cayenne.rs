@@ -1012,7 +1012,7 @@ async fn test_cayenne_partition_by_full_refresh_removes_rows_missing_from_source
 -> Result<(), anyhow::Error> {
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use runtime::accelerated::refresh::RefreshOverrides;
     use runtime::component::dataset::acceleration::RefreshMode as OverrideRefreshMode;
 

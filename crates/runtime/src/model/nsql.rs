@@ -34,8 +34,8 @@ use datafusion::arrow::{
 };
 use datafusion::{
     DATAFUSION_VERSION,
+    common::TableReference,
     common::{Constraint, Constraints, DataFusionError, utils::quote_identifier},
-    sql::TableReference,
 };
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -1634,8 +1634,7 @@ fn is_json_context_function(name: &str) -> bool {
 }
 
 fn spark_function_names(inventory: &FunctionInventory) -> BTreeSet<String> {
-    datafusion_spark::all_default_scalar_functions()
-        .into_iter()
+    crate::datafusion::builder::registered_spark_scalar_functions()
         .map(|function| function.name().to_ascii_lowercase())
         .filter(|name| inventory.names.contains(name))
         .collect()
@@ -1734,8 +1733,7 @@ pub(crate) fn all_context_function_names_for_test() -> HashSet<String> {
     }
 
     names.extend(
-        datafusion_spark::all_default_scalar_functions()
-            .into_iter()
+        crate::datafusion::builder::registered_spark_scalar_functions()
             .map(|function| function.name().to_ascii_lowercase()),
     );
     names
@@ -3103,8 +3101,7 @@ mod tests {
             );
         }
 
-        let expected_spark_names = datafusion_spark::all_default_scalar_functions()
-            .into_iter()
+        let expected_spark_names = crate::datafusion::builder::registered_spark_scalar_functions()
             .map(|function| function.name().to_ascii_lowercase())
             .collect::<BTreeSet<_>>();
         let actual_spark_names = context

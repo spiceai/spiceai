@@ -157,8 +157,10 @@ impl Embed {
             }
         }
 
-        let embeddings = if texts.is_empty() {
-            Vec::new()
+        // `embed_sync` yields the cache's shared handle; the empty case matches
+        // that shape rather than forcing the result back into an owned `Vec`.
+        let embeddings: Arc<Vec<Vec<f32>>> = if texts.is_empty() {
+            Arc::new(Vec::new())
         } else {
             model
                 .embed_sync(EmbeddingInput::StringArray(texts))

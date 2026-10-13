@@ -22,7 +22,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
+use datafusion::{catalog::TableProvider, common::TableReference, datasource::DefaultTableSource};
 use datafusion_expr::TableScan;
 use runtime_cluster::{ExecutorRegistry, PartitionValue};
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;

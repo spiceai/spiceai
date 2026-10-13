@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::future::join_all;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
@@ -250,7 +250,7 @@ impl PartitionService {
     }
 
     fn config_from_app(app: &App) -> AssignmentConfig {
-        let Some(scheduler) = app.runtime.scheduler.clone() else {
+        let Some(scheduler) = app.runtime.resolved_scheduler() else {
             return AssignmentConfig::default();
         };
         match PartitionAssignmentConfig::try_from(scheduler) {
@@ -1368,7 +1368,6 @@ async fn notify_executor_of_assignments(
     Ok(())
 }
 
-#[expect(clippy::result_large_err)]
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

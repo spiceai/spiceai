@@ -227,6 +227,46 @@ impl LookupIndexReservation {
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Transfers already admitted bytes without returning them to the pool.
+    pub(crate) fn absorb(&mut self, mut other: Self) -> Result<(), Self> {
+        if !Arc::ptr_eq(&self.account, &other.account) {
+            return Err(other);
+        }
+        let Some(bytes) = self.bytes.checked_add(other.bytes) else {
+            return Err(other);
+        };
+        self.bytes = bytes;
+        other.bytes = 0;
+        Ok(())
+    }
+
+    /// Changes the reservation to `bytes`. Returns `false`, keeping what it
+    /// held, when the pool cannot fit the growth; shrinking always succeeds.
+    pub(crate) fn try_resize(&mut self, bytes: usize) -> bool {
+        let mut state = self.account.state.lock();
+        let Some(lookup_index_bytes) = state
+            .lookup_index_bytes
+            .saturating_sub(self.bytes)
+            .checked_add(bytes)
+        else {
+            return false;
+        };
+        let total = state
+            .keyset_bytes
+            .saturating_add(state.deletion_bytes)
+            .saturating_add(state.cold_existence_bytes)
+            .saturating_add(lookup_index_bytes);
+        if bytes > self.bytes && state.reservation.try_resize(total).is_err() {
+            return false;
+        }
+        state.lookup_index_bytes = lookup_index_bytes;
+        if bytes <= self.bytes {
+            state.resize_to_total();
+        }
+        self.bytes = bytes;
+        true
+    }
 }
 
 impl std::fmt::Debug for LookupIndexReservation {
@@ -267,6 +307,29 @@ mod tests {
     use super::*;
 
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    #[test]
+    fn lookup_index_reservation_resizes_within_the_pool() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1000));
+        let account = Arc::new(CayenneMemoryAccount::new("resize", &pool));
+        account.set_keyset_bytes(100);
+        let mut reservation = account
+            .try_reserve_lookup_index(200)
+            .expect("fits the pool");
+        assert!(reservation.try_resize(900), "grows up to the pool");
+        assert_eq!(pool.reserved(), 1000);
+        assert!(!reservation.try_resize(901), "refused past the pool");
+        assert_eq!(
+            reservation.bytes(),
+            900,
+            "a refused resize keeps what it held"
+        );
+        assert_eq!(pool.reserved(), 1000);
+        assert!(reservation.try_resize(50), "shrinking always succeeds");
+        assert_eq!(pool.reserved(), 150);
+        drop(reservation);
+        assert_eq!(pool.reserved(), 100);
+    }
 
     #[test]
     fn snapshot_components_always_sum_to_the_reservation() {

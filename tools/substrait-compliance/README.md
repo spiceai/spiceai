@@ -1,13 +1,16 @@
 # Substrait compliance harness
 
 Measures [IBM/substrait-compliance](https://github.com/IBM/substrait-compliance)
-TPC-H pass rate against the Spice `DataFusion` fork (Mode A) and sketches the
-product path through FlightSQL `CommandStatementSubstraitPlan` (Mode B).
+TPC-H pass rate against the Spice `DataFusion` fork (Mode A) and through the
+product path, `spiced`'s FlightSQL `CommandStatementSubstraitPlan` endpoint over
+accelerated datasets (Mode B). Mode A runs the suite's 22 plans over its own
+SF 0.01 data, or at any `--scale-factor` over tables the harness generates; CI
+runs SF 1. Mode B serves generated tables through `spiced`.
 
-This is a **DataFusion consumer baseline**. CI (`pull_request`,
-`merge_group`, and nightly) is report-only on pass rate: it does not
-fail the repository on a low pass rate. A harness or build crash still
-fails the job.
+This is a **DataFusion consumer baseline**. CI (every merge-queue entry,
+pushes, and nightly) is report-only on pass rate: it does not fail the
+repository on a low pass rate. A harness or build crash still fails the
+job.
 
 ## Pins
 
@@ -15,7 +18,9 @@ fails the job.
 |------|--------|
 | Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `43d31411c69ef7594887c7d759037bcf8244eeed` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the TPC-H q01 shipdate-cutoff correction, the only difference from upstream |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `spiceai-54` @ `11624fb82dc5460d201d0379d269a4613e82f9c7` (workspace `[patch.crates-io]`; merged spiceai/datafusion#220, #221 and #226, includes #215) |
+| spiceai/datafusion fork | `spiceai-54` @ `f9bd47df2cbc536a9af95b57132602f121365f1b` (workspace `[patch.crates-io]`; merged spiceai/datafusion#227, #230, #231 and #232; spiceai-54 also merged #235, #220, #221 and #226 and includes #215) |
+| Tables at `--scale-factor` | `tpchgen` `3.0.0` (workspace `Cargo.lock`): the TPC's reference `dbgen` rows, generated in memory |
+| SF 1 goldens | [`expected/sf1`](expected/sf1): `DuckDB` `1.5.6` `tpch_queries()` over those rows ([provenance](expected/sf1/README.md)) |
 
 The IBM `examples/datafusion-rust` tree on **`main`** pins
 `datafusion` / `datafusion-substrait` **54.1** and is the layout Mode A
@@ -26,13 +31,14 @@ in `src/main.rs` carry the same pin and move together.
 Nothing from the IBM repository is vendored. The suite is cloned at run
 time. See [`NOTICE`](NOTICE) for Apache-2.0 attribution.
 
-## Mode A baseline (measured 2026-09-09 on the pins above)
+## Mode A baseline (on the pins above)
 
-| Suite | PASS | FAIL | SKIP | ERROR | Total |
-|-------|------|------|------|-------|-------|
-| TPC-H SF 0.01 | 22 | 0 | 0 | 0 | 22 |
+| Suite | Measured | PASS | FAIL | SKIP | ERROR | Total |
+|-------|----------|------|------|------|-------|-------|
+| TPC-H SF 1 (generated tables, `expected/sf1`; what CI runs) | 2026-10-01 | 22 | 0 | 0 | 0 | 22 |
+| TPC-H SF 0.01 (the suite's CSVs and goldens) | 2026-09-09 | 22 | 0 | 0 | 0 | 22 |
 
-Each step measured with the same command: IBM-strict compare on the first
+At SF 0.01, each step measured with the same command: IBM-strict compare on the first
 `spiceai-54` pin **5 / 14 / 0 / 3**; value-preserving compare lifts
 **16 / 3 / 0 / 3**; `extract` enum arguments in the fork consumer
 (spiceai/datafusion#220) **18 / 4 / 0 / 0**; the q01 suite correction with
@@ -47,20 +53,33 @@ a subquery scan's own qualifier in the fork consumer
 # From the spiceai/spiceai repository root
 ./tools/substrait-compliance/scripts/fetch-ibm.sh
 
-cargo run -p spice-substrait-compliance -- \
-  --mode mode-a \
-  --suite tools/substrait-compliance/.ibm/test-suites/tpch \
-  --out-json tools/substrait-compliance/results/mode-a-tpch.json \
-  --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
+# SF 1, as CI runs it: tables generated in memory, goldens from expected/sf1
+cargo run -p spice-substrait-compliance -- --mode mode-a --scale-factor 1
+
+# SF 0.01: the suite's own CSVs and goldens
+cargo run -p spice-substrait-compliance -- --mode mode-a
 ```
 
-Single query: add `--query q01`.
+Both default to `--suite tools/substrait-compliance/.ibm/test-suites/tpch`
+and write `results/mode-a-tpch.{json,csv}` (`--out-json`, `--out-csv`).
+Single query: add `--query q01`. On Apple Silicon an SF 1 run takes about
+11 s in a debug build (5 s to generate, 6 s for the 22 queries) and peaks at
+3.1 GB RSS.
 
-Mode B (encodes the FlightSQL command; does not contact `spiced`). Each
-mode defaults to its own report paths, `results/<mode>-tpch.{json,csv}`:
+Mode B, against a `spiced` binary. Each mode defaults to its own report paths,
+`results/<mode>-tpch.{json,csv}`:
 
 ```bash
-cargo run -p spice-substrait-compliance -- --mode mode-b
+cargo run -p spice-substrait-compliance -- --mode mode-b --scale-factor 1 \
+  --spiced-path ~/.spice/bin/spiced \
+  --acceleration-engine cayenne --acceleration-mode file --iterations 3
+
+# Every layout of one engine, held to Mode A and then to the default layout,
+# as CI runs it:
+tools/substrait-compliance/scripts/run-mode-b.sh \
+  target/debug/spice-substrait-compliance ~/.spice/bin/spiced \
+  cayenne file tools/substrait-compliance/results/mode-b \
+  primary_key indexes primary_key,indexes
 ```
 
 ## Mode A
@@ -101,32 +120,89 @@ Not lifted: row-count misses. `string` ↔ numeric type labels
 
 A test with no expected CSV is `SKIPPED`, never `PASSED`.
 
-## Mode B (stub)
+## Scale factors beyond the suite's
 
-Product path for any CI we keep long-term.
+The suite ships SF 0.01 data and goldens only. With `--scale-factor <SF>`,
+Mode A generates the eight tables in memory with `tpchgen` (a pure-Rust port
+of the TPC's reference `dbgen`), registers them under the Isthmus names and
+types, and compares against `expected/sf<SF>` (`--expected` overrides).
+No table data is downloaded or read from disk.
 
-1. Start `spiced` with a Spicepod that mounts the IBM CSVs as datasets
-   whose names match the plans (`LINEITEM`, …).
-2. Wrap plan bytes in `arrow_flight::sql::CommandStatementSubstraitPlan`
-   (`mode_b::command_statement_substrait_plan`).
-3. `GetFlightInfo(FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec()))`.
-4. `DoGet` the ticket; compare batches with `compare.rs`.
+The suite's SF 0.01 CSVs come from `DuckDB`'s `dbgen` port instead. It agrees
+with the reference `dbgen` on every key, number and date, but generates
+different comments and addresses: over all 86,630 SF 0.01 rows, only the
+`*_comment`, `s_address` and `c_address` columns differ. A generated run is
+therefore never compared against the suite's goldens (q02, q10, q13, q15 and
+q20 read those columns and fail against them), but against goldens computed
+on the generated rows:
 
-Server: `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs`.
+```bash
+cargo run -p spice-substrait-compliance -- --scale-factor 1 --write-data target/tpch-sf1
+uv run tools/substrait-compliance/scripts/generate_expected.py \
+  --data-dir target/tpch-sf1 --out tools/substrait-compliance/expected/sf1
+```
 
-Open work: catalog mapping from `spice.public.lineitem` onto unqualified
-Isthmus names; `spiced` bring-up in this harness; auth.
+`generate_expected.py` loads those CSVs into `DuckDB` with the TPC-H types and
+runs its standard `tpch_queries()`. A `DECIMAL` result column is declared
+`decimal(p,s)` in the golden, which the compare checks exactly as a scaled
+integer: SF 1 money columns carry no float tolerance. Regenerate after a
+`tpchgen` version change; `expected/sf1/README.md` records the `DuckDB`
+version and a SHA-256 of each input CSV.
+
+The SF 1 goldens agree with two independent answer sets. Every cell of the 17
+queries that read no generated text equals the SF 1 answers in
+`crates/test-framework/src/queries/validation/tpch`, and q02, q10, q13, q15
+and q20 equal the TPC's published SF 1 answers (`dbgen/answers`).
+
+## Mode B
+
+The product path. The harness generates the TPC-H tables with `tpchgen`
+(`--scale-factor` is required), writes them as parquet, and starts `spiced` on a
+Spicepod that serves each one as a dataset: accelerated with
+`--acceleration-engine` (`cayenne`, `duckdb`, `arrow`, `sqlite`, …) in
+`--acceleration-mode` (`file` or `memory`), or federated from the parquet files
+with `--acceleration-engine none`. `--layout` applies an acceleration layout to
+every dataset, the same as `testoperator --layout`: features from
+`primary_key`, `indexes`, `sort`, `cluster`, `time_column` and `partition`,
+joined by commas, keyed from `crates/test-framework/src/layout/tpch.rs`. A
+federated run refuses `--acceleration-mode` and `--layout`, which it could not
+apply.
+
+Each plan goes to `spiced` as a FlightSQL `CommandStatementSubstraitPlan`
+(`GetFlightInfo`, then `DoGet` for each endpoint;
+`crates/runtime/src/flight/flightsql/statement_substrait_plan.rs` serves it),
+and the rows are compared with the same goldens as Mode A. Spice registers
+datasets under lowercase names and the suite's Isthmus plans read uppercase
+ones, so the harness lowercases each plan's read names (`src/plan_names.rs`)
+and writes the tables' columns in lowercase; nothing else in the plan changes.
+
+`--iterations N` runs every plan N times and compares each execution, so an
+answer that changes once a cache or an index is warm fails the case.
+`--baseline <report.json>` fails the run (exit 1) when a case that passed in
+that report does not pass here, and refuses a baseline that passed none of the
+selected cases, which would compare nothing. `scripts/run-mode-b.sh` chains the
+two baselines for one engine: Mode A over the same tables, then the default
+layout, then each layout against the default.
 
 ## CI
 
-`.github/workflows/substrait_compliance.yml` runs on `pull_request` and
-`merge_group` (gated to harness source, scripts, DataFusion pin,
-toolchain, and workflow paths so repo docs and harness Markdown skip
-the job), plus nightly `schedule` and `workflow_dispatch`. Per-query
-FAIL/ERROR already exit 0; a harness/build crash fails the job (no
-`continue-on-error`). Uploads the JSON and CSV reports as an artifact.
-Do not gate merge on pass rate until a threshold is set from this
-baseline. The job is not in `REQUIRED_CHECKS`.
+`.github/workflows/substrait_compliance.yml` runs Mode A at SF 1 on the
+`spiceai-macos` runners for every merge-queue entry, on push to
+trunk/release/feature branches, nightly, and on `workflow_dispatch`; not
+on `pull_request`. The merge-queue run has no path filter: the consumer it
+measures moves with any DataFusion, arrow or fork-pin change in the
+workspace. Per-query FAIL/ERROR exit 0; a harness/build crash fails the job
+(no `continue-on-error`). Uploads the JSON and CSV reports as an artifact.
+The job is not in `REQUIRED_CHECKS`, so the queue does not wait on it. Do
+not gate merge on pass rate until a threshold is set from this baseline.
+
+The same workflow runs Mode B nightly and on `workflow_dispatch`, one job per
+acceleration engine (Cayenne file and memory, DuckDB file and memory, Arrow,
+SQLite, and federated parquet), against the newest trunk `spiced` that
+`setup-spiced` finds. Each job runs `scripts/run-mode-b.sh` with the layouts
+that engine's TPC-H SF 1 testoperator runs take, three executions per plan, and
+fails when a case regresses against its baseline. The jobs run one at a time,
+since each starts `spiced` on its default ports.
 
 ## License
 

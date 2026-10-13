@@ -23,7 +23,7 @@ limitations under the License.
 //! only buffers the **owned** wire payload (`RowsEventData<'static>`) plus
 //! `Arc` snapshots of the table-map columns and the member's decode layout, and
 //! hands them to this [`MysqlChangeRows`]. [`ChangeRows::build`] then runs the
-//! decode + [`build_change_batch`] later, on the per-dataset consumer thread.
+//! decode + [`build_change_batch`](super::rows::build_change_batch) later, on the per-dataset consumer thread.
 //!
 //! Two consequences, both intended:
 //!   - shared-pump CPU stays ~flat as members grow, and
@@ -33,12 +33,12 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
+use arrow::datatypes::{DataType, IntervalUnit};
 use mysql_async::binlog::events::{RowsEventData, TableMapEvent};
 
 use super::binlog::{TableMapRowDecoder, buffer_rows_event, buffer_rows_event_fast};
 use super::metrics::MetricsCollector;
-use super::rows::{TransactionBuffer, build_change_batch};
+use super::rows::{ChangeBatchSchemas, TransactionBuffer, build_change_batch_with};
 use super::setup::TableLayout;
 use crate::cdc::{ChangeBatch, ChangeBatchError, ChangeRows};
 
@@ -59,7 +59,9 @@ pub(super) struct MemberLayout {
 /// Deferred [`ChangeRows`] for one member's rows within one committed source
 /// transaction. Carries owned wire payloads; the decode runs in [`Self::build`].
 pub(crate) struct MysqlChangeRows {
-    schema: SchemaRef,
+    /// The member's dataset schema and its derived change-batch schemas (see
+    /// [`ChangeBatchSchemas`]).
+    change_schemas: Arc<ChangeBatchSchemas>,
     primary_keys: Vec<String>,
     /// Decode-time layout snapshot (see [`MemberLayout`]).
     layout: Arc<MemberLayout>,
@@ -81,7 +83,7 @@ pub(crate) struct MysqlChangeRows {
 
 impl MysqlChangeRows {
     pub(super) fn new(
-        schema: SchemaRef,
+        change_schemas: Arc<ChangeBatchSchemas>,
         primary_keys: Vec<String>,
         layout: Arc<MemberLayout>,
         tme: Arc<TableMapEvent<'static>>,
@@ -92,11 +94,7 @@ impl MysqlChangeRows {
         // Both metadata figures are computed WITHOUT decoding, from the buffered
         // wire size (`rows_data()` is a byte-slice accessor, no row parse).
         let wire_bytes: usize = events.iter().map(|e| e.rows_data().len()).sum();
-        let per_row_fixed: usize = schema
-            .fields()
-            .iter()
-            .map(|f| arrow_fixed_width(f.data_type()))
-            .sum();
+        let per_row_fixed = change_schemas.per_row_fixed();
         // Row count can't be known without decoding a MySQL rows event, so this
         // is an estimate: wire bytes over a per-row floor, never below one row
         // per event. Over/under-estimating only affects builder pre-allocation;
@@ -107,7 +105,7 @@ impl MysqlChangeRows {
         // allocation), matching `PgChangeRows`.
         let byte_len = wire_bytes.max(row_hint.saturating_mul(per_row_fixed));
         Self {
-            schema,
+            change_schemas,
             primary_keys,
             layout,
             tme,
@@ -181,8 +179,8 @@ impl ChangeRows for MysqlChangeRows {
                 message: e.to_string(),
             })?;
         }
-        build_change_batch(
-            &self.schema,
+        build_change_batch_with(
+            &self.change_schemas,
             &self.primary_keys,
             &self.layout.column_map,
             &buffer.changes,
@@ -223,7 +221,7 @@ fn warn_decoder_fallback_once(tme: &TableMapEvent<'_>, error: &super::Error) {
 /// types (whose bytes are already reflected in the buffered wire size). Used
 /// only to floor the coalescing byte estimate at the real Arrow footprint;
 /// mirrors `postgres_replication::changes::arrow_fixed_width`.
-fn arrow_fixed_width(data_type: &DataType) -> usize {
+pub(super) fn arrow_fixed_width(data_type: &DataType) -> usize {
     match data_type {
         DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
         DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,

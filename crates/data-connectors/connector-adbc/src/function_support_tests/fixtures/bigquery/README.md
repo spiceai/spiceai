@@ -7,7 +7,11 @@ credentials, service or network connection.
 The E2E Test CI workflow's `run_all_tests` release gate executes every corpus
 statement through real BigQuery using `test/scripts/bigquery_corpus.py`. It creates
 isolated tables from `schemas.json`, checks federation plans and successful
-execution, and requires 263 successful data-query jobs. The eight table-free
+execution, and requires 264 successful data-query jobs, one per remote subtree
+that runs. The plans hold 278 remote subtrees: the three queries a rounding cast
+splits contribute nine of them, and the four an ordered aggregate splits
+contribute thirteen. Against the empty fixtures, 14 of them sit on the probe side
+of an empty join build side and never run (#14848). The eight table-free
 statements execute locally. Queries 168 and 169 divide by cohort counts, so they
 execute last against synthetic cohorts with nonzero denominators and exact
 expected results. The other queries execute against empty tables, which does not
@@ -40,6 +44,26 @@ cooperative scheduling, byte accounting and partition coalescing without a limit
 are permitted. Query 241 is the explicit partial-federation case: its median and
 approximate-percentile windows and dependent projections/sorts stay local; its
 source joins, JSON extraction and aggregation must remain one remote subtree.
+
+Queries 033, 124 and 147 are the rounding-cast partial cases. Each computes a
+cast from a fractional value into an integer, which BigQuery rounds where
+DataFusion truncates, so the connector policy declines to push it down (issue
+#14482) and the plan splits into 3, 5 and 1 remote subtrees respectively. Both
+gates pin those counts and require the local integer cast to still be there:
+de-federating further, or restoring the pushdown, fails and asks for the entry
+to be re-decided. Issue #14607 tracks restoring full federation by rendering the
+cast as a truncating one instead of declining it.
+
+Queries 085, 086, 087 and 226 are the ordered-aggregate partial cases. Each
+calls `ARRAY_AGG` or `STRING_AGG` with an `ORDER BY` inside the call, which the
+unparser drops and the BigQuery dialect does not render, so a federated call
+came back in BigQuery's order. Every connector policy keeps such an aggregate
+local, and the plans split into 3, 6, 3 and 1 remote subtrees respectively.
+Against the gate's empty fixtures each runs one of them: an empty join build side
+never polls the rest. Both gates pin those counts and require the local ordered
+aggregate to still be there. Rendering the ordering inside the call, as the
+DuckDB dialect does, would restore full federation.
+
 Table-free statements are individually identified in the test and must contain
 no table scan or remote node. Final SQL rendering errors also fail the test.
 

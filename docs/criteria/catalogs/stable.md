@@ -12,7 +12,7 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 | Cayenne       | ➖             |              |
 | Databricks    | ➖             |              |
 | DuckLake      | ➖             |              |
-| Glue          | ➖             |              |
+| Glue          | ✅             | @lukekim     |
 | Iceberg       | ➖             |              |
 | MS SQL        | ➖             |              |
 | MySQL         | ➖             |              |

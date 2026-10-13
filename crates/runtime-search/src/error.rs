@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow_schema::ArrowError;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use itertools::Itertools;
 use search::aggregation;
 use snafu::prelude::*;

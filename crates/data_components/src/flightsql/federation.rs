@@ -23,13 +23,11 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
-    sql::{
-        TableReference,
-        unparser::dialect::{DefaultDialect, Dialect},
-    },
+    sql::unparser::dialect::{DefaultDialect, Dialect},
 };
 
 use super::{FlightSQLTable, query_to_stream};

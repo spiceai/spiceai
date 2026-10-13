@@ -304,7 +304,7 @@ impl CayenneContext {
             vortex_format,
             config: config.clone(),
             dataset: dataset.to_string(),
-            session_config: SessionConfig::default(),
+            session_config: util::session_state::session_config(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             overwrite_inline_admission: Arc::new(Semaphore::new(1)),
             runtime_env,
@@ -587,8 +587,9 @@ impl CayenneContext {
     }
 
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// The default `auto` resolves to `position` (merge-on-read position-delete
-    /// vectors); `key` is the opt-out that keeps the above-scan key-based filter.
+    /// The default `auto` resolves to `key` for PK tables (key-based tombstones
+    /// pruned by seq-prefix bake) and to `position` for PK-less tables; `key`
+    /// or `position` can be pinned explicitly.
     #[must_use]
     pub(crate) fn deletion_mode(&self) -> DeletionMode {
         self.config.deletion_mode
@@ -632,6 +633,23 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn bake_deletion_index_trigger(&self) -> usize {
         self.live_actuators.bake_deletion_index_trigger()
+    }
+
+    /// The CONFIGURED deletion-index trigger — what the spicepod set, or
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`] — with the adaptive
+    /// actuator's movement deliberately excluded.
+    ///
+    /// The actuator lowers the trigger to bake more often, trading the bake's write
+    /// amplification for a cheaper per-row probe. That trade is only sound where the
+    /// reclaim is the incremental bake, which rewrites the settled protected prefix.
+    /// The `deletion_mode: position` reclaim is a full current-snapshot rewrite
+    /// instead, whose cost curve is nothing like the bake's — an adaptive floor of
+    /// `1_000` tombstones would ask a large table to re-encode itself continuously,
+    /// holding the write lock each time. That path reads the configured value, so an
+    /// operator still sets it, and the controller cannot make it pathological.
+    #[must_use]
+    pub(crate) fn configured_deletion_index_trigger(&self) -> usize {
+        self.config.bake_deletion_index_trigger
     }
 
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
@@ -845,13 +863,22 @@ impl CayenneContext {
     /// phase) into the tuner's rolling EWMA. Called from the write path with the
     /// duration it already measured for telemetry.
     pub(crate) fn record_io_latency(&self, d: std::time::Duration) {
-        self.ingest_stats.record_io_latency(d);
+        self.ingest_stats
+            .record_io_latency(d, chrono::Utc::now().timestamp_millis());
     }
 
     /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
     /// single-writer commit) into the tuner's rolling EWMA.
     pub(crate) fn record_publish_latency(&self, d: std::time::Duration) {
-        self.ingest_stats.record_publish_latency(d);
+        self.ingest_stats
+            .record_publish_latency(d, chrono::Utc::now().timestamp_millis());
+    }
+
+    /// Record the live deletion-index size a committed seq-prefix bake left
+    /// behind, for the adaptive controller's futile-bake backoff.
+    pub(crate) fn record_bake_residual(&self, deletion_index_len: usize) {
+        self.ingest_stats
+            .record_bake(deletion_index_len, chrono::Utc::now().timestamp_millis());
     }
 
     /// Current memory pressure (`used / budget`), or `None` when unsampled. A
@@ -914,6 +941,7 @@ impl CayenneContext {
         snap.metastore_storage = self.config.metastore_storage_class;
         snap.data_write_mbps = self.config.data_storage_write_mbps;
         snap.metastore_write_mbps = self.config.metastore_storage_write_mbps;
+        self.ingest_stats.expire_stale_latencies(&mut snap, now_ms);
         snap
     }
 
@@ -924,7 +952,7 @@ impl CayenneContext {
     }
 
     /// Whether closed-loop dynamic tuning is active for this table
-    /// (`cayenne_tuning: adaptive`; a `cayenne_goal_*` setpoint alone does not
+    /// (`runtime.adaptive_tuning: enabled`; a `runtime.params.target_*` setpoint alone does not
     /// enable it). Gates the per-tick query-admission reserve report so it is a
     /// strict no-op for non-adaptive tables.
     #[must_use]

@@ -11,7 +11,7 @@ Cayenne is Spice's accelerated table engine, built on top of [Vortex](https://gi
 1. **Position-delete awareness**: Cayenne maintains external delete metadata. Without per-file access plans and statistics adjustment hooks, DataFusion can optimize from stale exact file statistics and return wrong results.
 2. **DataFusion fork compatibility**: Spice tracks a pinned DataFusion fork (see [`Cargo.toml`](../../Cargo.toml)). Upstream `vortex-datafusion`'s API direction and version targets do not match Spice's DataFusion surface.
 3. **Cayenne-specific scan performance**: Vendored options for projection pushdown, scan concurrency, footer/segment caching, and dynamic filter handling are required to meet Cayenne's accelerated query targets (TPC-H/TPC-DS).
-4. **Spice-wide hardening**: The crate must comply with Spice's lint, error-handling, async-blocking, and data-correctness rules (`docs/dev/style_guide.md`, `docs/dev/error_handling.md`, [.github/copilot-instructions.md](../../.github/copilot-instructions.md)).
+4. **Spice-wide hardening**: The crate must comply with Spice's lint, error-handling, async-blocking, and data-correctness rules (`docs/dev/style_guide.md`, `docs/dev/error_handling.md`, [`AGENTS.md`](../../AGENTS.md)).
 
 Doing this work upstream first would block Cayenne on external review cycles and on a DataFusion API direction that does not currently match Spice's fork. Carrying patches against an external crate would create the same long-term maintenance cost as vendoring, without the freedom to land Spice-specific behavior.
 
@@ -117,7 +117,7 @@ These are surfaced through Cayenne's accelerator configuration (e.g. `cayenne_fo
 * **Risk**: A future Vortex/DataFusion upgrade breaks vendored behavior silently.
   * **Mitigation**: Snapshot tests, dynamic-filter and pushdown unit tests, and Cayenne TPC benchmarks (`testoperator run bench`) guard the integration.
 * **Risk**: Wrapper/decorator traits added in either DataFusion or Vortex acquire defaulted no-op behavior that silently breaks vendored hooks.
-  * **Mitigation**: Follow the trait-evolution checklist in [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) (the "Trait Evolution & Wrapper Delegation" section) when adding or changing trait methods that wrappers must forward.
+  * **Mitigation**: Follow the trait-evolution checklist in [`AGENTS.md`](../../AGENTS.md) (the "Trait Evolution & Wrapper Delegation" section) when adding or changing trait methods that wrappers must forward.
 
 ## Exit Criteria
 
@@ -133,5 +133,5 @@ When those conditions are met, the vendored crate can be reconsidered. The defau
 
 * [`crates/vortex`](../../crates/vortex) — vendored crate (package name `vortex-datafusion`).
 * PR #10933 — initial vendoring.
-* [`.github/copilot-instructions.md`](../../.github/copilot-instructions.md) — Spice engineering rules the vendored crate must follow.
+* [`AGENTS.md`](../../AGENTS.md) — Spice engineering rules the vendored crate must follow.
 * [`docs/dev/style_guide.md`](../dev/style_guide.md), [`docs/dev/error_handling.md`](../dev/error_handling.md).

@@ -430,9 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn vector_params_accept_distance_metric_aliases() {
-        let typed = try_es_params(&[("elasticsearch_distance_metric", "mip")])
-            .await
-            .expect("distance metric alias should be accepted");
+        let typed = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_distance_metric", "mip"),
+        ])
+        .await
+        .expect("distance metric alias should be accepted");
         assert_eq!(
             typed.distance_metric,
             Some(EsDistanceMetric::MaxInnerProduct)
@@ -445,9 +448,12 @@ mod tests {
 
     #[tokio::test]
     async fn vector_params_reject_invalid_distance_metric() {
-        let err = try_es_params(&[("elasticsearch_distance_metric", "manhattan")])
-            .await
-            .expect_err("invalid distance metric should be rejected");
+        let err = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_distance_metric", "manhattan"),
+        ])
+        .await
+        .expect_err("invalid distance metric should be rejected");
         assert!(
             err.to_string()
                 .contains("Invalid value for parameter 'elasticsearch_distance_metric'"),
@@ -457,9 +463,12 @@ mod tests {
 
     #[tokio::test]
     async fn vector_params_reject_non_object_index_settings() {
-        let err = try_es_params(&[("elasticsearch_index_settings", "[1, 2]")])
-            .await
-            .expect_err("non-object index_settings should be rejected");
+        let err = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_index_settings", "[1, 2]"),
+        ])
+        .await
+        .expect_err("non-object index_settings should be rejected");
         assert!(
             err.to_string()
                 .contains("Invalid value for parameter 'elasticsearch_index_settings'"),
@@ -501,14 +510,20 @@ mod tests {
 
     #[tokio::test]
     async fn bool_params_accept_lenient_forms() {
-        let typed = try_es_params(&[("elasticsearch_force_merge_after_write", "1")])
-            .await
-            .expect("lenient boolean forms should be accepted");
+        let typed = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_force_merge_after_write", "1"),
+        ])
+        .await
+        .expect("lenient boolean forms should be accepted");
         assert!(typed.force_merge_after_write);
 
-        let typed = try_es_params(&[("elasticsearch_spill_writes", "No")])
-            .await
-            .expect("lenient boolean forms should be accepted");
+        let typed = try_es_params(&[
+            ("elasticsearch_endpoint", "http://localhost:9200"),
+            ("elasticsearch_spill_writes", "No"),
+        ])
+        .await
+        .expect("lenient boolean forms should be accepted");
         assert_eq!(typed.spill_writes, Some(false));
 
         let typed = try_fts_params(&[("force_merge_after_write", "Yes")])

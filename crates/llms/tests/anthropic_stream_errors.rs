@@ -19,20 +19,23 @@ limitations under the License.
     reason = "a failed set-up in a test should name itself and stop"
 )]
 
-//! What a caller of `chat_stream` is told when Anthropic refuses the request.
+//! What a caller of `chat_stream` is told when Anthropic refuses the request, and that a stream
+//! Anthropic completed is not reported as a failure.
 //!
 //! These drive the whole path a real failure takes — HTTP status, error body, the SSE client's
 //! own error mapping, and the adapter's classification — against a local server standing in for
 //! Anthropic, so no credentials are involved and the classification is exercised on the error
 //! shape the client actually builds rather than one written by hand.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-    CreateChatCompletionRequestArgs,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+    CreateChatCompletionStreamResponse, FinishReason,
 };
 use chat_api::Chat;
 use futures::StreamExt;
@@ -45,7 +48,8 @@ fn serve_one_error(status: &'static str, body: &'static str) -> String {
     serve_one(status, "application/json", body)
 }
 
-fn serve_one(status: &'static str, content_type: &'static str, body: &'static str) -> String {
+fn serve_one(status: &'static str, content_type: &'static str, body: impl Into<String>) -> String {
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
     let port = listener
         .local_addr()
@@ -78,17 +82,20 @@ fn serve_one(status: &'static str, content_type: &'static str, body: &'static st
     format!("http://127.0.0.1:{port}")
 }
 
-/// Opens one streaming chat against `base`.
-async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
-    let model = Anthropic::new(
+fn adapter_against(base: &str) -> Anthropic {
+    Anthropic::new(
         GenericAuthMechanism::from_api_key("not-a-real-key"),
         Some("claude-sonnet-4-6"),
         Some(base),
         None,
     )
-    .expect("the adapter is configured");
+    .expect("the adapter is configured")
+}
 
-    let request = CreateChatCompletionRequestArgs::default()
+/// One user turn, with `temperature` set when `temperature` is given. One control per request:
+/// Claude 4 and later reject `temperature` and `top_p` set together.
+fn request_with(temperature: Option<f32>) -> CreateChatCompletionRequest {
+    let mut request = CreateChatCompletionRequestArgs::default()
         .model("claude-sonnet-4-6")
         .messages(vec![
             ChatCompletionRequestUserMessageArgs::default()
@@ -99,9 +106,14 @@ async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
         ])
         .build()
         .expect("build the request");
+    request.temperature = temperature;
+    request
+}
 
-    model
-        .chat_stream(request)
+/// Opens one streaming chat against `base`.
+async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
+    adapter_against(base)
+        .chat_stream(request_with(None))
         .await
         .expect("a refusal is delivered as a stream item, not as a failure to open the stream")
 }
@@ -381,4 +393,205 @@ async fn a_mid_stream_rate_limit_is_classified_and_keeps_its_cause() {
         "the cause must survive: {message}"
     );
     assert_eq!(api_error_type(&error), Some("AnthropicRateLimitError"));
+}
+
+/// One server-sent event per packet, named by the packet's own `type` as Anthropic names them.
+fn sse(packets: &[&str]) -> String {
+    let mut body = String::new();
+    for data in packets {
+        let packet: serde_json::Value = serde_json::from_str(data).expect("each packet is JSON");
+        let event = packet["type"].as_str().expect("each packet names its type");
+        write!(body, "event: {event}\ndata: {data}\n\n").expect("writing to a String cannot fail");
+    }
+    body
+}
+
+/// Every chunk of a stream that must complete; an error item fails the test with its cause.
+async fn completed_stream(packets: &[&str]) -> Vec<CreateChatCompletionStreamResponse> {
+    let base = serve_one("200 OK", "text/event-stream", sse(packets));
+    let mut stream = chat_stream_against(&base).await;
+
+    let mut chunks = Vec::new();
+    while let Some(item) = stream.next().await {
+        chunks.push(item.unwrap_or_else(|e| panic!("the stream must not fail: {e}")));
+    }
+    chunks
+}
+
+fn streamed_content(chunks: &[CreateChatCompletionStreamResponse]) -> String {
+    chunks
+        .iter()
+        .flat_map(|chunk| &chunk.choices)
+        .filter_map(|choice| choice.delta.content.as_deref())
+        .collect()
+}
+
+fn finish_reasons(chunks: &[CreateChatCompletionStreamResponse]) -> Vec<FinishReason> {
+    chunks
+        .iter()
+        .flat_map(|chunk| &chunk.choices)
+        .filter_map(|choice| choice.finish_reason)
+        .collect()
+}
+
+const MESSAGE_START: &str = r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-5","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1},"content":[],"stop_reason":null}}"#;
+
+/// A thinking block as a model that thinks by default streams it, although the request never set
+/// `thinking`: an empty `thinking_delta` (the default display omits the text), one carrying text (a
+/// display that summarizes), and the closing `signature_delta`.
+const THINKING_BLOCK: [&str; 5] = [
+    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+    r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+    r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user wants a greeting."}}"#,
+    r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2lnbmF0dXJl"}}"#,
+    r#"{"type":"content_block_stop","index":0}"#,
+];
+
+/// Regression test for #14909. The thinking block opens the message, so a stream that cannot get
+/// past it delivers no answer; the answer must arrive whole, without the thinking text in it.
+#[tokio::test]
+async fn an_answer_after_a_thinking_block_streams_whole() {
+    let mut packets = vec![MESSAGE_START];
+    packets.extend(THINKING_BLOCK);
+    packets.extend([
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":", world"}}"#,
+        r#"{"type":"content_block_stop","index":1}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":9}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]);
+
+    let chunks = completed_stream(&packets).await;
+
+    assert_eq!(streamed_content(&chunks), "Hello, world");
+    assert_eq!(finish_reasons(&chunks), vec![FinishReason::Stop]);
+}
+
+/// The same block ahead of a tool call: the call must reach the caller intact.
+#[tokio::test]
+async fn a_tool_call_after_a_thinking_block_streams_whole() {
+    let mut packets = vec![MESSAGE_START];
+    packets.extend(THINKING_BLOCK);
+    packets.extend([
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"Paris\"}"}}"#,
+        r#"{"type":"content_block_stop","index":1}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]);
+
+    let chunks = completed_stream(&packets).await;
+
+    let calls: Vec<_> = chunks
+        .iter()
+        .flat_map(|chunk| &chunk.choices)
+        .filter_map(|choice| choice.delta.tool_calls.as_ref())
+        .flatten()
+        .collect();
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.id.as_deref() == Some("toolu_1")),
+        "every chunk of the call must carry its id: {calls:?}"
+    );
+    let names: Vec<_> = calls
+        .iter()
+        .filter_map(|call| call.function.as_ref()?.name.as_deref())
+        .collect();
+    assert_eq!(names, vec!["get_weather"]);
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call.function.as_ref()?.arguments.as_deref())
+        .collect();
+    assert_eq!(arguments, r#"{"city": "Paris"}"#);
+    assert_eq!(streamed_content(&chunks), "");
+    assert_eq!(finish_reasons(&chunks), vec![FinishReason::ToolCalls]);
+}
+
+/// Anthropic's answer to a sampling control the model does not accept, exactly as its newest
+/// generation returns it (measured in <https://github.com/spiceai/spiceai/issues/13564>).
+const TEMPERATURE_REJECTED: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."}}"#;
+
+fn assert_names_the_rejected_control(message: &str) {
+    assert!(
+        message.contains("'claude-sonnet-4-6'"),
+        "the model that refused the control must be named: {message}"
+    );
+    assert!(
+        message.contains("Remove `temperature` from the request and from the model's `params` (as `temperature`, `anthropic_temperature` or `openai_temperature`)"),
+        "the control and where to remove it must be named: {message}"
+    );
+    assert!(
+        message.contains("`temperature` is deprecated for this model."),
+        "Anthropic's own wording is the diagnostic and must survive as the cause: {message}"
+    );
+    assert!(
+        !message.contains("Anthropic streaming error"),
+        "an explained refusal must not be buried behind the generic stream prefix: {message}"
+    );
+}
+
+/// A streaming request carrying `temperature` to a model that rejects it: the refusal arrives as a
+/// stream item and is explained inside `transform_stream`'s own error formatting, ahead of the arm
+/// that re-types every other `invalid_request_error` behind the generic stream prefix.
+#[tokio::test]
+async fn a_rejected_sampling_control_is_explained_on_the_streaming_path() {
+    let base = serve_one_error("400 Bad Request", TEMPERATURE_REJECTED);
+
+    let error = adapter_against(&base)
+        .chat_stream(request_with(Some(0.2)))
+        .await
+        .expect("a refusal is delivered as a stream item, not as a failure to open the stream")
+        .next()
+        .await
+        .expect("the refusal reaches the caller")
+        .expect_err("a refusal is an error");
+
+    assert_names_the_rejected_control(api_error_message(&error));
+    assert_eq!(api_error_type(&error), Some("invalid_request_error"));
+    assert_eq!(
+        api_error(&error).code.as_deref(),
+        Some("invalid_request_error"),
+        "the caller's request was refused, so the HTTP layer must report a client error"
+    );
+}
+
+/// The same refusal on the non-streaming path.
+#[tokio::test]
+async fn a_rejected_sampling_control_is_explained_on_the_request_path() {
+    let base = serve_one_error("400 Bad Request", TEMPERATURE_REJECTED);
+
+    let error = adapter_against(&base)
+        .chat_request(request_with(Some(0.2)))
+        .await
+        .expect_err("a refusal is an error");
+
+    assert_names_the_rejected_control(api_error_message(&error));
+    assert_eq!(api_error_type(&error), Some("invalid_request_error"));
+    assert_eq!(
+        api_error(&error).code.as_deref(),
+        Some("invalid_request_error"),
+        "the caller's request was refused, so the HTTP layer must report a client error"
+    );
+}
+
+/// The explanation keys on a control the request actually forwarded. The same body answering a
+/// request that set no control is not a rejected control — it is whatever Anthropic says it is —
+/// and takes the generic path.
+#[tokio::test]
+async fn the_same_answer_to_a_request_without_the_control_is_not_explained_as_one() {
+    let error = stream_error("400 Bad Request", TEMPERATURE_REJECTED).await;
+
+    let message = api_error_message(&error);
+    assert!(
+        !message.contains("Remove `temperature`"),
+        "no control was forwarded, so none can be blamed: {message}"
+    );
+    assert!(
+        message.contains("`temperature` is deprecated for this model."),
+        "the cause must survive: {message}"
+    );
+    assert_eq!(api_error_type(&error), Some("AnthropicStreamError"));
 }

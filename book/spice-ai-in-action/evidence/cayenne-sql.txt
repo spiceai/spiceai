@@ -1,0 +1,11 @@
+first-query: [{"tenant_id": "north", "paid_orders": 4, "gross_cents": 22200}, {"tenant_id": "south", "paid_orders": 2, "gross_cents": 24900}]
+null-counts: [{"rows": 8, "known_customers": 7, "distinct_customers": 4}]
+empty-aggregate: [{"n": 0, "total": null}]
+wrong-join: [{"gross_cents": 74600}]
+fixed-join: [{"gross_cents": 47100, "line_cents": 47100}]
+net-revenue: [{"tenant_id": "north", "gross_cents": 22200, "refund_cents": 11200, "net_cents": 11000}, {"tenant_id": "south", "gross_cents": 24900, "refund_cents": 3300, "net_cents": 21600}]
+customers-without-orders: [{"customer_id": 5}]
+Traceback (most recent call last):
+  File "/Users/lukim/dev/spice2/book/spice-ai-in-action/companion/verify.py", line 61, in <module>
+    raise AssertionError(record)
+AssertionError: {'name': 'wrong-not-in', 'sql': 'SELECT customer_id FROM customers WHERE customer_id NOT IN (SELECT customer_id FROM orders)', 'actual': [{'customer_id': 5}], 'expected': []}

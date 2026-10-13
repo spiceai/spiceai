@@ -25,8 +25,8 @@ use std::sync::{Arc, RwLock};
 use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use datafusion::common::TableReference;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
@@ -143,6 +143,10 @@ impl DuckLakeCatalogProvider {
         federation: DuckLakeFederation,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "installs the catalog's `DuckLakeFederation` deny-list below"
+        )]
         let duckdb_factory = Arc::new(
             DuckDBTableFactory::new(Arc::clone(&pool))
                 .with_dialect(federation.dialect)
