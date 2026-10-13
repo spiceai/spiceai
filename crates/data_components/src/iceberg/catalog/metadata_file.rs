@@ -233,10 +233,9 @@ async fn metadata_named_by(file_io: &FileIO, hint: &str, directory: &str) -> Res
     let candidates: Vec<String> = stems
         .iter()
         .flat_map(|stem| {
-            [
-                format!("{stem}.metadata.json"),
-                format!("{stem}.gz.metadata.json"),
-            ]
+            METADATA_SUFFIXES
+                .iter()
+                .map(move |suffix| format!("{stem}{suffix}"))
         })
         .collect();
     for name in &candidates {
@@ -306,12 +305,15 @@ async fn read_table(location: &str, ident: &TableIdent, file_io: &FileIO) -> Res
     )
 }
 
+/// Metadata file suffixes, gzip first: `.gz.metadata.json` also ends in `.metadata.json`.
+const METADATA_SUFFIXES: [&str; 3] = [".gz.metadata.json", ".metadata.json.gz", ".metadata.json"];
+
 /// The version number of a metadata file named `v<N>.metadata.json` or
 /// `<N>-<uuid>.metadata.json`, plain or gzip-compressed (`.gz.metadata.json`, or
 /// the older `.metadata.json.gz`). Leading zeros are padding. Any other file name
 /// has no version.
 fn metadata_version(file_name: &str) -> Option<u64> {
-    let stem = [".gz.metadata.json", ".metadata.json.gz", ".metadata.json"]
+    let stem = METADATA_SUFFIXES
         .into_iter()
         .find_map(|suffix| file_name.strip_suffix(suffix))?;
     let stem = stem.strip_prefix('v').unwrap_or(stem);
@@ -1053,6 +1055,22 @@ mod tests {
             );
         }
 
+        // The older gzip spelling, `v<N>.metadata.json.gz`.
+        let v3 = table_root.join("metadata").join("v3.metadata.json");
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gzip, &std::fs::read(&v3).expect("v3 is read"))
+            .expect("v3 is compressed");
+        std::fs::write(
+            v3.with_file_name("v3.metadata.json.gz"),
+            gzip.finish().expect("gzip finishes"),
+        )
+        .expect("gzip v3 is written");
+        std::fs::remove_file(&v3).expect("plain v3 is removed");
+        for provider in [&root, &pinned] {
+            write_hint(&table_root, "3");
+            assert_eq!(ids_of(provider).await, [0, 1, 2], "hint names gzip v3");
+        }
+
         write_hint(&table_root, "12");
         let err = catalog_at(&hint)
             .await
@@ -1063,7 +1081,7 @@ mod tests {
         assert_eq!(
             err.message(),
             format!(
-                "The version hint '{hint}' names version '12', but none of v12.metadata.json, v12.gz.metadata.json, 12.metadata.json, 12.gz.metadata.json exists in '{directory}/'"
+                "The version hint '{hint}' names version '12', but none of v12.gz.metadata.json, v12.metadata.json.gz, v12.metadata.json, 12.gz.metadata.json, 12.metadata.json.gz, 12.metadata.json exists in '{directory}/'"
             )
         );
     }
