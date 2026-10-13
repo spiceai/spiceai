@@ -421,10 +421,64 @@ impl AdaptiveController {
     /// roughly one request per window.
     #[must_use]
     pub fn acquire_weight(&self) -> f64 {
-        let coefficient = self.admission_coefficient();
-        if coefficient >= 1.0 {
-            return 1.0;
+        weight_of(self.admission_coefficient())
+    }
+
+    /// The weight [`Self::acquire_weight`] will read `after` from now if no
+    /// further outcome is recorded. It never rises: the window decays toward
+    /// empty, which raises the coefficient toward 1.
+    #[must_use]
+    pub fn weight_after(&self, after: Duration) -> f64 {
+        let (requests, accepts) = self.decayed_window();
+        let remaining = 0.5_f64.powf(after.as_secs_f64() / self.half_life.as_secs_f64());
+        weight_of(self.coefficient_of(requests * remaining, accepts * remaining))
+    }
+
+    /// How long until, with no further outcomes, [`Self::acquire_weight`]
+    /// falls to `weight`: zero if it already has, and `None` if decay alone
+    /// never takes it there. The window only decays toward empty, which raises
+    /// the coefficient toward 1 without reaching it, so a weight of 1 or less
+    /// is never reached while the origin is throttled.
+    #[must_use]
+    pub fn decays_to_weight_in(&self, weight: f64) -> Option<Duration> {
+        let (requests, accepts) = self.decayed_window();
+        if weight_of(self.coefficient_of(requests, accepts)) <= weight {
+            return Some(Duration::ZERO);
         }
+
+        let target = 1.0 / weight;
+        if target.is_nan() || target >= FULL_ADMISSION_COEFFICIENT {
+            return None;
+        }
+        // After `n` half-lives the window holds `f = 0.5^n` of what it holds
+        // now, and `(k·a·f + 1) / (r·f + 1) >= target` exactly when
+        // `f <= (1 - target) / (target·r - k·a)`. The coefficient is below the
+        // target now, so that denominator is positive.
+        let denominator = target * requests - self.k * accepts;
+        if denominator <= 0.0 {
+            return Some(Duration::ZERO);
+        }
+        let fraction = (1.0 - target) / denominator;
+        if fraction >= 1.0 {
+            return Some(Duration::ZERO);
+        }
+        Duration::try_from_secs_f64(self.half_life.as_secs_f64() * -fraction.log2()).ok()
+    }
+
+    /// The window's request and accept counts, decayed to now.
+    fn decayed_window(&self) -> (f64, f64) {
+        let mut state = self.state.lock();
+        state.window.decay_to(Instant::now(), self.half_life);
+        (state.window.requests, state.window.accepts)
+    }
+}
+
+/// The weight one request charges at `coefficient`: `1 / coefficient`, and
+/// `1.0` for a healthy origin (`+inf` at coefficient 0).
+fn weight_of(coefficient: f64) -> f64 {
+    if coefficient >= FULL_ADMISSION_COEFFICIENT {
+        1.0
+    } else {
         1.0 / coefficient
     }
 }
@@ -808,6 +862,41 @@ mod tests {
             Some(ThrottleState::Healthy),
             "a marginal recovery is reported one window after traffic returns"
         );
+    }
+
+    /// `decays_to_weight_in` inverts the decay exactly: just before the time it
+    /// returns the weight is still above the target, and at that time it has
+    /// fallen to it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn decay_reaches_a_weight_at_the_time_it_predicts() {
+        // 10% failure threshold, 5s half-life, 100 failures: weight 101.
+        let controller = AdaptiveController::new(
+            AdaptiveRateControl::new(0.1, Duration::from_secs(5)).expect("valid control"),
+            "https://origin.example.com",
+        );
+        for _ in 0..100 {
+            controller.record(RequestOutcome::Failure);
+        }
+        assert!((controller.acquire_weight() - 101.0).abs() < 1e-9);
+
+        // Weight 3 needs coefficient 1/3: the window must hold
+        // (1 - 1/3) / (100 / 3) = 1/50 of its failures, 5s * log2(50) on.
+        let wait = controller
+            .decays_to_weight_in(3.0)
+            .expect("decay alone reaches weight 3");
+        assert!(
+            (wait.as_secs_f64() - 5.0 * 50_f64.log2()).abs() < 1e-6,
+            "predicted {wait:?}"
+        );
+
+        tokio::time::advance(wait.saturating_sub(Duration::from_millis(1))).await;
+        assert!(controller.acquire_weight() > 3.0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(controller.acquire_weight() <= 3.0 + 1e-9);
+        assert_eq!(controller.decays_to_weight_in(3.0), Some(Duration::ZERO));
+
+        // Decay raises the coefficient toward 1 but never to it.
+        assert_eq!(controller.decays_to_weight_in(1.0), None);
     }
 
     #[test]
