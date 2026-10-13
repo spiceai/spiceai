@@ -6378,12 +6378,9 @@ impl DataFusion {
 
     /// Create or get a logical plan from the query.
     ///
-    /// `parameters` are bound into the arguments of the table functions in
-    /// `sql` before it is planned (see [`table_function_params`]). The caller
-    /// binds them into the rest of the plan. A plan with values in its
-    /// table-function arguments is specific to those values, so it is never
-    /// cached. Thus a cached plan never has such arguments, and a cache hit
-    /// does not have to parse `sql` to find out.
+    /// Only table-function arguments receive `parameters` here; the caller binds
+    /// the rest with [`LogicalPlan::with_param_values`]. Plans with substituted
+    /// values are not cached, so a cache hit never needs `parameters`.
     pub(crate) async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
@@ -6405,9 +6402,7 @@ impl DataFusion {
             None
         };
 
-        let (plan, placeholders) = self
-            .create_logical_plan_with_params(session, sql, parameters)
-            .await?;
+        let (plan, placeholders) = self.create_logical_plan(session, sql, parameters).await?;
 
         if placeholders == TableFunctionPlaceholders::Absent
             && let Some(cache) = plans_cache
@@ -6422,59 +6417,22 @@ impl DataFusion {
 
     /// Route SQL through the planner, which intercepts DDL extensions and
     /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
-    /// standard planner. Binds `parameters` into the arguments of the table
-    /// functions in `sql`.
+    /// standard planner.
     ///
-    /// `DataFusion` calls a table function while it plans, before parameter
-    /// values are bound into the plan, so a placeholder argument would reach
-    /// the table function unbound. Placeholders in other positions are left in
-    /// the plan for [`LogicalPlan::with_param_values`].
-    pub(crate) async fn create_logical_plan_with_params(
+    /// `parameters` are substituted into table-function arguments first; see
+    /// [`runtime_datafusion::table_function_params`].
+    #[cfg(not(windows))]
+    pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
         sql: &str,
         parameters: Option<&ParamValues>,
     ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
-        let mut statement = Self::parse_statement(session, sql)?;
+        let mut statement = planner::parse_sql_statement(sql, session)?;
         let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
-        let plan = self.plan_statement(session, sql, statement).await?;
-        Ok((plan, placeholders))
-    }
 
-    /// Whether a table-function argument in `sql` is a parameter placeholder.
-    /// The schema of such a statement is known only when its values are bound.
-    ///
-    /// `false` when `sql` does not parse: planning then reports the error.
-    pub(crate) fn has_table_function_placeholders(&self, sql: &str) -> bool {
-        // Parsed against the session's state in place: copying the state
-        // copies every registered function.
-        let state = self.ctx.state_ref();
-        let state = state.read();
-        Self::parse_statement(&state, sql)
-            .and_then(|mut statement| bind_table_function_args(&mut statement, None))
-            .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
-    }
-
-    #[cfg(not(windows))]
-    fn parse_statement(session: &SessionState, sql: &str) -> Result<Statement, DataFusionError> {
-        planner::parse_sql_statement(sql, session)
-    }
-
-    #[cfg(windows)]
-    fn parse_statement(session: &SessionState, sql: &str) -> Result<Statement, DataFusionError> {
-        let dialect = session.config().options().sql_parser.dialect;
-        session.sql_to_statement(sql, &dialect)
-    }
-
-    #[cfg(not(windows))]
-    async fn plan_statement(
-        &self,
-        session: &SessionState,
-        sql: &str,
-        statement: Statement,
-    ) -> Result<LogicalPlan, DataFusionError> {
         let ctx = planner::PlannerContext {
             catalog_mode: if self.has_cayenne_catalog() {
                 planner::CatalogMode::Cayenne
@@ -6488,19 +6446,43 @@ impl DataFusion {
             io_runtime: self.io_runtime.clone(),
         };
 
-        planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await
+        let plan =
+            planner::create_logical_plan_from_statement(sql, statement, session, &ctx).await?;
+        Ok((plan, placeholders))
     }
 
     /// On Windows the `planner` module is not available, so delegate
     /// directly to DataFusion's standard logical planner.
     #[cfg(windows)]
-    async fn plan_statement(
+    pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
-        _sql: &str,
-        statement: Statement,
-    ) -> Result<LogicalPlan, DataFusionError> {
-        session.statement_to_plan(statement).await
+        sql: &str,
+        parameters: Option<&ParamValues>,
+    ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
+        let dialect = session.config().options().sql_parser.dialect;
+        let mut statement = session.sql_to_statement(sql, &dialect)?;
+        let placeholders = bind_table_function_args(&mut statement, parameters)?;
+        self.resolve_pending_initializations_for_statement(session, &statement)
+            .await?;
+        Ok((session.statement_to_plan(statement).await?, placeholders))
+    }
+
+    /// Whether `sql` has a placeholder in a table-function argument, which
+    /// means it cannot be planned until its parameters are known.
+    ///
+    /// Returns `false` if `sql` fails to parse; planning reports the error.
+    pub(crate) fn has_table_function_placeholders(&self, sql: &str) -> bool {
+        // Borrow the state; `ctx.state()` clones every registered function.
+        let state = self.ctx.state_ref();
+        let state = state.read();
+        // The plain parser suffices: only `CREATE TABLE ... CLUSTER BY` needs
+        // `planner::parse_sql_statement`, and it has no table functions.
+        let dialect = state.config().options().sql_parser.dialect;
+        state
+            .sql_to_statement(sql, &dialect)
+            .and_then(|mut statement| bind_table_function_args(&mut statement, None))
+            .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
@@ -7776,8 +7758,8 @@ mod tests {
         assert_eq!(cache_provider.item_count().await, 1);
     }
 
-    /// Returns its one string argument as a single row. Like the search table
-    /// functions, it accepts only a literal argument.
+    /// Returns its string argument as a single row. Like the search UDTFs, it
+    /// rejects anything but a literal.
     #[derive(Debug)]
     struct EchoTableFunc;
 
@@ -7804,8 +7786,8 @@ mod tests {
         }
     }
 
-    /// A parameter in a table-function argument is bound before planning, and
-    /// the plan that holds its value is not reused for other values.
+    /// Placeholders in table-function arguments are substituted before
+    /// planning, and the resulting plans are not cached.
     #[tokio::test]
     async fn table_function_args_accept_parameters() {
         use datafusion::scalar::ScalarValue;

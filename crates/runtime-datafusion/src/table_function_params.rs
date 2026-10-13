@@ -14,15 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Binds query parameters into the arguments of table functions.
+//! Substitutes query parameters into table-function arguments before planning.
 //!
-//! `DataFusion` calls a table function (`text_search`, `vector_search`, `rrf`,
-//! ...) while it plans a statement, and binds parameter values only into the
-//! finished plan. A table function therefore receives `$1` or `:name` as an
-//! unbound placeholder, which it cannot read. [`bind_table_function_args`]
-//! puts the values into the table-function arguments of the parsed statement
-//! before it is planned. Placeholders in other positions are left for
+//! `DataFusion` invokes table functions (`text_search`, `vector_search`, `rrf`,
+//! ...) during planning, but binds parameters only afterwards, with
 //! [`LogicalPlan::with_param_values`](datafusion::logical_expr::LogicalPlan::with_param_values).
+//! Without this pass, `text_search(t, $1)` would receive an unbound placeholder.
+//! Placeholders elsewhere in the statement are left for `with_param_values`.
 
 use std::ops::ControlFlow;
 
@@ -37,29 +35,22 @@ use datafusion::{
     },
 };
 
-/// Whether a statement has a placeholder in a table-function argument.
+/// Whether any table-function argument in a statement is a placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum TableFunctionPlaceholders {
-    /// No table-function argument holds a placeholder: the plan of the
-    /// statement does not depend on the values bound to its parameters.
     Absent,
-    /// A table-function argument holds a placeholder: the plan of the
-    /// statement is specific to the values bound to its parameters, and must
-    /// not be reused for other values.
+    /// The plan embeds the substituted values, so it must not be cached.
     Present,
 }
 
-/// Replaces each placeholder in a table-function argument of `statement` with
-/// the literal of its value in `params`.
-///
-/// With `params` set to `None`, the statement is not changed; the result still
-/// tells whether it has such a placeholder.
+/// Replaces placeholders in the table-function arguments of `statement` with
+/// literals from `params`. With `params = None`, only detects them.
 ///
 /// # Errors
 ///
-/// Returns an error when `params` has no value for a placeholder in a
-/// table-function argument, or when a value cannot be written as SQL.
+/// If `params` has no value for such a placeholder, or a value cannot be
+/// unparsed to SQL.
 pub fn bind_table_function_args(
     statement: &mut Statement,
     params: Option<&ParamValues>,
@@ -139,8 +130,8 @@ impl VisitorMut for TableFunctionArgBinder<'_> {
     }
 }
 
-/// The SQL literal of the value bound to placeholder `id`, looked up the same
-/// way `LogicalPlan::with_param_values` looks it up.
+/// Looks up `id` as `LogicalPlan::with_param_values` does and unparses the
+/// value to a SQL literal.
 fn placeholder_literal(params: &ParamValues, id: &str) -> Result<ast::Expr> {
     let value = params.get_placeholders_with_values(id)?.value;
     Unparser::default().expr_to_sql(&Expr::Literal(value, None))
@@ -282,7 +273,8 @@ mod tests {
         assert!(error.to_string().contains("query"), "{error}");
     }
 
-    /// The literal must plan to the same value `with_param_values` binds.
+    /// Each literal must plan back to the exact `ScalarValue` that
+    /// `with_param_values` would bind.
     #[tokio::test]
     async fn literal_plans_to_the_bound_value() {
         let ctx = SessionContext::new();

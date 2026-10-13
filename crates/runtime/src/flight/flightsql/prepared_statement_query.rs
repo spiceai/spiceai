@@ -213,8 +213,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     // body is executed as a transaction at do_get, not planned as one here).
     let schema_sql = schema_statement(&query);
     let schemas = if datafusion.has_table_function_placeholders(&schema_sql) {
-        // A table function is planned with its argument values, which are
-        // bound only at execution.
+        // Can't plan a table function until its parameters arrive at execution.
         Ok((arrow_schema::Schema::empty(), None))
     } else {
         Service::get_arrow_schema(datafusion, &schema_sql).await
@@ -285,8 +284,7 @@ pub(crate) async fn get_flight_info(
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
     let schema_sql = schema_statement(&sql);
     let schema = if datafusion.has_table_function_placeholders(&schema_sql) {
-        // A table function is planned with its argument values, which are
-        // bound only at execution.
+        // Can't plan a table function until its parameters arrive at execution.
         Ok(None)
     } else {
         Service::get_arrow_schema(datafusion, &schema_sql)

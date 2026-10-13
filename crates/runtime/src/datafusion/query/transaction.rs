@@ -316,9 +316,9 @@ async fn prepare_transaction(
     let session = df.ctx.state();
     let mut write_refs: Vec<TableReference> = Vec::new();
     let mut read_refs: Vec<TableReference> = Vec::new();
+    let dialect = session.config().options().sql_parser.dialect;
     for stmt_sql in inner_sqls {
-        // A table function needs its parameter values to plan.
-        let dialect = session.config().options().sql_parser.dialect;
+        // Table functions run during planning, so substitute their parameters first.
         let mut statement = session
             .sql_to_statement(stmt_sql, &dialect)
             .map_err(TransactionError::Plan)?;

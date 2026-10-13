@@ -1227,7 +1227,7 @@ mod tests {
     }
 
     /// Integration check: DDL/DML produced through Spice's planner wrapper
-    /// ([`DataFusion::create_logical_plan_with_params`]) — rather than `DataFusion`'s raw
+    /// ([`DataFusion::create_logical_plan`]) — rather than `DataFusion`'s raw
     /// planner — must still be rejected. This covers the statement-level
     /// rewrites (`plan_distributed_dml`, `plan_create_table`, etc.) that can
     /// emit `LogicalPlan::Extension` instead of `LogicalPlan::{Ddl,Dml}`.
@@ -1242,7 +1242,7 @@ mod tests {
         // covered by the read-only arm — but this exercises the Spice wrapper
         // rather than `SessionState::create_logical_plan` directly.
         let (plan, _) = df
-            .create_logical_plan_with_params(
+            .create_logical_plan(
                 &session,
                 "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)",
                 None,
