@@ -1980,6 +1980,7 @@ mod tests {
         let key_space = 80i64;
         let hash = |pk: &i64| hash_key_i64(*pk);
         let (mut folded_trials, mut straddled_trials, mut sibling_trials) = (0, 0, 0);
+        let mut internal_trials = 0;
 
         for trial in 0..200u64 {
             let mut seq: i64 = 0;
@@ -2027,6 +2028,16 @@ mod tests {
                 let adds = random_writes(&mut rng, &mut seq, count);
                 idx = idx.extend(adds.into_iter(), hash);
             }
+            // Bursts of keys new to the index each freeze a run, so the prefix
+            // spans several runs that later folds can merge among themselves.
+            for burst in 0..(rng() % 3) {
+                let first = 1_000 + 100 * burst;
+                let adds: Vec<_> = (0..100_i64)
+                    .map(|i| (first + i, seq + 1 + i, SEQUENCE_ABSENT))
+                    .collect();
+                seq += 100;
+                idx = idx.extend(adds.into_iter(), hash);
+            }
 
             // Take the prefix; the model is every write so far.
             let cutoff = (rng() as i64).rem_euclid(seq.max(1) + 2) - 1;
@@ -2045,7 +2056,7 @@ mod tests {
             // A sibling version, written from the same index: enough keys the main
             // history never writes to freeze a run of its own.
             let sibling = idx.extend(
-                (0..300_i64).map(|i| (1_000 + i, seq + 1 + i, SEQUENCE_ABSENT)),
+                (0..300_i64).map(|i| (5_000 + i, seq + 1 + i, SEQUENCE_ABSENT)),
                 hash,
             );
             let sibling_froze = sibling.runs.iter().any(|run| {
@@ -2055,28 +2066,36 @@ mod tests {
             });
             let sibling_prefix = sibling.prune_frozen_prefix(cutoff, hash);
 
-            // Keep writing, then splice. Half the histories also write a burst of
-            // keys new to the index, which freezes a run and, past the run cap,
-            // folds two adjacent ones.
+            // Keep writing, then splice. Up to three bursts of new keys freeze a
+            // run each and, past the run cap, fold adjacent runs: the prefix's
+            // own, or one of its and a newer one.
             let steps = rng() % 20;
-            let burst_at = (rng() % 2 == 0).then(|| rng() % (steps + 1));
+            let bursts = rng() % 4;
+            let mut burst_steps: Vec<u64> = (0..bursts).map(|_| rng() % (steps + 1)).collect();
+            burst_steps.sort_unstable();
+            let mut next_burst = 0_i64;
             for step in 0..=steps {
-                let adds = if burst_at == Some(step) {
-                    let burst: Vec<_> = (0..100_i64)
-                        .map(|i| (2_000 + i, seq + 1 + i, SEQUENCE_ABSENT))
+                while burst_steps.first() == Some(&step) {
+                    burst_steps.remove(0);
+                    let first = 2_000 + 100 * next_burst;
+                    next_burst += 1;
+                    let adds: Vec<_> = (0..100_i64)
+                        .map(|i| (first + i, seq + 1 + i, SEQUENCE_ABSENT))
                         .collect();
                     seq += 100;
-                    burst
-                } else if step < steps {
-                    let count = 1 + rng() % 10;
-                    random_writes(&mut rng, &mut seq, count)
-                } else {
-                    continue;
-                };
-                for (key, delete, insert) in &adds {
-                    naive_merge(&mut model, *key, *delete, *insert);
+                    for (key, delete, insert) in &adds {
+                        naive_merge(&mut model, *key, *delete, *insert);
+                    }
+                    idx = idx.extend(adds.into_iter(), hash);
                 }
-                idx = idx.extend(adds.into_iter(), hash);
+                if step < steps {
+                    let count = 1 + rng() % 10;
+                    let adds = random_writes(&mut rng, &mut seq, count);
+                    for (key, delete, insert) in &adds {
+                        naive_merge(&mut model, *key, *delete, *insert);
+                    }
+                    idx = idx.extend(adds.into_iter(), hash);
+                }
             }
             // Folds since the prefix: ones among its own runs, and ones across its
             // edge, which leave a run holding both its leaves and newer ones.
@@ -2098,6 +2117,16 @@ mod tests {
                 covered > 0 && covered < run.leaves.len()
             }) {
                 straddled_trials += 1;
+            }
+            if idx.runs.iter().any(|run| {
+                run.leaves.len() > 1
+                    && run
+                        .leaves
+                        .iter()
+                        .all(|leaf| prefix.source_leaves.contains(leaf))
+                    && !prefix_time_runs.iter().any(|source| Arc::ptr_eq(source, run))
+            }) {
+                internal_trials += 1;
             }
             // One prune of the whole final index at the cutoff.
             for (delete, _) in model.values_mut() {
@@ -2141,7 +2170,7 @@ mod tests {
                 "trial {trial}: max_sequence_number"
             );
             let spliced = DeletionIndex { core: spliced };
-            for key in (0..key_space).chain(2_000..2_100) {
+            for key in (0..key_space).chain(1_000..1_200).chain(2_000..2_300) {
                 let expected = naive_tombstone(model.get(&key));
                 assert_eq!(spliced.get(key), expected, "trial {trial}: key {key}");
                 for min in [None, Some(0), Some(cutoff), Some(seq / 2), Some(seq)] {
@@ -2179,10 +2208,13 @@ mod tests {
             }
         }
         assert!(
-            folded_trials >= 20 && straddled_trials >= 5 && sibling_trials >= 100,
+            folded_trials >= 20
+                && straddled_trials >= 5
+                && internal_trials >= 5
+                && sibling_trials >= 100,
             "the histories must fold the prefix's runs ({folded_trials} folded, \
-             {straddled_trials} across its edge) and give the sibling a run of its own \
-             ({sibling_trials})"
+             {straddled_trials} across its edge, {internal_trials} among its own) and give \
+             the sibling a run of its own ({sibling_trials})"
         );
     }
 
