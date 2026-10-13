@@ -501,6 +501,13 @@ path = "tests/cayenne_runtime_tuning.rs"
 name = "results_cache_growth"
 path = "tests/results_cache_growth.rs"
 
+# Drives `/v1/chat/completions` through the tool-use loop against an in-process
+# mock of the Anthropic Messages API.
+[[test]]
+name = "chat_tool_use"
+path = "tests/chat_tool_use.rs"
+required-features = ["models"]
+
 # Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
 [[test]]
 name = "retention_oom"
