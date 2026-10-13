@@ -31,17 +31,9 @@ limitations under the License.
 //! source slot advances only when a real durability event covers the RAM
 //! tier, never because a heartbeat arrived.
 
-#![cfg(not(windows))]
-#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
-// Accelerator engines are their own crates and self-register through a linkme slice. Each
-// integration test is a separate binary that links independently, and the linker drops an
-// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
-use accelerator_cayenne::CayenneAccelerator;
-use data_accelerator_api::DataAccelerator;
-use runtime_acceleration::change_sink::ChangeSinkContext;
+use super::make_refresh_task;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -57,7 +49,6 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
     changes_schema, now_unix_ms,
 };
-use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
@@ -67,11 +58,7 @@ use datafusion_table_providers::util::{
 use futures::StreamExt;
 use runtime::accelerated::refresh::Refresh;
 use runtime::accelerated::refresh_completion::RefreshCompletion;
-use runtime::accelerated::refresh_task::RefreshTaskBuilder;
-use runtime::federated::FederatedTable;
-use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
-use tokio::runtime::Handle;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 /// All-nullable data schema, matching what CDC sources produce (and what the
@@ -187,35 +174,6 @@ async fn setup_memory_mode_cayenne(table_name: &str) -> (TempDir, Arc<CayenneTab
         "test requires a memory-durability CDC tier"
     );
     (temp, Arc::new(table))
-}
-
-/// Build the refresh task with the change sink a Cayenne dataset gets in
-/// production, so the apply goes through Cayenne's deferred-durability path
-/// rather than the generic provider sink.
-async fn make_refresh_task(
-    accelerator: Arc<dyn TableProvider>,
-    table_name: &str,
-) -> runtime::accelerated::refresh_task::RefreshTask {
-    let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-    let binding =
-        ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
-    let write_lock = Arc::clone(&binding.write_lock);
-    let sink = CayenneAccelerator::new()
-        .change_sink(binding, &Handle::current(), 2)
-        .await
-        .expect("bind Cayenne change sink")
-        .expect("Cayenne provides a change sink");
-    RefreshTaskBuilder::new(
-        RuntimeStatus::new(),
-        TableReference::bare(table_name),
-        federated,
-        None,
-        accelerator,
-        Handle::current(),
-        write_lock,
-    )
-    .with_change_sink(Some(sink))
-    .build()
 }
 
 /// Count the rows currently visible via `TableProvider::scan`.

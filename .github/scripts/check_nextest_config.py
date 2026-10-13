@@ -105,6 +105,7 @@ ZERO_RETRY_BINARIES = frozenset(
         # nothing but repeated runs of ~250s of tests before the same failure.
         "cayenne::integration::result_correctness_vs_duckdb_test",
         "cayenne::integration::result_correctness_vs_sqlite_test",
+        "runtime::integration::result_correctness",
     }
 )
 

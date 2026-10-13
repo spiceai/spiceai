@@ -363,6 +363,8 @@ impl TableSink {
         .await
         .map_err(retry_from_df_error)?;
 
+        super::prepare_tables_for_reads(&providers_after_write).await;
+
         tracing::debug!(
             "TableSink::insert_into completed in {:.2}s (collect phase: {:.2}s)",
             start.elapsed().as_secs_f64(),
@@ -395,6 +397,84 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use cayenne::CAYENNE_TYPE_REWRITE_RULES;
+
+    /// A layer that changes nothing, as the layers a dataset stacks over its
+    /// accelerator do for writes.
+    #[derive(Debug)]
+    struct PassThroughLayer;
+
+    impl spice_table::TableLayer for PassThroughLayer {}
+
+    /// A refresh's write leaves a Cayenne table prepared for the scans it
+    /// releases, through the layers stacked over it: its scan view of the new
+    /// snapshot (after an overwrite) or files (after an append) is built, with
+    /// their statistics listed, by the time `insert_into` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_write_prepares_a_cayenne_table_for_scans() {
+        use arrow::array::{Int64Array, RecordBatch};
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!(
+                "sqlite://{}",
+                dir.path().join("catalog.db").display()
+            ))
+            .expect("catalog"),
+        );
+        catalog.init().await.expect("catalog init");
+        let schema = schema(vec![Field::new("id", DataType::Int64, false)]);
+        let table = Arc::new(
+            CayenneTableProviderBuilder::new(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                util::session_state::session_context().runtime_env(),
+            )
+            .create(CreateTableOptions {
+                table_name: "prepared_after_refresh".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: dir.path().join("data").to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    ..VortexConfig::default()
+                },
+            })
+            .await
+            .expect("create table"),
+        );
+        table.init_scan_view_cache();
+        let layered: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(PassThroughLayer),
+            Arc::clone(&table) as Arc<dyn TableProvider>,
+        );
+        let sink = TableSink::new(layered, "prepared_after_refresh".to_string());
+        let stream = |ids: Vec<i64>| -> Pin<Box<dyn RecordBatchStream + Send>> {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter([Ok(batch)]),
+            ))
+        };
+
+        for (write, op, ids) in [
+            ("overwrite", InsertOp::Overwrite, vec![1, 2, 3]),
+            ("append", InsertOp::Append, vec![4, 5]),
+        ] {
+            sink.insert_into(stream(ids), op, &super::super::RefreshWrite::default())
+                .await
+                .unwrap_or_else(|error| panic!("{write} failed: {error:?}"));
+            assert!(
+                table.scan_view_is_prepared(),
+                "a completed {write} must leave the table's scan view and listing built"
+            );
+        }
+    }
 
     /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds — the
     /// engine rewrite these tests exercise. Spelled out rather than imported because

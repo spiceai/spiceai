@@ -174,7 +174,7 @@ cargo test -p cayenne --features result-correctness-chdb \
 cargo test -p cayenne --test integration result_correctness_vs_sqlite_test:: -- --test-threads=1
 
 # Spice DuckDB / SQLite accelerators ↔ standalone oracles
-cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --nocapture
+cargo test -p runtime --features duckdb,sqlite --test integration result_correctness:: -- --nocapture
 ```
 
 ## What the gate runs
@@ -193,7 +193,7 @@ that flag the filterset selects them and they silently never run.
 | `result_correctness_standalone_engines_test` | yes |
 | `result_correctness_vs_duckdb_test` | yes |
 | `result_correctness_vs_chdb_test` (its own binary) | no — runs in `.github/workflows/correctness_chdb.yml` |
-| runtime `result_correctness` | no — see below |
+| runtime `result_correctness` (a module of runtime's `integration`) | no — runs in `.github/workflows/integration.yml`, see below |
 
 The chDB lane has a job of its own for two reasons. `chdb-rust` fetches libchdb
 at build time, so folding it into the gate would make every sign-off depend on
@@ -208,8 +208,9 @@ by cargo silently, which is how the lanes above once went unbuilt.
 The runtime accelerator lane stays out of the fast gate on purpose.
 `runtime/duckdb,runtime/sqlite` flow through the whole `--all` build, so
 every runtime test binary the gate builds relinks with them at hundreds of megabytes
-each — a permanent cost on every sign-off for two micro-shape comparisons. It
-belongs in the integration workflow, which already builds with `duckdb,sqlite`.
+each — a permanent cost on every sign-off for two micro-shape comparisons. It is
+a module of runtime's `integration` test binary, so the integration workflow,
+which already builds with `duckdb,sqlite`, runs it.
 
 Optional env: `CAYENNE_PARITY_SCRATCH`, `CAYENNE_PARITY_*_SF`,
 `CAYENNE_PARITY_SSB_SCALE`, `CLICKBENCH_HITS_PARQUET`, `SQLLANCER_EXTRA_SQL`.
