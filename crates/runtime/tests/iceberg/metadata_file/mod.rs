@@ -46,7 +46,7 @@ use crate::{
     configure_test_datafusion,
     docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
     init_tracing,
-    utils::{run_query, test_request_context},
+    utils::{run_query, test_request_context, wait_until_true},
 };
 
 const NAMESPACE: &str = "db";
@@ -635,32 +635,6 @@ fn s3_dataset(endpoint: &str, scheme: &str, name: &str, metadata_path: Option<St
     )
 }
 
-async fn put_s3_object(endpoint: &str, key: &str, body: &str) -> anyhow::Result<()> {
-    s3_client(endpoint)
-        .put_object()
-        .bucket(S3_BUCKET)
-        .key(key)
-        .body(body.as_bytes().to_vec().into())
-        .send()
-        .await?;
-    Ok(())
-}
-
-/// Polls `table` until it returns `expected`, for a value an acceleration refresh
-/// delivers.
-async fn wait_for_ids(rt: &Arc<Runtime>, table: &str, expected: &[i64]) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_mins(1);
-    let mut last = Vec::new();
-    while std::time::Instant::now() < deadline {
-        last = ids(rt, table).await?;
-        if last == expected {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    anyhow::bail!("{table} must return {expected:?}, last returned {last:?}")
-}
-
 /// The customer-shaped table: written to S3 the way a REST or Glue catalog writes
 /// one (`<N>-<uuid>.metadata.json`, no `version-hint.text`), read with no pin from
 /// the table root through both S3 schemes and through an acceleration. Commits
@@ -712,7 +686,14 @@ async fn an_unpinned_table_root_on_s3_reads_each_new_commit() -> anyhow::Result<
                     "dataset {name} must read the latest commit on the next query"
                 );
             }
-            wait_for_ids(&rt, "accelerated", &expected).await?;
+            // The acceleration catches up on its next refresh.
+            wait_until_true(Duration::from_mins(1), || async {
+                ids(&rt, "accelerated")
+                    .await
+                    .is_ok_and(|ids| ids == expected)
+            })
+            .await;
+            assert_eq!(ids(&rt, "accelerated").await?, expected);
             drop(container);
             Ok(())
         })
@@ -738,7 +719,15 @@ async fn a_version_hint_on_s3_is_read_on_every_query() -> anyhow::Result<()> {
                 .map(|name| name.trim_end_matches(".metadata.json").to_string())
                 .collect();
             let hint_key = format!("{S3_METADATA_PREFIX}version-hint.text");
-            put_s3_object(&endpoint, &hint_key, &stems[1]).await?;
+            let s3 = s3_client(&endpoint);
+            let put_hint = |stem: &str| {
+                s3.put_object()
+                    .bucket(S3_BUCKET)
+                    .key(&hint_key)
+                    .body(stem.as_bytes().to_vec().into())
+                    .send()
+            };
+            put_hint(&stems[1]).await?;
 
             let rt = start_runtime(
                 "iceberg_version_hint_s3",
@@ -761,7 +750,7 @@ async fn a_version_hint_on_s3_is_read_on_every_query() -> anyhow::Result<()> {
                 );
             }
 
-            put_s3_object(&endpoint, &hint_key, &stems[2]).await?;
+            put_hint(&stems[2]).await?;
             for name in ["from_root", "pinned_hint"] {
                 assert_eq!(
                     ids(&rt, name).await?,

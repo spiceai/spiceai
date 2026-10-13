@@ -22,7 +22,7 @@ use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use aws_sdk_credential_bridge::S3CredentialProvider;
-use data_components::iceberg::catalog::metadata_file::{FoundBy, MetadataFileCatalog};
+use data_components::iceberg::catalog::metadata_file::MetadataFileCatalog;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     Catalog, NamespaceIdent, TableIdent,
@@ -498,7 +498,7 @@ async fn serve_table(
             connector_component: ConnectorComponent::from(dataset),
             source: unresolved_metadata_message(location, &e).into(),
         })?;
-    if current.found_by == FoundBy::Listing {
+    if current.listed {
         tracing::warn!(
             "{}",
             found_by_listing_message(&dataset.name, location, &current.location)
