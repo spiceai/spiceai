@@ -714,9 +714,15 @@ async fn mock_renew(
         Json(serde_json::json!({
             "identity_cert_pem": leaf_pem,
             "not_after": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+            // Spice Cloud returns the org's license with every renewal.
+            "license": RENEWED_LICENSE,
         })),
     )
 }
+
+/// The license the mock Spice Cloud returns with a renewal. Cloud Connect keeps
+/// it without interpreting it, so any compact-token-shaped value will do.
+const RENEWED_LICENSE: &str = "cmVuZXdlZA.bGljZW5zZQ.c2lnbmF0dXJl";
 
 struct TlsListener {
     tcp: TcpListener,
@@ -3546,6 +3552,18 @@ async fn renewal_rotates_keypair_and_persists() {
     })
     .await;
     assert!(rotated, "the rotated identity must be persisted within 10s");
+
+    // The license rides on the renewal and is kept beside the identity.
+    let kept = wait_until(Duration::from_secs(10), || {
+        runtime_cloud_connect::license::load(dir.path())
+            .ok()
+            .flatten()
+            .and_then(|kept| kept.license)
+            .as_deref()
+            == Some(RENEWED_LICENSE)
+    })
+    .await;
+    assert!(kept, "the license from the renewal must be kept within 10s");
 
     let renewed_identity = IdentityStore::load_optional(&identity_path)
         .expect("load identity")

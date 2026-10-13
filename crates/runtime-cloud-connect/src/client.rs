@@ -363,6 +363,7 @@ impl ClientDriver {
         })?;
         let expected_identifier = current.identifier.clone();
         let outcome = client.renew(&current, &material).await?;
+        let license_delivery = outcome.license;
 
         // Identities written before endpoint binding was added relied on the
         // instance-local `cloud-endpoint` file. `spiced` resolves that legacy
@@ -454,6 +455,9 @@ impl ClientDriver {
                 .map_or_else(|| "no expiry".to_string(), |secs| format!("unix={secs}")),
         );
         self.identity = Some(rotated);
+        // The license rides on the renewal: kept once the renewed identity it
+        // belongs to is in place.
+        crate::license::record_logged(&self.config.config_dir, license_delivery).await;
         // Pace successful renewals too: if the cloud ever issues a leaf
         // already inside the renewal lead (validity <= lead, or heavy clock
         // skew), an unfloored timer would loop back-to-back renewals. The
@@ -1663,6 +1667,8 @@ async fn clear_identity_state(config: &CloudConnectConfig) -> std::result::Resul
         protected_config_dir.join(CloudConnectConfig::CONNECT_OPERATION_FILE),
         protected_config_dir.join(CloudConnectConfig::PROJECT_OPERATION_FILE),
         protected_config_dir.join(CloudConnectConfig::ENDPOINT_OVERRIDE_FILE),
+        // The license belongs to the connection that received it.
+        protected_config_dir.join(crate::config::CLOUD_CONNECT_LICENSE_FILE),
     ];
     tokio::task::spawn_blocking(move || {
         // The blocking task owns the outer guard as well as the inner

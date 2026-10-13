@@ -113,6 +113,10 @@ pub const INCOMING_SECRET_CACHE_FILE: &str = ".secrets-cache.incoming.json";
 /// File name (relative to `$SPICE_CONFIG_DIR`) where the runtime identity
 /// is persisted after enrollment.
 pub const IDENTITY_FILE: &str = "identity.json";
+/// File name (relative to `$SPICE_CONFIG_DIR`) where the license Spice Cloud
+/// returned with the last enrollment or renewal is kept (see
+/// [`crate::license`]).
+pub const CLOUD_CONNECT_LICENSE_FILE: &str = "cloud-connect-license.json";
 
 /// A control-plane URL that would expose an enrollment authority or cannot be
 /// used as an HTTP base URL.

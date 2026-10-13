@@ -67,6 +67,7 @@ pub mod enroll;
 pub mod enrollment_key;
 pub mod handlers;
 pub mod identity;
+pub mod license;
 pub mod mutation_lock;
 pub mod release;
 pub mod runtime_lock;

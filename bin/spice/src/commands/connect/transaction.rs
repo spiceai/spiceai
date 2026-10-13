@@ -1392,6 +1392,10 @@ pub(crate) async fn clear_local_state(config_dir: &Path, identity_path: &Path) -
                 runtime_cloud_connect::config::PREVIOUS_SECRET_CACHE_FILE,
             ),
             (
+                "license from Spice Cloud",
+                runtime_cloud_connect::config::CLOUD_CONNECT_LICENSE_FILE,
+            ),
+            (
                 "previous cloud-managed Spicepod",
                 runtime_cloud_connect::config::PREVIOUS_CLOUD_MANAGED_SPICEPOD_FILE,
             ),

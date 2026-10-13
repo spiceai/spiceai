@@ -408,6 +408,10 @@ struct EnrollResponseWire {
     region: Option<String>,
     #[serde(default)]
     portal: Option<PortalWire>,
+    /// The license Spice Cloud issued with this enrollment, or why it issued
+    /// none (see [`crate::license`]).
+    #[serde(flatten)]
+    license: crate::license::LicenseFieldsWire,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +433,9 @@ pub struct EnrollOutcome {
     pub not_after_unix: u64,
     /// The canonical non-credential metadata the response carried.
     pub metadata: EnrollmentMetadata,
+    /// The license Spice Cloud issued with this enrollment, or why it issued
+    /// none.
+    pub license: crate::license::LicenseDelivery,
 }
 
 /// The non-credential facts an enrollment response reports: which
@@ -467,6 +474,10 @@ struct RenewRequest<'a> {
 #[derive(Deserialize)]
 struct RenewResponseWire {
     identity_cert_pem: String,
+    /// The license Spice Cloud issued with this renewal, or why it issued
+    /// none (see [`crate::license`]).
+    #[serde(flatten)]
+    license: crate::license::LicenseFieldsWire,
 }
 
 /// Parsed result of a successful renewal (the CA bundle and gateway address
@@ -474,6 +485,9 @@ struct RenewResponseWire {
 #[derive(Debug)]
 pub struct RenewOutcome {
     pub identity_cert_pem: String,
+    /// The license Spice Cloud issued with this renewal, or why it issued
+    /// none.
+    pub license: crate::license::LicenseDelivery,
 }
 
 /// Error body shape the cloud endpoints return:
@@ -618,10 +632,12 @@ impl EnrollClient {
             }
         };
         let mut wire: EnrollResponseWire = self.send(&self.enroll_url, builder, sensitive).await?;
+        let license = std::mem::take(&mut wire.license).into_delivery();
         ensure_response_does_not_echo_sensitive(
             &self.enroll_url,
             sensitive,
             &[
+                ("license", license.license.as_deref().unwrap_or_default()),
                 ("instance_id", wire.instance_id.as_str()),
                 ("identity_cert_pem", wire.identity_cert_pem.as_str()),
                 ("ca_bundle_pem", wire.ca_bundle_pem.as_str()),
@@ -675,6 +691,7 @@ impl EnrollClient {
                 region: wire.region,
                 new_project_url,
             },
+            license,
         })
     }
 
@@ -708,6 +725,7 @@ impl EnrollClient {
         )?;
         Ok(RenewOutcome {
             identity_cert_pem: wire.identity_cert_pem,
+            license: wire.license.into_delivery(),
         })
     }
 
@@ -1469,6 +1487,7 @@ where
         )
     })
     .await?;
+    let license_delivery = std::mem::take(&mut outcome.license);
 
     // A successful enroll has already consumed the credential, so malformed
     // optional portal metadata must not discard the issued identity. Normalize
@@ -1585,6 +1604,10 @@ where
     // retry, so no authority is redeemed twice.
     cleanup_enrollment_draft(&enrollment_transaction).await?;
     drop(enrollment_transaction);
+
+    // Kept only once the identity it belongs to is durable; a failure to keep
+    // it is logged, not returned, because the enrollment itself succeeded.
+    crate::license::record_logged(&config.config_dir, license_delivery).await;
 
     Ok(EnrollNowOutcome::Enrolled {
         identity,

@@ -317,6 +317,8 @@ fn successful_enrollment_is_durable_before_the_runtime_listener_binds() {
             "gateway_addr": "127.0.0.1:9",
             "not_after": "2099-01-01T00:00:00Z",
             "organization": {"id": 42, "name": "acme"},
+            // Spice Cloud returns the org's license with the enrollment.
+            "license": "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl",
         })
         .to_string();
         let response = format!(
@@ -394,6 +396,17 @@ fn successful_enrollment_is_durable_before_the_runtime_listener_binds() {
     assert!(
         !identity.contains(&key),
         "identity leaked the key: {identity}"
+    );
+    // The license came with the enrollment and is kept beside the identity
+    // before the runtime starts, so its first evaluation already sees it.
+    let kept: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config_dir.path().join("cloud-connect-license.json"))
+            .expect("read the license Cloud Connect kept"),
+    )
+    .expect("parse the license Cloud Connect kept");
+    assert_eq!(
+        kept,
+        serde_json::json!({"license": "aGVhZGVy.cGF5bG9hZA.c2lnbmF0dXJl"})
     );
 
     child.kill().expect("stop spiced after assertion");
