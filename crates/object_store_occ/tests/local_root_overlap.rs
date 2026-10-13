@@ -76,7 +76,11 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
                 stored.len(),
                 stored.first()
             );
-            assert_eq!(winners, 1, "conditional writes must have exactly one winner");
+            assert_eq!(
+                winners,
+                1,
+                "conditional writes must have exactly one winner"
+            );
             match (left, right) {
                 (Ok(_), Err(ConditionalWriteError::Conflict { .. })) => {
                     assert_eq!(stored, left_bytes);
