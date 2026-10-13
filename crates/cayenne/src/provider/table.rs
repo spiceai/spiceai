@@ -186,9 +186,10 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// milliseconds; the timeout only guards against a wedged background task.
 const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many times a seq-prefix bake splices its off-fence deletion-index prune
-/// over the live index and tries to swap it in, before pruning under the fence
-/// instead ([`CayenneTableProvider::prune_deletion_index_after_bake`]).
-const BAKE_PRUNE_OFF_FENCE_ATTEMPTS: usize = 3;
+/// over the live index and tries to swap it in, before splicing under the fence
+/// instead ([`CayenneTableProvider::prune_deletion_index_after_bake`]). A lost
+/// swap costs one splice, a pass over the index's newest entries.
+const BAKE_PRUNE_OFF_FENCE_ATTEMPTS: usize = 5;
 
 /// What a seq-prefix bake published, so its deferred deletion-index prune can
 /// confirm the swap is still in place before it lands
@@ -273,7 +274,8 @@ enum OffFencePrune {
     Published,
     /// The index had no deletion to prune.
     NothingToPrune,
-    /// A writer replaced the index while the prune was being built.
+    /// Writers kept replacing the index, and the splice under the fence could not
+    /// be swapped in either.
     LostRace,
     /// The bake's swap is no longer what scans see; nothing may be pruned.
     OutputNotLive,
@@ -29164,15 +29166,17 @@ impl CayenneTableProvider {
     /// immutable, so that part runs once on a blocking thread however long it
     /// takes; the result is spliced over the index then live — the runs frozen
     /// since and the active tier (a mem-tier checkpoint publishes every few
-    /// seconds) pruned at the same cutoff in a pass over that tail alone — and
-    /// swapped in by compare-and-swap. A writer that wins the swap only costs a
-    /// re-splice; a fold that merged the pruned runs costs a rebuild. It is the
-    /// deletion reservation's only shrink (see
-    /// [`Self::deletion_index_over_memory_ceiling`]), so after
-    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost swaps it falls back to pruning under
-    /// the write fence, which no writer of the index runs concurrently with.
+    /// seconds) pruned at the same cutoff in a pass over that tail alone, however
+    /// the runs were folded meanwhile — and swapped in by compare-and-swap. A
+    /// writer that wins the swap only costs a re-splice, and only an index rebuilt
+    /// meanwhile (a clear or a reload) costs a new prefix. It is the deletion
+    /// reservation's only shrink (see [`Self::deletion_index_over_memory_ceiling`]),
+    /// so after [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost swaps it splices once more
+    /// under the write fence, which holds the fence for that pass over the tail;
+    /// only when that cannot be swapped in either does it prune the whole index
+    /// under the fence.
     ///
-    /// Every publication — the compare-and-swap and the fallback — happens under
+    /// Every publication — the compare-and-swap and the fallbacks — happens under
     /// the write fence and only while the bake's output is still live: the table
     /// keeps the snapshot the bake captured, `merged_snapshot_id` is protected and
     /// none of `input_ids` is. A recovery that read the catalog before the bake
@@ -29276,8 +29280,9 @@ impl CayenneTableProvider {
     /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] times `splice` it over the index live at
     /// that moment (also off the fence) and, under the write fence and only while
     /// the bake's output is live, swap the result in if `cell` still holds the
-    /// index it was spliced over. A lost swap re-splices; a declined splice (a
-    /// fold merged the prefix's runs) rebuilds the prefix.
+    /// index it was spliced over. A lost swap re-splices; a declined splice (the
+    /// index was rebuilt since the prefix was taken) rebuilds the prefix. When
+    /// every swap is lost, the last splice is redone under the write fence.
     async fn prune_deletion_snapshot_off_fence<T, P>(
         &self,
         cell: &ArcSwap<T>,
@@ -29342,7 +29347,33 @@ impl CayenneTableProvider {
                 return Ok(OffFencePrune::Published);
             }
         }
-        Ok(OffFencePrune::LostRace)
+        // Writers kept winning the swap. Splice once more under the write fence,
+        // which no fenced writer of the index publishes through: the fence is held
+        // for one pass over the index's newest entries, not for a whole prune.
+        let Some(built) = prefix else {
+            return Ok(OffFencePrune::LostRace);
+        };
+        let _fence = self.listing_fence.write().await;
+        if !self.bake_output_is_live(bake) {
+            return Ok(OffFencePrune::OutputNotLive);
+        }
+        let current = cell.load_full();
+        let (input, splice) = (Arc::clone(&current), Arc::clone(&splice));
+        let spliced = tokio::task::spawn_blocking(move || splice(&input, &built))
+            .await
+            .map_err(|source| Error::TaskPanicked {
+                table: table.clone(),
+                source,
+            })?;
+        let Some(spliced) = spliced else {
+            return Ok(OffFencePrune::LostRace);
+        };
+        let previous = cell.compare_and_swap(&current, Arc::new(spliced));
+        if !Arc::ptr_eq(&previous, &current) {
+            return Ok(OffFencePrune::LostRace);
+        }
+        self.refresh_deletion_memory_accounting();
+        Ok(OffFencePrune::Published)
     }
 
     /// Whether a seq-prefix bake's swap is still what scans see: the table keeps
@@ -59336,6 +59367,73 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "bake_prune_inputs_republished").await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40)],
             "key 0 must stay hidden in the republished inputs"
+        );
+    }
+
+    /// Installs a bake-prune hook that publishes a tombstone for an absent key
+    /// (`100 + n`, delete sequence `60 + n`) before each of the first
+    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] off-fence swaps, so a writer wins every
+    /// one of them; `wins` counts the publications.
+    fn install_winning_writer_hook(provider: &CayenneTableProvider, wins: Arc<AtomicUsize>) {
+        let provider_in_hook = provider.clone_for_write();
+        *provider.test_pre_bake_prune_publish_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let n = i64::try_from(wins.fetch_add(1, Ordering::SeqCst)).expect("fits i64");
+                let extended =
+                    int64_tombstones(&provider_in_hook).extend_max_deletes([(100 + n, 60 + n)]);
+                store_int64_tombstones(&provider_in_hook, extended);
+                if wins.load(Ordering::SeqCst) < BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
+                    install_winning_writer_hook(&provider_in_hook, wins);
+                }
+            })
+        }));
+    }
+
+    /// When a writer wins every off-fence swap, a seq-prefix bake splices its
+    /// deletion-index prune once more under the write fence: the prune lands, and
+    /// every tombstone the writers published meanwhile survives it. Five
+    /// snapshots (ids 0..5) pinned at seqs 10..50; the bake folds {0, 1}
+    /// (`T = 20`); key 0 is deleted at 15.
+    #[tokio::test]
+    async fn a_bake_prune_lands_under_the_fence_when_writers_win_every_swap() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_prune_fenced_splice",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+        let wins = Arc::new(AtomicUsize::new(0));
+        install_winning_writer_hook(&provider, Arc::clone(&wins));
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert_eq!(
+            wins.load(Ordering::SeqCst),
+            BAKE_PRUNE_OFF_FENCE_ATTEMPTS,
+            "precondition: a writer won every off-fence swap"
+        );
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(0).map(|t| t.delete_sequence),
+            None,
+            "the prune lands after every off-fence swap was lost"
+        );
+        for n in 0..i64::try_from(BAKE_PRUNE_OFF_FENCE_ATTEMPTS).expect("fits i64") {
+            assert_eq!(
+                tombstones.get(100 + n).map(|t| t.delete_sequence),
+                Some(60 + n),
+                "the tombstone writer {n} published during the prune survives it"
+            );
+        }
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_fenced_splice").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "key 0 stays deleted after the bake, others preserved"
         );
     }
 
