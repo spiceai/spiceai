@@ -5025,7 +5025,10 @@ mod tests {
 
     /// `LazyFree` is what this kernel reports for pages released with
     /// `MADV_FREE`: release 64 MiB of touched anonymous memory and the process's
-    /// own `smaps_rollup` must show at least that much more.
+    /// own `smaps_rollup` must show nearly all of it more. The kernel moves
+    /// released pages onto its lazy-free list through per-CPU batches, so up to
+    /// a batch per CPU can still be in flight when the count is read (16 pages
+    /// were on the Spark this was written on); 1/16 of the region bounds that.
     #[cfg(target_os = "linux")]
     #[test]
     fn smaps_rollup_reports_madv_free_pages_as_lazy_free() {
@@ -5060,7 +5063,7 @@ mod tests {
         unsafe { libc::munmap(region, LEN) };
         let released = u64::try_from(LEN).expect("64 MiB fits in u64");
         assert!(
-            after.saturating_sub(before) >= released,
+            after.saturating_sub(before) >= released - released / 16,
             "LazyFree grew by {} bytes after releasing {released}",
             after.saturating_sub(before)
         );
