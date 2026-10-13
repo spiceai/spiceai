@@ -2244,6 +2244,11 @@ pub struct CayenneTableProvider {
     /// rebuild reads the table after that capture. Consumed on first fire.
     #[cfg(test)]
     test_post_keyset_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by the durable write after it publishes its rows
+    /// inline and before it records their keys, so a test can land a checkpoint
+    /// in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_post_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by `rebuild_maintained_aggregates_from_visible_state`
     /// after its scan has been read, so a test can land a write inside that scan's
     /// window. Consumed on first fire.
@@ -9816,6 +9821,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_checkpoint_union_hook: Arc::new(ParkingMutex::new(None)),
@@ -12126,6 +12133,8 @@ impl CayenneTableProvider {
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
+            #[cfg(test)]
+            test_post_inline_publish_hook: Arc::clone(&self.test_post_inline_publish_hook),
             #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::clone(
                 &self.test_post_maintained_aggregate_scan_hook,
@@ -29013,6 +29022,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_post_keyset_capture_hook(&self) {
         let hook = self.test_post_keyset_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-inline-publish hook, if one is
+    /// installed. See [`Self::test_post_inline_publish_hook`].
+    #[cfg(test)]
+    pub(super) async fn run_test_post_inline_publish_hook(&self) {
+        let hook = self.test_post_inline_publish_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -75946,6 +75965,90 @@ mod tests {
         apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
         let rows_for_7: Vec<(i64, i64)> =
             collect_id_value_pairs(&ctx, &provider, "pk_sharded_rebuild_inline_flush")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value"
+        );
+    }
+
+    /// Probe for a race Codex reported (hypothesis, not reproduced): a durable write
+    /// publishes a row inline and records its key afterwards, and a one-shard
+    /// checkpoint — which takes no `write_lock` — can move the row into a file in
+    /// between. The flip relabels only keys already in the resident keyset, so the
+    /// late recording adds key 7 as `Inlined` although its row is in a file, and a
+    /// later upsert of key 7 would tombstone only the (absent) inline copy and
+    /// leave the file copy live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "probe for a pre-existing race; run with --ignored to reproduce"]
+    async fn an_inline_key_recorded_after_a_checkpoint_moved_its_row_is_superseded() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_inline_record_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // A RAM-tier row for the checkpoint to flush, and a resident Exact keyset.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Exact(_))
+            ),
+            "precondition: a resident Exact keyset"
+        );
+
+        // A checkpoint lands after the insert publishes key 7 inline and before the
+        // insert records the key.
+        let checkpointed = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let checkpointed = Arc::clone(&checkpointed);
+            *provider.test_post_inline_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint between the publication and the recording");
+                    checkpointed.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        assert!(
+            checkpointed.load(Ordering::SeqCst),
+            "precondition: the checkpoint ran between the publication and the recording"
+        );
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[2]),
+        )
+        .await;
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_inline_record_race")
                 .await
                 .into_iter()
                 .filter(|(id, _)| *id == 7)

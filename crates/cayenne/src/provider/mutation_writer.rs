@@ -1355,6 +1355,8 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     post_validation,
                 } => {
+                    #[cfg(test)]
+                    self.table.run_test_post_inline_publish_hook().await;
                     let record_seq = self.table.sequence_high_water().await;
                     self.table
                         .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
