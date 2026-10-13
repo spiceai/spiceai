@@ -12870,21 +12870,7 @@ impl CayenneTableProvider {
         // drop the key.
         let mut guard = self.pk_keyset_cache.lock();
         let restored = checkout.close();
-        // A checkpoint that moved the inline rows into files while the index was out
-        // leaves a Bloom valid as it is: it carries no row locations, and per-key OCC
-        // falls back to the per-table check for it. An Exact keyset's `Inlined`
-        // entries and per-key OCC stamps predate that flush. Relabeling the entries
-        // would not be enough: a writer that published an inline row before the
-        // flush but records its key after it (`record_inlined_pk_keys` follows the
-        // publication) would add an `Inlined` entry for a row now in a file, and an
-        // off-lock transaction that validated against the inline copy would pass
-        // its per-key OCC check. So an Exact keyset is dropped, as for any
-        // invalidation, and the next validation rebuilds it from the table.
-        let discard_reason = restored.discard_reason().or_else(|| {
-            (restored.relocates_inlined() && matches!(index, CachedPkIndex::Exact(_)))
-                .then_some("invalidated")
-        });
-        if let Some(discard_reason) = discard_reason {
+        if restored.index_must_be_discarded() {
             // Drop this index only. The per-shard index is a separate cache with its
             // own checkout log, and it sees every committed key (other writers'
             // through the commit mirror in `record_pk_keys_with_location`, the
@@ -12899,7 +12885,7 @@ impl CayenneTableProvider {
             self.track_pk_index_discard(
                 "table_keyset",
                 index.bloom_density().is_some(),
-                discard_reason,
+                restored.discard_reason().unwrap_or("unknown"),
             );
             tracing::debug!(
                 table = self.table_metadata.table_name.as_str(),
@@ -12915,6 +12901,19 @@ impl CayenneTableProvider {
             return;
         }
         let mut index = index;
+        if restored.relocates_inlined()
+            && let CachedPkIndex::Exact(keyset) = &mut index
+        {
+            // A checkpoint moved the inline rows into files while the index was out
+            // (see `PendingPkKeys::relocate_inlined_after_flush`); a Bloom carries no
+            // locations. The relabeled keys keep OCC stamps from before the flush, which
+            // an off-lock transaction that planned against the inline copy would pass,
+            // so per-key OCC falls back to the per-table check, which the flush's
+            // sequence fails.
+            if keyset.relocate_inlined_to_file_unlocated() || restored.relocated_inline_keys() {
+                self.mark_pk_keyset_occ_degraded();
+            }
+        }
         let mut replayed_keys = 0_usize;
         let mut replay_over_budget = false;
         for (keys, location, sequence) in restored.batches() {
@@ -13285,17 +13284,21 @@ impl CayenneTableProvider {
     /// emits key-based deletes to both lists, so no change is needed.
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
-        if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            keyset.relocate_inlined_to_file_unlocated();
+        if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut()
+            && keyset.relocate_inlined_to_file_unlocated()
+        {
+            // The relabeled keys keep OCC stamps from before the flush; see
+            // `store_cached_pk_index`.
+            self.mark_pk_keyset_occ_degraded();
         }
-        // An index checked out for validation is not in the cell, so a checked-out
-        // Exact keyset keeps saying `Inlined` for rows this checkpoint just moved
-        // into files; an upsert of such a key would tombstone the inline copy only
-        // and leave the file copy live. Tell its restore, which drops an Exact
-        // keyset and keeps a Bloom (see `store_cached_pk_index`). Keeping the Bloom
-        // matters: on a large table each discard costs the next apply a full-table
-        // rebuild under `write_lock`, and a checkpoint landing inside that rebuild
-        // discards it again. A no-op when nothing is checked out.
+        // An index checked out for validation is not in the cell, so its entries
+        // keep saying `Inlined` for rows this checkpoint just moved into files; an
+        // upsert of such a key would tombstone the inline copy only and leave the
+        // file copy live. Have its restore relabel it instead of discarding it: a
+        // discard costs the next apply a full-table keyset rebuild under
+        // `write_lock`, and a checkpoint landing inside that rebuild discards it
+        // again. A no-op when nothing is checked out. Why relabeling is sound for
+        // this index: `PendingPkKeys::relocate_inlined_after_flush`.
         self.pk_keyset_pending.lock().relocate_inlined_after_flush();
         drop(guard);
         // The N>1 sharded cache carries the same per-key `RowLocation`s; flip them
@@ -75548,14 +75551,15 @@ mod tests {
     }
 
     /// A checkpoint that moves the inline rows into files while a write has the
-    /// table-wide index checked out leaves an Exact keyset's `Inlined` entries and
-    /// per-key OCC stamps stale, so the restore drops it instead of caching it:
-    /// relabeling the entries would not cover a key whose inline row was published
-    /// before the flush and recorded after it, nor a transaction that validated
-    /// against the inline copy. (A Bloom carries neither and is kept; see
-    /// `an_inline_flush_during_a_table_wide_checkout_keeps_a_bloom_index`.)
+    /// table-wide index checked out must not cost that index: the flush changes
+    /// where rows live, not which keys are live. The restore relabels the `Inlined`
+    /// entries the index and the commits before the flush carry, caches the index,
+    /// and marks per-key OCC degraded, because the relabeled keys keep stamps from
+    /// before the flush. Discarding the index instead would make the next write
+    /// rebuild it from a full-table key scan under `write_lock` (on `stock` at
+    /// CH-benCH SF-100, a 10M-key rebuild that stalls the table's replication).
     #[tokio::test]
-    async fn an_inline_flush_during_a_table_wide_checkout_drops_an_exact_keyset() {
+    async fn an_inline_flush_during_a_table_wide_checkout_relabels_an_exact_keyset() {
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
             "pk_table_checkout_inline_flush",
@@ -75571,8 +75575,16 @@ mod tests {
         let converter = provider
             .build_pk_converter(&pk_indices)
             .expect("primary key converter");
+        let digest_of = |id: i64| {
+            pk_digest_set_for_ids(&converter, &[id])
+                .iter_with_digest()
+                .next()
+                .expect("one key")
+                .0
+        };
 
         insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        // An inline row the index already holds when the write checks it out.
         provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[5]), 10);
         let (checked_out, checkout) = provider.take_cached_pk_index();
         let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
@@ -75580,15 +75592,112 @@ mod tests {
             matches!(checked_out, CachedPkIndex::Exact(_)),
             "precondition: the keyset is exact"
         );
+        assert!(
+            !provider.pk_keyset_occ_degraded.load(Ordering::Acquire),
+            "precondition: per-key OCC is trusted before the flush"
+        );
 
+        // One inline commit lands before the flush, one after it.
         provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
         provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[8]), 12);
+
         provider.store_cached_pk_index(checked_out, checkout);
 
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => {
+                let location_of = |id: i64| keyset.location_by_digest(digest_of(id)).cloned();
+                assert!(
+                    matches!(location_of(5), Some(RowLocation::FileUnlocated)),
+                    "id=5 was inline when the index was checked out and the flush moved it \
+                     into a file: an `Inlined` entry would supersede only the inline copy and \
+                     leave the file copy live"
+                );
+                assert!(
+                    matches!(location_of(7), Some(RowLocation::FileUnlocated)),
+                    "id=7 was committed inline before the flush moved it into a file"
+                );
+                assert!(
+                    matches!(location_of(8), Some(RowLocation::Inlined)),
+                    "id=8 was committed inline after the flush and is still inline"
+                );
+            }
+            other => panic!(
+                "the table-wide index must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next write), present={}",
+                other.is_some()
+            ),
+        }
         assert!(
-            provider.pk_keyset_cache.lock().is_none(),
-            "an Exact keyset checked out across an inline flush must be dropped, not cached \
-             with labels and OCC stamps from before the flush"
+            provider.pk_keyset_occ_degraded.load(Ordering::Acquire),
+            "the relabeled keys keep OCC stamps from before the flush, so per-key OCC must \
+             fall back to the per-table check"
+        );
+    }
+
+    /// An off-lock transaction plans its writes from where the primary-key index says
+    /// each replaced row lives, and its commit trusts per-key OCC stamps. A one-shard
+    /// checkpoint that moves key 7's inline row into a file between the plan and the
+    /// commit leaves key 7's stamp unchanged, so per-key OCC would admit a plan that
+    /// supersedes only the absent inline copy; the commit must conflict instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transaction_that_planned_against_an_inline_row_conflicts_after_a_checkpoint_moves_it()
+     {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table_with_cap("occ_inline_flush", ctx.runtime_env(), 1, 0)
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        let write_set = pk_digest_set_for_ids(&converter, &[7]);
+        let footprint: std::collections::HashSet<u128> = write_set
+            .iter_with_digest()
+            .map(|(digest, _)| digest)
+            .collect();
+        let stage_seq = provider.sequence_high_water().await;
+        assert!(
+            !provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &write_set,
+                stage_seq + 1,
+            ),
+            "precondition: per-key OCC is in force, so a commit to another key alone does \
+             not conflict"
+        );
+
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint moves key 7 into a file");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+        let current = provider.sequence_high_water().await;
+        assert!(
+            provider.transaction_has_conflict(stage_seq, &footprint, true, &write_set, current),
+            "a transaction that planned against key 7's inline row must conflict once a \
+             checkpoint has moved it into a file"
         );
     }
 
