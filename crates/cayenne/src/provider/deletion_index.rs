@@ -2146,6 +2146,11 @@ mod tests {
                 assert_eq!(spliced.get(key), expected, "trial {trial}: key {key}");
                 for min in [None, Some(0), Some(cutoff), Some(seq / 2), Some(seq)] {
                     for apply in [true, false] {
+                        // Only a branch that ignores re-inserts probes with a
+                        // threshold (see `LayeredRuns`).
+                        if apply && min.is_some() {
+                            continue;
+                        }
                         assert_eq!(
                             oracle_visible(spliced.get_with_min_seq(key, min), apply, min),
                             oracle_visible(expected, apply, min),

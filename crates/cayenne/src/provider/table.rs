@@ -59382,6 +59382,7 @@ mod tests {
                 let extended =
                     int64_tombstones(&provider_in_hook).extend_max_deletes([(100 + n, 60 + n)]);
                 store_int64_tombstones(&provider_in_hook, extended);
+                provider_in_hook.notify_scan_input_change();
                 if wins.load(Ordering::SeqCst) < BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
                     install_winning_writer_hook(&provider_in_hook, wins);
                 }
@@ -59466,6 +59467,9 @@ mod tests {
                     let extended =
                         int64_tombstones(&provider_in_hook).extend_max_deletes([(1, 25)]);
                     store_int64_tombstones(&provider_in_hook, extended);
+                    // As a writer does on publishing, so the scan below does not
+                    // reuse the view the precondition scan cached.
+                    provider_in_hook.notify_scan_input_change();
                 })
             }));
         }
