@@ -31,7 +31,7 @@ use async_openai::{
         ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream, ChatCompletionTools,
         CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse, PromptTokensDetails,
-        ServiceTier,
+        ServiceTierResponse,
     },
     types::embeddings::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
 };
@@ -222,7 +222,7 @@ pub struct DatabricksCreateChatCompletionStreamResponse {
     pub choices: Vec<ChatChoiceStream>,
     pub created: u32,
     pub model: String,
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<ServiceTierResponse>,
     pub system_fingerprint: Option<String>,
     pub object: String,
 

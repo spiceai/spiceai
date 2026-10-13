@@ -27,7 +27,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Engine, IndexType, RefreshMode};
 use crate::parameters::ParameterSpec;
 
 use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
@@ -58,6 +58,23 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sort_columns")
         .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
 ];
+
+/// Arrow treats a `unique` index like `enabled`: say so at registration, as Cayenne
+/// does, rather than let a slow lookup say it. Shared with the partitioned accelerator.
+pub(crate) fn warn_if_unique_index(source: Option<&dyn AccelerationSource>) {
+    if let Some(source) = source
+        && let Some(acceleration) = source.acceleration()
+        && acceleration
+            .indexes
+            .values()
+            .any(|index_type| matches!(index_type, IndexType::Unique))
+    {
+        tracing::warn!(
+            "{}",
+            data_components::arrow::unique_index_warning(&source.name().to_string())
+        );
+    }
+}
 
 pub(crate) fn enable_hash_index_for_primary_key_or_indexes(cmd: &mut CreateExternalTable) {
     let has_primary_key = cmd.constraints.iter().any(
@@ -124,6 +141,7 @@ impl DataAccelerator for ArrowAccelerator {
                 .insert("sort_columns".to_string(), sort_cols_str.clone());
         }
 
+        warn_if_unique_index(source);
         enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
         let ctx = util::session_state::session_context();

@@ -25,7 +25,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod common;
+use crate::common;
 
 use common::lookup_index::{
     SplitMix64, TableSpec, counters, explain_total, insert, open_table, overwrite, poll_until,

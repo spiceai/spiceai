@@ -41,9 +41,8 @@ jobs:
       # Local, ephemeral PostgreSQL for the postgres catalog connector, mirroring
       # what the bench workflow does for SF1/SF10 (see #11730). Catalog discovery
       # reads pg_catalog, so it needs the tables to exist but not their rows -
-      # the seed step below creates the schema only. Excludes
-      # ducklake[postgres+s3], which provisions its own postgres catalog DB on the
-      # same port.
+      # the seed step below creates the schema only. Excludes the DuckLake
+      # spicepods, which provision their own postgres catalog DB on the same port.
       postgres_tpch:
         image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake')) && 'postgres:16' || '' }}
         ports:
@@ -115,14 +114,17 @@ jobs:
         if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
         uses: ./.github/actions/setup-oracle-odpi
 
+      # Every DuckLake spicepod (ducklake[catalog] as well as ducklake[postgres+s3])
+      # reads the same local postgres catalog and MinIO bucket, so all of this setup
+      # keys on 'ducklake', matching testoperator_run_bench.yml.
       - name: Install PostgreSQL for DuckLake
-        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         uses: ./.github/actions/install-postgres
         with:
           pg-db: ducklake_catalog
 
       - name: Start local MinIO for DuckLake
-        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
           # MinIO no longer publishes images or binaries: quay.io/minio/minio and minio/minio refuse
           # anonymous pulls and dl.min.io answers 410. Chainguard builds the same server from the
@@ -139,7 +141,7 @@ jobs:
           fi
 
       - name: Wait for local MinIO
-        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
           for _ in {1..30}; do
             if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
@@ -151,8 +153,15 @@ jobs:
           docker logs minio
           exit 1
 
+      # The dev runner image has python3 but no pip, which the bootstrap below needs.
+      - name: Set up Python
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
       - name: Bootstrap DuckLake TPCH SF1 catalog
-        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
           # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
           # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
@@ -247,8 +256,8 @@ jobs:
           # A variable set to "" is not unset. `AWS_ENDPOINT_URL=""` is an endpoint
           # override the AWS SDK rejects by panicking, which aborts the whole
           # runtime, and `DUCKLAKE_CONNECTION_STRING=""` is a connection the
-          # DuckLake extension tries to open. These are only meaningful for
-          # `ducklake[postgres+s3]`.
+          # DuckLake extension tries to open. These are only meaningful for the
+          # DuckLake spicepods.
           for name in AWS_ENDPOINT_URL AWS_ALLOW_HTTP DUCKLAKE_CONNECTION_STRING; do
             if [ -z "${!name:-}" ]; then
               unset "$name"
@@ -272,11 +281,11 @@ jobs:
           DATABRICKS_SQL_WAREHOUSE_ID: ${{ vars.DATABRICKS_SQL_WAREHOUSE_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'minioadmin' || secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'minioadmin' || secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'http://127.0.0.1:9000' || '' }}
-          AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'true' || '' }}
-          DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake[postgres+s3]') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
+          AWS_ACCESS_KEY_ID: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'minioadmin' || secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'http://127.0.0.1:9000' || '' }}
+          AWS_ALLOW_HTTP: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'true' || '' }}
+          DUCKLAKE_CONNECTION_STRING: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') && 'postgres:dbname=ducklake_catalog host=localhost user=postgres password=postgres' || '' }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}

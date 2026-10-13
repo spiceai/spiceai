@@ -85,6 +85,21 @@ pub enum CatalogError {
         current: String,
     },
 
+    /// A compaction's commit found that protected snapshots it folded into its
+    /// output are no longer registered: another writer merged or removed them
+    /// while it ran, so committing would register the folded rows twice.
+    #[snafu(display(
+        "Table {table_id} no longer registers {missing} of the {folded} protected snapshots it compacted, so the compacted snapshot was not committed"
+    ))]
+    ProtectedSnapshotsReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// How many protected snapshots the compaction folded
+        folded: usize,
+        /// How many of them the catalog no longer registers
+        missing: usize,
+    },
+
     /// IO error
     #[snafu(display("IO error: {source}"))]
     Io {
@@ -221,6 +236,11 @@ pub enum CatalogError {
         stored: String,
         configured: String,
     },
+
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
+    ))]
+    PkConflictDetectionEnabledOnExistingTable { table_name: String },
 
     #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
@@ -646,7 +666,12 @@ pub trait MetadataCatalog: Send + Sync {
     /// because their `sequence_number` column records the delete-fence at
     /// creation, not the snapshot's own creation sequence.
     ///
-    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`].
+    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`]. Every
+    /// id in `protected_snapshot_ids_to_clear` must also still be registered: the
+    /// commit changes nothing and returns
+    /// [`CatalogError::ProtectedSnapshotsReplaced`] when one is not, because a
+    /// writer that merged or removed it since the rewrite folded it would
+    /// otherwise leave the rewritten rows registered twice.
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,

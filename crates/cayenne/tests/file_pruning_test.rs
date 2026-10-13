@@ -18,7 +18,7 @@ limitations under the License.
 
 //! Integration tests for listing-time Vortex file pruning and correctness.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
