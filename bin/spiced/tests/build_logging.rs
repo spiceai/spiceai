@@ -83,6 +83,7 @@ impl<'a> MakeWriter<'a> for ProbeWriter {
 
 #[tokio::test]
 async fn build_time_warnings_reach_the_installed_subscriber() {
+    crate::require_process_per_test("this test installs the process-global tracing subscriber");
     let probe = ProbeWriter::default();
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(
