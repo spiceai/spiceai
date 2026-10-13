@@ -800,25 +800,6 @@ fn score_legend(criteria: &[NonNullEntry]) -> BTreeMap<String, EntryType> {
         .collect()
 }
 
-/// The answer to a question that needs no model: a choice with a single option, which
-/// is that option with all the probability. `OpenAI` asks a choice of at least two
-/// options, so such a question is answered here rather than sent. `None` for any other
-/// question.
-fn foregone_answer(question: &Question) -> Option<Answer> {
-    let Question::Choice { criteria, .. } = question else {
-        return None;
-    };
-    if criteria.len() != 1 {
-        return None;
-    }
-    let option = criteria.keys().next()?;
-    Some(Answer::Choice {
-        choice: option.clone(),
-        probabilities: BTreeMap::from([(option.clone(), 1.0)]),
-        confidence: 1.0,
-    })
-}
-
 /// Builds the `OpenAI` decision request that asks `request`'s questions of `model`,
 /// naming each question by its System One id so its answer can be matched back, and
 /// forwarding the request's `safety_identifier`. A choice with a boolean option is sent
@@ -838,7 +819,7 @@ pub fn system_one_to_decision_request(
     let asked = request
         .questions
         .values()
-        .filter(|question| foregone_answer(question).is_none())
+        .filter(|question| question.foregone_answer().is_none())
         .count();
     if asked > MAX_QUESTIONS {
         return Err(InvalidDecisionRequest::new(
@@ -859,7 +840,7 @@ pub fn system_one_to_decision_request(
 
     let mut questions = Vec::with_capacity(asked);
     for (id, question) in &request.questions {
-        if foregone_answer(question).is_some() {
+        if question.foregone_answer().is_some() {
             continue;
         }
         let name = Some(id.clone());
@@ -982,7 +963,7 @@ pub fn decision_response_to_system_one(
         let Some(question) = request
             .questions
             .get(&id)
-            .filter(|question| foregone_answer(question).is_none())
+            .filter(|question| question.foregone_answer().is_none())
         else {
             return Err(format!("an answer names '{id}', which was not asked"));
         };
@@ -1097,7 +1078,7 @@ pub fn decision_response_to_system_one(
         }
     }
     for (id, question) in &request.questions {
-        if let Some(answer) = foregone_answer(question) {
+        if let Some(answer) = question.foregone_answer() {
             answers.insert(id.clone(), answer);
         }
     }

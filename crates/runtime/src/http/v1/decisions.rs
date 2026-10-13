@@ -106,11 +106,12 @@ pub(crate) async fn post(
         let translated = match request.to_system_one() {
             Ok(translated) => translated,
             Err(invalid) => {
-                let refused = EvaluateError::InvalidRequest {
-                    model: request.model.clone(),
-                    message: invalid.message.clone(),
-                };
-                tracing::error!(target: "task_history", "{}", refused.telemetry_message());
+                tracing::error!(
+                    target: "task_history",
+                    "Evaluation of model '{}' failed: invalid request (`{}`)",
+                    request.model,
+                    invalid.param
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
@@ -122,34 +123,40 @@ pub(crate) async fn post(
         };
 
         let Some(model) = models.read().await.get(&request.model).cloned() else {
-            let message = format!(
-                "Model '{}' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: {MODELS_DOCS}",
+            tracing::error!(
+                target: "task_history",
+                "Evaluation of model '{}' failed: model not found",
                 request.model
             );
-            tracing::error!(target: "task_history", "{message}");
             return error_response(
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 Some("model"),
                 Some("model_not_found"),
-                &message,
+                &format!(
+                    "Model '{}' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: {MODELS_DOCS}",
+                    request.model
+                ),
             );
         };
 
         // A decision model has no reasoning effort to set; answering anyway would hide
         // that the level the caller asked for was never applied.
         if request.reasoning_effort.is_some() && model.is_decision_model() {
-            let message = format!(
-                "Model '{}' is a decision model, which does not take `reasoning_effort`. Omit `reasoning_effort`, or name a chat model to set how much it reasons. See: {MODELS_DOCS}",
+            tracing::error!(
+                target: "task_history",
+                "Evaluation of model '{}' failed: unsupported parameter `reasoning_effort`",
                 request.model
             );
-            tracing::error!(target: "task_history", "{message}");
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 Some("reasoning_effort"),
                 Some("unsupported_parameter"),
-                &message,
+                &format!(
+                    "Model '{}' is a decision model, which does not take `reasoning_effort`. Omit `reasoning_effort`, or name a chat model to set how much it reasons. See: {MODELS_DOCS}",
+                    request.model
+                ),
             );
         }
 
@@ -449,7 +456,7 @@ mod tests {
         (status, json, errors)
     }
 
-    // regression test for #14910: a refused request was recorded as a successful task.
+    // regression test for #14893: a refused request was recorded as a successful task.
     #[tokio::test]
     async fn every_refused_decision_is_recorded_as_failed_in_task_history() {
         let jev = || store_with("jev", Arc::new(DummyEvaluate::default()));
@@ -458,19 +465,19 @@ mod tests {
                 EvaluateModelStore::new(),
                 json!({"model": "nope", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
                 StatusCode::NOT_FOUND,
-                "Model 'nope' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: https://spiceai.org/docs/components/models",
+                "Evaluation of model 'nope' failed: model not found",
             ),
             (
                 jev(),
                 json!({"model": "jev", "input": "x", "questions": []}),
                 StatusCode::BAD_REQUEST,
-                "Evaluation of model 'jev' failed: invalid request",
+                "Evaluation of model 'jev' failed: invalid request (`questions`)",
             ),
             (
                 jev(),
                 json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}], "reasoning_effort": "high"}),
                 StatusCode::BAD_REQUEST,
-                "Model 'jev' is a decision model, which does not take `reasoning_effort`. Omit `reasoning_effort`, or name a chat model to set how much it reasons. See: https://spiceai.org/docs/components/models",
+                "Evaluation of model 'jev' failed: unsupported parameter `reasoning_effort`",
             ),
         ];
         let mut expected = Vec::new();

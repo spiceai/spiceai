@@ -26,10 +26,7 @@ use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::{
     RefreshableCatalogProvider,
     iceberg::{
-        catalog::{
-            hadoop::{HadoopCatalogBuilder, MetadataMode},
-            rest::RestCatalog,
-        },
+        catalog::{hadoop::HadoopCatalogBuilder, rest::RestCatalog},
         provider::{CatalogTableWrapper, IcebergCatalogProvider},
     },
 };
@@ -153,7 +150,6 @@ impl IcebergCatalog {
         // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
         let mut catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(catalog_id)
-            .with_metadata_mode(MetadataMode::Infer)
             .with_operator(operator)
             .with_properties(props);
 
@@ -404,12 +400,7 @@ impl CatalogConnector for IcebergCatalog {
                 None
             };
 
-        if catalog_id.starts_with("file://")
-            || catalog_id.starts_with("s3://")
-            || catalog_id.starts_with("s3a://")
-            || catalog_id.starts_with("gs://")
-            || catalog_id.starts_with("gcs://")
-        {
+        if is_storage_url(&catalog_id) {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
                 s3_credential_loader,
@@ -728,6 +719,14 @@ fn get_warehouse(url: &Url) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `url` addresses object storage or the local filesystem, rather than an
+/// Iceberg REST catalog.
+pub(crate) fn is_storage_url(url: &str) -> bool {
+    ["file://", "s3://", "s3a://", "gs://", "gcs://"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
 }
 
 pub fn parse_hadoop_table_url(

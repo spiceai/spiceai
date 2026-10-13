@@ -199,6 +199,12 @@ async fn handle_streaming(
     include_stream_events: bool,
 ) -> Response {
     let span = Span::current();
+    // Spice always requests usage from the provider; only forward it if the client did.
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.include_usage)
+        .unwrap_or(false);
     let (tx, rx) = channel(100);
     let tx = Arc::new(tx);
     let (end_completion, completion_done) = oneshot::channel::<()>();
@@ -255,6 +261,7 @@ async fn handle_streaming(
         Box::pin(ReceiverStream::new(rx)),
         time::Duration::from_secs(KEEP_ALIVE_INTERVAL),
         span,
+        include_usage,
     )
 }
 
@@ -301,14 +308,21 @@ fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
     span: Span,
+    include_usage: bool,
 ) -> Response {
     Sse::new(Box::pin(stream! {
         let mut chat_output = String::new();
         let mut id: Option<String> = None;
-        let mut failed = false;
+        let mut errored = false;
         while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    if !include_usage {
+                        resp.usage = None;
+                        if resp.choices.is_empty() {
+                            continue;
+                        }
+                    }
                     if id.is_none() {
                         id = Some(resp.id.clone());
                     }
@@ -325,12 +339,12 @@ fn create_sse_response(
                 Err(e) => {
                     tracing::error!("Error encountered in chat completion stream: {e}");
                     yield Ok(to_openai_error_event(e.to_string()));
-                    failed = true;
+                    errored = true;
                     break;
                 }
             }
         };
-        if !failed {
+        if !errored {
             yield Ok(Event::default().data("[DONE]"));
         }
         tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);

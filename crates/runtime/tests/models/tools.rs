@@ -1193,7 +1193,7 @@ params:
     }
 
     /// Asserts that a `tools/call` was refused with `message`: a tool result
-    /// marked `isError` carrying the tool's error.
+    /// with `isError: true` carrying the tool's error.
     fn assert_read_only_rejection(response: &Value, message: &str) {
         assert_eq!(
             response.pointer("/result/isError").and_then(Value::as_bool),
@@ -1221,11 +1221,9 @@ params:
             .ok_or_else(|| anyhow::anyhow!("tools/call returned no text content: {response}"))
     }
 
-    /// The rows a successful `sql` tool call returned. Its result is a JSON
-    /// string that holds the rows as a JSON array.
+    /// The rows a successful `sql` tool call returned, as a JSON array.
     fn sql_tool_rows(response: &Value) -> anyhow::Result<Value> {
-        let rows: String = serde_json::from_str(tool_result_text(response)?)?;
-        Ok(serde_json::from_str(&rows)?)
+        Ok(serde_json::from_str(tool_result_text(response)?)?)
     }
 
     /// An INSERT of one row whose `id` and `value` are `value` into

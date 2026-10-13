@@ -525,6 +525,10 @@ name = "pk_keyset_present_path"
 harness = false
 name = "scan_view_reuse_qps"
 
+[[bench]]
+harness = false
+name = "listing_after_overwrite"
+
 [lints]
 workspace = true
 
