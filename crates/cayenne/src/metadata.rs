@@ -345,7 +345,8 @@ pub enum SortColumnsOrigin {
 }
 
 /// Which compression strategy the table's FULL encoding tier uses — i.e.
-/// maintenance writes (compaction outputs, rewrites, overwrites) and delta
+/// maintenance writes (compaction outputs, rewrites, overwrites, a load into
+/// an empty table) and delta
 /// writes that resolve to a full level (`7..=10`, or `auto` on large /
 /// unknown-size writes). Light delta levels (`0..=6`) are a fixed
 /// `BtrBlocks`-subset effort ladder and are not affected by this choice.
@@ -378,8 +379,8 @@ pub enum CompressionStrategy {
 ///   pre-feature write behavior (`7` is the explicit opt-out of `auto`;
 ///   `8`–`10` are reserved for future heavier-effort search).
 ///
-/// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
-/// NOT affected by this setting — they always use the full default encoding,
+/// Maintenance writes (compaction outputs, sorted rewrites, overwrites, and a
+/// load into an empty table) are NOT affected by this setting — they always use the full default encoding,
 /// because their output is the long-lived artifact whose encoding quality
 /// pays for scan throughput and storage footprint.
 ///
@@ -829,8 +830,9 @@ pub struct VortexConfig {
     /// `auto` (default) encodes every delta light (deltas are transient and
     /// folded into properly-encoded files by compaction); explicit `0..=10`
     /// pins the level (`7` = the full default cascade, the pre-feature
-    /// behavior). Maintenance writes (compaction, rewrites) always use the full
-    /// default encoding. See [`DeltaEncoding`].
+    /// behavior). Maintenance writes (compaction, rewrites, overwrites, a load
+    /// into an empty table) always use the full default encoding. See
+    /// [`DeltaEncoding`].
     #[serde(default)]
     pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.

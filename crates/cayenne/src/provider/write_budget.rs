@@ -110,7 +110,7 @@ fn maintenance_permit_reserve(total: usize) -> usize {
 /// single source of truth for the gate size — used both when the gate
 /// semaphore is created and when a request is clamped against it, so the two
 /// can never disagree.
-fn maintenance_gate_cap(total: usize) -> usize {
+pub(crate) fn maintenance_gate_cap(total: usize) -> usize {
     total
         .saturating_sub(maintenance_permit_reserve(total))
         .max(1)
