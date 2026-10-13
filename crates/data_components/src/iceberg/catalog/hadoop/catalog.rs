@@ -29,18 +29,6 @@ use iceberg::{
 };
 use opendal::{Entry, Operator};
 
-/// Specifies the mode for identifying metadata files in a Hadoop catalog
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum MetadataMode {
-    /// Infer the latest metadata file from the Hadoop structure
-    #[default]
-    Infer,
-    /// Use the exact metadata file specified, or infer it if the file does not exist
-    ExactOrInfer(String),
-    /// Use the exact metadata file specified
-    Exact(String),
-}
-
 /// A function that builds a `StorageFactory` for a given URL scheme (e.g. `s3`, `s3a`).
 ///
 /// This is used by the `HadoopCatalogBuilder` to allow the storage factory to be
@@ -53,7 +41,6 @@ pub type StorageFactoryBuilderFn = Arc<dyn Fn(&str) -> Arc<dyn StorageFactory> +
 pub struct HadoopCatalogBuilder {
     warehouse_root: Option<String>,
     file_io: Option<FileIO>,
-    metadata_mode: MetadataMode,
     properties: HashMap<String, String>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     storage_factory_builder: Option<StorageFactoryBuilderFn>,
@@ -65,7 +52,6 @@ impl std::fmt::Debug for HadoopCatalogBuilder {
         f.debug_struct("HadoopCatalogBuilder")
             .field("warehouse_root", &self.warehouse_root)
             .field("file_io", &self.file_io)
-            .field("metadata_mode", &self.metadata_mode)
             .field("properties", &self.properties)
             .field("storage_factory", &self.storage_factory)
             .field(
@@ -123,13 +109,6 @@ impl HadoopCatalogBuilder {
     #[must_use]
     pub fn with_operator(mut self, operator: Operator) -> Self {
         self.operator = Some(operator);
-        self
-    }
-
-    /// Sets the metadata mode for the Hadoop catalog.
-    #[must_use]
-    pub fn with_metadata_mode(mut self, metadata_mode: MetadataMode) -> Self {
-        self.metadata_mode = metadata_mode;
         self
     }
 
@@ -212,10 +191,9 @@ impl HadoopCatalogBuilder {
 
             let cloned_warehouse_root = warehouse_root.clone();
             let catalog = HadoopCatalog {
-                warehouse_root,
                 file_io,
                 operator,
-                metadata_mode: self.metadata_mode,
+                warehouse_root,
             };
 
             if infer_scheme {
@@ -284,7 +262,6 @@ pub struct HadoopCatalog {
     file_io: FileIO,
     operator: Operator,
     warehouse_root: String,
-    metadata_mode: MetadataMode,
 }
 
 #[async_trait]
@@ -390,10 +367,7 @@ impl Catalog for HadoopCatalog {
 
         for entry in directories {
             let path = format!("{path}{entry}/", path = path, entry = entry.name());
-            if self
-                .directory_has_metadata_and_data(&path, self.metadata_mode.clone())
-                .await?
-            {
+            if self.directory_has_metadata_and_data(&path).await? {
                 // This is a table, skip it
                 continue;
             }
@@ -434,39 +408,13 @@ impl Catalog for HadoopCatalog {
 
     async fn load_table(&self, table_identifier: &TableIdent) -> Result<Table> {
         if !self.table_exists(table_identifier).await? {
-            if let MetadataMode::Exact(ref metadata_file) = self.metadata_mode {
-                let input_file = self.file_io.new_input(metadata_file)?;
-                if !input_file.exists().await? {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Expected metadata file '{metadata_file}' does not exist"),
-                    ));
-                }
-            }
-
             return Err(Error::new(
                 ErrorKind::TableNotFound,
                 format!("Table {table_identifier} does not exist"),
             ));
         }
 
-        let metadata_file_path = match self.metadata_mode {
-            MetadataMode::Infer => None,
-            MetadataMode::ExactOrInfer(ref metadata_file) => {
-                let input_file = self.file_io.new_input(metadata_file)?;
-                if input_file.exists().await? {
-                    Some(metadata_file.clone())
-                } else {
-                    // If the exact metadata file does not exist, infer the latest metadata file
-                    None
-                }
-            }
-            MetadataMode::Exact(ref metadata_file) => Some(metadata_file.clone()),
-        };
-
-        let metadata_file = self
-            .find_metadata_file(table_identifier, metadata_file_path)
-            .await?;
+        let metadata_file = self.find_metadata_file(table_identifier).await?;
 
         let metadata_file_content = metadata_file.read().await?;
         let table_metadata = serde_json::from_slice::<TableMetadata>(&metadata_file_content)?;
@@ -496,8 +444,7 @@ impl Catalog for HadoopCatalog {
         }
 
         // Check if the table has metadata
-        self.directory_has_metadata_and_data(&path, MetadataMode::Infer)
-            .await
+        self.directory_has_metadata_and_data(&path).await
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
@@ -523,10 +470,10 @@ impl Catalog for HadoopCatalog {
             };
 
             if self
-                .directory_has_metadata_and_data(
-                    &format!("{path}/{table_name}", table_name = table_ident.name),
-                    self.metadata_mode.clone(),
-                )
+                .directory_has_metadata_and_data(&format!(
+                    "{path}/{table_name}",
+                    table_name = table_ident.name
+                ))
                 .await?
             {
                 tables.push(table_ident);
@@ -574,11 +521,7 @@ impl HadoopCatalog {
         Ok(directories)
     }
 
-    async fn directory_has_metadata_and_data(
-        &self,
-        path: &str,
-        metadata_mode: MetadataMode,
-    ) -> Result<bool> {
+    async fn directory_has_metadata_and_data(&self, path: &str) -> Result<bool> {
         let data_dir = format!("{path}/data/");
         let op_path = self.to_operator_path(&data_dir);
         let is_data_dir = match self.operator.stat(&op_path).await {
@@ -594,7 +537,7 @@ impl HadoopCatalog {
         if !is_data_dir {
             return Ok(false);
         }
-        self.directory_has_metadata(path, metadata_mode).await
+        self.directory_has_metadata(path).await
     }
 
     async fn directory_exists(&self, path: &str) -> Result<bool> {
@@ -609,11 +552,7 @@ impl HadoopCatalog {
         }
     }
 
-    async fn directory_has_metadata(
-        &self,
-        path: &str,
-        metadata_mode: MetadataMode,
-    ) -> Result<bool> {
+    async fn directory_has_metadata(&self, path: &str) -> Result<bool> {
         let metadata_directory = format!("{path}/metadata/");
         let op_path = self.to_operator_path(&metadata_directory);
 
@@ -622,12 +561,6 @@ impl HadoopCatalog {
             Ok(m) if m.is_dir() => {}
             Ok(_) | Err(_) => return Ok(false),
         }
-
-        let (metadata_file, fail_if_exact_missing) = match &metadata_mode {
-            MetadataMode::Infer => (None, false),
-            MetadataMode::ExactOrInfer(metadata_file) => (Some(metadata_file.as_str()), false),
-            MetadataMode::Exact(metadata_file) => (Some(metadata_file.as_str()), true),
-        };
 
         let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
             Error::new(
@@ -642,19 +575,8 @@ impl HadoopCatalog {
                 format!("Failed to read metadata entry: {e}"),
             )
         })? {
-            if entry.metadata().is_file() {
-                if let Some(mf) = metadata_file {
-                    // Compare by filename — metadata_file may be a full path or just a name
-                    let mf_name = mf.rsplit('/').next().unwrap_or(mf);
-                    if entry.name() == mf_name {
-                        return Ok(true);
-                    }
-                }
-
-                // For non-Exact modes, any .metadata.json file qualifies
-                if !fail_if_exact_missing && entry.name().ends_with(".metadata.json") {
-                    return Ok(true);
-                }
+            if entry.metadata().is_file() && entry.name().ends_with(".metadata.json") {
+                return Ok(true);
             }
         }
 
@@ -671,132 +593,108 @@ impl HadoopCatalog {
         )
     }
 
-    async fn find_metadata_file(
-        &self,
-        table_identifier: &TableIdent,
-        metadata_file_path: Option<String>,
-    ) -> Result<InputFile> {
-        if let Some(metadata_file) = metadata_file_path {
+    async fn find_metadata_file(&self, table_identifier: &TableIdent) -> Result<InputFile> {
+        let hint_one = self
+            .file_io
+            .new_input(self.version_hint_path(table_identifier, "txt"))?;
+        let hint_two = self
+            .file_io
+            .new_input(self.version_hint_path(table_identifier, "text"))?;
+        let hint_input = if hint_one.exists().await? {
+            Some(hint_one)
+        } else if hint_two.exists().await? {
+            Some(hint_two)
+        } else {
+            None
+        };
+
+        if let Some(input) = hint_input {
+            // Load the version hint file to get the latest metadata file
+            let metadata_version = input.read().await?;
+            let metadata_version = std::str::from_utf8(&metadata_version).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Invalid UTF-8 in version hint file: {e}"),
+                )
+            })?;
+            let metadata_file = format!(
+                "{warehouse_root}{namespace}/{table}/metadata/v{version}.metadata.json",
+                warehouse_root = self.warehouse_root,
+                namespace = table_identifier.namespace.join("/"),
+                table = table_identifier.name,
+                version = metadata_version.trim()
+            );
+
             self.file_io.new_input(&metadata_file)
         } else {
-            let hint_one = self
-                .file_io
-                .new_input(self.version_hint_path(table_identifier, "txt"))?;
-            let hint_two = self
-                .file_io
-                .new_input(self.version_hint_path(table_identifier, "text"))?;
-            let hint_input = if hint_one.exists().await? {
-                Some(hint_one)
-            } else if hint_two.exists().await? {
-                Some(hint_two)
-            } else {
-                None
-            };
+            // If there is no version hint, list the metadata files and get the latest one
+            let metadata_directory = format!(
+                "{warehouse_root}{namespace}/{table}/metadata/",
+                warehouse_root = self.warehouse_root,
+                namespace = table_identifier.namespace.join("/"),
+                table = table_identifier.name
+            );
 
-            if let Some(input) = hint_input {
-                // Load the version hint file to get the latest metadata file
-                let metadata_version = input.read().await?;
-                let metadata_version = std::str::from_utf8(&metadata_version).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Invalid UTF-8 in version hint file: {e}"),
-                    )
-                })?;
-                let metadata_file = format!(
-                    "{warehouse_root}{namespace}/{table}/metadata/v{version}.metadata.json",
+            let op_path = self.to_operator_path(&metadata_directory);
+            let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to list metadata directory: {e}"),
+                )
+            })?;
+            let mut latest_metadata_file: Option<Entry> = None;
+            while let Some(entry) = lister.try_next().await.map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to read metadata entry: {e}"),
+                )
+            })? {
+                if entry.metadata().is_file() && entry.name().ends_with(".metadata.json") {
+                    if let Some(latest_file) = &latest_metadata_file {
+                        match (
+                            latest_file.metadata().last_modified(),
+                            entry.metadata().last_modified(),
+                        ) {
+                            (Some(latest_modified), Some(entry_modified)) => {
+                                // Compare last modified times
+                                if entry_modified > latest_modified {
+                                    latest_metadata_file = Some(entry);
+                                }
+                            }
+                            _ => {
+                                // compare by name if last modified times are not available
+                                if entry.name() > latest_file.name() {
+                                    latest_metadata_file = Some(entry);
+                                }
+                            }
+                        }
+                    } else {
+                        latest_metadata_file = Some(entry);
+                    }
+                }
+            }
+
+            if let Some(latest_file) = latest_metadata_file {
+                let path = format!(
+                    "{warehouse_root}{namespace}/{table}/metadata/{latest_file}",
                     warehouse_root = self.warehouse_root,
                     namespace = table_identifier.namespace.join("/"),
                     table = table_identifier.name,
-                    version = metadata_version.trim()
+                    latest_file = latest_file.name()
                 );
 
-                self.file_io.new_input(&metadata_file)
+                self.file_io.new_input(path)
             } else {
-                // If there is no version hint, list the metadata files and get the latest one
-                let metadata_directory = format!(
-                    "{warehouse_root}{namespace}/{table}/metadata/",
-                    warehouse_root = self.warehouse_root,
-                    namespace = table_identifier.namespace.join("/"),
-                    table = table_identifier.name
-                );
-
-                let op_path = self.to_operator_path(&metadata_directory);
-                let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!("Failed to list metadata directory: {e}"),
-                    )
-                })?;
-                let mut latest_metadata_file: Option<Entry> = None;
-                while let Some(entry) = lister.try_next().await.map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        format!("Failed to read metadata entry: {e}"),
-                    )
-                })? {
-                    if entry.metadata().is_file() && entry.name().ends_with(".metadata.json") {
-                        if let Some(latest_file) = &latest_metadata_file {
-                            match (
-                                latest_file.metadata().last_modified(),
-                                entry.metadata().last_modified(),
-                            ) {
-                                (Some(latest_modified), Some(entry_modified)) => {
-                                    // Compare last modified times
-                                    if entry_modified > latest_modified {
-                                        latest_metadata_file = Some(entry);
-                                    }
-                                }
-                                _ => {
-                                    // compare by name if last modified times are not available
-                                    if entry.name() > latest_file.name() {
-                                        latest_metadata_file = Some(entry);
-                                    }
-                                }
-                            }
-                        } else {
-                            latest_metadata_file = Some(entry);
-                        }
-                    }
-                }
-
-                if let Some(latest_file) = latest_metadata_file {
-                    let path = format!(
-                        "{warehouse_root}{namespace}/{table}/metadata/{latest_file}",
-                        warehouse_root = self.warehouse_root,
-                        namespace = table_identifier.namespace.join("/"),
-                        table = table_identifier.name,
-                        latest_file = latest_file.name()
-                    );
-
-                    self.file_io.new_input(path)
-                } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "No metadata file found in the table directory",
-                    ))
-                }
+                Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "No metadata file found in the table directory",
+                ))
             }
         }
     }
 
     async fn load_metadata(&self, table_identifier: &TableIdent) -> Result<TableMetadata> {
-        let metadata_file_path = match self.metadata_mode {
-            MetadataMode::Infer => None,
-            MetadataMode::ExactOrInfer(ref metadata_file) => {
-                let input_file = self.file_io.new_input(metadata_file)?;
-                if input_file.exists().await? {
-                    Some(metadata_file.clone())
-                } else {
-                    // If the exact metadata file does not exist, infer the latest metadata file
-                    None
-                }
-            }
-            MetadataMode::Exact(ref metadata_file) => Some(metadata_file.clone()),
-        };
-
-        let metadata_file = self
-            .find_metadata_file(table_identifier, metadata_file_path)
-            .await?;
+        let metadata_file = self.find_metadata_file(table_identifier).await?;
 
         let metadata_file_content = metadata_file.read().await?;
         Ok(serde_json::from_slice::<TableMetadata>(
