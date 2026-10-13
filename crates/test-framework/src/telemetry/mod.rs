@@ -27,7 +27,7 @@ use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_sdk::{
     Resource,
-    metrics::{SdkMeterProvider, data::ResourceMetrics},
+    metrics::{Instrument, SdkMeterProvider, Stream, data::ResourceMetrics},
 };
 
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
@@ -67,6 +67,25 @@ pub fn meter() -> Meter {
     METER.get().cloned().unwrap_or_else(|| NOOP_METER.clone())
 }
 
+/// Maximum number of distinct attribute sets kept per instrument. The SDK default (2000) folds
+/// every set past the limit into one `otel.metric.overflow` point, which would drop per-query
+/// series for a query set larger than 2000 queries. A test process records once and exports
+/// once, so the higher limit only costs memory for points that are actually recorded.
+const CARDINALITY_LIMIT: usize = 100_000;
+
+fn meter_provider(resource: Resource, reader: InitialReader) -> SdkMeterProvider {
+    SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .with_view(|_: &Instrument| {
+            Stream::builder()
+                .with_cardinality_limit(CARDINALITY_LIMIT)
+                .build()
+                .ok()
+        })
+        .build()
+}
+
 #[derive(Debug, Clone)]
 pub struct OtlpExporterConfig {
     pub endpoint: Arc<str>,
@@ -103,11 +122,7 @@ impl Telemetry {
     #[must_use]
     pub fn new_with_resource(resource: &Resource, api_key_name: &str) -> Self {
         let reader = InitialReader::default();
-
-        let provider = SdkMeterProvider::builder()
-            .with_resource(resource.clone())
-            .with_reader(reader.clone())
-            .build();
+        let provider = meter_provider(resource.clone(), reader.clone());
 
         let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
         let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
@@ -143,11 +158,7 @@ impl Telemetry {
     #[must_use]
     pub fn with_otlp_resource(config: OtlpExporterConfig, resource: Resource) -> Self {
         let reader = InitialReader::default();
-
-        let provider = SdkMeterProvider::builder()
-            .with_resource(resource.clone())
-            .with_reader(reader.clone())
-            .build();
+        let provider = meter_provider(resource.clone(), reader.clone());
 
         let provider: Arc<dyn MeterProvider + Send + Sync> = Arc::new(provider);
         let setup = METER_PROVIDER_ONCE.set(Arc::clone(&provider)).is_ok();
@@ -227,5 +238,52 @@ impl Telemetry {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CARDINALITY_LIMIT, InitialReader, meter_provider};
+    use opentelemetry::{KeyValue, metrics::MeterProvider};
+    use opentelemetry_sdk::{
+        Resource,
+        metrics::{
+            data::{AggregatedMetrics, MetricData, ResourceMetrics},
+            reader::MetricReader,
+        },
+    };
+
+    /// A per-query gauge over more than 2000 queries keeps one point per query.
+    #[test]
+    fn gauge_keeps_more_attribute_sets_than_the_sdk_default() {
+        const QUERIES: usize = 2_500;
+        let reader = InitialReader::default();
+        let provider = meter_provider(Resource::builder_empty().build(), reader.clone());
+        let gauge = provider.meter("test").f64_gauge("per_query").build();
+        for query in 0..QUERIES {
+            gauge.record(1.0, &[KeyValue::new("query_id", query.to_string())]);
+        }
+
+        let mut rm = ResourceMetrics::default();
+        reader.collect(&mut rm).expect("collects");
+        let metric = rm
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == "per_query")
+            .expect("the gauge is collected");
+        let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = metric.data() else {
+            panic!("expected an f64 gauge");
+        };
+        let overflowed = gauge
+            .data_points()
+            .filter(|point| {
+                point
+                    .attributes()
+                    .any(|kv| kv.key.as_str() == "otel.metric.overflow")
+            })
+            .count();
+        assert_eq!(overflowed, 0);
+        assert_eq!(gauge.data_points().count(), QUERIES);
+        assert!(QUERIES < CARDINALITY_LIMIT);
     }
 }

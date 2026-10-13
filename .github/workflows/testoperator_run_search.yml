@@ -114,6 +114,7 @@ jobs:
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          TESTOPERATOR_SEARCH_PER_QUERY_OUTPUT: search-per-query-metrics.json
         run: |
           rm -rf .spice/data
           # A "custom" (or empty) selection tests the spicepod as-is: omit --benchmark-dataset so the
@@ -128,3 +129,13 @@ jobs:
             $dataset_flag \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"
+
+      # Per-query scores at every rank cutoff, for a query-by-query comparison of two runs.
+      - name: Upload per-query search metrics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: search-per-query-metrics
+          path: search-per-query-metrics.json
+          if-no-files-found: warn
+          retention-days: 30
