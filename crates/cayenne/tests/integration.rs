@@ -63,7 +63,6 @@ mod file_based_retention_delete_test;
 mod file_pruning_test;
 mod file_scan_statistics_source_test;
 mod filtered_delete_scan_test;
-mod first_load_pk_bloom_test;
 mod fixed_offset_timezone_test;
 mod float_nan_predicate_test;
 mod float_zero_predicate_test;

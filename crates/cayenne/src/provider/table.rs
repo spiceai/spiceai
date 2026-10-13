@@ -3357,20 +3357,7 @@ pub(crate) fn ensure_outcome_known(outcome_unknown: &AtomicBool, table: &str) ->
     Ok(())
 }
 
-// Integration tests link the library without cfg(test). Keep the observation
-// seam in debug builds only, without adding production counters or metrics.
-#[cfg(debug_assertions)]
-static TEST_PK_REBUILDS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
-    #[cfg(debug_assertions)]
-    if phase == "keyset_rebuild" {
-        let mut counts = TEST_PK_REBUILDS.lock();
-        let count = counts.entry(table_name.to_string()).or_default();
-        *count = count.saturating_add(1);
-    }
     let elapsed = start.elapsed();
     tracing::debug!(
         table = table_name,
@@ -12799,27 +12786,8 @@ impl CayenneTableProvider {
         ]);
     }
 
-    /// Debug-build integration-test observation: table-wide bloom presence and
-    /// completed keyset rebuild phases. Not a stable API.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    #[must_use]
-    pub fn first_load_pk_test_observation(&self) -> (bool, u64) {
-        let bloom = self
-            .pk_keyset_cache
-            .lock()
-            .as_ref()
-            .is_some_and(|index| index.bloom_density().is_some());
-        let rebuilds = TEST_PK_REBUILDS
-            .lock()
-            .get(self.table_name())
-            .copied()
-            .unwrap_or(0);
-        (bloom, rebuilds)
-    }
-
-    /// The first load holds the write guard and bypasses validation, so no
-    /// validation checkout is open. Use the normal store path for accounting.
+    /// Cache the filter a first load built of the keys it wrote, as the
+    /// table-wide index (see `first_load_pk`).
     pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkBloom) {
         let (_, checkout) = self.take_cached_pk_index();
         self.store_cached_pk_index(CachedPkIndex::Bloom(bloom), checkout);
@@ -74964,6 +74932,8 @@ mod tests {
              discard its keyset, which rebuilds the whole keyset on every write"
         );
     }
+
+    mod first_load_pk_filter;
 
     /// A snapshot reader reclaims the directories a reload leaves unreferenced
     /// without touching one a query still reads (spiceai/spiceai#14981). The

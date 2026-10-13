@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
+use super::first_load_pk::FirstLoadPkObserver;
 use super::key_conflicts::KeyResolver;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::overwrite::{FileStatsObserver, WriteShape};
@@ -206,17 +207,10 @@ impl CayenneTableProvider {
                 (prepared.stream, post_validation)
             }
         };
-        let first_load_pk =
-            if matches!(scope, ValidationScope::Empty) && self.upsert_bloom_eligible() {
-                self.primary_key_indices()?
-                    .filter(|indices| !indices.is_empty())
-                    .map(|indices| {
-                        super::first_load_pk::FirstLoadPkObserver::new(self, indices).map(Arc::new)
-                    })
-                    .transpose()?
-            } else {
-                None
-            };
+        let first_load_pk = matches!(scope, ValidationScope::Empty)
+            .then(|| FirstLoadPkObserver::for_table(self))
+            .flatten()
+            .map(Arc::new);
         let pk_observer = first_load_pk.as_ref().map(|observer| {
             Arc::clone(observer) as Arc<dyn vortex_datafusion::VortexWriteObserver>
         });
@@ -266,15 +260,7 @@ impl CayenneTableProvider {
         }
         .await;
         record_cayenne_write_phase(self.table_name(), "vortex_write", start);
-        let written = written.map(|(rows, stats, hidden)| {
-            let live_rows =
-                rows.saturating_sub(hidden.values().map(|rows| rows.len() as u64).sum());
-            let bloom = first_load_pk
-                .as_ref()
-                .and_then(|observer| observer.finish(live_rows));
-            (rows, stats, hidden, bloom)
-        });
-        let (row_count, stats, hidden, first_load_pk_bloom) = match written {
+        let (row_count, stats, hidden) = match written {
             Ok(written) => written,
             Err(error) => {
                 drop(post_validation.lock().take());
@@ -284,6 +270,13 @@ impl CayenneTableProvider {
                 super::staged_upsert::cleanup_orphan_snapshot_dir(self, &new_snapshot_id).await;
                 return Err(error);
             }
+        };
+        let first_load_pk_bloom = match first_load_pk {
+            Some(observer) => {
+                let hidden_rows: u64 = hidden.values().map(|rows| rows.len() as u64).sum();
+                observer.finish(row_count.saturating_sub(hidden_rows)).await
+            }
+            None => None,
         };
         let PostValidationState {
             mut on_conflict_deletions,

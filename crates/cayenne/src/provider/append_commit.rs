@@ -154,11 +154,7 @@ impl PreparedResolvedAppend {
             delta,
             published_delta,
         );
-        if retention {
-            self.table.clear_cached_pk_keyset();
-        } else if self.into_empty_table {
-            // Preserve the first-load invalidation of other derived key views;
-            // only the table-wide cache is replaced by the observed bloom.
+        if retention || self.into_empty_table {
             self.table.clear_cached_pk_keyset();
             if let Some(bloom) = self.first_load_pk_bloom.take() {
                 self.table.install_first_load_pk_bloom(bloom);
