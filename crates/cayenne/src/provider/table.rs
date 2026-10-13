@@ -12847,6 +12847,14 @@ impl CayenneTableProvider {
             return;
         }
         let mut index = index;
+        if restored.relocates_inlined()
+            && let CachedPkIndex::Exact(keyset) = &mut index
+        {
+            // A checkpoint moved the inline rows into files while the index was out
+            // (see `PendingPkKeys::relocate_inlined_after_flush`); a bloom carries no
+            // locations.
+            keyset.relocate_inlined_to_file_unlocated();
+        }
         let mut replayed_keys = 0_usize;
         let mut replay_over_budget = false;
         for (keys, location, sequence) in restored.batches() {
@@ -13219,14 +13227,16 @@ impl CayenneTableProvider {
         let mut guard = self.pk_keyset_cache.lock();
         if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
             keyset.relocate_inlined_to_file_unlocated();
-        } else {
-            // An index checked out for validation is not in the cell, so its entries
-            // keep saying `Inlined` for rows this checkpoint just moved into files.
-            // An upsert of such a key would tombstone the inline copy only and leave
-            // the file copy live, so drop that index at its restore instead — the
-            // rebuild reads the post-checkpoint locations.
-            self.pk_keyset_pending.lock().invalidate();
         }
+        // An index checked out for validation is not in the cell, so its entries
+        // keep saying `Inlined` for rows this checkpoint just moved into files; an
+        // upsert of such a key would tombstone the inline copy only and leave the
+        // file copy live. Have its restore relabel it as above instead of
+        // discarding it: a discard costs the next apply a full-table keyset rebuild
+        // under `write_lock`, and a checkpoint landing inside that rebuild discards
+        // it again. A no-op when nothing is checked out. Why relabeling is sound
+        // for this index: `PendingPkKeys::relocate_inlined_after_flush`.
+        self.pk_keyset_pending.lock().relocate_inlined_after_flush();
         drop(guard);
         // The N>1 sharded cache carries the same per-key `RowLocation`s; flip them
         // in lockstep so a post-checkpoint upsert tombstones a flushed key by file,
@@ -75432,6 +75442,266 @@ mod tests {
             .map(|id| (id, if id == 7 { 2 } else { 1 }))
             .collect();
         assert_eq!(rows, expected, "one live row per key, key 7 upserted");
+    }
+
+    /// A checkpoint that moves the inline rows into files while a write has the
+    /// table-wide index checked out must not cost that index: the flush changes
+    /// where rows live, not which keys are live. The restore relabels the
+    /// `Inlined` entries the index and the commits before the flush carry, and
+    /// caches the index; discarding it would make the next write rebuild it from
+    /// a full-table key scan under `write_lock`.
+    #[tokio::test]
+    async fn an_inline_flush_during_a_table_wide_checkout_relabels_instead_of_discarding() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_table_checkout_inline_flush",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        let digest_of = |id: i64| {
+            pk_digest_set_for_ids(&converter, &[id])
+                .iter_with_digest()
+                .next()
+                .expect("one key")
+                .0
+        };
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        // An inline row the index already holds when the write checks it out.
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[5]), 10);
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
+
+        // One inline commit lands before the flush, one after it.
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[8]), 12);
+
+        provider.store_cached_pk_index(checked_out, checkout);
+
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => {
+                let location_of = |id: i64| keyset.location_by_digest(digest_of(id)).cloned();
+                assert!(
+                    matches!(location_of(5), Some(RowLocation::FileUnlocated)),
+                    "id=5 was inline when the index was checked out and the flush moved it \
+                     into a file: an `Inlined` entry would supersede only the inline copy and \
+                     leave the file copy live"
+                );
+                assert!(
+                    matches!(location_of(7), Some(RowLocation::FileUnlocated)),
+                    "id=7 was committed inline before the flush moved it into a file"
+                );
+                assert!(
+                    matches!(location_of(8), Some(RowLocation::Inlined)),
+                    "id=8 was committed inline after the flush and is still inline"
+                );
+            }
+            other => panic!(
+                "the table-wide index must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next write), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The table-wide index is a Bloom once the keyset outgrows its budget (the
+    /// form `order_line` runs in at CH-benCH SF-100, where a discard reports
+    /// `kind=bloom, reason=invalidated`). A Bloom carries no row locations, so an
+    /// inline flush during its checkout has nothing to relabel and must not cost
+    /// the index: the restore keeps it and replays the keys committed while it
+    /// was out.
+    #[tokio::test]
+    async fn an_inline_flush_during_a_table_wide_checkout_keeps_a_bloom_index() {
+        use crate::provider::pk_index::pk_digest;
+
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_budgeted_upsert_table(
+            "pk_table_checkout_inline_flush_bloom",
+            1,
+            ctx.runtime_env(),
+        )
+        .await;
+        provider.maybe_install_warm_pk_caches().await;
+        // ~25k 8-byte keys cross the 1 MiB budget (see
+        // `conversion_bloom_is_right_sized_for_conversion_time_keys`).
+        let mut keys = PkDigestSet::with_capacity(25_000);
+        for i in 0..25_000u64 {
+            let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        provider.record_file_pk_keys(&keys, 1);
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        assert!(
+            matches!(checked_out, Some(CachedPkIndex::Bloom(_))),
+            "precondition: the over-budget table-wide index is a Bloom"
+        );
+        let checked_out = checked_out.expect("the Bloom is checked out");
+
+        // A key committed inline while the index is out, then the checkpoint's
+        // inline flush, then the restore.
+        let committed_id = 1_000_000_u64;
+        let committed =
+            crate::row_converter::Row::from_encoded(&committed_id.to_be_bytes()).owned();
+        let mut committed_keys = PkDigestSet::with_capacity(1);
+        committed_keys.insert_with_digest(pk_digest(&committed), committed.clone());
+        provider.record_inlined_pk_keys(&committed_keys, 2);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.store_cached_pk_index(checked_out, checkout);
+
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Bloom(bloom)) => assert!(
+                bloom.maybe_contains(committed.as_ref()),
+                "the restore must replay the key committed during the checkout"
+            ),
+            other => panic!(
+                "the table-wide Bloom must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next write), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The table-wide twin of
+    /// `a_checkpoint_during_a_sharded_keyset_rebuild_keeps_the_flushed_inline_keys`,
+    /// driven through real applies on a one-shard memory-CDC table, whose applies
+    /// validate against the table-wide index. A cold cache makes an apply's
+    /// checkout rebuild the index, and a checkpoint lands right after the
+    /// rebuild's fenced capture and moves key 7 out of the inline corpus. The
+    /// index must come back cached — discarded, the next apply rebuilds it from a
+    /// full-table key scan under `write_lock`, and on a large CDC table a
+    /// checkpoint lands inside nearly every such rebuild, so the applies never
+    /// stop rebuilding — and must still know key 7, so its next upsert replaces
+    /// the row the checkpoint moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_during_a_table_wide_keyset_rebuild_keeps_the_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_table_rebuild_inline_flush",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // RAM-tier rows for the checkpoint to flush, and key 7 in the inline corpus.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1), (101, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        assert!(
+            !provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: key 7 must be in the inline corpus"
+        );
+
+        // A cold cache, so the next apply's checkout rebuilds the index, and a
+        // checkpoint that runs right after the rebuild's fenced capture.
+        provider.clear_cached_pk_keyset();
+        let checkpointed = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let checkpointed = Arc::clone(&checkpointed);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint during the keyset rebuild");
+                    checkpointed.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(200, 1)])
+                .await
+                .is_some(),
+            "precondition: the apply takes the in-memory path"
+        );
+        assert!(
+            checkpointed.load(Ordering::SeqCst),
+            "precondition: the checkpoint ran inside the apply's keyset rebuild"
+        );
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+
+        let key_7 = pk_digest_set_for_ids(&converter, &[7])
+            .iter_with_digest()
+            .next()
+            .expect("one key")
+            .0;
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => assert!(
+                matches!(
+                    keyset.location_by_digest(key_7),
+                    Some(RowLocation::FileUnlocated)
+                ),
+                "the index must hold key 7 at a file location: the checkpoint moved its row \
+                 out of the inline corpus"
+            ),
+            other => panic!(
+                "the rebuilt table-wide index must survive the checkpoint's inline flush, \
+                 present={}",
+                other.is_some()
+            ),
+        }
+
+        // The next apply reuses the index instead of rebuilding it, and its upsert of
+        // key 7 replaces the row the checkpoint moved.
+        let rebuilt = Arc::new(AtomicBool::new(false));
+        {
+            let rebuilt = Arc::clone(&rebuilt);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    rebuilt.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+        assert!(
+            !rebuilt.load(Ordering::SeqCst),
+            "the next apply must reuse the table-wide index, not rebuild it from a table scan"
+        );
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_table_rebuild_inline_flush")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value"
+        );
     }
 
     /// A checkpoint that moves the inline rows into files while an apply has the
