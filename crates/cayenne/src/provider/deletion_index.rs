@@ -1975,27 +1975,44 @@ mod tests {
                     .zip(&prefix.source_runs)
                     .all(|(run, source)| Arc::ptr_eq(run, source));
             let Some(spliced) = idx.with_pruned_prefix(&prefix) else {
-                assert!(!prefix_intact, "trial {trial}: declined over an intact prefix");
+                assert!(
+                    !prefix_intact,
+                    "trial {trial}: declined over an intact prefix"
+                );
                 declined_trials += 1;
                 continue;
             };
             assert!(prefix_intact, "trial {trial}: spliced over merged runs");
             spliced_trials += 1;
 
-            assert_eq!(spliced.entry_count, model.len(), "trial {trial}: entry_count");
+            assert_eq!(
+                spliced.entry_count,
+                model.len(),
+                "trial {trial}: entry_count"
+            );
             assert_eq!(
                 spliced.delete_count,
-                model.values().filter(|(d, _)| *d != SEQUENCE_ABSENT).count(),
+                model
+                    .values()
+                    .filter(|(d, _)| *d != SEQUENCE_ABSENT)
+                    .count(),
                 "trial {trial}: delete_count"
             );
             assert_eq!(
                 spliced.insert_count,
-                model.values().filter(|(_, i)| *i != SEQUENCE_ABSENT).count(),
+                model
+                    .values()
+                    .filter(|(_, i)| *i != SEQUENCE_ABSENT)
+                    .count(),
                 "trial {trial}: insert_count"
             );
             assert_eq!(
                 spliced.max_sequence_number,
-                model.values().map(|(d, _)| *d).filter(|d| *d != SEQUENCE_ABSENT).max(),
+                model
+                    .values()
+                    .map(|(d, _)| *d)
+                    .filter(|d| *d != SEQUENCE_ABSENT)
+                    .max(),
                 "trial {trial}: max_sequence_number"
             );
             let spliced = DeletionIndex { core: spliced };

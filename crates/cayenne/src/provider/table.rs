@@ -54934,10 +54934,7 @@ mod tests {
                 .finish()
                 .await
                 .expect("CDC upsert published");
-            provider
-                .checkpoint_mem_tier()
-                .await
-                .expect("checkpoint");
+            provider.checkpoint_mem_tier().await.expect("checkpoint");
         }
         let before: HashSet<String> = provider
             .protected_snapshots
