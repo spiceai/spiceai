@@ -24,13 +24,13 @@ limitations under the License.
 //! checking the current `ETag` under a file-backed advisory lock, then writing
 //! with `PutMode::Overwrite` if the `ETag` matches.
 //!
-//! **Concurrency model**: each conditional write takes an advisory lock beside
-//! the target object. Two clients whose roots and keys name the same file
+//! **Concurrency model**: each conditional write takes an advisory lock for the
+//! object's directory. Two clients whose roots and keys name the same file
 //! therefore share one lock, including across processes. A dedicated filesystem
 //! worker retains that lock through publication after caller cancellation or
 //! Tokio shutdown. Accepted writes may finish after their caller stops waiting.
-//! The lock file is not removed: unlinking it would let the next writer lock a
-//! different inode.
+//! The lock file is not an object and is not removed: unlinking it would let
+//! the next writer lock a different inode.
 //!
 //! [`LocalFileSystem`]: object_store::local::LocalFileSystem
 //! [`Error::NotImplemented`]: object_store::Error::NotImplemented
@@ -45,6 +45,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
@@ -56,13 +57,13 @@ use object_store::{
 /// Wraps a [`LocalFileSystem`] to add `PutMode::Update` support.
 ///
 /// For `PutMode::Update`, it:
-/// 1. Acquires a file-backed advisory lock for the local state root
+/// 1. Acquires the directory advisory lock
 /// 2. Reads the current `ETag` of the target file via `head()`
 /// 3. Compares with the expected `ETag` from the [`UpdateVersion`]
 /// 4. Writes with `PutMode::Overwrite` if they match
 /// 5. Releases the advisory lock
 ///
-/// All other operations are delegated directly to the inner `LocalFileSystem`.
+/// Other operations are delegated. The directory lock path is not an object.
 ///
 /// [`UpdateVersion`]: object_store::UpdateVersion
 pub struct LocalConditionalPut {
@@ -82,6 +83,17 @@ fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> Objec
     ObjectStoreError::Generic {
         store: "LocalConditionalPut",
         source: Box::new(source),
+    }
+}
+
+fn is_publication_lock(location: &Path) -> bool {
+    location.filename() == Some(".spice-occ-lock")
+}
+
+fn reserved_lock_error(location: &Path) -> ObjectStoreError {
+    ObjectStoreError::Generic {
+        store: "LocalConditionalPut",
+        source: format!("path {location} is reserved for the conditional-write lock").into(),
     }
 }
 
@@ -210,6 +222,9 @@ impl ObjectStore for LocalConditionalPut {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, ObjectStoreError> {
+        if is_publication_lock(location) {
+            return Err(reserved_lock_error(location));
+        }
         if matches!(opts.mode, PutMode::Update(_)) {
             let (reply, result) = tokio::sync::oneshot::channel();
             self.writes
@@ -232,6 +247,9 @@ impl ObjectStore for LocalConditionalPut {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
+        if is_publication_lock(location) {
+            return Err(reserved_lock_error(location));
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -240,6 +258,12 @@ impl ObjectStore for LocalConditionalPut {
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, ObjectStoreError> {
+        if is_publication_lock(location) {
+            return Err(ObjectStoreError::NotFound {
+                path: location.to_string(),
+                source: "reserved for the conditional-write lock".into(),
+            });
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -247,7 +271,10 @@ impl ObjectStore for LocalConditionalPut {
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, ObjectStoreError>> {
-        self.inner.list(prefix)
+        self.inner
+            .list(prefix)
+            .try_filter(|meta| futures::future::ready(!is_publication_lock(&meta.location)))
+            .boxed()
     }
 
     fn list_with_offset(
@@ -255,14 +282,21 @@ impl ObjectStore for LocalConditionalPut {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta, ObjectStoreError>> {
-        self.inner.list_with_offset(prefix, offset)
+        let offset = offset.clone();
+        self.list(prefix)
+            .try_filter(move |meta| futures::future::ready(meta.location > offset))
+            .boxed()
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
     ) -> Result<ListResult, ObjectStoreError> {
-        self.inner.list_with_delimiter(prefix).await
+        let mut result = self.inner.list_with_delimiter(prefix).await?;
+        result
+            .objects
+            .retain(|meta| !is_publication_lock(&meta.location));
+        Ok(result)
     }
 
     async fn get_ranges(
@@ -277,7 +311,24 @@ impl ObjectStore for LocalConditionalPut {
         &self,
         locations: BoxStream<'static, Result<Path, ObjectStoreError>>,
     ) -> BoxStream<'static, Result<Path, ObjectStoreError>> {
-        self.inner.delete_stream(locations)
+        let inner = Arc::clone(&self.inner);
+        locations
+            .then(move |item| {
+                let inner = Arc::clone(&inner);
+                async move {
+                    let path = item?;
+                    if is_publication_lock(&path) {
+                        return Err(reserved_lock_error(&path));
+                    }
+                    let mut deleted =
+                        inner.delete_stream(futures::stream::once(async move { Ok(path) }).boxed());
+                    match deleted.next().await {
+                        Some(result) => result,
+                        None => Err(worker_error(io::Error::other("delete produced no result"))),
+                    }
+                }
+            })
+            .boxed()
     }
 
     async fn copy_opts(
@@ -286,6 +337,13 @@ impl ObjectStore for LocalConditionalPut {
         to: &Path,
         options: CopyOptions,
     ) -> Result<(), ObjectStoreError> {
+        if is_publication_lock(from) || is_publication_lock(to) {
+            return Err(reserved_lock_error(if is_publication_lock(to) {
+                to
+            } else {
+                from
+            }));
+        }
         self.inner.copy_opts(from, to, options).await
     }
 
@@ -295,12 +353,20 @@ impl ObjectStore for LocalConditionalPut {
         to: &Path,
         options: RenameOptions,
     ) -> Result<(), ObjectStoreError> {
+        if is_publication_lock(from) || is_publication_lock(to) {
+            return Err(reserved_lock_error(if is_publication_lock(to) {
+                to
+            } else {
+                from
+            }));
+        }
         self.inner.rename_opts(from, to, options).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt;
     use object_store::UpdateVersion;
 
     use super::*;
@@ -398,6 +464,67 @@ mod tests {
         let get_result = store.get(&path).await.expect("get should succeed");
         let bytes = get_result.bytes().await.expect("read bytes");
         assert_eq!(bytes.as_ref(), b"v2");
+    }
+
+    #[tokio::test]
+    async fn publication_lock_is_hidden_and_cannot_be_replaced() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let store = LocalConditionalPut::new(dir.path()).expect("create store");
+        let path = Path::from("cluster/state.json");
+        let created = store
+            .put_opts(
+                &path,
+                b"v1".as_slice().into(),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect("create");
+        store
+            .put_opts(
+                &path,
+                b"v2".as_slice().into(),
+                PutOptions::from(PutMode::Update(UpdateVersion {
+                    e_tag: created.e_tag,
+                    version: None,
+                })),
+            )
+            .await
+            .expect("update");
+
+        let lock = Path::from("cluster/.spice-occ-lock");
+        let lock_file = dir.path().join("cluster/.spice-occ-lock");
+        assert!(
+            lock_file.is_file(),
+            "conditional update must create the lock"
+        );
+        let listed = store
+            .list(Some(&Path::from("cluster")))
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list");
+        assert!(
+            listed.iter().all(|meta| meta.location != lock),
+            "list must hide the lock: {listed:?}"
+        );
+        assert!(
+            matches!(
+                store.get(&lock).await,
+                Err(ObjectStoreError::NotFound { .. })
+            ),
+            "get must not expose the lock"
+        );
+        assert!(
+            store.delete(&lock).await.is_err(),
+            "delete must not unlink the lock"
+        );
+        assert!(
+            store
+                .put(&lock, b"replaced".as_slice().into())
+                .await
+                .is_err()
+        );
+        assert!(lock_file.is_file(), "the original lock file must remain");
+        assert_eq!(std::fs::read(&lock_file).expect("read lock"), b"");
     }
 
     #[tokio::test]
