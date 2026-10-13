@@ -228,6 +228,15 @@ pub enum CatalogError {
     ))]
     ChangedConfiguration { table_name: String },
 
+    /// The table's stored rows were written under settings the requested ones change
+    /// the meaning of (see [`crate::metadata::SettingsChangeAction`]), and the caller
+    /// asked for such a table to be rebuilt rather than kept. Worded as the cause clause
+    /// the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' was built with settings it cannot adopt in place ({changes})"
+    ))]
+    SettingsChangeRequiresRebuild { table_name: String, changes: String },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]

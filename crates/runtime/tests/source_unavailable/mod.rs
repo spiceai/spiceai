@@ -58,8 +58,8 @@ use crate::{
 /// `read_provider` waits `read_delay_ms`), counts every build and read it is asked
 /// for, and can report a primary key on `id`, the way `DynamoDB` reports its key
 /// schema.
-struct UnreachableSource {
-    prefix: &'static str,
+pub(crate) struct UnreachableSource {
+    pub(crate) prefix: &'static str,
     up: AtomicBool,
     refuse_reads: AtomicBool,
     connect_attempts: AtomicUsize,
@@ -78,7 +78,7 @@ struct UnreachableSource {
 }
 
 impl UnreachableSource {
-    fn new(prefix: &'static str, value: usize) -> Arc<Self> {
+    pub(crate) fn new(prefix: &'static str, value: usize) -> Arc<Self> {
         Arc::new(Self {
             prefix,
             up: AtomicBool::new(false),
@@ -126,15 +126,15 @@ impl UnreachableSource {
         })
     }
 
-    fn bring_up(&self) {
+    pub(crate) fn bring_up(&self) {
         self.up.store(true, Ordering::SeqCst);
     }
 
-    fn take_down(&self) {
+    pub(crate) fn take_down(&self) {
         self.up.store(false, Ordering::SeqCst);
     }
 
-    fn set_value(&self, value: usize) {
+    pub(crate) fn set_value(&self, value: usize) {
         self.value.store(value, Ordering::SeqCst);
     }
 
@@ -213,7 +213,7 @@ impl UnreachableSource {
         })
     }
 
-    async fn register(self: &Arc<Self>) {
+    pub(crate) async fn register(self: &Arc<Self>) {
         dataconnector::register_connector_factory(
             self.prefix,
             Arc::new(UnreachableSourceFactory {
@@ -380,7 +380,7 @@ impl DataConnectorFactory for UnreachableSourceFactory {
     }
 }
 
-fn dataset_status(rt: &Runtime, name: &str) -> Option<ComponentStatus> {
+pub(crate) fn dataset_status(rt: &Runtime, name: &str) -> Option<ComponentStatus> {
     rt.status().get_component_status(&format!("dataset:{name}"))
 }
 

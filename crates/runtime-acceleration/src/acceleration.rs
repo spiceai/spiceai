@@ -630,6 +630,28 @@ impl Acceleration {
             .filter(|location| !location.is_empty())
     }
 
+    /// Whether an existing acceleration whose stored table was built with settings it
+    /// cannot adopt in place — a different primary key or partitioning, for example — may
+    /// be rebuilt from the source with the current settings, rather than kept with the
+    /// settings it was built with, judged from the storage and refresh modes alone. A
+    /// source's own answer also depends on its connector:
+    /// [`crate::acceleration_source::rebuilds_on_settings_change`].
+    ///
+    /// `refresh_mode` is the mode the dataset runs with
+    /// ([`crate::acceleration_source::resolved_refresh_mode`]), not the raw field.
+    ///
+    /// Only `refresh_mode: full`, in a storage mode that keeps a table across restarts
+    /// (`file` or `file_update`), qualifies: every full refresh rewrites every row from
+    /// the source, so dropping the stored rows loses nothing the next refresh would not
+    /// replace. Every other refresh mode can hold rows a reload would not bring back — an
+    /// append window, or a change stream that resumes from a position recorded outside
+    /// the table and so never re-delivers what was dropped — and `mode: memory` and
+    /// `mode: file_create` keep no table across a restart.
+    #[must_use]
+    pub fn rebuilds_on_settings_change(&self, refresh_mode: RefreshMode) -> bool {
+        matches!(self.mode, Mode::File | Mode::FileUpdate) && refresh_mode == RefreshMode::Full
+    }
+
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
@@ -2224,5 +2246,39 @@ mod tests {
             !Acceleration::default().resolves_to_durable_write_back(),
             "the gate must not fire on ordinary datasets"
         );
+    }
+
+    /// Every storage mode against every refresh mode. A `true` where a reload cannot
+    /// bring every stored row back drops rows that exist nowhere else, so the table is
+    /// exhaustive rather than sampled.
+    #[test]
+    fn rebuilds_on_settings_change_only_where_a_reload_restores_every_row() {
+        let refresh_modes = [
+            RefreshMode::Disabled,
+            RefreshMode::Full,
+            RefreshMode::Append,
+            RefreshMode::Changes,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ];
+        let cases = [
+            (Mode::Memory, [false, false, false, false, false, false]),
+            (Mode::FileCreate, [false, false, false, false, false, false]),
+            (Mode::File, [false, true, false, false, false, false]),
+            (Mode::FileUpdate, [false, true, false, false, false, false]),
+        ];
+        for (mode, expected) in cases {
+            let acceleration = Acceleration {
+                mode,
+                ..Acceleration::default()
+            };
+            for (refresh_mode, expected) in refresh_modes.iter().zip(expected) {
+                assert_eq!(
+                    acceleration.rebuilds_on_settings_change(*refresh_mode),
+                    expected,
+                    "mode: {mode}, refresh_mode: {refresh_mode:?}"
+                );
+            }
+        }
     }
 }

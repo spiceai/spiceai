@@ -39,7 +39,7 @@ use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
-use crate::dataaccelerator::{self, BootstrapStatus};
+use crate::dataaccelerator::{self, AccelerationSource, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -254,6 +254,17 @@ pub enum Error {
 
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
     UnableToCreateDataAccelerator { source: dataaccelerator::Error },
+
+    /// A rebuild for changed settings could not clear the dataset checkpoint, which it
+    /// must do before dropping the acceleration: a checkpoint that outlived the dropped
+    /// table would mark its empty replacement loaded. Nothing is dropped. Retriable.
+    #[snafu(display(
+        "Failed to rebuild the acceleration of dataset '{dataset_name}' for its changed settings, so the dataset does not load until a retry succeeds: its load checkpoint could not be cleared. Cause: {source}"
+    ))]
+    AccelerationRebuildCheckpoint {
+        dataset_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
@@ -634,6 +645,18 @@ impl Error {
                 | Self::SnapshotCreationBatchesShouldBePositive
         )
     }
+}
+
+/// The line an operator reads when an acceleration is rebuilt for changed settings.
+/// `cause` is the engine's account of the settings its stored table cannot adopt, worded
+/// as a clause.
+fn acceleration_rebuilt_message(cause: &str) -> String {
+    let mut chars = cause.chars();
+    let cause: String = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    format!("{cause}, so it is dropped and reloaded from the source with the new settings.")
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -3864,18 +3887,14 @@ impl DataFusion {
         };
 
         let accelerated_table_provider = self
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                dataset.name.clone(),
+            .create_accelerator_table_adopting_settings(
+                dataset,
                 Arc::clone(&storage_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
                 Arc::clone(&secrets),
-                Some(dataset),
-                Arc::clone(&self.ctx),
             )
-            .await
-            .context(UnableToCreateDataAcceleratorSnafu)?;
+            .await?;
 
         // For RefreshMode::Snapshot, wrap the accelerator in a SwappableTableProvider
         // so the underlying provider can be replaced atomically when a newer snapshot
@@ -4926,27 +4945,10 @@ impl DataFusion {
                 .await;
             }
 
-            // Drop the existing table from the acceleration engine so it can be recreated
-            // with the updated schema
-            let accelerator = self
-                .accelerator_engine_registry
-                .get_accelerator_engine(acceleration_settings.engine)
-                .await
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset_name.clone(),
-                })?;
-            accelerator
-                .drop_table(&dataset_name, dataset)
-                .await
-                .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
-                .context(UnableToCreateDataAcceleratorSnafu)?;
-
-            // Clear the checkpoint so the refresh treats this as a fresh table
-            let _ = cp.delete().await;
-
-            // The table is recreated with a new schema; cached logical plans reference the
-            // old schema and must be dropped (mirrors the in-place evolution path above).
-            self.clear_cached_plans().await;
+            // Drop the existing table from the acceleration engine so it is recreated with
+            // the updated schema; cached logical plans reference the old schema.
+            self.drop_acceleration_for_recreate(dataset, acceleration_settings, Some(&cp))
+                .await?;
 
             SCHEMA_EVOLUTION_APPLIED.add(
                 1,
@@ -4958,6 +4960,108 @@ impl DataFusion {
         }
 
         Ok(None)
+    }
+
+    /// Creates `source`'s accelerator table, rebuilding the acceleration once when the
+    /// engine reports that its stored table was built with settings it cannot adopt in
+    /// place ([`dataaccelerator::Error::RebuildRequired`]).
+    ///
+    /// An engine reports that only for a dataset whose settings let it be rebuilt from
+    /// the source (`acceleration_source::rebuilds_on_settings_change`: `refresh_mode:
+    /// full`), so the rebuild loses no row a reload does not bring back: the dataset
+    /// checkpoint is cleared, the table dropped, and it is created again from the current
+    /// settings, to be loaded as on a first start. That includes a dataset registering
+    /// against its existing acceleration before its source is reached: the rebuilt table
+    /// loads once the source answers, and readiness follows `ready_state` as on a first
+    /// start.
+    async fn create_accelerator_table_adopting_settings(
+        &self,
+        source: &dyn AccelerationSource,
+        schema: SchemaRef,
+        constraints: Option<&Constraints>,
+        acceleration_settings: &Acceleration,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let create = || {
+            self.accelerator_engine_registry.create_accelerator_table(
+                source.name().clone(),
+                Arc::clone(&schema),
+                constraints,
+                acceleration_settings,
+                Arc::clone(&secrets),
+                Some(source),
+                Arc::clone(&self.ctx),
+            )
+        };
+        match create().await {
+            Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
+                let dataset_name = source.name().to_string();
+                let cause = cause.to_string();
+
+                // The checkpoint goes before the table, and must go. One that outlived
+                // the table it describes would mark the recreated, empty table loaded,
+                // and with no refresh due it would serve no rows. Without it, a restart
+                // that finds the old table still in place detects the change again and
+                // rebuilds.
+                let checkpoint = dataset_checkpointer(
+                    source,
+                    self.accelerator_engine_registry(),
+                    OpenOption::OpenExisting,
+                    SnapshotBehavior::Disabled,
+                )
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+                .context(AccelerationRebuildCheckpointSnafu {
+                    dataset_name: dataset_name.clone(),
+                })?;
+                checkpoint
+                    .delete()
+                    .await
+                    .context(AccelerationRebuildCheckpointSnafu { dataset_name })?;
+
+                self.drop_acceleration_for_recreate(source, acceleration_settings, None)
+                    .await?;
+                tracing::info!("{}", acceleration_rebuilt_message(&cause));
+                create().await.context(UnableToCreateDataAcceleratorSnafu)
+            }
+            result => result.context(UnableToCreateDataAcceleratorSnafu),
+        }
+    }
+
+    /// Drops `source`'s accelerated table so the next create builds it again, empty,
+    /// from the current settings, then clears the cached plans that reference it.
+    ///
+    /// `checkpoint`, when given, is cleared after the drop, the order a schema-change
+    /// recreate needs: its checkpoint records the old schema, which is how a restart
+    /// after a failed drop detects the change again. A settings rebuild clears its
+    /// checkpoint itself, before the drop (see
+    /// [`Self::create_accelerator_table_adopting_settings`]).
+    async fn drop_acceleration_for_recreate(
+        &self,
+        source: &dyn AccelerationSource,
+        acceleration_settings: &Acceleration,
+        checkpoint: Option<&Arc<dyn DatasetCheckpointer>>,
+    ) -> Result<()> {
+        let name = source.name().to_string();
+        let accelerator = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::ExpectedAccelerationSettings { name: name.clone() })?;
+        accelerator
+            .drop_table(&name, source)
+            .await
+            .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
+            .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        // Clear the checkpoint so the refresh treats this as a fresh table.
+        if let Some(checkpoint) = checkpoint {
+            let _ = checkpoint.delete().await;
+        }
+
+        // Cached logical plans reference the dropped table.
+        self.clear_cached_plans().await;
+        Ok(())
     }
 
     /// Applies a widening plan to the dataset's acceleration engine table and persists
@@ -6118,19 +6222,15 @@ impl DataFusion {
         )?;
 
         let accelerated_table_provider = self
-            .accelerator_engine_registry()
-            .create_accelerator_table(
-                table.clone(),
-                schema,
-                None,
-                acceleration,
-                secrets,
-                Some(view),
-                Arc::clone(&self.ctx),
-            )
+            .create_accelerator_table_adopting_settings(view, schema, None, acceleration, secrets)
             .await
             .map_err(|e| Error::UnableToCreateView {
-                reason: format!("Failed to create view acceleration: {e}"),
+                reason: match e {
+                    Error::UnableToCreateDataAccelerator { source } => {
+                        format!("Failed to create view acceleration: {source}")
+                    }
+                    e => format!("Failed to create view acceleration: {e}"),
+                },
             })?;
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
@@ -7284,6 +7384,24 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    #[test]
+    fn settings_rebuild_messages_name_the_dataset_the_change_and_the_outcome() {
+        let cause = "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])";
+        assert_eq!(
+            acceleration_rebuilt_message(cause),
+            "The existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id']), so it is dropped and reloaded from the source with the new settings."
+        );
+        let checkpoint = Error::AccelerationRebuildCheckpoint {
+            dataset_name: "trips".to_string(),
+            source: "database is locked".into(),
+        };
+        assert_eq!(
+            checkpoint.to_string(),
+            "Failed to rebuild the acceleration of dataset 'trips' for its changed settings, so the dataset does not load until a retry succeeds: its load checkpoint could not be cleared. Cause: database is locked"
+        );
+        assert!(checkpoint.is_retriable());
+    }
 
     #[test]
     fn retention_use_source_untranslatable_names_the_combination() {

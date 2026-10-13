@@ -64,7 +64,9 @@ use data_accelerator_api::{
 use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
 use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
-use runtime_acceleration::acceleration_source::resolved_refresh_mode;
+use runtime_acceleration::acceleration_source::{
+    rebuilds_on_settings_change, resolved_refresh_mode,
+};
 use runtime_acceleration::sidecar::{AcceleratorSidecar, OpenOption};
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_checkpoint_api::CheckpointError;
@@ -134,6 +136,29 @@ pub enum Error {
         configured: Vec<String>,
         data_dir: String,
         metadata_dir: String,
+    },
+
+    /// The dataset's stored table was built with settings it cannot adopt in place, and
+    /// its settings let it be rebuilt from the source
+    /// (`acceleration_source::rebuilds_on_settings_change`). Displays as the catalog's cause
+    /// clause, which the runtime's rebuild message embeds.
+    #[snafu(display("{source}"))]
+    SettingsChangeRequiresRebuild { source: cayenne::CatalogError },
+
+    /// The dataset's stored acceleration was written under a partitioning its
+    /// `partition_by` no longer has, and its settings let it be rebuilt from the source
+    /// (`acceleration_source::rebuilds_on_settings_change`). Worded as the cause clause the
+    /// runtime's rebuild message embeds, like the catalog's
+    /// `SettingsChangeRequiresRebuild`.
+    #[snafu(display(
+        "the existing acceleration of dataset '{dataset}' was built with settings it cannot adopt in place (`partition_by`: {} -> {})",
+        partitioning_setting_value(stored),
+        partitioning_setting_value(configured)
+    ))]
+    PartitionByChangeRequiresRebuild {
+        dataset: Arc<str>,
+        stored: Vec<String>,
+        configured: Vec<String>,
     },
 
     #[snafu(display(
@@ -1147,6 +1172,24 @@ fn build_workload_profile(
         is_upsert_on_conflict(on_conflict),
         &inferred,
     )
+}
+
+/// Whether opening the dataset's stored table reported settings it cannot adopt in
+/// place for a dataset that is rebuilt rather than kept. The catalog error arrives
+/// wrapped by the table-provider build, so the whole chain is searched.
+fn requires_rebuild(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(
+                Error::SettingsChangeRequiresRebuild { .. }
+                    | Error::PartitionByChangeRequiresRebuild { .. }
+            )
+        ) || matches!(
+            error.downcast_ref::<cayenne::CatalogError>(),
+            Some(cayenne::CatalogError::SettingsChangeRequiresRebuild { .. })
+        )
+    })
 }
 
 /// Whether opening the dataset's stored table failed on a setting the table
@@ -2750,6 +2793,14 @@ impl CayenneAccelerator {
             Self::apply_memory_mode_overrides(&mut vortex_config, acceleration);
         }
 
+        // A stored table built with settings it cannot adopt in place is rebuilt from the
+        // source when the dataset can lose nothing by it, and kept with its stored
+        // settings otherwise. Set on this table only: partition children are opened as
+        // they are and dropped with their parent.
+        if rebuilds_on_settings_change(source) {
+            vortex_config.settings_change = cayenne::metadata::SettingsChangeAction::Rebuild;
+        }
+
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
         // has no data directory or object store (and `cayenne_data_dir` errors for
         // it), so skip this entirely — memory-mode data lives only in RAM.
@@ -2913,11 +2964,19 @@ impl CayenneAccelerator {
             builder = builder.with_snapshot_dir_pins(pins);
         }
         tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
-        let cayenne_table = builder
-            .create(table_options)
-            .await
-            .boxed()
-            .context(AccelerationCreationFailedSnafu)?;
+        let cayenne_table = match builder.create(table_options).await {
+            Ok(cayenne_table) => cayenne_table,
+            // Passed through as it is: a cause clause the runtime's rebuild message
+            // embeds, not a failure to create the table.
+            Err(source @ cayenne::CatalogError::SettingsChangeRequiresRebuild { .. }) => {
+                return Err(Error::SettingsChangeRequiresRebuild { source });
+            }
+            Err(source) => {
+                return Err(Error::AccelerationCreationFailed {
+                    source: Box::new(source),
+                });
+            }
+        };
 
         tracing::debug!("create_cayenne_table_provider: table {table_name} created successfully");
         let provider = Arc::new(cayenne_table);
@@ -4280,6 +4339,10 @@ impl DataAccelerator for CayenneAccelerator {
         ) || rejects_stored_table(error)
     }
 
+    fn requires_rebuild(&self, error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+        requires_rebuild(error)
+    }
+
     fn prefix(&self) -> &'static str {
         "cayenne"
     }
@@ -4452,7 +4515,7 @@ impl DataAccelerator for CayenneAccelerator {
         if path_exists(&path_buf).await {
             Self::remove_acceleration_data_dir(source, &dir_path).await?;
             tracing::info!(
-                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
+                "Removed the Cayenne data directory '{dir_path}' of dataset '{table_name}' to recreate its acceleration"
             );
         }
 
@@ -4622,6 +4685,23 @@ fn configured_partition_by(configured: &[String]) -> String {
     }
 }
 
+/// A partitioning as a setting value in a settings-change message: `none` when
+/// unpartitioned, otherwise the quoted partition columns or expressions.
+fn partitioning_setting_value(partitioning: &[String]) -> String {
+    if partitioning.is_empty() {
+        "none".to_string()
+    } else {
+        format!(
+            "[{}]",
+            partitioning
+                .iter()
+                .map(|partition| format!("'{partition}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
 fn restore_partition_by(stored: &[String]) -> &'static str {
     if stored.is_empty() {
         "remove 'partition_by'"
@@ -4634,6 +4714,11 @@ fn restore_partition_by(stored: &[String]) -> &'static str {
 /// dataset's `partition_by`. An unpartitioned table keeps its rows in the table
 /// itself and a partitioned one in per-partition tables, and each reads only its
 /// own, so opening data stored the other way would serve none of its rows.
+///
+/// A dataset that is [rebuilt](rebuilds_on_settings_change) on such a change gets
+/// [`Error::PartitionByChangeRequiresRebuild`], after `table`'s maintenance is
+/// quiesced: the rebuild deletes the files that maintenance would otherwise still be
+/// working on.
 async fn ensure_stored_partitioning_matches(
     table: &cayenne::CayenneTableProvider,
     source: &dyn AccelerationSource,
@@ -4667,19 +4752,28 @@ async fn ensure_stored_partitioning_matches(
             None => return Ok(()),
         }
     };
+    let configured = source
+        .acceleration()
+        .map(|acceleration| {
+            acceleration
+                .partition_by
+                .iter()
+                .map(|partition| partition.expression.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if rebuilds_on_settings_change(source) {
+        table.quiesce().await;
+        return Err(Error::PartitionByChangeRequiresRebuild {
+            dataset: Arc::from(source.name().to_string()),
+            stored,
+            configured,
+        });
+    }
     Err(Error::PartitionByChanged {
         dataset: Arc::from(source.name().to_string()),
         stored,
-        configured: source
-            .acceleration()
-            .map(|acceleration| {
-                acceleration
-                    .partition_by
-                    .iter()
-                    .map(|partition| partition.expression.clone())
-                    .collect()
-            })
-            .unwrap_or_default(),
+        configured,
         data_dir: data_dir.to_string(),
         metadata_dir: CayenneAccelerator::resolve_metadata_dir(source.acceleration()),
     })
@@ -4762,6 +4856,43 @@ mod tests {
                 table_name: "checking".to_string(),
             }
         )));
+    }
+
+    /// A settings change the stored table cannot adopt reaches the runtime as a rebuild,
+    /// however it is wrapped, and reads as the cause clause the runtime's rebuild message
+    /// embeds — not as a failed table creation.
+    #[test]
+    fn a_settings_change_to_rebuild_reads_as_its_cause() {
+        let catalog = Error::SettingsChangeRequiresRebuild {
+            source: cayenne::CatalogError::SettingsChangeRequiresRebuild {
+                table_name: "trips".to_string(),
+                changes: "`primary_key`: none -> ['id']".to_string(),
+            },
+        };
+        assert_eq!(
+            catalog.to_string(),
+            "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])"
+        );
+        assert!(requires_rebuild(&catalog));
+
+        let partitioning = Error::PartitionByChangeRequiresRebuild {
+            dataset: Arc::from("trips"),
+            stored: Vec::new(),
+            configured: vec!["bucket(2, id)".to_string()],
+        };
+        assert_eq!(
+            partitioning.to_string(),
+            "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`partition_by`: none -> ['bucket(2, id)'])"
+        );
+        assert!(requires_rebuild(&Error::AccelerationCreationFailed {
+            source: Box::new(partitioning),
+        }));
+
+        assert!(!requires_rebuild(&Error::AccelerationCreationFailed {
+            source: Box::new(cayenne::CatalogError::TableNotFound {
+                table_name: "trips".to_string(),
+            }),
+        }));
     }
 
     #[test]

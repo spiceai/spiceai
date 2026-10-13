@@ -801,9 +801,9 @@ pub struct VortexConfig {
     /// ranks BELOW the hot filter columns actually observed on scans, so the
     /// default-on adaptive layout can override a guess with evidence.
     ///
-    /// Deliberately NOT compared by `configuration_matches`: it is provenance
-    /// about a value, not a data-affecting field. Comparing it would make every
-    /// existing table look config-changed on upgrade and trip the recreate path.
+    /// Persisted with `sort_columns` when a reopened table takes the requested
+    /// layout settings in place, but never reported as a changed setting: it is
+    /// provenance about a value, not a setting an operator configures.
     #[serde(default)]
     pub sort_columns_origin: SortColumnsOrigin,
     /// Columns to hash-cluster rows by during intra-write sharding (the parallel
@@ -1087,17 +1087,22 @@ pub struct VortexConfig {
     /// (`append_new_columns` / `sync_all_columns`); the default
     /// [`SchemaEvolutionMode::Disabled`] keeps the legacy pin-stored-schema
     /// behavior verbatim (`on_schema_change: block`/`fail`, or omitted).
-    /// Runtime-only — never compared by `configuration_matches`.
+    /// Runtime-only — never compared against a reopened table's stored settings.
     #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
     pub schema_evolution: SchemaEvolutionMode,
+    /// What opening an existing table does when a setting that defines its stored
+    /// rows differs from the requested one; see [`SettingsChangeAction`]. Runtime-only
+    /// — `#[serde(skip)]`, never persisted and never compared.
+    #[serde(skip)]
+    pub settings_change: SettingsChangeAction,
     /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
     /// `runtime.params.target_*` params. A goal declares a target, not a controller, so it
     /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
-    /// accelerator warns). Runtime-only — never compared by
-    /// `configuration_matches` (does not affect data layout).
+    /// accelerator warns). Runtime-only — never compared against a reopened
+    /// table's stored settings (does not affect data layout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_replication_lag_secs: Option<f64>,
     /// Freshness goal target in seconds (age of the newest queryable data).
@@ -1117,7 +1122,7 @@ pub struct VortexConfig {
     /// and mapped from the runtime's acceleration storage class. A slow tier
     /// (EBS / object store / undetected) biases the tuner toward fewer, larger
     /// files. Detected runtime fact — `#[serde(skip)]` (never a spicepod knob,
-    /// never compared by `configuration_matches`).
+    /// never compared against a reopened table's stored settings).
     #[serde(skip)]
     pub data_storage_class: StorageClass,
     /// Storage medium of the METASTORE (where publish commits + inline re-reads
@@ -1171,9 +1176,9 @@ pub struct VortexConfig {
     /// Absolute object-store URL prefix for the cold tier (e.g.
     /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
     /// Set from the `cayenne_datalake_location` spicepod param. Persisted so a
-    /// reopened table knows where its cold files live; NOT compared by
-    /// `configuration_matches`, so toggling it never recreates the table (the
-    /// cold tier is a strict superset of behavior over an unchanged warm tier).
+    /// reopened table knows where its cold files live; a change is applied to
+    /// the table in place rather than rebuilding it (the cold tier is a strict
+    /// superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
     /// Hilbert-clustering key columns for warm and datalake files.
     /// Empty leaves layout selection to the existing automatic policy. Set from
@@ -1274,6 +1279,28 @@ impl SchemaEvolutionMode {
             SchemaEvolutionMode::Widen => true,
         }
     }
+}
+
+/// What opening an existing table does when a setting that defines its stored rows —
+/// its primary key, effective `on_conflict`, partition column, location, or a
+/// `pk_conflict_detection` that would start enforcing keys the rows were not written
+/// under — differs from the requested one. Those settings cannot be applied to stored
+/// rows in place; layout settings (sort order, clustering, encoding) always can, and
+/// are applied whatever this says.
+///
+/// Set by the runtime accelerator from the dataset's storage and refresh modes, and
+/// never persisted: it describes what the caller can afford to lose, not the table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettingsChangeAction {
+    /// Keep the settings the table was built with and warn that the requested ones do
+    /// not take effect. Right whenever the table can hold rows a reload from the source
+    /// would not bring back.
+    #[default]
+    KeepStored,
+    /// Refuse to open the table with
+    /// [`crate::catalog::CatalogError::SettingsChangeRequiresRebuild`], so the caller
+    /// drops it and creates it again with the requested settings.
+    Rebuild,
 }
 
 fn default_concurrency() -> usize {
@@ -1547,6 +1574,7 @@ impl Default for VortexConfig {
             // manifest is a dual-source supplement until proven complete.
             scan_from_manifest: false,
             schema_evolution: SchemaEvolutionMode::default(),
+            settings_change: SettingsChangeAction::default(),
             goal_replication_lag_secs: None,
             goal_freshness_secs: None,
             goal_query_latency_ms: None,
