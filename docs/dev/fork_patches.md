@@ -79,8 +79,9 @@ integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 `--all --tests` compiles them either way, so an unnamed binary is built and then
 skipped. Guards were found running nowhere for that reason, in integration-test
 targets now named there: `adbc_cancellation` for the two `arrow-adbc`
-cancellation rows (fork PRs #4 and #65, which share one test), and `cpu_budget`
-for vortex's `set_available_parallelism`. (`json_semantics` is named there too; it
+cancellation rows (fork PRs #4 and #65, which share one test), and `spiced`'s
+`integration` binary, whose `cpu_budget` module guards vortex's
+`set_available_parallelism` and is selected by its module prefix. (`json_semantics` is named there too; it
 guarded the `datafusion-functions-json` fork, which is now taken from crates.io.)
 Nothing yet checks this automatically — adding a guard here means checking by hand that `NEXTEST_FILTER` selects the
 target it lives in, or that a workflow of its own runs it.
