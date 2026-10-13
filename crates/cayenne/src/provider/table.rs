@@ -29166,7 +29166,8 @@ impl CayenneTableProvider {
     /// since and the active tier (a mem-tier checkpoint publishes every few
     /// seconds) pruned at the same cutoff in a pass over that tail alone — and
     /// swapped in by compare-and-swap. A writer that wins the swap only costs a
-    /// re-splice; a fold that merged the pruned runs costs a rebuild. It is the deletion reservation's only shrink (see
+    /// re-splice; a fold that merged the pruned runs costs a rebuild. It is the
+    /// deletion reservation's only shrink (see
     /// [`Self::deletion_index_over_memory_ceiling`]), so after
     /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost swaps it falls back to pruning under
     /// the write fence, which no writer of the index runs concurrently with.
