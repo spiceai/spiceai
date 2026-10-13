@@ -2260,6 +2260,12 @@ pub struct CayenneTableProvider {
     /// One-shot signal before a scan waits for build admission.
     #[cfg(test)]
     test_pre_scan_view_admission_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a demand-cache capture passes its version
+    /// check and before the view is keyed and built, so a test can land a write
+    /// and queue another scan behind a capture that is already stamped.
+    /// Consumed on first fire.
+    #[cfg(test)]
+    test_post_scan_input_validation_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired after a full current-snapshot rewrite finishes its
     /// off-fence re-encode and before it takes the listing fence to commit, so a
     /// test can publish a protected snapshot the rewrite's scan never folded.
@@ -9817,6 +9823,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_scan_view_admission_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_scan_input_validation_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
@@ -12127,6 +12135,10 @@ impl CayenneTableProvider {
             test_scan_view_build_hook: Arc::clone(&self.test_scan_view_build_hook),
             #[cfg(test)]
             test_pre_scan_view_admission_hook: Arc::clone(&self.test_pre_scan_view_admission_hook),
+            #[cfg(test)]
+            test_post_scan_input_validation_hook: Arc::clone(
+                &self.test_post_scan_input_validation_hook,
+            ),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
@@ -31699,6 +31711,11 @@ impl CayenneTableProvider {
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
+            // Stamped BEFORE the capture, so it never postdates the state the
+            // capture read: freshness checks compare it with when a scan asked,
+            // and a stamp taken after the capture would let a write that
+            // completed in between pass for already included.
+            let captured_at = Instant::now();
             let order_before = self.scan_input_version.load(Ordering::Acquire);
             let (structural_version, raw) = match self
                 .structural_version
@@ -31739,9 +31756,16 @@ impl CayenneTableProvider {
                 continue;
             }
 
+            #[cfg(test)]
+            {
+                let hook = self.test_post_scan_input_validation_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+
             let key = raw.key(structural_version);
             let order = order_after;
-            let captured_at = Instant::now();
 
             // Another scan may have published while we captured — serve it
             // without taking the in-flight mutex.
@@ -67647,6 +67671,119 @@ mod tests {
             collect_id_value_pairs_from_batches(&rows),
             vec![(1, 12), (2, 20), (3, 30)],
             "queued query must capture the committed checkpoint and latest CDC upsert"
+        );
+    }
+
+    /// A zero-lag scan must see every write that completed before it asked,
+    /// even when it queues behind a build whose capture predates that write.
+    /// The first scan pauses after its capture passes the version check, a
+    /// write completes, and a zero-lag scan queues for admission; once the first
+    /// build publishes, the queued scan must recapture rather than reuse it,
+    /// because that capture was stamped before the state it read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_lag_scan_sees_writes_completed_before_it_queued() {
+        let ctx = SessionContext::new();
+        let (mut provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "zero_lag_queued_scan",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.scan_view_reuse = ScanViewReuse::WithinLag(Duration::ZERO);
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register real provider");
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first write")
+            .finish()
+            .await
+            .expect("first write published");
+
+        let (validated_tx, validated_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_post_scan_input_validation_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                validated_tx.send(()).expect("report validated capture");
+                release_rx.await.expect("release validated capture");
+            })
+        }));
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            first_ctx
+                .sql("SELECT id, value FROM t ORDER BY id")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), validated_rx)
+            .await
+            .expect("first scan validates its capture")
+            .expect("validated signal");
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second write")
+            .finish()
+            .await
+            .expect("second write published");
+
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_scan_view_admission_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                admission_tx.send(()).expect("report queued scan admission");
+            })
+        }));
+        let second_ctx = ctx.clone();
+        let second = tokio::spawn(async move {
+            second_ctx
+                .sql("SELECT id, value FROM t ORDER BY id")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), admission_rx)
+            .await
+            .expect("second scan queues for admission")
+            .expect("admission signal");
+        release_tx.send(()).expect("release first scan");
+
+        let first_rows = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("first scan completes")
+            .expect("first scan task joins")
+            .expect("first scan succeeds");
+        let second_rows = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("second scan completes")
+            .expect("second scan task joins")
+            .expect("second scan succeeds");
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&first_rows),
+            vec![(1, 10)],
+            "the first scan's capture predates the second write"
+        );
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&second_rows),
+            vec![(1, 10), (2, 20)],
+            "a zero-lag scan must see a write that completed before it asked"
         );
     }
 
