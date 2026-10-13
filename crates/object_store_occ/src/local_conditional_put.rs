@@ -24,11 +24,13 @@ limitations under the License.
 //! checking the current `ETag` under a file-backed advisory lock, then writing
 //! with `PutMode::Overwrite` if the `ETag` matches.
 //!
-//! **Concurrency model**: a lock file under the local state root serializes
-//! conditional writes across [`LocalConditionalPut`] instances and across local
-//! processes that use this wrapper for the same directory. A dedicated filesystem
-//! worker retains the lock through publication after caller cancellation or Tokio
-//! shutdown. Accepted writes may finish after their caller stops waiting.
+//! **Concurrency model**: each conditional write takes an advisory lock beside
+//! the target object. Two clients whose roots and keys name the same file
+//! therefore share one lock, including across processes. A dedicated filesystem
+//! worker retains that lock through publication after caller cancellation or
+//! Tokio shutdown. Accepted writes may finish after their caller stops waiting.
+//! The lock file is not removed: unlinking it would let the next writer lock a
+//! different inode.
 //!
 //! [`LocalFileSystem`]: object_store::local::LocalFileSystem
 //! [`Error::NotImplemented`]: object_store::Error::NotImplemented
@@ -83,19 +85,29 @@ fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> Objec
     }
 }
 
+fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
+    let object_path = root.join(location.as_ref());
+    let mut file_name = object_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    file_name.push(".spice-occ-lock");
+    object_path.with_file_name(file_name)
+}
+
 /// Runs outside any Tokio runtime so `LocalFileSystem` performs its filesystem
 /// calls synchronously. The lock and publication have one owner, even when the
 /// caller drops its future or shuts its runtime down. The bounded queue limits
 /// pending payloads; closing all senders drains accepted writes and exits.
 fn write_worker(
     inner: &LocalFileSystem,
-    lock_path: &std::path::Path,
+    root: &std::path::Path,
     mut receive: tokio::sync::mpsc::Receiver<ConditionalWrite>,
 ) {
     while let Some(request) = receive.blocking_recv() {
         let result = conditional_write(
             inner,
-            lock_path,
+            root,
             &request.location,
             request.payload,
             request.options,
@@ -107,17 +119,21 @@ fn write_worker(
 
 fn conditional_write(
     inner: &LocalFileSystem,
-    lock_path: &std::path::Path,
+    root: &std::path::Path,
     location: &Path,
     payload: PutPayload,
     mut options: PutOptions,
 ) -> Result<PutResult, ObjectStoreError> {
+    let lock_path = publication_lock_path(root, location);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(worker_error)?;
+    }
     let guard = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(lock_path)
+        .open(&lock_path)
         .map_err(worker_error)?;
     guard.lock().map_err(worker_error)?;
     // No async executor task owns this guard: every filesystem operation runs
@@ -165,10 +181,10 @@ impl LocalConditionalPut {
         let inner = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
         let (writes, receive) = tokio::sync::mpsc::channel(1);
         let worker_store = Arc::clone(&inner);
-        let lock_path = root.join(".spice-object-store-occ.lock");
+        let worker_root = root.clone();
         std::thread::Builder::new()
             .name("local-state-writer".to_owned())
-            .spawn(move || write_worker(&worker_store, &lock_path, receive))
+            .spawn(move || write_worker(&worker_store, &worker_root, receive))
             .map_err(worker_error)?;
         Ok(Self {
             inner,

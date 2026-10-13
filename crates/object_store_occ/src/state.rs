@@ -102,9 +102,17 @@ where
     }
 
     /// Sets a prefix for all keys stored by this `ObjectState`.
+    ///
+    /// A leading slash is removed. Object paths do not keep one, so listing
+    /// must use the same string that [`Self::path`] writes.
     #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = prefix.into();
+        let trimmed = prefix.into().trim_matches('/').to_string();
+        self.prefix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        };
         self
     }
 
