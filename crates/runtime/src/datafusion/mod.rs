@@ -6447,7 +6447,11 @@ impl DataFusion {
         let statement = session.sql_to_statement(sql, &dialect)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
-        session.statement_to_plan(statement).await
+        let spellings =
+            runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
+                &statement,
+            );
+        spellings.retain(session.statement_to_plan(statement).await?)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {

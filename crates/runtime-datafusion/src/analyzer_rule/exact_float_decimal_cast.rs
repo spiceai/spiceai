@@ -24,22 +24,47 @@ limitations under the License.
 //! cent value in five misses this way (#14970). A bound `$1` with the same number
 //! takes the same path once the parameter is substituted.
 //!
-//! A float literal came from a decimal spelling, and the shortest decimal string
-//! that reads back as the same `f64` (Rust's `Display`) recovers it: `12345678.9`.
 //! This rule rewrites `CAST(<float literal> AS DECIMAL(p, s))` to the decimal
-//! literal parsed exactly from that string, at the cast's precision and scale. It
-//! only does so when that spelling has at most the float type's decimal digits
-//! (`f64::DIGITS` / `f32::DIGITS` / ~3 for `f16`) so no other decimal shares the
-//! float, and fits the scale without rounding; anything else is left to the cast
-//! as before, so overflow and out-of-range behaviour is unchanged.
+//! literal parsed exactly from the literal's decimal spelling, at the cast's
+//! precision and scale, when that spelling fits the scale without rounding;
+//! anything else is left to the cast as before, so overflow and out-of-range
+//! behaviour is unchanged.
+//!
+//! The spelling comes from one of two places:
+//!
+//! - **The SQL token, when the `f64` lost it.** A token with more significant
+//!   digits than an `f64` holds (`4.0700000000000003` reads as the same `f64` as
+//!   `4.07`) cannot be recovered from the float. [`FloatLiteralSpellings`] reads
+//!   such tokens from the parsed statement and records them on the planned
+//!   literal under [`FLOAT_LITERAL_SPELLING_KEY`]; this rule parses that
+//!   spelling and removes the key.
+//! - **The float itself, otherwise.** The shortest decimal string that reads back
+//!   as the same `f64` (Rust's `Display`) is the token whenever the token had at
+//!   most `f64::DIGITS` significant digits, since every such decimal reads as a
+//!   distinct `f64`: `12345678.90` is recovered as `12345678.9`. A bound float
+//!   parameter has no token, and is converted the same way. A float whose
+//!   shortest spelling is longer than the type's decimal digits (`f64::DIGITS` /
+//!   `f32::DIGITS` / ~3 for `f16`) is left to the cast.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::ControlFlow;
 
 use datafusion::arrow::datatypes::{DataType, Decimal128Type, Decimal256Type};
+use datafusion::common::metadata::FieldMetadata;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::config::ConfigOptions;
-use datafusion::logical_expr::expr::{Cast, TryCast};
+use datafusion::logical_expr::expr::{Alias, Cast, TryCast};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::optimizer::AnalyzerRule;
+use datafusion::sql::parser::{CopyToSource, Statement as DFStatement};
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, Visit, visit_expressions};
+
+/// Literal metadata carrying a float literal's SQL spelling, set by
+/// [`FloatLiteralSpellings::retain`] when the planned `f64` cannot recover it.
+/// An empty value means the statement spelled this `f64` more than one way, so
+/// no single spelling is known and the cast is left alone.
+pub const FLOAT_LITERAL_SPELLING_KEY: &str = "spice.float_literal_spelling";
 
 /// Rewrites float-literal-to-decimal casts into exact decimal literals. See the
 /// module docs.
@@ -56,7 +81,9 @@ impl ExactFloatLiteralDecimalCast {
 impl AnalyzerRule for ExactFloatLiteralDecimalCast {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
-            plan.map_expressions(|expr| expr.transform_up(|expr| Ok(rewrite_expr(expr))))
+            // Top down, so a cast sees its literal's spelling before the literal
+            // itself is visited and has the spelling removed.
+            plan.map_expressions(|expr| expr.transform_down(|expr| Ok(rewrite_expr(expr))))
         })
         .map(|transformed| transformed.data)
     }
@@ -73,13 +100,36 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
         }
         _ => return Transformed::no(expr),
     };
-    let Expr::Literal(value, metadata) = inner else {
-        return Transformed::no(expr);
-    };
-    match exact_decimal(value, data_type) {
-        Some(decimal) => Transformed::yes(Expr::Literal(decimal, metadata.clone())),
-        None => Transformed::no(expr),
+    if let Expr::Literal(value, metadata) = inner {
+        let token_spelling = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.inner().get(FLOAT_LITERAL_SPELLING_KEY));
+        let decimal = match token_spelling {
+            Some(spelling) => exact_decimal_from_spelling(spelling, data_type),
+            None => exact_decimal(value, data_type),
+        };
+        if let Some(decimal) = decimal {
+            return Transformed::yes(Expr::Literal(decimal, without_spelling(metadata.as_ref())));
+        }
     }
+    // The spelling only matters to the rewrite above; drop it from any literal
+    // it did not apply to so it never reaches the physical plan.
+    match expr {
+        Expr::Literal(value, Some(metadata)) if has_spelling(&metadata) => {
+            Transformed::yes(Expr::Literal(value, without_spelling(Some(&metadata))))
+        }
+        expr => Transformed::no(expr),
+    }
+}
+
+fn has_spelling(metadata: &FieldMetadata) -> bool {
+    metadata.inner().contains_key(FLOAT_LITERAL_SPELLING_KEY)
+}
+
+fn without_spelling(metadata: Option<&FieldMetadata>) -> Option<FieldMetadata> {
+    let mut inner = metadata?.inner().clone();
+    inner.remove(FLOAT_LITERAL_SPELLING_KEY);
+    (!inner.is_empty()).then(|| FieldMetadata::new(inner))
 }
 
 /// The decimal `value` spells, at `data_type`'s precision and scale, when it is a
@@ -98,6 +148,15 @@ pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option
     if !is_unambiguous_spelling(&spelling, max_digits) {
         return None;
     }
+    exact_decimal_from_spelling(&spelling, data_type)
+}
+
+/// `spelling`, a plain decimal string, parsed exactly at `data_type`'s precision
+/// and scale, when it fits that scale without rounding.
+fn exact_decimal_from_spelling(spelling: &str, data_type: &DataType) -> Option<ScalarValue> {
+    if spelling.is_empty() {
+        return None;
+    }
     let fraction_digits = spelling.split_once('.').map_or(0, |(_, f)| f.len());
     match data_type {
         DataType::Decimal128(precision, scale) => {
@@ -106,7 +165,7 @@ pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option
             }
             let parsed = datafusion::arrow::compute::kernels::cast_utils::parse_decimal::<
                 Decimal128Type,
-            >(&spelling, *precision, *scale)
+            >(spelling, *precision, *scale)
             .ok()?;
             Some(ScalarValue::Decimal128(Some(parsed), *precision, *scale))
         }
@@ -116,12 +175,209 @@ pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option
             }
             let parsed = datafusion::arrow::compute::kernels::cast_utils::parse_decimal::<
                 Decimal256Type,
-            >(&spelling, *precision, *scale)
+            >(spelling, *precision, *scale)
             .ok()?;
             Some(ScalarValue::Decimal256(Some(parsed), *precision, *scale))
         }
         _ => None,
     }
+}
+
+/// The SQL spellings of a statement's number tokens that the `f64` they are
+/// planned as cannot recover.
+///
+/// `DataFusion` plans a fractional token as `Float64`, which keeps about 17
+/// significant digits, so `4.0700000000000003` and `4.07` plan as the same
+/// literal. [`Self::collect`] reads the tokens from the parsed statement before
+/// it is planned, and [`Self::retain`] records each such token's spelling on the
+/// literal it was planned as, for [`ExactFloatLiteralDecimalCast`] to cast from.
+/// Tokens the `f64` does recover (every token of at most `f64::DIGITS`
+/// significant digits) are not recorded: the rule recovers them from the float.
+#[derive(Debug, Default)]
+pub struct FloatLiteralSpellings {
+    /// Keyed by the bits of the token's `f64` magnitude. `None` when the
+    /// statement spells that `f64` more than one way.
+    by_bits: HashMap<u64, Option<String>>,
+}
+
+impl FloatLiteralSpellings {
+    /// Reads the number tokens of `statement` whose `f64` loses their value.
+    #[must_use]
+    pub fn collect(statement: &DFStatement) -> Self {
+        let mut spellings: HashMap<u64, (BTreeSet<String>, bool)> = HashMap::new();
+        let mut record = |token: &str| {
+            if let Some((bits, spelling, recovered)) = token_spelling(token) {
+                let (seen, lossy) = spellings.entry(bits).or_default();
+                seen.insert(spelling);
+                *lossy |= !recovered;
+            }
+        };
+        visit_statement(statement, &mut record);
+        Self {
+            by_bits: spellings
+                .into_iter()
+                .filter(|(_, (_, lossy))| *lossy)
+                .map(|(bits, (seen, _))| {
+                    let only = (seen.len() == 1).then(|| seen.into_iter().next()).flatten();
+                    (bits, only)
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether no token of the statement lost its value to the `f64`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_bits.is_empty()
+    }
+
+    /// Records the collected spellings on the `Float64` literals of `plan` they
+    /// were planned as.
+    ///
+    /// A literal that is a whole projection or `VALUES` entry is left alone:
+    /// those positions name an output column, and the spelling must not become
+    /// part of its field metadata.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from rewriting the plan.
+    pub fn retain(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        if self.is_empty() {
+            return Ok(plan);
+        }
+        plan.transform_up_with_subqueries(|plan| match plan {
+            LogicalPlan::Values(_) => Ok(Transformed::no(plan)),
+            LogicalPlan::Projection(_) => plan.map_expressions(|expr| {
+                if is_bare_literal(&expr) {
+                    Ok(Transformed::no(expr))
+                } else {
+                    expr.transform_up(|expr| Ok(self.mark(expr)))
+                }
+            }),
+            plan => plan.map_expressions(|expr| expr.transform_up(|expr| Ok(self.mark(expr)))),
+        })
+        .map(|transformed| transformed.data)
+    }
+
+    fn mark(&self, expr: Expr) -> Transformed<Expr> {
+        let Expr::Literal(ScalarValue::Float64(Some(value)), metadata) = &expr else {
+            return Transformed::no(expr);
+        };
+        let Some(spelling) = self.by_bits.get(&value.abs().to_bits()) else {
+            return Transformed::no(expr);
+        };
+        let spelling = match spelling {
+            Some(spelling) if value.is_sign_negative() => format!("-{spelling}"),
+            Some(spelling) => spelling.clone(),
+            None => String::new(),
+        };
+        let mut inner = metadata
+            .as_ref()
+            .map_or_else(BTreeMap::new, |metadata| metadata.inner().clone());
+        inner.insert(FLOAT_LITERAL_SPELLING_KEY.to_string(), spelling);
+        Transformed::yes(Expr::Literal(
+            ScalarValue::Float64(Some(*value)),
+            Some(FieldMetadata::new(inner)),
+        ))
+    }
+}
+
+fn is_bare_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) => true,
+        Expr::Alias(Alias { expr, .. }) => is_bare_literal(expr),
+        _ => false,
+    }
+}
+
+fn visit_statement(statement: &DFStatement, record: &mut impl FnMut(&str)) {
+    match statement {
+        DFStatement::Statement(statement) => visit_numbers(statement.as_ref(), record),
+        DFStatement::CopyTo(copy) => {
+            if let CopyToSource::Query(query) = &copy.source {
+                visit_numbers(query.as_ref(), record);
+            }
+        }
+        DFStatement::Explain(explain) => visit_statement(&explain.statement, record),
+        DFStatement::CreateExternalTable(_) | DFStatement::Reset(_) => {}
+    }
+}
+
+fn visit_numbers(node: &impl Visit, record: &mut impl FnMut(&str)) {
+    let _ = visit_expressions(node, |expr| {
+        if let SqlExpr::Value(value) = expr
+            && let Value::Number(token, _) = &value.value
+        {
+            record(token);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// For a number token `DataFusion` plans as `Float64`: the bits of that `f64`'s
+/// magnitude, the token as a plain decimal, and whether the `f64`'s shortest
+/// spelling recovers it.
+fn token_spelling(token: &str) -> Option<(u64, String, bool)> {
+    let token = token.replace('_', "");
+    // Integer tokens plan as Int64 / UInt64, not as floats.
+    if token.parse::<u64>().is_ok() {
+        return None;
+    }
+    let value = token
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())?;
+    let spelling = plain_decimal(&token)?;
+    let recovered = plain_decimal(&value.to_string()).is_some_and(|shortest| shortest == spelling);
+    Some((value.abs().to_bits(), spelling, recovered))
+}
+
+/// An unsigned decimal token (`012.50`, `1.5e-3`, `.5`) as a canonical plain
+/// decimal: no exponent, no leading integer zeros, no trailing fraction zeros.
+fn plain_decimal(token: &str) -> Option<String> {
+    let (mantissa, exponent) = match token.find(['e', 'E']) {
+        Some(at) => (&token[..at], token[at + 1..].parse::<i64>().ok()?),
+        None => (token, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+        || integer.len() + fraction.len() == 0
+    {
+        return None;
+    }
+    let digits = format!("{integer}{fraction}");
+    // `digits` scaled by 10^-scale is the value.
+    let scale = i64::try_from(fraction.len()).ok()? - exponent;
+    // Bound the expansion: a token this far out of range is not finite anyway.
+    if scale.unsigned_abs() > 400 {
+        return None;
+    }
+    let (integer, fraction) = if scale <= 0 {
+        let zeros = usize::try_from(-scale).ok()?;
+        (format!("{digits}{}", "0".repeat(zeros)), String::new())
+    } else {
+        let scale = usize::try_from(scale).ok()?;
+        let padded = if digits.len() <= scale {
+            format!("{}{digits}", "0".repeat(scale - digits.len() + 1))
+        } else {
+            digits
+        };
+        let (integer, fraction) = padded.split_at(padded.len() - scale);
+        (integer.to_string(), fraction.to_string())
+    };
+    let integer = match integer.trim_start_matches('0') {
+        "" => "0",
+        trimmed => trimmed,
+    };
+    let fraction = fraction.trim_end_matches('0');
+    Some(if fraction.is_empty() {
+        integer.to_string()
+    } else {
+        format!("{integer}.{fraction}")
+    })
 }
 
 /// Every decimal with at most `max_digits` significant digits reads as a
@@ -267,6 +523,223 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn plain_decimal_normalizes_token_spellings() {
+        for (token, expected) in [
+            ("4.07", Some("4.07")),
+            ("004.0700", Some("4.07")),
+            (".5", Some("0.5")),
+            ("100.", Some("100")),
+            ("1.5e3", Some("1500")),
+            ("15E-4", Some("0.0015")),
+            ("0.0", Some("0")),
+            ("1e", None),
+            ("1.2.3", None),
+        ] {
+            assert_eq!(plain_decimal(token).as_deref(), expected, "{token}");
+        }
+    }
+
+    #[test]
+    fn only_tokens_the_float_loses_are_recorded() {
+        // At most f64::DIGITS significant digits: the float recovers it.
+        assert_eq!(
+            token_spelling("12345678.90"),
+            Some((12_345_678.9_f64.to_bits(), "12345678.9".to_string(), true))
+        );
+        // Same f64 bits as 4.07, but a different decimal.
+        assert_eq!(
+            token_spelling("4.0700000000000003"),
+            Some((4.07_f64.to_bits(), "4.0700000000000003".to_string(), false))
+        );
+        // Integers plan as Int64 / UInt64.
+        assert_eq!(token_spelling("42"), None);
+    }
+
+    /// The f64 for `4.0700000000000003` is the f64 for `4.07`, so only the
+    /// recorded token spelling can tell them apart at a scale that can.
+    #[test]
+    fn a_recorded_token_spelling_wins_over_the_float() {
+        let data_type = DataType::Decimal128(38, 17);
+        let spelled = |spelling: &str| {
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(
+                    ScalarValue::Float64(Some(4.07)),
+                    Some(FieldMetadata::new(BTreeMap::from([(
+                        FLOAT_LITERAL_SPELLING_KEY.to_string(),
+                        spelling.to_string(),
+                    )]))),
+                )),
+                data_type.clone(),
+            ))
+        };
+        assert_eq!(
+            rewrite_expr(spelled("4.0700000000000003")).data,
+            Expr::Literal(
+                ScalarValue::Decimal128(Some(407_000_000_000_000_030), 38, 17),
+                None
+            )
+        );
+        assert_eq!(
+            rewrite_expr(spelled("-4.0700000000000003")).data,
+            Expr::Literal(
+                ScalarValue::Decimal128(Some(-407_000_000_000_000_030), 38, 17),
+                None
+            )
+        );
+        // More fraction digits than the scale: the cast's rounding decides,
+        // but the spelling is still dropped from the literal.
+        assert_eq!(
+            rewrite_expr(Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(
+                    ScalarValue::Float64(Some(4.07)),
+                    Some(FieldMetadata::new(BTreeMap::from([(
+                        FLOAT_LITERAL_SPELLING_KEY.to_string(),
+                        "4.0700000000000003".to_string(),
+                    )]))),
+                )),
+                DataType::Decimal128(38, 10),
+            )))
+            .data,
+            Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(ScalarValue::Float64(Some(4.07)), None)),
+                DataType::Decimal128(38, 10),
+            ))
+        );
+        // Spelled two ways in one statement: no spelling is known.
+        assert_eq!(
+            exact_decimal_from_spelling("", &data_type),
+            None,
+            "an ambiguous token leaves the cast"
+        );
+        // Without a recorded spelling the float's shortest spelling is used.
+        assert_eq!(
+            rewrite_expr(Expr::Cast(Cast::new(
+                Box::new(Expr::Literal(ScalarValue::Float64(Some(4.07)), None)),
+                data_type,
+            )))
+            .data,
+            Expr::Literal(
+                ScalarValue::Decimal128(Some(407_000_000_000_000_000), 38, 17),
+                None
+            )
+        );
+    }
+
+    /// The ids of the rows `predicate` keeps from a `Decimal128(38, 17)` column
+    /// holding 4.07 (id 1) and 4.0700000000000003 (id 2), planned the way the
+    /// runtime plans SQL: token spellings retained before analysis. Without
+    /// `exact`, plain `DataFusion` plans it.
+    async fn matching_ids_with(predicate: &str, exact: bool) -> Vec<i64> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("dec", DataType::Decimal128(38, 17), false),
+        ]));
+        let values = Decimal128Array::from(vec![407_000_000_000_000_000, 407_000_000_000_000_030])
+            .with_precision_and_scale(38, 17)
+            .expect("valid decimal");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(values)],
+        )
+        .expect("valid batch");
+
+        let ctx = SessionContext::new();
+        if exact {
+            ctx.add_analyzer_rule(Arc::new(ExactFloatLiteralDecimalCast::new()));
+        }
+        ctx.register_batch("t", batch).expect("register");
+        let state = ctx.state();
+        let sql = format!("SELECT id FROM t WHERE {predicate} ORDER BY id");
+        let statement = state
+            .sql_to_statement(&sql, &datafusion::common::config::Dialect::PostgreSQL)
+            .expect("parse");
+        let spellings = if exact {
+            FloatLiteralSpellings::collect(&statement)
+        } else {
+            FloatLiteralSpellings::default()
+        };
+        let plan = spellings
+            .retain(state.statement_to_plan(statement).await.expect("plan"))
+            .expect("retain");
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute")
+            .collect()
+            .await
+            .expect("collect");
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    async fn matching_ids(predicate: &str) -> Vec<i64> {
+        matching_ids_with(predicate, true).await
+    }
+
+    #[tokio::test]
+    async fn a_long_literal_matches_the_decimal_it_spells_not_its_float() {
+        assert_eq!(matching_ids("dec = 4.07").await, vec![1]);
+        assert_eq!(
+            matching_ids("dec = 4.0700000000000003").await,
+            vec![2],
+            "the token is 4.0700000000000003, even though its f64 is 4.07's"
+        );
+        assert_eq!(matching_ids("-dec = -4.0700000000000003").await, vec![2]);
+        // Both spellings in one statement share one f64: neither is known, so
+        // each comparison falls back to the cast.
+        let ambiguous = "dec = 4.0700000000000003 OR dec = 4.07";
+        assert_eq!(
+            matching_ids(ambiguous).await,
+            matching_ids_with(ambiguous, false).await,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projected_long_literal_keeps_its_field_metadata_clean() {
+        let ctx = SessionContext::new();
+        ctx.add_analyzer_rule(Arc::new(ExactFloatLiteralDecimalCast::new()));
+        let state = ctx.state();
+        let sql = "SELECT 4.0700000000000003 AS bare, \
+                   CAST(4.0700000000000003 AS DECIMAL(38, 17)) AS exact";
+        let statement = state
+            .sql_to_statement(sql, &datafusion::common::config::Dialect::PostgreSQL)
+            .expect("parse");
+        let plan = FloatLiteralSpellings::collect(&statement)
+            .retain(state.statement_to_plan(statement).await.expect("plan"))
+            .expect("retain");
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute")
+            .collect()
+            .await
+            .expect("collect");
+        let batch = &batches[0];
+        for field in batch.schema().fields() {
+            assert!(
+                !field.metadata().contains_key(FLOAT_LITERAL_SPELLING_KEY),
+                "{field:?}"
+            );
+        }
+        let exact = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal");
+        assert_eq!(exact.value(0), 407_000_000_000_000_030);
     }
 
     async fn count_matches(sql: &str, params: Option<Vec<ScalarValue>>, scale: i8) -> i64 {
