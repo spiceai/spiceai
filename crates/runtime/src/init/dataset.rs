@@ -380,12 +380,7 @@ impl Runtime {
             let resolved = resolve_table_reference(ds.name.clone());
             let future = if pending {
                 background_roots.insert(resolved.clone());
-                self.track_snapshot_bootstrap(
-                    &ds.name,
-                    future,
-                    Some(self.initial_load.cancel.clone()),
-                )
-                .await
+                self.track_snapshot_bootstrap(&ds.name, future).await
             } else {
                 future
             };
@@ -429,13 +424,7 @@ impl Runtime {
                         parent_done.cancelled().await;
                         chain.await;
                     });
-                    let chain = self
-                        .track_snapshot_bootstrap(
-                            &name,
-                            chain,
-                            Some(self.initial_load.cancel.clone()),
-                        )
-                        .await;
+                    let chain = self.track_snapshot_bootstrap(&name, chain).await;
                     background_chains.push((name, chain));
                 } else {
                     chains.push(chain);
@@ -1072,7 +1061,6 @@ impl Runtime {
         self: &Arc<Self>,
         name: &TableReference,
         load: Pin<Box<dyn Future<Output = ()> + Send>>,
-        initial_load_cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let cancel = self.status.shutdown_token().child_token();
         let task_cancel = cancel.clone();
@@ -1081,16 +1069,9 @@ impl Runtime {
                 &Self::snapshot_bootstrap_task_name(name),
                 Some(cancel),
                 async move {
-                    let initial_load_cancel = async move {
-                        match initial_load_cancel {
-                            Some(token) => token.cancelled().await,
-                            None => std::future::pending().await,
-                        }
-                    };
                     tokio::select! {
                         biased;
                         () = task_cancel.cancelled() => {},
-                        () = initial_load_cancel => {},
                         () = load => {},
                     }
                     Ok(())
@@ -2853,8 +2834,7 @@ impl Runtime {
                     .await;
             });
             let load_future = if pending {
-                self.track_snapshot_bootstrap(&ds.name, load_future, None)
-                    .await
+                self.track_snapshot_bootstrap(&ds.name, load_future).await
             } else {
                 load_future
             };

@@ -40,7 +40,7 @@ use spice_table::{Index, WriteWindow};
 
 use crate::accelerated::{
     refresh_task::retry_from_df_error,
-    sink::{finalize_indexes, prepare_indexes, rollback_indexes},
+    sink::{finalize_indexes, prepare_indexes, prepare_tables_for_reads, rollback_indexes},
     synchronized_table::SynchronizedTable,
 };
 use runtime_acceleration::dataupdate::StreamingDataUpdateExecutionPlan;
@@ -263,6 +263,8 @@ impl MultiSink {
         finalize_indexes("MultiSink", self.sink_indexes.iter())
             .await
             .map_err(retry_from_df_error)?;
+
+        prepare_tables_for_reads(&maintenance_targets).await;
 
         Ok(())
     }
