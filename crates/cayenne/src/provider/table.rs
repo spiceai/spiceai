@@ -19981,13 +19981,15 @@ impl CayenneTableProvider {
     /// first, unless scans pin another column more than twice as often — schema
     /// inference can supply a primary key the workload never looks rows up by (an
     /// auto-increment surrogate), and a layout routed on it prunes nothing. A
-    /// filter counts for a column only where it pins it to a few values or to a
-    /// bounded range (`FilterColumnObservations::pinned_hits`), because only such
-    /// a filter skips files that each hold one range of the column: a lookup
+    /// filter counts for a column only where it pins it to a few values or bounds
+    /// it by a literal (`FilterColumnObservations::pinned_hits`), because only
+    /// such a filter skips files that each hold one range of the column: a lookup
     /// that fixes the leading key and lists many values of another skips every
     /// file but one when routed on the leading key, and none when routed on the
-    /// other. Join keys arrive as runtime filters, which are not observed, so the
-    /// primary key yields only to a column pinned distinctly more often.
+    /// other. Pinned values outrank bounds, which decide only between columns no
+    /// scan pins: a lookup's witness bound (`count >= 1`) prunes nothing. Join
+    /// keys arrive as runtime filters, which are not observed, so the primary key
+    /// yields only to a column pinned distinctly more often.
     /// Whichever of the two is not preferred follows as the fallback.
     fn range_routing_candidates(&self, schema: &SchemaRef) -> Vec<(String, RangeKeySource)> {
         let routable = |column: &str| {
@@ -20013,8 +20015,9 @@ impl CayenneTableProvider {
             .find(|column| routable(column));
         match (leading_key, hottest) {
             (Some(key), Some(hottest)) if hottest != key => {
-                let hottest_leads = observations.pinned_hits(&hottest)
-                    > observations.pinned_hits(&key).saturating_mul(2);
+                let hottest_leads = observations
+                    .pinned_hits(&hottest)
+                    .lead_more_than_twice(&observations.pinned_hits(&key));
                 let key = (key, RangeKeySource::PrimaryKey);
                 let hottest = (hottest, RangeKeySource::ObservedFilters);
                 if hottest_leads {
@@ -54077,7 +54080,10 @@ mod tests {
             "precondition: every scan references the listed column"
         );
         assert_eq!(
-            (observations.pinned_hits("w"), observations.pinned_hits("i")),
+            (
+                observations.pinned_hits("w").values,
+                observations.pinned_hits("i").values
+            ),
             (10, 0),
             "the lookups pin the leading key; nothing pins the listed column"
         );
@@ -54087,6 +54093,56 @@ mod tests {
             .map(|(column, _)| column)
             .collect();
         assert_eq!(names, vec!["w"], "routed on the key the lookups pin");
+    }
+
+    /// A receipt lookup fixes the warehouse, lists a few items and bounds a
+    /// witness column in every branch — `(w = 4 AND i = k AND cnt >= 1) OR …` —
+    /// on a table whose inferred key leads with the item. The layout routes on
+    /// the warehouse the lookups pin, not on the witness they only bound, though
+    /// the witness is bounded as often and sorts first.
+    #[tokio::test]
+    async fn range_routing_follows_the_pinned_column_over_a_witness_bound() {
+        use datafusion_expr::{col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cnt", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+            Field::new("w", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (table, _dir) = create_cayenne_table_with_config(
+            "routing_witness_bound",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec!["i".to_string(), "w".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let lookup = [11_368_i64, 21_466, 43_612, 46_726, 55_728, 56_103]
+            .into_iter()
+            .map(|item| {
+                col("w")
+                    .eq(lit(4_i64))
+                    .and(col("i").eq(lit(item)))
+                    .and(col("cnt").gt_eq(lit(1_i64)))
+            })
+            .reduce(datafusion_expr::Expr::or)
+            .expect("six rows");
+        for _ in 0..10 {
+            table
+                .filter_column_observations
+                .record_filters(std::slice::from_ref(&lookup));
+        }
+        let names: Vec<String> = table
+            .range_routing_candidates(&table.table_schema())
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["w", "i"],
+            "routed on the column the lookups pin, the inferred key kept as the fallback"
+        );
     }
 
     #[tokio::test]

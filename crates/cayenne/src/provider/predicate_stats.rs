@@ -21,11 +21,14 @@ limitations under the License.
 //! [`FilterColumnObservations::top_columns`] and sorts the rewrite by the hottest
 //! columns so zone maps prune selective queries without any spicepod setup.
 //!
-//! Scans also record which columns a filter pins to a few values or to a bounded
-//! range ([`FilterColumnObservations::pinned_hits`]). Key-range routing ranks
-//! columns by those: a file holding one range of a column is skipped only by a
-//! filter that names few of its ranges, so a column that queries reference only
-//! in a long `IN` list, or in a join, would route files no lookup can skip.
+//! Scans also record which columns a filter pins to a few values, and which it
+//! only bounds by a literal ([`FilterColumnObservations::pinned_hits`]). Key-range
+//! routing ranks columns by those: a file holding one range of a column is skipped
+//! only by a filter that names few of its ranges, so a column that queries
+//! reference only in a long `IN` list, or in a join, would route files no lookup
+//! can skip. A pinned value outranks a bound — a lookup that fixes one column and
+//! bounds another by a witness such as `count >= 1` is served by routing on the
+//! fixed one — so bounds decide only between columns no scan pins to values.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,9 +54,28 @@ const MAX_PINNED_VALUES: usize = 4;
 struct ColumnHits {
     /// Scans whose filters reference the column at all.
     any: u64,
-    /// Scans whose filters pin the column to at most [`MAX_PINNED_VALUES`]
-    /// values or to a range bounded by a literal.
-    pinned: u64,
+    /// Scans whose filters pin or bound the column ([`PinnedHits`]).
+    pinned: PinnedHits,
+}
+
+/// How many scans' filters pinned a column to at most [`MAX_PINNED_VALUES`]
+/// literal values, and how many only bounded it by a literal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinnedHits {
+    pub(crate) values: u64,
+    pub(crate) bounds: u64,
+}
+
+impl PinnedHits {
+    /// Whether these hits lead `other`'s by more than twice: on pinned values
+    /// when either column has any, else on bounds.
+    pub(crate) fn lead_more_than_twice(&self, other: &Self) -> bool {
+        if self.values > 0 || other.values > 0 {
+            self.values > other.values.saturating_mul(2)
+        } else {
+            self.bounds > other.bounds.saturating_mul(2)
+        }
+    }
 }
 
 /// Bounded per-table filter-column hit counts shared across provider clones.
@@ -87,11 +109,20 @@ impl FilterColumnObservations {
         let pinned = pinned_columns(filters);
         let mut state = self.state.lock();
         for name in names {
-            let is_pinned = pinned.contains(&name);
+            let pin = pinned
+                .iter()
+                .find(|(column, _)| *column == name)
+                .map(|(_, kind)| *kind);
             let entry = state.entry(name).or_default();
             entry.any = entry.any.saturating_add(1);
-            if is_pinned {
-                entry.pinned = entry.pinned.saturating_add(1);
+            match pin {
+                Some(PinKind::Values) => {
+                    entry.pinned.values = entry.pinned.values.saturating_add(1);
+                }
+                Some(PinKind::Bound) => {
+                    entry.pinned.bounds = entry.pinned.bounds.saturating_add(1);
+                }
+                None => {}
             }
         }
         // Cap cardinality: drop lowest-hit keys when over the limit so memory
@@ -118,32 +149,34 @@ impl FilterColumnObservations {
     /// in `schema`, highest first. Empty when nothing useful has been observed.
     #[must_use]
     pub(crate) fn top_columns(&self, top_k: usize, schema: &Schema) -> Vec<String> {
-        self.ranked(top_k, schema, |hits| hits.any)
+        self.ranked(top_k, schema, |hits| (hits.any, 0))
     }
 
-    /// Return up to `top_k` column names in `schema` that filters have pinned
-    /// ([`Self::pinned_hits`]), most often first. Empty when no filter has pinned
-    /// a column yet.
+    /// Return up to `top_k` column names in `schema` that filters have pinned or
+    /// bounded ([`Self::pinned_hits`]): most pinned values first, then most
+    /// bounds. Empty when no filter has done either yet.
     #[must_use]
     pub(crate) fn top_pinned_columns(&self, top_k: usize, schema: &Schema) -> Vec<String> {
-        self.ranked(top_k, schema, |hits| hits.pinned)
+        self.ranked(top_k, schema, |hits| {
+            (hits.pinned.values, hits.pinned.bounds)
+        })
     }
 
     fn ranked(
         &self,
         top_k: usize,
         schema: &Schema,
-        count: impl Fn(&ColumnHits) -> u64,
+        count: impl Fn(&ColumnHits) -> (u64, u64),
     ) -> Vec<String> {
         if top_k == 0 {
             return Vec::new();
         }
         let state = self.state.lock();
-        let mut ranked: Vec<(&str, u64)> = state
+        let mut ranked: Vec<(&str, (u64, u64))> = state
             .iter()
             .filter(|(name, _)| schema.index_of(name.as_str()).is_ok())
             .map(|(name, hits)| (name.as_str(), count(hits)))
-            .filter(|(_, hits)| *hits > 0)
+            .filter(|(_, hits)| *hits != (0, 0))
             .collect();
         // Stable tie-break by name so compaction layout is deterministic under
         // equal hit counts (tests and zone-map quality both care).
@@ -163,10 +196,13 @@ impl FilterColumnObservations {
     }
 
     /// How many scans' filters pinned a column to at most [`MAX_PINNED_VALUES`]
-    /// values or to a literal-bounded range (0 if never).
+    /// values, and how many only bounded it by a literal (zeros if never).
     #[must_use]
-    pub(crate) fn pinned_hits(&self, column: &str) -> u64 {
-        self.state.lock().get(column).map_or(0, |hits| hits.pinned)
+    pub(crate) fn pinned_hits(&self, column: &str) -> PinnedHits {
+        self.state
+            .lock()
+            .get(column)
+            .map_or_else(PinnedHits::default, |hits| hits.pinned)
     }
 }
 
@@ -180,19 +216,28 @@ enum Pin {
     Range,
 }
 
+/// Whether a filter pins a column to a few values or only bounds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinKind {
+    Values,
+    Bound,
+}
+
 /// The columns a conjunction of `filters` pins to at most
-/// [`MAX_PINNED_VALUES`] values or to a literal-bounded range.
-fn pinned_columns(filters: &[Expr]) -> Vec<String> {
+/// [`MAX_PINNED_VALUES`] values, or bounds by a literal.
+fn pinned_columns(filters: &[Expr]) -> Vec<(String, PinKind)> {
     let mut pins = HashMap::new();
     for filter in filters {
         pins = and_pins(pins, pins_of(filter));
     }
     pins.into_iter()
-        .filter(|(_, pin)| match pin {
-            Pin::Values(values) => values.len() <= MAX_PINNED_VALUES,
-            Pin::Range => true,
+        .filter_map(|(column, pin)| match pin {
+            Pin::Values(values) if values.len() <= MAX_PINNED_VALUES => {
+                Some((column, PinKind::Values))
+            }
+            Pin::Values(_) => None,
+            Pin::Range => Some((column, PinKind::Bound)),
         })
-        .map(|(column, _)| column)
         .collect()
 }
 
@@ -371,25 +416,29 @@ mod tests {
             col("amount").in_list((0..10_i64).map(lit).collect(), false),
         ]);
         observations.record_filters(&[col("pk").eq(lit(1_i64)).or(col("region").eq(lit("x")))]);
+        let values = |values| PinnedHits { values, bounds: 0 };
         assert_eq!(
             observations.pinned_hits("pk"),
-            1,
+            values(1),
             "every branch pins pk to the same value; one side of an OR pins nothing"
         );
         assert_eq!(
             observations.pinned_hits("amount"),
-            0,
+            PinnedHits::default(),
             "fifteen values, and then ten, are too many"
         );
         assert_eq!(
             observations.pinned_hits("region"),
-            1,
+            values(1),
             "a two-value list pins"
         );
         assert_eq!(
             observations.pinned_hits("ts"),
-            1,
-            "a literal bound pins a range"
+            PinnedHits {
+                values: 0,
+                bounds: 1
+            },
+            "a literal bound bounds the column without pinning it"
         );
         assert_eq!(
             (
@@ -400,6 +449,50 @@ mod tests {
             ),
             (2, 2, 2, 1),
             "every reference still counts as a hit"
+        );
+    }
+
+    /// A pinned value outranks a bound: a receipt lookup that fixes `w`, lists
+    /// a few values of `i` and bounds a witness `cnt >= 1` in every branch ranks
+    /// `w` first, although `cnt` is bounded as often and sorts before it; and a
+    /// bound decides only between columns no scan pins.
+    #[test]
+    fn a_pinned_value_outranks_a_bound() {
+        let observations = FilterColumnObservations::new();
+        let schema = Schema::new(vec![
+            Field::new("cnt", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+            Field::new("w", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]);
+        let lookup = [1_i64, 6_152, 12_303, 18_454, 24_605, 30_756]
+            .into_iter()
+            .map(|item| {
+                col("w")
+                    .eq(lit(4_i64))
+                    .and(col("i").eq(lit(item)))
+                    .and(col("cnt").gt_eq(lit(1_i64)))
+            })
+            .reduce(Expr::or)
+            .expect("six rows");
+        for _ in 0..3 {
+            observations.record_filters(std::slice::from_ref(&lookup));
+        }
+        assert_eq!(
+            observations.top_pinned_columns(2, &schema),
+            vec!["w".to_string(), "cnt".to_string()],
+            "the pinned column ranks before the bounded one"
+        );
+        let (w, cnt) = (observations.pinned_hits("w"), observations.pinned_hits("cnt"));
+        assert!(w.lead_more_than_twice(&observations.pinned_hits("i")));
+        assert!(!cnt.lead_more_than_twice(&w), "a bound never leads a pinned column");
+        for _ in 0..10 {
+            observations.record_filters(&[col("ts").gt(lit(5_i64))]);
+        }
+        let none = PinnedHits::default();
+        assert!(
+            observations.pinned_hits("ts").lead_more_than_twice(&none),
+            "where neither column is pinned, bounds decide"
         );
     }
 
