@@ -67845,11 +67845,13 @@ mod tests {
         }
     }
 
-    /// Every scan-view build carries the previous build's merged deletions and
-    /// visible mem-tier rows forward. After each CDC upsert, delete and
-    /// checkpoint of a seeded history, the carried result must equal a build
-    /// from scratch — the same visible rows, and the same delete sequence for
-    /// every key ever written — and SQL must return exactly the modeled rows.
+    /// Every scan-view build and mem-tier checkpoint carries the previous one's
+    /// merged deletions and visible mem-tier rows forward. After each CDC
+    /// upsert, delete and checkpoint of a seeded history, the carried result
+    /// must equal a build from scratch — the same visible rows, per shard for a
+    /// checkpoint, including for a tier captured before the step and filtered
+    /// after a build of the newer one, and the same delete sequence for every
+    /// key ever written — and SQL must return exactly the modeled rows.
     /// Runs for an `Int64` key and a composite key, and requires that builds
     /// actually carried segments and extended a merge, so the fallback alone
     /// cannot pass it.
@@ -67920,6 +67922,13 @@ mod tests {
         let mut model: BTreeMap<(i64, i64), i64> = BTreeMap::new();
         let mut written: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
         for step in 0..48 {
+            // The tier as a checkpoint might have captured it before this step's
+            // write, to filter after a build of the newer tier.
+            let before = provider
+                .capture_raw_scan_input()
+                .await
+                .expect("capture before the step")
+                .mem_tier_shards;
             let mut keys: std::collections::BTreeSet<(i64, i64)> =
                 std::collections::BTreeSet::new();
             for _ in 0..=rng.below(12) {
@@ -68002,30 +68011,37 @@ mod tests {
                 rows(&full[..]),
                 "{case}, step {step}: visible mem-tier rows"
             );
-            // The checkpoint's per-shard groups come from the same carried state.
-            let by_shard = provider
-                .visible_mem_tier_batches_by_shard(&raw.mem_tier_shards)
-                .expect("checkpoint visibility");
-            assert_eq!(
-                by_shard.len(),
-                raw.mem_tier_shards.len(),
-                "{case}, step {step}: shard groups"
-            );
-            for (shard, group) in raw.mem_tier_shards.iter().zip(&by_shard) {
-                let full_group = provider
-                    .visible_mem_tier_batches(shard, None)
-                    .expect("full shard visibility");
-                let as_segments = |batches: &[RecordBatch]| {
-                    vec![VisibleMemTierSegment {
-                        statistics: Arc::new(Statistics::new_unknown(&schema)),
-                        batches: batches.to_vec(),
-                    }]
-                };
+            // The checkpoint's per-shard groups come from the same carried state,
+            // for the current tier and for the tier captured before this step,
+            // which the cache now describes a newer state of.
+            let as_segments = |batches: &[RecordBatch]| {
+                vec![VisibleMemTierSegment {
+                    statistics: Arc::new(Statistics::new_unknown(&schema)),
+                    batches: batches.to_vec(),
+                }]
+            };
+            for (shards, what) in [
+                (&raw.mem_tier_shards, "checkpoint visible rows"),
+                (&before, "checkpoint visible rows of the earlier capture"),
+            ] {
+                let by_shard = provider
+                    .visible_mem_tier_batches_by_shard(shards)
+                    .expect("checkpoint visibility");
                 assert_eq!(
-                    rows(&as_segments(group)[..]),
-                    rows(&as_segments(&full_group)[..]),
-                    "{case}, step {step}: checkpoint visible rows"
+                    by_shard.len(),
+                    shards.len(),
+                    "{case}, step {step}: shard groups"
                 );
+                for (shard, group) in shards.iter().zip(&by_shard) {
+                    let full_group = provider
+                        .visible_mem_tier_batches(shard, None)
+                        .expect("full shard visibility");
+                    assert_eq!(
+                        rows(&as_segments(group)[..]),
+                        rows(&as_segments(&full_group)[..]),
+                        "{case}, step {step}: {what}"
+                    );
+                }
             }
 
             let merged =
