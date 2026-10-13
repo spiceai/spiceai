@@ -1614,6 +1614,9 @@ struct ScanViewCache {
     latest_complete: ArcSwapOption<CompletedScanView>,
     /// Builds still resolving. Self-trims on [`Self::drain_completed`].
     in_flight: ParkingMutex<Vec<InFlightScanView>>,
+    /// Admit a miss before capturing snapshots. The blocking build owns the
+    /// permit, so cancelling its caller cannot admit overlapping work.
+    build_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for ScanViewCache {
@@ -1621,6 +1624,7 @@ impl Default for ScanViewCache {
         Self {
             latest_complete: ArcSwapOption::empty(),
             in_flight: ParkingMutex::new(Vec::new()),
+            build_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -31258,10 +31262,8 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Cap on concurrent in-flight builds cached for dedup. Read-your-writes scans key
-    /// to the CURRENT state, so distinct in-flight identities are few in practice; this
-    /// bounds cache memory under pathological churn. Over the cap, a build still runs
-    /// (awaited locally) but is not cached for dedup — bounded memory, correct result.
+    /// Cap on completed or resolving builds retained for deduplication. The
+    /// build permit independently bounds snapshot capture and blocking work.
     const MAX_IN_FLIGHT_SCAN_VIEWS: usize = 8;
 
     /// Bound on capture retries across a live schema-evolution (odd/torn generation)
@@ -31336,6 +31338,7 @@ impl CayenneTableProvider {
         key: ScanViewKey,
         order: u64,
         captured_at: Instant,
+        build_permit: tokio::sync::OwnedMutexGuard<()>,
     ) -> ScanViewBuild {
         use futures::FutureExt;
         let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
@@ -31349,15 +31352,18 @@ impl CayenneTableProvider {
             return futures::future::ready(result).boxed().shared();
         };
         let build = async move {
-            task::spawn_blocking(move || provider.build_scan_view(raw, structural_version))
-                .await
-                .map_err(|join_error| {
-                    Arc::new(datafusion_common::DataFusionError::Execution(format!(
-                        "scan-view build task failed to join: {join_error}"
-                    )))
-                })?
-                .map(Arc::new)
-                .map_err(Arc::new)
+            task::spawn_blocking(move || {
+                let _build_permit = build_permit;
+                provider.build_scan_view(raw, structural_version)
+            })
+            .await
+            .map_err(|join_error| {
+                Arc::new(datafusion_common::DataFusionError::Execution(format!(
+                    "scan-view build task failed to join: {join_error}"
+                )))
+            })?
+            .map(Arc::new)
+            .map_err(Arc::new)
         }
         .boxed()
         .shared();
@@ -31374,21 +31380,9 @@ impl CayenneTableProvider {
         build
     }
 
-    /// Obtain the [`ScanView`] for this scan from the demand cache.
-    /// A hit is wait-free (`ArcSwap` load + atomic version validation). A miss
-    /// captures, then takes the in-flight mutex only long enough to dedup or
-    /// spawn; the build is awaited outside it.
-    ///
-    /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
-    /// `order == scan_input_version` and the structural generation matches.
-    /// [`ScanViewReuse::WithinLag`]: serve it when `now - captured_at <= lag`
-    /// and the structural generation matches. A zero lag recaptures every scan.
-    ///
-    /// On a miss, capture under the structural seqlock, then hit / await / build.
-    async fn scan_view_at_current_input(
-        &self,
-        reuse: ScanViewReuse,
-    ) -> datafusion_common::Result<Arc<ScanView>> {
+    /// Reuse a completed view only after validating its input and structural
+    /// versions against this lookup's time.
+    fn try_reuse_scan_view(&self, reuse: ScanViewReuse) -> Option<Arc<ScanView>> {
         // Bracket the candidate with both versions. Ordinary writes invalidate
         // UntilInvalidated; a structural event rejects either reuse mode when it
         // straddles selection. No drain, no mutex.
@@ -31409,6 +31403,27 @@ impl CayenneTableProvider {
                 candidate,
             )
         {
+            return Some(view);
+        }
+        None
+    }
+
+    /// Obtain the [`ScanView`] for this scan from the demand cache.
+    /// A hit is wait-free (`ArcSwap` load + atomic version validation). A miss
+    /// waits for build admission before capturing, then takes the in-flight
+    /// mutex only to dedup or spawn; the build is awaited outside it.
+    ///
+    /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
+    /// `order == scan_input_version` and the structural generation matches.
+    /// [`ScanViewReuse::WithinLag`]: serve it when `now - captured_at <= lag`
+    /// and the structural generation matches. A zero lag recaptures every scan.
+    ///
+    /// On a miss, capture under the structural seqlock, then hit / await / build.
+    async fn scan_view_at_current_input(
+        &self,
+        reuse: ScanViewReuse,
+    ) -> datafusion_common::Result<Arc<ScanView>> {
+        if let Some(view) = self.try_reuse_scan_view(reuse) {
             return Ok(view);
         }
 
@@ -31419,6 +31434,16 @@ impl CayenneTableProvider {
                 hook().await;
             }
         }
+        // Wait without pinning a raw snapshot. A queued query captures the
+        // current input after admission, and can reuse a view completed while
+        // it waited only if the ordinary version and freshness checks permit it.
+        let build_permit = Arc::clone(&self.scan_view_cache.build_lock)
+            .lock_owned()
+            .await;
+        if let Some(view) = self.try_reuse_scan_view(reuse) {
+            return Ok(view);
+        }
+
         // Capture the CURRENT state under the structural seqlock, retrying across a
         // (rare) live schema-evolution that leaves the generation odd/torn, and
         // across a write that advanced `scan_input_version` while we captured.
@@ -31484,6 +31509,7 @@ impl CayenneTableProvider {
                 if let Some(view) = self.scan_view_cache.serve_if_key(&key, order, captured_at) {
                     ScanViewAction::Serve(view)
                 } else if let Some(pending) = in_flight.iter().find(|entry| entry.key == key) {
+                    drop(build_permit);
                     ScanViewAction::Await {
                         build: pending.build.clone(),
                         key: pending.key.clone(),
@@ -31499,9 +31525,10 @@ impl CayenneTableProvider {
                         key.clone(),
                         order,
                         captured_at,
+                        build_permit,
                     );
-                    // Cache the in-flight build for dedup, unless we are over the
-                    // churn cap (then build standalone — bounded memory, no dedup).
+                    // Retain the shared result for deduplication. The build
+                    // permit bounds work independently of this cache.
                     if in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
                         in_flight.push(InFlightScanView {
                             key: key.clone(),
