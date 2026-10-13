@@ -1001,12 +1001,7 @@ async fn an_auto_tables_reclaim_waits_for_the_process_wide_reclaim_budget() {
         "premise: the table is on position deletes"
     );
 
-    let budget = crate::provider::compaction::whole_table_reclaim_budget();
-    let permits = u32::try_from(budget.available_permits()).expect("permits fit in u32");
-    let held = Arc::clone(&budget)
-        .acquire_many_owned(permits)
-        .await
-        .expect("the budget is open");
+    let held = hold_every_reclaim_permit().await;
     // With every permit held the pass cannot start its rewrite; a bounded wait is
     // the only way to see that it does not finish.
     let blocked = tokio::time::timeout(
@@ -1055,6 +1050,142 @@ async fn an_auto_tables_reclaim_waits_for_the_process_wide_reclaim_budget() {
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
     let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
     assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// Every permit of the process-wide reclaim budget, waiting out any that another
+/// test holds, so that none is free until the returned permit drops.
+async fn hold_every_reclaim_permit() -> tokio::sync::OwnedSemaphorePermit {
+    let permits = u32::try_from(cpu_budget::cpu_budget().cayenne_whole_table_reclaim_permits())
+        .expect("permits fit in u32");
+    crate::provider::compaction::whole_table_reclaim_budget()
+        .acquire_many_owned(permits)
+        .await
+        .expect("the budget is open")
+}
+
+/// A background compaction pass holds a compaction permit, so while every reclaim
+/// permit is held its whole-table reclaim of an auto table declines, as
+/// `declined_paced`, instead of waiting with that permit held, and rewrites
+/// nothing.
+#[tokio::test]
+async fn a_background_pass_declines_an_auto_reclaim_while_the_reclaim_budget_is_in_use() {
+    let name = "auto_reclaim_declined";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    insert_batch(
+        &provider,
+        id_value_batch(
+            Arc::clone(&provider.table_metadata.schema),
+            &keys,
+            &[200; 16],
+        ),
+    )
+    .await;
+    assert!(
+        provider.should_capture_positions(),
+        "premise: the table is on position deletes"
+    );
+    let trigger = provider
+        .deletion_index_reclaim_trigger()
+        .expect("premise: the whole-table reclaim is due");
+    let index_before = provider.deletion_index_len();
+
+    let held = hold_every_reclaim_permit().await;
+    let (declined, rewrote) = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::provider::compaction::run_holding_compaction_permit(async {
+            let declined = provider.whole_table_reclaim_permit(trigger).await.err();
+            let rewrote = provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("reclaim pass");
+            (declined, rewrote)
+        }),
+    )
+    .await
+    .expect("a background pass declines instead of waiting for a reclaim permit");
+    drop(held);
+    assert_eq!(
+        (declined, rewrote),
+        (Some(CompactionOutcome::DeclinedPaced), false),
+        "the background pass declined as declined_paced and rewrote nothing"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "no whole-table rewrite ran"
+    );
+    assert_eq!(
+        provider.deletion_index_len(),
+        index_before,
+        "the index is untouched"
+    );
+}
+
+/// Over the deletion index's memory ceiling an auto table's whole-table reclaim is
+/// the OOM guard, so it takes no reclaim permit: with every permit held it still
+/// rewrites the table and clears the index.
+#[tokio::test]
+async fn an_auto_reclaim_over_the_memory_ceiling_takes_no_reclaim_permit() {
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    // ~32 bytes a tombstone, so 1M tombstones (≈32 MiB) sit over 25% of a 64 MiB
+    // pool, which still leaves the rewrite room to scan the table.
+    const POOL_BYTES: usize = 64 * 1024 * 1024;
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(POOL_BYTES)))
+            .build()
+            .expect("finite-pool runtime env"),
+    );
+    let name = "auto_reclaim_over_ceiling";
+    let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+        name,
+        runtime_env,
+        table_config(DeletionMode::Auto, 256),
+    )
+    .await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    // Delete-only tombstones for keys the table never held, at the first
+    // sequence: they hide no row, and the rewrite's cutoff covers every one.
+    let deletes: Vec<(i64, i64)> = (1_000_000..2_000_000).map(|key| (key, 1)).collect();
+    install_int64_deletes(&provider, &deletes);
+    assert!(
+        provider.should_capture_positions(),
+        "premise: the table is on position deletes"
+    );
+    assert!(
+        provider.deletion_index_over_memory_ceiling(),
+        "premise: 1M tombstones exceed 25% of the {POOL_BYTES}-byte pool"
+    );
+
+    let held = hold_every_reclaim_permit().await;
+    let committed = tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.compact_current_snapshot_small_files(),
+    )
+    .await
+    .expect("the reclaim over the memory ceiling waited for a reclaim permit")
+    .expect("reclaim pass");
+    drop(held);
+    assert!(committed, "the whole-table reclaim committed");
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "the reclaim rewrote the table whole"
+    );
+    assert_eq!(
+        provider.deletion_index_len(),
+        0,
+        "the reclaim cleared the index"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 100)).collect();
+    assert_eq!(rows, expected, "every row is still there, once");
 }
 
 /// The whole-table reclaim of an auto table on key deletes takes no permit from
@@ -1546,6 +1677,90 @@ fn the_key_deletes_switch_line_names_the_dataset_the_bound_and_the_docs() {
          `cayenne_deletion_mode: auto` keeps on position deletes, so it now uses key \
          deletes: queries still see every write, applying recent updates and deletes \
          as they read until compaction merges them in. See: \
+         https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    );
+}
+
+/// A writer collecting what a test's subscriber logs.
+#[derive(Clone)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("captured log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An auto table that cannot be sized as it loads starts on key deletes and says
+/// so at `warn`, naming the dataset. Here its current snapshot directory cannot be
+/// listed: a file stands where the directory was.
+#[tokio::test]
+async fn an_auto_table_that_cannot_be_sized_as_it_loads_starts_on_key_deletes_and_warns() {
+    use tracing::instrument::WithSubscriber;
+
+    let name = "auto_unsized_at_open";
+    let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    let snapshot_dir = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+    drop(provider);
+    tokio::fs::remove_dir_all(&snapshot_dir)
+        .await
+        .expect("remove the current snapshot directory");
+    tokio::fs::write(&snapshot_dir, b"not a directory")
+        .await
+        .expect("a file where the directory was");
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = CapturedLog(Arc::clone(&captured));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    // tracing-core's single-dispatcher callsite cache consults the registering
+    // thread's default subscriber; a second dispatcher makes interest depend on
+    // every registered subscriber, so this one sees the line.
+    let _callsite_dispatch = tracing::Dispatch::new(tracing_subscriber::fmt().finish());
+    let config = table_config(DeletionMode::Auto, 256);
+    let runtime_env = SessionContext::new().runtime_env();
+    let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+        .with_context(CayenneContext::new(&config, runtime_env, name))
+        .open(name)
+        .with_subscriber(subscriber)
+        .await
+        .expect("the table opens");
+    let log = String::from_utf8(captured.lock().expect("captured log").clone()).expect("UTF-8 log");
+    assert!(
+        reopened.pk_deletion_mode.auto().is_some() && !reopened.should_capture_positions(),
+        "an auto table that cannot be sized starts on key deletes, still auto"
+    );
+    assert!(
+        log.contains(
+            "Failed to read the size on disk of dataset 'auto_unsized_at_open' when it \
+             loaded, so `cayenne_deletion_mode: auto` uses key deletes for it until it \
+             next loads. Cause: "
+        ),
+        "the warning names the dataset and what it uses until it next loads: {log}"
+    );
+}
+
+/// The line an auto table logs when it cannot be sized as it loads names the
+/// dataset in quotes, says what the user gets until the next load, carries the
+/// cause, and links the docs.
+#[test]
+fn the_unsized_at_open_line_names_the_dataset_the_consequence_and_the_cause() {
+    assert_eq!(
+        auto_unsized_at_open_message("orders", &"Permission denied (os error 13)"),
+        "Failed to read the size on disk of dataset 'orders' when it loaded, so \
+         `cayenne_deletion_mode: auto` uses key deletes for it until it next loads. \
+         Cause: Permission denied (os error 13). See: \
          https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     );
 }

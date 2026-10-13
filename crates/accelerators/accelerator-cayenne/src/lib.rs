@@ -1952,9 +1952,6 @@ impl CayenneAccelerator {
                 && workload.has_primary_key
             {
                 config.deletion_mode = cayenne::metadata::DeletionMode::Key;
-                tracing::debug!(
-                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (CDC refresh mode with a primary key). Key-based deletes compact concurrently with writers; set `cayenne_deletion_mode: position` to opt back into merge-on-read position deletes."
-                );
             }
 
             // `auto` keeps a small primary-key table on position deletes, compacted

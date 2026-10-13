@@ -780,6 +780,13 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
 /// every table's. Compaction runs as under `spiced`, on its runtime (see
 /// [`install_compaction_runtime_from_env`]) and under its process-wide budget of
 /// one compaction per core.
+///
+/// `HARNESS_SEED_OP=overwrite` seeds each table through one replace, into its
+/// current snapshot, as a full refresh does (default `append`). `HARNESS_LARGE_ROWS`
+/// adds one more table, `t_large`, of that many rows, seeded through one replace
+/// and written like the others but never read: a large table rewriting itself whole
+/// alongside the small ones. Every table's deletion index is sampled every 100 ms;
+/// how far past its trigger it grows says how long its reclaims were held back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing harness; run explicitly with HARNESS_* variables"]
 async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::Error>> {
@@ -796,16 +803,24 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
     let trigger = env_usize("HARNESS_TRIGGER", 50_000);
     let seed_batch = env_usize("HARNESS_SEED_BATCH", 100_000);
     let read_interval_ms = env_usize("HARNESS_READ_INTERVAL_MS", 60) as u64;
+    let seed_op = env_string("HARNESS_SEED_OP", "append");
+    let large_rows = env_usize("HARNESS_LARGE_ROWS", 0);
 
     let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
     let schema = schema();
     let ctx = SessionContext::new();
-    let mut providers = Vec::with_capacity(tables);
+    // Each table: its name, its rows, and whether it is seeded through one replace.
+    let mut specs: Vec<(String, usize, bool)> = (0..tables)
+        .map(|index| (format!("t{index}"), rows, seed_op == "overwrite"))
+        .collect();
+    if large_rows > 0 {
+        specs.push(("t_large".to_string(), large_rows, true));
+    }
+    let mut providers = Vec::with_capacity(specs.len());
     // The process-wide compaction budget `spiced` hands every Cayenne table: one
     // permit per core.
     let compactions = cayenne::compaction_budget();
-    for index in 0..tables {
-        let name = format!("t{index}");
+    for (name, table_rows, overwrite) in &specs {
         let options = CreateTableOptions {
             table_name: name.clone(),
             schema: Arc::clone(&schema),
@@ -831,11 +846,19 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
         table.spawn_background_compaction(Arc::clone(&compactions));
         ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
         let mut next = 0usize;
-        while next < rows {
-            let end = (next + seed_batch).min(rows);
+        let mut seed_batches = Vec::new();
+        while next < *table_rows {
+            let end = (next + seed_batch).min(*table_rows);
             let ids: Vec<i64> = (next as i64..end as i64).collect();
-            common::insert_batch(&table, rows_batch(&schema, &ids, 0)).await?;
+            if *overwrite {
+                seed_batches.push(rows_batch(&schema, &ids, 0));
+            } else {
+                common::insert_batch(&table, rows_batch(&schema, &ids, 0)).await?;
+            }
             next = end;
+        }
+        if !seed_batches.is_empty() {
+            common::write_batches(&table, seed_batches, InsertOp::Overwrite).await?;
         }
         providers.push(table);
     }
@@ -843,7 +866,7 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
         table.drain_in_flight_maintenance().await?;
     }
     eprintln!(
-        "HARNESS mode={mode_label} config many_tables tables={tables} rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} trigger={trigger} read_interval_ms={read_interval_ms} compaction_runtime={compaction_runtime}"
+        "HARNESS mode={mode_label} config many_tables tables={tables} rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} trigger={trigger} read_interval_ms={read_interval_ms} compaction_runtime={compaction_runtime} seed_op={seed_op} large_rows={large_rows}"
     );
 
     let start = Instant::now();
@@ -851,22 +874,25 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
     let interval = Duration::from_millis(write_interval_ms);
     let writers: Vec<_> = providers
         .iter()
+        .zip(&specs)
         .enumerate()
-        .map(|(index, table)| {
+        .map(|(index, (table, (_, table_rows, _)))| {
             let table = Arc::clone(table);
             let schema = Arc::clone(&schema);
+            let table_rows = (*table_rows).max(1);
+            let stagger = index as f64 / specs.len() as f64;
             tokio::spawn(async move {
                 let mut latencies = Vec::new();
-                let mut scheduled = start + interval.mul_f64(index as f64 / tables as f64);
+                let mut scheduled = start + interval.mul_f64(stagger);
                 let mut round = 0usize;
                 while scheduled < deadline {
                     let now = Instant::now();
                     if now < scheduled {
                         tokio::time::sleep(scheduled - now).await;
                     }
-                    let first = (round * round_keys) % rows.max(1);
+                    let first = (round * round_keys) % table_rows;
                     let ids: Vec<i64> = (first..first + round_keys)
-                        .map(|id| (id % rows) as i64)
+                        .map(|id| (id % table_rows) as i64)
                         .collect();
                     common::insert_batch(&table, rows_batch(&schema, &ids, (round + 1) as i64))
                         .await
@@ -932,13 +958,49 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
             (agg, filter, point, count, by_table)
         })
     };
+    // Each table's largest deletion index, sampled every 100 ms.
+    let sampler = {
+        let providers: Vec<_> = providers.iter().map(Arc::clone).collect();
+        tokio::spawn(async move {
+            let mut peaks = vec![0usize; providers.len()];
+            while Instant::now() < deadline {
+                for (peak, table) in peaks.iter_mut().zip(&providers) {
+                    *peak = (*peak).max(table.deletion_index_len());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            peaks
+        })
+    };
 
+    // The small tables' writes are pooled; the large table's are reported apart.
     let mut write_ms = Vec::new();
     let mut write_by_table = Vec::with_capacity(tables);
-    for writer in writers {
+    let mut large_write_ms = Vec::new();
+    for (index, writer) in writers.into_iter().enumerate() {
         let table_ms = writer.await?;
-        write_ms.extend_from_slice(&table_ms);
-        write_by_table.push(table_ms);
+        if index < tables {
+            write_ms.extend_from_slice(&table_ms);
+            write_by_table.push(table_ms);
+        } else {
+            large_write_ms = table_ms;
+        }
+    }
+    let peaks = sampler.await?;
+    let mut small_peaks = peaks.iter().take(tables).copied().collect::<Vec<_>>();
+    small_peaks.sort_unstable();
+    eprintln!(
+        "HARNESS mode={mode_label} metric=c_index_peak_per_table tables={tables} trigger={trigger} min={} median={} max={}",
+        small_peaks.first().copied().unwrap_or(0),
+        small_peaks.get(small_peaks.len() / 2).copied().unwrap_or(0),
+        small_peaks.last().copied().unwrap_or(0),
+    );
+    if large_rows > 0 {
+        summarize("c_write_large", &mode_label, &mut large_write_ms);
+        eprintln!(
+            "HARNESS mode={mode_label} metric=c_index_peak_large rows={large_rows} trigger={trigger} peak={}",
+            peaks.get(tables).copied().unwrap_or(0)
+        );
     }
     let (mut agg, mut filter, mut point, mut count, mut by_table) = reader.await?;
     report_read_rounds(&mode_label, agg.len(), duration_s, read_interval_ms.max(1));
@@ -964,22 +1026,27 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
         summarize_per_table(label, &mode_label, &mut per_table);
     }
     let mut rewritten_whole = 0usize;
-    for table in &providers {
+    let mut large_rewritten_whole = false;
+    for (index, table) in providers.iter().enumerate() {
         table.drain_in_flight_maintenance().await?;
-        if matches!(
+        let whole = matches!(
             table.last_small_file_compact_path(),
             cayenne::LastSmallFileCompactPath::Full
-        ) {
-            rewritten_whole += 1;
+        );
+        if index < tables {
+            rewritten_whole += usize::from(whole);
+        } else {
+            large_rewritten_whole = whole;
         }
     }
     eprintln!(
-        "HARNESS mode={mode_label} metric=c_final dir_bytes={} tables_rewritten_whole={rewritten_whole}/{tables} last_small_file_compact_path={}",
+        "HARNESS mode={mode_label} metric=c_final dir_bytes={} tables_rewritten_whole={rewritten_whole}/{tables} large_rewritten_whole={large_rewritten_whole} last_small_file_compact_path={}",
         dir_bytes(&fixture.data_path),
         if rewritten_whole > 0 { "Full" } else { "None" }
     );
-    let union = (0..tables)
-        .map(|index| format!("SELECT id, generation, qty FROM t{index}"))
+    let union = specs
+        .iter()
+        .map(|(name, _, _)| format!("SELECT id, generation, qty FROM {name}"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let answer = run_query(

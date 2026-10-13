@@ -10060,9 +10060,26 @@ impl CayenneTableProvider {
         provider.backfill_snapshot_manifest_if_empty().await;
 
         // Size an `auto` table for its starting mode, before anything writes to
-        // it: past the bound, or unsized, it starts on key deletes.
-        if let Some(auto) = provider.pk_deletion_mode.auto() {
-            auto.size_at_open(provider.warm_listed_bytes().await.ok());
+        // it: past the bound, or unsized, it starts on key deletes. One that keeps
+        // key deletes from the start has nothing to size.
+        if let Some(auto) = provider.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let table_bytes = match provider.warm_listed_bytes().await {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        "{}",
+                        auto_unsized_at_open_message(
+                            provider.table_metadata.table_name.as_str(),
+                            &error,
+                        )
+                    );
+                    None
+                }
+            };
+            auto.size_at_open(table_bytes);
         }
 
         // Startup replay for the orphaned-DV sweep. A publication that raises the
@@ -20563,6 +20580,19 @@ impl CayenneTableProvider {
         // hold a single settled file while the index carries every tombstone the
         // table has recorded. Only the full rewrite clears the index.
         if let Some(trigger) = deletion_index_trigger {
+            // Held for the rewrite, and taken before it is timed: a wait for a permit
+            // is not reclaim time, and does not count toward the table's pace.
+            let _reclaim_permit = match self.whole_table_reclaim_permit(trigger).await {
+                Ok(permit) => permit,
+                Err(declined) => {
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::SubsetCurrent,
+                        declined,
+                    );
+                    return Ok(false);
+                }
+            };
             self.log_snapshot_maintenance_trigger(trigger);
             let committed = self
                 .rewrite_current_snapshot_for_reclaim_tracked(position_guards)
@@ -23800,23 +23830,47 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// The permit a whole-table reclaim fired by `trigger` holds while it rewrites:
+    /// an `auto` table's comes from the process-wide reclaim budget
+    /// (`compaction::whole_table_reclaim_budget`), so tables written alike do not
+    /// all rewrite at once. `None` for a reclaim that takes none: one on a table not
+    /// on `deletion_mode: auto`, and one over the deletion index's memory ceiling,
+    /// where the rewrite is the OOM guard and nothing may hold it back.
+    ///
+    /// A background pass already holds a compaction permit, so when no reclaim
+    /// permit is free it declines as `declined_paced` and a later tick tries again:
+    /// waiting, it would hold the compaction permit other tables' background
+    /// compaction needs. Any other pass waits for one.
+    async fn whole_table_reclaim_permit(
+        &self,
+        trigger: SnapshotMaintenanceTrigger,
+    ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, CompactionOutcome> {
+        if self.pk_deletion_mode.auto().is_none()
+            || matches!(
+                trigger,
+                SnapshotMaintenanceTrigger::DeletionIndexSize {
+                    over_memory_ceiling: true,
+                    ..
+                }
+            )
+        {
+            return Ok(None);
+        }
+        let budget = super::compaction::whole_table_reclaim_budget();
+        if super::compaction::holds_compaction_permit() {
+            return budget
+                .try_acquire_owned()
+                .map(Some)
+                .map_err(|_| CompactionOutcome::DeclinedPaced);
+        }
+        Ok(budget.acquire_owned().await.ok())
+    }
+
     async fn rewrite_current_snapshot_tracked(
         &self,
         held_position_guards: Option<PositionRewriteGuards>,
         reclaim: bool,
     ) -> Result<bool> {
-        // An `auto` table's whole-table reclaim takes a permit from the process-wide
-        // reclaim budget, so tables written alike do not all rewrite at once. Taken
-        // before the pass is timed: a wait for a permit is not reclaim time, and
-        // does not count toward the table's pace.
-        let _reclaim_permit = if reclaim && self.pk_deletion_mode.auto().is_some() {
-            super::compaction::whole_table_reclaim_budget()
-                .acquire_owned()
-                .await
-                .ok()
-        } else {
-            None
-        };
         let pass_start = Instant::now();
         let result = self
             .rewrite_current_snapshot_holding_bounded(held_position_guards, reclaim)
@@ -41072,6 +41126,14 @@ fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) 
     };
     format!(
         "Dataset '{dataset}' grew past {bound} on disk, the largest size `cayenne_deletion_mode: auto` keeps on position deletes, so it now uses key deletes: queries still see every write, applying recent updates and deletes as they read until compaction merges them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    )
+}
+
+/// The line a table logs when `deletion_mode: auto` cannot size it as it loads,
+/// and so starts it on key deletes until it next loads.
+fn auto_unsized_at_open_message(dataset: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Failed to read the size on disk of dataset '{dataset}' when it loaded, so `cayenne_deletion_mode: auto` uses key deletes for it until it next loads. Cause: {error}. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     )
 }
 

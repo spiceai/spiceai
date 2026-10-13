@@ -107,6 +107,30 @@ pub(crate) fn whole_table_reclaim_budget() -> Arc<Semaphore> {
     Arc::clone(&WHOLE_TABLE_RECLAIM_BUDGET)
 }
 
+tokio::task_local! {
+    /// Set while a background compaction pass holds a permit from its compaction
+    /// budget ([`BackgroundCompactor`]). A whole-table reclaim in such a pass that
+    /// finds no reclaim permit free declines rather than wait: waiting, it would hold
+    /// a compaction permit that other tables' background compaction needs.
+    static BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT: ();
+}
+
+/// Run `pass` as a background compaction pass that holds a compaction permit
+/// (see [`BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT`]).
+pub(crate) async fn run_holding_compaction_permit<F: Future>(pass: F) -> F::Output {
+    BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT
+        .scope((), pass)
+        .await
+}
+
+/// Whether the running pass is a background compaction pass holding a compaction
+/// permit (see [`BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT`]).
+pub(crate) fn holds_compaction_permit() -> bool {
+    BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT
+        .try_with(|()| ())
+        .is_ok()
+}
+
 static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
     LazyLock::new(CompactionPassTracker::default);
@@ -656,7 +680,7 @@ impl BackgroundCompactor {
                         )],
                     );
 
-                    match runner.run_compaction_trigger().await {
+                    match run_holding_compaction_permit(runner.run_compaction_trigger()).await {
                         Ok(true) => {
                             tracing::debug!(
                                 target: "cayenne::compaction",

@@ -243,7 +243,7 @@ impl fmt::Display for DeletionModeChoice {
                 if physical < logical {
                     write!(
                         f,
-                        "auto (key deletes: {logical} CPU cores on {physical} physical, fewer than {fewer_than})"
+                        "auto (key deletes: {physical} physical cores, fewer than {fewer_than}; {logical} CPUs with SMT)"
                     )
                 } else {
                     write!(
@@ -599,7 +599,7 @@ mod tests {
                 "auto (position deletes up to 2 MiB, then key deletes)",
                 "auto (position deletes up to 32 KiB, then key deletes)",
                 "auto (key deletes: 4 CPU cores, fewer than 8)",
-                "auto (key deletes: 8 CPU cores on 4 physical, fewer than 8)",
+                "auto (key deletes: 4 physical cores, fewer than 8; 8 CPUs with SMT)",
                 "auto (key deletes: position deletes need Linux)",
                 "key (auto: CDC dataset)",
                 "key (auto: datalake tier)",
