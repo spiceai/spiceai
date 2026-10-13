@@ -514,12 +514,13 @@ mod tests {
 
     #[test]
     fn invalid_bodies_are_bad_requests() {
-        let json_error = decode(Encoding::Json, b"{not json").unwrap_err();
+        let json_error = decode(Encoding::Json, b"{not json").expect_err("malformed JSON");
         assert!(
             json_error.starts_with("Invalid OTLP JSON body"),
             "{json_error}"
         );
-        let protobuf_error = decode(Encoding::Protobuf, &[0xff, 0xff, 0xff]).unwrap_err();
+        let protobuf_error =
+            decode(Encoding::Protobuf, &[0xff, 0xff, 0xff]).expect_err("malformed protobuf");
         assert!(
             protobuf_error.starts_with("Invalid OTLP protobuf body"),
             "{protobuf_error}"
