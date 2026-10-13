@@ -2223,6 +2223,12 @@ pub struct CayenneTableProvider {
     /// they commit under. Consumed on first fire.
     #[cfg(test)]
     test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired after a seq-prefix bake has built its deletion-index
+    /// prune off the listing fence and before it takes the fence to publish it, so
+    /// a test can scan, or republish table state, inside that window. Consumed on
+    /// first fire.
+    #[cfg(test)]
+    test_pre_bake_prune_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Test-only seam fired by `sort_and_rewrite_data` after its catalog commit
     /// and before its in-memory flip, so a test can commit an overwrite between
     /// the two. Consumed on first fire.
@@ -9841,6 +9847,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_pre_bake_prune_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12173,6 +12181,8 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
+            #[cfg(test)]
+            test_pre_bake_prune_publish_hook: Arc::clone(&self.test_pre_bake_prune_publish_hook),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::clone(&self.test_post_catalog_commit_hook),
             #[cfg(test)]
@@ -28954,6 +28964,8 @@ impl CayenneTableProvider {
                 table: self.table_metadata.table_name.clone(),
                 source,
             })?;
+        #[cfg(test)]
+        self.run_test_pre_bake_prune_publish_hook().await;
         let _fence = self.listing_fence.write().await;
         if !self.bake_output_is_live(bake) {
             return Ok(OffFencePrune::OutputNotLive);
@@ -29127,6 +29139,17 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_pre_publish_hook(&self) {
         let hook = self.test_pre_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only hook between a bake's off-fence prune
+    /// build and its fenced publication, if one is installed. See
+    /// [`Self::test_pre_bake_prune_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_bake_prune_publish_hook(&self) {
+        let hook = self.test_pre_bake_prune_publish_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -58533,6 +58556,143 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40)],
             "key 0 stays deleted after the bake (no resurrection), others preserved"
+        );
+    }
+
+    /// A seq-prefix bake builds its deletion-index prune without holding the
+    /// listing fence: a scan started while the pruned index is being built
+    /// completes, and it reads the swapped protected set with the still-unpruned
+    /// index — the same rows as before and after the bake. Five snapshots (ids
+    /// 0..5) pinned at seqs 10..50; the bake folds {0, 1} (`T = 20`); key 0 is
+    /// deleted at 15.
+    #[tokio::test]
+    async fn a_scan_completes_while_a_bake_builds_its_deletion_index_prune() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_prune_off_fence_scan",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+        let expected = vec![(1, 10), (2, 20), (3, 30), (4, 40)];
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_off_fence_scan").await,
+            expected,
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
+
+        let scanned_in_window: Arc<ParkingMutex<Option<Vec<(i64, i64)>>>> =
+            Arc::new(ParkingMutex::new(None));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let ctx_in_hook = ctx.clone();
+            let scanned = Arc::clone(&scanned_in_window);
+            *provider.test_pre_bake_prune_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let rows = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        collect_id_value_pairs(
+                            &ctx_in_hook,
+                            &provider_in_hook,
+                            "bake_prune_off_fence_scan",
+                        ),
+                    )
+                    .await
+                    .expect("a scan must not wait on the bake's deletion-index prune");
+                    *scanned.lock() = Some(rows);
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert_eq!(
+            scanned_in_window.lock().take(),
+            Some(expected.clone()),
+            "a scan between the swap and the prune reads the merged output with the \
+             unpruned index: key 0 stays hidden, every other row is present"
+        );
+        assert_eq!(
+            int64_tombstones(&provider).delete_len(),
+            0,
+            "the prune still lands after the off-fence build"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_off_fence_scan").await,
+            expected,
+            "key 0 stays deleted after the bake, others preserved"
+        );
+    }
+
+    /// A recovery that read the catalog before the bake committed can republish
+    /// the bake's inputs after the bake swapped them out. A deletion-index prune
+    /// that lands after that would strip the tombstone hiding key 0's row in the
+    /// restored inputs, so the prune must be dropped: the index keeps it and key 0
+    /// stays hidden. The republished index is the same one the prune was built
+    /// from, so only the liveness check — not the compare-and-swap — stops it.
+    #[tokio::test]
+    async fn a_bake_prune_is_dropped_when_its_inputs_are_republished() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_prune_inputs_republished",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+
+        let pre_swap: Arc<ParkingMutex<Option<Arc<HashMap<String, i64>>>>> =
+            Arc::new(ParkingMutex::new(None));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let pre_swap = Arc::clone(&pre_swap);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    *pre_swap.lock() = Some(provider_in_hook.protected_snapshots.load_full());
+                })
+            }));
+        }
+        let republished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let pre_swap = Arc::clone(&pre_swap);
+            let republished = Arc::clone(&republished);
+            *provider.test_pre_bake_prune_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let inputs = pre_swap
+                        .lock()
+                        .take()
+                        .expect("the bake captured its pre-swap protected set");
+                    // What `publish_recovered_visibility` does with a stale read.
+                    let _fence = provider_in_hook.listing_fence.write().await;
+                    provider_in_hook.protected_snapshots.store(inputs);
+                    republished.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert!(
+            republished.load(Ordering::SeqCst),
+            "the inputs must be republished between the prune's build and its publication"
+        );
+        assert_eq!(
+            int64_tombstones(&provider).get(0).map(|t| t.delete_sequence),
+            Some(15),
+            "the tombstone the republished inputs need must survive the bake"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_inputs_republished").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "key 0 must stay hidden in the republished inputs"
         );
     }
 
