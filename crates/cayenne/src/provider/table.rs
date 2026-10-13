@@ -27498,21 +27498,13 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
 
-        // Bring the in-memory protected set into agreement under the scan fence
-        // (readers capture deletion snapshot + protected set together). We hold
-        // the write fence across BOTH the protected-set swap AND the deletion
-        // index prune below, so no scan combines the post-swap protected set
-        // (M present, inputs gone) with a pre-prune deletion index (or vice
-        // versa). The clean-prefix assertion is evaluated under this same fence
-        // over the now-current live set.
-        // CLEAN-PREFIX GATE (resurrect-rows-critical) — re-evaluated here OUTSIDE
-        // the write fence so the per-snapshot manifest reads (metastore I/O) never
-        // stall concurrent scans, then enforced TOGETHER with the prune under the
-        // single write-fence hold below so no scan observes a torn (swapped-but-not-
-        // pruned, or the reverse) state. The merged output M is not yet in the
-        // protected set at this point (the rcu swap is below), so it is not among
-        // the live ids; its `<= T` rows are SURVIVORS the rewrite kept. See
-        // `bake_clean_prefix_holds` for the watermark-or-min soundness argument.
+        // CLEAN-PREFIX GATE (resurrect-rows-critical) — evaluated here, outside
+        // the write fence, so the per-snapshot manifest reads (metastore I/O) never
+        // stall concurrent scans; the prune below runs only when it holds. The
+        // merged output M is not yet in the protected set at this point (the rcu
+        // swap is below), so it is not among the live ids; its `<= T` rows are
+        // SURVIVORS the rewrite kept. See `bake_clean_prefix_holds` for the
+        // watermark-or-min soundness argument.
         let (clean_prefix_holds, violating_min) = self
             .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
             .await;
