@@ -102,7 +102,7 @@ jobs:
     name: Tests for signoff-batch
     # Real Git against a local bare "origin", with stub gh and scripts/signoff:
     # pushes stay in the job's temp directory and no status is posted.
-    runs-on: ubuntu-24.04
+    runs-on: spiceai-dev-runners
     timeout-minutes: 5
     permissions:
       contents: read
