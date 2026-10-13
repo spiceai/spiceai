@@ -90,7 +90,7 @@ impl ManagedTokioRuntime {
 
 /// Builder for [`ManagedTokioRuntime`] with configuration options.
 pub struct ManagedTokioRuntimeBuilder {
-    low_priority: bool,
+    nice: Option<i32>,
     thread_name: Option<String>,
     worker_threads: Option<usize>,
 }
@@ -106,7 +106,7 @@ impl ManagedTokioRuntimeBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            low_priority: false,
+            nice: None,
             thread_name: None,
             worker_threads: None,
         }
@@ -115,8 +115,16 @@ impl ManagedTokioRuntimeBuilder {
     /// Set worker threads to run at lower priority (nice value 10 on Unix).
     /// This is useful for background tasks that shouldn't compete with latency-sensitive work.
     #[must_use]
-    pub fn with_low_priority(mut self) -> Self {
-        self.low_priority = true;
+    pub fn with_low_priority(self) -> Self {
+        self.with_nice(10)
+    }
+
+    /// Run worker threads at nice value `nice` on Unix (0 is the default; higher
+    /// values yield the CPU to threads at lower ones). On Linux the value applies to
+    /// each worker thread; on macOS `setpriority` sets it for the whole process.
+    #[must_use]
+    pub fn with_nice(mut self, nice: i32) -> Self {
+        self.nice = Some(nice);
         self
     }
 
@@ -155,14 +163,13 @@ impl ManagedTokioRuntimeBuilder {
             builder.thread_name(name);
         }
 
-        // Set low priority on worker threads if requested (Unix only)
+        // Set the worker threads' nice value if requested (Unix only)
         #[cfg(unix)]
-        if self.low_priority {
-            builder.on_thread_start(|| {
-                // Set nice value to 10 (lower priority than default 0, range is -20 to 19)
+        if let Some(nice) = self.nice {
+            builder.on_thread_start(move || {
                 // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0 (current thread)
                 unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
                 }
             });
         }
@@ -243,6 +250,33 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::sleep;
+
+    /// A worker thread reads its own nice value: on Linux each worker sets it as
+    /// it starts, which leaves the test's own thread untouched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_threads_run_at_the_requested_nice_value() {
+        // SAFETY: getpriority with PRIO_PROCESS and 0 reads the calling thread's value.
+        let nice_of_this_thread = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let before = nice_of_this_thread();
+        let runtime = ManagedTokioRuntime::builder()
+            .with_nice(5)
+            .with_worker_threads(1)
+            .build()
+            .expect("Failed to create runtime");
+        let worker_nice = futures::executor::block_on(
+            runtime
+                .handle()
+                // SAFETY: as above, on the worker thread.
+                .spawn(async { unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) } }),
+        )
+        .expect("the worker reads its nice value");
+        assert_eq!(
+            (worker_nice, nice_of_this_thread()),
+            (5, before),
+            "the worker runs at nice 5 and the thread that built the runtime keeps its own"
+        );
+    }
 
     /// Drop joins the runtime's thread, and that thread drops the runtime, so by
     /// the time `drop` returns every task still pending on it has been cancelled
