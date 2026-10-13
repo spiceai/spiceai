@@ -377,7 +377,7 @@ async fn a_pinned_table_refuses_read_write_access() -> anyhow::Result<()> {
                 assert_eq!(
                     errors.get(name),
                     Some(&Some(format!(
-                        "Failed to setup the dataset {name} (iceberg). Unable to resolve table provider: Cannot setup the dataset {name} (iceberg) with an invalid configuration. An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog to commit to, so it is read-only. Remove `access: read_write` from the dataset, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+                        "Failed to setup the dataset {name} (iceberg). Unable to resolve table provider: Cannot setup the dataset {name} (iceberg) with an invalid configuration. An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog to commit to, so it is read-only. Remove `access: read_write`, keep writes in the acceleration with `acceleration.write_mode: acceleration`, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg"
                     ))),
                     "dataset {name}"
                 );
@@ -386,6 +386,49 @@ async fn a_pinned_table_refuses_read_write_access() -> anyhow::Result<()> {
                 std::fs::read_dir(table_root.join("data"))?.count(),
                 data_files_before,
                 "refusing the datasets must not write into the table"
+            );
+            Ok(())
+        })
+        .await
+}
+
+/// Writes kept in the acceleration (`write_mode: acceleration`) never reach the
+/// source, so a pinned table with `access: read_write` loads and accepts them, and
+/// the table's own files are left untouched.
+#[tokio::test]
+async fn a_pinned_table_takes_writes_kept_in_its_acceleration() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let warehouse = tempfile::tempdir()?;
+            let table_root = write_table(warehouse.path(), &[&[1], &[2]]).await?;
+            let files = metadata_file_names(&table_root)?;
+            let data_files_before = std::fs::read_dir(table_root.join("data"))?.count();
+
+            let mut dataset = pinned_dataset(
+                &table_root,
+                "accelerated_writes",
+                "iceberg_metadata_path",
+                &format!("/metadata/{}", files[2]),
+            );
+            dataset.access = spicepod::component::access::AccessMode::ReadWrite;
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
+                ..Acceleration::default()
+            });
+            let rt = start_runtime("iceberg_metadata_path_accelerated_writes", vec![dataset]).await;
+            crate::utils::runtime_ready_check(&rt).await;
+
+            run_query(&rt, "INSERT INTO accelerated_writes VALUES (99)").await?;
+            assert_eq!(ids(&rt, "accelerated_writes").await?, vec![1, 2, 99]);
+            assert_eq!(
+                std::fs::read_dir(table_root.join("data"))?.count(),
+                data_files_before,
+                "a write kept in the acceleration must not write into the table"
             );
             Ok(())
         })

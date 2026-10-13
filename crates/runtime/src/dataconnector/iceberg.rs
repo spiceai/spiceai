@@ -437,7 +437,9 @@ impl DataConnector for IcebergDataConnector {
         // A table pinned to one metadata file has no catalog to commit to. Refused
         // before anything is built: an Iceberg insert writes its data files before
         // the commit that would be rejected, which would leave orphan files in a
-        // table location Spice usually does not own.
+        // table location Spice usually does not own. Writes kept in the acceleration
+        // (`write_mode: acceleration`) never reach the source, so they never ask for
+        // this provider and are unaffected.
         if matches!(self.table_source(dataset.path()), TableSource::Pinned(_)) {
             return Some(Err(Error::InvalidConfigurationNoSource {
                 dataconnector: "iceberg".into(),
@@ -474,7 +476,7 @@ impl DataConnector for IcebergDataConnector {
 data_connector_api::register_data_connector!("iceberg", IcebergDataConnectorFactory);
 
 #[cfg(feature = "iceberg-write")]
-const READ_ONLY_PINNED_TABLE_MESSAGE: &str = "An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog to commit to, so it is read-only. Remove `access: read_write` from the dataset, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg";
+const READ_ONLY_PINNED_TABLE_MESSAGE: &str = "An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog to commit to, so it is read-only. Remove `access: read_write`, keep writes in the acceleration with `acceleration.write_mode: acceleration`, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg";
 
 /// Where an Iceberg dataset's table is read from.
 enum TableSource {
