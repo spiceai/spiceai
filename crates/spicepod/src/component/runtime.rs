@@ -107,9 +107,11 @@ pub struct Runtime {
 
     /// Shared object-store location for runtime state (`file://`, `s3://`,
     /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
-    /// source rate control, and distributed query state. Each feature writes
-    /// under its own folder: `results-cache/`, `rate-control/` and `cluster/`.
-    /// A `runtime.scheduler.state_location` overrides it for the scheduler.
+    /// source rate control, distributed query state and acceleration snapshots.
+    /// Each feature writes under its own folder: `results-cache/`,
+    /// `rate-control/`, `cluster/` and `snapshots/`. A
+    /// `runtime.scheduler.state_location` overrides it for the scheduler, and a
+    /// `snapshots.location` for snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<RuntimeState>,
 

@@ -454,3 +454,116 @@ async fn snapshot_bootstrap_removed_reader_does_not_register_after_publication()
     assert!(!fixture.directory.path().join("reader.db").exists());
     runtime.shutdown().await;
 }
+
+/// A file-mode `DuckDB` dataset over `csv`, accelerated into `duckdb_file`.
+fn duckdb_dataset(
+    directory: &std::path::Path,
+    csv: &str,
+    duckdb_file: &str,
+    acceleration: spicepod::acceleration::Acceleration,
+) -> PodDataset {
+    let mut dataset = PodDataset::new(
+        format!("file:{}", directory.join(csv).display()),
+        "orders",
+    );
+    dataset.params = Some(Params::from_string_map(HashMap::from([(
+        "file_format".to_string(),
+        "csv".to_string(),
+    )])));
+    dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        mode: spicepod::acceleration::Mode::File,
+        params: Some(Params::from_string_map(HashMap::from([(
+            "duckdb_file".to_string(),
+            directory.join(duckdb_file).to_string_lossy().into_owned(),
+        )]))),
+        ..acceleration
+    });
+    dataset
+}
+
+/// With `runtime.state` set and no `snapshots` section, a writer publishes to the
+/// `snapshots/` folder of the state location, and a reader with the same
+/// `runtime.state` restores from it.
+#[tokio::test]
+async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
+    let directory = tempfile::tempdir().expect("test directory");
+    std::fs::write(directory.path().join("rows.csv"), "id\n1\n2\n3\n").expect("writer source");
+    std::fs::write(
+        directory.path().join("reader_rows.csv"),
+        "id\n1\n2\n3\n4\n5\n",
+    )
+    .expect("reader source");
+    let runtime_config = spicepod::component::runtime::Runtime {
+        state: Some(spicepod::component::runtime::RuntimeState {
+            location: format!("file://{}/state/", directory.path().display()),
+            params: None,
+        }),
+        ..Default::default()
+    };
+
+    let writer_app = app::AppBuilder::new("snapshot_writer")
+        .with_runtime(runtime_config.clone())
+        .with_dataset(duckdb_dataset(
+            directory.path(),
+            "rows.csv",
+            "writer.db",
+            spicepod::acceleration::Acceleration {
+                snapshots: spicepod::acceleration::SnapshotBehavior::Enabled,
+                ..Default::default()
+            },
+        ))
+        .build();
+    assert!(writer_app.snapshots.is_none(), "the spicepod has no snapshots section");
+    let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
+    Arc::clone(&writer).load_datasets().await;
+    wait_for_count(&writer, "orders", 3).await;
+
+    let metadata = directory.path().join("state/snapshots/metadata.json");
+    let current_snapshot_id = || async {
+        let contents = tokio::fs::read_to_string(&metadata).await.ok()?;
+        let metadata: serde_json::Value = serde_json::from_str(&contents).ok()?;
+        metadata.get("current-snapshot-id")?.as_u64()
+    };
+    assert!(
+        test_framework::utils::wait_until_true(Duration::from_secs(15), || async {
+            current_snapshot_id().await.is_some()
+        })
+        .await,
+        "the writer must publish a current snapshot to {}",
+        metadata.display()
+    );
+    writer.shutdown().await;
+    let mut state_root: Vec<_> = std::fs::read_dir(directory.path().join("state"))
+        .expect("list state location")
+        .map(|entry| entry.expect("state entry").file_name())
+        .filter(|name| name != ".spice-object-store-occ.lock")
+        .collect();
+    state_root.sort();
+    assert_eq!(
+        state_root,
+        ["snapshots"],
+        "snapshots are kept in their own folder of the state location"
+    );
+
+    let reader_app = app::AppBuilder::new("snapshot_reader")
+        .with_runtime(runtime_config)
+        .with_dataset(duckdb_dataset(
+            directory.path(),
+            "reader_rows.csv",
+            "reader.db",
+            spicepod::acceleration::Acceleration {
+                refresh_mode: Some(spicepod::acceleration::RefreshMode::Snapshot),
+                refresh_check_interval: Some("100ms".to_string()),
+                snapshots: spicepod::acceleration::SnapshotBehavior::BootstrapOnly,
+                ..Default::default()
+            },
+        ))
+        .build();
+    let reader = Arc::new(Runtime::builder().with_app(reader_app).build().await);
+    Arc::clone(&reader).load_datasets().await;
+    // The snapshot holds the writer's three rows; the reader's own source has five.
+    wait_for_count(&reader, "orders", 3).await;
+    reader.shutdown().await;
+}

@@ -289,7 +289,7 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        if let Some(snapshots) = app.snapshots.as_deref() {
+        if let Some(snapshots) = app.effective_snapshots().as_deref() {
             let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
                 ds.acceleration.as_ref().is_some_and(|acceleration| {
                     acceleration.enabled
