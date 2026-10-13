@@ -312,8 +312,16 @@ impl HistogramQuantileAccumulator {
         bounds: Option<Vec<f64>>,
         counts: Option<Vec<u64>>,
     ) -> Result<()> {
-        if self.q.is_none() {
-            self.q = q;
+        match (self.q, q) {
+            (None, q) => self.q = q,
+            // Taking the first quantile and ignoring the rest would make the
+            // result depend on row and merge order.
+            (Some(existing), Some(q)) if existing.to_bits() != q.to_bits() => {
+                return exec_err!(
+                    "{HISTOGRAM_QUANTILE_UDAF_NAME}: every row in a group must ask for the same quantile; got {existing} and {q}"
+                );
+            }
+            _ => {}
         }
         let (Some(bounds), Some(counts)) = (bounds, counts) else {
             return Ok(());
@@ -1080,6 +1088,50 @@ mod tests {
             .await
             .expect_err("mixed bounds");
         assert!(err.to_string().contains("same explicit_bounds"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn histogram_quantile_rejects_differing_quantiles_in_a_group() {
+        let ctx = ctx();
+        for quantiles in [(0.25, 0.75), (0.75, 0.25)] {
+            let err = ctx
+                .sql(&format!(
+                    "SELECT histogram_quantile(q, b, c) FROM (VALUES
+                        ({}, make_array(1.0, 2.0), make_array(1, 1, 0)),
+                        ({}, make_array(1.0, 2.0), make_array(1, 1, 0))
+                    ) AS t(q, b, c)",
+                    quantiles.0, quantiles.1
+                ))
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect_err("differing quantiles");
+            assert!(err.to_string().contains("same quantile"), "{err}");
+        }
+    }
+
+    #[test]
+    fn histogram_quantile_state_with_another_quantile_does_not_merge() {
+        let mut parts = [
+            HistogramQuantileAccumulator::default(),
+            HistogramQuantileAccumulator::default(),
+        ];
+        for (acc, q) in parts.iter_mut().zip([0.25, 0.75]) {
+            acc.add(Some(q), Some(vec![1.0, 2.0]), Some(vec![1, 1, 0]))
+                .expect("add");
+        }
+        let mut merged = HistogramQuantileAccumulator::default();
+        let [first, second] = &mut parts;
+        for (acc, ok) in [(first, true), (second, false)] {
+            let state: Vec<ArrayRef> = acc
+                .state()
+                .expect("state")
+                .into_iter()
+                .map(|s| s.to_array().expect("array"))
+                .collect();
+            assert_eq!(merged.merge_batch(&state).is_ok(), ok);
+        }
     }
 
     #[tokio::test]
