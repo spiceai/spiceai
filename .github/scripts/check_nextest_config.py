@@ -105,6 +105,7 @@ ZERO_RETRY_BINARIES = frozenset(
         # nothing but repeated runs of ~250s of tests before the same failure.
         "cayenne::integration::result_correctness_vs_duckdb_test",
         "cayenne::integration::result_correctness_vs_sqlite_test",
+        "runtime::integration::result_correctness",
     }
 )
 
@@ -276,6 +277,19 @@ def selectors_matched(filter_expr: str) -> set[str]:
     return selectors | set(_BINARY_EQ_TERM.findall(rest))
 
 
+def selected(key: str, filter_expr: str) -> bool:
+    """Return whether the filter expression selects the test set `key`.
+
+    A `package::binary::module` key is also selected by a `binary(=binary)` term,
+    which selects every module of that binary, as nextest applies it.
+    """
+    selectors = selectors_matched(filter_expr)
+    if key in selectors:
+        return True
+    parts = key.split("::")
+    return len(parts) == 3 and parts[1] in selectors
+
+
 def resolve(config: dict, binary: str, setting: str) -> object | None:
     """Resolve `setting` for the test set `binary` the way nextest does.
 
@@ -286,7 +300,7 @@ def resolve(config: dict, binary: str, setting: str) -> object | None:
     for override in profile.get("overrides", []):
         if setting not in override:
             continue
-        if binary in selectors_matched(override.get("filter", "")):
+        if selected(binary, override.get("filter", "")):
             return override[setting]
     return profile.get(setting)
 
@@ -419,7 +433,7 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
 def has_override_setting(config: dict, binary: str, setting: str) -> bool:
     """Return whether an override — not the profile default — supplies `setting`."""
     return any(
-        setting in override and binary in selectors_matched(override.get("filter", ""))
+        setting in override and selected(binary, override.get("filter", ""))
         for override in config.get("profile", {}).get("default", {}).get("overrides", [])
     )
 

@@ -679,7 +679,7 @@ pub(crate) fn engine_to_acceleration_engine(engine: Engine) -> Option<Accelerati
 
 /// The write destination selected for an accelerated, writable dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcceleratedWriteMode {
+pub(crate) enum AcceleratedWriteMode {
     /// Writes go only to the local accelerator (source is read-only or discards writes).
     AcceleratorOnly,
     /// Writes commit to the accelerator first, then reconcile to the federated source.
@@ -696,7 +696,7 @@ enum AcceleratedWriteMode {
 /// `WriteThrough` path sends every row to the discarding sink and leaves the accelerated
 /// table stuck "loading initial data" forever — so accelerated `sink:` datasets must write
 /// directly to the accelerator instead.
-fn select_accelerated_write_mode(
+pub(crate) fn select_accelerated_write_mode(
     source: &str,
     allows_write: bool,
     configured_write_mode: spicepod::acceleration::WriteMode,
@@ -7252,11 +7252,17 @@ async fn build_snapshot_refresh_state(
 
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
+    let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
+    // The initial provider serves the restored snapshot; the engine may reclaim
+    // what an earlier process left that this snapshot no longer references.
+    accelerator
+        .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
+        .await;
 
     Ok(SnapshotRefreshState {
         manager,
         accelerator,
-        source: Arc::new(dataset.clone()),
+        source,
         swappable_provider,
         provider_factory,
         current_snapshot_id,

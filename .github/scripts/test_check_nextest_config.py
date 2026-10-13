@@ -41,7 +41,7 @@ filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 [[profile.default.overrides]]
-filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/))'
+filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/)) | (binary_id(=runtime::integration) & test(/^result_correctness::/))'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
 """
@@ -229,6 +229,42 @@ class ResolveTest(unittest.TestCase):
             {"period": "60s", "terminate-after": 2},
         )
 
+    def test_a_whole_binary_override_applies_to_its_modules_in_order(self):
+        """nextest takes the first override a test matches, and a module of a
+        binary matches a filter that selects the whole binary."""
+        module = "cayenne::integration::mutation_property_test"
+        config = {
+            "profile": {
+                "default": {
+                    "retries": 3,
+                    "overrides": [
+                        {"filter": "binary(=integration)", "retries": 5},
+                        {
+                            "filter": "(binary_id(=cayenne::integration) & test(/^mutation_property_test::/))",
+                            "retries": 0,
+                        },
+                    ],
+                }
+            }
+        }
+        self.assertEqual(check_nextest_config.resolve(config, module, "retries"), 5)
+        # With only the whole-binary override left, it alone has to count as an
+        # override that supplies the setting.
+        whole_binary_only = {
+            "profile": {
+                "default": {
+                    "retries": 3,
+                    "overrides": [{"filter": "binary(=integration)", "retries": 5}],
+                }
+            }
+        }
+        self.assertTrue(
+            check_nextest_config.has_override_setting(whole_binary_only, module, "retries")
+        )
+        # A whole-binary filter for a different binary does not match.
+        config["profile"]["default"]["overrides"][0]["filter"] = "binary(=retention_oom)"
+        self.assertEqual(check_nextest_config.resolve(config, module, "retries"), 0)
+
     def test_falls_back_to_the_profile_default(self):
         config = {"profile": {"default": {"retries": 5, "overrides": []}}}
         self.assertEqual(check_nextest_config.resolve(config, "z_test", "retries"), 5)
@@ -345,6 +381,29 @@ class CheckConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             problems = check_nextest_config.check_config(write(tmp, config))
         self.assertTrue(any("no longer has retries = 0" in p for p in problems))
+
+    def test_rejects_dropping_a_module_from_the_parity_override(self):
+        """Each zero-retry module is guarded on its own, not only through its block-mates.
+
+        Deleting one clause from the shared filter leaves the others intact, so
+        the module silently falls back to the default retries and a parity
+        mismatch is retried until a run happens to pass.
+        """
+        config = FIXED_CONFIG.replace(
+            " | (binary_id(=runtime::integration) & test(/^result_correctness::/))", ""
+        )
+        self.assertNotEqual(config, FIXED_CONFIG)
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(
+            [p for p in problems if "no longer has retries = 0" in p],
+            [
+                "nextest.toml: runtime::integration::result_correctness no longer has "
+                "retries = 0. These tests assert the accelerated table converges to a "
+                "reference model; a retry that passes hides a real race instead of "
+                "working around flakiness."
+            ],
+        )
 
     def test_rejects_removing_the_ceiling_from_a_zero_retry_binary(self):
         """A bare period cannot kill a test — including a genuinely hung one.

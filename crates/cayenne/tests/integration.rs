@@ -36,6 +36,8 @@ mod support;
 mod acid_compliance_test;
 mod adaptive_layout_test;
 mod anti_join_sort_merge_null_aware_test;
+mod bulk_load_fold_test;
+mod bulk_load_index_coverage_test;
 mod catalog_concurrency_test;
 mod catalog_selector_test;
 mod cdc_compaction_delete_race_test;

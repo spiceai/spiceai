@@ -1687,6 +1687,223 @@ mod tests {
                 "once caught up, the lookup is answered from the index: {after:?}"
             );
         }
+
+        /// Replaces the table's rows with `batch`, as a full refresh does.
+        async fn overwrite(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+            use datafusion::dataframe::DataFrameWriteOptions;
+            use datafusion::logical_expr::dml::InsertOp;
+            let ctx = SessionContext::new();
+            ctx.register_table(NAME, Arc::clone(table) as Arc<dyn TableProvider>)
+                .expect("register");
+            ctx.read_batch(batch)
+                .expect("read batch")
+                .write_table(
+                    NAME,
+                    DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+                )
+                .await
+                .expect("overwrite");
+        }
+
+        /// Archives the writer's directories the way the runtime does after a
+        /// refresh: under the index persistence hold, then restores the archive
+        /// into `root` and reopens it there.
+        async fn snapshot_and_reopen(
+            env: &Arc<RuntimeEnv>,
+            table: &Arc<CayenneTableProvider>,
+            catalog: &Arc<CayenneCatalog>,
+            (meta, data): (&Path, &Path),
+            root: &Path,
+        ) -> Arc<CayenneTableProvider> {
+            let archive = root.with_extension("tar");
+            {
+                let _hold = table.persist_lookup_index_for_snapshot().await;
+                snapshot(catalog, meta, data, &archive).await;
+            }
+            let (reader_catalog, reader_data) = restore(&archive, root).await;
+            open(env, reader_catalog, &reader_data, IndexPersistence::Enabled).await
+        }
+
+        /// A snapshot taken the moment a full refresh returns carries the
+        /// refresh's index runs, so a table restored from it covers every file
+        /// without a build. The runs of a write persist in the background; the
+        /// runtime snapshots straight after a refresh, and without the hold the
+        /// archive held only the runs of the replaced files in 7 of 10 rounds
+        /// (`covered_files=0 uncovered_files=8`). Regression test for #14803.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_snapshot_right_after_a_full_refresh_carries_its_runs() {
+            if !cfg!(unix) {
+                return;
+            }
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let table = open(&env, Arc::clone(&catalog), &data, IndexPersistence::Enabled).await;
+            for round in 0..5_i64 {
+                let first = round * 1_000_000;
+                overwrite(&table, rows(first, 400_000)).await;
+                let reader = snapshot_and_reopen(
+                    &env,
+                    &table,
+                    &catalog,
+                    (&meta, &data),
+                    &tmp.path().join(format!("r{round}")),
+                )
+                .await;
+                let restored = reader
+                    .verify_lookup_index_against_read_back()
+                    .await
+                    .expect("verify");
+                let counters = reader.lookup_index_counters().expect("indexed");
+                assert!(
+                    restored.agrees()
+                        && restored.files > 1
+                        && restored.uncovered_files == 0
+                        && counters.builds_started == 0,
+                    "round {round}: the restore must be covered by the refresh's runs, not a build: {restored:?} {counters:?}"
+                );
+                assert_eq!(lookup(&reader, first + 123_457).await, 1);
+                let after = reader.lookup_index_counters().expect("indexed");
+                assert_eq!(
+                    (after.full - counters.full, after.none - counters.none),
+                    (1, 0),
+                    "round {round}: the first lookup is answered from the restored index: {after:?}"
+                );
+            }
+        }
+
+        /// While the snapshot hold is held, a write's runs are not persisted, so
+        /// no run file the archive lists is replaced or deleted under it; once
+        /// the hold drops, they are.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn the_snapshot_hold_keeps_the_persisted_runs_until_it_drops() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, _meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let table = open(&env, Arc::clone(&catalog), &data, IndexPersistence::Enabled).await;
+            let before = persisted(&catalog, &data, 2).await;
+            let hold = table.persist_lookup_index_for_snapshot().await;
+            overwrite(&table, rows(500_000, 5_000)).await;
+            // Asserting that a sync does NOT run takes a window of time: the
+            // write's sync is spawned when the write returns, so it has had
+            // this long to replace the runs were the hold not blocking it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let table_id = catalog.get_table(NAME).await.expect("table").table_id;
+            let mut registered: Vec<(String, String)> = catalog
+                .list_index_runs(&table_id)
+                .await
+                .expect("list runs")
+                .into_iter()
+                .map(|run| (run.index_key, run.run_name))
+                .collect();
+            registered.sort();
+            assert_eq!(
+                registered, before,
+                "no run is registered or removed while held"
+            );
+            assert_eq!(
+                run_files(&data),
+                before.len(),
+                "no run file changes while held"
+            );
+            drop(hold);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let now = persisted(&catalog, &data, 1).await;
+                if now != before {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the overwrite's runs were never persisted after the hold dropped"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// A table restored without its index runs (here, the archive lost
+        /// them) indexes every uncovered file in `catch_up_lookup_index`, and
+        /// is fully covered when it returns: no lookup reads a file in full.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn catching_up_indexes_a_restore_that_lost_its_runs() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let archive = tmp.path().join("snapshot.tar");
+            snapshot(&catalog, &meta, &data, &archive).await;
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            for run in run_file_paths(&reader_data) {
+                std::fs::remove_file(run).expect("drop a restored run file");
+            }
+            let reader = open(
+                &env,
+                reader_catalog,
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            let restored = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            assert!(
+                restored.uncovered_files > 0,
+                "the restore starts uncovered: {restored:?}"
+            );
+
+            reader.catch_up_lookup_index().await;
+            let caught_up = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            let counters = reader.lookup_index_counters().expect("indexed");
+            assert!(
+                caught_up.agrees()
+                    && caught_up.files > 0
+                    && caught_up.uncovered_files == 0
+                    && counters.builds_started == 1,
+                "catching up returns once every file is indexed: {caught_up:?} {counters:?}"
+            );
+            assert_eq!(lookup(&reader, 24_007).await, 1);
+            let after = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (after.full - counters.full, after.none - counters.none),
+                (1, 0),
+                "the first lookup is answered from the index: {after:?}"
+            );
+        }
+
+        /// Catching up a table its runs already cover starts no build.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn catching_up_a_covered_table_builds_nothing() {
+            if !cfg!(unix) {
+                return;
+            }
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let archive = tmp.path().join("snapshot.tar");
+            snapshot(&catalog, &meta, &data, &archive).await;
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            let reader = open(
+                &env,
+                reader_catalog,
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            reader.catch_up_lookup_index().await;
+            let verification = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            let counters = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (verification.uncovered_files, counters.builds_started),
+                (0, 0),
+                "{verification:?} {counters:?}"
+            );
+        }
     }
 
     /// A key-upsert table holding one row, plus `orphans` orphan-eligible key

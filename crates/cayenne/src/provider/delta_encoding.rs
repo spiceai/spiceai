@@ -130,6 +130,19 @@ pub(crate) enum WriteClass {
 pub(crate) struct WritePolicy {
     pub(crate) class: WriteClass,
     pub(crate) fan_out: crate::provider::table::EncodeFanOut,
+    pub(crate) routing: ShardRouting,
+}
+
+/// How a sharded write assigns its input to the shard encoders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShardRouting {
+    /// Split every batch row-wise on the shard key (configured, inferred, or
+    /// the primary key), or on range bounds when the caller supplies them.
+    Key,
+    /// Hand whole batches to the shards in turn when the table requested no
+    /// layout. A row-wise split hashes every row on the single task that feeds
+    /// the encoders, which bounds a bulk load's throughput.
+    WholeBatch,
 }
 
 impl WritePolicy {
@@ -137,6 +150,17 @@ impl WritePolicy {
     pub(crate) const DELTA: Self = Self {
         class: WriteClass::Delta,
         fan_out: crate::provider::table::EncodeFanOut::Sized,
+        routing: ShardRouting::Key,
+    };
+
+    /// A load into an empty table, routed in whole batches. It writes the
+    /// table's durable files, as a full refresh's replace does, so it is
+    /// maintenance: it encodes at the full level, leaves the encode permits
+    /// reserved for deltas free, and finishes its secondary index runs before
+    /// it is visible.
+    pub(crate) const BULK_LOAD: Self = Self {
+        routing: ShardRouting::WholeBatch,
+        ..Self::MAINTENANCE
     };
 
     /// A maintenance rewrite that may shard: compaction outputs and overwrites
@@ -144,6 +168,7 @@ impl WritePolicy {
     pub(crate) const MAINTENANCE: Self = Self {
         class: WriteClass::Maintenance,
         fan_out: crate::provider::table::EncodeFanOut::Sized,
+        routing: ShardRouting::Key,
     };
 
     /// A maintenance rewrite that must emit ONE sequence of files, whatever the
@@ -151,6 +176,7 @@ impl WritePolicy {
     pub(crate) const MAINTENANCE_SERIAL: Self = Self {
         class: WriteClass::Maintenance,
         fan_out: crate::provider::table::EncodeFanOut::Serial,
+        routing: ShardRouting::Key,
     };
 }
 
