@@ -22,8 +22,9 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerInfo, Tool,
+        Implementation, ListResourceTemplatesRequestMethod, ListResourceTemplatesResult,
+        ListResourcesRequestMethod, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -495,7 +496,12 @@ impl RuntimeServer {
             tools
                 .values()
                 .filter_map(|tooling| match tooling {
-                    Tooling::Catalog { tools: catalog, .. } => Some(Arc::clone(catalog)),
+                    Tooling::Catalog {
+                        tools: catalog,
+                        default_catalog_names,
+                    } if !is_default_catalog(catalog.name(), default_catalog_names) => {
+                        Some(Arc::clone(catalog))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -702,9 +708,10 @@ impl RuntimeServer {
                 ));
             }
             ResolveOutcome::Missing => {
-                return Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >());
+                return Err(McpError::invalid_params(
+                    format!("Unknown tool: {tool_name}"),
+                    None,
+                ));
             }
         };
 
@@ -769,14 +776,22 @@ impl RuntimeServer {
             ));
         }
 
-        let result = resolved
-            .tool
-            .call(args.as_str())
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Tool execution failures are reported in-band (`isError: true`) so the
+        // model can see and react to them; only protocol errors are JSON-RPC errors.
+        let result = match resolved.tool.call(args.as_str()).await {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into());
+            }
+        };
 
-        let text = serde_json::to_string(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Tools such as `sql` already return JSON as a string; re-encoding it
+        // would make clients parse the text into a string instead of the data.
+        let text = match result {
+            Value::String(text) => text,
+            other => serde_json::to_string(&other)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
@@ -829,6 +844,28 @@ impl ServerHandler for RuntimeServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         Box::pin(async move { Ok(listed_tools_result(self.publish_listed_tools().await)) })
+    }
+
+    // The resources capability is not advertised, so reject these rather than
+    // rmcp's default of returning an empty list.
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        std::future::ready(Err(
+            McpError::method_not_found::<ListResourcesRequestMethod>(),
+        ))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        std::future::ready(Err(McpError::method_not_found::<
+            ListResourceTemplatesRequestMethod,
+        >()))
     }
 }
 
@@ -898,10 +935,19 @@ fn mcp_schemas_from_map_with_warm(
     warm: &[Arc<dyn SpiceModelTool>],
 ) -> HashMap<String, Tool> {
     let mut schemas = mcp_direct_schemas_from_map(tools);
+    // Default-catalog tools are already listed as top-level tools; listing
+    // the catalog too would advertise each one twice (`X` and `catalog__X`).
     let mut async_only = HashSet::new();
     for tooling in tools.values() {
-        if let Tooling::Catalog { tools: catalog, .. } = tooling {
+        if let Tooling::Catalog {
+            tools: catalog,
+            default_catalog_names,
+        } = tooling
+        {
             let catalog_name = catalog.name();
+            if is_default_catalog(catalog_name, default_catalog_names) {
+                continue;
+            }
             let listed = catalog.try_all();
             if listed.is_empty() {
                 async_only.insert(catalog_name.to_string());
@@ -938,6 +984,12 @@ fn mcp_schemas_from_map_with_warm(
         schemas.insert(name, fetched);
     }
     schemas
+}
+
+fn is_default_catalog(catalog_name: &str, default_catalog_names: &[String]) -> bool {
+    default_catalog_names
+        .iter()
+        .any(|name| name == catalog_name)
 }
 
 fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModelTool) -> Tool {
