@@ -31,7 +31,11 @@ use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 use tools::SpiceModelTool;
 use tools::naming::encode_tool_name;
 
-use super::{Result, catalog::McpClient, task_name_for_exposed_tool};
+use super::{
+    Result,
+    catalog::{McpClient, Reconnector},
+    task_name_for_exposed_tool,
+};
 
 pub struct McpToolWrapper {
     client: Arc<RwLock<McpClient>>,
@@ -39,15 +43,30 @@ pub struct McpToolWrapper {
 
     /// Spicepod defined name, not from underlying MCP.
     server_name: String,
+
+    /// Replaces `client` when a call finds its transport closed.
+    reconnector: Arc<Reconnector>,
 }
 
 impl McpToolWrapper {
-    pub fn new(client: Arc<RwLock<McpClient>>, spec: Tool, server_name: String) -> Self {
+    pub(crate) fn new(
+        client: Arc<RwLock<McpClient>>,
+        spec: Tool,
+        server_name: String,
+        reconnector: Arc<Reconnector>,
+    ) -> Self {
         Self {
             client,
             spec,
             server_name,
+            reconnector,
         }
+    }
+
+    /// Reconnects when `result` failed because the transport is closed (e.g. a
+    /// stdio server crashed). Returns whether the call should be retried once.
+    async fn reconnected_after_close<T>(&self, result: &Result<T, ServiceError>) -> bool {
+        matches!(result, Err(ServiceError::TransportClosed)) && self.reconnector.reconnect().await
     }
 
     #[must_use]
@@ -118,8 +137,6 @@ impl SpiceModelTool for McpToolWrapper {
         tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %self.server_name, "labels");
 
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
-            let client = self.client.read().await;
-
             let input: Value = if arg.is_empty() {
                 Value::Null
             } else {
@@ -138,13 +155,35 @@ impl SpiceModelTool for McpToolWrapper {
                 .into());
             }
 
-            let response = client
-                .call_tool(CallToolRequestParams::new(self.internal_name()).with_arguments(object(input)))
-                .await
-                .boxed()?;
+            let params = CallToolRequestParams::new(self.internal_name()).with_arguments(object(input));
+            let mut result = self.client.read().await.call_tool(params.clone()).await;
+            if self.reconnected_after_close(&result).await {
+                result = self.client.read().await.call_tool(params).await;
+            }
+            let response = result.boxed()?;
 
-            let v = serde_json::to_value(response.content).boxed()?;
-            Ok(v)
+            if response.is_error == Some(true) {
+                let text = response
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let message = if text.is_empty() {
+                    "MCP tool reported an error".to_string()
+                } else {
+                    text
+                };
+                return Err(message.into());
+            }
+
+            let content = serde_json::to_value(response.content).boxed()?;
+            Ok(match response.structured_content {
+                Some(structured) => {
+                    serde_json::json!({"content": content, "structuredContent": structured})
+                }
+                None => content,
+            })
         }
         .instrument(span.clone())
         .await;
@@ -173,18 +212,28 @@ impl McpProxy for McpToolWrapper {
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
-        let inner = self.client.read().await;
-        inner.call_tool(params).await
+        let mut result = self.client.read().await.call_tool(params.clone()).await;
+        if self.reconnected_after_close(&result).await {
+            result = self.client.read().await.call_tool(params).await;
+        }
+        result
     }
 
     async fn call_tool_once(
         &self,
         request: CallToolRequestParams,
     ) -> Result<CallToolResponse, ServiceError> {
-        let inner = self.client.read().await;
-        inner
-            .call_tool_once(rename_proxied_call(request, self.internal_name()))
+        let request = rename_proxied_call(request, self.internal_name());
+        let mut result = self
+            .client
+            .read()
             .await
+            .call_tool_once(request.clone())
+            .await;
+        if self.reconnected_after_close(&result).await {
+            result = self.client.read().await.call_tool_once(request).await;
+        }
+        result
     }
 }
 

@@ -79,8 +79,9 @@ integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 `--all --tests` compiles them either way, so an unnamed binary is built and then
 skipped. Guards were found running nowhere for that reason, in integration-test
 targets now named there: `adbc_cancellation` for the two `arrow-adbc`
-cancellation rows (fork PRs #4 and #65, which share one test), and `cpu_budget`
-for vortex's `set_available_parallelism`. (`json_semantics` is named there too; it
+cancellation rows (fork PRs #4 and #65, which share one test), and `spiced`'s
+`integration` binary, whose `cpu_budget` module guards vortex's
+`set_available_parallelism`. (`json_semantics` is named there too; it
 guarded the `datafusion-functions-json` fork, which is now taken from crates.io.)
 Nothing yet checks this automatically — adding a guard here means checking by hand that `NEXTEST_FILTER` selects the
 target it lives in, or that a workflow of its own runs it.
@@ -122,7 +123,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `7735caa2d9a839ad81aa6a1316932c99ea3019c5` | `spiceai-0.11.0-df-55` |
+| [iceberg-rust](#iceberg-rust) | `1707b349584845e802a703adca1e71f544defc5f` | `spiceai-0.11.0-df-55` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -481,6 +482,7 @@ upstream's new REST auth API.
 | SigV4 signing for REST catalogs on AWS Glue (commits `c9f1c85`, `f67e44c`; re-implemented as an `AuthManager` in `crates/catalog/rest/src/auth/sigv4.rs` by fork PR #55) | Glue-backed Iceberg catalogs fail to authenticate | build (module) + silent (signing) | `crates/runtime/src/catalogconnector/iceberg.rs` wires `rest.sigv4-enabled`; the signing itself is guarded by `crates/data_components/src/iceberg/catalog/rest/catalog.rs::a_sigv4_catalog_signs_every_request_it_sends`, with `…::a_catalog_without_sigv4_sends_no_signature` as its control |
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
+| `IcebergTableScan` decodes at the session `batch_size` (fork PR #58) | Every Iceberg scan decodes 1024-row batches, the Parquet reader's default, instead of the session's 8192, and every operator downstream pays its per-batch cost 8x as often | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_uses_the_session_batch_size` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
 | `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
 | `IcebergTableProvider::catalog` and `::table_ident` exposed (fork PR #49, on `spiceai-0.11.0-df-55`) | The Iceberg REST `loadTable` cannot load the table a provider reads, so no table can be served to an Iceberg client as itself | build | compile-guarded by `crates/runtime/src/http/v1/iceberg/passthrough.rs`, which calls both; what is served is guarded by `…::tests::an_iceberg_table_read_unchanged_is_served_as_itself` |

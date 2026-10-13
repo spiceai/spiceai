@@ -24,7 +24,7 @@ use crate::{
 use llms::{chat::try_map_boxed_error_to_box, responses::Responses};
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::component::model::Model as SpicepodModel;
+use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
 impl Runtime {
     /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
@@ -74,7 +74,16 @@ impl Runtime {
             }
         };
 
-        if let Some(model) = &responses_model
+        // `OpenAI` and Azure chat models already probe the backend at load: `/v1/responses`
+        // when `responses_api` is enabled, `/v1/chat/completions` otherwise. A second probe
+        // sends a real LLM request for no extra signal, so the Responses model is
+        // registered without one and any failure surfaces on first use.
+        let already_probed = matches!(
+            m.get_source(),
+            Some(ModelSource::OpenAi | ModelSource::Azure)
+        );
+        if !already_probed
+            && let Some(model) = &responses_model
             && let Err(e) = model.health().await
         {
             tracing::warn!(

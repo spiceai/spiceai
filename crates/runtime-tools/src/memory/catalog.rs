@@ -70,6 +70,11 @@ impl MemoryToolCatalog {
     }
 }
 
+/// Memory tools need a `memory:` dataset to read from and write to.
+fn has_memory_dataset(app: Option<&App>) -> bool {
+    app.is_some_and(|app| !app.datasets_of_connector_type("memory").is_empty())
+}
+
 impl IndividualToolFactory for MemoryToolCatalog {
     fn construct(
         &self,
@@ -103,6 +108,9 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     }
 
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        if !has_memory_dataset(self.app.read().await.as_deref()) {
+            return Vec::new();
+        }
         vec![
             Arc::new(LoadMemoryTool::new(
                 Arc::clone(&self.df),
@@ -128,6 +136,14 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     }
 
     fn try_all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
+        // A contended lock lists the tools rather than hiding them.
+        if self
+            .app
+            .try_read()
+            .is_ok_and(|app| !has_memory_dataset(app.as_deref()))
+        {
+            return Vec::new();
+        }
         ["load", "store"]
             .iter()
             .filter_map(|id| self.get_tool(id, None, None))

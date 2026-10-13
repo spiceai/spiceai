@@ -532,7 +532,7 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
 /// named in.
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::AsArray as _;
+    use datafusion::arrow::array::{AsArray as _, RecordBatch};
     use datafusion::arrow::datatypes::Int64Type;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -703,6 +703,64 @@ mod tests {
             "a scan given a limit must stop at it, not read the table and let the operator \
              above trim the result"
         );
+    }
+
+    /// Guards the session batch size passed to the fork's `IcebergTableScan`.
+    /// The size is neither the Parquet reader's 1024 nor `DataFusion`'s 8192
+    /// default, so a scan that hard-codes either one fails.
+    #[tokio::test]
+    async fn a_scan_uses_the_session_batch_size() {
+        let (catalog, ident) = catalog_with_empty_table().await;
+        let batch_size = 5000;
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(batch_size),
+        );
+        ctx.register_table("writable", Arc::new(provider_for(&catalog, &ident).await))
+            .expect("provider registers");
+        ctx.sql("INSERT INTO writable SELECT CAST(value AS BIGINT) AS id FROM generate_series(0, 19999)")
+            .await.expect("append plans").collect().await.expect("append commits");
+        let table = catalog.load_table(&ident).await.expect("table loads");
+        let files: Vec<_> = futures::TryStreamExt::try_collect(
+            table
+                .scan()
+                .build()
+                .expect("file scan builds")
+                .plan_files()
+                .await
+                .expect("files plan"),
+        )
+        .await
+        .expect("files collect");
+        assert_eq!(files.len(), 1, "fixture must contain one data file");
+        let provider = provider_for(&catalog, &ident).await;
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plans");
+        let batches = collect(plan, ctx.task_ctx()).await.expect("scan executes");
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            20_000
+        );
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).max(),
+            Some(batch_size)
+        );
+        let mut ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|id| id.expect("id is not null"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..20_000).collect::<Vec<i64>>());
     }
 
     #[tokio::test]

@@ -260,7 +260,9 @@ jobs:
           # gate sits inside an `any(...)` that `postgres`/`duckdb`/`sqlite` already satisfy.
           # `turso` alongside `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the
           # combination `make test-integration` runs.
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb,turso"
+          # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
+          # are gated on it and run nowhere else.
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb,turso"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
