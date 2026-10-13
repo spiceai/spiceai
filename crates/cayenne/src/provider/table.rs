@@ -19738,6 +19738,108 @@ impl CayenneTableProvider {
             })
     }
 
+    /// Key-range split points for a seq-prefix bake's merged output, so each of its
+    /// files holds one slice of the routing key — the leading primary-key column
+    /// unless scans filter on another more than twice as often (see
+    /// [`Self::range_routing_candidates`]) — and sorts its rows by it in runs.
+    /// Hashed, every output file spans the whole key domain, and a lookup on the
+    /// key opens every file of the merged snapshot; routed, it opens one.
+    ///
+    /// The split points are equal-count quantiles of a strided sample of the key
+    /// read from the bake's own inputs, the rows it merges. `None` keeps the hash:
+    /// one encode shard, a table with `cayenne_cluster_by` or authoritative sort
+    /// columns, or a key whose sample cannot fill the shards. Split points only
+    /// place rows: every row still reaches exactly one file, whose statistics
+    /// describe what it holds.
+    async fn bake_range_plan(
+        &self,
+        state: &dyn Session,
+        inputs: &[(String, i64)],
+        target_partitions: usize,
+        target_size_bytes: usize,
+        estimated_bytes: Option<u64>,
+    ) -> Option<OverwriteRangePlan> {
+        // As `overwrite_range_plan`.
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return None;
+        }
+        let shards = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+            EncodeFanOut::Sized,
+        );
+        if shards < 2 {
+            return None;
+        }
+        let schema = self.table_schema();
+        for (column, _) in self.range_routing_candidates(&schema) {
+            let Ok(index) = schema.index_of(&column) else {
+                continue;
+            };
+            let key_type = schema.field(index).data_type().clone();
+            let sample = match self
+                .sample_snapshots_column(state, inputs, index, &key_type, MAX_SAMPLE_ROWS)
+                .await
+            {
+                Ok(Some(sample)) => sample,
+                Ok(None) => return None,
+                Err(error) => {
+                    // Placement only: hashing keeps the merge correct, just unclustered.
+                    tracing::debug!(
+                        table = self.table_name(),
+                        column = column.as_str(),
+                        %error,
+                        "Could not sample the routing key of a seq-prefix bake; hashing it instead"
+                    );
+                    return None;
+                }
+            };
+            if sample.null_count().saturating_mul(shards) > sample.len() {
+                continue;
+            }
+            let Some(bounds) = equal_count_bounds(&sample, shards) else {
+                continue;
+            };
+            if bounds.len() + 1 < shards {
+                continue;
+            }
+            return Some(OverwriteRangePlan {
+                column,
+                bounds,
+                from_input_head: false,
+            });
+        }
+        None
+    }
+
+    /// A strided sample of column `index` across the files of the `inputs`
+    /// snapshots; see [`Self::sample_plan_column`].
+    async fn sample_snapshots_column(
+        &self,
+        state: &dyn Session,
+        inputs: &[(String, i64)],
+        index: usize,
+        data_type: &DataType,
+        max_rows: usize,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        let projection = vec![index];
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
+        for (snapshot_id, _) in inputs {
+            plans.push(
+                self.create_snapshot_scan_plan(state, snapshot_id, Some(&projection), &[], None)
+                    .await?,
+            );
+        }
+        let plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        Self::sample_plan_column(plan, state.task_ctx(), data_type, max_rows).await
+    }
+
     /// Equal-count split points for `shards` from the key column of an input's
     /// buffered head, or `None` when the head is not a fair sample of the key.
     /// See [`Self::input_range_plan`].
@@ -19884,11 +19986,23 @@ impl CayenneTableProvider {
         data_type: &DataType,
         max_rows: usize,
     ) -> DataFusionResult<Option<ArrayRef>> {
-        use arrow::array::UInt32Array;
-
         let ctx = self.create_session_context();
         let state = ctx.state();
         let plan = TableProvider::scan(self, &state, Some(&vec![index]), &[], None).await?;
+        Self::sample_plan_column(plan, ctx.task_ctx(), data_type, max_rows).await
+    }
+
+    /// A strided sample of at most about `max_rows` values of the single column
+    /// `plan` yields, cast to `data_type`. `None` when the plan yields no rows, or
+    /// far more than its statistics promised (rather than hold the column).
+    async fn sample_plan_column(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+        data_type: &DataType,
+        max_rows: usize,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        use arrow::array::UInt32Array;
+
         let total_rows = datafusion_physical_plan::StatisticsContext::new()
             .compute(
                 plan.as_ref(),
@@ -19898,7 +20012,7 @@ impl CayenneTableProvider {
             .and_then(|stats| stats.num_rows.get_value().copied());
         // Without a row count, sample sparsely rather than hold the column.
         let stride = total_rows.map_or(16, |rows| rows.div_ceil(max_rows).max(1));
-        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+        let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)?;
         let mut sampled: Vec<ArrayRef> = Vec::new();
         let mut sampled_rows = 0_usize;
         let mut position = 0_usize;
@@ -27275,14 +27389,24 @@ impl CayenneTableProvider {
             state.config().target_partitions(),
             total_input_bytes,
         );
+        // Boxed for the reason `snapshot_bytes_for_merge_budget` is.
+        let range_plan = Box::pin(self.bake_range_plan(
+            &state,
+            &selected,
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+        ))
+        .await;
         let write_result = self
-            .write_to_snapshot(
+            .write_to_snapshot_range_partitioned(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
                 super::delta_encoding::WritePolicy::MAINTENANCE,
+                range_plan.as_ref().map(OverwriteRangePlan::partitioning),
             )
             .await;
         let (total_rows, _writer_ops, _stats_acc) = match write_result {
