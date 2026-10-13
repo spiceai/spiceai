@@ -61,17 +61,22 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            // `spiceai-macos-large` in the merge queue, like `build`: on the
+            // `spiceai-macos` minis these legs queued 52.5 min at p90 for a
+            // runner and then ran for about a minute (merge_group,
+            // 2026-09-29..10-13). The standard pool on every other event.
+            const runner = context.eventName === 'merge_group' ? 'spiceai-macos-large' : 'spiceai-macos';
             const matrix = [
               {
                 name: 'self-hosted',
                 needs_env: false,
-                runner: 'spiceai-macos',
+                runner,
                 model_allowlist: 'local_phi3,hf_phi3'
               },
               {
                 name: 'hosted',
                 needs_env: true,
-                runner: 'spiceai-macos',
+                runner,
                 // Bedrock is left out until CI has credentials that can invoke it (#13558).
                 model_allowlist: 'anthropic,openai,xai'
               }
@@ -96,7 +101,11 @@ jobs:
 
   build:
     name: Build Test Binary
-    runs-on: spiceai-macos
+    # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
+    # this build queued 68 min at p90 for a runner (merge_group,
+    # 2026-09-29..10-13). The `test` legs follow it there through
+    # `setup-matrix`. The standard pool on every other event.
+    runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
     # Slowest observed success in the 2026-07-25..08-08 window: 17 min, but
     # every sample had a warm sccache. Sized against the other macOS workspace
     # builds (pr.yml peaks at 117 min) so a cold cache cannot turn a passing
