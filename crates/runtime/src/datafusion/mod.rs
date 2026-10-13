@@ -7256,11 +7256,17 @@ async fn build_snapshot_refresh_state(
 
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
+    let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
+    // The initial provider serves the restored snapshot; the engine may reclaim
+    // what an earlier process left that this snapshot no longer references.
+    accelerator
+        .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
+        .await;
 
     Ok(SnapshotRefreshState {
         manager,
         accelerator,
-        source: Arc::new(dataset.clone()),
+        source,
         swappable_provider,
         provider_factory,
         current_snapshot_id,

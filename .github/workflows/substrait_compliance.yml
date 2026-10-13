@@ -138,7 +138,7 @@ jobs:
       # commit, the nightly and a dispatch still publish the reports.
       - name: Upload JSON and CSV reports
         if: ${{ !cancelled() && github.event_name != 'merge_group' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: substrait-compliance-mode-a-tpch
           path: |
@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always() && runner.os == 'macOS' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-substrait-compliance-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -283,7 +283,7 @@ jobs:
 
       - name: Upload JSON and CSV reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: substrait-compliance-mode-b-tpch-${{ matrix.engine }}-${{ matrix.mode }}
           path: tools/substrait-compliance/results/mode-b

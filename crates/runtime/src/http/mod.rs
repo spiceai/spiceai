@@ -36,6 +36,8 @@ use runtime_tls::TlsConfig;
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
+#[cfg(feature = "mcp")]
+mod mcp_transport;
 mod mtls;
 mod response_outcome;
 mod routes;
