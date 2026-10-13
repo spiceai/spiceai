@@ -65,9 +65,9 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// a Linux virtual machine held to four CPUs, a 250K-row table rewrote itself
 /// every 1.8 s for 236 ms, 13% of the time, and its write P99 was 16% above key
 /// deletes'; paced to a tenth, its writes were even with key deletes'. On a
-/// runtime with fewer than 8 CPU cores an `auto` table keeps key deletes from the
-/// start (`CpuBudget::cayenne_keeps_small_tables_compacted`), so there the pace
-/// bounds only the rewrites that reclaim rows the bake cannot reach.
+/// runtime with fewer than 8 CPU cores, or not on Linux, an `auto` table keeps key
+/// deletes from the start ([`auto_keeps_small_tables_compacted`]), so there the
+/// pace bounds only the rewrites that reclaim rows the bake cannot reach.
 ///
 /// The pace costs reads while it holds a reclaim back, because the index grows
 /// past the trigger: a 1M-row table under 8,000 upserts a second read at a 10 ms
@@ -76,6 +76,22 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// every position-delete table measured at 8,000 upserts a second on 16 cores,
 /// which rewrote for 44–145 ms every ~6.25 s.
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
+
+/// Whether `deletion_mode: auto` may keep a small primary-key table on position
+/// deletes, compacted whole alongside its writes, on this runtime. That takes the
+/// cores for it (`CpuBudget::cayenne_keeps_small_tables_compacted`), and compaction
+/// that runs below the priority of queries and writes, which only Linux gives
+/// `spiced`'s compaction runtime: there `setpriority` lowers each of its worker
+/// threads, while on macOS it lowers the whole process, and elsewhere it is not
+/// called. On macOS with 16 cores, 20 tables of 200K rows, each upserting 8,000
+/// keys a second, wrote at a P99 76% above key deletes' on position deletes, and
+/// read 95–161% slower at the P99. Where this answers no, the accelerator and a
+/// Cayenne catalog open an `auto` table on key deletes from the start
+/// ([`crate::metadata::VortexConfig::auto_keeps_key_deletes`]).
+#[must_use]
+pub fn auto_keeps_small_tables_compacted() -> bool {
+    cfg!(target_os = "linux") && cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted()
+}
 
 /// How a primary-key table records the delete of a row right now.
 #[derive(Clone, Debug)]
@@ -194,8 +210,9 @@ impl AutoDeletionMode {
     }
 
     /// An `auto` table on key deletes from the start, in the state one opened past
-    /// its bound is in: `auto` on a runtime with too few cores to keep a small
-    /// table compacted whole alongside its writes. Opening it records no switch.
+    /// its bound is in: `auto` on a runtime where it may not keep a small table
+    /// compacted whole ([`auto_keeps_small_tables_compacted`]). Opening it records
+    /// no switch.
     pub(crate) fn on_key_deletes(max_position_bytes: u64) -> Self {
         let auto = Self::new(max_position_bytes);
         auto.position.store(false, Ordering::Release);

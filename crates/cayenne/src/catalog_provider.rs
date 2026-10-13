@@ -831,11 +831,11 @@ impl SchemaProvider for CayenneSchemaProvider {
 
 /// A builder that opens a table of a Cayenne catalog with its stored
 /// configuration, and with `deletion_mode: auto` set up for this runtime as the
-/// accelerator sets it up for a dataset. On a runtime with fewer than the cores
-/// that keep a small table compacted whole alongside its writes
-/// (`CpuBudget::cayenne_keeps_small_tables_compacted`), an `auto` table keeps key
-/// deletes from the start ([`VortexConfig::auto_keeps_key_deletes`]). The setting is
-/// not stored, so the table chooses again wherever it next opens.
+/// accelerator sets it up for a dataset. On a runtime where `auto` may not keep a
+/// small table compacted whole alongside its writes, with fewer than 8 CPU cores or
+/// not on Linux ([`crate::auto_keeps_small_tables_compacted`]), an `auto` table
+/// keeps key deletes from the start ([`VortexConfig::auto_keeps_key_deletes`]). The
+/// setting is not stored, so the table chooses again wherever it next opens.
 pub(crate) fn catalog_table_builder(
     catalog: &Arc<dyn MetadataCatalog>,
     runtime_env: &Arc<RuntimeEnv>,
@@ -843,9 +843,7 @@ pub(crate) fn catalog_table_builder(
     stored: &VortexConfig,
 ) -> CayenneTableProviderBuilder {
     let mut config = stored.clone();
-    if config.deletion_mode == DeletionMode::Auto
-        && !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted()
-    {
+    if config.deletion_mode == DeletionMode::Auto && !crate::auto_keeps_small_tables_compacted() {
         config.auto_keeps_key_deletes = true;
     }
     CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env)).with_context(

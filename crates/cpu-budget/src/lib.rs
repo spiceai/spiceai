@@ -1205,8 +1205,9 @@ impl CpuBudget {
         self.cores
     }
 
-    /// Whether Cayenne's `deletion_mode: auto` may keep a small primary-key table
-    /// on position deletes, compacted whole alongside its writes. In a Linux
+    /// Whether Cayenne's `deletion_mode: auto` has the cores to keep a small
+    /// primary-key table on position deletes, compacted whole alongside its writes.
+    /// Cayenne also requires Linux (`cayenne::auto_keeps_small_tables_compacted`). In a Linux
     /// virtual machine held to four CPUs, a 200K-row table under 2,000 upserts
     /// every 250 ms wrote at a P99 4% above key deletes' on position deletes, with
     /// mixed reads. On eight performance cores of a bare-metal Arm host its writes
