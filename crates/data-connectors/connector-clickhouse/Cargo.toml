@@ -50,6 +50,7 @@ uuid.workspace = true
 default = []
 
 [dev-dependencies]
+insta.workspace = true
 runtime = { path = "../../runtime" }
 
 [lints]

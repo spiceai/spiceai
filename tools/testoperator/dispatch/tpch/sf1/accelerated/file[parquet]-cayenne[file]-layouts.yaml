@@ -1,0 +1,23 @@
+# file[parquet]-cayenne[file].yaml with an acceleration layout configured on
+# every table (testoperator --layout, keys from test_framework::layout): each
+# feature alone, then the combinations that interact. Every run is validated
+# against the TPC-H answer files and the unaccelerated __test_reference.* clones.
+# Cayenne refuses `sort` with `cluster`, so no layout names both.
+tests:
+  bench:
+    spicepod_path: accelerated/file[parquet]-cayenne[file].yaml
+    ready_wait: 300
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    layouts:
+      - primary_key
+      - indexes
+      - sort
+      - cluster
+      - time_column
+      - partition
+      - primary_key,indexes
+      - primary_key,sort,time_column
+      - primary_key,indexes,cluster,partition
+      - primary_key,indexes,sort,time_column,partition

@@ -112,8 +112,7 @@ endif
 # the `metrics` binary into that one selection. It builds every test target
 # in the workspace, including ones the filterset never runs. Naming just the
 # wanted targets with `--test <glob>` would build fewer, but a new test file that
-# didn't match the glob would silently stop being covered — cayenne already has
-# a test target that doesn't follow the `*_test` convention its other 55 do.
+# didn't match the glob would silently stop being covered.
 #
 # `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
 # own process to control the OTel meter-provider install order. Every metrics
@@ -157,15 +156,17 @@ endif
 # Select it explicitly so the gate checks the diagnostic emitted by the pinned
 # storage dependency as well as the formatter's unit tests.
 #
-# `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
-# name for the same reason: each stands a local one-shot HTTP server up on an
+# `llms`'s `anthropic_stream_errors` and `list_models_errors` modules are
+# selected for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
-# real client's error mapping with no credentials and no external service.
-# `model2vec_hf_cache` is selected for a different reason: it is its own binary
-# because it sets a process-wide environment variable, which is only sound with
-# one test in the process.
-# `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
-# provider APIs and needs a `.env`, so it stays in the nightly gate.
+# real client's error mapping with no credentials and no external service, as
+# does `model2vec_hf_cache` against a local Hugging Face cache. They are modules
+# of `llms`'s `integration` binary; its `llms` module calls the live provider
+# APIs and needs a `.env`, so it stays in the nightly gate.
+#
+# `vortex-datafusion`'s integration tests are offline: they install the
+# process-wide segment cache and measure the footer cache's heap through a
+# counting allocator, so select every `kind(=test)` binary in the package.
 #
 # `--features` here, not a per-crate default, because the result-correctness
 # lanes are the only reason the gate links an engine at all. Cargo skips a test
@@ -221,13 +222,16 @@ print-rust-gate-features:
 # seconds of running them and cost the coverage the ledger claimed.
 # `runtime`'s `rate_control` binary holds the HTTP rate-control tests, which are
 # self-contained and gate the parameter validation and shared-origin rules.
+# `runtime`'s `cayenne_runtime_tuning` binary loads real Spicepods from a temp dir
+# and gates `runtime.adaptive_tuning` / `target_*` resolution and the
+# warnings for the retired `cayenne_tuning` / `cayenne_goal_*` names.
 # They need `runtime/rate-control`, which `rate-control` in RUST_GATE_FEATURES
 # enables for NEXTEST_SELECTION, to be built at all —
 # the target's `required-features` drops it otherwise. They are kept out of
 # `runtime`'s `integration` binary on purpose: selecting any test there makes
 # nextest execute that binary to list it, and its debug build on macOS is too
 # large to load (dyld aborts before `main`, failing the whole run).
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (binary_id(=data_components::integration) & test(=every_test_file_is_compiled)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget)) + (binary_id(=llms::integration) & (test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/) | test(=every_test_file_is_compiled)))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would

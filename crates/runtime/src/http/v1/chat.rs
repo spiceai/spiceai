@@ -111,7 +111,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
                 }
             })
         ))),
-        (status = 400, description = "The specified model is an evaluation model; use POST /v1/evaluate"),
+        (status = 400, description = "The specified model is a decision model; use POST /v1/decisions"),
         (status = 404, description = "The specified model was not found"),
         (status = 500, description = "An internal server error occurred while processing the chat completion", content((
             serde_json::Value = "application/json",
@@ -199,6 +199,12 @@ async fn handle_streaming(
     include_stream_events: bool,
 ) -> Response {
     let span = Span::current();
+    // Spice always requests usage from the provider; only forward it if the client did.
+    let include_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.include_usage)
+        .unwrap_or(false);
     let (tx, rx) = channel(100);
     let tx = Arc::new(tx);
     let (end_completion, completion_done) = oneshot::channel::<()>();
@@ -255,6 +261,7 @@ async fn handle_streaming(
         Box::pin(ReceiverStream::new(rx)),
         time::Duration::from_secs(KEEP_ALIVE_INTERVAL),
         span,
+        include_usage,
     )
 }
 
@@ -298,13 +305,21 @@ fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
     span: Span,
+    include_usage: bool,
 ) -> Response {
     Sse::new(Box::pin(stream! {
         let mut chat_output = String::new();
         let mut id: Option<String> = None;
+        let mut errored = false;
         while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
-                Ok(resp) => {
+                Ok(mut resp) => {
+                    if !include_usage {
+                        resp.usage = None;
+                        if resp.choices.is_empty() {
+                            continue;
+                        }
+                    }
                     if id.is_none() {
                         id = Some(resp.id.clone());
                     }
@@ -321,10 +336,14 @@ fn create_sse_response(
                 Err(e) => {
                     tracing::error!("Error encountered in chat completion stream: {e}");
                     yield Ok(to_openai_error_event(e.to_string()));
+                    errored = true;
                     break;
                 }
             }
         };
+        if !errored {
+            yield Ok(Event::default().data("[DONE]"));
+        }
         tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);
         if let Some(id) = id {
             tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
@@ -518,9 +537,12 @@ mod tests {
         body_str
             .split("\n\n")
             .filter_map(|e| {
+                let data = e.strip_prefix("data: ")?;
+                if data == "[DONE]" {
+                    return None;
+                }
                 let resp: CreateChatCompletionStreamResponse =
-                    serde_json::from_str(e.strip_prefix("data: ")?)
-                        .expect("Failed to deserialise SSE event");
+                    serde_json::from_str(data).expect("Failed to deserialise SSE event");
                 resp.choices
                     .first()
                     .expect("Expected a choice in SSE event")
@@ -608,8 +630,8 @@ mod tests {
         assert_eq!(body_json["param"].as_str(), Some("model"), "{body_json}");
         let message = body_json["message"].as_str().expect("message");
         assert!(
-            message.contains("/v1/evaluate"),
-            "message should direct callers to /v1/evaluate: {message}"
+            message.contains("/v1/decisions"),
+            "message should direct callers to /v1/decisions: {message}"
         );
     }
 

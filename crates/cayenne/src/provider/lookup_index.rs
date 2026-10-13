@@ -30,11 +30,9 @@ limitations under the License.
 //! A file no run covers — written before a restart, or by a write whose run
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
-//! so it takes a bounded share of a core. With the hidden
-//! `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled` switch (for testing), each run also
-//! persists as a file under the table's `_lookup_index` directory, registered
-//! in the metastore, so a reopened table loads its runs instead of reading its
-//! files back; otherwise nothing is persisted.
+//! so it takes a bounded share of a core. Each run also persists as a file
+//! under the table's `_lookup_index` directory, registered in the metastore,
+//! so a reopened table loads its runs instead of reading its files back.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -658,6 +656,15 @@ impl LookupIndexView {
             views,
             rows,
         }
+    }
+
+    /// Every key's view, each with the directory its runs persist in.
+    fn persisted_views(&self) -> Vec<(String, IndexView)> {
+        self.shapes
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .zip(self.views.iter().cloned())
+            .collect()
     }
 
     /// Whether every key's view covers the file `path` names.
@@ -1549,16 +1556,29 @@ impl LookupIndexState {
     fn repin(&self) {
         let view = LookupIndexView::of(self.shapes.load_full());
         if let Some(persisted_runs) = self.persisted_runs.get() {
-            persisted_runs.schedule(
-                view.shapes
-                    .iter()
-                    .map(|shape| shape.persisted_dir())
-                    .zip(view.views.iter().cloned())
-                    .collect(),
-            );
+            persisted_runs.schedule(view.persisted_views());
         }
         self.index.store(Arc::new(view));
         self.scan_input_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Writes every published run to disk and registers it, then holds off
+    /// further syncs until the returned hold drops, so an acceleration snapshot
+    /// taken meanwhile archives runs that cover the files it archives: the
+    /// runs of a write that just returned, which otherwise persist in the
+    /// background, and no run file a later merge retires disappears from under
+    /// the archive. A large append whose runs are still being finished in the
+    /// background is not waited for: its files restore uncovered, and the
+    /// restored table indexes them before it serves queries. `None` when the
+    /// runs do not persist (memory mode, persistence off, or not loaded yet);
+    /// an error when they could not all be written.
+    pub(crate) async fn persist_for_snapshot(&self) -> Option<Result<PersistedRunsHold, String>> {
+        let persisted_runs = Arc::clone(self.persisted_runs.get()?);
+        Some(
+            persisted_runs
+                .flush(|| self.index.load().persisted_views())
+                .await,
+        )
     }
 
     /// Persists every key's runs as run files under `root`, registered in
@@ -2566,10 +2586,6 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
 
-/// Whether a table's secondary index runs persist as run files. Hidden,
-/// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
-pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
-
 /// Serializes persistence for one durable table location across provider opens.
 /// The weak owner fences work queued by providers that have been replaced.
 struct PersistenceCoordinator {
@@ -2591,6 +2607,12 @@ impl PersistenceCoordinator {
         registry.insert(location, Arc::downgrade(&coordinator));
         coordinator
     }
+}
+
+/// Keeps the table's persisted runs exactly as [`LookupIndexState::persist_for_snapshot`]
+/// left them until dropped: no run is written, registered, or deleted meanwhile.
+pub(crate) struct PersistedRunsHold {
+    _owner: tokio::sync::OwnedMutexGuard<std::sync::Weak<()>>,
 }
 
 /// Every key's runs, persisted one file per run under the table's
@@ -2756,6 +2778,27 @@ impl PersistedRuns {
                 tracing::debug!(table = %self.table_name, %error, "Persisted secondary index runs were not synced; the next change retries");
             }
         }
+    }
+
+    /// Syncs the views `views` returns, taken once no other sync is running, and
+    /// holds off every later sync until the returned hold drops.
+    async fn flush(
+        &self,
+        views: impl FnOnce() -> Vec<(String, IndexView)>,
+    ) -> Result<PersistedRunsHold, String> {
+        if !self.loaded.load(Ordering::Acquire) {
+            return Err("the persisted runs have not been loaded".to_string());
+        }
+        let generation = Arc::clone(&self.coordinator.owner).lock_owned().await;
+        if !std::sync::Weak::ptr_eq(&generation, &Arc::downgrade(&self.owner)) {
+            return Err("a newer instance of the table persists its runs".to_string());
+        }
+        let views = views();
+        if !distinct_dirs(views.iter().map(|(dir, _)| dir.as_str())) {
+            return Err("two keys share a run directory".to_string());
+        }
+        self.sync_views(&views).await?;
+        Ok(PersistedRunsHold { _owner: generation })
     }
 
     fn path(&self, key: &str, run_name: &str) -> object_store::path::Path {
@@ -3177,13 +3220,14 @@ pub(crate) type ListLive =
 /// background by reading them back, and publishes the runs against the file
 /// set `list_live` reports once they are built, so a file that left the set
 /// meanwhile is never covered. Failures leave those files read in full
-/// until the schedule allows another attempt.
+/// until the schedule allows another attempt. The returned handle finishes once
+/// the build has published or given up.
 pub(crate) fn spawn_build(
     claim: BuildClaim,
     store: Arc<dyn ObjectStore>,
     files: Vec<IndexedFile>,
     list_live: ListLive,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let state = Arc::clone(&claim.state);
         let table = state.table_name.clone();
@@ -3228,7 +3272,7 @@ pub(crate) fn spawn_build(
                 claim.unpublished();
             }
         }
-    });
+    })
 }
 
 /// One run builder per key over `files`, read back from the finished files.

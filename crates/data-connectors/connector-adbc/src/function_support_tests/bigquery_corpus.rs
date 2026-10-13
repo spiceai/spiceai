@@ -284,6 +284,70 @@ fn rounding_cast_partial(
     Ok(())
 }
 
+/// The queries an aggregate's argument-list `ORDER BY` keeps from federating
+/// whole, and the number of remote subtrees each one keeps.
+///
+/// The unparser writes an aggregate `ORDER BY` only as `WITHIN GROUP`, and the
+/// `BigQuery` dialect renders none of its own, so a federated
+/// `ARRAY_AGG(x ORDER BY y)` reached `BigQuery` as `ARRAY_AGG(x)` and came back
+/// in whatever order `BigQuery` produced: queries 085, 086 and 087 then read each
+/// array's first element as its earliest row, and query 226 lists rule names in
+/// an order it asked for. `runtime_udfs_api::aggregate_clauses_survive_unparsing`
+/// keeps such an aggregate local, and each plan splits around it. The five
+/// ordered `ARRAY_AGG`s of 085–087 sit in a CTE that the outer query joins to
+/// others, so those joins run locally over the remote subtrees; 226 keeps its one
+/// scan and lifts the aggregate above it.
+///
+/// Rendering the ordering inside the call, as the `DuckDB` dialect does, would
+/// return each of these to `fully_federated` and delete its entry here.
+const ORDERED_AGGREGATE_PARTIAL: [(usize, usize); 4] = [(85, 3), (86, 6), (87, 3), (226, 1)];
+
+/// The expected remote-subtree count where `index` is an
+/// [`ORDERED_AGGREGATE_PARTIAL`] query, and `None` where it is not.
+fn ordered_aggregate_remotes(index: usize) -> Option<usize> {
+    ORDERED_AGGREGATE_PARTIAL
+        .iter()
+        .find(|(query, _)| *query == index)
+        .map(|(_, remotes)| *remotes)
+}
+
+/// A query whose plan an ordered aggregate splits must keep exactly the remote
+/// subtrees [`ORDERED_AGGREGATE_PARTIAL`] records, and must still evaluate an
+/// ordered aggregate locally — a plan that federates it again is not this case
+/// and belongs back under `fully_federated`.
+fn ordered_aggregate_partial(
+    plan: &dyn ExecutionPlan,
+    expected: usize,
+) -> std::result::Result<(), String> {
+    let remotes = remote_nodes(plan).len();
+    if remotes != expected {
+        return Err(format!(
+            "ordered-aggregate case expected {expected} remote nodes, got {remotes}"
+        ));
+    }
+    if !local_ordered_aggregate(plan) {
+        return Err("ordered-aggregate case has no local ordered aggregate left".into());
+    }
+    Ok(())
+}
+
+/// Whether a node outside the remote subtrees aggregates with an argument-list
+/// `ORDER BY`, which an `AggregateExec` displays as `array_agg(x) ORDER BY [y …]`.
+fn local_ordered_aggregate(plan: &dyn ExecutionPlan) -> bool {
+    if plan.is::<VirtualExecutionPlan>() {
+        return false;
+    }
+    (plan.name() == "AggregateExec"
+        && displayable(plan)
+            .one_line()
+            .to_string()
+            .contains(") ORDER BY ["))
+        || plan
+            .children()
+            .iter()
+            .any(|child| local_ordered_aggregate(child.as_ref()))
+}
+
 /// Query 241 computes median and approximate-percentile windows locally because
 /// the `BigQuery` policy rejects those window forms. The source joins, JSON
 /// extraction and aggregation must still form a single remote subtree.
@@ -380,6 +444,8 @@ async fn check_query(
             percentile_window_partial(plan.as_ref())
         } else if let Some(expected) = rounding_cast_remotes(index) {
             rounding_cast_partial(plan.as_ref(), expected)
+        } else if let Some(expected) = ordered_aggregate_remotes(index) {
+            ordered_aggregate_partial(plan.as_ref(), expected)
         } else {
             fully_federated(plan.as_ref())
         };
@@ -434,8 +500,9 @@ async fn run_corpus() {
         "planning attempted remote execution"
     );
     eprintln!(
-        "BigQuery corpus: 271 checked (259 full, {} rounding-cast partial, 1 percentile partial, 8 table-free), {} failures, {:.2}s; no remote statements",
+        "BigQuery corpus: 271 checked (255 full, {} rounding-cast partial, {} ordered-aggregate partial, 1 percentile partial, 8 table-free), {} failures, {:.2}s; no remote statements",
         ROUNDING_CAST_PARTIAL.len(),
+        ORDERED_AGGREGATE_PARTIAL.len(),
         failures.len(),
         started.elapsed().as_secs_f64()
     );

@@ -42,7 +42,7 @@ limitations under the License.
 //! in `crates/runtime/tests/acceleration/cayenne_memory.rs`. This path needs a
 //! real CDC source to reach through the runtime, so it is driven directly here.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

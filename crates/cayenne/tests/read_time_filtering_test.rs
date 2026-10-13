@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! These tests verify that deletion vector filtering is applied during reads.
 
-mod common;
+use crate::common;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 
