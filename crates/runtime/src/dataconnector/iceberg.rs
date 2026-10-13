@@ -152,7 +152,7 @@ impl IcebergDataConnector {
         let source = dataset.path();
         let table_source = self.table_source(source);
 
-        if let TableSource::MetadataFileInFrom = table_source {
+        if matches!(table_source, TableSource::MetadataFileInFrom) {
             return Err(Error::InvalidConfigurationNoSource {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
@@ -438,7 +438,7 @@ impl DataConnector for IcebergDataConnector {
         // before anything is built: an Iceberg insert writes its data files before
         // the commit that would be rejected, which would leave orphan files in a
         // table location Spice usually does not own.
-        if let TableSource::Pinned(_) = self.table_source(dataset.path()) {
+        if matches!(self.table_source(dataset.path()), TableSource::Pinned(_)) {
             return Some(Err(Error::InvalidConfigurationNoSource {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
