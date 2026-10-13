@@ -1297,6 +1297,11 @@ pub enum SettingsChangeAction {
     /// would not bring back.
     #[default]
     KeepStored,
+    /// Keep the settings the table was built with while its source cannot be read on
+    /// the table's schema — unreachable, or with a schema change the runtime holds back:
+    /// a rebuilt table could not reload until it can. Warns why, and how to let the
+    /// rebuild happen.
+    HoldUntilSourceReadable,
     /// Refuse to open the table with
     /// [`crate::catalog::CatalogError::SettingsChangeRequiresRebuild`], so the caller
     /// drops it and creates it again with the requested settings.

@@ -215,6 +215,22 @@ impl Display for Mode {
     }
 }
 
+/// Whether a registration may rebuild an existing acceleration whose stored table was
+/// built with settings it cannot adopt in place
+/// ([`Acceleration::rebuilds_on_settings_change`]). Runtime state, never configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsRebuild {
+    /// The storage and refresh modes decide.
+    #[default]
+    Allowed,
+    /// The source cannot be read on the schema the existing acceleration was built with
+    /// — it is unreachable, or the dataset's `on_schema_change` policy holds back its
+    /// schema change — so the runtime keeps serving that acceleration. A rebuilt table
+    /// could not reload until the source can be read again, so the stored settings are
+    /// kept meanwhile.
+    HeldUntilSourceReadable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageProfile {
     #[default]
@@ -572,6 +588,11 @@ pub struct Acceleration {
     pub snapshots_reset_expiry_on_load_enabled: bool,
 
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
+
+    /// Whether this registration may rebuild the existing acceleration for changed
+    /// settings. Runtime state set for a single registration, never configured; see
+    /// [`SettingsRebuild`].
+    pub settings_rebuild: SettingsRebuild,
 }
 
 /// What durable write-back has to deliver on, given a primary key's columns.
@@ -647,9 +668,14 @@ impl Acceleration {
     /// append window, or a change stream that resumes from a position recorded outside
     /// the table and so never re-delivers what was dropped — and `mode: memory` and
     /// `mode: file_create` keep no table across a restart.
+    ///
+    /// A registration that cannot read its source on the acceleration's schema never
+    /// rebuilds ([`SettingsRebuild::HeldUntilSourceReadable`]).
     #[must_use]
     pub fn rebuilds_on_settings_change(&self, refresh_mode: RefreshMode) -> bool {
-        matches!(self.mode, Mode::File | Mode::FileUpdate) && refresh_mode == RefreshMode::Full
+        self.settings_rebuild == SettingsRebuild::Allowed
+            && matches!(self.mode, Mode::File | Mode::FileUpdate)
+            && refresh_mode == RefreshMode::Full
     }
 
     #[must_use]
@@ -1151,6 +1177,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
             ),
             snapshots_creation_policy: acceleration.snapshots_creation_policy,
+            settings_rebuild: SettingsRebuild::default(),
         })
     }
 }
@@ -1197,6 +1224,7 @@ impl Default for Acceleration {
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load_enabled: false,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
+            settings_rebuild: SettingsRebuild::default(),
         }
     }
 }
@@ -2272,11 +2300,19 @@ mod tests {
                 mode,
                 ..Acceleration::default()
             };
+            let held = Acceleration {
+                settings_rebuild: SettingsRebuild::HeldUntilSourceReadable,
+                ..acceleration.clone()
+            };
             for (refresh_mode, expected) in refresh_modes.iter().zip(expected) {
                 assert_eq!(
                     acceleration.rebuilds_on_settings_change(*refresh_mode),
                     expected,
                     "mode: {mode}, refresh_mode: {refresh_mode:?}"
+                );
+                assert!(
+                    !held.rebuilds_on_settings_change(*refresh_mode),
+                    "a source that cannot be read holds the rebuild: mode: {mode}, refresh_mode: {refresh_mode:?}"
                 );
             }
         }

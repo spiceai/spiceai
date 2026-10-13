@@ -168,7 +168,7 @@ impl UnreachableSource {
     }
 
     /// Adds a column `w` to the source's schema, as a source-side schema change.
-    fn add_column(&self) {
+    pub(crate) fn add_column(&self) {
         self.extra_column.store(true, Ordering::SeqCst);
     }
 

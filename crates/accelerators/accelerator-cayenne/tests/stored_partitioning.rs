@@ -31,7 +31,7 @@ use datafusion::{
 };
 use runtime_acceleration::{
     Engine,
-    acceleration::{Acceleration, Mode, RefreshMode},
+    acceleration::{Acceleration, Mode, RefreshMode, SettingsRebuild},
     testing::TestAccelerationSource,
 };
 
@@ -54,11 +54,31 @@ async fn table(
     partition_by: &[&str],
     refresh_mode: RefreshMode,
 ) -> Result<Arc<dyn TableProvider>, String> {
+    table_with(
+        ctx,
+        dir,
+        partition_by,
+        refresh_mode,
+        SettingsRebuild::Allowed,
+    )
+    .await
+}
+
+/// [`table`], registered with the runtime's decision on rebuilding it for changed
+/// settings.
+async fn table_with(
+    ctx: &SessionContext,
+    dir: &Path,
+    partition_by: &[&str],
+    refresh_mode: RefreshMode,
+    settings_rebuild: SettingsRebuild,
+) -> Result<Arc<dyn TableProvider>, String> {
     let source = TestAccelerationSource::new("t").with_acceleration(Acceleration {
         enabled: true,
         engine: Engine::Cayenne,
         mode: Mode::File,
         refresh_mode: Some(refresh_mode),
+        settings_rebuild,
         partition_by: partition_by
             .iter()
             .map(|column| spicepod::partitioning::PartitionedBy {
@@ -252,4 +272,34 @@ async fn repartitioning_a_full_refresh_acceleration_rebuilds_it() {
             )
         );
     }
+}
+
+/// A full-refresh acceleration whose rebuild the runtime holds until its source can be
+/// read cannot serve its rows under the new partitioning meanwhile, so the change is
+/// refused, with the fixes that apply then, and the stored data is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_repartitioning_is_refused_until_the_source_can_be_read() {
+    let dir = tempfile::tempdir().expect("dir");
+    store(dir.path(), &[]).await;
+
+    let error = table_with(
+        &SessionContext::new(),
+        dir.path(),
+        &["w"],
+        RefreshMode::Full,
+        SettingsRebuild::HeldUntilSourceReadable,
+    )
+    .await
+    .expect_err("a held rebuild must not open unpartitioned data as partitioned");
+    assert_eq!(
+        error,
+        "Acceleration creation failed: Failed to load dataset t (cayenne): its acceleration data was written without 'partition_by', but the dataset now sets 'partition_by: [w]'. Applying it rebuilds the acceleration from the source, which cannot be read on the acceleration's schema yet. To keep using the existing data, remove 'partition_by'. To apply the new 'partition_by', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/features/data-acceleration/partitioning"
+    );
+
+    let ctx = SessionContext::new();
+    let table = table(&ctx, dir.path(), &[], RefreshMode::Full)
+        .await
+        .expect("the stored data reopens under its own partitioning");
+    ctx.register_table("t", table).expect("register");
+    assert_eq!(ids(&ctx).await, [1, 2]);
 }

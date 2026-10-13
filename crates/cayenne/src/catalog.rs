@@ -251,6 +251,15 @@ pub enum CatalogError {
     ))]
     PkConflictDetectionEnabledOnExistingTable { table_name: String },
 
+    /// [`Self::PkConflictDetectionEnabledOnExistingTable`] for a table the caller would
+    /// rebuild, but holds until its source can be read
+    /// (`SettingsChangeAction::HoldUntilSourceReadable`): the stored rows cannot be
+    /// served under the check meanwhile.
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. Applying 'auto' rebuilds the table from its source, which cannot be read on the table's schema yet. To keep using the existing data, set 'cayenne_pk_conflict_detection' back to 'none'. To apply 'auto', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionChangeHeld { table_name: String },
+
     #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
     ))]

@@ -63,7 +63,7 @@ use data_accelerator_api::{
 };
 use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
-use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode};
+use runtime_acceleration::acceleration::{Acceleration, Mode, RefreshMode, SettingsRebuild};
 use runtime_acceleration::acceleration_source::{
     rebuilds_on_settings_change, resolved_refresh_mode,
 };
@@ -136,6 +136,27 @@ pub enum Error {
         configured: Vec<String>,
         data_dir: String,
         metadata_dir: String,
+    },
+
+    /// [`Self::PartitionByChanged`] for a dataset the runtime would rebuild, but holds
+    /// until its source can be read (`SettingsRebuild::HeldUntilSourceReadable`): the
+    /// stored rows cannot be served under the new partitioning meanwhile.
+    #[snafu(display(
+        "Failed to load dataset {dataset} (cayenne): its acceleration data was written {}, but the dataset now sets {}. \
+        Applying it rebuilds the acceleration from the source, which cannot be read on the acceleration's schema yet. \
+        To keep using the existing data, {}. \
+        To apply the new 'partition_by', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). \
+        See: https://spiceai.org/docs/features/data-acceleration/partitioning",
+        stored_partitioning(stored),
+        configured_partition_by(configured),
+        restore_partition_by(stored)
+    ))]
+    PartitionByChangeHeld {
+        dataset: Arc<str>,
+        /// The partition columns the stored data was written with; empty when it is unpartitioned.
+        stored: Vec<String>,
+        /// The dataset's `partition_by` expressions.
+        configured: Vec<String>,
     },
 
     /// The dataset's stored table was built with settings it cannot adopt in place, and
@@ -1200,8 +1221,19 @@ fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(error), |error| error.source()).any(|error| {
         matches!(
             error.downcast_ref::<cayenne::CatalogError>(),
-            Some(cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable { .. })
+            Some(
+                cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable { .. }
+                    | cayenne::CatalogError::PkConflictDetectionChangeHeld { .. }
+            )
         )
+    })
+}
+
+/// Whether the runtime holds this registration's rebuild for changed settings until its
+/// source can be read ([`SettingsRebuild::HeldUntilSourceReadable`]).
+fn rebuild_held(acceleration: Option<&Acceleration>) -> bool {
+    acceleration.is_some_and(|acceleration| {
+        acceleration.settings_rebuild == SettingsRebuild::HeldUntilSourceReadable
     })
 }
 
@@ -2799,6 +2831,9 @@ impl CayenneAccelerator {
         // they are and dropped with their parent.
         if rebuilds_on_settings_change(source) {
             vortex_config.settings_change = cayenne::metadata::SettingsChangeAction::Rebuild;
+        } else if rebuild_held(acceleration) {
+            vortex_config.settings_change =
+                cayenne::metadata::SettingsChangeAction::HoldUntilSourceReadable;
         }
 
         // Build S3 object store if using S3 Express One Zone storage. Memory mode
@@ -4335,6 +4370,7 @@ impl DataAccelerator for CayenneAccelerator {
                     | Error::InvalidScanConcurrency { .. }
                     | Error::UnsupportedDataTypes { .. }
                     | Error::PartitionByChanged { .. }
+                    | Error::PartitionByChangeHeld { .. }
             )
         ) || rejects_stored_table(error)
     }
@@ -4739,7 +4775,8 @@ fn restore_partition_by(stored: &[String]) -> &'static str {
 /// A dataset that is [rebuilt](rebuilds_on_settings_change) on such a change gets
 /// [`Error::PartitionByChangeRequiresRebuild`], after `table`'s maintenance is
 /// quiesced: the rebuild deletes the files that maintenance would otherwise still be
-/// working on.
+/// working on. One whose rebuild the runtime holds until its source can be read
+/// ([`rebuild_held`]) gets [`Error::PartitionByChangeHeld`].
 async fn ensure_stored_partitioning_matches(
     table: &cayenne::CayenneTableProvider,
     source: &dyn AccelerationSource,
@@ -4786,6 +4823,13 @@ async fn ensure_stored_partitioning_matches(
     if rebuilds_on_settings_change(source) {
         table.quiesce().await;
         return Err(Error::PartitionByChangeRequiresRebuild {
+            dataset: Arc::from(source.name().to_string()),
+            stored,
+            configured,
+        });
+    }
+    if rebuild_held(source.acceleration()) {
+        return Err(Error::PartitionByChangeHeld {
             dataset: Arc::from(source.name().to_string()),
             stored,
             configured,
@@ -4869,6 +4913,11 @@ mod tests {
         };
         assert!(rejects_stored_table(&wrapped(
             cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable {
+                table_name: "checking".to_string(),
+            }
+        )));
+        assert!(rejects_stored_table(&wrapped(
+            cayenne::CatalogError::PkConflictDetectionChangeHeld {
                 table_name: "checking".to_string(),
             }
         )));

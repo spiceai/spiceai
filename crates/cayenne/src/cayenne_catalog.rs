@@ -1613,18 +1613,29 @@ impl CayenneCatalog {
                     // that from the requested settings), so this change is refused
                     // rather than kept.
                     if enables_pk_conflict_detection(&stored_metadata, options) {
+                        if options.vortex_config.settings_change
+                            == SettingsChangeAction::HoldUntilSourceReadable
+                        {
+                            return Err(CatalogError::PkConflictDetectionChangeHeld {
+                                table_name: table_name.to_string(),
+                            });
+                        }
                         return Err(CatalogError::PkConflictDetectionEnabledOnExistingTable {
                             table_name: table_name.to_string(),
                         });
                     }
-                    tracing::warn!(
-                        "{}",
+                    let warning = if options.vortex_config.settings_change
+                        == SettingsChangeAction::HoldUntilSourceReadable
+                    {
+                        settings_held_warning(table_name, &identity_changes)
+                    } else {
                         settings_kept_warning(
                             table_name,
                             &identity_changes,
-                            options.vortex_config.memory_mode
+                            options.vortex_config.memory_mode,
                         )
-                    );
+                    };
+                    tracing::warn!("{warning}");
                     return Err(CatalogError::ChangedConfiguration {
                         table_name: table_name.to_string(),
                     });
@@ -6285,6 +6296,16 @@ fn settings_kept_warning(table_name: &str, changes: &[SettingChange], memory_mod
     }
     format!(
         "Dataset '{table_name}' keeps the settings its existing acceleration was built with, so the changed settings ({}) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only under `refresh_mode: full`, since otherwise it can hold rows a reload would not bring back. To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+        describe_setting_changes(changes)
+    )
+}
+
+/// The warning an operator reads when settings that define a table's stored rows
+/// changed while its source cannot be read on the table's schema, so the table keeps the
+/// settings it was built with until it can.
+fn settings_held_warning(table_name: &str, changes: &[SettingChange]) -> String {
+    format!(
+        "Dataset '{table_name}' keeps the settings its existing acceleration was built with while its source cannot be read on that acceleration's schema, so the changed settings ({}) do not take effect yet: they cannot be applied to stored rows in place, and a rebuilt acceleration could not reload until the source can be read. Restart once the source is reachable and any change to its schema is resolved (revert it, or set `on_schema_change` to adopt it) to rebuild with the new settings. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
         describe_setting_changes(changes)
     )
 }
@@ -11698,6 +11719,18 @@ mod tests {
         );
 
         assert_eq!(
+            settings_held_warning(
+                "trips",
+                &[SettingChange::new(
+                    "`primary_key`",
+                    "none".to_string(),
+                    "['id']".to_string(),
+                )]
+            ),
+            "Dataset 'trips' keeps the settings its existing acceleration was built with while its source cannot be read on that acceleration's schema, so the changed settings (`primary_key`: none -> ['id']) do not take effect yet: they cannot be applied to stored rows in place, and a rebuilt acceleration could not reload until the source can be read. Restart once the source is reachable and any change to its schema is resolved (revert it, or set `on_schema_change` to adopt it) to rebuild with the new settings. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+
+        assert_eq!(
             schema_kept_warning("trips"),
             "Dataset 'trips' keeps the schema its existing acceleration was built with, so the changed schema does not take effect. Set `on_schema_change` to evolve the acceleration's schema in place, or `mode: file_update` to rebuild the acceleration with the new schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
@@ -11915,6 +11948,28 @@ mod tests {
                 .is_empty()
         );
 
+        // The same change while the source cannot be read on the table's schema: kept,
+        // like any table the caller does not rebuild.
+        let held = VortexConfig {
+            settings_change: SettingsChangeAction::HoldUntilSourceReadable,
+            ..sorted.clone()
+        };
+        assert_eq!(
+            catalog
+                .create_table(options(&["id"], held))
+                .await
+                .expect("reopen while the source cannot be read"),
+            table_id
+        );
+        assert!(
+            catalog
+                .get_table("trips")
+                .await
+                .expect("read the table")
+                .primary_key
+                .is_empty()
+        );
+
         // The same change when the caller keeps stored tables: the stored settings win
         // wholesale, so the unsorted layout requested with it is not persisted either.
         let kept = VortexConfig {
@@ -11939,7 +11994,8 @@ mod tests {
     }
 
     /// Turning conflict detection on for a keyed table written with it off is reported
-    /// for a rebuild when the caller allows one, and refused as before when it does not.
+    /// for a rebuild when the caller allows one, and refused as before when it does not,
+    /// or holds the rebuild until the source can be read.
     #[tokio::test]
     async fn enabling_conflict_detection_is_rebuilt_when_allowed() {
         use crate::metadata::{PkConflictDetection, SettingsChangeAction, VortexConfig};
@@ -11994,6 +12050,30 @@ mod tests {
                 CatalogError::PkConflictDetectionEnabledOnExistingTable { .. }
             ),
             "{refused:?}"
+        );
+
+        // A rebuild held until the source can be read is refused too, since the stored
+        // rows cannot be served under the check meanwhile, with the fixes that apply.
+        let held = catalog
+            .create_table(options(
+                PkConflictDetection::Auto,
+                SettingsChangeAction::HoldUntilSourceReadable,
+            ))
+            .await
+            .expect_err("a held rebuild cannot serve the stored rows under the check");
+        assert_eq!(
+            held.to_string(),
+            "Failed to load table 'keyed': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. Applying 'auto' rebuilds the table from its source, which cannot be read on the table's schema yet. To keep using the existing data, set 'cayenne_pk_conflict_detection' back to 'none'. To apply 'auto', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            catalog
+                .get_table("keyed")
+                .await
+                .expect("read the table")
+                .vortex_config
+                .pk_conflict_detection,
+            PkConflictDetection::None,
+            "a refused change persists nothing"
         );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
