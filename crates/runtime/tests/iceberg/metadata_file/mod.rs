@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Iceberg datasets read from a pinned metadata file (`iceberg_metadata_path`), with
-//! no catalog. The tables are written to the local filesystem by iceberg-rust, so
-//! these tests need no network, container or credentials.
+//! Iceberg datasets read from their metadata files with no catalog: pinned with
+//! `iceberg_metadata_path`, or found from the table root. The tables are written by
+//! iceberg-rust to the local filesystem, or to S3 in a `RustFS` container.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
-    component::dataset::Dataset,
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
     param::Params as DatasetParams,
 };
 
@@ -69,13 +69,14 @@ pub(crate) async fn write_table(warehouse: &Path, appends: &[&[i64]]) -> anyhow:
 }
 
 /// [`write_table`] against any warehouse URL the `factory` can write, with
-/// `props` (endpoint, credentials) passed to its file IO.
+/// `props` (endpoint, credentials) passed to its file IO. The returned writer
+/// appends further commits.
 async fn write_table_at(
     warehouse_url: &str,
     factory: Arc<dyn StorageFactory>,
     mut props: HashMap<String, String>,
     appends: &[&[i64]],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<TableWriter> {
     props.insert(
         MEMORY_CATALOG_WAREHOUSE.to_string(),
         warehouse_url.to_string(),
@@ -102,11 +103,29 @@ async fn write_table_at(
         )
         .await?;
 
-    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let writer = TableWriter {
+        catalog: Arc::new(catalog),
+        namespace,
+    };
     for rows in appends {
+        writer.append(rows).await?;
+    }
+    Ok(writer)
+}
+
+/// Commits appends to the table [`write_table_at`] created.
+struct TableWriter {
+    catalog: Arc<dyn Catalog>,
+    namespace: NamespaceIdent,
+}
+
+impl TableWriter {
+    /// Appends `rows` as one commit.
+    async fn append(&self, rows: &[i64]) -> anyhow::Result<()> {
         let ctx = SessionContext::new();
         let provider =
-            IcebergTableProvider::try_new(Arc::clone(&catalog), namespace.clone(), TABLE).await?;
+            IcebergTableProvider::try_new(Arc::clone(&self.catalog), self.namespace.clone(), TABLE)
+                .await?;
         ctx.register_table("t", Arc::new(provider))?;
         let values = rows
             .iter()
@@ -117,9 +136,8 @@ async fn write_table_at(
             .await?
             .collect()
             .await?;
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// The metadata file name for each version of the table at `table_root`, indexed
@@ -170,8 +188,13 @@ pub(crate) fn pinned_dataset(table_root: &Path, name: &str, param: &str, value: 
     )
 }
 
+/// Starts a runtime serving `datasets`, without the results cache, so every query
+/// reaches the table and sees its current commit.
 async fn start_runtime(app_name: &str, datasets: Vec<Dataset>) -> Arc<Runtime> {
-    let mut builder = AppBuilder::new(app_name);
+    let mut builder = AppBuilder::new(app_name).with_sql_cache(SQLResultsCacheConfig {
+        enabled: false,
+        ..SQLResultsCacheConfig::default()
+    });
     for dataset in datasets {
         builder = builder.with_dataset(dataset);
     }
@@ -465,6 +488,38 @@ async fn a_from_naming_a_metadata_file_is_refused_with_the_corrected_configurati
         .await
 }
 
+/// A `from` that is not an Iceberg table root, such as one level too deep, fails
+/// to load with what the table root must contain.
+#[tokio::test]
+async fn a_from_with_no_metadata_files_is_refused_with_what_a_table_root_holds()
+-> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let warehouse = tempfile::tempdir()?;
+            let table_root = write_table(warehouse.path(), &[&[1]]).await?;
+            let too_deep = table_root.join("metadata");
+            let errors = dataset_errors(
+                "iceberg_table_root_without_metadata",
+                vec![dataset_with_params(
+                    format!("iceberg:file://{}", too_deep.display()),
+                    "too_deep",
+                    HashMap::new(),
+                )],
+            )
+            .await?;
+            assert_eq!(
+                errors.get("too_deep"),
+                Some(&Some(format!(
+                    "Failed to load the dataset too_deep (iceberg). Failed to find the current Iceberg metadata file for 'file://{root}': DataInvalid => No Iceberg metadata file was found in 'file://{root}/metadata/'. The table root must contain a 'metadata/' directory with files named 'v<N>.metadata.json' or '<N>-<uuid>.metadata.json'. Verify `from` is the table root, the directory that contains 'metadata/', or set `iceberg_metadata_path` to the metadata file to read. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                    root = too_deep.display()
+                )))
+            );
+            Ok(())
+        })
+        .await
+}
+
 const S3_ACCESS_KEY: &str = "spiceadmin";
 const S3_SECRET_KEY: &str = "spiceintegrationsecret";
 const S3_BUCKET: &str = "lake";
@@ -531,6 +586,195 @@ async fn create_bucket(endpoint: &str) -> anyhow::Result<()> {
     anyhow::bail!("could not create bucket {S3_BUCKET}: {last_error:?}")
 }
 
+const S3_METADATA_PREFIX: &str = "warehouse/db/events/metadata/";
+
+/// [`write_table`] into the bucket, at `s3://lake/warehouse/db/events`.
+async fn write_s3_table(endpoint: &str, appends: &[&[i64]]) -> anyhow::Result<TableWriter> {
+    write_table_at(
+        &format!("s3://{S3_BUCKET}/warehouse"),
+        Arc::new(OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        }),
+        HashMap::from([
+            ("s3.endpoint".to_string(), endpoint.to_string()),
+            ("s3.path-style-access".to_string(), "true".to_string()),
+            ("s3.access-key-id".to_string(), S3_ACCESS_KEY.to_string()),
+            (
+                "s3.secret-access-key".to_string(),
+                S3_SECRET_KEY.to_string(),
+            ),
+            ("s3.region".to_string(), "us-east-1".to_string()),
+        ]),
+        appends,
+    )
+    .await
+}
+
+/// A dataset reading the table [`write_s3_table`] writes, through the `scheme` URL
+/// (`s3` or `s3a`), pinned to `metadata_path` when it is given.
+fn s3_dataset(endpoint: &str, scheme: &str, name: &str, metadata_path: Option<String>) -> Dataset {
+    let mut params = HashMap::from([
+        ("iceberg_s3_endpoint".to_string(), endpoint.to_string()),
+        (
+            "iceberg_s3_access_key_id".to_string(),
+            S3_ACCESS_KEY.to_string(),
+        ),
+        (
+            "iceberg_s3_secret_access_key".to_string(),
+            S3_SECRET_KEY.to_string(),
+        ),
+        ("iceberg_s3_region".to_string(), "us-east-1".to_string()),
+    ]);
+    if let Some(path) = metadata_path {
+        params.insert("iceberg_metadata_path".to_string(), path);
+    }
+    dataset_with_params(
+        format!("iceberg:{scheme}://{S3_BUCKET}/warehouse/{NAMESPACE}/{TABLE}"),
+        name,
+        params,
+    )
+}
+
+async fn put_s3_object(endpoint: &str, key: &str, body: &str) -> anyhow::Result<()> {
+    s3_client(endpoint)
+        .put_object()
+        .bucket(S3_BUCKET)
+        .key(key)
+        .body(body.as_bytes().to_vec().into())
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Polls `table` until it returns `expected`, for a value an acceleration refresh
+/// delivers.
+async fn wait_for_ids(rt: &Arc<Runtime>, table: &str, expected: &[i64]) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_mins(1);
+    let mut last = Vec::new();
+    while std::time::Instant::now() < deadline {
+        last = ids(rt, table).await?;
+        if last == expected {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!("{table} must return {expected:?}, last returned {last:?}")
+}
+
+/// The customer-shaped table: written to S3 the way a REST or Glue catalog writes
+/// one (`<N>-<uuid>.metadata.json`, no `version-hint.text`), read with no pin from
+/// the table root through both S3 schemes and through an acceleration. Commits
+/// made after the datasets load, taking the table past version 9, must be read by
+/// the next query and the next refresh, with no restart.
+#[tokio::test]
+async fn an_unpinned_table_root_on_s3_reads_each_new_commit() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let container = start_object_store().await?;
+            let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
+            create_bucket(&endpoint).await?;
+            let writer = write_s3_table(&endpoint, &[&[1], &[2]]).await?;
+
+            let mut accelerated = s3_dataset(&endpoint, "s3", "accelerated", None);
+            accelerated.acceleration = Some(Acceleration {
+                enabled: true,
+                engine: Some("cayenne".to_string()),
+                mode: Mode::Memory,
+                refresh_mode: Some(RefreshMode::Full),
+                refresh_check_interval: Some("1s".to_string()),
+                ..Acceleration::default()
+            });
+            let rt = start_runtime(
+                "iceberg_table_root_s3",
+                vec![
+                    s3_dataset(&endpoint, "s3", "via_s3", None),
+                    s3_dataset(&endpoint, "s3a", "via_s3a", None),
+                    accelerated,
+                ],
+            )
+            .await;
+            crate::utils::runtime_ready_check(&rt).await;
+            for name in ["via_s3", "via_s3a", "accelerated"] {
+                assert_eq!(ids(&rt, name).await?, vec![1, 2], "dataset {name} at load");
+            }
+
+            let expected: Vec<i64> = (1..=12).collect();
+            for id in 3..=12 {
+                writer.append(&[id]).await?;
+            }
+            let files = s3_metadata_file_names(&endpoint, S3_METADATA_PREFIX).await?;
+            anyhow::ensure!(files.len() == 13, "fixture has {files:?}");
+            for name in ["via_s3", "via_s3a"] {
+                assert_eq!(
+                    ids(&rt, name).await?,
+                    expected,
+                    "dataset {name} must read the latest commit on the next query"
+                );
+            }
+            wait_for_ids(&rt, "accelerated", &expected).await?;
+            drop(container);
+            Ok(())
+        })
+        .await
+}
+
+/// A `version-hint.text` names the metadata file to read, ahead of newer files in
+/// `metadata/`, whether it is found from the table root or pinned with
+/// `iceberg_metadata_path`. The hint is read on every query, so moving it moves
+/// both datasets. The hint holds a file name stem, as `DuckDB` accepts.
+#[tokio::test]
+async fn a_version_hint_on_s3_is_read_on_every_query() -> anyhow::Result<()> {
+    let _tracing = init_tracing(None);
+    test_request_context()
+        .scope(async {
+            let container = start_object_store().await?;
+            let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
+            create_bucket(&endpoint).await?;
+            write_s3_table(&endpoint, &[&[1], &[2], &[3]]).await?;
+            let stems: Vec<String> = s3_metadata_file_names(&endpoint, S3_METADATA_PREFIX)
+                .await?
+                .iter()
+                .map(|name| name.trim_end_matches(".metadata.json").to_string())
+                .collect();
+            let hint_key = format!("{S3_METADATA_PREFIX}version-hint.text");
+            put_s3_object(&endpoint, &hint_key, &stems[1]).await?;
+
+            let rt = start_runtime(
+                "iceberg_version_hint_s3",
+                vec![
+                    s3_dataset(&endpoint, "s3", "from_root", None),
+                    s3_dataset(
+                        &endpoint,
+                        "s3",
+                        "pinned_hint",
+                        Some("/metadata/version-hint.text".to_string()),
+                    ),
+                ],
+            )
+            .await;
+            for name in ["from_root", "pinned_hint"] {
+                assert_eq!(
+                    ids(&rt, name).await?,
+                    vec![1],
+                    "dataset {name}, hint at version 1"
+                );
+            }
+
+            put_s3_object(&endpoint, &hint_key, &stems[2]).await?;
+            for name in ["from_root", "pinned_hint"] {
+                assert_eq!(
+                    ids(&rt, name).await?,
+                    vec![1, 2],
+                    "dataset {name}, hint at version 2"
+                );
+            }
+            drop(container);
+            Ok(())
+        })
+        .await
+}
+
 /// The metadata file name for each version under `prefix`, indexed by version.
 async fn s3_metadata_file_names(endpoint: &str, prefix: &str) -> anyhow::Result<Vec<String>> {
     let listed = s3_client(endpoint)
@@ -560,56 +804,17 @@ async fn iceberg_metadata_path_reads_a_pinned_table_from_s3() -> anyhow::Result<
             let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
             create_bucket(&endpoint).await?;
 
-            write_table_at(
-                &format!("s3://{S3_BUCKET}/warehouse"),
-                Arc::new(OpenDalStorageFactory::S3 {
-                    customized_credential_load: None,
-                }),
-                HashMap::from([
-                    ("s3.endpoint".to_string(), endpoint.clone()),
-                    ("s3.path-style-access".to_string(), "true".to_string()),
-                    ("s3.access-key-id".to_string(), S3_ACCESS_KEY.to_string()),
-                    (
-                        "s3.secret-access-key".to_string(),
-                        S3_SECRET_KEY.to_string(),
-                    ),
-                    ("s3.region".to_string(), "us-east-1".to_string()),
-                ]),
-                &[&[1], &[2, 3], &[4]],
-            )
-            .await?;
-            let files = s3_metadata_file_names(
-                &endpoint,
-                &format!("warehouse/{NAMESPACE}/{TABLE}/metadata/"),
-            )
-            .await?;
+            write_s3_table(&endpoint, &[&[1], &[2, 3], &[4]]).await?;
+            let files = s3_metadata_file_names(&endpoint, S3_METADATA_PREFIX).await?;
             anyhow::ensure!(files.len() == 4, "fixture has {files:?}");
 
-            let s3_dataset = |scheme: &str, name: &str| {
-                dataset_with_params(
-                    format!("iceberg:{scheme}://{S3_BUCKET}/warehouse/{NAMESPACE}/{TABLE}"),
-                    name,
-                    HashMap::from([
-                        (
-                            "iceberg_metadata_path".to_string(),
-                            format!("/metadata/{}", files[2]),
-                        ),
-                        ("iceberg_s3_endpoint".to_string(), endpoint.clone()),
-                        (
-                            "iceberg_s3_access_key_id".to_string(),
-                            S3_ACCESS_KEY.to_string(),
-                        ),
-                        (
-                            "iceberg_s3_secret_access_key".to_string(),
-                            S3_SECRET_KEY.to_string(),
-                        ),
-                        ("iceberg_s3_region".to_string(), "us-east-1".to_string()),
-                    ]),
-                )
-            };
+            let pin = Some(format!("/metadata/{}", files[2]));
             let rt = start_runtime(
                 "iceberg_metadata_path_s3",
-                vec![s3_dataset("s3", "via_s3"), s3_dataset("s3a", "via_s3a")],
+                vec![
+                    s3_dataset(&endpoint, "s3", "via_s3", pin.clone()),
+                    s3_dataset(&endpoint, "s3a", "via_s3a", pin),
+                ],
             )
             .await;
 
