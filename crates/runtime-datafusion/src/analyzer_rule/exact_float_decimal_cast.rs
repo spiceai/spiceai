@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-
 //! Casts a float *literal* to a decimal through its decimal spelling, not its
 //! binary value.
 //!
@@ -67,8 +66,8 @@ impl AnalyzerRule for ExactFloatLiteralDecimalCast {
 
 fn rewrite_expr(expr: Expr) -> Result<Transformed<Expr>> {
     let (inner, data_type) = match &expr {
-        Expr::Cast(Cast { expr, data_type }) | Expr::TryCast(TryCast { expr, data_type }) => {
-            (expr.as_ref(), data_type)
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
+            (expr.as_ref(), field.data_type())
         }
         _ => return Ok(Transformed::no(expr)),
     };
@@ -127,7 +126,12 @@ mod tests {
     #[test]
     fn float_literals_cast_to_the_decimal_they_spell() {
         for (value, precision, scale, expected) in [
-            (12_345_678.90_f64, 30_u8, 15_i8, 12_345_678_900_000_000_000_000_i128),
+            (
+                12_345_678.90_f64,
+                30_u8,
+                15_i8,
+                12_345_678_900_000_000_000_000_i128,
+            ),
             (4.07, 30, 15, 4_070_000_000_000_000),
             (4.07, 10, 2, 407),
             (0.1, 38, 10, 1_000_000_000),
@@ -212,8 +216,8 @@ mod tests {
         ])
         .with_precision_and_scale(precision, scale)
         .expect("valid decimal");
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)])
-            .expect("valid batch");
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).expect("valid batch");
 
         let ctx = SessionContext::new();
         ctx.add_analyzer_rule(Arc::new(ExactFloatLiteralDecimalCast::new()));
@@ -236,7 +240,11 @@ mod tests {
         for scale in [2_i8, 4, 6, 15] {
             for literal in ["12345678.90", "4.07"] {
                 let sql = format!("SELECT count(*) FROM t WHERE dec = {literal}");
-                assert_eq!(count_matches(&sql, None, scale).await, 1, "{sql}, scale {scale}");
+                assert_eq!(
+                    count_matches(&sql, None, scale).await,
+                    1,
+                    "{sql}, scale {scale}"
+                );
             }
         }
     }
