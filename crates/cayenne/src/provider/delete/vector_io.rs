@@ -444,20 +444,18 @@ impl<'a> DeletionVectorWriter<'a> {
             .map(|_| Self::deletion_file_path(&deletion_dir))
             .collect::<Vec<_>>();
         let mut cleanup_guard = UncommittedDeleteFilesGuard::new(batch_paths.clone());
-        let write_futures =
-            specs
-                .into_iter()
-                .zip(batch_paths.iter().cloned())
-                .map(|(spec, file_path)| {
-                    let mut completion = Some(cleanup_guard.completion());
-                    let sequence_number = spec.sequence_number;
-                    let table_name = self.table.table_name.clone();
-                    #[cfg(test)]
-                    let test_hook = self.test_hook.as_ref().map(Arc::clone);
-                    async move {
-                        let (batch, schema, count, identifiers, source_data_file_path) = match spec
-                            .identifiers
-                        {
+        let write_futures = specs
+            .into_iter()
+            .zip(batch_paths.iter().cloned())
+            .map(|(spec, file_path)| {
+                let mut completion = Some(cleanup_guard.completion());
+                let sequence_number = spec.sequence_number;
+                let table_name = self.table.table_name.clone();
+                #[cfg(test)]
+                let test_hook = self.test_hook.as_ref().map(Arc::clone);
+                async move {
+                    let (batch, schema, count, identifiers, source_data_file_path) =
+                        match spec.identifiers {
                             DeletionIdentifier::PositionBased {
                                 file_path: source_file,
                                 mut row_ids,
@@ -504,42 +502,42 @@ impl<'a> DeletionVectorWriter<'a> {
                             }
                         };
 
-                        // From this point the completion token is transferred into the
-                        // detached blocking writer. Any earlier `?` drops it here and
-                        // decrements the pending count, so cancellation cleanup cannot
-                        // wait forever for a writer that was never spawned.
+                    // From this point the completion token is transferred into the
+                    // detached blocking writer. Any earlier `?` drops it here and
+                    // decrements the pending count, so cancellation cleanup cannot
+                    // wait forever for a writer that was never spawned.
 
-                        #[cfg(test)]
-                        let file_size_bytes = write_deletion_file(
-                            &file_path,
-                            Arc::clone(&schema),
-                            batch,
-                            &table_name,
-                            completion.take(),
-                            test_hook,
-                        )
-                        .await?;
-                        #[cfg(not(test))]
-                        let file_size_bytes = write_deletion_file(
-                            &file_path,
-                            Arc::clone(&schema),
-                            batch,
-                            &table_name,
-                            completion.take(),
-                        )
-                        .await?;
+                    #[cfg(test)]
+                    let file_size_bytes = write_deletion_file(
+                        &file_path,
+                        Arc::clone(&schema),
+                        batch,
+                        &table_name,
+                        completion.take(),
+                        test_hook,
+                    )
+                    .await?;
+                    #[cfg(not(test))]
+                    let file_size_bytes = write_deletion_file(
+                        &file_path,
+                        Arc::clone(&schema),
+                        batch,
+                        &table_name,
+                        completion.take(),
+                    )
+                    .await?;
 
-                        Ok::<_, Error>((
-                            file_path,
-                            count,
-                            file_size_bytes,
-                            identifiers,
-                            source_data_file_path,
-                            sequence_number,
-                        ))
-                    }
-                })
-                .collect::<Vec<_>>();
+                    Ok::<_, Error>((
+                        file_path,
+                        count,
+                        file_size_bytes,
+                        identifiers,
+                        source_data_file_path,
+                        sequence_number,
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
         let written: Vec<WrittenDeletionFile> =
             match futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::buffered(
                 futures::stream::iter(write_futures),
@@ -580,8 +578,14 @@ impl<'a> DeletionVectorWriter<'a> {
         }
 
         let mut results = Vec::with_capacity(written.len());
-        for (file_path, count, file_size_bytes, identifiers, source_data_file_path, sequence_number) in
-            written
+        for (
+            file_path,
+            count,
+            file_size_bytes,
+            identifiers,
+            source_data_file_path,
+            sequence_number,
+        ) in written
         {
             let deletion_type = match &identifiers {
                 DeletionIdentifier::PositionBased { .. } => DeletionType::PositionBased,
@@ -1157,7 +1161,9 @@ mod tests {
                     .with_sequence_number(sequence(i))
             })
             .collect();
-        specs.push(DeletionVectorWriteSpec::new_key_based(vec![key(3 * groups)]));
+        specs.push(DeletionVectorWriteSpec::new_key_based(vec![
+            key(3 * groups),
+        ]));
         let results = DeletionVectorWriter::new(&table_metadata)
             .write(specs)
             .await
@@ -1172,7 +1178,10 @@ mod tests {
         assert_eq!(recorded, expected);
 
         let (positions, keys, reinserted, missing) = detect_deletion_type_and_read(
-            results.into_iter().map(|result| result.delete_file).collect(),
+            results
+                .into_iter()
+                .map(|result| result.delete_file)
+                .collect(),
         )
         .expect("read the written deletion vectors back");
         assert!(positions.is_empty() && reinserted.is_empty() && missing.is_empty());
