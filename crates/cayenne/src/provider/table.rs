@@ -33651,16 +33651,11 @@ impl CayenneTableProvider {
         // lever — see `encode_snapshot_shards_concurrently`). Disjoint keys ⇒ the
         // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
         // this is exactly `[visible_mem_tier_batches(shard 0)]`.
-        let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
-        for shard in &shard_snapshots {
-            if shard.is_empty() || shard.segments.is_empty() {
-                continue;
-            }
-            let group = self.visible_mem_tier_batches(shard, None)?;
-            if !group.is_empty() {
-                shard_groups.push(group);
-            }
-        }
+        let shard_groups: Vec<Vec<RecordBatch>> = self
+            .visible_mem_tier_batches_by_shard(&shard_snapshots)?
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .collect();
         let flushed_mem_rows: usize = shard_groups
             .iter()
             .flat_map(|group| group.iter())
@@ -34989,9 +34984,9 @@ impl CayenneTableProvider {
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
     ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
         let visible = match (self.live_file_deletion_index(), self.primary_key_indices()) {
-            (Some(file), Ok(Some(pk_indices))) => {
-                self.visible_mem_tier_segments_incremental(shards, file, &pk_indices)
-            }
+            (Some(file), Ok(Some(pk_indices))) => self
+                .visible_mem_tier_segments_incremental(shards, file, &pk_indices)
+                .map(|groups| groups.into_iter().flatten().collect::<Vec<_>>()),
             _ => return self.visible_mem_tier_segments(shards),
         };
         Ok(Arc::from(visible.map_err(|e| {
@@ -35007,7 +35002,7 @@ impl CayenneTableProvider {
         shards: &[Arc<crate::provider::mem_tier::MemTier>],
         file: FileDeletionIndex,
         pk_indices: &[usize],
-    ) -> Result<Vec<VisibleMemTierSegment>> {
+    ) -> Result<Vec<Vec<VisibleMemTierSegment>>> {
         let previous = self
             .scan_view_cache
             .visible_segments
@@ -35063,7 +35058,7 @@ impl CayenneTableProvider {
         }
 
         let digest_keys = matches!(file, FileDeletionIndex::RowKeys(_));
-        let mut visible = Vec::new();
+        let mut visible = Vec::with_capacity(shards.len());
         let mut cache_shards = Vec::with_capacity(shards.len());
         for (i, shard) in shards.iter().enumerate() {
             let (start, carried) = plans[i];
@@ -35071,6 +35066,7 @@ impl CayenneTableProvider {
             let aggregate = Self::mem_tier_deletion_maps(shard);
             let hidden = (carried > 0).then(|| AppendedKeys::of(&segments[carried..], digest_keys));
             let mut cached_segments = Vec::with_capacity(segments.len());
+            let mut shard_visible = Vec::new();
             for (j, segment) in segments.iter().enumerate() {
                 let carried_segment = previous
                     .as_ref()
@@ -35090,13 +35086,14 @@ impl CayenneTableProvider {
                     }
                 };
                 if !cached.batches.is_empty() {
-                    visible.push(VisibleMemTierSegment {
+                    shard_visible.push(VisibleMemTierSegment {
                         statistics: Arc::clone(&segment.statistics),
                         batches: cached.batches.clone(),
                     });
                 }
                 cached_segments.push(cached);
             }
+            visible.push(shard_visible);
             cache_shards.push(cached_segments);
         }
         *self.scan_view_cache.visible_segments.lock() = Some(Arc::new(VisibleSegmentsCache {
@@ -35104,6 +35101,35 @@ impl CayenneTableProvider {
             shards: cache_shards,
         }));
         Ok(visible)
+    }
+
+    /// Visible mem-tier rows per shard for a checkpoint, from the incremental
+    /// computation scan-view builds use (see
+    /// [`Self::visible_mem_tier_segments_for_build`]), so a checkpoint filters only
+    /// what changed since the last build or checkpoint instead of every resident
+    /// row. Each group equals [`Self::visible_mem_tier_batches`] of its shard.
+    fn visible_mem_tier_batches_by_shard(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> Result<Vec<Vec<RecordBatch>>> {
+        if let (Some(file), Some(pk_indices)) =
+            (self.live_file_deletion_index(), self.primary_key_indices()?)
+        {
+            return Ok(self
+                .visible_mem_tier_segments_incremental(shards, file, &pk_indices)?
+                .into_iter()
+                .map(|segments| {
+                    segments
+                        .into_iter()
+                        .flat_map(|segment| segment.batches)
+                        .collect()
+                })
+                .collect());
+        }
+        shards
+            .iter()
+            .map(|shard| self.visible_mem_tier_batches(shard, None))
+            .collect()
     }
 
     /// Filter one segment in full against its shard's tombstones, recording each
@@ -67978,6 +68004,27 @@ mod tests {
                 rows(&full[..]),
                 "{case}, step {step}: visible mem-tier rows"
             );
+            // The checkpoint's per-shard groups come from the same carried state.
+            let by_shard = provider
+                .visible_mem_tier_batches_by_shard(&raw.mem_tier_shards)
+                .expect("checkpoint visibility");
+            assert_eq!(by_shard.len(), raw.mem_tier_shards.len(), "{case}, step {step}: shard groups");
+            for (shard, group) in raw.mem_tier_shards.iter().zip(&by_shard) {
+                let full_group = provider
+                    .visible_mem_tier_batches(shard, None)
+                    .expect("full shard visibility");
+                let as_segments = |batches: &[RecordBatch]| {
+                    vec![VisibleMemTierSegment {
+                        statistics: Arc::new(Statistics::new_unknown(&schema)),
+                        batches: batches.to_vec(),
+                    }]
+                };
+                assert_eq!(
+                    rows(&as_segments(group)[..]),
+                    rows(&as_segments(&full_group)[..]),
+                    "{case}, step {step}: checkpoint visible rows"
+                );
+            }
 
             let merged =
                 provider.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
