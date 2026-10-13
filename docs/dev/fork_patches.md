@@ -114,8 +114,8 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `7bf101c408b422ed11692518d1dcbcbc109c94db` | `spiceai-55` |
-| [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
+| [datafusion](#datafusion) | `f6d7f6cba257cdc8b23db73642395850ade4d0e1` | `peasee/io-wait-spiceai-55` (TEMPORARY: a spiceai/datafusion pull request merging `peasee/io-wait-spiceai-55` into `spiceai-55`) |
+| [datafusion-ballista](#datafusion-ballista) | `65c44c954d48921c9a77995a98f222ba293d4501` | `peasee/io-wait-spiceai-55` (TEMPORARY: a spiceai/datafusion-ballista pull request merging `peasee/io-wait-spiceai-55` into `spiceai-55`) |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `2fc46179fa45b764e8c2996bf04aa58fc652d069` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `ef2e59053978a7f4f795065598999c5eb31f4c69` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
@@ -203,8 +203,11 @@ spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
 pruning that #229 carried on `spiceai-54`, #251, which gives a file that holds no
 rows no partition-column bounds, #252, #256, which reads a Substrait string or
 binary field over a column of any width, and #254, which lets a `ListingFileFilter`
-select a listing table's data files; the pin is #254's merge commit. None changes a
-manifest. #240 threads its metadata filters through the listing calls in
+select a listing table's data files. After #254 come #255, which casts a MySQL timestamp to
+`DATETIME` with the precision of its unit, and the `IoWaitHook` patch on
+`peasee/io-wait-spiceai-55` ([#15049](https://github.com/spiceai/spiceai/issues/15049));
+the pin is that branch's head. None changes a manifest except the `IoWaitHook`
+patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
 upstream's own `[branch-52]` … `[branch-55]` backports; those are upstream commits
@@ -306,6 +309,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | A correlated `NOT IN (subquery)` in a `WHERE` clause is planned as the `NOT EXISTS` it equals there: a plain anti join on `x IS NULL OR y IS NULL OR x = y` and the correlation (spiceai/datafusion#235). Upstream evaluates these shapes in the null-aware join executor instead (apache/datafusion#25339, #25560), which builds on the null-aware mark joins of #21585; drop this patch on a re-cut onto a release that has them | A NULL correlation key drops rows although the subquery holds no NULL, a subquery NULL that the correlation excludes still removes every outer row, and a column `NOT IN` with an equality correlation, or a constant one with a non-equality correlation, fails to plan | silent (wrong data / query failure) | `…::correlated_not_in_is_answered_as_not_exists` |
 | Backport of apache/datafusion#25227: cast statistics propagate only through safe conversions | A `MIN`/`MAX` over a cast column is answered from the uncast Parquet statistics, so `MAX(CAST(a AS INT))` over the strings `'1'`, `'100'`, `'2'` answers `2` | silent (wrong data) | `…::a_cast_aggregate_is_not_answered_from_uncast_statistics` |
 | Backport of apache/datafusion#24516: a scalar subquery that can return no rows is nullable | `(SELECT 1 WHERE FALSE) IS NULL` answers `false`, and `WHERE (SELECT z FROM t) IS NULL` over an empty `t` whose `z` is `NOT NULL` keeps no row | silent (wrong data) | `…::an_empty_scalar_subquery_is_null` |
+| Unparser: a MySQL timestamp is cast to `DATETIME(n)` with the precision of its unit, at most `DATETIME(6)`, and a literal with more than six sub-second digits is cut to six (spiceai/datafusion#255) | MySQL's bare `DATETIME` keeps no fractional seconds, so a pushed-down equality on a fractional-second value selects no row and a range bound lands up to a second from the one the query wrote ([#14929](https://github.com/spiceai/spiceai/issues/14929)) | silent (wrong data) | `crates/data_components/src/federation.rs::a_mysql_timestamp_literal_keeps_its_fractional_seconds` |
+| `IoWaitExt::io_wait` and the process-wide `IoWaitHook` in `common-runtime`, with `SpawnedTask` and `JoinSet` passing spawned work through the hook's `carry_future`/`carry_block` (branch `peasee/io-wait-spiceai-55`, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Without the API, the HTTP connector's `io_wait()` calls and `RuntimeBuilder::build`'s `set_io_wait_hook` stop compiling. Without the carry, a wait inside a task DataFusion spawns (`RepartitionExec`, `CoalescePartitionsExec`) never reaches the hook, so a distributed task waiting there on a slow HTTP source holds its executor slot again | build; silent (throughput) for the carry | compile-guarded by `crates/data_components/src/http/provider.rs` and `crates/runtime/src/builder.rs`. The carry is **GAP**: with it disabled, `crates/runtime/tests/cluster/io_wait_lending.rs` still passes for a query whose single-node plan puts `RepartitionExec` over `HttpExec`, so no cluster query here polls a wait under a DataFusion spawn yet; the fork's `common-runtime` tests cover it |
 
 ## arrow-rs
 
@@ -367,6 +372,7 @@ so the rows below name the contracts, not every commit.
 | Task statuses re-delivered after a failed `poll_work` (fork PR #57) | An executor that fails to deliver a batch of task statuses drops them, so the scheduler never learns those tasks finished and the stage waits on work that is already done | silent (hang) | **GAP** — needs a cluster and an induced `poll_work` failure |
 | Terminal job status persisted before the job leaves the active cache (fork PR #59; upstreamed as `persist_terminal_and_evict`, apache/datafusion-ballista#2037) | `succeed_job` removed the job from the active execution-graph cache before the `save_job` write completed, so a concurrent `get_job_status` fell through to the not-yet-updated shared state and answered a stale `Running`. The distributed query client polls on a 2s budget, so it reported a timeout for a query that had in fact succeeded | silent (a successful query reported as a timeout) | **GAP** — a race between a status poll and a save, so any test of it is a timing test; measured by the fork against the client's poll budget |
 | Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | not carried | none — not carried. There is no watchdog or progress sampler at this pin or the previous one, and `SPICE_FORK_CHANGES.md` records the patch lost; restoring it would need a row with a guard |
+| A task's vcore lent while all of the task waits on remote I/O marked with `io_wait()`: `VcoreHook` and `VcorePermit` (`executor/src/vcore_permit.rs`), every pull-scheduled task run through the permit, and the poll loop no longer waiting for a vcore itself (branch `peasee/io-wait-spiceai-55`, [#15049](https://github.com/spiceai/spiceai/issues/15049)) | Losing `VcoreHook` breaks the build. Losing the execution-loop half leaves the hook set and counting nothing, so a distributed task waiting on a slow HTTP source holds its slot for the whole wait again and a cluster querying that source answers a few queries per minute, queuing everything else behind idle tasks | build; silent (throughput) | `crates/runtime/tests/cluster/io_wait_lending.rs::a_task_waiting_on_http_lends_its_slot_to_another_query` |
 
 ## datafusion-federation and datafusion-table-providers
 
@@ -684,7 +690,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**27 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**28 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -757,7 +763,9 @@ without becoming a flaky timing test:
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
-    `async-openai` retry-after handling.
+    `async-openai` retry-after handling; `datafusion`'s `IoWaitHook` carry through
+    `SpawnedTask`/`JoinSet`, which no cluster query here reaches yet (a stage's
+    scan is polled on Ballista's own shuffle-writer tasks, which are guarded).
 
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
