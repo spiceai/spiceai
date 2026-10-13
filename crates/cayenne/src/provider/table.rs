@@ -31895,7 +31895,7 @@ impl CayenneTableProvider {
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 let converter = self.build_pk_converter(&self.pk_column_indices)?;
-                let mut keys: HashSet<Box<[u8]>> = HashSet::new();
+                let mut keys = HashSet::with_hasher(PrehashedBuildHasher);
                 for batch in batches {
                     if batch.num_rows() == 0 {
                         continue;
@@ -31906,9 +31906,7 @@ impl CayenneTableProvider {
                         .map(|&idx| Arc::clone(batch.column(idx)))
                         .collect();
                     let rows = converter.convert_columns(&pk_columns)?;
-                    for row in &rows {
-                        keys.insert(Box::from(row.as_ref()));
-                    }
+                    keys.extend(rows.iter().map(|row| hash_index::hash_key_128(row.as_ref())));
                 }
                 Ok(CheckpointCorpusKeys::RowKeys(keys))
             }
