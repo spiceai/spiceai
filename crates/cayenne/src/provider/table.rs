@@ -24641,17 +24641,24 @@ impl CayenneTableProvider {
     /// deliberately tracks ONLY current-dir publishes — not the rewrite's own
     /// output write or background mem-tier checkpoints — so the fence does not
     /// abort on changes that leave the current dir untouched.
-    /// The scan view a writer-concurrent full rewrite reads, captured as a query
-    /// captures one, and the current-dir generation sampled before it. Flushes the
-    /// inline memtable first, so the view covers every visible row.
+    /// The scan view a full rewrite reads, captured fresh, and the current-dir
+    /// generation sampled before it. Flushes the inline memtable first, so the view
+    /// covers every visible row.
+    ///
+    /// Fresh whatever view reuse the table allows its queries: a read-only
+    /// `refresh_mode: changes` dataset lets a query serve a view up to a second
+    /// old, and a rewrite reading such a view would fold, and drop, a protected
+    /// snapshot published after it without that snapshot's rows in its output.
     async fn rewrite_scan_view(&self, ctx: &SessionContext) -> Result<(Arc<ScanView>, u64)> {
         if self.cached_inlined_row_count() > 0 {
             self.checkpoint_inlined_data().await?;
         }
         let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
         let state = ctx.state();
-        let reuse = self.prepare_scan(&state, &[]).await?;
-        let scan_view = self.scan_view_at_current_input(reuse).await?;
+        self.prepare_scan(&state, &[]).await?;
+        let scan_view = self
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await?;
         Ok((scan_view, generation_before))
     }
 
@@ -24694,13 +24701,10 @@ impl CayenneTableProvider {
         &self,
         ctx: &SessionContext,
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
-        if self.cached_inlined_row_count() > 0 {
-            self.checkpoint_inlined_data().await?;
-        }
-
-        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
-
-        let plan = TableProvider::scan(self, &ctx.state(), None, &[], None).await?;
+        let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
+        let plan = self
+            .plan_scan_from_view(&ctx.state(), None, &[], None, scan_view)
+            .await?;
         Ok((plan, generation_before))
     }
 

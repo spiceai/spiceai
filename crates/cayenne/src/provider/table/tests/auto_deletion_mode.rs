@@ -942,6 +942,95 @@ async fn an_auto_table_folds_a_key_repeated_within_one_write() {
     }
 }
 
+/// A full rewrite reads a fresh capture of the table whatever view reuse the
+/// table allows its queries. A read-only `refresh_mode: changes`
+/// dataset lets queries serve a view up to a second old. A rewrite that took such a
+/// view would fold, and drop, a protected snapshot published after it without
+/// that snapshot's rows in its output.
+#[tokio::test]
+async fn a_rewrite_reads_a_fresh_view_where_queries_may_reuse_an_older_one() {
+    for mode in [
+        DeletionMode::Key,
+        DeletionMode::Auto,
+        DeletionMode::Position,
+    ] {
+        let name = format!("stale_view_rewrite_{}", mode.as_str());
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: name.clone(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: temp_dir.path().join("data").display().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                deletion_mode: mode,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_scan_view_reuse(ScanViewReuse::WithinLag(Duration::from_hours(1)))
+            .create(options)
+            .await
+            .expect("table created");
+        let ids: Vec<i64> = (0..8).collect();
+        write(&provider, &ids, 100).await;
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked(None)
+            .await
+            .expect("fold the seed into the current snapshot");
+        // A query captures the table's view, then every key is upserted.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, &name).await,
+            ids.iter().map(|id| (*id, 100)).collect::<Vec<_>>(),
+            "{mode:?}: premise: the seed"
+        );
+        write(&provider, &ids, 200).await;
+        {
+            let _pass = provider.compaction_lock.write().await;
+            assert!(
+                provider
+                    .rewrite_current_snapshot_for_compaction()
+                    .await
+                    .expect("rewrite"),
+                "{mode:?}: premise: the rewrite commits"
+            );
+        }
+        // Read what the rewrite committed through a fresh provider, which
+        // reuses no view.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open(&name)
+            .await
+            .expect("reopen the table");
+        let reopened_ctx = SessionContext::new();
+        assert_eq!(
+            collect_id_value_pairs(&reopened_ctx, &reopened, &name).await,
+            ids.iter().map(|id| (*id, 200)).collect::<Vec<_>>(),
+            "{mode:?}: every key keeps the value upserted after the query's view"
+        );
+    }
+}
+
 /// A writer-concurrent full rewrite holds `write_lock` only to capture what it
 /// reads. A write can land after that capture, before the rewrite builds its plan,
 /// and the rewrite then reads none of that write's rows and keeps the deletes that
