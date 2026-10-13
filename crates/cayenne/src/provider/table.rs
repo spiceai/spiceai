@@ -19680,8 +19680,8 @@ impl CayenneTableProvider {
     /// A hash split leaves every shard file spanning the whole key domain, so a
     /// lookup on the key reads every file of every checkpoint not yet compacted
     /// away. Cut into ranges, each file holds one slice of the routing key —
-    /// the leading primary-key column unless scans filter on another column
-    /// more than twice as often (see [`Self::range_routing_candidates`]) — and
+    /// the leading primary-key column unless scans pin another column more
+    /// than twice as often (see [`Self::range_routing_candidates`]) — and
     /// sorts its rows by it in runs, so a lookup reads one file per checkpoint
     /// and the zones of its slice within it. `None` keeps the hash split: one
     /// encode shard, a table with `cayenne_cluster_by` or authoritative sort
@@ -19742,7 +19742,7 @@ impl CayenneTableProvider {
 
     /// Key-range split points for a seq-prefix bake's merged output, so each of its
     /// files holds one slice of the routing key — the leading primary-key column
-    /// unless scans filter on another more than twice as often (see
+    /// unless scans pin another more than twice as often (see
     /// [`Self::range_routing_candidates`]) — and sorts its rows by it in runs.
     /// Hashed, every output file spans the whole key domain, and a lookup on the
     /// key opens every file of the merged snapshot; routed, it opens one.
@@ -19928,11 +19928,16 @@ impl CayenneTableProvider {
     ///
     /// A configured `cayenne_shard_key_columns` is the only candidate: the
     /// operator named the key. Otherwise the leading primary-key column comes
-    /// first, unless scans filter on another column more than twice as often —
-    /// schema inference can supply a primary key the workload never looks rows up
-    /// by (an auto-increment surrogate), and a layout routed on it prunes
-    /// nothing. Join keys arrive as runtime filters, which are not observed, so
-    /// the primary key yields only to a column filtered on distinctly more often.
+    /// first, unless scans pin another column more than twice as often — schema
+    /// inference can supply a primary key the workload never looks rows up by (an
+    /// auto-increment surrogate), and a layout routed on it prunes nothing. A
+    /// filter counts for a column only where it pins it to a few values or to a
+    /// bounded range (`FilterColumnObservations::pinned_hits`), because only such
+    /// a filter skips files that each hold one range of the column: a lookup
+    /// that fixes the leading key and lists many values of another skips every
+    /// file but one when routed on the leading key, and none when routed on the
+    /// other. Join keys arrive as runtime filters, which are not observed, so the
+    /// primary key yields only to a column pinned distinctly more often.
     /// Whichever of the two is not preferred follows as the fallback.
     fn range_routing_candidates(&self, schema: &SchemaRef) -> Vec<(String, RangeKeySource)> {
         let routable = |column: &str| {
@@ -19953,13 +19958,13 @@ impl CayenneTableProvider {
         }
         let observations = &self.filter_column_observations;
         let hottest = observations
-            .top_columns(DEFAULT_ROUTING_CANDIDATES, schema.as_ref())
+            .top_pinned_columns(DEFAULT_ROUTING_CANDIDATES, schema.as_ref())
             .into_iter()
             .find(|column| routable(column));
         match (leading_key, hottest) {
             (Some(key), Some(hottest)) if hottest != key => {
-                let hottest_leads =
-                    observations.hits(&hottest) > observations.hits(&key).saturating_mul(2);
+                let hottest_leads = observations.pinned_hits(&hottest)
+                    > observations.pinned_hits(&key).saturating_mul(2);
                 let key = (key, RangeKeySource::PrimaryKey);
                 let hottest = (hottest, RangeKeySource::ObservedFilters);
                 if hottest_leads {
@@ -53932,9 +53937,67 @@ mod tests {
     }
 
     /// The routing key of a whole-table replace: a configured shard key alone;
-    /// otherwise the primary key, yielding the lead only to a column filtered on
-    /// more than twice as often, with the other kept as the fallback; never a
-    /// column the router cannot split.
+    /// otherwise the primary key, yielding the lead only to a column pinned more
+    /// than twice as often, with the other kept as the fallback; never a column
+    /// the router cannot split.
+    /// Only filters that pin a column to a few values or a bounded range count
+    /// toward its routing lead. A lookup that fixes the leading key column and
+    /// lists many values of another — a multi-row receipt lookup, one
+    /// conjunction per row — and a long `IN` list on that other column, as a
+    /// semi-join pushdown writes, leave the table routed on the leading key
+    /// however often they run, where counting every reference would hand the
+    /// lead to the listed column.
+    #[tokio::test]
+    async fn range_routing_counts_only_pinning_filters() {
+        use datafusion_expr::{col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("w", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (table, _dir) = create_cayenne_table_with_config(
+            "routing_pinning_filters",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec!["w".to_string(), "i".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let lookup = (0..15_i64)
+            .map(|k| col("w").eq(lit(7_i64)).and(col("i").eq(lit(k * 6151 + 1))))
+            .reduce(datafusion_expr::Expr::or)
+            .expect("fifteen rows");
+        let semi_join = col("i").in_list((0..100_i64).map(lit).collect(), false);
+        for _ in 0..10 {
+            table
+                .filter_column_observations
+                .record_filters(std::slice::from_ref(&lookup));
+        }
+        for _ in 0..25 {
+            table
+                .filter_column_observations
+                .record_filters(std::slice::from_ref(&semi_join));
+        }
+        let observations = &table.filter_column_observations;
+        assert_eq!(
+            (observations.hits("w"), observations.hits("i")),
+            (10, 35),
+            "precondition: every scan references the listed column"
+        );
+        assert_eq!(
+            (observations.pinned_hits("w"), observations.pinned_hits("i")),
+            (10, 0),
+            "the lookups pin the leading key; nothing pins the listed column"
+        );
+        let names: Vec<String> = table
+            .range_routing_candidates(&table.table_schema())
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(names, vec!["w"], "routed on the key the lookups pin");
+    }
+
     #[tokio::test]
     async fn test_range_routing_candidates_order() {
         use datafusion_expr::{col, lit};
