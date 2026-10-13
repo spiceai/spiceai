@@ -1122,7 +1122,7 @@ mod tests {
         })
     }
 
-    fn chunk(delta: Value, finish_reason: Option<&str>) -> CreateChatCompletionStreamResponse {
+    fn chunk(delta: &Value, finish_reason: Option<&str>) -> CreateChatCompletionStreamResponse {
         serde_json::from_value(json!({
             "id": "scripted", "object": "chat.completion.chunk", "created": 0, "model": "scripted",
             "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
@@ -1145,17 +1145,17 @@ mod tests {
                 let mut call = sql_call();
                 call["index"] = json!(0);
                 vec![
-                    chunk(json!({ "role": "assistant", "content": "" }), None),
-                    chunk(json!({ "content": first }), None),
-                    chunk(json!({ "content": second }), None),
-                    chunk(json!({ "tool_calls": [call] }), None),
-                    chunk(json!({}), Some("tool_calls")),
+                    chunk(&json!({ "role": "assistant", "content": "" }), None),
+                    chunk(&json!({ "content": first }), None),
+                    chunk(&json!({ "content": second }), None),
+                    chunk(&json!({ "tool_calls": [call] }), None),
+                    chunk(&json!({}), Some("tool_calls")),
                 ]
             } else {
                 vec![
-                    chunk(json!({ "role": "assistant", "content": "" }), None),
-                    chunk(json!({ "content": ANSWER }), None),
-                    chunk(json!({}), Some("stop")),
+                    chunk(&json!({ "role": "assistant", "content": "" }), None),
+                    chunk(&json!({ "content": ANSWER }), None),
+                    chunk(&json!({}), Some("stop")),
                 ]
             };
             Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
