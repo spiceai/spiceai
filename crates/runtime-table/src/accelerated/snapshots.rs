@@ -622,11 +622,15 @@ async fn create_checkpoint_and_snapshot_once(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) -> Result<(), SnapshotAttemptError> {
+    let cayenne_table = match accelerator.and_then(extract_cayenne_write_target) {
+        Some(CayenneWriteTarget::Staged(table)) => Some(table),
+        _ => None,
+    };
     // Keeps Cayenne maintenance from deleting files until the archive is written.
     // Taken before the write lock, so writers never wait on a sweep batch.
-    let file_deletion_hold = match accelerator.and_then(extract_cayenne_write_target) {
-        Some(CayenneWriteTarget::Staged(table)) => Some(table.hold_file_deletions().await),
-        _ => None,
+    let file_deletion_hold = match &cayenne_table {
+        Some(table) => Some(table.hold_file_deletions().await),
+        None => None,
     };
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
@@ -663,10 +667,17 @@ async fn create_checkpoint_and_snapshot_once(
     } else {
         None
     };
+    // The secondary index runs of the writes just made persist in the
+    // background; written here, under the write lock, so the archive carries
+    // runs that cover its files and a restored table need not index them again.
+    let index_hold = match &cayenne_table {
+        Some(table) => Some(table.persist_lookup_index_for_snapshot().await),
+        None => None,
+    };
     snapshot_manager
         .create_snapshot(
             checkpoint_schema,
-            SnapshotLockGuard::from(lock_guard).with(file_deletion_hold),
+            SnapshotLockGuard::from(lock_guard).with((file_deletion_hold, index_hold)),
             updated_at,
             row_count,
             force_create,

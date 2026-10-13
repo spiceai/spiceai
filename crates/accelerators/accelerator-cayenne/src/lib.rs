@@ -4026,6 +4026,13 @@ impl DataAccelerator for CayenneAccelerator {
 
         ensure_stored_partitioning_matches(&cayenne_table, source, &partition_by, &dir_path)
             .await?;
+        // Safety net for the secondary index: files no loaded index run covers
+        // (a snapshot taken behind its index, runs that could not be loaded, a
+        // key encoding an upgrade changed) are indexed before the table is
+        // served, so no lookup reads them in full. A no-op when the persisted
+        // runs loaded and cover every file, which is the normal case: it lists
+        // the files and starts no build.
+        cayenne_table.catch_up_lookup_index().await;
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
@@ -4208,6 +4215,14 @@ impl DataAccelerator for CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
+            // The same safety net per partition, a no-op for a partition whose
+            // loaded runs cover its files. A snapshot archives no partition's
+            // runs, so a restored partition is indexed here.
+            for partition in &partition_table_providers {
+                if let Some(partition) = partition.downcast_ref::<cayenne::CayenneTableProvider>() {
+                    partition.catch_up_lookup_index().await;
+                }
+            }
             let partition_provider =
                 Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
