@@ -1931,3 +1931,227 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
         })
         .await
 }
+
+/// Every row a statement returns, each rendered as `col|col|…` (`NULL` for a
+/// null), sorted so two answers compare as multisets.
+async fn sorted_rows(rt: &Runtime, sql: &str) -> Result<Vec<String>, String> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
+
+    let options = FormatOptions::default().with_null("NULL");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to format the rows of `{sql}`: {e}"))?;
+        for row in 0..batch.num_rows() {
+            rows.push(
+                formatters
+                    .iter()
+                    .map(|formatter| formatter.value(row).to_string())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+        }
+    }
+    rows.sort_unstable();
+    Ok(rows)
+}
+
+/// `INTERSECT` and `EXCEPT` compare rows with NULLs treated as equal, and must
+/// keep doing so when the whole query is handed to `DuckDB` as SQL. They are
+/// sent as `EXISTS`/`NOT EXISTS` subqueries, and correlating those with `=`
+/// made every row with a NULL in a compared column drop out of an `INTERSECT`
+/// and survive an `EXCEPT`: TPC-DS q38 counted 0 rows instead of 111, and q87
+/// 46704 instead of 46449 (regression test for #14941).
+///
+/// The same three tables are accelerated twice: into one `DuckDB` file, where
+/// the set operation is pushed down, and into Arrow, where `DataFusion`
+/// evaluates it. Each query must return the same rows from both, and the rows
+/// written out below.
+#[tokio::test]
+async fn duckdb_file_acceleration_set_operations_match_nulls() -> Result<(), String> {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("day", DataType::Int64, true),
+            ]));
+            let write_table = |table: &str,
+                               names: Vec<Option<&str>>,
+                               days: Vec<Option<i64>>|
+             -> Result<std::path::PathBuf, String> {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(names)),
+                        Arc::new(Int64Array::from(days)),
+                    ],
+                )
+                .map_err(|e| format!("failed to build table {table}: {e}"))?;
+                let path = temp_dir.path().join(format!("{table}.parquet"));
+                let file = std::fs::File::create(&path)
+                    .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+                let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+                    .map_err(|e| format!("failed to open a writer for {table}: {e}"))?;
+                writer
+                    .write(&batch)
+                    .map_err(|e| format!("failed to write {table}: {e}"))?;
+                writer
+                    .close()
+                    .map_err(|e| format!("failed to close {table}: {e}"))?;
+                Ok(path)
+            };
+
+            let tables = [
+                (
+                    "a",
+                    write_table(
+                        "a",
+                        vec![None, None, Some("x"), Some("y"), Some("z"), None],
+                        vec![Some(1), Some(1), Some(2), None, Some(3), None],
+                    )?,
+                ),
+                (
+                    "b",
+                    write_table(
+                        "b",
+                        vec![None, Some("x"), Some("y"), Some("w")],
+                        vec![Some(1), Some(2), None, Some(4)],
+                    )?,
+                ),
+                (
+                    "c",
+                    write_table(
+                        "c",
+                        vec![None, Some("y"), Some("x")],
+                        vec![Some(1), None, Some(5)],
+                    )?,
+                ),
+            ];
+
+            let duckdb_file = temp_dir.path().join("set_operations.db");
+            let mut app = AppBuilder::new("duckdb_set_operations_test");
+            for (table, path) in &tables {
+                for engine in ["duckdb", "arrow"] {
+                    let name = format!("{table}_{engine}");
+                    let mut dataset =
+                        Dataset::new(format!("file:{}", path.display()), name.clone());
+                    dataset.name = name;
+                    dataset.acceleration = Some(Acceleration {
+                        enabled: true,
+                        engine: Some(engine.to_string()),
+                        mode: if engine == "duckdb" {
+                            Mode::File
+                        } else {
+                            Mode::Memory
+                        },
+                        refresh_mode: Some(RefreshMode::Full),
+                        params: (engine == "duckdb").then(|| {
+                            Params::from_string_map(HashMap::from([(
+                                "duckdb_file".to_string(),
+                                duckdb_file.display().to_string(),
+                            )]))
+                        }),
+                        ..Acceleration::default()
+                    });
+                    app = app.with_dataset(dataset);
+                }
+            }
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app.build()).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let select = |table: &str, engine: &str| format!("SELECT name, day FROM {table}_{engine}");
+            let cases: [(&str, fn(&dyn Fn(&str) -> String) -> String, Vec<&str>); 5] = [
+                (
+                    "INTERSECT",
+                    |t| format!("{} INTERSECT {}", t("a"), t("b")),
+                    vec!["NULL|1", "x|2", "y|NULL"],
+                ),
+                (
+                    "EXCEPT",
+                    |t| format!("{} EXCEPT {}", t("a"), t("b")),
+                    vec!["NULL|NULL", "z|3"],
+                ),
+                // The shape of TPC-DS q38: a chained INTERSECT, counted.
+                (
+                    "chained INTERSECT",
+                    |t| format!("SELECT count(*) FROM ({} INTERSECT {} INTERSECT {}) AS s", t("a"), t("b"), t("c")),
+                    vec!["2"],
+                ),
+                // The shape of TPC-DS q87: a chained EXCEPT, counted.
+                (
+                    "chained EXCEPT",
+                    |t| format!("SELECT count(*) FROM ({} EXCEPT {} EXCEPT {}) AS s", t("a"), t("b"), t("c")),
+                    vec!["2"],
+                ),
+                (
+                    "INTERSECT under a filter",
+                    |t| format!("SELECT * FROM ({} INTERSECT {}) AS s WHERE name IS NULL OR day IS NULL", t("a"), t("b")),
+                    vec!["NULL|1", "y|NULL"],
+                ),
+            ];
+
+            let mut failures = Vec::new();
+            for (label, query, expected) in &cases {
+                let duckdb_sql = query(&|table| select(table, "duckdb"));
+                let arrow_sql = query(&|table| select(table, "arrow"));
+
+                let plan = formatted_explain(&rt, &duckdb_sql).await?;
+                if !plan.contains("EXISTS") {
+                    failures.push(format!(
+                        "{label}: the set operation was not pushed down to DuckDB, so this case \
+                         does not test the SQL sent there; plan was:\n{plan}"
+                    ));
+                }
+
+                let duckdb_rows = sorted_rows(&rt, &duckdb_sql).await?;
+                let arrow_rows = sorted_rows(&rt, &arrow_sql).await?;
+                if duckdb_rows != arrow_rows || arrow_rows != *expected {
+                    failures.push(format!(
+                        "{label}: `{duckdb_sql}`\n    duckdb:   {duckdb_rows:?}\n    arrow:    {arrow_rows:?}\n    expected: {expected:?}"
+                    ));
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+            Ok(())
+        })
+        .await
+}

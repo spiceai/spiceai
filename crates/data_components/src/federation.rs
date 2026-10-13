@@ -3884,6 +3884,55 @@ mod tests {
         }
     }
 
+    /// Regression test for #14941: `INTERSECT` and `EXCEPT` are planned as semi
+    /// and anti joins whose keys match NULLs, because a set operation treats two
+    /// NULLs as the same value. `=` is never true on NULL, so the federated
+    /// statement must compare those keys with `IS NOT DISTINCT FROM` (`<=>` on
+    /// MySQL), or the remote engine drops every row with a NULL in a compared
+    /// column from an `INTERSECT` and keeps it in an `EXCEPT`.
+    #[test]
+    fn intersect_and_except_unparse_keys_that_match_nulls() {
+        let scan = |name: &str| {
+            LogicalPlanBuilder::scan(
+                name,
+                table_source(vec![Field::new("k", DataType::Utf8, true)]),
+                None,
+            )
+            .and_then(|scan| scan.project(vec![col("k")]))
+            .and_then(LogicalPlanBuilder::build)
+            .unwrap_or_else(|error| panic!("scan {name}: {error}"))
+        };
+        // (dialect, identifier quote, how it spells a key comparison that matches NULLs)
+        let dialects: [(&str, &dyn Dialect, char, &str); 3] = [
+            ("duckdb", &DuckDBDialect::new(), '"', "IS NOT DISTINCT FROM"),
+            (
+                "postgres",
+                &PostgreSqlDialect {},
+                '"',
+                "IS NOT DISTINCT FROM",
+            ),
+            ("mysql", &MySqlDialect {}, '`', "<=>"),
+        ];
+        for (operation, exists) in [("INTERSECT", "EXISTS"), ("EXCEPT", "NOT EXISTS")] {
+            let plan = if operation == "INTERSECT" {
+                LogicalPlanBuilder::intersect(scan("a"), scan("b"), false)
+            } else {
+                LogicalPlanBuilder::except(scan("a"), scan("b"), false)
+            }
+            .unwrap_or_else(|error| panic!("{operation}: {error}"));
+            for (dialect_name, dialect, q, matches) in dialects {
+                assert_eq!(
+                    unparse_with(dialect_name, dialect, &plan),
+                    format!(
+                        "SELECT DISTINCT {q}a{q}.{q}k{q} FROM {q}a{q} WHERE {exists} \
+                         (SELECT 1 FROM {q}b{q} WHERE ({q}a{q}.{q}k{q} {matches} {q}b{q}.{q}k{q}))"
+                    ),
+                    "{dialect_name}: {operation} must compare its keys so that NULLs match"
+                );
+            }
+        }
+    }
+
     /// Regression test for the unparser's `rescope_projection_over_projection`,
     /// carried by the `spiceai/datafusion` fork (upstream's
     /// apache/datafusion#22961): common subexpression elimination leaves a
