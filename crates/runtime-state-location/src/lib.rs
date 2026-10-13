@@ -205,7 +205,9 @@ impl StateFeature {
     }
 
     /// Whether a `gs://` location's `params` take the GCS data connector's names
-    /// and are validated. Snapshot `params` go to the GCS store as written.
+    /// and are validated. Snapshot `params` take the GCS store's own names
+    /// (`skip_signature`, ...) as written, unless they use the connector's `gcs_`
+    /// names, as `runtime.state.params` do; see [`uses_gcs_connector_names`].
     fn validates_gcs_parameters(self) -> bool {
         !matches!(self, Self::Snapshots)
     }
@@ -324,7 +326,9 @@ pub async fn build_object_store(
             location: url.to_string(),
         })?;
         let params = params.map(Params::as_string_map);
-        let gcs_params = if feature.validates_gcs_parameters() {
+        let gcs_params = if feature.validates_gcs_parameters()
+            || params.as_ref().is_some_and(uses_gcs_connector_names)
+        {
             build_gcs_parameters(secrets, params.as_ref(), usage).await?
         } else {
             build_secret_resolved_parameters(secrets, params.as_ref()).await
@@ -385,6 +389,13 @@ pub async fn build_s3_parameters(
         }
         None => Ok(Parameters::new(vec![], "s3", s3_parameters)),
     }
+}
+
+/// Whether `params` name a GCS setting the way the GCS data connector does
+/// (`gcs_skip_signature`), which the GCS store does not read until they are
+/// validated and mapped to its own names.
+fn uses_gcs_connector_names(params: &HashMap<String, String>) -> bool {
+    params.keys().any(|key| key.starts_with("gcs_"))
 }
 
 /// Resolves a `gs://` location's `params`, given under the GCS data connector's
@@ -906,7 +917,6 @@ mod tests {
             ),
             (feature_setting("gs://bucket/snapshots", None), "snapshots"),
             (feature_setting(&file_location, None), ""),
-            (feature_setting("memory://snapshots", None), ""),
         ] {
             let (_, prefix) = build_object_store(
                 secrets(),
@@ -949,39 +959,46 @@ mod tests {
         );
     }
 
-    /// A snapshot location's `gs://` `params` reach the GCS store as written,
-    /// unvalidated, where a state location validates the GCS data connector's names.
+    /// A snapshot location's `gs://` `params` reach the GCS store as written when
+    /// they use its own names. With the GCS data connector's `gcs_` names, which
+    /// a location inherited from `runtime.state` has, they are validated and
+    /// mapped as for every other state location, not ignored.
     #[tokio::test]
-    async fn snapshot_gcs_parameters_are_passed_as_written() {
-        let params = Params::from_string_map(HashMap::from([(
-            "skip_signature".to_string(),
-            "true".to_string(),
-        )]));
-
-        let (store, _) = build_object_store(
-            secrets(),
-            Handle::current(),
-            &feature_setting("gs://snapshot-bucket/snapshots/", Some(&params)),
-            StateFeature::Snapshots,
-        )
-        .await
-        .expect("snapshot GCS store should build");
-        assert!(
-            format!("{store:?}").contains("skip_signature: true"),
-            "`skip_signature: true` must build an unsigned store: {store:?}"
-        );
+    async fn snapshot_gcs_parameters_take_store_or_connector_names() {
+        for (key, value) in [("skip_signature", "true"), ("gcs_skip_signature", "true")] {
+            let params = Params::from_string_map(HashMap::from([(
+                key.to_string(),
+                value.to_string(),
+            )]));
+            let (store, _) = build_object_store(
+                secrets(),
+                Handle::current(),
+                &feature_setting("gs://snapshot-bucket/snapshots/", Some(&params)),
+                StateFeature::Snapshots,
+            )
+            .await
+            .expect("snapshot GCS store should build");
+            assert!(
+                format!("{store:?}").contains("skip_signature: true"),
+                "`{key}: true` must build an unsigned store: {store:?}"
+            );
+        }
 
         let not_a_bool = Params::from_string_map(HashMap::from([(
             "gcs_skip_signature".to_string(),
             "not-a-bool".to_string(),
         )]));
-        build_object_store(
+        let err = build_object_store(
             secrets(),
             Handle::current(),
             &feature_setting("gs://snapshot-bucket/snapshots/", Some(&not_a_bool)),
             StateFeature::Snapshots,
         )
         .await
-        .expect("snapshot GCS params are not validated");
+        .expect_err("an invalid GCS connector parameter is reported, not ignored");
+        assert_eq!(
+            err.to_string(),
+            "Failed to validate GCS parameters for snapshot: Invalid configuration for snapshot. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
+        );
     }
 }

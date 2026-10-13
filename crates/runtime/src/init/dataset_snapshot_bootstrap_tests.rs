@@ -455,6 +455,27 @@ async fn snapshot_bootstrap_removed_reader_does_not_register_after_publication()
     runtime.shutdown().await;
 }
 
+/// Every file under `root`, relative to it.
+fn walk(root: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                files.push(relative.display().to_string());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 /// A file-mode `DuckDB` dataset over `csv`, accelerated into `duckdb_file`.
 fn duckdb_dataset(
     directory: &std::path::Path,
@@ -517,24 +538,43 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
         .build();
     assert!(writer_app.snapshots.is_none(), "the spicepod has no snapshots section");
     let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
-    Arc::clone(&writer).load_datasets().await;
+    // A writer publishes its first snapshot once the runtime is ready, which
+    // `load_components` reports and `load_datasets` alone does not.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        Arc::clone(&writer).load_components(),
+    )
+    .await
+    .expect("the writer must finish loading");
     wait_for_count(&writer, "orders", 3).await;
 
     let metadata = directory.path().join("state/snapshots/metadata.json");
     let current_snapshot_id = || async {
         let contents = tokio::fs::read_to_string(&metadata).await.ok()?;
         let metadata: serde_json::Value = serde_json::from_str(&contents).ok()?;
-        metadata.get("current-snapshot-id")?.as_u64()
+        metadata.get("orders")?.get("current-snapshot-id")?.as_u64()
     };
     assert!(
         test_framework::utils::wait_until_true(Duration::from_secs(15), || async {
             current_snapshot_id().await.is_some()
         })
         .await,
-        "the writer must publish a current snapshot to {}",
-        metadata.display()
+        "the writer must publish a current snapshot to {} (runtime ready: {}, components: {:?}, files: {:?})",
+        metadata.display(),
+        writer.status.is_ready(),
+        writer.status.get_all_statuses(),
+        walk(&directory.path().join("state")),
     );
     writer.shutdown().await;
+    let recorded: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&metadata).expect("read snapshot metadata"),
+    )
+    .expect("parse snapshot metadata");
+    assert_eq!(
+        recorded.get("location").and_then(serde_json::Value::as_str),
+        Some(format!("file://{}/state/snapshots/", directory.path().display()).as_str()),
+        "the snapshot location is the `snapshots/` folder of `runtime.state.location`"
+    );
     let mut state_root: Vec<_> = std::fs::read_dir(directory.path().join("state"))
         .expect("list state location")
         .map(|entry| entry.expect("state entry").file_name())

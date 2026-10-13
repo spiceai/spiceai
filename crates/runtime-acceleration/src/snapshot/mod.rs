@@ -4023,6 +4023,13 @@ fn log_snapshot_store_error(
                 "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because 'snapshots.params' is invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
             );
         }
+        Error::GcsParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because its GCS parameters are invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
         Error::S3ObjectStoreInit { source, .. } => {
             tracing::error!(
                 dataset = %dataset_name,
@@ -4092,9 +4099,7 @@ fn log_snapshot_store_error(
                 "Failed to build snapshot object store",
             );
         }
-        Error::InvalidStateLocation { .. }
-        | Error::ObjectStoreInit { .. }
-        | Error::GcsParameterValidation { .. } => {
+        Error::InvalidStateLocation { .. } | Error::ObjectStoreInit { .. } => {
             tracing::error!(
                 dataset = %dataset_name,
                 location = %snapshots_location_url,
