@@ -86,6 +86,27 @@ static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| R
 static COMPACTION_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(compaction_budget_permits())));
 
+/// Process-wide budget bounding how many `deletion_mode: auto` tables rewrite
+/// themselves whole at once to reclaim deletes
+/// (`CpuBudget::cayenne_whole_table_reclaim_permits`). Each table paces its own
+/// reclaims, but tables written alike reach their triggers together, and with
+/// nothing bounding them across tables 20 rewrote at once on eight cores and
+/// stalled queries. Separate from [`COMPACTION_BUDGET`], which a background pass
+/// already holds when it reaches a reclaim, and from the encode budget, which
+/// writers draw on.
+static WHOLE_TABLE_RECLAIM_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        cpu_budget::cpu_budget().cayenne_whole_table_reclaim_permits(),
+    ))
+});
+
+/// The process-wide budget an `auto` table's whole-table reclaim draws on. See
+/// [`WHOLE_TABLE_RECLAIM_BUDGET`].
+#[must_use]
+pub(crate) fn whole_table_reclaim_budget() -> Arc<Semaphore> {
+    Arc::clone(&WHOLE_TABLE_RECLAIM_BUDGET)
+}
+
 static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
     LazyLock::new(CompactionPassTracker::default);

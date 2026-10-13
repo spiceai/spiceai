@@ -832,8 +832,8 @@ impl SchemaProvider for CayenneSchemaProvider {
 /// A builder that opens a table of a Cayenne catalog with its stored
 /// configuration, and with `deletion_mode: auto` set up for this runtime as the
 /// accelerator sets it up for a dataset. On a runtime where `auto` may not keep a
-/// small table compacted whole alongside its writes, with fewer than 8 CPU cores or
-/// not on Linux ([`crate::auto_keeps_small_tables_compacted`]), an `auto` table
+/// small table compacted whole alongside its writes, with fewer than 8 physical CPU
+/// cores or not on Linux ([`crate::auto_keeps_small_tables_compacted`]), an `auto` table
 /// keeps key deletes from the start ([`VortexConfig::auto_keeps_key_deletes`]). The
 /// setting is not stored, so the table chooses again wherever it next opens.
 pub(crate) fn catalog_table_builder(

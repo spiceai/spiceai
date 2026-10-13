@@ -62,7 +62,7 @@ use super::on_conflict::{
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
-use super::pk_deletion_mode::{AutoDeletionMode, PkDeletionMode};
+use super::pk_deletion_mode::{AutoDeletionMode, AutoKeyTableKind, PkDeletionMode, TableStorage};
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
@@ -13718,15 +13718,22 @@ impl CayenneTableProvider {
         context: &CayenneContext,
     ) -> PkDeletionMode {
         let has_primary_key = !table_metadata.primary_key.is_empty();
-        // `auto` rewrites a table whole only where that was measured to pay: on
-        // local storage. A whole-table rewrite of a table on object storage reads
-        // and writes it over the network, which was not measured, so such a table
-        // keeps key deletes.
-        let adapts = !table_metadata.vortex_config.memory_mode
-            && table_metadata.partition_column.is_none()
-            && !context.is_coupled_writer()
-            && !table_metadata.vortex_config.cold_tier_enabled()
-            && !table_metadata.path.starts_with("s3://");
+        // `auto` rewrites a table whole only where that was measured to pay (see
+        // `AutoKeyTableKind`); the accelerator prints the same kinds in its
+        // auto-tuned config line.
+        let storage = if table_metadata.vortex_config.memory_mode {
+            TableStorage::Memory
+        } else if table_metadata.path.starts_with("s3://") {
+            TableStorage::ObjectStorage
+        } else {
+            TableStorage::LocalDisk
+        };
+        let adapts = AutoKeyTableKind::of(
+            storage,
+            table_metadata.partition_column.is_some() || context.is_coupled_writer(),
+            table_metadata.vortex_config.cold_tier_enabled(),
+        )
+        .is_none();
         PkDeletionMode::for_table(
             context.deletion_mode(),
             has_primary_key,
@@ -23798,6 +23805,18 @@ impl CayenneTableProvider {
         held_position_guards: Option<PositionRewriteGuards>,
         reclaim: bool,
     ) -> Result<bool> {
+        // An `auto` table's whole-table reclaim takes a permit from the process-wide
+        // reclaim budget, so tables written alike do not all rewrite at once. Taken
+        // before the pass is timed: a wait for a permit is not reclaim time, and
+        // does not count toward the table's pace.
+        let _reclaim_permit = if reclaim && self.pk_deletion_mode.auto().is_some() {
+            super::compaction::whole_table_reclaim_budget()
+                .acquire_owned()
+                .await
+                .ok()
+        } else {
+            None
+        };
         let pass_start = Instant::now();
         let result = self
             .rewrite_current_snapshot_holding_bounded(held_position_guards, reclaim)

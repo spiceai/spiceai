@@ -1944,6 +1944,9 @@ impl CayenneAccelerator {
             // changes/CDC refresh mode, and only when a primary key exists
             // (key mode requires one) — explicit `position`/`key` configs and
             // every non-CDC profile keep their config as-is.
+            // The mode as configured, before this and the datalake pin below resolve
+            // `auto`: the auto-tuned config line names it with the reason.
+            let configured_deletion_mode = config.deletion_mode;
             if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
                 && acceleration.refresh_mode == Some(RefreshMode::Changes)
                 && workload.has_primary_key
@@ -1956,27 +1959,18 @@ impl CayenneAccelerator {
 
             // `auto` keeps a small primary-key table on position deletes, compacted
             // whole alongside its writes, only where compaction can do that without
-            // slowing queries and writes: on Linux, with 8 or more CPU cores
-            // (`cayenne::auto_keeps_small_tables_compacted`). Elsewhere the table
-            // stays `auto` but keeps key deletes from the start, so it never records
-            // a position delete and still reclaims, by `auto`'s paced whole-table
-            // rewrite, deletes of rows the bake cannot reach. The auto-tuned config
-            // line below shows the result beside `cores`.
+            // slowing queries and writes: on Linux, with 8 or more physical CPU cores
+            // (`cayenne::auto_key_deletes_reason`). Elsewhere the table stays `auto`
+            // but keeps key deletes from the start, so it never records a position
+            // delete and still reclaims, by `auto`'s paced whole-table rewrite,
+            // deletes of rows the bake cannot reach. The auto-tuned config line below
+            // names the choice and its reason.
+            let auto_key_deletes = cayenne::auto_key_deletes_reason();
             if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
                 && workload.has_primary_key
-                && !cayenne::auto_keeps_small_tables_compacted()
+                && auto_key_deletes.is_some()
             {
                 config.auto_keeps_key_deletes = true;
-                if cfg!(target_os = "linux") {
-                    tracing::debug!(
-                        "Dataset '{table_name}': cayenne_deletion_mode 'auto' keeps key deletes from the start (this runtime has {} CPU cores, fewer than the 8 that keep a small table compacted whole alongside its writes). Set `cayenne_deletion_mode: position` to opt into position deletes.",
-                        hw.cores
-                    );
-                } else {
-                    tracing::debug!(
-                        "Dataset '{table_name}': cayenne_deletion_mode 'auto' keeps key deletes from the start (only on Linux does compaction run below the priority of queries and writes, which keeping a small table compacted whole alongside its writes needs). Set `cayenne_deletion_mode: position` to opt into position deletes."
-                    );
-                }
             }
 
             // CDC durability mode (file | memory). Memory mode appends CDC
@@ -2460,6 +2454,30 @@ impl CayenneAccelerator {
                 tracing::warn!(target: "spiced::acceleration::cayenne", "{warning}");
             }
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
+                // `cayenne_deletion_mode` as it resolves for this table, and why.
+                let deletion_mode = cayenne::DeletionModeChoice::resolve(
+                    configured_deletion_mode,
+                    workload.has_primary_key,
+                    if acceleration.refresh_mode == Some(RefreshMode::Changes) {
+                        Some(cayenne::AutoKeyTableKind::Cdc)
+                    } else {
+                        cayenne::AutoKeyTableKind::of(
+                            if !source.is_file_accelerated() {
+                                cayenne::TableStorage::Memory
+                            } else if is_s3 {
+                                cayenne::TableStorage::ObjectStorage
+                            } else {
+                                cayenne::TableStorage::LocalDisk
+                            },
+                            !acceleration.partition_by.is_empty(),
+                            config.cold_tier_enabled(),
+                        )
+                    },
+                    auto_key_deletes,
+                    config
+                        .target_vortex_file_size_mb
+                        .saturating_mul(1024 * 1024),
+                );
                 // A `target_*` SLO with the closed loop off does nothing, and it is easy
                 // to set one and assume it took effect.
                 if targets_are_inert {
@@ -2502,11 +2520,7 @@ impl CayenneAccelerator {
                     inferred_schema_present = workload.inferred_metadata.is_present(),
                     has_primary_key = workload.has_primary_key,
                     is_upsert = workload.is_upsert,
-                    // Whether `deletion_mode: auto` keeps key deletes from the start
-                    // on this runtime (fewer than 8 CPU cores, or not Linux); the
-                    // table stays `auto`.
-                    auto_keeps_key_deletes = config.auto_keeps_key_deletes,
-                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
+                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                     config.pk_keyset_cache_mb,
                     config.target_vortex_file_size_mb,
                     config.upload_concurrency,
@@ -2515,7 +2529,7 @@ impl CayenneAccelerator {
                     config.compression_strategy,
                     config.delta_encoding,
                     config.pk_conflict_detection.as_str(),
-                    config.deletion_mode,
+                    deletion_mode,
                     config.compaction_trigger_files,
                     config.compaction_trigger_protected_snapshots,
                     config.compaction_trigger_snapshot_age_ms,
@@ -3320,7 +3334,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
-            .description("How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more physical CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.")
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
@@ -8315,6 +8329,119 @@ mod tests {
                 !keeps_small_tables_compacted
             )
         );
+    }
+
+    /// The auto-tuned config line names how `cayenne_deletion_mode` resolves for
+    /// each table, and why, in the Spicepod's spelling: the CDC pin, an in-memory
+    /// dataset, a datalake tier, an explicit mode, a table without a primary key,
+    /// and a file dataset on this host.
+    #[tokio::test]
+    async fn auto_tuned_config_line_names_the_deletion_mode_and_its_reason() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let pk = autotune::WorkloadProfile {
+            has_primary_key: true,
+            is_upsert: true,
+            pk_arity: 1,
+            ..Default::default()
+        };
+        let no_pk = autotune::WorkloadProfile::default();
+        let captured = capture_logs();
+        let resolve = |name: &'static str,
+                       mode: Mode,
+                       refresh_mode: RefreshMode,
+                       params: Vec<(&'static str, &'static str)>,
+                       workload: autotune::WorkloadProfile| {
+            let app = Arc::clone(&app);
+            async move {
+                let mut dataset = TestAccelerationSource::new(name).with_app(app);
+                dataset.set_acceleration(Acceleration {
+                    engine: Engine::Cayenne,
+                    mode,
+                    refresh_mode: Some(refresh_mode),
+                    params: params
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    ..Default::default()
+                });
+                CayenneAccelerator::get_vortex_config_with_footer_cache(
+                    name, &dataset, None, &workload,
+                )
+                .await
+                .expect("config should be valid")
+            }
+        };
+
+        for (name, mode, refresh_mode, params, workload, expected) in [
+            (
+                "deletion_mode_line_cdc",
+                Mode::File,
+                RefreshMode::Changes,
+                vec![],
+                pk.clone(),
+                "deletion_mode=key (auto: CDC dataset),",
+            ),
+            (
+                "deletion_mode_line_memory",
+                Mode::Memory,
+                RefreshMode::Full,
+                vec![],
+                pk.clone(),
+                "deletion_mode=key (auto: in-memory dataset),",
+            ),
+            (
+                "deletion_mode_line_datalake",
+                Mode::File,
+                RefreshMode::Append,
+                vec![("cayenne_datalake_location", "s3://bucket/prefix")],
+                pk.clone(),
+                "deletion_mode=key (auto: datalake tier),",
+            ),
+            (
+                "deletion_mode_line_position",
+                Mode::File,
+                RefreshMode::Full,
+                vec![("cayenne_deletion_mode", "position")],
+                pk.clone(),
+                "deletion_mode=position,",
+            ),
+            (
+                "deletion_mode_line_no_pk",
+                Mode::File,
+                RefreshMode::Full,
+                vec![],
+                no_pk.clone(),
+                "deletion_mode=position (no primary key),",
+            ),
+        ] {
+            resolve(name, mode, refresh_mode, params, workload).await;
+            assert_eq!(captured.occurrences_of(expected), 1, "{name}: {expected}");
+        }
+
+        // A file dataset with a primary key: the choice depends on this host.
+        let config = resolve(
+            "deletion_mode_line_file",
+            Mode::File,
+            RefreshMode::Full,
+            vec![],
+            pk.clone(),
+        )
+        .await;
+        let expected = if cfg!(target_os = "linux") {
+            format!(
+                "deletion_mode={},",
+                cayenne::DeletionModeChoice::resolve(
+                    cayenne::metadata::DeletionMode::Auto,
+                    true,
+                    None,
+                    cayenne::auto_key_deletes_reason(),
+                    config.target_vortex_file_size_mb * 1024 * 1024,
+                )
+            )
+        } else {
+            "deletion_mode=auto (key deletes: position deletes need Linux),".to_string()
+        };
+        assert_eq!(captured.occurrences_of(&expected), 1, "{expected}");
     }
 
     /// Off Linux, `spiced`'s compaction cannot run below the priority of queries

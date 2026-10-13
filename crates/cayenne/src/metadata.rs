@@ -506,8 +506,8 @@ pub enum DeletionMode {
     /// reclaim them by rewriting it whole — at most 1/32 of the target file
     /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
     /// deletes once it outgrows that. The switch holds until the table is next
-    /// opened, which sizes it again. On a runtime with fewer than 8 CPU cores, or
-    /// not on Linux, an `Auto` table keeps key deletes from the start
+    /// opened, which sizes it again. On a runtime with fewer than 8 physical CPU
+    /// cores, or not on Linux, an `Auto` table keeps key deletes from the start
     /// ([`VortexConfig::auto_keeps_key_deletes`]); it is still `Auto`, so it still
     /// reclaims, by its paced whole-table rewrite, deletes of rows the bake
     /// cannot reach. A table on object storage, in `mode: memory`, partitioned,
@@ -966,8 +966,9 @@ pub struct VortexConfig {
     /// Whether `deletion_mode: auto` keeps key deletes from the start on this
     /// runtime. The accelerator and the Cayenne catalog set it where `auto` may not
     /// keep a small table compacted whole alongside its writes: with fewer than 8
-    /// CPU cores, or not on Linux ([`crate::auto_keeps_small_tables_compacted`]). Such a table is
-    /// still `auto`, as one past its bound is, so it still reclaims, by the paced
+    /// physical CPU cores, or not on Linux
+    /// ([`crate::auto_keeps_small_tables_compacted`]). Such a table is still
+    /// `auto`, as one past its bound is, so it still reclaims, by the paced
     /// whole-table rewrite, deletes of rows the bake cannot reach. Never stored
     /// with the table, so a table chooses again wherever it next opens.
     #[serde(skip)]

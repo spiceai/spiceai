@@ -9447,7 +9447,7 @@
           ]
         },
         "cayenne_deletion_mode": {
-          "description": "How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.",
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more physical CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.",
           "type": "string",
           "default": "auto",
           "enum": [

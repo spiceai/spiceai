@@ -284,8 +284,8 @@ The same primitives produce visibly different trees depending on whether the wor
 
 | Deletion mode | Schema | When |
 |---------------|--------|------|
-| **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or a PK table on position deletes (`deletion_mode: position`, or `auto` on a table it adapts while the table is within its bound, on Linux with 8 or more CPU cores) for a delete whose `(file path, file-local position)` is known |
-| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables on key deletes (`deletion_mode: key`; `auto` once the table outgrows its bound, from the start on a runtime with fewer than 8 CPU cores or not on Linux, and always on a table it does not adapt: `refresh_mode: changes`, `mode: memory`, partitioned, datalake-tiered, or on object storage) — and a position-delete PK table's fallback |
+| **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or a PK table on position deletes (`deletion_mode: position`, or `auto` on a table it adapts while the table is within its bound, on Linux with 8 or more physical CPU cores) for a delete whose `(file path, file-local position)` is known |
+| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables on key deletes (`deletion_mode: key`; `auto` once the table outgrows its bound, from the start on a runtime with fewer than 8 physical CPU cores or not on Linux, and always on a table it does not adapt: `refresh_mode: changes`, `mode: memory`, partitioned, datalake-tiered, or on object storage) — and a position-delete PK table's fallback |
 
 The schema is chosen per *delete*, not per table: a position-delete PK table records a key-based vector for every delete without a known position — an unlocated or upserted row, and every filter-based `DELETE` — so it keeps a key deletion index too.
 

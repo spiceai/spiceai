@@ -298,6 +298,20 @@ pub struct HostReadings {
     /// could read a pod spec put it there. `None` when no request is declared,
     /// which is every bare-metal and benchmark deployment.
     pub declared_request_millicores: Option<u64>,
+    /// The host's simultaneous multithreading (SMT) layout: its online logical
+    /// CPUs and the physical cores they form. `None` when it cannot be read,
+    /// which is every platform but Linux.
+    pub smt: Option<SmtLayout>,
+}
+
+/// A host's online logical CPUs and the physical cores they form. With SMT each
+/// physical core runs two (or more) logical CPUs, which share its execution units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmtLayout {
+    /// Online logical CPUs.
+    pub logical_cpus: usize,
+    /// Distinct physical cores among them.
+    pub physical_cores: usize,
 }
 
 impl HostReadings {
@@ -316,8 +330,64 @@ impl HostReadings {
             kubernetes: std::env::var_os("KUBERNETES_SERVICE_HOST")
                 .is_some_and(|value| !value.is_empty()),
             declared_request_millicores: detect_declared_request_millicores(),
+            smt: detect_smt_layout(),
         }
     }
+}
+
+/// The host's SMT layout, from Linux sysfs: the online CPUs, and the distinct
+/// sets of SMT siblings they form, one per physical core. `None` off Linux or
+/// when sysfs cannot be read.
+fn detect_smt_layout() -> Option<SmtLayout> {
+    const CPU_DIR: &str = "/sys/devices/system/cpu";
+    let online = parse_cpu_list(&std::fs::read_to_string(format!("{CPU_DIR}/online")).ok()?)?;
+    let mut sibling_sets = std::collections::HashSet::new();
+    for cpu in &online {
+        let siblings =
+            std::fs::read_to_string(format!("{CPU_DIR}/cpu{cpu}/topology/thread_siblings_list"))
+                .ok()?;
+        sibling_sets.insert(parse_cpu_list(&siblings)?);
+    }
+    smt_layout(online.len(), sibling_sets.len())
+}
+
+/// An [`SmtLayout`] of `logical_cpus` forming `physical_cores`, when both are
+/// known and consistent.
+const fn smt_layout(logical_cpus: usize, physical_cores: usize) -> Option<SmtLayout> {
+    if physical_cores == 0 || physical_cores > logical_cpus {
+        return None;
+    }
+    Some(SmtLayout {
+        logical_cpus,
+        physical_cores,
+    })
+}
+
+/// The CPUs of a Linux CPU list, such as `0-3,8,10-11`, the format of sysfs
+/// `online` and `thread_siblings_list` files. `None` when it does not parse.
+#[must_use]
+pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let list = list.trim();
+    if list.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let (start, end) = (
+                    start.trim().parse::<usize>().ok()?,
+                    end.trim().parse::<usize>().ok()?,
+                );
+                if start > end {
+                    return None;
+                }
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(part.trim().parse().ok()?),
+        }
+    }
+    Some(cpus)
 }
 
 /// The environment variable carrying the pod's own `requests.cpu`.
@@ -515,7 +585,14 @@ pub struct CpuBudget {
     /// The pod's declared `requests.cpu`. Reported, and the only request the
     /// warning below is allowed to compare against.
     declared_request_millicores: Option<u64>,
+    /// The host's SMT layout, which scales [`Self::physical_cores`].
+    smt: Option<SmtLayout>,
 }
+
+/// The physical cores Cayenne's `deletion_mode: auto` needs before it keeps a
+/// small primary-key table compacted whole alongside its writes (see
+/// [`CpuBudget::cayenne_keeps_small_tables_compacted`]).
+pub const CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES: usize = 8;
 
 impl CpuBudget {
     /// Resolve the effective entitlement.
@@ -645,6 +722,7 @@ impl CpuBudget {
             cpu_share: host.cpu_share,
             kubernetes: host.kubernetes,
             declared_request_millicores: host.declared_request_millicores,
+            smt: host.smt,
         })
     }
 
@@ -1089,6 +1167,24 @@ impl CpuBudget {
         self.detected_cores
     }
 
+    /// The physical cores behind [`Self::cores`]: the budget scaled by the
+    /// host's physical cores per online logical CPU, rounded down and at least
+    /// one. Equal to `cores` without SMT, or where the layout is unknown. A
+    /// budget of 8 logical CPUs on a host with two SMT threads per core is 4.
+    #[must_use]
+    pub const fn physical_cores(&self) -> usize {
+        match self.smt {
+            Some(SmtLayout {
+                logical_cpus,
+                physical_cores,
+            }) if physical_cores < logical_cpus => {
+                let scaled = self.cores * physical_cores / logical_cpus;
+                if scaled == 0 { 1 } else { scaled }
+            }
+            _ => self.cores,
+        }
+    }
+
     // ---- tokio runtimes ----
 
     /// Worker threads for the primary runtime (HTTP, control plane, queries).
@@ -1206,15 +1302,31 @@ impl CpuBudget {
     }
 
     /// Whether Cayenne's `deletion_mode: auto` has the cores to keep a small
-    /// primary-key table on position deletes, compacted whole alongside its writes.
-    /// Cayenne also requires Linux (`cayenne::auto_keeps_small_tables_compacted`). In a Linux
-    /// virtual machine held to four CPUs, a 200K-row table under 2,000 upserts
-    /// every 250 ms wrote at a P99 4% above key deletes' on position deletes, with
-    /// mixed reads. On eight performance cores of a bare-metal Arm host its writes
-    /// were even and its P99 reads 8–27% faster.
+    /// primary-key table on position deletes, compacted whole alongside its writes:
+    /// [`CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES`] physical cores. Cayenne
+    /// also requires Linux (`cayenne::auto_keeps_small_tables_compacted`).
+    ///
+    /// In a Linux virtual machine held to four CPUs, a 200K-row table under 2,000
+    /// upserts every 250 ms wrote at a P99 4% above key deletes' on position
+    /// deletes, with mixed reads. On eight performance cores of a bare-metal Arm
+    /// host, without SMT, its writes were even and its P99 reads 8–27% faster. The
+    /// count is of physical cores because no host with SMT was measured: two SMT
+    /// threads share one core's execution units however their priorities are set,
+    /// so 8 logical CPUs on 4 such cores are counted as the 4 that lost.
     #[must_use]
     pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
-        self.cores >= 8
+        self.physical_cores() >= CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES
+    }
+
+    /// How many Cayenne `deletion_mode: auto` tables may rewrite themselves whole
+    /// at once to reclaim deletes: one per four physical cores, and at least one.
+    /// Tables written alike reach their reclaim triggers together: on eight cores,
+    /// with 20 tables of 200K rows, all 20 rewriting at once stalled aggregate scans
+    /// on them to 154–194 ms, against 67–74 ms on key deletes.
+    #[must_use]
+    pub const fn cayenne_whole_table_reclaim_permits(&self) -> usize {
+        let permits = self.physical_cores() / 4;
+        if permits == 0 { 1 } else { permits }
     }
 
     /// Connections in the Cayenne `SQLite` metastore pool. Capped at 32 because
@@ -1293,6 +1405,7 @@ pub fn cpu_budget() -> &'static CpuBudget {
             cpu_share: None,
             kubernetes: false,
             declared_request_millicores: None,
+            smt: None,
         })
     })
 }
@@ -1422,6 +1535,82 @@ mod tests {
         }
     }
 
+    fn smt_budget(cores: usize, logical_cpus: usize, physical_cores: usize) -> CpuBudget {
+        let host = HostReadings {
+            affinity_cores: cores,
+            smt: smt_layout(logical_cpus, physical_cores),
+            ..HostReadings::default()
+        };
+        CpuBudget::resolve(&CpuConfig::default(), &host).expect("detection cannot fail")
+    }
+
+    /// On a host with SMT the rule counts physical cores: 8 logical CPUs on a
+    /// host with two threads per core are 4 physical cores, and stay on key
+    /// deletes; 16 are 8.
+    #[test]
+    fn cayenne_keeps_small_tables_compacted_counts_physical_cores_under_smt() {
+        for (cores, logical, physical, expected_physical, keeps) in [
+            (8, 16, 8, 4, false),
+            (16, 16, 8, 8, true),
+            (12, 32, 16, 6, false),
+            (8, 8, 8, 8, true),
+            (1, 2, 1, 1, false),
+        ] {
+            let budget = smt_budget(cores, logical, physical);
+            assert_eq!(
+                (
+                    budget.physical_cores(),
+                    budget.cayenne_keeps_small_tables_compacted()
+                ),
+                (expected_physical, keeps),
+                "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+    }
+
+    /// One whole-table reclaim per four physical cores, and at least one.
+    #[test]
+    fn cayenne_whole_table_reclaim_permits_follow_physical_cores() {
+        for (cores, logical, physical, permits) in [
+            (1, 1, 1, 1),
+            (4, 4, 4, 1),
+            (8, 8, 8, 2),
+            (8, 16, 8, 1),
+            (16, 16, 16, 4),
+            (64, 64, 64, 16),
+        ] {
+            assert_eq!(
+                smt_budget(cores, logical, physical).cayenne_whole_table_reclaim_permits(),
+                permits,
+                "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+    }
+
+    /// The sysfs CPU-list format: single CPUs and inclusive ranges, comma
+    /// separated, with the trailing newline sysfs writes.
+    #[test]
+    fn parse_cpu_list_reads_sysfs_lists() {
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11\n"),
+            Some(vec![0, 1, 2, 3, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("5"), Some(vec![5]));
+        assert_eq!(parse_cpu_list("0,64"), Some(vec![0, 64]));
+        assert_eq!(parse_cpu_list(""), Some(vec![]));
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("a-b"), None);
+    }
+
+    /// A layout whose physical count is zero or exceeds its logical CPUs is not
+    /// a layout, and the budget reads as having no SMT.
+    #[test]
+    fn an_inconsistent_smt_layout_is_ignored() {
+        assert_eq!(smt_layout(8, 0), None);
+        assert_eq!(smt_layout(4, 8), None);
+        assert_eq!(smt_budget(8, 4, 8).physical_cores(), 8);
+    }
+
     fn quota(affinity_cores: usize, quota_millicores: u64) -> HostReadings {
         HostReadings {
             affinity_cores,
@@ -1465,6 +1654,7 @@ mod tests {
             cpu_share: None,
             kubernetes: false,
             declared_request_millicores: Some(declared_request_millicores),
+            smt: None,
         }
     }
 
@@ -2567,6 +2757,7 @@ mod tests {
             cpu_share: Some(CpuShare::Weight(174)),
             declared_request_millicores: None,
             kubernetes: true,
+            smt: None,
         };
         let warning = CpuBudget::resolve(&CpuConfig::default(), &unwired)
             .expect("valid")

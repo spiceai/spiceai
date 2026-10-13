@@ -41,6 +41,7 @@ limitations under the License.
 //! reclaim of an `auto` table, on either kind of delete, is paced to a small share
 //! of the time ([`RECLAIM_SHARE_DENOMINATOR`]).
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -65,7 +66,7 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// a Linux virtual machine held to four CPUs, a 250K-row table rewrote itself
 /// every 1.8 s for 236 ms, 13% of the time, and its write P99 was 16% above key
 /// deletes'; paced to a tenth, its writes were even with key deletes'. On a
-/// runtime with fewer than 8 CPU cores, or not on Linux, an `auto` table keeps key
+/// runtime with fewer than 8 physical CPU cores, or not on Linux, an `auto` table keeps key
 /// deletes from the start ([`auto_keeps_small_tables_compacted`]), so there the
 /// pace bounds only the rewrites that reclaim rows the bake cannot reach.
 ///
@@ -78,19 +79,207 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
 
 /// Whether `deletion_mode: auto` may keep a small primary-key table on position
-/// deletes, compacted whole alongside its writes, on this runtime. That takes the
-/// cores for it (`CpuBudget::cayenne_keeps_small_tables_compacted`), and compaction
-/// that runs below the priority of queries and writes, which only Linux gives
-/// `spiced`'s compaction runtime: there `setpriority` lowers each of its worker
-/// threads, while on macOS it lowers the whole process, and elsewhere it is not
-/// called. On macOS with 16 cores, 20 tables of 200K rows, each upserting 8,000
-/// keys a second, wrote at a P99 76% above key deletes' on position deletes, and
-/// read 95–161% slower at the P99. Where this answers no, the accelerator and a
-/// Cayenne catalog open an `auto` table on key deletes from the start
-/// ([`crate::metadata::VortexConfig::auto_keeps_key_deletes`]).
+/// deletes, compacted whole alongside its writes, on this runtime: where
+/// [`auto_key_deletes_reason`] finds no reason not to. Where it answers no, the
+/// accelerator and a Cayenne catalog open an `auto` table on key deletes from the
+/// start ([`crate::metadata::VortexConfig::auto_keeps_key_deletes`]).
 #[must_use]
 pub fn auto_keeps_small_tables_compacted() -> bool {
-    cfg!(target_os = "linux") && cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted()
+    auto_key_deletes_reason().is_none()
+}
+
+/// Why `deletion_mode: auto` keeps key deletes from the start on this runtime, or
+/// `None` where it may keep a small table compacted whole.
+///
+/// That takes the physical cores for it
+/// (`CpuBudget::cayenne_keeps_small_tables_compacted`), and compaction that runs
+/// below the priority of queries and writes, which only Linux gives `spiced`'s
+/// compaction runtime: there `setpriority` lowers each of its worker threads, while
+/// on macOS it lowers the whole process, and elsewhere it is not called. On macOS
+/// with 16 cores, 20 tables of 200K rows, each upserting 8,000 keys a second, wrote
+/// at a P99 76% above key deletes' on position deletes, and read 95–161% slower at
+/// the P99.
+#[must_use]
+pub fn auto_key_deletes_reason() -> Option<AutoKeyDeletesReason> {
+    if !cfg!(target_os = "linux") {
+        return Some(AutoKeyDeletesReason::NotLinux);
+    }
+    let budget = cpu_budget::cpu_budget();
+    (!budget.cayenne_keeps_small_tables_compacted()).then(|| AutoKeyDeletesReason::FewCores {
+        logical: budget.cores(),
+        physical: budget.physical_cores(),
+    })
+}
+
+/// Why `deletion_mode: auto` keeps key deletes from the start on a runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoKeyDeletesReason {
+    /// Fewer physical CPU cores than
+    /// [`cpu_budget::CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES`]: `logical`
+    /// CPUs in the runtime's budget, on `physical` cores.
+    FewCores {
+        /// Logical CPUs in the runtime's budget.
+        logical: usize,
+        /// The physical cores behind them.
+        physical: usize,
+    },
+    /// Not Linux, so compaction cannot run below queries and writes.
+    NotLinux,
+}
+
+/// A kind of primary-key table that `deletion_mode: auto` keeps on key deletes
+/// throughout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoKeyTableKind {
+    /// `refresh_mode: changes`, which the accelerator pins to key deletes: its
+    /// staged writes and in-memory durability tier were not evaluated for position
+    /// deletes.
+    Cdc,
+    /// A table with a datalake tier, which requires key deletes.
+    Datalake,
+    /// `mode: memory`.
+    InMemory,
+    /// A partitioned table, or one partition of one.
+    Partitioned,
+    /// A table whose data files are on object storage, where a whole-table rewrite
+    /// reads and writes it over the network, which was not measured.
+    ObjectStorage,
+}
+
+/// Where a table's data lives, for [`AutoKeyTableKind::of`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableStorage {
+    /// In memory (`mode: memory`).
+    Memory,
+    /// On local disk.
+    LocalDisk,
+    /// On object storage.
+    ObjectStorage,
+}
+
+impl AutoKeyTableKind {
+    /// The kind of a table from its storage and layout, among those Cayenne keeps
+    /// on key deletes itself, or `None` for a table `auto` adapts. The accelerator
+    /// pins [`Self::Cdc`] itself.
+    #[must_use]
+    pub const fn of(storage: TableStorage, partitioned: bool, datalake: bool) -> Option<Self> {
+        match storage {
+            TableStorage::Memory => Some(Self::InMemory),
+            _ if partitioned => Some(Self::Partitioned),
+            _ if datalake => Some(Self::Datalake),
+            TableStorage::ObjectStorage => Some(Self::ObjectStorage),
+            TableStorage::LocalDisk => None,
+        }
+    }
+}
+
+/// What `cayenne_deletion_mode` resolves to for one table, and why: the
+/// `deletion_mode` value of the accelerator's auto-tuned config line, in the
+/// Spicepod's spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeletionModeChoice {
+    /// `key`, set explicitly.
+    Key,
+    /// `position`, set explicitly.
+    Position,
+    /// No primary key: position deletes, whatever the setting.
+    NoPrimaryKey,
+    /// `auto`, on position deletes while the table is within `max_position_bytes`
+    /// and on key deletes once it outgrows them.
+    Adaptive {
+        /// The bound, in on-disk bytes.
+        max_position_bytes: u64,
+    },
+    /// `auto`, on key deletes from the start on this runtime.
+    AutoOnKeyDeletes(AutoKeyDeletesReason),
+    /// `auto`, on key deletes throughout for the table's kind.
+    AutoAsKey(AutoKeyTableKind),
+}
+
+impl DeletionModeChoice {
+    /// The choice for a table configured with `mode`: `kind` is the table's kind
+    /// when `auto` keeps it on key deletes throughout, and `auto_key_deletes` the
+    /// runtime's reason to keep key deletes from the start, if any.
+    #[must_use]
+    pub fn resolve(
+        mode: DeletionMode,
+        has_primary_key: bool,
+        kind: Option<AutoKeyTableKind>,
+        auto_key_deletes: Option<AutoKeyDeletesReason>,
+        target_file_size_bytes: usize,
+    ) -> Self {
+        if !has_primary_key {
+            return Self::NoPrimaryKey;
+        }
+        match mode {
+            DeletionMode::Key => Self::Key,
+            DeletionMode::Position => Self::Position,
+            DeletionMode::Auto => match (kind, auto_key_deletes) {
+                (Some(kind), _) => Self::AutoAsKey(kind),
+                (None, Some(reason)) => Self::AutoOnKeyDeletes(reason),
+                (None, None) => Self::Adaptive {
+                    max_position_bytes: AutoDeletionMode::max_position_bytes_for(
+                        target_file_size_bytes,
+                    ),
+                },
+            },
+        }
+    }
+}
+
+impl fmt::Display for DeletionModeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Key => f.write_str("key"),
+            Self::Position => f.write_str("position"),
+            Self::NoPrimaryKey => f.write_str("position (no primary key)"),
+            Self::Adaptive { max_position_bytes } => write!(
+                f,
+                "auto (position deletes up to {}, then key deletes)",
+                ByteSize(*max_position_bytes)
+            ),
+            Self::AutoOnKeyDeletes(AutoKeyDeletesReason::FewCores { logical, physical }) => {
+                let fewer_than = cpu_budget::CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES;
+                if physical < logical {
+                    write!(
+                        f,
+                        "auto (key deletes: {logical} CPU cores on {physical} physical, fewer than {fewer_than})"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "auto (key deletes: {logical} CPU cores, fewer than {fewer_than})"
+                    )
+                }
+            }
+            Self::AutoOnKeyDeletes(AutoKeyDeletesReason::NotLinux) => {
+                f.write_str("auto (key deletes: position deletes need Linux)")
+            }
+            Self::AutoAsKey(kind) => f.write_str(match kind {
+                AutoKeyTableKind::Cdc => "key (auto: CDC dataset)",
+                AutoKeyTableKind::Datalake => "key (auto: datalake tier)",
+                AutoKeyTableKind::InMemory => "key (auto: in-memory dataset)",
+                AutoKeyTableKind::Partitioned => "key (auto: partitioned dataset)",
+                AutoKeyTableKind::ObjectStorage => "key (auto: dataset on object storage)",
+            }),
+        }
+    }
+}
+
+/// Bytes in the largest of MiB or KiB that divides them, else bytes.
+struct ByteSize(u64);
+
+impl fmt::Display for ByteSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+        match self.0 {
+            0 => f.write_str("0 bytes"),
+            bytes if bytes % MIB == 0 => write!(f, "{} MiB", bytes / MIB),
+            bytes if bytes % KIB == 0 => write!(f, "{} KiB", bytes / KIB),
+            bytes => write!(f, "{bytes} bytes"),
+        }
+    }
 }
 
 /// How a primary-key table records the delete of a row right now.
@@ -330,6 +519,122 @@ mod tests {
 
     const TARGET: usize = 256 * 1024 * 1024;
     const BOUND: u64 = 8 * 1024 * 1024;
+
+    /// The `deletion_mode` value the auto-tuned config line prints, for every
+    /// choice: the setting in the Spicepod's spelling, and why.
+    #[test]
+    fn a_deletion_mode_choice_names_the_mode_and_its_reason() {
+        let resolve = |mode, has_pk, kind, reason, target| {
+            DeletionModeChoice::resolve(mode, has_pk, kind, reason, target).to_string()
+        };
+        let few = |logical, physical| Some(AutoKeyDeletesReason::FewCores { logical, physical });
+        assert_eq!(
+            [
+                resolve(DeletionMode::Auto, true, None, None, TARGET),
+                resolve(DeletionMode::Auto, true, None, None, 64 * 1024 * 1024),
+                resolve(DeletionMode::Auto, true, None, None, 1024 * 1024),
+                resolve(DeletionMode::Auto, true, None, few(4, 4), TARGET),
+                resolve(DeletionMode::Auto, true, None, few(8, 4), TARGET),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    None,
+                    Some(AutoKeyDeletesReason::NotLinux),
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    Some(AutoKeyTableKind::Cdc),
+                    few(4, 4),
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    Some(AutoKeyTableKind::Datalake),
+                    None,
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    Some(AutoKeyTableKind::InMemory),
+                    None,
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    Some(AutoKeyTableKind::Partitioned),
+                    None,
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    Some(AutoKeyTableKind::ObjectStorage),
+                    None,
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Key,
+                    true,
+                    Some(AutoKeyTableKind::Cdc),
+                    few(4, 4),
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Position,
+                    true,
+                    None,
+                    Some(AutoKeyDeletesReason::NotLinux),
+                    TARGET
+                ),
+                resolve(DeletionMode::Auto, false, None, None, TARGET),
+                resolve(DeletionMode::Key, false, None, None, TARGET),
+            ],
+            [
+                "auto (position deletes up to 8 MiB, then key deletes)",
+                "auto (position deletes up to 2 MiB, then key deletes)",
+                "auto (position deletes up to 32 KiB, then key deletes)",
+                "auto (key deletes: 4 CPU cores, fewer than 8)",
+                "auto (key deletes: 8 CPU cores on 4 physical, fewer than 8)",
+                "auto (key deletes: position deletes need Linux)",
+                "key (auto: CDC dataset)",
+                "key (auto: datalake tier)",
+                "key (auto: in-memory dataset)",
+                "key (auto: partitioned dataset)",
+                "key (auto: dataset on object storage)",
+                "key",
+                "position",
+                "position (no primary key)",
+                "position (no primary key)",
+            ]
+        );
+    }
+
+    /// `auto` keeps key deletes throughout for these kinds of table, in this order
+    /// when a table is more than one, and adapts any other.
+    #[test]
+    fn auto_key_table_kind_names_the_kinds_auto_does_not_adapt() {
+        assert_eq!(
+            [
+                AutoKeyTableKind::of(TableStorage::LocalDisk, false, false),
+                AutoKeyTableKind::of(TableStorage::Memory, true, true),
+                AutoKeyTableKind::of(TableStorage::ObjectStorage, true, true),
+                AutoKeyTableKind::of(TableStorage::ObjectStorage, false, true),
+                AutoKeyTableKind::of(TableStorage::ObjectStorage, false, false),
+            ],
+            [
+                None,
+                Some(AutoKeyTableKind::InMemory),
+                Some(AutoKeyTableKind::Partitioned),
+                Some(AutoKeyTableKind::Datalake),
+                Some(AutoKeyTableKind::ObjectStorage),
+            ]
+        );
+    }
 
     /// An `auto` table opened at `table_bytes` (`None`: could not be sized).
     fn opened(table_bytes: Option<u64>) -> AutoDeletionMode {

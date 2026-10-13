@@ -975,6 +975,88 @@ async fn an_auto_tables_position_reclaim_takes_no_encode_permit() {
     assert_eq!(rows, expected, "every key shows its latest row, once");
 }
 
+/// An auto table's whole-table reclaim takes a permit from the process-wide
+/// reclaim budget, so tables written alike do not all rewrite at once: while every
+/// permit is held the pass waits and rewrites nothing, and once they are free it
+/// runs.
+#[tokio::test]
+async fn an_auto_tables_reclaim_waits_for_the_process_wide_reclaim_budget() {
+    let name = "auto_reclaim_budgeted";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    // The upsert's deletes put the index past its trigger. Its maintenance, and
+    // the reclaim that schedules, run below.
+    insert_batch(
+        &provider,
+        id_value_batch(
+            Arc::clone(&provider.table_metadata.schema),
+            &keys,
+            &[200; 16],
+        ),
+    )
+    .await;
+    assert!(
+        provider.should_capture_positions(),
+        "premise: the table is on position deletes"
+    );
+
+    let budget = crate::provider::compaction::whole_table_reclaim_budget();
+    let permits = u32::try_from(budget.available_permits()).expect("permits fit in u32");
+    let held = Arc::clone(&budget)
+        .acquire_many_owned(permits)
+        .await
+        .expect("the budget is open");
+    // With every permit held the pass cannot start its rewrite; a bounded wait is
+    // the only way to see that it does not finish.
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(500),
+        provider.compact_current_snapshot_small_files(),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "the reclaim pass waited for a permit, rather than returning {blocked:?}"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "no whole-table rewrite ran while every permit was held"
+    );
+    drop(held);
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("post-write maintenance");
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain maintenance");
+    })
+    .await
+    .expect("the reclaim ran once a permit was free");
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "the whole-table reclaim committed"
+    );
+    assert_eq!(
+        provider.deletion_index_len(),
+        0,
+        "the reclaim cleared the index"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
 /// The whole-table reclaim of an auto table on key deletes takes no permit from
 /// the process-global encode budget either, while what it rewrites is within the
 /// bound: here a table that keeps key deletes from the start, as on a small host,
