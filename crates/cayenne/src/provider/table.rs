@@ -19385,6 +19385,73 @@ impl CayenneTableProvider {
         Ok((data, plan))
     }
 
+    /// Key-range split points for a mem-tier checkpoint's encode shards, cut
+    /// from the corpus it flushes, which is the whole input and so a fair sample
+    /// of itself (see [`Self::sampled_input_bounds`]).
+    ///
+    /// A hash split leaves every shard file spanning the whole key domain, so a
+    /// lookup on the key reads every file of every checkpoint not yet compacted
+    /// away. Cut into ranges, each file holds one slice of the routing key —
+    /// the leading primary-key column unless scans filter on another column
+    /// more than twice as often (see [`Self::range_routing_candidates`]) — and
+    /// sorts its rows by it in runs, so a lookup reads one file per checkpoint
+    /// and the zones of its slice within it. `None` keeps the hash split: one
+    /// encode shard, a table with `cayenne_cluster_by` or authoritative sort
+    /// columns, or a key with too few distinct values, or too many NULLs, to
+    /// fill the shards.
+    fn checkpoint_range_plan(
+        &self,
+        batches: &[RecordBatch],
+        target_partitions: usize,
+        target_size_bytes: usize,
+        estimated_bytes: u64,
+    ) -> Option<OverwriteRangePlan> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        // Places equal-count cuts within a fraction of a percent of their target
+        // for any shard count a write uses (as `overwrite_range_plan`).
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return None;
+        }
+        // The cuts are for the shard count this write will create: the sink keeps
+        // the ascending prefix of the bounds it is handed.
+        let shards = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            Some(estimated_bytes),
+            EncodeFanOut::Sized,
+        );
+        if shards < 2 {
+            return None;
+        }
+        let schema = self.table_schema();
+        let reservation = MemoryConsumer::new(format!(
+            "cayenne_checkpoint_range_sample:{}",
+            self.table_name()
+        ))
+        .register(&self.context.runtime_env().memory_pool);
+        self.range_routing_candidates(&schema)
+            .into_iter()
+            .find_map(|(column, _)| {
+                let key_index = schema.index_of(&column).ok()?;
+                let key_type = schema.field(key_index).data_type().clone();
+                Self::sampled_input_bounds(
+                    batches,
+                    key_index,
+                    &key_type,
+                    shards,
+                    true,
+                    MAX_SAMPLE_ROWS,
+                    &reservation,
+                )
+                .map(|bounds| OverwriteRangePlan {
+                    column,
+                    bounds,
+                    from_input_head: false,
+                })
+            })
+    }
+
     /// Equal-count split points for `shards` from the key column of an input's
     /// buffered head, or `None` when the head is not a fair sample of the key.
     /// See [`Self::input_range_plan`].
@@ -33796,12 +33863,24 @@ impl CayenneTableProvider {
         );
 
         let schema = self.table_schema();
+        let ctx = self.create_session_context();
+        // The single-stream encode's key ranges, cut from the corpus before it
+        // moves into the encode source (see `checkpoint_range_plan`).
+        let range_plan = (n == 1 && !self.pk_deletion_strategy.is_position_based())
+            .then(|| {
+                self.checkpoint_range_plan(
+                    &batches,
+                    ctx.state().config().target_partitions(),
+                    self.context.target_file_size_bytes(),
+                    estimated_flushed_bytes,
+                )
+            })
+            .flatten();
         let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
             &[batches],
             Arc::clone(&schema),
             None,
         )?;
-        let ctx = self.create_session_context();
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
         // Two-phase off-fence checkpoint: for the key/Int64 strategies
@@ -33874,16 +33953,17 @@ impl CayenneTableProvider {
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
             let (checkpoint_file_count, stats) = if n == 1 {
-                // N==1: the single coordinated encode over the merged corpus —
-                // byte-identical to the pre-sharding path.
+                // N==1: the single coordinated encode over the merged corpus,
+                // its shards cut into key ranges when it has more than one.
                 let (_rows, files, stats) = self
-                    .write_to_snapshot(
+                    .write_to_snapshot_range_partitioned(
                         stream,
                         target_size_bytes,
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                         super::delta_encoding::WritePolicy::DELTA,
+                        range_plan.as_ref().map(OverwriteRangePlan::partitioning),
                     )
                     .await?;
                 (files, stats)
@@ -53168,7 +53248,25 @@ mod tests {
         files: usize,
         rows: usize,
     ) {
-        let snapshot_id = provider.current_snapshot_id();
+        assert_disjoint_sorted_key_range_files_in(
+            provider,
+            &provider.current_snapshot_id(),
+            schema,
+            files,
+            rows,
+        )
+        .await;
+    }
+
+    /// [`assert_disjoint_sorted_key_range_files`] for the snapshot `snapshot_id`.
+    async fn assert_disjoint_sorted_key_range_files_in(
+        provider: &CayenneTableProvider,
+        snapshot_id: &str,
+        schema: &SchemaRef,
+        files: usize,
+        rows: usize,
+    ) {
+        let snapshot_id = snapshot_id.to_string();
         let names: Vec<String> = provider
             .list_snapshot_files_with_sizes(&snapshot_id)
             .await
@@ -53811,6 +53909,81 @@ mod tests {
         prepared.apply_owned_txn().await.expect("apply_owned_txn");
         prepared.finish().await.expect("finish");
         assert_disjoint_sorted_key_range_files(&provider, &schema, SHARDS, ROWS).await;
+    }
+
+    /// A mem-tier checkpoint large enough for several encode shards cuts them
+    /// into key ranges from its own rows: every file of the checkpoint's
+    /// snapshot covers one slice of the key, in key order, so a lookup on the
+    /// key reads one file per checkpoint rather than all of them. Rows arrive in
+    /// a scrambled key order, which a hash split would scatter across every
+    /// file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_routes_rows_into_disjoint_sorted_key_range_files() {
+        use arrow::array::StringArray;
+
+        const ROWS: usize = 20_000;
+        const SHARDS: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "checkpoint_range_routed",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                write_concurrency: Some(SHARDS),
+                // A 1 MiB target makes every ~1 MiB of rows an encode shard, so
+                // the ~4 MiB corpus below fills all four.
+                target_vortex_file_size_mb: 1,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let order: Vec<i64> = (0..ROWS)
+            .map(|i| i64::try_from((i * 7919) % ROWS).expect("row fits i64"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(order.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    order.iter().map(|id| format!("{id:0>200}")),
+                )),
+            ],
+        )
+        .expect("corpus batch");
+        provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("CDC upsert")
+            .finish()
+            .await
+            .expect("CDC upsert published");
+        assert_eq!(
+            provider.checkpoint_mem_tier().await.expect("checkpoint"),
+            u64::try_from(ROWS).expect("rows fit u64")
+        );
+
+        let snapshots: Vec<String> = provider.protected_snapshots.load().keys().cloned().collect();
+        let [snapshot_id] = snapshots.as_slice() else {
+            panic!("one checkpoint registers one snapshot: {snapshots:?}");
+        };
+        assert_disjoint_sorted_key_range_files_in(&provider, snapshot_id, &schema, SHARDS, ROWS)
+            .await;
     }
 
     /// A whole-table replace of a keyed table routes its rows into key-range
