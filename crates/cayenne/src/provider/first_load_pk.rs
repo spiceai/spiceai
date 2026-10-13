@@ -28,12 +28,16 @@ limitations under the License.
 //! whose exact keyset could not fit the table's keyset budget. Until a load has
 //! written that many keys it keeps only their hashes, so a load that ends
 //! smaller costs eight bytes per row rather than a filter of the whole budget.
+//! The filter's bytes count against the process-wide keyset budget from its
+//! allocation until the table publishes them as its index's, so tables loading
+//! at the same time cannot each take the same headroom.
 //!
 //! Each writer hashes the keys it writes and queues the hashes for a thread of
 //! the load's own, which records them, so no writer waits while the filter is
-//! filled. A load that gets [`QUEUED_HASHES`] keys ahead of that thread records
-//! no more and installs no filter; the index is then built after the load, as
-//! it is for any table.
+//! filled. A load that gets [`QUEUED_HASHES`] keys ahead of that thread, or
+//! whose filter the process-wide budget has no room for, records no more and
+//! installs no filter; the index is then built after the load, as it is for any
+//! table.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,6 +47,7 @@ use parking_lot::Mutex;
 use vortex_datafusion::VortexWriteObserver;
 
 use super::pk_index::{PkBloom, pk_keyset_entry_overhead_bytes};
+use super::pk_keyset_budget::{KeysetReservation, PkKeysetBudget, global_pk_keyset_budget};
 use super::table::CayenneTableProvider;
 use crate::row_converter::RowConverter;
 
@@ -80,6 +85,8 @@ struct Hashes {
 /// The keys written so far, owned by the recording thread.
 struct Recorder {
     budget: usize,
+    /// The process-wide keyset budget, when one is installed.
+    fleet: Option<PkKeysetBudget>,
     keys: WrittenKeys,
     /// The shortest encoded key written, which bounds the exact keyset's size
     /// from below.
@@ -90,7 +97,23 @@ enum WrittenKeys {
     /// The [`PkBloom::split_block_hash`] of every key written, while an exact
     /// keyset of them may still fit the budget.
     Hashed(Vec<u64>),
-    Filter(PkBloom),
+    Filter(FirstLoadPkFilter),
+}
+
+/// A filter of a first load's keys, with its bytes held against the
+/// process-wide keyset budget until the table publishes them.
+pub(super) struct FirstLoadPkFilter {
+    bloom: PkBloom,
+    reservation: Option<KeysetReservation>,
+}
+
+impl FirstLoadPkFilter {
+    /// Caches the filter as `table`'s table-wide index, then returns the bytes
+    /// held for it, which the table has published as its own by then.
+    pub(super) fn install(self, table: &CayenneTableProvider) {
+        table.install_first_load_pk_bloom(self.bloom);
+        drop(self.reservation);
+    }
 }
 
 impl std::fmt::Debug for FirstLoadPkObserver {
@@ -122,6 +145,7 @@ impl FirstLoadPkObserver {
             // The budget a rebuild of the table-wide index degrades to a filter
             // of, so the filter has the false-positive rate a rebuilt one would.
             table.effective_single_keyset_budget(),
+            global_pk_keyset_budget(),
             QUEUED_HASHES,
             None,
         )
@@ -135,6 +159,7 @@ impl FirstLoadPkObserver {
         indices: Vec<usize>,
         converter: RowConverter,
         budget: usize,
+        fleet: Option<PkKeysetBudget>,
         queue_limit: usize,
         gate: Option<std::sync::mpsc::Receiver<()>>,
     ) -> Option<Self> {
@@ -146,6 +171,7 @@ impl FirstLoadPkObserver {
         });
         let mut recorder = Recorder {
             budget,
+            fleet,
             keys: WrittenKeys::Hashed(Vec::new()),
             shortest_key: usize::MAX,
         };
@@ -160,9 +186,10 @@ impl FirstLoadPkObserver {
                 }
                 for batch in receiver {
                     let count = batch.hashes.len();
-                    if !recording.incomplete.load(Ordering::Acquire) && !recorder.record(&batch) {
-                        recording
-                            .mark_incomplete(&"the filter does not use the split-block layout");
+                    if !recording.incomplete.load(Ordering::Acquire)
+                        && let Err(cause) = recorder.record(&batch)
+                    {
+                        recording.mark_incomplete(&cause);
                     }
                     recording.queued_hashes.fetch_sub(count, Ordering::AcqRel);
                 }
@@ -183,7 +210,7 @@ impl FirstLoadPkObserver {
     /// left `live_rows` keys too many for an exact keyset to fit the budget.
     /// `None` when it left fewer, which keeps a smaller table's exact index, or
     /// when a written batch was not recorded.
-    pub(super) async fn finish(&self, live_rows: u64) -> Option<PkBloom> {
+    pub(super) async fn finish(&self, live_rows: u64) -> Option<FirstLoadPkFilter> {
         // Closing the queue ends the thread once it has recorded what it holds.
         drop(self.queue.lock().take());
         let done = self.recorded.lock().take()?;
@@ -208,34 +235,50 @@ impl Shared {
 }
 
 impl Recorder {
-    /// Records one written batch's key hashes; `false` when the filter refused
-    /// them.
-    fn record(&mut self, batch: &Hashes) -> bool {
+    /// Records one written batch's key hashes, or says why the load cannot
+    /// install a filter of its keys.
+    fn record(&mut self, batch: &Hashes) -> Result<(), &'static str> {
+        const NOT_SPLIT_BLOCK: &str = "the filter does not use the split-block layout";
         self.shortest_key = self.shortest_key.min(batch.shortest_key);
-        match &mut self.keys {
-            WrittenKeys::Filter(filter) => filter.insert_split_block_hashes(&batch.hashes),
-            WrittenKeys::Hashed(hashes) => {
-                hashes.extend_from_slice(&batch.hashes);
-                let written = u64::try_from(hashes.len()).unwrap_or(u64::MAX);
-                if exact_keyset_may_fit(written, self.shortest_key, self.budget) {
-                    return true;
-                }
-                let mut filter = PkBloom::with_byte_budget(self.budget);
-                let complete = filter.insert_split_block_hashes(hashes);
-                self.keys = WrittenKeys::Filter(filter);
-                complete
+        let hashes = match &mut self.keys {
+            WrittenKeys::Filter(filter) => {
+                return filter
+                    .bloom
+                    .insert_split_block_hashes(&batch.hashes)
+                    .then_some(())
+                    .ok_or(NOT_SPLIT_BLOCK);
             }
+            WrittenKeys::Hashed(hashes) => hashes,
+        };
+        hashes.extend_from_slice(&batch.hashes);
+        let written = u64::try_from(hashes.len()).unwrap_or(u64::MAX);
+        if exact_keyset_may_fit(written, self.shortest_key, self.budget) {
+            return Ok(());
         }
+        let mut bloom = PkBloom::with_byte_budget(self.budget);
+        let reservation = match &self.fleet {
+            Some(fleet) => Some(
+                fleet
+                    .reserve(u64::try_from(bloom.size_bytes()).unwrap_or(u64::MAX))
+                    .ok_or("the process-wide keyset budget has no room for the filter")?,
+            ),
+            None => None,
+        };
+        if !bloom.insert_split_block_hashes(hashes) {
+            return Err(NOT_SPLIT_BLOCK);
+        }
+        self.keys = WrittenKeys::Filter(FirstLoadPkFilter { bloom, reservation });
+        Ok(())
     }
 
-    fn finish(self, live_rows: u64) -> Option<PkBloom> {
+    fn finish(self, live_rows: u64) -> Option<FirstLoadPkFilter> {
         if exact_keyset_may_fit(live_rows, self.shortest_key, self.budget) {
             return None;
         }
         match self.keys {
             WrittenKeys::Filter(mut filter) => {
                 // Written copies include those the resolution dropped.
-                filter.inserted_keys = usize::try_from(live_rows).unwrap_or(usize::MAX);
+                filter.bloom.inserted_keys = usize::try_from(live_rows).unwrap_or(usize::MAX);
                 Some(filter)
             }
             WrittenKeys::Hashed(_) => None,
@@ -320,7 +363,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use vortex_datafusion::VortexWriteObserver;
 
-    use super::{FirstLoadPkObserver, PkBloom};
+    use super::{FirstLoadPkFilter, FirstLoadPkObserver, PkKeysetBudget};
     use crate::row_converter::{RowConverter, SortField};
 
     const ROWS: usize = 1024;
@@ -352,14 +395,18 @@ mod tests {
 
     /// Writes two batches of more keys than an exact keyset of a 4 KiB budget
     /// holds while the recording thread waits, under a queue of `queue_limit`
-    /// hashes.
-    async fn load_two_batches(queue_limit: usize) -> Option<PkBloom> {
+    /// hashes and a process-wide keyset budget of `fleet`.
+    async fn load_two_batches(
+        queue_limit: usize,
+        fleet: Option<PkKeysetBudget>,
+    ) -> Option<FirstLoadPkFilter> {
         let (release, gate) = std::sync::mpsc::channel();
         let observer = FirstLoadPkObserver::start(
             "t",
             vec![0, 1],
             key_converter(),
             4096,
+            fleet,
             queue_limit,
             Some(gate),
         )
@@ -373,23 +420,53 @@ mod tests {
 
     #[tokio::test]
     async fn a_load_that_gets_ahead_of_recording_its_keys_installs_no_filter() {
-        let filter = load_two_batches(usize::MAX)
+        let filter = load_two_batches(usize::MAX, None)
             .await
             .expect("a load whose keys were all recorded yields a filter");
-        assert_eq!(filter.inserted_keys, 2 * ROWS);
+        assert_eq!(filter.bloom.inserted_keys, 2 * ROWS);
         let converter = key_converter();
         for first in [0, 1024] {
             let keys = converter
                 .convert_columns(batch(first).columns())
                 .expect("keys");
             assert!(
-                keys.iter().all(|key| filter.maybe_contains(key.as_ref())),
+                keys.iter()
+                    .all(|key| filter.bloom.maybe_contains(key.as_ref())),
                 "the filter holds every key written"
             );
         }
         assert!(
-            load_two_batches(ROWS).await.is_none(),
+            load_two_batches(ROWS, None).await.is_none(),
             "a load with a batch left unrecorded yields no filter"
         );
+    }
+
+    #[tokio::test]
+    async fn a_filter_holds_its_bytes_against_the_process_wide_budget() {
+        let fleet = PkKeysetBudget::new(1 << 20);
+        let filter = load_two_batches(usize::MAX, Some(fleet.clone()))
+            .await
+            .expect("a budget with room yields a filter");
+        assert_eq!(filter.bloom.size_bytes(), 4096);
+        assert_eq!(
+            fleet.used(),
+            4096,
+            "the filter's bytes are held while it is built"
+        );
+        drop(filter);
+        assert_eq!(
+            fleet.used(),
+            0,
+            "a filter that is not installed returns its bytes"
+        );
+
+        let full = PkKeysetBudget::new(4095);
+        assert!(
+            load_two_batches(usize::MAX, Some(full.clone()))
+                .await
+                .is_none(),
+            "a load whose filter the budget has no room for yields no filter"
+        );
+        assert_eq!(full.used(), 0, "a refused filter holds nothing");
     }
 }

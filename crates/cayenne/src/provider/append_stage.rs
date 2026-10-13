@@ -27,12 +27,12 @@ use parking_lot::Mutex;
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::first_load_pk::FirstLoadPkObserver;
+use super::first_load_pk::{FirstLoadPkFilter, FirstLoadPkObserver};
 use super::key_conflicts::KeyResolver;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::overwrite::{FileStatsObserver, WriteShape};
 use super::overwrite_postpass::{self, ArrivalStream, CopyOrder, DedupShare};
-use super::pk_index::{PkBloom, PkDigestSet};
+use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 
 /// A write that resolves the keys it repeats across record batches after it is
@@ -129,7 +129,7 @@ pub(super) struct StagedAppend {
     pub stats: Arc<ColumnStatsAccumulator>,
     pub row_count: u64,
     pub superseded: usize,
-    pub first_load_pk_bloom: Option<PkBloom>,
+    pub first_load_pk_bloom: Option<FirstLoadPkFilter>,
 }
 
 type ResolvedFiles = (u64, Arc<ColumnStatsAccumulator>, HashMap<String, Vec<u32>>);

@@ -25,8 +25,9 @@ use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
+use super::first_load_pk::FirstLoadPkFilter;
 use super::on_conflict::{OnConflictDeletions, PreparedOnConflictDeletionPublish};
-use super::pk_index::{PkBloom, PkDigestSet};
+use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 use super::{Error, Result};
 use crate::CayenneCatalog;
@@ -46,7 +47,7 @@ pub(super) struct PreparedResolvedAppend {
     pub validated_keys: PkDigestSet,
     pub superseded: usize,
     pub into_empty_table: bool,
-    pub first_load_pk_bloom: Option<PkBloom>,
+    pub first_load_pk_bloom: Option<FirstLoadPkFilter>,
 }
 
 /// A failed publication, and whether its snapshot's files must be kept because
@@ -156,8 +157,8 @@ impl PreparedResolvedAppend {
         );
         if retention || self.into_empty_table {
             self.table.clear_cached_pk_keyset();
-            if let Some(bloom) = self.first_load_pk_bloom.take() {
-                self.table.install_first_load_pk_bloom(bloom);
+            if let Some(filter) = self.first_load_pk_bloom.take() {
+                filter.install(&self.table);
             }
         } else {
             self.table
