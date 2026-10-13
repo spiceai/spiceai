@@ -149,6 +149,28 @@ impl DrasiForwardMetrics {
         slot(&self.dead_letters, component)
     }
 
+    /// Publishes every outcome counter for `(component, transport)` at zero.
+    ///
+    /// Call when a forwarder is registered so scrapes can tell "none yet" from
+    /// a missing series (see [`crate::publish_component_counters_at_zero`]).
+    pub fn seed_batch_outcomes(&self, component: &str, transport: &str) {
+        for outcome in [
+            OUTCOME_DELIVERED,
+            OUTCOME_RETRIED,
+            OUTCOME_DEAD_LETTERED,
+            OUTCOME_DISCARDED,
+        ] {
+            self.batches.add(
+                0,
+                &[
+                    KeyValue::new(LABEL_COMPONENT, component.to_string()),
+                    KeyValue::new(LABEL_TRANSPORT, transport.to_string()),
+                    KeyValue::new(LABEL_OUTCOME, outcome.to_string()),
+                ],
+            );
+        }
+    }
+
     /// Counts one delivery attempt.
     ///
     /// `outcome` is `delivered`, `retried`, `dead_lettered`, or `discarded`.

@@ -73,8 +73,10 @@ struct BatchMetadata {
     primary_key_columns: Vec<Vec<String>>,
     source_commit_ts_ms: Option<i64>,
     /// Absent on a batch written before delivery latency was recorded.
+    /// Legacy files deserialize as `None`; recovery stamps queue time then so
+    /// runtime-table batches (no source commit) do not record epoch latency.
     #[serde(default)]
-    queued_at_ms: i64,
+    queued_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Snafu)]
@@ -235,7 +237,7 @@ impl DeadLetterStore {
             op_codes: batch.op_codes.clone(),
             primary_key_columns: batch.primary_key_columns.clone(),
             source_commit_ts_ms: batch.source_commit_ts_ms,
-            queued_at_ms: batch.queued_at_ms,
+            queued_at_ms: Some(batch.queued_at_ms),
         })
         .map_err(|e| Error::EncodeBatch {
             source: arrow::error::ArrowError::JsonError(e.to_string()),
@@ -494,7 +496,11 @@ fn decode(bytes: &[u8], path: &Path) -> Result<QueuedBatch> {
         primary_key_columns: metadata.primary_key_columns,
         data,
         source_commit_ts_ms: metadata.source_commit_ts_ms,
-        queued_at_ms: metadata.queued_at_ms,
+        // Missing on pre-latency files. Use recovery time so a runtime-table
+        // redelivery (no source commit) does not record ~56 years of latency.
+        queued_at_ms: metadata
+            .queued_at_ms
+            .unwrap_or_else(crate::drasi::queue::now_ms),
     })
 }
 
@@ -868,5 +874,23 @@ mod tests {
             path.ends_with("drasi/weird_.._name"),
             "a path separator must not escape the store directory: {path:?}"
         );
+    }
+    #[test]
+    fn legacy_metadata_without_queued_at_uses_recovery_time() {
+        let before = crate::drasi::queue::now_ms();
+        let encoded = encode(
+            &batch("row-1"),
+            r#"{"op_codes":["c"],"primary_key_columns":[["id"]],"source_commit_ts_ms":null}"#,
+        )
+        .expect("encodes legacy metadata");
+        let decoded = decode(&encoded, std::path::Path::new("legacy.arrow")).expect("decodes");
+        let after = crate::drasi::queue::now_ms();
+        assert!(
+            decoded.queued_at_ms >= before && decoded.queued_at_ms <= after,
+            "missing queued_at_ms must stamp recovery time, not the Unix epoch; got {}",
+            decoded.queued_at_ms
+        );
+        assert_eq!(decoded.source_commit_ts_ms, None);
+        assert_eq!(decoded.op_codes, vec!["c".to_string()]);
     }
 }

@@ -170,6 +170,9 @@ impl DeliveryQueue {
         let dead_lettered = Arc::new(AtomicU64::new(0));
         let transport = sink.transport_name();
         let queue_depth = metrics.queue_depth_slot(&component);
+        // Publish every outcome series at zero so scrapes can tell "none yet"
+        // from a missing exporter series.
+        metrics.seed_batch_outcomes(&component, transport);
         // A component with no store still publishes the dead-letter series at
         // zero. A store publishes its own occupancy, including batches
         // recovered at open, so resetting it here would hide them.

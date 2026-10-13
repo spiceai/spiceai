@@ -360,4 +360,85 @@ mod tests {
             "length-prefixed framing must keep these attribute sets distinct"
         );
     }
+    #[test]
+    fn array_valued_attributes_get_distinct_identities() {
+        // converter.rs used to map every Value::Array to Bytes with an empty
+        // payload, so buckets=[1] and buckets=[2] hashed identically. Distinct
+        // Slice encodings must produce distinct series_id values.
+        let list = slice_attributes(&[
+            vec![("buckets", encode_i64_array(&[1]))],
+            vec![("buckets", encode_i64_array(&[2]))],
+        ]);
+        let ids = series_ids(&list).expect("derives ids");
+        assert_ne!(
+            ids.value(0),
+            ids.value(1),
+            "array attribute content must participate in series_id"
+        );
+    }
+
+    fn encode_i64_array(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(2); // matches converter encode_array_attribute I64 tag
+        out.extend_from_slice(
+            &u64::try_from(values.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    fn slice_attributes(rows: &[Vec<(&str, Vec<u8>)>]) -> ListArray {
+        let mut keys = StringBuilder::new();
+        let mut types = UInt8Builder::new();
+        let mut strings = StringBuilder::new();
+        let mut ints = Int64Builder::new();
+        let mut doubles = Float64Builder::new();
+        let mut bools = BooleanBuilder::new();
+        let mut bytes = BinaryBuilder::new();
+        let mut serialized = BinaryBuilder::new();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        offsets.push(0_i32);
+        let mut list_nulls = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            list_nulls.push(true);
+            for (key, value) in row {
+                keys.append_value(*key);
+                types.append_value(AttributeValueType::Slice.to_u8());
+                strings.append_null();
+                ints.append_null();
+                doubles.append_null();
+                bools.append_null();
+                bytes.append_value(value);
+                serialized.append_null();
+            }
+            offsets.push(i32::try_from(keys.len()).expect("attribute count fits"));
+        }
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(keys.finish()),
+            Arc::new(types.finish()),
+            Arc::new(strings.finish()),
+            Arc::new(ints.finish()),
+            Arc::new(doubles.finish()),
+            Arc::new(bools.finish()),
+            Arc::new(bytes.finish()),
+            Arc::new(serialized.finish()),
+        ];
+        let values = StructArray::try_new(attribute_struct_fields().into(), arrays, None)
+            .expect("attribute struct");
+        let field: Field = attribute_list_field();
+        let nulls = NullBuffer::from(list_nulls);
+        ListArray::try_new(
+            Arc::new(field),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(values),
+            Some(nulls),
+        )
+        .expect("attribute list")
+    }
 }
