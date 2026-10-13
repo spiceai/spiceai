@@ -23,15 +23,6 @@ pub struct SearchTestArgs {
     #[clap(flatten)]
     pub(crate) common: CommonArgs,
 
-    /// Write the per-query retrieval metrics (NDCG, recall, reciprocal rank, and precision of each
-    /// judged query, at every rank cutoff k) to this JSON file.
-    #[arg(
-        long,
-        env = "TESTOPERATOR_SEARCH_PER_QUERY_OUTPUT",
-        value_name = "FILE"
-    )]
-    pub(crate) per_query_output: Option<std::path::PathBuf>,
-
     /// Built-in MTEB benchmark dataset to run the search test against. When omitted, the run is
     /// treated as a custom run: no MTEB data is downloaded, and the search harness tests the
     /// `corpus`, `test_queries`, and `relevance_data` tables defined in `--spicepod-path` as-is.

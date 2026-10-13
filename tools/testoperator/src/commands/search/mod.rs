@@ -201,10 +201,6 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     telemetry.emit().await?;
 
-    if let Some(path) = &args.per_query_output {
-        per_query::PerQueryReport::new(&search_resource, primary_k, &evaluation).write(path)?;
-    }
-
     let health_report = health_monitor.stop().await;
     spiced_instance.stop()?;
     let health_report = health_report?;

@@ -18,11 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
 
 /// Id of a judged query, from the `query-id` column of the relevance judgments.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QueryId(String);
 
 impl QueryId {
@@ -127,8 +125,7 @@ impl QueryRetrievalMetrics {
 ///
 /// # Reference
 /// MTEB `RetrievalEvaluator`: <https://github.com/embeddings-benchmark/mteb/blob/03347ebfe4809056e0fd2894fcae69dcdd2ed964/mteb/evaluation/evaluators/RetrievalEvaluator.py#L500>
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(try_from = "EvaluationRepr<QueryId>")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetrievalEvaluation {
     max_k: usize,
     /// Never empty: construction rejects an empty `qrels`.
@@ -161,7 +158,7 @@ impl RetrievalEvaluation {
     ///
     /// # Errors
     /// Returns an error when `qrels` is empty.
-    pub(crate) fn up_to_longest_result_list<S: ::std::hash::BuildHasher>(
+    pub fn up_to_longest_result_list<S: ::std::hash::BuildHasher>(
         qrels: &HashMap<String, HashMap<String, i32, S>, S>,
         results: &HashMap<String, HashMap<String, f64, S>, S>,
     ) -> anyhow::Result<Self> {
@@ -230,109 +227,6 @@ impl RetrievalEvaluation {
         (1..=self.max_k)
             .filter_map(|k| self.mean_at_k(k).map(|m| (k, m)))
             .collect()
-    }
-}
-
-// Serialized form of a `RetrievalEvaluation`: one entry per query, each with one entry per `k`,
-// so a reader does not need to know the in-memory layout.
-#[derive(Serialize, Deserialize)]
-struct EvaluationRepr<Q> {
-    max_k: usize,
-    queries: Vec<QueryRepr<Q>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct QueryRepr<Q> {
-    query_id: Q,
-    result_count: usize,
-    metrics_at_k: Vec<MetricsAtKRepr>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MetricsAtKRepr {
-    k: usize,
-    ndcg: f64,
-    recall: f64,
-    /// One query's `mrr`: its mean over queries is MRR.
-    reciprocal_rank: f64,
-    precision: f64,
-}
-
-impl Serialize for RetrievalEvaluation {
-    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
-        let queries = self
-            .queries
-            .iter()
-            .map(|(query_id, query)| QueryRepr {
-                query_id,
-                result_count: query.result_count,
-                metrics_at_k: query
-                    .metrics
-                    .iter()
-                    .zip(1..)
-                    .map(|(m, k)| MetricsAtKRepr {
-                        k,
-                        ndcg: m.ndcg,
-                        recall: m.recall,
-                        reciprocal_rank: m.mrr,
-                        precision: m.precision,
-                    })
-                    .collect(),
-            })
-            .collect();
-        EvaluationRepr {
-            max_k: self.max_k,
-            queries,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl TryFrom<EvaluationRepr<QueryId>> for RetrievalEvaluation {
-    type Error = String;
-
-    /// Rejects input that breaks the invariants the constructors guarantee: at least one query,
-    /// unique query ids, and metrics at exactly `k = 1..=max_k` for every query.
-    fn try_from(repr: EvaluationRepr<QueryId>) -> Result<Self, Self::Error> {
-        if repr.queries.is_empty() {
-            return Err("a retrieval evaluation must have at least one query".to_string());
-        }
-        let mut queries = BTreeMap::new();
-        for query in repr.queries {
-            let ks: Vec<usize> = query.metrics_at_k.iter().map(|m| m.k).collect();
-            if !ks.iter().copied().eq(1..=repr.max_k) {
-                return Err(format!(
-                    "query {} must have metrics at k = 1..={} in order, got {ks:?}",
-                    query.query_id, repr.max_k
-                ));
-            }
-            let metrics = query
-                .metrics_at_k
-                .into_iter()
-                .map(|m| RetrievalMetrics {
-                    ndcg: m.ndcg,
-                    recall: m.recall,
-                    mrr: m.reciprocal_rank,
-                    precision: m.precision,
-                })
-                .collect();
-            let duplicate = queries
-                .insert(
-                    query.query_id.clone(),
-                    QueryRetrievalMetrics {
-                        result_count: query.result_count,
-                        metrics,
-                    },
-                )
-                .is_some();
-            if duplicate {
-                return Err(format!("query {} appears more than once", query.query_id));
-            }
-        }
-        Ok(Self {
-            max_k: repr.max_k,
-            queries,
-        })
     }
 }
 
@@ -413,7 +307,7 @@ fn dcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
         .enumerate()
         .map(|(i, &rel)| rel / (i as f64 + 2f64).log2())
         .sum::<f64>()
-        // An empty f64 sum is -0.0; adding 0.0 makes it 0.0, so per-query output never shows -0.0.
+        // An empty f64 sum is -0.0; adding 0.0 makes it 0.0, so per-query metrics never show -0.0.
         + 0.0
 }
 
@@ -901,58 +795,6 @@ mod tests {
         }
         // MRR@3 = (1/2 + 1 + 0) / 3.
         assert_close(means[&3].mrr, 0.5, "mrr@3");
-    }
-
-    #[test]
-    fn evaluation_round_trips_through_json() {
-        let (qrels, results) = three_queries_one_unanswered();
-        let evaluation = RetrievalEvaluation::up_to_longest_result_list(&qrels, &results)
-            .expect("metrics are calculable for a non-empty qrels");
-
-        let json = serde_json::to_value(&evaluation).expect("serializes");
-        assert_eq!(json["max_k"], 3);
-        assert_eq!(json["queries"][2]["query_id"], "q3");
-        assert_eq!(json["queries"][2]["result_count"], 0);
-        assert_eq!(json["queries"][0]["metrics_at_k"][2]["k"], 3);
-        assert_eq!(
-            json["queries"][0]["metrics_at_k"][2]["reciprocal_rank"],
-            0.5
-        );
-
-        let parsed: RetrievalEvaluation = serde_json::from_value(json).expect("deserializes");
-        assert_eq!(parsed, evaluation);
-    }
-
-    #[test]
-    fn deserializing_rejects_a_broken_evaluation() {
-        let metrics_at = |k: usize| {
-            serde_json::json!({
-                "k": k, "ndcg": 0.0, "recall": 0.0, "reciprocal_rank": 0.0, "precision": 0.0,
-            })
-        };
-        let query = |id: &str, ks: &[usize]| {
-            serde_json::json!({
-                "query_id": id,
-                "result_count": 0,
-                "metrics_at_k": ks.iter().map(|&k| metrics_at(k)).collect::<Vec<_>>(),
-            })
-        };
-        for (what, json) in [
-            ("no queries", serde_json::json!({"max_k": 1, "queries": []})),
-            (
-                "a missing k",
-                serde_json::json!({"max_k": 2, "queries": [query("q1", &[1])]}),
-            ),
-            (
-                "a duplicate query",
-                serde_json::json!({"max_k": 1, "queries": [query("q1", &[1]), query("q1", &[1])]}),
-            ),
-        ] {
-            assert!(
-                serde_json::from_value::<RetrievalEvaluation>(json).is_err(),
-                "expected an error for {what}"
-            );
-        }
     }
 
     /// An empty `qrels` used to divide by zero and publish `NaN` into the benchmark metrics.
