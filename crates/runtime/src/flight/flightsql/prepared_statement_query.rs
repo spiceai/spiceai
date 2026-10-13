@@ -212,13 +212,12 @@ pub(crate) async fn do_action_create_prepared_statement(
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema (the
     // body is executed as a transaction at do_get, not planned as one here).
     let schema_sql = schema_statement(&query);
-    let schemas = if datafusion.has_table_function_placeholders(&schema_sql) {
-        // Can't plan a table function until its parameters arrive at execution.
-        Ok((arrow_schema::Schema::empty(), None))
-    } else {
-        Service::get_arrow_schema(datafusion, &schema_sql).await
-    };
-    let (dataset_schema, parameter_schema) = match schemas {
+    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
+        Arc::clone(&datafusion),
+        &schema_sql,
+    )
+    .await
+    {
         Ok(schemas) => schemas,
         Err(e) => {
             // Check if this is a type inference error related to parameters
@@ -227,6 +226,8 @@ pub(crate) async fn do_action_create_prepared_statement(
                 || err_msg.contains("Invalid arithmetic operation")
                 || err_msg.contains("type inference")
                 || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
             {
                 tracing::debug!(
                     "Could not infer schema during prepare (will be determined at execution): {err_msg}"
@@ -283,22 +284,18 @@ pub(crate) async fn get_flight_info(
     // we'll omit the schema from FlightInfo. The actual schema will be determined during execution.
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
     let schema_sql = schema_statement(&sql);
-    let schema = if datafusion.has_table_function_placeholders(&schema_sql) {
-        // Can't plan a table function until its parameters arrive at execution.
-        Ok(None)
-    } else {
-        Service::get_arrow_schema(datafusion, &schema_sql)
-            .await
-            .map(|(schema, _)| Some(schema))
-    };
-    let maybe_arrow_schema = match schema {
-        Ok(schema) => schema,
+    let maybe_arrow_schema = match Service::get_arrow_schema(Arc::clone(&datafusion), &schema_sql)
+        .await
+    {
+        Ok((schema, _)) => Some(schema),
         Err(e) => {
             let err_msg = e.to_string();
             if err_msg.contains("Cannot get result type")
                 || err_msg.contains("Invalid arithmetic operation")
                 || err_msg.contains("type inference")
                 || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
             {
                 tracing::debug!(
                     "Could not infer schema for prepared statement (will be determined at execution): {err_msg}"
