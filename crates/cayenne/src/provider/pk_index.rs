@@ -166,8 +166,12 @@ pub(crate) fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
     // those bounds the cache at a fraction of its believed size - a
     // counting-allocator measurement puts the real per-entry cost at 1.6-3.5x
     // a key-plus-location-only figure.
-    key.as_ref().len()
-        + std::mem::size_of::<u128>()
+    key.as_ref().len() + pk_keyset_entry_overhead_bytes()
+}
+
+/// What [`approx_pk_keyset_entry_bytes`] charges a key besides its encoded bytes.
+pub(crate) const fn pk_keyset_entry_overhead_bytes() -> usize {
+    std::mem::size_of::<u128>()
         + std::mem::size_of::<PkKeysetEntry>()
         + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
 }
@@ -814,16 +818,28 @@ impl PkBloom {
         (0..PK_BLOOM_NUM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)))
     }
 
-    /// The block index and the eight per-lane masks for a key, for the
-    /// split-block layout. Fixed length and branch-free so it vectorises.
+    /// The hash the split-block layout places `key` by.
     #[inline]
-    fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+    pub(crate) fn split_block_hash(key: &[u8]) -> u64 {
         // The crate's existing one-shot XXH3-64, the same primitive the WAL
         // checksum and the frame fingerprint use. One-shot rather than the
         // streaming `Hasher`: for a 16-byte key the streaming path's setup
         // costs more than the hash, and more than the two FNV passes it
         // replaces.
-        let hash = hash_index::hash_key_bytes_oneshot(key);
+        hash_index::hash_key_bytes_oneshot(key)
+    }
+
+    /// The block index and the eight per-lane masks for a key, for the
+    /// split-block layout.
+    #[inline]
+    fn split_block_locate(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+        Self::split_block_locate_hash(block_mask, Self::split_block_hash(key))
+    }
+
+    /// [`Self::split_block_locate`] for a key's [`Self::split_block_hash`].
+    /// Fixed length and branch-free so it vectorises.
+    #[inline]
+    fn split_block_locate_hash(block_mask: u64, hash: u64) -> (usize, [u32; 8]) {
         let block = usize::try_from((hash >> 32) & block_mask).unwrap_or(0);
         // The low half, deliberately: the high half already chose the block, so
         // the lanes draw on bits the block selection did not consume.
@@ -854,6 +870,25 @@ impl PkBloom {
             }
         }
         self.inserted_keys = self.inserted_keys.saturating_add(1);
+    }
+
+    /// Insert the keys whose [`Self::split_block_hash`]es are `hashes`.
+    ///
+    /// Returns `false`, inserting nothing, for a filter of the scattered layout,
+    /// which places keys by other hashes.
+    #[must_use]
+    pub(crate) fn insert_split_block_hashes(&mut self, hashes: &[u64]) -> bool {
+        let PkBloomRepr::SplitBlock { blocks, block_mask } = &mut self.repr else {
+            return false;
+        };
+        for &hash in hashes {
+            let (index, masks) = Self::split_block_locate_hash(*block_mask, hash);
+            for (lane, mask) in blocks[index].iter_mut().zip(masks) {
+                *lane |= mask;
+            }
+        }
+        self.inserted_keys = self.inserted_keys.saturating_add(hashes.len());
+        true
     }
 
     pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {
@@ -2529,6 +2564,36 @@ mod tests {
                 "false negative after round-trip -- a missed conflict writes a duplicate live row"
             );
         }
+    }
+
+    /// Inserting keys by their hashes sets exactly the bits inserting the keys
+    /// does, so a filter built from hashes probes like one built from keys.
+    #[test]
+    fn inserting_split_block_hashes_matches_inserting_keys() {
+        let keys: Vec<[u8; 16]> = (0..20_000u128).map(u128::to_le_bytes).collect();
+        let mut by_key = PkBloom::with_byte_budget(64 * 1024);
+        for key in &keys {
+            by_key.insert(key);
+        }
+        let hashes: Vec<u64> = keys
+            .iter()
+            .map(|key| PkBloom::split_block_hash(key))
+            .collect();
+        let mut by_hash = PkBloom::with_byte_budget(64 * 1024);
+        assert!(by_hash.insert_split_block_hashes(&hashes));
+        assert_eq!(by_hash.to_bytes(), by_key.to_bytes());
+
+        let mut scattered = PkBloom::scattered_with_expected_keys(keys.len(), 64 * 1024);
+        let before = scattered.to_bytes();
+        assert!(
+            !scattered.insert_split_block_hashes(&hashes),
+            "the scattered layout cannot place keys by their split-block hashes"
+        );
+        assert_eq!(
+            scattered.to_bytes(),
+            before,
+            "a refused insert sets nothing"
+        );
     }
 
     /// The property the whole versioning scheme rests on: a v2 reader must reject

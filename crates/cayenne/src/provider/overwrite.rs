@@ -983,9 +983,11 @@ impl CayenneTableProvider {
                     .map(str::to_string)
             })
             .collect();
-        // Each file folds on its own, through one writer: its rows stay in one
-        // file, though not necessarily in the order it held them, since the
-        // scan may split a large file into ranges. Merging every file's
+        // Each file folds on its own, through one writer, so no two source
+        // files' rows are merged. The writer still rolls to a new file at the
+        // target size, so one source file may fold into several, and its rows
+        // need not keep their order: the scan may split a large file into
+        // ranges. Merging every file's
         // survivors into one stream would feed the rewrite from a single task,
         // however many encoders it had. Each write holds one encode permit. A
         // maintenance fold (a load into an empty table) runs as many files at

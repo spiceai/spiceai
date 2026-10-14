@@ -20,7 +20,10 @@ limitations under the License.
 //! metadata about available models, which helps with error messages
 //! and configuration validation.
 
+use async_openai::Client;
+use async_openai::config::Config;
 use async_openai::error::{ApiError, OpenAIError};
+use async_openai::middleware::ReqwestService;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use secrecy::SecretString;
@@ -128,6 +131,15 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
         let _ = write!(hint, " (and {remaining} more)");
     }
     hint
+}
+
+/// Builds an `async-openai` client that sends each request once. `async-openai` retries `429` and
+/// `5xx` responses by default; Spice retries and rate-controls requests itself, so a second layer
+/// would multiply attempts and hide the provider's first answer.
+#[must_use]
+pub fn client_without_retry<C: Config>(config: C) -> Client<C> {
+    let http_client = reqwest::Client::new();
+    Client::build(http_client.clone(), config).with_http_service(ReqwestService::new(http_client))
 }
 
 /// Creates an HTTP client with standard timeout and TLS settings.
