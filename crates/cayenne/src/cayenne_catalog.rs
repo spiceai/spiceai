@@ -6215,12 +6215,13 @@ fn identity_setting_changes(
             columns_setting_value(&stored.primary_key),
             columns_setting_value(&options.primary_key),
         ));
-        // A new key already changes what the rows mean, but turning the check on or off
-        // with it is a change of its own, and the list names every setting that changed:
-        // a table that keeps its settings keeps both.
+        // A new key already changes what the rows mean, but changing the check with it is
+        // a change of its own, and the list names every setting that changed: a table
+        // that keeps its settings keeps both. The requested table is keyed, so the check
+        // it asks for applies to it, whatever an unkeyed stored table recorded.
         if !options.primary_key.is_empty()
-            && (enables_pk_conflict_detection(stored, options)
-                || disables_pk_conflict_detection(stored, options))
+            && stored.vortex_config.pk_conflict_detection
+                != options.vortex_config.pk_conflict_detection
         {
             changes.push(SettingChange::new(
                 "`cayenne_pk_conflict_detection`",
@@ -11654,6 +11655,44 @@ mod tests {
             described(&identity_setting_changes(&stored, &unkeyed)),
             vec!["`primary_key`: ['id'] -> none"]
         );
+    }
+
+    /// A key added to an unkeyed table with the check changed is two changes too: the
+    /// requested table is keyed, so the check it asks for applies to it, whatever the
+    /// unkeyed stored table recorded.
+    #[test]
+    fn a_key_added_with_conflict_detection_changed_lists_both_changes() {
+        for (stored_detection, requested_detection, described_change) in [
+            (
+                PkConflictDetection::Auto,
+                PkConflictDetection::None,
+                "`cayenne_pk_conflict_detection`: 'auto' -> 'none'",
+            ),
+            (
+                PkConflictDetection::None,
+                PkConflictDetection::Auto,
+                "`cayenne_pk_conflict_detection`: 'none' -> 'auto'",
+            ),
+        ] {
+            let stored = make_test_metadata(
+                vec![],
+                None,
+                None,
+                "table-root",
+                with_detection(stored_detection),
+                id_schema(),
+            );
+            let keyed = requested_like(&stored, |options| {
+                options.primary_key = vec!["id".to_string()];
+                options.on_conflict =
+                    (requested_detection == PkConflictDetection::Auto).then(|| upsert_on(&["id"]));
+                options.vortex_config = with_detection(requested_detection);
+            });
+            assert_eq!(
+                described(&identity_setting_changes(&stored, &keyed)),
+                vec!["`primary_key`: none -> ['id']", described_change]
+            );
+        }
     }
 
     /// Rows written with the check on are unique per key, which rows written without it

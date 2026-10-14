@@ -518,9 +518,12 @@ async fn turning_conflict_detection_off_in_place_admits_a_repeated_key() {
         .expect("turning conflict detection off opens the stored table");
         ctx.register_table("t", table).expect("register");
         run(&ctx, "INSERT INTO t VALUES (1, 0, 5)").await;
+        // One write repeating a key keeps both rows too, into the partition `w = 0` that
+        // existed before the change.
+        run(&ctx, "INSERT INTO t VALUES (2, 0, 1), (2, 0, 2)").await;
         assert_eq!(
             ids(&ctx).await,
-            [1, 1],
+            [1, 1, 2, 2],
             "partition_by: {partition_by:?}: writes must follow the check turned off in place"
         );
     }

@@ -3087,10 +3087,11 @@ struct CayenneTableProviderOpenOptions {
     snapshot_dir_pins: Option<SnapshotDirPins>,
     /// The conflict detection recorded for the partitioned table this table is a
     /// partition of, if it is one. A partition follows that table turning the check
-    /// off: the change is applied in place to the table's metastore row, not to the
-    /// rows of the partitions it already has, which would otherwise keep checking. A
-    /// partition is never given the check this way, since one written without it may
-    /// hold more than one row per key.
+    /// off, with the conflict action it records cleared to match, as the table's own is:
+    /// the change is applied in place to the table's metastore row, not to the rows of
+    /// the partitions it already has, which would otherwise keep checking and keep
+    /// resolving a key repeated within one write. A partition is never given the check
+    /// this way, since one written without it may hold more than one row per key.
     partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
@@ -9579,6 +9580,7 @@ impl CayenneTableProvider {
             upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
         if partitioned_table_conflict_detection == Some(PkConflictDetection::None) {
             table_metadata.vortex_config.pk_conflict_detection = PkConflictDetection::None;
+            table_metadata.on_conflict = None;
         }
 
         // Use the provided context (for partition cache sharing) or build a

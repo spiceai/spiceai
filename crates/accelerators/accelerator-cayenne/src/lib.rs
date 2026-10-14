@@ -245,6 +245,21 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// [`Self::AccelerationDataDirRemovalFailed`] for a previous acceleration stored
+    /// somewhere other than the configured location, whose files a recreate removes before
+    /// its rows, so the rows are still in the metastore.
+    #[snafu(display(
+        "Failed to recreate dataset '{table_name}' (cayenne): Could not delete the data directory '{data_dir}' of its previous acceleration ({source}). \
+        The Cayenne metastore still records that acceleration and '{data_dir}' may be partly deleted, so the dataset serves no accelerated data until a recreate completes — retrying it is safe and resumes from here. \
+        Check that Spice can write to '{data_dir}' and that nothing else is holding files open in it. \
+        See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PreviousAccelerationDataDirRemovalFailed {
+        table_name: String,
+        data_dir: String,
+        source: std::io::Error,
+    },
+
     #[snafu(display(
         "Unsupported data type(s) in schema: {details}. By default, unsupported types cause an error. To convert unsupported types to strings, set 'unsupported_type_action: string'; otherwise, remove the unsupported columns."
     ))]
@@ -1200,6 +1215,30 @@ fn build_workload_profile(
 /// Whether opening the dataset's stored table reported settings it cannot adopt in
 /// place for a dataset that is rebuilt rather than kept. The catalog error arrives
 /// wrapped by the table-provider build, so the whole chain is searched.
+/// The error of removing a previous acceleration's files before its rows
+/// ([`CayenneAccelerator::drop_table`] for a table stored elsewhere): a failed removal
+/// leaves the rows in the metastore, which [`Error::PreviousAccelerationDataDirRemovalFailed`]
+/// says, where [`Error::AccelerationDataDirRemovalFailed`] says they are gone.
+fn previous_acceleration_still_recorded(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match error.downcast::<Error>() {
+        Ok(error) => match *error {
+            Error::AccelerationDataDirRemovalFailed {
+                table_name,
+                data_dir,
+                source,
+            } => Box::new(Error::PreviousAccelerationDataDirRemovalFailed {
+                table_name,
+                data_dir,
+                source,
+            }),
+            other => Box::new(other),
+        },
+        Err(error) => error,
+    }
+}
+
 fn requires_rebuild(error: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(error), |error| error.source()).any(|error| {
         matches!(
@@ -1718,6 +1757,29 @@ impl CayenneAccelerator {
                 data_dir: data_dir.to_string(),
                 source: source_error,
             })?;
+        Ok(())
+    }
+
+    /// Removes each local directory among `dirs` that exists, through
+    /// [`Self::remove_acceleration_data_dir`], to recreate `table_name`'s acceleration. A
+    /// local location can be spelled as a `file://` URI: the directory it names is what
+    /// exists, and what is removed.
+    async fn remove_local_data_dirs(
+        source: &dyn AccelerationSource,
+        table_name: &str,
+        dirs: &[String],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for dir in dirs {
+            if let Some(local_dir) = absolute_data_dir(dir).boxed()?
+                && path_exists(&local_dir).await
+            {
+                let local_dir = local_dir.to_string_lossy().into_owned();
+                Self::remove_acceleration_data_dir(source, &local_dir).await?;
+                tracing::info!(
+                    "Removed the Cayenne data directory '{local_dir}' of dataset '{table_name}' to recreate its acceleration"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4642,6 +4704,8 @@ impl DataAccelerator for CayenneAccelerator {
         // no longer exist and, for a partitioned table, children still pinning
         // the old schema. Failing before anything is deleted leaves a table the
         // operator can retry; the reverse order leaves one nothing can repair.
+        // A table stored somewhere other than the configured location is the
+        // exception, below: its rows are what tell a retry where it is stored.
         //
         // The files removed are the ones the stored table was written to. When
         // the dataset's settings now put its data elsewhere — a rebuild for a
@@ -4655,6 +4719,7 @@ impl DataAccelerator for CayenneAccelerator {
         // configured one with it, so only the stored table's own directories go.
         let mut removed_dirs = vec![dir_path.clone()];
         let mut left_in_place = None;
+        let mut stored_elsewhere = false;
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
             let metastore_type = acceleration
@@ -4688,26 +4753,27 @@ impl DataAccelerator for CayenneAccelerator {
                     } else {
                         vec![stored.path]
                     };
+                    stored_elsewhere = true;
                 }
                 Ok(_) | Err(cayenne::CatalogError::TableNotFound { .. }) => {}
                 Err(error) => return Err(Box::new(error)),
             }
+            // A table stored somewhere other than the configured location loses its files
+            // before its rows. If removing them fails, a retry still reads where the table
+            // is stored from its rows; with the rows already dropped, it would find no
+            // stored table and clear the configured location instead, which may already
+            // hold data. Rows a failed drop leaves behind are dropped by that retry, which
+            // finds their files already gone.
+            if stored_elsewhere {
+                Self::remove_local_data_dirs(source, table_name, &removed_dirs)
+                    .await
+                    .map_err(previous_acceleration_still_recorded)?;
+                removed_dirs.clear();
+            }
             catalog.drop_table(table_name).await.boxed()?;
         }
 
-        // A local location can be spelled as a `file://` URI. The directory it names is
-        // what exists, and what is removed or recreated.
-        for removed_dir in removed_dirs {
-            if let Some(local_dir) = absolute_data_dir(&removed_dir).boxed()?
-                && path_exists(&local_dir).await
-            {
-                let local_dir = local_dir.to_string_lossy().into_owned();
-                Self::remove_acceleration_data_dir(source, &local_dir).await?;
-                tracing::info!(
-                    "Removed the Cayenne data directory '{local_dir}' of dataset '{table_name}' to recreate its acceleration"
-                );
-            }
-        }
+        Self::remove_local_data_dirs(source, table_name, &removed_dirs).await?;
         if let Some(prefixes) = left_in_place {
             tracing::warn!(
                 "{}",
@@ -6794,6 +6860,109 @@ mod tests {
         assert!(
             new_file.exists(),
             "the newly configured location's contents must be left alone"
+        );
+    }
+
+    /// A teardown that cannot remove the stored table's files keeps its rows, so a retry
+    /// still knows where the table is stored. With the rows dropped first, the retry would
+    /// find no stored table and clear the configured location instead, which may already
+    /// hold data.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_table_retried_after_a_failed_removal_keeps_the_configured_location() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        let old_dir = base.path().join("old").join("orders");
+        let new_dir = base.path().join("new").join("orders");
+
+        // The table as an earlier configuration stored it, at `old/orders`, with a
+        // directory whose entries cannot be deleted, so removing its files fails.
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: old_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the stored table");
+        drop(catalog);
+        let locked = old_dir.join(&table_id).join("locked");
+        std::fs::create_dir_all(&locked).expect("locked dir");
+        std::fs::write(locked.join("data.vortex"), b"rows").expect("old file");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("lock");
+        if std::fs::write(locked.join("probe"), b"").is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("unlock");
+            eprintln!(
+                "skipped: this user can write to a read-only directory, so the removal cannot be made to fail"
+            );
+            return;
+        }
+
+        // The dataset now puts its data under `new/`, which already holds a file.
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_file = new_dir.join("unrelated");
+        std::fs::write(&new_file, b"keep").expect("new file");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    base.path().join("new").to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let accelerator = CayenneAccelerator::new();
+        let failed = accelerator
+            .drop_table("orders", &dataset)
+            .await
+            .expect_err("removing the stored table's files must fail while they are locked")
+            .to_string();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+        accelerator
+            .drop_table("orders", &dataset)
+            .await
+            .expect("the retry drops the stored table");
+
+        assert!(
+            new_file.exists(),
+            "the newly configured location's contents must be left alone"
+        );
+        assert!(
+            !old_dir.exists(),
+            "the retry must remove the stored table's files"
+        );
+        assert!(
+            failed.contains("Failed to recreate dataset 'orders' (cayenne)")
+                && failed.contains("The Cayenne metastore still records that acceleration")
+                && failed.contains("may be partly deleted"),
+            "the failure must say the acceleration is still recorded; got: {failed}"
         );
     }
 
