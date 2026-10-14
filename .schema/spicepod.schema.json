@@ -3289,7 +3289,7 @@
           }
         },
         "snapshots": {
-          "description": "Enables snapshots for this dataset. Snapshots are stored in `snapshots_location`,\nor in the `snapshots/` folder of `runtime.state.location`.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
+          "description": "Enables snapshots for this dataset. Snapshots are stored in the first of\n`snapshots_location`, the deprecated top-level `snapshots.location` and the\n`snapshots/` folder of `runtime.state.location` that is set.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
           "$ref": "#/$defs/SnapshotBehavior"
         },
         "snapshots_trigger": {
@@ -3318,14 +3318,14 @@
           "$ref": "#/$defs/SnapshotsCreationPolicy"
         },
         "snapshots_location": {
-          "description": "The object store location of this dataset's snapshots, for example\n`s3://my-bucket/spice/snapshots/`. Defaults to the `snapshots/` folder of\n`runtime.state.location`.",
+          "description": "The object store location of this dataset's snapshots, for example\n`s3://my-bucket/spice/snapshots/`. Defaults to the deprecated top-level\n`snapshots.location`, then to the `snapshots/` folder of\n`runtime.state.location`.",
           "type": [
             "string",
             "null"
           ]
         },
         "snapshots_params": {
-          "description": "Object store params for this dataset's snapshots, such as `s3_region` or\n`s3_queue_url`. When set, they are the only params used. Otherwise a\n`snapshots_location` uses no params, and the `runtime.state` location uses\n`runtime.state.params`.",
+          "description": "Object store params for this dataset's snapshots, such as `s3_region` or\n`s3_queue_url`. When set, they are the only params used. Otherwise a\n`snapshots_location` uses no params, the deprecated top-level\n`snapshots.location` uses `snapshots.params`, and the `runtime.state`\nlocation uses `snapshots.params` when set, else `runtime.state.params`.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3336,7 +3336,7 @@
           ]
         },
         "snapshots_bootstrap_on_failure_behavior": {
-          "description": "The behavior when loading a snapshot fails: `warn` (default), `retry` or `fallback`.",
+          "description": "The behavior when loading a snapshot fails: `warn`, `retry` or `fallback`.\nDefaults to the deprecated top-level `snapshots.bootstrap_on_failure_behavior`,\nthen to `warn`.",
           "anyOf": [
             {
               "$ref": "#/$defs/BootstrapOnFailureBehavior"

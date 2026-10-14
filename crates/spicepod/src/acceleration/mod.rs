@@ -631,8 +631,9 @@ pub struct Acceleration {
     )]
     pub partition_by: Vec<PartitionedBy>,
 
-    /// Enables snapshots for this dataset. Snapshots are stored in `snapshots_location`,
-    /// or in the `snapshots/` folder of `runtime.state.location`.
+    /// Enables snapshots for this dataset. Snapshots are stored in the first of
+    /// `snapshots_location`, the deprecated top-level `snapshots.location` and the
+    /// `snapshots/` folder of `runtime.state.location` that is set.
     ///
     /// Options: `enabled` / `disabled` / `bootstrap_only` / `create_only`.
     ///
@@ -666,19 +667,23 @@ pub struct Acceleration {
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
 
     /// The object store location of this dataset's snapshots, for example
-    /// `s3://my-bucket/spice/snapshots/`. Defaults to the `snapshots/` folder of
+    /// `s3://my-bucket/spice/snapshots/`. Defaults to the deprecated top-level
+    /// `snapshots.location`, then to the `snapshots/` folder of
     /// `runtime.state.location`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_location: Option<String>,
 
     /// Object store params for this dataset's snapshots, such as `s3_region` or
     /// `s3_queue_url`. When set, they are the only params used. Otherwise a
-    /// `snapshots_location` uses no params, and the `runtime.state` location uses
-    /// `runtime.state.params`.
+    /// `snapshots_location` uses no params, the deprecated top-level
+    /// `snapshots.location` uses `snapshots.params`, and the `runtime.state`
+    /// location uses `snapshots.params` when set, else `runtime.state.params`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_params: Option<Params>,
 
-    /// The behavior when loading a snapshot fails: `warn` (default), `retry` or `fallback`.
+    /// The behavior when loading a snapshot fails: `warn`, `retry` or `fallback`.
+    /// Defaults to the deprecated top-level `snapshots.bootstrap_on_failure_behavior`,
+    /// then to `warn`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_bootstrap_on_failure_behavior: Option<BootstrapOnFailureBehavior>,
 }
