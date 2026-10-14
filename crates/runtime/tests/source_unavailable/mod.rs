@@ -610,7 +610,13 @@ mod served_from_acceleration {
     use app::AppBuilder;
     use arrow::array::Int64Array;
     use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
+    use cache::result::CacheStatus;
+    use futures::TryStreamExt;
     use runtime::{Runtime, status::ComponentStatus};
+    use spicepod::component::{
+        caching::{Caching, SQLResultsCacheConfig},
+        runtime::Runtime as SpicepodRuntime,
+    };
     use spicepod::{
         acceleration::{Acceleration, Mode, RefreshMode},
         component::dataset::{Dataset as SpicepodDataset, ReadyState},
@@ -741,6 +747,66 @@ mod served_from_acceleration {
             async move { rt.load_components().await }
         });
         (rt, loader)
+    }
+
+    /// [`start`] with the SQL results cache on, entries fresh for `item_ttl` and
+    /// served stale for a further `stale_while_revalidate_ttl`.
+    async fn start_with_results_cache(
+        dataset: SpicepodDataset,
+        item_ttl: &str,
+        stale_while_revalidate_ttl: Option<&str>,
+    ) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
+        let app = AppBuilder::new("source_unavailable")
+            .with_dataset(dataset)
+            .with_runtime(SpicepodRuntime {
+                caching: Caching {
+                    sql_results: Some(SQLResultsCacheConfig {
+                        item_ttl: Some(item_ttl.to_string()),
+                        stale_while_revalidate_ttl: stale_while_revalidate_ttl.map(str::to_string),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .build();
+        configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        (rt, loader)
+    }
+
+    /// How the results cache answered `sql`, and its `(SUM(v), COUNT(*))`.
+    async fn cached_sum_and_count(
+        rt: &Arc<Runtime>,
+        sql: &str,
+    ) -> Result<(CacheStatus, (i64, i64)), String> {
+        let result = rt
+            .datafusion()
+            .query_builder(sql)
+            .build()
+            .run()
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = result.cache_status;
+        let batches: Vec<_> = result
+            .data
+            .try_collect()
+            .await
+            .map_err(|err| err.to_string())?;
+        let batch = batches.first().ok_or("no batches")?;
+        let column = |index: usize| {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|values| values.value(0))
+                .ok_or_else(|| format!("column {index} is not Int64"))
+        };
+        Ok((status, (column(0)?, column(1)?)))
     }
 
     async fn stop(rt: Arc<Runtime>, loader: tokio::task::JoinHandle<()>) {
@@ -2157,6 +2223,113 @@ mod served_from_acceleration {
             "escalated configuration error must bypass the transient warning throttle"
         );
         assert_eq!(rows, Some((3, 3)));
+        Ok(())
+    }
+
+    /// A results-cache miss on an accelerated dataset is answered from the
+    /// acceleration while its source is down, including the miss after an entry
+    /// ages past `item_ttl`. The source holds `v = 2` and refuses every connection,
+    /// so a miss that reached it would fail or return `(6, 3)`.
+    #[tokio::test]
+    async fn results_cache_misses_are_answered_from_the_acceleration_while_the_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("cache-miss-while-down").await?;
+        let source = &fixture.source;
+        seed(source, fixture.dataset(ReadyState::OnLoad)).await?;
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) =
+            start_with_results_cache(fixture.dataset(ReadyState::OnLoad), "1s", None).await;
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "queries must be answered from the existing acceleration, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+
+        let sql = "SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders WHERE id >= 0";
+        assert_eq!(
+            cached_sum_and_count(&rt, sql).await,
+            Ok((CacheStatus::CacheMiss, (3, 3))),
+            "the first query is a miss answered from the acceleration"
+        );
+        assert_eq!(
+            cached_sum_and_count(&rt, sql).await,
+            Ok((CacheStatus::CacheHit, (3, 3))),
+            "the second query is served from the results cache"
+        );
+        // The entry's age is what is under test: wait out `item_ttl`.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            cached_sum_and_count(&rt, sql).await,
+            Ok((CacheStatus::CacheMiss, (3, 3))),
+            "an expired entry is a miss answered from the acceleration, not the source"
+        );
+        assert!(
+            reports_served_error(&rt).await,
+            "the source must still be down for the misses above to prove anything ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// With `stale_while_revalidate_ttl`, an entry past `item_ttl` is served stale
+    /// while the source is down, and its background revalidation runs against the
+    /// acceleration and replaces it.
+    #[tokio::test]
+    async fn stale_results_are_revalidated_from_the_acceleration_while_the_source_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("cache-revalidate-while-down").await?;
+        let source = &fixture.source;
+        seed(source, fixture.dataset(ReadyState::OnLoad)).await?;
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) =
+            start_with_results_cache(fixture.dataset(ReadyState::OnLoad), "1s", Some("30s")).await;
+        assert!(
+            served_from_acceleration(&rt, Duration::from_secs(10)).await,
+            "queries must be answered from the existing acceleration, got {:?} ({:?})",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+
+        let sql = "SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders WHERE id >= 0";
+        assert_eq!(
+            cached_sum_and_count(&rt, sql).await,
+            Ok((CacheStatus::CacheMiss, (3, 3))),
+            "the first query is a miss answered from the acceleration"
+        );
+        // The entry's age is what is under test: wait out `item_ttl`.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            cached_sum_and_count(&rt, sql).await,
+            Ok((CacheStatus::CacheStaleWhileRevalidate, (3, 3))),
+            "an entry past item_ttl is served stale while it is revalidated"
+        );
+        let last = std::sync::Mutex::new(None);
+        let revalidated = wait_until_true(Duration::from_secs(10), || async {
+            let observed = cached_sum_and_count(&rt, sql).await;
+            let done = observed == Ok((CacheStatus::CacheHit, (3, 3)));
+            *last.lock().expect("last observation lock") = Some(observed);
+            done
+        })
+        .await;
+        assert!(
+            revalidated,
+            "the revalidation must store a fresh entry read from the acceleration, last saw {:?}",
+            last.lock().expect("last observation lock")
+        );
+        assert!(
+            reports_served_error(&rt).await,
+            "the source must still be down for the revalidation above to prove anything ({:?})",
+            dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
         Ok(())
     }
 }

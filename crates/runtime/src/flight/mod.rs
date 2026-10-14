@@ -233,8 +233,19 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
+        Self::get_arrow_schema_with_params(datafusion, sql, None).await
+    }
+
+    /// Like [`Self::get_arrow_schema`], but binds `parameters` before deriving
+    /// the schema so it matches what `do_get` streams for the same values.
+    async fn get_arrow_schema_with_params(
+        datafusion: Arc<DataFusion>,
+        sql: &str,
+        parameters: Option<datafusion::common::ParamValues>,
+    ) -> Result<(Schema, Option<Schema>), Status> {
         let read_only = crate::http::v1::current_principal_requires_read_only().await;
         let query = QueryBuilder::new(sql, datafusion)
+            .parameters(parameters)
             .read_only(read_only)
             .build();
 

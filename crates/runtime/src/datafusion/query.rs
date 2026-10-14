@@ -2023,6 +2023,25 @@ impl Query {
             }
         };
 
+        // Bind any supplied parameter values the same way execution does, so the
+        // advertised schema matches the streamed one: a bound `$1` becomes a
+        // typed, non-null literal (e.g. `SELECT $1` is `Int64 NOT NULL`, not a
+        // nullable `Null`).
+        let plan = match &self.sql {
+            QueryMethod::Text {
+                parameters: Some(parameters),
+                ..
+            } => match plan.with_param_values(parameters.clone()) {
+                Ok(bound) => Box::new(bound),
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            },
+            _ => plan,
+        };
+
         // Verify the plan against the restricted options
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
             let e = find_datafusion_root(e);
