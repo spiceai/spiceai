@@ -1642,10 +1642,7 @@ impl Query {
                     let session_ctx = if let Some(flight_session) =
                         owned_flight_session(&request_context)
                     {
-                        tracing::debug!(
-                            "Statement plan using Flight session: {}",
-                            flight_session.session_context().session_id()
-                        );
+                        tracing::debug!("Statement plan using the request's Flight session");
                         Arc::clone(flight_session.session_context())
                     } else {
                         tracing::debug!(
