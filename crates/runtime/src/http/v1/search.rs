@@ -116,12 +116,9 @@ struct SearchResponse {
         )
     )
 ))]
-pub(crate) async fn post(
-    Extension(vs): Extension<Arc<SearchEngine<crate::search::util::RuntimeTableProviderExplorer>>>,
-    Json(payload): Json<SearchRequestHTTPJson>,
-) -> Response {
-    let start_time = Instant::now();
-
+/// Validates basic `/v1/search` request parameters, returning an error message
+/// for a `400 Bad Request` if the request is invalid.
+fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
     // For now, force the user to specify which data.
     if payload
         .base
@@ -129,11 +126,28 @@ pub(crate) async fn post(
         .as_ref()
         .is_some_and(std::vec::Vec::is_empty)
     {
-        return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
+        return Some("No data sources provided");
     }
 
     if payload.base.limit.is_some_and(|limit| limit == 0) {
-        return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
+        return Some("Limit must be greater than 0");
+    }
+
+    if payload.base.text.trim().is_empty() {
+        return Some("Search text must not be empty");
+    }
+
+    None
+}
+
+pub(crate) async fn post(
+    Extension(vs): Extension<Arc<SearchEngine<crate::search::util::RuntimeTableProviderExplorer>>>,
+    Json(payload): Json<SearchRequestHTTPJson>,
+) -> Response {
+    let start_time = Instant::now();
+
+    if let Some(msg) = validate_request(&payload) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = %payload.base.text);
@@ -216,5 +230,36 @@ pub(crate) async fn post(
             tracing::error!(target: "task_history", parent: &span, "{e}");
             (error_type, e.to_string()).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn req(json: serde_json::Value) -> SearchRequestHTTPJson {
+        serde_json::from_value(json).expect("valid request json")
+    }
+
+    #[test]
+    fn rejects_empty_and_whitespace_text() {
+        for text in ["", "   ", "\t\n "] {
+            let r = req(serde_json::json!({"datasets": ["products"], "text": text, "limit": 3}));
+            assert_eq!(validate_request(&r), Some("Search text must not be empty"), "text={text:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_non_empty_text() {
+        let r = req(serde_json::json!({"datasets": ["products"], "text": " boots ", "limit": 3}));
+        assert_eq!(validate_request(&r), None);
+    }
+
+    #[test]
+    fn rejects_zero_limit_and_empty_datasets() {
+        let r = req(serde_json::json!({"datasets": ["products"], "text": "boots", "limit": 0}));
+        assert_eq!(validate_request(&r), Some("Limit must be greater than 0"));
+        let r = req(serde_json::json!({"datasets": [], "text": "boots"}));
+        assert_eq!(validate_request(&r), Some("No data sources provided"));
     }
 }
