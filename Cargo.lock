@@ -17661,6 +17661,7 @@ dependencies = [
  "runtime-resources",
  "runtime-search",
  "runtime-secrets",
+ "runtime-state-location",
  "runtime-status",
  "runtime-table",
  "runtime-table-partition",
@@ -17760,10 +17761,10 @@ dependencies = [
  "runtime-parameters",
  "runtime-query-engine",
  "runtime-secrets",
+ "runtime-state-location",
  "runtime-table-partition",
  "rusqlite",
  "s3-event-notifications",
- "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -18444,6 +18445,27 @@ dependencies = [
  "tracing",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "runtime-state-location"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "aws-sdk-credential-bridge",
+ "datafusion",
+ "object_store 0.13.2",
+ "object_store_occ",
+ "runtime-object-store",
+ "runtime-parameters",
+ "runtime-secrets",
+ "secrecy",
+ "serde",
+ "snafu",
+ "spicepod",
+ "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]
