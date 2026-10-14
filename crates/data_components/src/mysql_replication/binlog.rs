@@ -48,6 +48,7 @@ use std::time::{Duration, SystemTime};
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use arrow_tools::schema_evolution::is_widening_cast;
 use bitvec::slice::BitSlice;
+use datafusion_table_providers::sql::arrow_sql_gen::mysql::map_column_to_data_type;
 use mysql_async::binlog::events::{OptionalMetaExtractor, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
@@ -611,10 +612,10 @@ pub(super) struct AdoptedLayout {
     pub(super) layout: TableLayout,
     pub(super) column_map: Vec<usize>,
     pub(super) pk_source_indexes: Vec<usize>,
-    /// The schema the member's change batches are built with from here on: the
-    /// previous one with each column whose source type widened losslessly
-    /// retyped to the new type (see [`widen_to_source_types`]).
-    pub(super) schema: SchemaRef,
+    /// The schema the member's change batches are built with from here on, when
+    /// a column's source type widened losslessly (see [`widen_to_source_types`]);
+    /// `None` when every column keeps its type.
+    pub(super) widened_schema: Option<SchemaRef>,
 }
 
 /// Re-fetch the source table's layout and reconcile it against the dataset
@@ -665,73 +666,46 @@ pub(super) async fn adopt_current_layout(
     }
 
     let widened_schema = widen_to_source_types(schema, &layout, &column_map, primary_keys);
-    if !Arc::ptr_eq(&widened_schema, schema) {
-        let widened: Vec<String> = schema
-            .fields()
-            .iter()
-            .zip(widened_schema.fields().iter())
-            .filter(|(before, after)| before.data_type() != after.data_type())
-            .map(|(before, after)| {
-                format!(
-                    "'{}' {} -> {}",
-                    before.name(),
-                    before.data_type(),
-                    after.data_type()
-                )
-            })
-            .collect();
-        tracing::debug!(
-            dataset = %dataset_name,
-            "Dataset '{dataset_name}': source table '{database}.{table}' widened column \
-             types ({}); changes from here on carry the new types, and \
-             `on_schema_change` decides whether the acceleration evolves to them",
-            widened.join(", ")
-        );
-    }
 
     Ok(AdoptedLayout {
         layout,
         column_map,
         pk_source_indexes,
-        schema: widened_schema,
+        widened_schema,
     })
 }
 
 /// The Arrow type the `MySQL` table provider infers for a numeric
-/// `information_schema.COLUMNS.COLUMN_TYPE`, or `None` for any other type.
-///
-/// Mirrors the provider's mapping (`UNSIGNED` maps to the unsigned Arrow type,
-/// `MEDIUMINT` to 32 bits, `DECIMAL` past 38 digits to `Decimal256`) so a type
-/// adopted mid-stream is the type a restart would register.
+/// `information_schema.COLUMNS.COLUMN_TYPE`, or `None` for any other type, so a
+/// type adopted mid-stream is the type a restart would register.
 fn numeric_arrow_type(column_type: &str) -> Option<DataType> {
     let lower = column_type.trim().to_ascii_lowercase();
-    let base: String = lower
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect();
-    let unsigned = lower.contains("unsigned");
-    let data_type = match (base.as_str(), unsigned) {
-        ("tinyint", false) => DataType::Int8,
-        ("tinyint", true) => DataType::UInt8,
-        ("smallint", false) => DataType::Int16,
-        ("smallint", true) => DataType::UInt16,
-        ("mediumint" | "int" | "integer", false) => DataType::Int32,
-        ("mediumint" | "int" | "integer", true) => DataType::UInt32,
-        ("bigint", false) => DataType::Int64,
-        ("bigint", true) => DataType::UInt64,
-        ("float", _) => DataType::Float32,
-        ("double", _) => DataType::Float64,
-        ("decimal" | "numeric", _) => {
-            let (precision, scale) = decimal_precision_and_scale(&lower)?;
-            if precision > 38 {
-                DataType::Decimal256(precision, scale)
-            } else {
-                DataType::Decimal128(precision, scale)
-            }
-        }
+    let wire_type = match type_base_name(&lower).as_str() {
+        "tinyint" => ColumnType::MYSQL_TYPE_TINY,
+        "smallint" => ColumnType::MYSQL_TYPE_SHORT,
+        "mediumint" => ColumnType::MYSQL_TYPE_INT24,
+        "int" | "integer" => ColumnType::MYSQL_TYPE_LONG,
+        "bigint" => ColumnType::MYSQL_TYPE_LONGLONG,
+        "float" => ColumnType::MYSQL_TYPE_FLOAT,
+        "double" => ColumnType::MYSQL_TYPE_DOUBLE,
+        "decimal" | "numeric" => ColumnType::MYSQL_TYPE_NEWDECIMAL,
         _ => return None,
     };
-    Some(data_type)
+    let (precision, scale) = if wire_type == ColumnType::MYSQL_TYPE_NEWDECIMAL {
+        let (precision, scale) = decimal_precision_and_scale(&lower)?;
+        (Some(precision), Some(scale))
+    } else {
+        (None, None)
+    };
+    map_column_to_data_type(
+        wire_type,
+        false,
+        false,
+        lower.contains("unsigned"),
+        false,
+        precision,
+        scale,
+    )
 }
 
 /// `(precision, scale)` of a `decimal(p[,s])` column type. `MySQL` always
@@ -745,6 +719,16 @@ fn decimal_precision_and_scale(column_type: &str) -> Option<(u8, i8)> {
     let precision = parts.next()?.parse().ok()?;
     let scale = parts.next().map_or(Some(0), |s| s.parse().ok())?;
     Some((precision, scale))
+}
+
+/// The lowercase type name a `COLUMN_TYPE` starts with (`int` for
+/// `int(11) unsigned`).
+fn type_base_name(column_type: &str) -> String {
+    column_type
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 /// `schema` with each column whose source type is now a lossless widening of
@@ -761,7 +745,7 @@ fn widen_to_source_types(
     layout: &TableLayout,
     column_map: &[usize],
     primary_keys: &[String],
-) -> SchemaRef {
+) -> Option<SchemaRef> {
     let mut changed = false;
     let fields: Vec<FieldRef> = schema
         .fields()
@@ -783,10 +767,7 @@ fn widen_to_source_types(
             }
         })
         .collect();
-    if !changed {
-        return Arc::clone(schema);
-    }
-    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+    changed.then(|| Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
 }
 
 /// A coarse binlog column-type class, used to compare a layout fetched from
@@ -826,12 +807,7 @@ enum BinlogTypeClass {
 /// 5.6), `TEXT` / `BLOB` (all sent as `MYSQL_TYPE_BLOB`, distinguished only by
 /// a length byte in the metadata), and `REAL` (`REAL_AS_FLOAT` `sql_mode`).
 fn source_type_class(column_type: &str) -> Option<BinlogTypeClass> {
-    let base: String = column_type
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match base.as_str() {
+    match type_base_name(column_type).as_str() {
         "tinyint" => Some(BinlogTypeClass::Int8),
         "smallint" => Some(BinlogTypeClass::Int16),
         "mediumint" => Some(BinlogTypeClass::Int24),
@@ -1511,7 +1487,8 @@ mod tests {
             ("name", "varchar(20)"),
         ]);
         let widened =
-            widen_to_source_types(&schema, &layout, &[0, 1, 2, 3, 4], &["id".to_string()]);
+            widen_to_source_types(&schema, &layout, &[0, 1, 2, 3, 4], &["id".to_string()])
+                .expect("k and price widen");
         let types: Vec<_> = widened
             .fields()
             .iter()
@@ -1533,8 +1510,10 @@ mod tests {
     fn an_unchanged_layout_keeps_the_same_schema() {
         let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int32)]);
         let layout = layout_of(&[("id", "bigint"), ("k", "int")]);
-        let widened = widen_to_source_types(&schema, &layout, &[0, 1], &["id".to_string()]);
-        assert!(Arc::ptr_eq(&widened, &schema));
+        assert_eq!(
+            widen_to_source_types(&schema, &layout, &[0, 1], &["id".to_string()]),
+            None
+        );
     }
 
     #[test]

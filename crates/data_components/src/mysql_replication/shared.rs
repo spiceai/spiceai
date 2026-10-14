@@ -658,17 +658,16 @@ impl MemberHandle {
     }
 }
 
-/// The change-batch schemas for `schema`, reusing `current` when the schema did
-/// not change.
+/// The change-batch schemas for a widened schema, or `current` when the ALTER
+/// widened nothing.
 fn changed_schemas(
     current: &Arc<ChangeBatchSchemas>,
-    schema: &SchemaRef,
+    widened: Option<&SchemaRef>,
 ) -> Arc<ChangeBatchSchemas> {
-    if Arc::ptr_eq(current.dataset(), schema) {
-        Arc::clone(current)
-    } else {
-        Arc::new(ChangeBatchSchemas::new(schema))
-    }
+    widened.map_or_else(
+        || Arc::clone(current),
+        |schema| Arc::new(ChangeBatchSchemas::new(schema)),
+    )
 }
 
 impl SharedSource {
@@ -1756,7 +1755,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                         tme.columns_count() != g.layout.columns.len() as u64
                     };
                     if needs_adopt {
-                        let old = { Arc::clone(&lock(&member.layout)) };
+                        let old = Arc::clone(&lock(&member.layout));
                         match adopt_current_layout(
                             &params,
                             &mkey.0,
@@ -1772,13 +1771,16 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                                 layout,
                                 column_map,
                                 pk_source_indexes,
-                                schema,
+                                widened_schema,
                             }) if layout.columns.len() as u64 == tme.columns_count() => {
                                 *lock(&member.layout) = Arc::new(MemberLayout {
                                     layout,
                                     column_map,
                                     pk_source_indexes,
-                                    change_schemas: changed_schemas(&old.change_schemas, &schema),
+                                    change_schemas: changed_schemas(
+                                        &old.change_schemas,
+                                        widened_schema.as_ref(),
+                                    ),
                                 });
                             }
                             outcome => {
@@ -2183,7 +2185,7 @@ async fn handle_statement(
                 // other retype keeps the column's type. Adopting on the statement
                 // (not only on the next TableMap's column-count change) also
                 // catches type-only ALTERs that keep the column count.
-                let old = { Arc::clone(&lock(&member.layout)) };
+                let old = Arc::clone(&lock(&member.layout));
                 match adopt_current_layout(
                     &source.params,
                     &mkey.0,
@@ -2199,13 +2201,16 @@ async fn handle_statement(
                         layout,
                         column_map,
                         pk_source_indexes,
-                        schema,
+                        widened_schema,
                     }) => {
                         *lock(&member.layout) = Arc::new(MemberLayout {
                             layout,
                             column_map,
                             pk_source_indexes,
-                            change_schemas: changed_schemas(&old.change_schemas, &schema),
+                            change_schemas: changed_schemas(
+                                &old.change_schemas,
+                                widened_schema.as_ref(),
+                            ),
                         });
                     }
                     Err(e) => {

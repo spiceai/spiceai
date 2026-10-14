@@ -801,7 +801,7 @@ fn value_to_bool(value: &Value) -> Result<bool> {
 
 fn value_to_signed<T>(value: &Value, target: &str) -> Result<T>
 where
-    T: TryFrom<i64> + TryFrom<u64> + std::str::FromStr,
+    T: TryFrom<i64> + TryFrom<u64> + TryFrom<i128> + std::str::FromStr,
 {
     let out_of_range = |v: &dyn std::fmt::Debug| Error::Decode {
         message: format!(
@@ -818,9 +818,9 @@ where
             .ok()
             .and_then(|s| s.trim().parse::<T>().ok())
             .ok_or_else(|| out_of_range(&String::from_utf8_lossy(b).into_owned())),
-        Value::Float(_) | Value::Double(_) => exact_integer(value)
-            .and_then(|v| T::try_from(v).ok())
-            .ok_or_else(|| not_exact(value, target)),
+        Value::Float(_) | Value::Double(_) => {
+            exact_integer(value).ok_or_else(|| not_exact(value, target))
+        }
         other => DecodeSnafu {
             message: format!("cannot interpret {other:?} as {target}"),
         }
@@ -828,8 +828,9 @@ where
     }
 }
 
-/// The integer a `FLOAT` or `DOUBLE` value equals exactly, or `None` when it
-/// has a fraction, is not finite, or is outside `i64`.
+/// The integer a `FLOAT` or `DOUBLE` value equals exactly, as `T`, or `None`
+/// when it has a fraction, is not finite, or is outside `T`'s range. `-0.0`
+/// becomes `0`, as every SQL cast to an integer does.
 ///
 /// An integer column receives a float value when the source column's type
 /// changed and the column kept its type (a primary key, or a policy that does
@@ -837,23 +838,18 @@ where
 /// is refused, never rounded.
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "the round trip through `as` is the exactness check"
+    reason = "the float is integral and below 2^127 in magnitude, so `as i128` is exact"
 )]
-fn exact_integer(value: &Value) -> Option<i64> {
+fn exact_integer<T: TryFrom<i128>>(value: &Value) -> Option<T> {
     let v = match value {
         Value::Float(v) => f64::from(*v),
         Value::Double(v) => *v,
         _ => return None,
     };
-    // `i64::MIN` is exactly representable; `i64::MAX` is not, and `2^63` rounds
-    // to it under `as`, so the upper bound is exclusive.
-    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
-    if !(v.is_finite() && v.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&v)) {
+    if !(v.is_finite() && v.fract() == 0.0 && v.abs() < 2f64.powi(127)) {
         return None;
     }
-    let integer = v as i64;
-    (integer as f64 == v).then_some(integer)
+    T::try_from(v as i128).ok()
 }
 
 fn not_exact(value: &Value, target: &str) -> Error {
@@ -870,7 +866,7 @@ fn not_exact(value: &Value, target: &str) -> Error {
 
 fn value_to_unsigned<T>(value: &Value, target: &str) -> Result<T>
 where
-    T: TryFrom<u64> + std::fmt::Debug,
+    T: TryFrom<u64> + TryFrom<i128> + std::fmt::Debug,
 {
     let out_of_range = |v: &dyn std::fmt::Debug| Error::Decode {
         message: format!("value {v:?} does not fit dataset column type {target}"),
@@ -895,10 +891,9 @@ where
             }
             T::try_from(acc).map_err(|_| out_of_range(&acc))
         }
-        Value::Float(_) | Value::Double(_) => exact_integer(value)
-            .and_then(|v| u64::try_from(v).ok())
-            .and_then(|v| T::try_from(v).ok())
-            .ok_or_else(|| not_exact(value, target)),
+        Value::Float(_) | Value::Double(_) => {
+            exact_integer(value).ok_or_else(|| not_exact(value, target))
+        }
         other => DecodeSnafu {
             message: format!("cannot interpret {other:?} as {target}"),
         }
@@ -1220,7 +1215,14 @@ mod tests {
                 )
             );
         }
-        assert!(value_to_unsigned::<u32>(&Value::Double(-1.0), "UInt32").is_err());
+        assert_eq!(
+            value_to_unsigned::<u32>(&Value::Double(-1.0), "UInt32").ok(),
+            None
+        );
+        assert_eq!(
+            value_to_unsigned::<u64>(&Value::Double(9_223_372_036_854_775_808.0), "UInt64").ok(),
+            Some(1 << 63)
+        );
     }
 
     #[test]
