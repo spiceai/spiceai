@@ -646,7 +646,7 @@ pub(super) async fn adopt_current_layout(
     }
 
     let column_map = layout.column_map(schema, database, table)?;
-    if let Some(message) = lossy_key_retype(schema, &layout, &column_map, primary_keys) {
+    if let Some(message) = lossy_retype(schema, old_layout, &layout, &column_map) {
         return SchemaMismatchSnafu { message }.fail();
     }
     let pk_source_indexes = compute_pk_source_indexes(schema, primary_keys, &column_map);
@@ -745,40 +745,44 @@ fn type_base_name(column_type: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Why a primary-key column's new source type cannot be followed, or `None`
-/// when every key column's type still holds each key exactly.
+/// Why a replicated column's new source type cannot be followed, or `None`
+/// when every replicated column's new type holds each value of its old one.
 ///
-/// An `ALTER` that changes a key column to a type that does not hold every
-/// value of its current one (`BIGINT` to `DOUBLE`) rewrites the stored keys in
-/// place, with no row event: `9007199254740993` becomes `9007199254740992`.
-/// The acceleration still holds the old key, so a later change matched by the
-/// rewritten key would update or delete the wrong row.
-fn lossy_key_retype(
+/// An `ALTER` that changes a column to a type that does not hold every value of
+/// its old one (`BIGINT` to `DOUBLE`, `DOUBLE` to `INT`) rewrites the stored
+/// values in place, with no row event: `9007199254740993` becomes
+/// `9007199254740992`. The acceleration still holds the old values, and no
+/// later change can repair a row it does not touch; on a key column, a change
+/// matched by a rewritten key misses the row the acceleration holds.
+///
+/// The old and new types are both the source's, so a dataset whose `columns`
+/// declare their own types is judged by what the `ALTER` did to the source.
+fn lossy_retype(
     schema: &SchemaRef,
+    old_layout: &TableLayout,
     layout: &TableLayout,
     column_map: &[usize],
-    primary_keys: &[String],
 ) -> Option<String> {
     schema
         .fields()
         .iter()
         .zip(column_map)
-        .filter(|(field, _)| primary_keys.iter().any(|pk| pk == field.name()))
         .find_map(|(field, &source_index)| {
             let column = layout.columns.get(source_index)?;
+            let old_column = old_layout.columns.iter().find(|c| c.name == column.name)?;
+            let from = numeric_arrow_type(&old_column.column_type)?;
             let to = numeric_arrow_type(&column.column_type)?;
-            let from = field.data_type();
-            (to != *from && !is_widening_cast(from, &to) && !integer_fits_decimal(from, &to)).then(
-                || {
-                    format!(
-                        "primary key column '{}' changed type from {from} to `{}`, which cannot \
-                     hold every key exactly, so the source may have rewritten keys the \
-                     acceleration still holds",
-                        field.name(),
-                        column.column_type
-                    )
-                },
-            )
+            let holds_every_value =
+                to == from || is_widening_cast(&from, &to) || integer_fits_decimal(&from, &to);
+            (!holds_every_value).then(|| {
+                format!(
+                    "column '{}' changed type from `{}` to `{}`, which cannot hold every value \
+                     exactly, so the source rewrote stored values the acceleration still holds",
+                    field.name(),
+                    old_column.column_type,
+                    column.column_type
+                )
+            })
         })
 }
 
@@ -1577,42 +1581,49 @@ mod tests {
     }
 
     #[test]
-    fn a_key_column_retyped_to_a_lossy_type_is_refused() {
-        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int32)]);
-        let keys = ["id".to_string()];
+    fn a_column_retyped_to_a_type_that_loses_values_is_refused() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int64)]);
+        let old = layout_of(&[("id", "bigint"), ("k", "bigint")]);
+        let retyped = |id: &str, k: &str| {
+            lossy_retype(&schema, &old, &layout_of(&[("id", id), ("k", k)]), &[0, 1])
+        };
         assert_eq!(
-            lossy_key_retype(
-                &schema,
-                &layout_of(&[("id", "double"), ("k", "double")]),
-                &[0, 1],
-                &keys
-            ),
+            retyped("bigint", "double"),
             Some(
-                "primary key column 'id' changed type from Int64 to `double`, which cannot hold \
-                 every key exactly, so the source may have rewritten keys the acceleration \
-                 still holds"
+                "column 'k' changed type from `bigint` to `double`, which cannot hold every value \
+                 exactly, so the source rewrote stored values the acceleration still holds"
                     .to_string()
             )
         );
-        // A widening keeps every key; a non-key column is not a key.
         assert_eq!(
-            lossy_key_retype(
+            retyped("double", "bigint"),
+            Some(
+                "column 'id' changed type from `bigint` to `double`, which cannot hold every value \
+                 exactly, so the source rewrote stored values the acceleration still holds"
+                    .to_string()
+            )
+        );
+        // `DECIMAL(18,0)` holds 18 integer digits; a `BIGINT` can have 19.
+        assert!(retyped("bigint", "decimal(18,0)").is_some());
+        // Types that hold every old value, and non-numeric types, are followed.
+        assert_eq!(retyped("bigint", "decimal(19,0)"), None);
+        assert_eq!(retyped("bigint", "bigint"), None);
+        assert_eq!(retyped("bigint", "varchar(40)"), None);
+    }
+
+    #[test]
+    fn a_column_typed_by_the_dataset_is_judged_by_its_source_types() {
+        // The dataset declares `k` as text; an `INT` to `BIGINT` change on the
+        // source loses nothing, whatever the dataset's own type.
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Utf8)]);
+        assert_eq!(
+            lossy_retype(
                 &schema,
-                &layout_of(&[("id", "decimal(30,0)"), ("k", "float")]),
-                &[0, 1],
-                &keys
+                &layout_of(&[("id", "bigint"), ("k", "int")]),
+                &layout_of(&[("id", "bigint"), ("k", "bigint")]),
+                &[0, 1]
             ),
             None
-        );
-        // `DECIMAL(18,0)` holds 18 integer digits; a `BIGINT` key can have 19.
-        assert!(
-            lossy_key_retype(
-                &schema,
-                &layout_of(&[("id", "decimal(18,0)"), ("k", "int")]),
-                &[0, 1],
-                &keys
-            )
-            .is_some_and(|message| message.contains("`decimal(18,0)`"))
         );
     }
 
