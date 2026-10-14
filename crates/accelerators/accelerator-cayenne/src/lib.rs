@@ -4332,6 +4332,9 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             serialize_partition_child_writes(&mut vortex_config, &table_name);
+            // A new partition takes the stored table's conflict detection, with its key.
+            vortex_config.pk_conflict_detection =
+                table_metadata.vortex_config.pk_conflict_detection;
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {

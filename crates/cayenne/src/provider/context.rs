@@ -26,9 +26,7 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{
-    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
-};
+use crate::metadata::{DeletionMode, DeltaEncoding, StorageClass, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -586,12 +584,6 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn inline_flush_max_bytes(&self) -> i64 {
         self.live_actuators.inline_flush_max_bytes().max(0)
-    }
-
-    /// Primary-key conflict detection behavior for inserts.
-    #[must_use]
-    pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
-        self.config.pk_conflict_detection
     }
 
     /// How primary-key deletions are recorded and applied for PK tables.

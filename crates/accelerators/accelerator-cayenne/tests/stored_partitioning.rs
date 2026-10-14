@@ -91,6 +91,8 @@ struct Setup<'a> {
     /// under `metadata` whatever this is.
     data: &'a str,
     schema: SchemaRef,
+    /// Acceleration params besides the data and metastore locations.
+    params: &'a [(&'a str, &'a str)],
 }
 
 impl Default for Setup<'_> {
@@ -99,6 +101,7 @@ impl Default for Setup<'_> {
             primary_key: None,
             data: "data",
             schema: schema(),
+            params: &[],
         }
     }
 }
@@ -140,6 +143,12 @@ async fn table_configured(
             ),
         ]
         .into_iter()
+        .chain(
+            setup
+                .params
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        )
         .collect(),
         ..Default::default()
     });
@@ -322,6 +331,69 @@ fn vector_index_keys(table: &Arc<dyn TableProvider>) -> Vec<Vec<String>> {
                 .collect()
         })
         .collect()
+}
+
+/// A table that keeps its settings through a change keeps the conflict detection they
+/// include. Here it is reopened under `append` with a new primary key and
+/// `cayenne_pk_conflict_detection: none`, which keeps the stored key `id` and detection
+/// `auto`, so writing a stored `id` again still replaces its row. Admitting a second row
+/// for `id` would break the table the metastore still describes as keyed on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_change_keeps_the_stored_conflict_detection() {
+    async fn run(ctx: &SessionContext, sql: &str) {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("insert");
+    }
+
+    for partition_by in [&[][..], &["w"][..]] {
+        let dir = tempfile::tempdir().expect("dir");
+        let ctx = SessionContext::new();
+        let table = table_configured(
+            &ctx,
+            dir.path(),
+            partition_by,
+            RefreshMode::Append,
+            SettingsRebuild::Allowed,
+            Setup {
+                primary_key: Some("id"),
+                ..Setup::default()
+            },
+        )
+        .await
+        .expect("table");
+        ctx.register_table("t", table).expect("register");
+        run(&ctx, "INSERT INTO t VALUES (1, 0, 0)").await;
+
+        let ctx = SessionContext::new();
+        let table = table_configured(
+            &ctx,
+            dir.path(),
+            partition_by,
+            RefreshMode::Append,
+            SettingsRebuild::Allowed,
+            Setup {
+                primary_key: Some("v"),
+                params: &[("cayenne_pk_conflict_detection", "none")],
+                ..Setup::default()
+            },
+        )
+        .await
+        .expect("a kept change opens the stored table");
+        ctx.register_table("t", table).expect("register");
+        run(&ctx, "INSERT INTO t VALUES (1, 0, 5)").await;
+        // Twice into a partition the table has not seen, `w = 1`, which the change creates.
+        run(&ctx, "INSERT INTO t VALUES (2, 1, 0)").await;
+        run(&ctx, "INSERT INTO t VALUES (2, 1, 7)").await;
+        assert_eq!(
+            ids(&ctx).await,
+            [1, 2],
+            "partition_by: {partition_by:?}: the stored key `id` must still be enforced"
+        );
+    }
 }
 
 /// Vector search identifies rows by the key the stored table holds them by, the key its
