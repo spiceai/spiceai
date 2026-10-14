@@ -4273,6 +4273,16 @@ impl DataAccelerator for CayenneAccelerator {
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
 
+            // Partitions agree with the stored table. One created from here on takes the
+            // stored table's primary key, conflict action and data location. Those are the
+            // requested ones unless the table kept its settings through a change it cannot
+            // adopt in place, or holds them until its source can be read; creating the
+            // partition with the requested ones then would leave one table keyed and placed
+            // two ways. The partitioned write-ahead log is kept under the same root.
+            let table_root = PathBuf::from(&table_metadata.path);
+            let partition_primary_keys = table_metadata.primary_key.clone();
+            let partition_on_conflict = table_metadata.on_conflict.clone();
+
             // Build S3 object store if using S3 Express One Zone storage
             let object_store_config = s3::build_s3_object_store(
                 source,
@@ -4287,8 +4297,8 @@ impl DataAccelerator for CayenneAccelerator {
                 source,
                 source.acceleration(),
                 arrow_schema.as_ref(),
-                &primary_keys,
-                on_conflict.as_ref(),
+                &partition_primary_keys,
+                partition_on_conflict.as_ref(),
             );
             let mut vortex_config = Self::get_vortex_config_with_footer_cache(
                 &table_name,
@@ -4330,7 +4340,7 @@ impl DataAccelerator for CayenneAccelerator {
             let creator = Arc::new(
                 CayennePartitionCreator::new(
                     table_name.clone(),
-                    PathBuf::from(&dir_path),
+                    table_root.clone(),
                     partition_by.clone(),
                     Arc::clone(&arrow_schema),
                     catalog,
@@ -4340,8 +4350,8 @@ impl DataAccelerator for CayenneAccelerator {
                     time_retention_filter_builder,
                     vortex_config,
                     object_store_config,
-                    primary_keys.clone(),
-                    on_conflict,
+                    partition_primary_keys,
+                    partition_on_conflict,
                     runtime_env,
                 )
                 // Per-partition background compaction draws on the accelerator's
@@ -4365,7 +4375,7 @@ impl DataAccelerator for CayenneAccelerator {
             let insert_strategy = Arc::new(
                 partitioned_insert_strategy::CayennePartitionedInsertStrategy::new(
                     Arc::clone(&catalog_concrete),
-                    PathBuf::from(&dir_path),
+                    table_root,
                     partition_provider.write_coordinator(),
                 ),
             );

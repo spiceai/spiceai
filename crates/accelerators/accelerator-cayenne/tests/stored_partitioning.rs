@@ -73,12 +73,39 @@ async fn table_with(
     refresh_mode: RefreshMode,
     settings_rebuild: SettingsRebuild,
 ) -> Result<Arc<dyn TableProvider>, String> {
+    table_configured(
+        ctx,
+        dir,
+        partition_by,
+        refresh_mode,
+        settings_rebuild,
+        None,
+        "data",
+    )
+    .await
+}
+
+/// [`table_with`], keyed on `primary_key`, with its data configured under `dir/{data}`
+/// and its metastore under `dir/metadata` whatever `data` is.
+async fn table_configured(
+    ctx: &SessionContext,
+    dir: &Path,
+    partition_by: &[&str],
+    refresh_mode: RefreshMode,
+    settings_rebuild: SettingsRebuild,
+    primary_key: Option<&str>,
+    data: &str,
+) -> Result<Arc<dyn TableProvider>, String> {
     let source = TestAccelerationSource::new("t").with_acceleration(Acceleration {
         enabled: true,
         engine: Engine::Cayenne,
         mode: Mode::File,
         refresh_mode: Some(refresh_mode),
         settings_rebuild,
+        primary_key: primary_key.map(|key| {
+            datafusion_table_providers::util::column_reference::ColumnReference::try_from(key)
+                .expect("valid column reference")
+        }),
         partition_by: partition_by
             .iter()
             .map(|column| spicepod::partitioning::PartitionedBy {
@@ -89,7 +116,7 @@ async fn table_with(
         params: [
             (
                 "cayenne_file_path".to_string(),
-                dir.join("data").to_string_lossy().into_owned(),
+                dir.join(data).to_string_lossy().into_owned(),
             ),
             (
                 "cayenne_metadata_dir".to_string(),
@@ -169,6 +196,76 @@ async fn stored_data_reopens_under_its_own_partitioning() {
             .expect("reopen");
         ctx.register_table("t", table).expect("register");
         assert_eq!(ids(&ctx).await, [1, 2], "partition_by: {partition_by:?}");
+    }
+}
+
+/// A stored partitioned table that keeps its settings through a change (here a new
+/// primary key and data location under `refresh_mode: append`, which can hold rows a
+/// reload would not bring back) keeps them for every partition, including one created
+/// after the change. A partition created with the requested settings instead would
+/// leave one table keyed and placed two ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partition_created_after_a_kept_change_takes_the_stored_settings() {
+    use cayenne::{CayenneCatalog, MetadataCatalog};
+
+    let dir = tempfile::tempdir().expect("dir");
+    // Unkeyed, under `dir/data`, with partitions `w = 0` and `w = 1`.
+    store(dir.path(), &["w"]).await;
+
+    let ctx = SessionContext::new();
+    let table = table_configured(
+        &ctx,
+        dir.path(),
+        &["w"],
+        RefreshMode::Append,
+        SettingsRebuild::Allowed,
+        Some("id"),
+        "moved",
+    )
+    .await
+    .expect("a kept change opens the stored table");
+    ctx.register_table("t", table).expect("register");
+    // A row for a partition the table has not seen, `w = 2`.
+    ctx.sql("INSERT INTO t VALUES (3, 2, 0)")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("insert");
+    assert_eq!(ids(&ctx).await, [1, 2, 3]);
+
+    let catalog = CayenneCatalog::new(format!(
+        "sqlite://{}",
+        dir.path().join("metadata").join("cayenne.db").display()
+    ))
+    .expect("catalog");
+    catalog.init().await.expect("init catalog");
+    let parent = catalog.get_table("t").await.expect("the stored table");
+    assert!(parent.primary_key.is_empty());
+    let stored_root = parent.path.trim_end_matches('/').to_string();
+    let partitions = catalog
+        .get_partitions(&parent.table_id)
+        .await
+        .expect("partitions");
+    assert_eq!(partitions.len(), 3, "partitions: {partitions:?}");
+    for partition in partitions {
+        let key = partition.composite_key();
+        let child = catalog
+            .get_table(&cayenne::partition_naming::partition_child_table_name(
+                "t", &key,
+            ))
+            .await
+            .expect("the partition's table");
+        assert_eq!(
+            (child.primary_key.clone(), child.on_conflict.clone()),
+            (parent.primary_key.clone(), parent.on_conflict.clone()),
+            "partition {key} must have the stored table's key"
+        );
+        assert!(
+            child.path.starts_with(&stored_root),
+            "partition {key} must be stored under '{stored_root}', got '{}'",
+            child.path
+        );
     }
 }
 
