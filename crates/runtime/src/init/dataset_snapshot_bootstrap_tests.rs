@@ -483,10 +483,7 @@ fn duckdb_dataset(
     duckdb_file: &str,
     acceleration: spicepod::acceleration::Acceleration,
 ) -> PodDataset {
-    let mut dataset = PodDataset::new(
-        format!("file:{}", directory.join(csv).display()),
-        "orders",
-    );
+    let mut dataset = PodDataset::new(format!("file:{}", directory.join(csv).display()), "orders");
     dataset.params = Some(Params::from_string_map(HashMap::from([(
         "file_format".to_string(),
         "csv".to_string(),
@@ -536,7 +533,10 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
             },
         ))
         .build();
-    assert!(writer_app.snapshots.is_none(), "the spicepod has no snapshots section");
+    assert!(
+        writer_app.snapshots.is_none(),
+        "the spicepod has no snapshots section"
+    );
     let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
     // A writer publishes its first snapshot once the runtime is ready, which
     // `load_components` reports and `load_datasets` alone does not.
@@ -566,10 +566,9 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
         walk(&directory.path().join("state")),
     );
     writer.shutdown().await;
-    let recorded: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&metadata).expect("read snapshot metadata"),
-    )
-    .expect("parse snapshot metadata");
+    let recorded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metadata).expect("read snapshot metadata"))
+            .expect("parse snapshot metadata");
     assert_eq!(
         recorded.get("location").and_then(serde_json::Value::as_str),
         Some(format!("file://{}/state/snapshots/", directory.path().display()).as_str()),

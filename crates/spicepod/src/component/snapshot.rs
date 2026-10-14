@@ -161,7 +161,10 @@ mod tests {
             ("s3://my-bucket", "s3://my-bucket/snapshots/"),
             ("s3://my-bucket/", "s3://my-bucket/snapshots/"),
             ("file:///", "file:///snapshots/"),
-            ("file:///var/spice/state", "file:///var/spice/state/snapshots/"),
+            (
+                "file:///var/spice/state",
+                "file:///var/spice/state/snapshots/",
+            ),
             (
                 "abfss://container@account.dfs.core.windows.net/spice/",
                 "abfss://container@account.dfs.core.windows.net/spice/snapshots/",
@@ -200,9 +203,12 @@ mod tests {
             location: None,
             bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Fallback,
             params: Some(Params::from_string_map(
-                [("s3_queue_url".to_string(), "https://sqs.us-east-1.amazonaws.com/1/q".to_string())]
-                    .into_iter()
-                    .collect(),
+                [(
+                    "s3_queue_url".to_string(),
+                    "https://sqs.us-east-1.amazonaws.com/1/q".to_string(),
+                )]
+                .into_iter()
+                .collect(),
             )),
         };
         assert_eq!(

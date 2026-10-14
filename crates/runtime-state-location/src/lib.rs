@@ -22,6 +22,7 @@ limitations under the License.
 //! before they shared this builder; [`StateFeature`] lists each one.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock};
 
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
@@ -367,16 +368,20 @@ pub async fn build_object_store(
 /// # Errors
 ///
 /// Returns [`Error::S3ParameterValidation`] when a parameter is invalid.
-pub async fn build_s3_parameters(
+pub async fn build_s3_parameters<S: BuildHasher>(
     secrets: Arc<RwLock<Secrets>>,
-    params: Option<&HashMap<String, String>>,
+    params: Option<&HashMap<String, String, S>>,
     feature: StateFeature,
 ) -> Result<Parameters> {
     let usage = feature.usage();
     let s3_parameters = feature.s3_parameters();
     match params {
         Some(params) => {
-            let secret_params = get_params_with_secrets(Arc::clone(&secrets), params).await;
+            let params: HashMap<String, String> = params
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let secret_params = get_params_with_secrets(Arc::clone(&secrets), &params).await;
             Parameters::try_new(
                 usage,
                 secret_params.into_iter().collect(),
@@ -539,7 +544,10 @@ mod tests {
             .filter(|name| name != ".spice-object-store-occ.lock")
             .collect();
         root.sort();
-        assert_eq!(root, ["cluster", "rate-control", "results-cache", "snapshots"]);
+        assert_eq!(
+            root,
+            ["cluster", "rate-control", "results-cache", "snapshots"]
+        );
     }
 
     const S3_KEY_PARAMS: &[(&str, &str)] = &[
@@ -966,10 +974,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_gcs_parameters_take_store_or_connector_names() {
         for (key, value) in [("skip_signature", "true"), ("gcs_skip_signature", "true")] {
-            let params = Params::from_string_map(HashMap::from([(
-                key.to_string(),
-                value.to_string(),
-            )]));
+            let params =
+                Params::from_string_map(HashMap::from([(key.to_string(), value.to_string())]));
             let (store, _) = build_object_store(
                 secrets(),
                 Handle::current(),
