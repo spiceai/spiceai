@@ -173,8 +173,8 @@ pub enum ExecutorRegistration {
     /// nothing it held — running tasks, shuffle output, loaded partitions — can
     /// be counted on. Partition assignments follow the id and stay.
     Restarted,
-    /// A process that a later registration replaced connected again, so two
-    /// running processes share the id. The connection is not registered.
+    /// A process older than the one registered last connected, so two running
+    /// processes share the id. The connection is not registered.
     Duplicate,
 }
 
@@ -229,7 +229,14 @@ fn classify_registration(
             ExecutorRegistration::New
         };
     }
-    if seen.replaced.iter().any(|replaced| replaced == process_id) {
+    // Process ids sort by creation time, so a process older than the one
+    // registered last is still running alongside it, whatever order they connect in.
+    if seen.replaced.iter().any(|replaced| replaced == process_id)
+        || seen
+            .current
+            .as_deref()
+            .is_some_and(|current| process_id < current)
+    {
         return ExecutorRegistration::Duplicate;
     }
     match seen.current.replace(process_id.to_string()) {
@@ -1411,6 +1418,22 @@ mod tests {
         assert!(registry.is_current("exec-a", later.connection));
         assert!(!registry.is_current("exec-a", returning.connection));
         assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
+    }
+
+    /// An older process that connects after a newer one, for example to a
+    /// scheduler that started after both, is a duplicate, not a restart.
+    #[tokio::test]
+    async fn an_older_process_connecting_later_is_a_duplicate() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let newer = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        let older = registry.register("exec-a".to_string(), "run-1", tx2).await;
+
+        assert_eq!(newer.registration, ExecutorRegistration::New);
+        assert_eq!(older.registration, ExecutorRegistration::Duplicate);
+        assert!(registry.is_current("exec-a", newer.connection));
     }
 
     /// An executor that sends no process id is registered as before: a second

@@ -876,9 +876,13 @@ impl ClusterService for ClusterServiceImpl {
                     Ok(moved) => tracing::info!(
                         "Moved {moved} partition assignments of executor '{executor_address}' to its instance identity '{executor_id}'"
                     ),
-                    Err(err) => tracing::warn!(
-                        "Failed to move the partition assignments of executor '{executor_address}' to its instance identity '{executor_id}', so it does not serve those partitions: {err}"
-                    ),
+                    // Unavailable makes the executor retry, rather than start with
+                    // none of the partitions still assigned to its address.
+                    Err(err) => {
+                        return Err(Status::unavailable(format!(
+                            "Failed to move the partition assignments of executor '{executor_address}' to its instance identity '{executor_id}': {err}"
+                        )));
+                    }
                 }
             }
         }
