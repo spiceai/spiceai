@@ -632,23 +632,45 @@ impl ExecutorRegistry {
     /// Unregisters `executor_id` and removes it from all three tracking maps,
     /// if `connection` is still its registered connection. Returns whether it
     /// was: a connection that a later one replaced leaves the executor alone.
+    ///
+    /// A later process under the same id may already have registered its Flight
+    /// endpoint before its control stream connects; that endpoint, and the
+    /// executor's other state, are then left for the later process.
     pub async fn unregister(&self, executor_id: &str, connection: u64) -> bool {
         let mut connections = self.connections.write().await;
-        {
+        let process_id = {
             let mut processes = self.processes.lock();
             match processes.get_mut(executor_id) {
-                Some(seen) if seen.connection == Some(connection) => seen.connection = None,
+                Some(seen) if seen.connection == Some(connection) => {
+                    seen.connection = None;
+                    seen.current.clone().unwrap_or_default()
+                }
                 _ => return false,
             }
-        }
+        };
         if connections.remove(executor_id).is_some() {
             tracing::debug!("Executor {executor_id} disconnected");
         }
-        drop(connections);
-        {
+        // Held while `connections` is, so no endpoint registers between the
+        // check above and its removal below.
+        let successor_registered = {
             let mut clients = self.flight_sql_clients.write().await;
-            clients.remove(executor_id);
-            self.flight_sql_endpoints.write().remove(executor_id);
+            let mut endpoints = self.flight_sql_endpoints.write();
+            let successor_registered = endpoints
+                .get(executor_id)
+                .is_some_and(|endpoint| endpoint.process_id > process_id);
+            if !successor_registered {
+                clients.remove(executor_id);
+                endpoints.remove(executor_id);
+            }
+            successor_registered
+        };
+        drop(connections);
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
+        }
+        if successor_registered {
+            return true;
         }
         self.partitions.write().await.remove(executor_id);
 
@@ -660,10 +682,6 @@ impl ExecutorRegistry {
                 table_stats.remove(executor_id);
             }
             stats.retain(|_, table_stats| !table_stats.is_empty());
-        }
-
-        if let Some(node_id) = self.node_id.as_deref() {
-            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
         }
         true
     }
@@ -1398,6 +1416,31 @@ mod tests {
         assert_eq!(
             registry.ready_executor_addresses_sync(),
             ["127.0.0.1:50103"]
+        );
+    }
+
+    /// The earlier run's connection closing after the next run registered its
+    /// endpoint, but before the next run's control stream connected, leaves
+    /// that endpoint in place.
+    #[tokio::test]
+    async fn an_earlier_connection_closing_keeps_its_successors_endpoint() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+
+        let earlier = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "run-2",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        assert!(registry.unregister("exec-a", earlier.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
         );
     }
 
