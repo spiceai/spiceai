@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Dataset-agnostic search harness: the SQL and result-mapping logic shared by every
-//! `testoperator run search` run, whether it targets a built-in MTEB dataset or a
-//! customer-supplied spicepod. Every run exposes the same fixed schema — a `corpus` table,
+//! Dataset-agnostic search harness: the SQL and result-mapping logic of a
+//! `testoperator run search` run. Every spicepod exposes the same fixed schema — a `corpus` table,
 //! a `test_queries` table with `_id`/`text`, and a `relevance_data` table with `query-id`,
-//! `corpus-id`, and `score` (each may be a dataset or a view) — so the query, qrel, and transform
-//! steps here serve both.
+//! `corpus-id`, and `score` (each may be a dataset or a view) — so these steps work for any
+//! dataset the spicepod loads.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -36,8 +35,8 @@ use test_framework::{
 };
 
 /// Reads a whole column as UTF-8 strings, accepting `Utf8`, `LargeUtf8`, or any type Arrow can cast
-/// to text (for example an integer id column). Customer datasets come from arbitrary connectors, so
-/// the id columns are not guaranteed to be `LargeUtf8` the way the MTEB parquet files are.
+/// to text (for example an integer id column). Datasets come from arbitrary connectors, so the id
+/// columns are not guaranteed to be `LargeUtf8` the way the MTEB parquet files are.
 ///
 /// Returns one owned `String` per row; a NULL cell becomes an empty string, matching the previous
 /// behaviour where every id/text cell was assumed present.
@@ -67,8 +66,8 @@ fn read_text_column(batch: &RecordBatch, name: &str) -> anyhow::Result<Vec<Strin
         .collect())
 }
 
-/// Builds the search config by reading the queries from `test_queries`. Every dataset exposes the
-/// same `_id`/`text` query columns, so this loader serves the built-in and custom runs alike.
+/// Builds the search config by reading the queries from `test_queries`, which every search spicepod
+/// exposes with `_id`/`text` columns.
 pub(crate) async fn init_search_config(
     spiced_instance: &SpicedInstance,
     search_limit: Option<usize>,
@@ -113,10 +112,10 @@ pub(crate) async fn get_query_relevance_data(
 ) -> anyhow::Result<HashMap<String, HashMap<String, i32>>> {
     let mut spice_client = spiced_instance.spice_client(None, false).await?;
 
-    // Cast `score` to `BIGINT` so the loader handles both the `int64` judgments of the
-    // `_top_250_only_w_correct-v2` layout and the `float64` judgments of the standard MTEB layout.
-    // Relevance judgments are whole numbers, so the cast is exact. Customer datasets must likewise
-    // supply whole-number grades (see the issue #12935 schema).
+    // Cast `score` to `BIGINT` so the loader handles both `int64` judgments (for example the MTEB
+    // `_top_250_only_w_correct-v2` layout) and `float64` judgments (the standard MTEB layout).
+    // Relevance judgments are whole numbers, so the cast is exact. Every dataset must supply
+    // whole-number grades (see the issue #12935 schema).
     let records = execute_sql(
         &mut spice_client,
         r#"SELECT "query-id", "corpus-id", CAST(score AS BIGINT) AS score FROM relevance_data"#,
@@ -156,58 +155,39 @@ fn extract_query_relevance_from_batches(
     Ok(query_relevance)
 }
 
-/// Converts raw search results into `query id → (corpus id → score)` for evaluation, reading the
-/// corpus id from the `_id` primary-key field of every built-in MTEB corpus.
+/// Converts raw search results into `query id → (corpus id → score)` for evaluation. The corpus row
+/// id comes from the dataset's declared `row_id`, whose column name differs per dataset (`_id` for
+/// MTEB, `chunk_id` for ConTEB), so this takes the single primary-key field of each result rather
+/// than a fixed name. A corpus whose `row_id` names more than one column cannot be matched against
+/// the single `corpus-id` qrel column, so such a result is skipped.
 pub(crate) fn transform_search_results_for_eval(
     search: &BTreeMap<String, SearchResult>,
 ) -> HashMap<String, HashMap<String, f64>> {
-    transform_search_results(search, |primary_key| {
-        primary_key.get("_id").and_then(primary_key_value_to_string)
-    })
-}
-
-/// Converts raw search results into `query id → (corpus id → score)` for a customer-supplied
-/// corpus. The corpus row id comes from the dataset's declared `row_id`, whose column name is not
-/// known ahead of time, so this takes the single primary-key field of each result rather than
-/// assuming `_id`. A corpus whose `row_id` names more than one column cannot be matched against the
-/// single `corpus-id` qrel column, so such a result is skipped.
-pub(crate) fn transform_custom_search_results_for_eval(
-    search: &BTreeMap<String, SearchResult>,
-) -> HashMap<String, HashMap<String, f64>> {
-    transform_search_results(search, sole_primary_key_value)
+    search
+        .iter()
+        .map(|(query_id, search_result)| {
+            let corpus_scores: HashMap<String, f64> = search_result
+                .response
+                .results
+                .iter()
+                .filter_map(|result| {
+                    sole_primary_key_value(&result.primary_key).map(|id| (id, result.score))
+                })
+                .collect();
+            (query_id.clone(), corpus_scores)
+        })
+        .collect()
 }
 
 /// Returns the single primary-key value of a result as a corpus id, or `None` when the result has
-/// zero or more than one primary-key field. A custom corpus with a multi-column `row_id` cannot be
-/// matched against the single `corpus-id` qrel column, so it is skipped rather than guessed at.
+/// zero or more than one primary-key field. A corpus with a multi-column `row_id` cannot be matched
+/// against the single `corpus-id` qrel column, so it is skipped rather than guessed at.
 fn sole_primary_key_value(primary_key: &HashMap<String, serde_json::Value>) -> Option<String> {
     let mut entries = primary_key.values();
     match (entries.next(), entries.next()) {
         (Some(value), None) => primary_key_value_to_string(value),
         _ => None,
     }
-}
-
-fn transform_search_results<F>(
-    search: &BTreeMap<String, SearchResult>,
-    corpus_id_of: F,
-) -> HashMap<String, HashMap<String, f64>>
-where
-    F: Fn(&HashMap<String, serde_json::Value>) -> Option<String>,
-{
-    let mut eval_results = HashMap::new();
-
-    for (query_id, search_result) in search {
-        let mut corpus_scores = HashMap::new();
-        for result in &search_result.response.results {
-            if let Some(corpus_id) = corpus_id_of(&result.primary_key) {
-                corpus_scores.insert(corpus_id, result.score);
-            }
-        }
-        eval_results.insert(query_id.clone(), corpus_scores);
-    }
-
-    eval_results
 }
 
 fn primary_key_value_to_string(value: &serde_json::Value) -> Option<String> {
@@ -240,7 +220,7 @@ mod tests {
     #[test]
     fn read_text_column_accepts_utf8_largeutf8_and_int() {
         // LargeUtf8 (the MTEB parquet width), Utf8 (common connector width), and an integer id
-        // column must all read back as the same text, so a custom dataset from any connector works.
+        // column must all read back as the same text, so a dataset from any connector works.
         let large = Arc::new(LargeStringArray::from(vec![Some("a"), Some("b")]));
         let small = Arc::new(StringArray::from(vec![Some("a"), Some("b")]));
         let ints = Arc::new(Int64Array::from(vec![1_i64, 2]));

@@ -14,19 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod dataset;
 mod harness;
-mod mteb;
 mod per_query;
-use self::dataset::SearchDataset;
+mod spicepod;
+use self::spicepod::BenchmarkDataset;
 use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use test_framework::{
-    TestType, anyhow,
-    app::App,
-    git,
+    TestType, anyhow, git,
     metrics::{MetricCollector, QueryMetrics},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
@@ -42,22 +39,10 @@ use test_framework::{
 use tokio::time::sleep;
 
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
-    let dataset = SearchDataset::from(args.benchmark_dataset);
+    // The spicepod loads its own data; the run only needs the tables it queries and the label.
+    let benchmark_dataset = BenchmarkDataset::from_spicepod_file(&args.common.spicepod_path)?;
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-
-    if matches!(dataset, SearchDataset::Custom) {
-        validate_custom_spicepod(&app)?;
-    }
-
-    dataset
-        .prepare(
-            &args
-                .common
-                .data_dir
-                .clone()
-                .unwrap_or(start_request.get_tempdir_path()),
-        )
-        .await?;
+    spicepod::validate_required_tables(&app)?;
 
     let started_at = Instant::now();
 
@@ -86,9 +71,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
         KeyValue::new("config_name", app.name.clone()),
-        KeyValue::new("benchmark_dataset", dataset.name()),
+        KeyValue::new("benchmark_dataset", benchmark_dataset.as_str().to_string()),
     ];
-    search_attributes.extend(search_dataset_attributes(&app));
+    search_attributes.extend(spicepod::corpus_attributes(&app));
 
     let search_resource = Resource::builder_empty()
         .with_attributes(search_attributes)
@@ -106,12 +91,10 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     println!("Running search");
 
-    let config = dataset
-        .init_search_config(&spiced_instance, Some(10))
-        .await?;
+    let config = harness::init_search_config(&spiced_instance, Some(10)).await?;
 
     // retrieve query relevance data
-    let qrels = dataset.query_relevance_data(&spiced_instance).await?;
+    let qrels = harness::get_query_relevance_data(&spiced_instance).await?;
 
     let search_started_at = Instant::now();
 
@@ -140,7 +123,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
     let evaluation =
-        test.evaluate_search_results(&qrels, |results| dataset.transform_results(results))?;
+        test.evaluate_search_results(&qrels, harness::transform_search_results_for_eval)?;
     let retrieval_metrics_at_all_k = evaluation.mean_at_all_k();
 
     // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
@@ -232,75 +215,4 @@ fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics
             metrics.ndcg, metrics.recall, metrics.mrr, metrics.precision
         );
     }
-}
-
-/// Fails fast with an actionable message when a custom run's spicepod is missing one of the fixed
-/// tables the harness queries. Each of `corpus`, `test_queries`, and `relevance_data` may be a
-/// dataset or a view. Without this check the run would fail later with a raw `table not found` from
-/// the harness SQL.
-fn validate_custom_spicepod(app: &App) -> anyhow::Result<()> {
-    let missing: Vec<&str> = ["corpus", "test_queries", "relevance_data"]
-        .into_iter()
-        .filter(|name| !spicepod_has_table(app, name))
-        .collect();
-
-    if !missing.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Failed to run custom search test ({}): spicepod is missing required table(s): {}. \
-            A custom search run (no --benchmark-dataset) must define `corpus`, `test_queries`, and \
-            `relevance_data` (each may be a dataset or a view). \
-            See: https://github.com/spiceai/spiceai/issues/12935",
-            app.name,
-            missing.join(", ")
-        ));
-    }
-
-    Ok(())
-}
-
-/// Whether the spicepod defines a table with `name` as either a dataset or a view.
-fn spicepod_has_table(app: &App, name: &str) -> bool {
-    app.datasets.iter().any(|ds| ds.name == name) || app.views.iter().any(|v| v.name == name)
-}
-
-fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {
-    let Some(ds) = app.datasets.iter().find(|ds| ds.name == "corpus") else {
-        return vec![];
-    };
-    let mut attributes = vec![];
-    if let Some(engine) = ds
-        .acceleration
-        .as_ref()
-        .map(|acc| acc.engine_name().to_string())
-    {
-        attributes.push(KeyValue::new("engine", engine));
-    }
-
-    if let Some(acc) = ds.acceleration.as_ref() {
-        attributes.push(KeyValue::new("engine_mode", acc.mode.to_string()));
-    }
-
-    let Some(text_col) = ds.columns.iter().find(|c| c.name == "text") else {
-        return attributes;
-    };
-
-    if let Some(embed) = text_col.embeddings.first()
-        && let Some(e) = app.embeddings.iter().find(|e| e.name == embed.model)
-    {
-        attributes.push(KeyValue::new("vector_search", "true"));
-        attributes.push(KeyValue::new("model", e.from.clone()));
-    } else {
-        attributes.push(KeyValue::new("vector_search", "false"));
-    }
-
-    attributes.push(KeyValue::new(
-        "full_text_search",
-        text_col
-            .full_text_search
-            .as_ref()
-            .is_some_and(|fts| fts.enabled)
-            .to_string(),
-    ));
-
-    attributes
 }
