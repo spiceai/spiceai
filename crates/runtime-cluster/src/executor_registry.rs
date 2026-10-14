@@ -597,7 +597,7 @@ impl ExecutorRegistry {
             let mut endpoints = self.flight_sql_endpoints.write();
             if endpoints
                 .get(&executor_id)
-                .is_none_or(|endpoint| endpoint.process_id != process_id)
+                .is_some_and(|endpoint| endpoint.process_id.as_str() < process_id)
             {
                 clients.remove(&executor_id);
                 endpoints.remove(&executor_id);
@@ -675,7 +675,9 @@ impl ExecutorRegistry {
     /// connects to `address` (`host:port`) and was registered by the executor
     /// process `process_id` (empty for executors that send none). Returns
     /// `false`, inserting nothing, when a later process under the same id
-    /// replaced `process_id`: its endpoint must not displace its successor's.
+    /// replaced `process_id` or already registered its own endpoint: an earlier
+    /// process's endpoint must not displace its successor's, whichever arrives
+    /// first. Process ids sort by creation time.
     pub async fn insert_flight_sql_client(
         &self,
         executor_id: String,
@@ -684,12 +686,16 @@ impl ExecutorRegistry {
         client: FlightSqlClient,
     ) -> bool {
         let mut clients = self.flight_sql_clients.write().await;
-        let replaced =
+        let superseded =
             !process_id.is_empty()
-                && self.processes.lock().get(&executor_id).is_some_and(|seen| {
+                && (self.processes.lock().get(&executor_id).is_some_and(|seen| {
                     seen.replaced.iter().any(|replaced| replaced == process_id)
-                });
-        if replaced {
+                }) || self
+                    .flight_sql_endpoints
+                    .read()
+                    .get(&executor_id)
+                    .is_some_and(|endpoint| endpoint.process_id.as_str() > process_id));
+        if superseded {
             return false;
         }
         self.flight_sql_endpoints.write().insert(
@@ -1355,6 +1361,36 @@ mod tests {
         assert_eq!(
             registry.ready_executor_addresses_sync(),
             ["127.0.0.1:50102"]
+        );
+
+        // The next run registers its endpoint, the run it replaces registers
+        // its endpoint late, and only then does the next run's control stream
+        // connect: the next run's endpoint stays.
+        let (tx4, _rx4) = mpsc::channel(1);
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50103".to_string(),
+                    "run-4",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-3",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        registry.register("exec-a".to_string(), "run-4", tx4).await;
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50103"]
         );
     }
 

@@ -1342,8 +1342,9 @@ pub async fn initialize_cluster_executor(
         };
 
     let executor_id = rt.df.cluster_config.instance_id().to_string();
-    // Tells the scheduler this process apart from an earlier run under the same id.
-    let process_id = uuid::Uuid::new_v4().to_string();
+    // Tells the scheduler this process apart from an earlier run under the same
+    // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
+    let process_id = uuid::Uuid::now_v7().to_string();
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
