@@ -31,6 +31,9 @@ mod bigquery;
 mod duckdb;
 mod duckdb_dialect;
 mod re2;
+mod string_literal;
+
+pub use string_literal::quote_safe_string_literal;
 
 pub use bigquery::SpiceBigQueryDialect;
 

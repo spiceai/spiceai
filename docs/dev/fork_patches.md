@@ -79,8 +79,9 @@ integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
 `--all --tests` compiles them either way, so an unnamed binary is built and then
 skipped. Guards were found running nowhere for that reason, in integration-test
 targets now named there: `adbc_cancellation` for the two `arrow-adbc`
-cancellation rows (fork PRs #4 and #65, which share one test), and `cpu_budget`
-for vortex's `set_available_parallelism`. (`json_semantics` is named there too; it
+cancellation rows (fork PRs #4 and #65, which share one test), and `spiced`'s
+`integration` binary, whose `cpu_budget` module guards vortex's
+`set_available_parallelism`. (`json_semantics` is named there too; it
 guarded the `datafusion-functions-json` fork, which is now taken from crates.io.)
 Nothing yet checks this automatically — adding a guard here means checking by hand that `NEXTEST_FILTER` selects the
 target it lives in, or that a workflow of its own runs it.
@@ -107,7 +108,7 @@ own section below — a count here would be one more thing to keep true by hand.
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
 | [arrow-rs](#arrow-rs) | `2e2cc330c64ac8a9e44d2a5f2da171b391f775b8` | `spiceai-59` |
-| [async-openai](#async-openai) | `dfadaedd13bed8c819293ee803243f2ebed8c991` | `spiceai` |
+| [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
@@ -122,7 +123,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `7735caa2d9a839ad81aa6a1316932c99ea3019c5` | `spiceai-0.11.0-df-55` |
+| [iceberg-rust](#iceberg-rust) | `1707b349584845e802a703adca1e71f544defc5f` | `spiceai-0.11.0-df-55` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
@@ -487,6 +488,7 @@ upstream's new REST auth API.
 | SigV4 signing for REST catalogs on AWS Glue (commits `c9f1c85`, `f67e44c`; re-implemented as an `AuthManager` in `crates/catalog/rest/src/auth/sigv4.rs` by fork PR #55) | Glue-backed Iceberg catalogs fail to authenticate | build (module) + silent (signing) | `crates/runtime/src/catalogconnector/iceberg.rs` wires `rest.sigv4-enabled`; the signing itself is guarded by `crates/data_components/src/iceberg/catalog/rest/catalog.rs::a_sigv4_catalog_signs_every_request_it_sends`, with `…::a_catalog_without_sigv4_sends_no_signature` as its control |
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
+| `IcebergTableScan` decodes at the session `batch_size` (fork PR #58) | Every Iceberg scan decodes 1024-row batches, the Parquet reader's default, instead of the session's 8192, and every operator downstream pays its per-batch cost 8x as often | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_uses_the_session_batch_size` |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
 | `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
 | `IcebergTableProvider::catalog` and `::table_ident` exposed (fork PR #49, on `spiceai-0.11.0-df-55`) | The Iceberg REST `loadTable` cannot load the table a provider reads, so no table can be served to an Iceberg client as itself | build | compile-guarded by `crates/runtime/src/http/v1/iceberg/passthrough.rs`, which calls both; what is served is guarded by `…::tests::an_iceberg_table_read_unchanged_is_served_as_itself` |
@@ -508,6 +510,10 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 | A reply's `service_tier` accepts a tier the enum does not name: the response fields use `ServiceTierResponse`, which keeps it verbatim in `Other(String)`, with a hand-written OpenAPI schema of any string because the derive renders that variant as an object. The request types keep the closed `ServiceTier` (fork PRs #42, #44) | OpenAI names the tier that served a request in every reply and adds tiers on its side (`"fast"`), so a closed response enum fails the whole reply: a model whose load-time health check is answered on a new tier never loads ([#14916](https://github.com/spiceai/spiceai/issues/14916)), and every request and stream answered on it errors. The request half fails the other way: `/v1/chat/completions` and `/v1/responses` deserialize into the request types, so a re-cut that opens them (upstream's chat `ServiceTier` already names `fast`) accepts tiers the published API does not list | silent (load failure; widened request contract) | `crates/llms/src/openai/chat.rs::service_tier_tests`: the health check, a request, and a stream through both `ChatBackend`s against a local endpoint that answers on `"fast"`, checking the client's tier reaches the server and the server's reaches the client; and `…::a_request_naming_an_unnamed_tier_is_refused`, which refuses `"fast"` on both request types against an accepted `"priority"` control |
 | A 404 ends the retry loop instead of being retried | The retry path treats a 404 as permanent, because it means the base URL is wrong rather than that the service is busy. Without it a mistyped `endpoint` is retried through the whole backoff budget before reporting, so a configuration error looks like a slow provider | silent (a configuration error reported late) | **GAP** — the difference is *when* the error arrives rather than what it is, and asserting that is a timing test. The `list_models_errors` module of `llms`'s `integration` binary covers the error mapping for the lister, not the retry decision |
 | Aggregated rate-limit retry logging; `retry-after` honoured from the response header (fork PRs #37, #38) | One `WARN` per retried request instead of one per burst; retries ignore the server's back-off hint | silent (log noise, throughput) | **GAP** |
+| Spice builds every `async-openai` client without its default retry (`crates/llms/src/provider.rs::client_without_retry`, which installs a bare `ReqwestService`) | The default client retries `429` and `5xx` three times. Spice retries and rate-controls requests itself, so the extra layer multiplies attempts and hides the provider's first answer. The two retry rows above apply only to a client built with the default executor, which Spice no longer uses | silent (extra requests, delayed errors) | `crates/llms/tests/anthropic_stream_errors.rs`: each test serves one answer, so a retried `429` or `529` fails with a refused connection instead of the provider's error |
+| Response `service_tier` keeps a tier the enum does not name (`ServiceTierResponse::Other`, fork PRs #42, #44) | A provider reply naming a new tier fails to deserialize, so every request answered on that tier errors | silent (request failure) | `crates/llms/src/openai/chat.rs::tests::a_reply_naming_an_unknown_service_tier_keeps_it_verbatim`, for both the reply and a streamed chunk, with a named tier as the control |
+| Chat Completions `allowed_tools` is one `{mode, tools}` object, not a list (fork PR #43) | A `tool_choice` in OpenAI's shape is refused with 422, and the list shape is forwarded to OpenAI, which rejects it with 400 | build + silent (request failure) | compile-guarded by `crates/runtime/src/model/tool_use.rs` and `crates/llms/src/openai/responses_adapter.rs`; `crates/llms/src/chat/mistral.rs::tests::allowed_tools_keeps_its_mode_and_tools` deserializes OpenAI's shape |
+| A JSON request carries one `Content-Type` (fork commit `f63bb212`) | `HostedModelConfig` (Anthropic, Databricks, Spice.ai) carries `Content-Type` in its default headers and the client appends another, so every request carries two and a server can refuse it as an unsupported content type | silent (request failure) | `crates/llms/src/spiceai/chat.rs::tests::a_hosted_model_request_carries_one_content_type`, which reads the headers a one-shot local endpoint received |
 
 ## clickhouse-rs
 
