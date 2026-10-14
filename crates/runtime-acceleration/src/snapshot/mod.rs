@@ -127,9 +127,12 @@ pub mod api {
 }
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
 
+/// The `format-version` of `metadata.json`, the same number a `runtime.state`
+/// location's `_spice/format.json` records.
+use runtime_state_location::FORMAT_VERSION as SNAPSHOT_METADATA_FORMAT_VERSION;
+
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
-const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
