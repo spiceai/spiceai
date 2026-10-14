@@ -1284,12 +1284,12 @@ impl RefreshTask {
         if let Some(cache_provider_ref) = context.caching
             && let Some(cache_provider) = cache_provider_ref.upgrade()
             && let Err(e) = cache_provider
-                .invalidate_for_table(context.dataset_name.clone())
+                .invalidate_for_refresh(context.dataset_name.clone())
                 .await
             && !self.runtime_status.is_shutdown()
         {
             tracing::error!(
-                "Failed to invalidate cached results for dataset {}: {e}",
+                "Failed to invalidate cached query plans and search results for dataset {} after a refresh, so they may reflect the previous data until they expire: {e}",
                 context.dataset_name
             );
         }
@@ -1759,12 +1759,12 @@ impl RefreshTask {
                     && let Some(cache_provider_ref) = context.caching
                     && let Some(cache_provider) = cache_provider_ref.upgrade()
                     && let Err(e) = cache_provider
-                        .invalidate_for_table(context.dataset_name.clone())
+                        .invalidate_for_refresh(context.dataset_name.clone())
                         .await
                     && !self.runtime_status.is_shutdown()
                 {
                     tracing::error!(
-                        "Failed to invalidate cached results for dataset {}: {e}",
+                        "Failed to invalidate cached query plans and search results for dataset {} after a refresh, so they may reflect the previous data until they expire: {e}",
                         context.dataset_name
                     );
                 }
