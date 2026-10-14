@@ -37,7 +37,9 @@ use cayenne::{CayennePartitionCreator, ScanViewReuse};
 // connector, so both configuration surfaces refuse the same overlap. The delete-path
 // half — a metastore on disk that no parameter names — stays in this file, beside the
 // teardown it guards.
-use cayenne::metastore_layout::{fs_probe_path, is_local_path, overlapping_metastore_dir};
+use cayenne::metastore_layout::{
+    absolute_data_dir, fs_probe_path, is_local_path, overlapping_metastore_dir,
+};
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -4597,7 +4599,6 @@ impl DataAccelerator for CayenneAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let dir_path = self.cayenne_data_dir(source).boxed()?;
-        let path_buf = PathBuf::from(&dir_path);
 
         // A schema rebuild reaches this without going through `init`, so the
         // open-time check is not on this path's stack. Refuse before touching
@@ -4668,12 +4669,16 @@ impl DataAccelerator for CayenneAccelerator {
             catalog.drop_table(table_name).await.boxed()?;
         }
 
+        // A local location can be spelled as a `file://` URI. The directory it names is
+        // what exists, and what is removed or recreated.
         if let Some(removed_dir) = removed_dir
-            && path_exists(&removed_dir).await
+            && let Some(local_dir) = absolute_data_dir(&removed_dir).boxed()?
+            && path_exists(&local_dir).await
         {
-            Self::remove_acceleration_data_dir(source, &removed_dir).await?;
+            let local_dir = local_dir.to_string_lossy().into_owned();
+            Self::remove_acceleration_data_dir(source, &local_dir).await?;
             tracing::info!(
-                "Removed the Cayenne data directory '{removed_dir}' of dataset '{table_name}' to recreate its acceleration"
+                "Removed the Cayenne data directory '{local_dir}' of dataset '{table_name}' to recreate its acceleration"
             );
         }
         if let Some(prefixes) = left_in_place {
@@ -4685,8 +4690,8 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Recreate the local data directory so the next create_external_table works.
         // An object-store location has no directory to create.
-        if !dir_path.starts_with("s3://") {
-            tokio::fs::create_dir_all(&path_buf).await.boxed()?;
+        if let Some(local_dir) = absolute_data_dir(&dir_path).boxed()? {
+            tokio::fs::create_dir_all(&local_dir).await.boxed()?;
         }
         Ok(())
     }
@@ -4998,12 +5003,9 @@ data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Ca
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spicepod::component::runtime::AdaptiveTuning;
-    // Exercised only by the tests below; the delete-path guard reaches it through
-    // `overlapping_metastore_dir` rather than calling it directly.
-    use cayenne::metastore_layout::absolute_data_dir;
     use runtime_acceleration::OnSchemaChange;
     use runtime_acceleration::testing::TestAccelerationSource;
+    use spicepod::component::runtime::AdaptiveTuning;
 
     /// A timestamp column compared against a string literal is how such a filter
     /// is normally written, and it must survive all the way to *evaluation*.
@@ -6742,6 +6744,94 @@ mod tests {
                 (
                     "cayenne_file_path".to_string(),
                     base.path().join("new").to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        CayenneAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await
+            .expect("drop the stored table");
+
+        assert!(
+            !old_dir.exists(),
+            "the stored table's files must be removed"
+        );
+        assert!(
+            new_file.exists(),
+            "the newly configured location's contents must be left alone"
+        );
+    }
+
+    /// [`drop_table_removes_the_stored_location_not_the_configured_one`] for locations
+    /// spelled as `file://` URIs, which name local directories as plain paths do.
+    #[tokio::test]
+    async fn drop_table_removes_a_stored_location_spelled_as_a_file_uri() {
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        let old_dir = base.path().join("old").join("orders");
+        let new_dir = base.path().join("new").join("orders");
+
+        // The table as an earlier configuration stored it, at `file://…/old/orders`. It is
+        // created at the plain path and its stored location respelled, since creating a
+        // table at a `file://` location also makes a stray relative `file:` directory.
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: old_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the stored table");
+        drop(catalog);
+        let respelled = rusqlite::Connection::open(metadata_dir.join("cayenne.db"))
+            .expect("open the metastore")
+            .execute(
+                "UPDATE cayenne_table SET path = ?1 WHERE table_name = 'orders'",
+                [format!("file://{}", old_dir.display())],
+            )
+            .expect("respell the stored location");
+        assert_eq!(
+            respelled, 1,
+            "the stored table's location must be respelled"
+        );
+        let old_file = old_dir.join(&table_id).join("data.vortex");
+        std::fs::create_dir_all(old_file.parent().expect("parent")).expect("old table dir");
+        std::fs::write(&old_file, b"rows").expect("old file");
+
+        // The dataset now puts its data under `file://…/new`, which already holds a file.
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_file = new_dir.join("unrelated");
+        std::fs::write(&new_file, b"keep").expect("new file");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    format!("file://{}", base.path().join("new").display()),
                 ),
                 (
                     "cayenne_metadata_dir".to_string(),
