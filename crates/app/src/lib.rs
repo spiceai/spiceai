@@ -23,7 +23,7 @@ use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
     Spicepod,
-    acceleration::{Acceleration, Mode as AccelerationMode, RefreshMode},
+    acceleration::{Acceleration, Mode as AccelerationMode, RefreshMode, SnapshotBehavior},
     component::{
         caching::{CacheConfig, SQLResultsCacheConfig},
         catalog::Catalog,
@@ -167,7 +167,7 @@ impl App {
     }
 
     /// The settings that set `s3_queue_url` for snapshots that no dataset with
-    /// `refresh_mode: snapshot` reads, named as a user writes them, for example
+    /// `refresh_mode: snapshot` and `snapshots: enabled` or `bootstrap_only` reads, named as a user writes them, for example
     /// `` `runtime.state.params.s3_queue_url` ``. Empty when the top-level
     /// `snapshots` section turns snapshots off.
     #[must_use]
@@ -187,7 +187,12 @@ impl App {
             .iter()
             .filter_map(|dataset| {
                 let acceleration = dataset.acceleration.as_ref().filter(|acceleration| {
-                    acceleration.enabled && acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+                    acceleration.enabled
+                        && acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+                        && matches!(
+                            acceleration.snapshots,
+                            SnapshotBehavior::Enabled | SnapshotBehavior::BootstrapOnly
+                        )
                 })?;
                 Some((
                     self.snapshot_params_setting(acceleration)?,
@@ -898,7 +903,7 @@ mod tests {
 
     mod dataset_snapshots {
         use crate::{App, AppBuilder};
-        use spicepod::acceleration::{Acceleration, RefreshMode};
+        use spicepod::acceleration::{Acceleration, RefreshMode, SnapshotBehavior};
         use spicepod::component::dataset::Dataset;
         use spicepod::component::runtime::{Runtime, RuntimeState};
         use spicepod::component::snapshot::{BootstrapOnFailureBehavior, Snapshots};
@@ -1141,6 +1146,7 @@ mod tests {
             let mut dataset = Dataset::new("spice.ai:orders", name);
             dataset.acceleration = Some(Acceleration {
                 refresh_mode: Some(RefreshMode::Snapshot),
+                snapshots: SnapshotBehavior::BootstrapOnly,
                 ..acceleration
             });
             dataset
@@ -1219,6 +1225,20 @@ mod tests {
                 reader_with_own_params.unread_snapshot_queues(),
                 vec!["`runtime.state.params.s3_queue_url`".to_string()]
             );
+
+            // Only `enabled` and `bootstrap_only` snapshots read the queue.
+            for snapshots in [SnapshotBehavior::Disabled, SnapshotBehavior::CreateOnly] {
+                let mut dataset = snapshot_reader("orders", Acceleration::default());
+                if let Some(acceleration) = dataset.acceleration.as_mut() {
+                    acceleration.snapshots = snapshots;
+                }
+                let not_loading = app_with(None, Some(state_with_queue()), vec![dataset]);
+                assert_eq!(
+                    not_loading.unread_snapshot_queues(),
+                    vec!["`runtime.state.params.s3_queue_url`".to_string()],
+                    "{snapshots:?}"
+                );
+            }
 
             let disabled = app_with(
                 Some(Snapshots {
