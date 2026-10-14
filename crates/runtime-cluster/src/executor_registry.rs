@@ -673,15 +673,25 @@ impl ExecutorRegistry {
 
     /// Inserts or replaces the `FlightSqlClient` for `executor_id`, which
     /// connects to `address` (`host:port`) and was registered by the executor
-    /// process `process_id` (empty for executors that send none).
+    /// process `process_id` (empty for executors that send none). Returns
+    /// `false`, inserting nothing, when a later process under the same id
+    /// replaced `process_id`: its endpoint must not displace its successor's.
     pub async fn insert_flight_sql_client(
         &self,
         executor_id: String,
         address: String,
         process_id: &str,
         client: FlightSqlClient,
-    ) {
+    ) -> bool {
         let mut clients = self.flight_sql_clients.write().await;
+        let replaced =
+            !process_id.is_empty()
+                && self.processes.lock().get(&executor_id).is_some_and(|seen| {
+                    seen.replaced.iter().any(|replaced| replaced == process_id)
+                });
+        if replaced {
+            return false;
+        }
         self.flight_sql_endpoints.write().insert(
             executor_id.clone(),
             FlightEndpoint {
@@ -690,6 +700,7 @@ impl ExecutorRegistry {
             },
         );
         clients.insert(executor_id, client);
+        true
     }
 
     /// Replaces the cached `TablePartitions` for `executor_id`.
@@ -1325,6 +1336,22 @@ mod tests {
             .await;
         registry.register("exec-a".to_string(), "run-3", tx3).await;
         assert_eq!(registry.flight_sql_clients_count().await, 1);
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        // A replaced process registering its endpoint late is ignored.
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
         assert_eq!(
             registry.ready_executor_addresses_sync(),
             ["127.0.0.1:50102"]
