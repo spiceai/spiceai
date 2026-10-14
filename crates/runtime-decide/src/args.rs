@@ -921,6 +921,16 @@ mod tests {
                 "Error during planning: ai_decide: `questions` is not a valid questions object: score criteria must contain between two and ten non-null levels at line 1 column 122. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`.",
             ),
             (
+                Kind::Decide,
+                vec![
+                    col("x"),
+                    lit(
+                        r#"{"t": {"type": "score", "instructions": "How bad?", "criteria": ["low", null]}}"#,
+                    ),
+                ],
+                "Error during planning: ai_decide: `questions` is not a valid questions object: a score level must be a string, an object, or an array, not null at line 1 column 79. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`.",
+            ),
+            (
                 Kind::If,
                 vec![col("x"), lit("c"), named("modle", "m")],
                 "Error during planning: ai_if: unknown argument `modle`. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])",

@@ -57,9 +57,12 @@ env:
 jobs:
   mode_a_tpch:
     name: Mode A TPC-H
-    # The standard pool, not `spiceai-macos-large`: a debug build of the
-    # harness, then an SF 1 run that takes about 11 seconds.
-    runs-on: spiceai-macos
+    # `spiceai-macos-large` in the merge queue: on the `spiceai-macos` minis
+    # this job queued 83 min at p90 for a runner and then ran for 2.8 min at
+    # the median (merge_group, 2026-09-29..10-13). The standard pool on every
+    # other event: a debug build of the harness, then an SF 1 run that takes
+    # about 11 seconds.
+    runs-on: ${{ github.event_name == 'merge_group' && 'spiceai-macos-large' || 'spiceai-macos' }}
     timeout-minutes: 60
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}

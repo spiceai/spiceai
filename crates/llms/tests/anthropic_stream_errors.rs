@@ -311,11 +311,12 @@ async fn an_overload_arrives_untyped_and_keeps_its_body_as_the_cause() {
     )
     .await;
 
-    let message = api_error_message(&error);
-    assert!(
-        message.contains("overloaded_error"),
-        "the body must survive as the cause: {message}"
+    assert_eq!(
+        api_error_message(&error),
+        r#"Anthropic streaming error: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        "the body must survive as the cause"
     );
+    assert_eq!(api_error_type(&error), Some("AnthropicStreamError"));
 }
 
 /// Anthropic sheds load partway through a generation by sending an `error` event over an HTTP 200

@@ -123,7 +123,6 @@ pub mod jobs;
 mod management;
 mod metrics_server;
 pub mod model;
-mod object_store_state;
 pub mod opentelemetry;
 pub mod opentelemetry_store;
 pub mod otel_push_exporter;
