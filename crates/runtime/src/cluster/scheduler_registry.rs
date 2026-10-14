@@ -133,6 +133,20 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type SchedulerPeers = HashMap<String, SchedulerEntry>;
 
+/// The advertise addresses of the peer schedulers other than `local`, each once.
+/// During a rolling upgrade one scheduler can be registered under both its
+/// previous `host:port` key and its instance identity until the older entry
+/// expires; both entries carry the same address.
+#[must_use]
+pub fn remote_scheduler_addresses(peers: &SchedulerPeers, local: &str) -> Vec<String> {
+    let addresses: std::collections::BTreeSet<&str> = peers
+        .values()
+        .map(|peer| peer.advertise_address.as_str())
+        .filter(|address| *address != local)
+        .collect();
+    addresses.into_iter().map(str::to_string).collect()
+}
+
 struct SchedulerRegistryRunner {
     cluster: Arc<ClusterStateStore>,
     heartbeats: Arc<SchedulerHeartbeatStore>,
@@ -2846,6 +2860,35 @@ mod tests {
                 .get("test:50051")
                 .map(|entry| entry.instance_id),
             Some(holder)
+        );
+    }
+
+    /// A scheduler registered under both its previous `host:port` key and its
+    /// instance identity is reached once, and this scheduler not at all.
+    #[test]
+    fn remote_scheduler_addresses_are_listed_once() {
+        let entry = |id: &str, address: &str| SchedulerEntry {
+            scheduler_id: id.to_string(),
+            instance_id: Uuid::new_v4(),
+            advertise_address: address.to_string(),
+            grpc_address: address.to_string(),
+            http_address: address.to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let peers = SchedulerPeers::from([
+            (
+                "10.0.0.2:50052".to_string(),
+                entry("10.0.0.2:50052", "10.0.0.2:50052"),
+            ),
+            ("sched-b".to_string(), entry("sched-b", "10.0.0.2:50052")),
+            ("sched-a".to_string(), entry("sched-a", "10.0.0.1:50052")),
+        ]);
+        assert_eq!(
+            remote_scheduler_addresses(&peers, "10.0.0.1:50052"),
+            ["10.0.0.2:50052"]
         );
     }
 }

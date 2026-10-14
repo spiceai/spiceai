@@ -226,12 +226,8 @@ impl TableProvider for FederatedTaskHistoryTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Get the list of peer schedulers
         let peers = self.scheduler_peers.read().await;
-        let peer_addresses: Vec<String> = peers
-            .values()
-            .map(|peer| &peer.advertise_address)
-            .filter(|addr| *addr != &self.local_node_id)
-            .cloned()
-            .collect();
+        let peer_addresses =
+            crate::cluster::remote_scheduler_addresses(&peers, &self.local_node_id);
         drop(peers);
 
         // Get the list of connected executors' FlightSQL clients
