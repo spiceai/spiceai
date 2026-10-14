@@ -105,9 +105,12 @@ pub fn auto_key_deletes_reason() -> Option<AutoKeyDeletesReason> {
         return Some(AutoKeyDeletesReason::NotLinux);
     }
     let budget = cpu_budget::cpu_budget();
-    (!budget.cayenne_keeps_small_tables_compacted()).then(|| AutoKeyDeletesReason::FewCores {
+    let Some(physical) = budget.known_physical_cores() else {
+        return Some(AutoKeyDeletesReason::UnknownCpuTopology);
+    };
+    (!budget.cayenne_keeps_small_tables_compacted()).then_some(AutoKeyDeletesReason::FewCores {
         logical: budget.cores(),
-        physical: budget.physical_cores(),
+        physical,
     })
 }
 
@@ -123,6 +126,8 @@ pub enum AutoKeyDeletesReason {
         /// The physical cores behind them.
         physical: usize,
     },
+    /// The host did not report enough CPU topology to count physical cores.
+    UnknownCpuTopology,
     /// Not Linux, so compaction cannot run below queries and writes.
     NotLinux,
 }
@@ -254,6 +259,9 @@ impl fmt::Display for DeletionModeChoice {
             }
             Self::AutoOnKeyDeletes(AutoKeyDeletesReason::NotLinux) => {
                 f.write_str("auto (key deletes: position deletes need Linux)")
+            }
+            Self::AutoOnKeyDeletes(AutoKeyDeletesReason::UnknownCpuTopology) => {
+                f.write_str("auto (key deletes: physical CPU count unavailable)")
             }
             Self::AutoAsKey(kind) => f.write_str(match kind {
                 AutoKeyTableKind::Cdc => "key (auto: CDC dataset)",
@@ -539,6 +547,13 @@ mod tests {
                     DeletionMode::Auto,
                     true,
                     None,
+                    Some(AutoKeyDeletesReason::UnknownCpuTopology),
+                    TARGET
+                ),
+                resolve(
+                    DeletionMode::Auto,
+                    true,
+                    None,
                     Some(AutoKeyDeletesReason::NotLinux),
                     TARGET
                 ),
@@ -600,6 +615,7 @@ mod tests {
                 "auto (position deletes up to 32 KiB, then key deletes)",
                 "auto (key deletes: 4 physical cores, fewer than 8)",
                 "auto (key deletes: 4 physical cores, fewer than 8; 8 CPUs with SMT)",
+                "auto (key deletes: physical CPU count unavailable)",
                 "auto (key deletes: position deletes need Linux)",
                 "key (auto: CDC dataset)",
                 "key (auto: datalake tier)",

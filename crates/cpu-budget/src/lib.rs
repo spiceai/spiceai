@@ -1228,6 +1228,17 @@ impl CpuBudget {
         }
     }
 
+    /// The physical-core budget when the host reports its CPU topology.
+    /// Unlike [`Self::physical_cores`], an unreadable topology returns `None`
+    /// instead of assuming that every logical CPU is a physical core.
+    #[must_use]
+    pub const fn known_physical_cores(&self) -> Option<usize> {
+        match self.smt {
+            Some(_) => Some(self.physical_cores()),
+            None => None,
+        }
+    }
+
     // ---- tokio runtimes ----
 
     /// Worker threads for the primary runtime (HTTP, control plane, queries).
@@ -1348,6 +1359,7 @@ impl CpuBudget {
     /// primary-key table on position deletes, compacted whole alongside its writes:
     /// [`CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES`] physical cores. Cayenne
     /// also requires Linux (`cayenne::auto_keeps_small_tables_compacted`).
+    /// Unknown CPU topology cannot establish that minimum.
     ///
     /// In a Linux virtual machine held to four CPUs, a 200K-row table under 2,000
     /// upserts every 250 ms wrote at a P99 4% above key deletes' on position
@@ -1358,7 +1370,10 @@ impl CpuBudget {
     /// so 8 logical CPUs on 4 such cores are counted as the 4 that lost.
     #[must_use]
     pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
-        self.physical_cores() >= CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES
+        matches!(
+            self.known_physical_cores(),
+            Some(cores) if cores >= CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES
+        )
     }
 
     /// How many Cayenne `deletion_mode: auto` tables may rewrite themselves whole
@@ -1566,14 +1581,26 @@ mod tests {
     }
 
     /// Cayenne's `deletion_mode: auto` keeps small tables compacted on eight
-    /// cores and more, and on key deletes below.
+    /// known physical cores and more, and on key deletes below.
     #[test]
     fn cayenne_keeps_small_tables_compacted_from_eight_cores() {
         for (cores, keeps) in [(1, false), (4, false), (7, false), (8, true), (64, true)] {
             assert_eq!(
-                budget(cores).cayenne_keeps_small_tables_compacted(),
+                smt_budget(cores, cores, cores).cayenne_keeps_small_tables_compacted(),
                 keeps,
                 "{cores} cores"
+            );
+        }
+    }
+
+    #[test]
+    fn cayenne_keeps_key_deletes_when_cpu_topology_is_unknown() {
+        for cores in [1, 7, 8, 16, 64] {
+            let budget = budget(cores);
+            assert_eq!(budget.known_physical_cores(), None);
+            assert!(
+                !budget.cayenne_keeps_small_tables_compacted(),
+                "{cores} logical CPUs do not establish a physical-core count"
             );
         }
     }
