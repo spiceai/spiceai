@@ -4194,6 +4194,12 @@ impl DataAccelerator for CayenneAccelerator {
         // the files and starts no build.
         cayenne_table.catch_up_lookup_index().await;
 
+        // The primary key the stored table has. It is the requested one unless the table
+        // kept its settings through a change it cannot adopt in place, or holds them until
+        // its source can be read. Whatever identifies the table's rows uses it: its writes,
+        // its partitions and vector search all key rows the same way.
+        let stored_primary_keys = cayenne_table.metadata().primary_key.clone();
+
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support.
@@ -4217,7 +4223,7 @@ impl DataAccelerator for CayenneAccelerator {
                 table_provider,
                 &arrow_schema,
                 &table_name,
-                &primary_keys,
+                &stored_primary_keys,
             ))
         } else {
             // Get metadata catalog for partition tracking
@@ -4280,7 +4286,6 @@ impl DataAccelerator for CayenneAccelerator {
             // partition with the requested ones then would leave one table keyed and placed
             // two ways. The partitioned write-ahead log is kept under the same root.
             let table_root = PathBuf::from(&table_metadata.path);
-            let partition_primary_keys = table_metadata.primary_key.clone();
             let partition_on_conflict = table_metadata.on_conflict.clone();
 
             // Build S3 object store if using S3 Express One Zone storage
@@ -4297,7 +4302,7 @@ impl DataAccelerator for CayenneAccelerator {
                 source,
                 source.acceleration(),
                 arrow_schema.as_ref(),
-                &partition_primary_keys,
+                &stored_primary_keys,
                 partition_on_conflict.as_ref(),
             );
             let mut vortex_config = Self::get_vortex_config_with_footer_cache(
@@ -4350,7 +4355,7 @@ impl DataAccelerator for CayenneAccelerator {
                     time_retention_filter_builder,
                     vortex_config,
                     object_store_config,
-                    partition_primary_keys,
+                    stored_primary_keys.clone(),
                     partition_on_conflict,
                     runtime_env,
                 )
@@ -4416,7 +4421,7 @@ impl DataAccelerator for CayenneAccelerator {
                 table_provider,
                 &arrow_schema,
                 &table_name,
-                &primary_keys,
+                &stored_primary_keys,
             ))
         }
     }

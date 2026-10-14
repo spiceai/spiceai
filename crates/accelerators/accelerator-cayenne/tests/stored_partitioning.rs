@@ -79,22 +79,38 @@ async fn table_with(
         partition_by,
         refresh_mode,
         settings_rebuild,
-        None,
-        "data",
+        Setup::default(),
     )
     .await
 }
 
-/// [`table_with`], keyed on `primary_key`, with its data configured under `dir/{data}`
-/// and its metastore under `dir/metadata` whatever `data` is.
+/// How [`table_configured`] sets `t` up, beyond its partitioning and refresh mode.
+struct Setup<'a> {
+    primary_key: Option<&'a str>,
+    /// Where `t`'s data is configured, under the test's directory. Its metastore stays
+    /// under `metadata` whatever this is.
+    data: &'a str,
+    schema: SchemaRef,
+}
+
+impl Default for Setup<'_> {
+    fn default() -> Self {
+        Self {
+            primary_key: None,
+            data: "data",
+            schema: schema(),
+        }
+    }
+}
+
+/// [`table_with`], set up as `setup` says.
 async fn table_configured(
     ctx: &SessionContext,
     dir: &Path,
     partition_by: &[&str],
     refresh_mode: RefreshMode,
     settings_rebuild: SettingsRebuild,
-    primary_key: Option<&str>,
-    data: &str,
+    setup: Setup<'_>,
 ) -> Result<Arc<dyn TableProvider>, String> {
     let source = TestAccelerationSource::new("t").with_acceleration(Acceleration {
         enabled: true,
@@ -102,7 +118,7 @@ async fn table_configured(
         mode: Mode::File,
         refresh_mode: Some(refresh_mode),
         settings_rebuild,
-        primary_key: primary_key.map(|key| {
+        primary_key: setup.primary_key.map(|key| {
             datafusion_table_providers::util::column_reference::ColumnReference::try_from(key)
                 .expect("valid column reference")
         }),
@@ -116,7 +132,7 @@ async fn table_configured(
         params: [
             (
                 "cayenne_file_path".to_string(),
-                dir.join(data).to_string_lossy().into_owned(),
+                dir.join(setup.data).to_string_lossy().into_owned(),
             ),
             (
                 "cayenne_metadata_dir".to_string(),
@@ -135,7 +151,7 @@ async fn table_configured(
     registry
         .create_accelerator_table(
             TableReference::bare("t"),
-            schema(),
+            setup.schema,
             None,
             &acceleration,
             source.secrets(),
@@ -219,8 +235,11 @@ async fn a_partition_created_after_a_kept_change_takes_the_stored_settings() {
         &["w"],
         RefreshMode::Append,
         SettingsRebuild::Allowed,
-        Some("id"),
-        "moved",
+        Setup {
+            primary_key: Some("id"),
+            data: "moved",
+            ..Setup::default()
+        },
     )
     .await
     .expect("a kept change opens the stored table");
@@ -266,6 +285,75 @@ async fn a_partition_created_after_a_kept_change_takes_the_stored_settings() {
             "partition {key} must be stored under '{stored_root}', got '{}'",
             child.path
         );
+    }
+}
+
+/// `t (id, w, k, e)`, where `e` is a two-dimensional embedding, so the table is served
+/// with a native vector index.
+fn vector_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("w", DataType::Int64, false),
+        Field::new("k", DataType::Int64, false),
+        Field::new(
+            "e",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        ),
+    ]))
+}
+
+/// The key each native vector index of `table` identifies its search results by.
+fn vector_index_keys(table: &Arc<dyn TableProvider>) -> Vec<Vec<String>> {
+    let table = table
+        .downcast_ref::<spice_table::SpiceTable>()
+        .expect("a table with a vector column is served with its vector index");
+    table
+        .indexes()
+        .iter()
+        .map(|index| {
+            let index = index
+                .as_any()
+                .downcast_ref::<search::index::NativeVectorIndex>()
+                .expect("a native vector index");
+            search::index::SearchIndex::primary_fields(index)
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        })
+        .collect()
+}
+
+/// Vector search identifies rows by the key the stored table holds them by, the key its
+/// writes and partitions use, including after a key change the table keeps. Identifying
+/// them by the requested key would give search results a key the table never adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vector_search_identifies_rows_by_the_stored_key_after_a_kept_change() {
+    for partition_by in [&[][..], &["w"][..]] {
+        let dir = tempfile::tempdir().expect("dir");
+        // Keyed on `id`, then reopened keyed on `k` under `append`, which keeps `id`.
+        for requested in ["id", "k"] {
+            let ctx = SessionContext::new();
+            let table = table_configured(
+                &ctx,
+                dir.path(),
+                partition_by,
+                RefreshMode::Append,
+                SettingsRebuild::Allowed,
+                Setup {
+                    primary_key: Some(requested),
+                    schema: vector_schema(),
+                    ..Setup::default()
+                },
+            )
+            .await
+            .expect("table");
+            assert_eq!(
+                vector_index_keys(&table),
+                [vec!["id".to_string()]],
+                "partition_by: {partition_by:?}, requested key: {requested}"
+            );
+        }
     }
 }
 
