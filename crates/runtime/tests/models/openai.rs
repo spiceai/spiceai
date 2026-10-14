@@ -29,6 +29,7 @@ use crate::{
     },
 };
 use app::AppBuilder;
+use arrow::array::StringArray;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
@@ -43,7 +44,6 @@ use async_openai::types::responses::{
 };
 use async_openai::types::responses::{OutputTextContent, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
-use arrow::array::StringArray;
 use futures::{StreamExt, TryStreamExt};
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
@@ -1190,7 +1190,10 @@ async fn create_response(
 
 /// The `input` of each `responses` task that started at `since` or later, in order: the requests
 /// Spice sent the provider.
-async fn responses_task_inputs(rt: &Arc<Runtime>, since: &str) -> Result<Vec<Value>, anyhow::Error> {
+async fn responses_task_inputs(
+    rt: &Arc<Runtime>,
+    since: &str,
+) -> Result<Vec<Value>, anyhow::Error> {
     let batches = rt
         .datafusion()
         .query_builder(&format!(
@@ -1421,7 +1424,9 @@ async fn openai_test_responses_api_tool_history_replay() -> Result<(), anyhow::E
                     let upstream_requests = responses_task_inputs(&rt, &since).await?;
                     // One round: the model answered from the history instead of running a tool.
                     let [upstream_request] = upstream_requests.as_slice() else {
-                        panic!("{label}: turn 2 made other than one request: {upstream_requests:#?}");
+                        panic!(
+                            "{label}: turn 2 made other than one request: {upstream_requests:#?}"
+                        );
                     };
                     let upstream_input = upstream_request["input"]
                         .as_array()

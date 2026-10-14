@@ -451,7 +451,8 @@ impl ToolUsingResponses {
     /// `req` for the round after the last that may run Spice tools: without Spice's tools, so
     /// that the model answers rather than ending the response with a Spice tool call nothing
     /// runs. `OpenAI` rejects an `allowed_tools` choice that names a tool `tools` lacks, and
-    /// another provider may reject a `tool_choice` with no tools (issue #14821).
+    /// another provider may reject a `tool_choice` or `parallel_tool_calls` with no tools
+    /// (issue #14821).
     fn without_runtime_tools(&self, mut req: CreateResponse) -> CreateResponse {
         let is_spice_tool =
             |name: Option<&str>| name.is_some_and(|name| self.as_spiced_tool(name).is_some());
@@ -466,6 +467,7 @@ impl ToolUsingResponses {
             .collect::<Vec<_>>();
         if tools.is_empty() {
             req.tool_choice = None;
+            req.parallel_tool_calls = None;
             return req;
         }
         req.tools = Some(tools);
@@ -1174,6 +1176,11 @@ mod tests {
                 serde_json::to_value(&request.tool_choice).expect("a serializable tool choice"),
             )
         }
+
+        /// The `parallel_tool_calls` of request `round`.
+        fn parallel_tool_calls(&self, round: usize) -> Option<bool> {
+            self.requests.lock()[round].parallel_tool_calls
+        }
     }
 
     #[async_trait]
@@ -1774,9 +1781,10 @@ mod tests {
                 let provider = ScriptedResponses::new(vec![vec!["list_datasets"]; limit]);
                 let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
 
+                let mut request = request(stream);
+                request.parallel_tool_calls = Some(true);
                 let output =
-                    output_through_spice(&model(&provider, &tool, Some(limit)), request(stream))
-                        .await;
+                    output_through_spice(&model(&provider, &tool, Some(limit)), request).await;
 
                 // `limit` rounds run Spice tools. The round after them is offered none, so the
                 // response ends with the model's answer rather than a call nothing runs.
@@ -1791,6 +1799,13 @@ mod tests {
                     );
                 }
                 assert_eq!(provider.tools(limit), (vec![], Value::Null), "{label}");
+                // Nor `parallel_tool_calls`, which a request without tools may not carry (#14821).
+                assert_eq!(
+                    provider.parallel_tool_calls(limit - 1),
+                    Some(true),
+                    "{label}"
+                );
+                assert_eq!(provider.parallel_tool_calls(limit), None, "{label}");
                 let mut types = vec![json!("mcp_call"); limit];
                 types.push(json!("message"));
                 assert_eq!(
