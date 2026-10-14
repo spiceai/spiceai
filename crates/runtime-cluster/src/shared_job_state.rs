@@ -417,7 +417,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             .await
             .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
         else {
-            return Ok(None);
+            // Recovery has already claimed the async query. Reporting absence
+            // makes that query wait for a scheduler job that was never saved.
+            return Err(BallistaError::Internal(format!(
+                "Failed to resume query '{id}': its scheduler stopped before the query was saved. Resubmit the query.",
+                id = job_id.as_str()
+            )));
         };
         if meta.is_terminal() {
             return Ok(None);
@@ -638,14 +643,11 @@ mod tests {
     async fn try_acquire_refuses_unknown_self_owned_and_corrupt() {
         let state = test_state();
 
-        // Unknown job: nothing to acquire.
+        // Unknown job: recovery must fail rather than report absence.
+        let missing = state.try_acquire_job(&JobId::new("missing")).await;
         assert!(
-            state
-                .try_acquire_job(&JobId::new("missing"))
-                .await
-                .expect("acquire")
-                .is_none(),
-            "unknown job should not be acquirable"
+            missing.is_err(),
+            "a job with no saved scheduler state must fail acquisition: {missing:?}"
         );
 
         // A job this scheduler already owns is not re-acquired.

@@ -293,11 +293,11 @@ impl super::AcceleratedTable {
                 && num_records > 0
                 && let Some(cache_provider) = caching.as_ref()
                 && let Err(e) = cache_provider
-                    .invalidate_for_table(dataset_name.clone())
+                    .invalidate_for_refresh(dataset_name.clone())
                     .await
             {
                 tracing::error!(
-                    "Failed to invalidate cached results for dataset {}: {e}",
+                    "Failed to invalidate cached query plans and search results for dataset {} after retention, so they may reflect the previous data until they expire: {e}",
                     &dataset_name
                 );
             }

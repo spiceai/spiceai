@@ -3844,6 +3844,46 @@ mod tests {
         }
     }
 
+    /// MySQL's bare `DATETIME` keeps no fractional seconds and rounds a literal with
+    /// more than six, so a fractional-second filter must reach it as `DATETIME(6)`
+    /// with the literal cut to six digits, or it compares a different instant.
+    #[test]
+    fn a_fractional_second_filter_unparsed_for_mysql_keeps_its_precision() {
+        let at = |nanos: i64| lit(ScalarValue::TimestampNanosecond(Some(nanos), None));
+        // 1994-06-15 12:30:00.5 and 12:30:00.123456789 as nanoseconds since the Unix epoch.
+        let (half_second, nine_digits) = (771_683_400_500_000_000, 771_683_400_123_456_789);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            None,
+        )
+        .expect("scan events")
+        .filter(
+            col("ts")
+                .eq(at(half_second))
+                .or(col("ts").eq(at(nine_digits))),
+        )
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("mysql", &MySqlDialect {}, &plan);
+        for literal in [
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))",
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))",
+        ] {
+            assert!(
+                sql.contains(literal),
+                "MySQL must compare at microsecond precision, or the filter selects the wrong \
+                 rows: expected {literal} in {sql}"
+            );
+        }
+    }
+
     /// Regression test for the unparser's `rescope_projection_over_projection`,
     /// carried by the `spiceai/datafusion` fork (upstream's
     /// apache/datafusion#22961): common subexpression elimination leaves a

@@ -4368,6 +4368,56 @@ mod tests {
         );
     }
 
+    /// String filter values reach `DuckDB` as literals it parses back to the same
+    /// value. A backslash before a quote used to render as `'a\'b'`, which
+    /// `DuckDB` rejects as unterminated, and `a''b` rendered as `'a''b'`, which
+    /// `DuckDB` reads as `a'b` (#12580). This runs each rendered filter against a
+    /// real table, so it fails on a parser error or on a wrong match.
+    #[test]
+    fn duckdb_string_filters_with_backslashes_and_quotes_match_exactly() {
+        use datafusion::prelude::{col, lit};
+        use datafusion::sql::unparser::Unparser;
+        use runtime_datafusion::dialect::new_duckdb_dialect;
+
+        let values = [
+            r"a\b",
+            "a'b",
+            r"a\'b",
+            r"a\''b",
+            "a''b",
+            r"\'",
+            "'",
+            r"C:\path\it's",
+            r"trailing\",
+        ];
+        let duck = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        duck.execute_batch("CREATE TABLE orders (customer_id VARCHAR)")
+            .expect("create table");
+        for value in values {
+            duck.execute("INSERT INTO orders VALUES (?)", [value])
+                .expect("insert value");
+        }
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        for value in values {
+            let filter = unparser
+                .expr_to_sql(&col("customer_id").eq(lit(value)))
+                .expect("filter unparses")
+                .to_string();
+            let sql = format!("SELECT customer_id FROM orders WHERE {filter}");
+            let mut statement = duck
+                .prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB should parse {sql}: {e}"));
+            let matched: Vec<String> = statement
+                .query_map([], |row| row.get(0))
+                .expect("query runs")
+                .collect::<Result<_, _>>()
+                .expect("rows read");
+            assert_eq!(matched, vec![value.to_string()], "{sql}");
+        }
+    }
+
     /// `trim(...)` resolves to `DataFusion`'s `btrim`, which is the name the
     /// unparser emits — and `DuckDB` has no function called `btrim`, so a
     /// federated call into the accelerated store failed outright with

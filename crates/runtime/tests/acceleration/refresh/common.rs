@@ -12,6 +12,7 @@ use futures::StreamExt;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, IndexType, Mode, OnConflictBehavior, RefreshMode};
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::component::dataset::{Dataset, TimeFormat};
 use spicepod::param::Params;
 use std::collections::HashMap;
@@ -289,8 +290,13 @@ async fn start_test_runtime_with_dataset(
     register_test_connectors().await;
 
     dataset.acceleration = Some(acceleration);
+    // Refresh leaves cached SQL results in place; reads after one must skip the cache.
     let app = AppBuilder::new("test_acceleration_refresh")
         .with_dataset(dataset)
+        .with_sql_cache(SQLResultsCacheConfig {
+            enabled: false,
+            ..Default::default()
+        })
         .build();
 
     configure_test_datafusion();

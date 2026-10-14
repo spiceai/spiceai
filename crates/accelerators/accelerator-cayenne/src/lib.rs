@@ -71,7 +71,7 @@ use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_sqlite::SqliteSidecar;
 use runtime_parameters::ParameterSpec;
 use search::index::native_vector::NativeVectorIndex;
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, IndexLayer, LayerWalk, find_concrete};
 use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
@@ -423,6 +423,27 @@ pub struct CayenneAccelerator {
     /// on this one budget, including those created by `CREATE TABLE …
     /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Pins a snapshot reload hands from the replaced provider to the one the
+    /// factory creates, keyed by dataset. An entry lives only for that one
+    /// create: inserted before the factory runs, removed when the reload
+    /// completes or is dropped (`InheritedPinsEntry`).
+    inherited_snapshot_dir_pins:
+        parking_lot::Mutex<HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>>,
+}
+
+/// Removes a dataset's hand-off entry when dropped, so a reload the refresh
+/// runner cancels mid-create leaves no pins for a later create to inherit.
+struct InheritedPinsEntry<'a> {
+    slot: &'a parking_lot::Mutex<
+        HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>,
+    >,
+    dataset: datafusion::common::TableReference,
+}
+
+impl Drop for InheritedPinsEntry<'_> {
+    fn drop(&mut self) {
+        self.slot.lock().remove(&self.dataset);
+    }
 }
 
 /// `(available, total)` permits of the fleet-wide compaction budget.
@@ -1341,6 +1362,7 @@ impl CayenneAccelerator {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
             compaction_semaphore: cayenne::compaction_budget(),
+            inherited_snapshot_dir_pins: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2881,6 +2903,15 @@ impl CayenneAccelerator {
         if let Some(cold) = cold_object_store {
             builder = builder.with_cold_object_store(cold);
         }
+        // A reload's replacement sweeps against the replaced instance's pins, so
+        // queries still reading the replaced snapshot keep their directories.
+        if let Some(pins) = self
+            .inherited_snapshot_dir_pins
+            .lock()
+            .remove(source.name())
+        {
+            builder = builder.with_snapshot_dir_pins(pins);
+        }
         tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table = builder
             .create(table_options)
@@ -4009,6 +4040,13 @@ impl DataAccelerator for CayenneAccelerator {
 
         ensure_stored_partitioning_matches(&cayenne_table, source, &partition_by, &dir_path)
             .await?;
+        // Safety net for the secondary index: files no loaded index run covers
+        // (a snapshot taken behind its index, runs that could not be loaded, a
+        // key encoding an upgrade changed) are indexed before the table is
+        // served, so no lookup reads them in full. A no-op when the persisted
+        // runs loaded and cover every file, which is the normal case: it lists
+        // the files and starts no build.
+        cayenne_table.catch_up_lookup_index().await;
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
@@ -4191,6 +4229,14 @@ impl DataAccelerator for CayenneAccelerator {
                 .await
                 .boxed()
                 .context(AccelerationCreationFailedSnafu)?;
+            // The same safety net per partition, a no-op for a partition whose
+            // loaded runs cover its files. A snapshot archives no partition's
+            // runs, so a restored partition is indexed here.
+            for partition in &partition_table_providers {
+                if let Some(partition) = partition.downcast_ref::<cayenne::CayenneTableProvider>() {
+                    partition.catch_up_lookup_index().await;
+                }
+            }
             let partition_provider =
                 Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
@@ -4303,7 +4349,7 @@ impl DataAccelerator for CayenneAccelerator {
     /// factory then reopens the directory tree from disk.
     async fn reload_from_snapshot(
         &self,
-        _source: &dyn AccelerationSource,
+        source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
         provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
@@ -4311,8 +4357,52 @@ impl DataAccelerator for CayenneAccelerator {
         // previous instance's maintenance must stop before the new one starts:
         // nothing in memory serializes two instances' compaction (#11581).
         change_sink::quiesce_table_maintenance(&previous_provider).await;
+        // Queries planned on the previous instance may still read its snapshot
+        // directories after the swap; they pin them in that instance's maps, so
+        // the replacement is opened over the same maps (spiceai/spiceai#14981).
+        let pins = find_concrete::<cayenne::CayenneTableProvider>(
+            previous_provider.as_ref(),
+            LayerWalk::Write,
+        )
+        .map(cayenne::CayenneTableProvider::snapshot_dir_pins);
         drop(previous_provider);
+        let Some(pins) = pins else {
+            // No single Cayenne instance to inherit from (partitioned): no pins,
+            // and `maintain_after_snapshot_restore` reclaims nothing either.
+            return provider_factory().await;
+        };
+        let dataset = source.name().clone();
+        self.inherited_snapshot_dir_pins
+            .lock()
+            .insert(dataset.clone(), pins);
+        let _entry = InheritedPinsEntry {
+            slot: &self.inherited_snapshot_dir_pins,
+            dataset,
+        };
         provider_factory().await
+    }
+
+    /// Reclaim the snapshot directories the restored snapshot no longer
+    /// references. The pins handed over in `reload_from_snapshot` keep the ones
+    /// the replaced instance's queries still read.
+    async fn maintain_after_snapshot_restore(
+        &self,
+        source: &dyn AccelerationSource,
+        provider: &Arc<dyn TableProvider>,
+    ) {
+        let Some(table) =
+            find_concrete::<cayenne::CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
+        else {
+            return;
+        };
+        match table.retire_unreferenced_snapshot_dirs().await {
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                dataset = %source.name(),
+                %error,
+                "Failed to retire the superseded snapshot directories; the next snapshot reload retries"
+            ),
+        }
     }
 
     async fn drop_table(
@@ -6092,6 +6182,122 @@ mod tests {
                 .expect("prepare missing table"),
             BootstrapStatus::None,
             "a dataset with a datalake tier must not be restored from a snapshot"
+        );
+    }
+
+    /// A Cayenne table in its own temp dir, as the provider a reload replaces.
+    async fn cayenne_table(name: &str) -> (Arc<dyn TableProvider>, tempfile::TempDir) {
+        use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = tmp.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            cayenne::CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn cayenne::MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let provider = CayenneTableProviderBuilder::new(
+            catalog,
+            datafusion::prelude::SessionContext::new().runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: name.to_string(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: tmp.path().join("data").to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        })
+        .await
+        .expect("table created");
+        (Arc::new(provider), tmp)
+    }
+
+    /// The refresh runner drops an in-flight reload when another request
+    /// arrives. A reload dropped after it parked the replaced provider's pins
+    /// but before the factory took them must leave nothing for a later create
+    /// to inherit.
+    #[tokio::test]
+    async fn a_dropped_reload_leaves_no_pins_to_inherit() {
+        let accelerator = CayenneAccelerator::new();
+        let source = TestAccelerationSource::new("ds");
+        let (previous, _tmp) = cayenne_table("ds").await;
+        let never_creates: data_accelerator_api::ReloadProviderFactory =
+            Arc::new(|| Box::pin(std::future::pending()));
+
+        let mut reload =
+            Box::pin(accelerator.reload_from_snapshot(&source, previous, never_creates));
+        // Poll until the pins are parked and the factory is pending.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                futures::poll!(reload.as_mut()).is_pending(),
+                "the factory never completes"
+            );
+            if accelerator
+                .inherited_snapshot_dir_pins
+                .lock()
+                .contains_key(&datafusion::common::TableReference::bare("ds"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pins are never parked"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(reload);
+        assert!(
+            accelerator.inherited_snapshot_dir_pins.lock().is_empty(),
+            "a dropped reload clears its hand-off entry"
+        );
+    }
+
+    /// A completed reload hands the replaced provider's pins to the provider the
+    /// factory creates, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_completed_reload_hands_the_pins_over_and_clears_the_slot() {
+        let accelerator = Arc::new(CayenneAccelerator::new());
+        let source = TestAccelerationSource::new("ds");
+        let (previous, _tmp) = cayenne_table("ds").await;
+        let previous_pins =
+            find_concrete::<cayenne::CayenneTableProvider>(previous.as_ref(), LayerWalk::Write)
+                .expect("a Cayenne provider")
+                .snapshot_dir_pins();
+
+        // The factory takes the parked pins, as `create_cayenne_table_provider` does.
+        let taken: Arc<parking_lot::Mutex<Option<cayenne::SnapshotDirPins>>> = Arc::default();
+        let factory_accelerator = Arc::clone(&accelerator);
+        let factory_taken = Arc::clone(&taken);
+        let factory: data_accelerator_api::ReloadProviderFactory = Arc::new(move || {
+            let accelerator = Arc::clone(&factory_accelerator);
+            let taken = Arc::clone(&factory_taken);
+            Box::pin(async move {
+                *taken.lock() = accelerator
+                    .inherited_snapshot_dir_pins
+                    .lock()
+                    .remove(&datafusion::common::TableReference::bare("ds"));
+                let (replacement, tmp) = cayenne_table("ds").await;
+                std::mem::forget(tmp);
+                Ok(replacement)
+            })
+        });
+        accelerator
+            .reload_from_snapshot(&source, previous, factory)
+            .await
+            .expect("the reload completes");
+        assert!(
+            taken
+                .lock()
+                .as_ref()
+                .is_some_and(|pins| pins.is_shared_with(&previous_pins)),
+            "the factory received the replaced provider's pins"
+        );
+        assert!(
+            accelerator.inherited_snapshot_dir_pins.lock().is_empty(),
+            "a completed reload clears its hand-off entry"
         );
     }
 

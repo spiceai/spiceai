@@ -254,6 +254,7 @@ impl CayenneStagedUpsert {
             validated_keys: self.validated_keys,
             superseded: self.superseded,
             into_empty_table: false,
+            first_load_pk_bloom: None,
         }
         .commit()
         .await
@@ -556,6 +557,7 @@ impl CayenneTableProvider {
             stats,
             row_count,
             superseded,
+            first_load_pk_bloom: None,
         })
     }
 }
