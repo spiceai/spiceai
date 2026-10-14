@@ -32,7 +32,7 @@
       ]
     },
     "snapshots": {
-      "description": "Optional acceleration snapshot configuration",
+      "description": "Deprecated: snapshots are stored in the `snapshots/` folder of\n`runtime.state.location`. A dataset sets `acceleration.snapshots_location`,\n`acceleration.snapshots_params` and\n`acceleration.snapshots_bootstrap_on_failure_behavior` to override it.",
       "anyOf": [
         {
           "$ref": "#/$defs/Snapshots"
@@ -40,7 +40,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "deprecated": true
     },
     "extensions": {
       "description": "Optional extensions configuration",
@@ -1746,11 +1747,12 @@
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
-          "type": "string"
+          "description": "Deprecated: set `runtime.state.location`, which keeps cluster state in its\n`cluster/` folder. Root URI for shared cluster state (see\n[`Runtime::scheduler_state`]).",
+          "type": "string",
+          "deprecated": true
         },
         "params": {
-          "description": "Optional object store params for the shared cluster state.",
+          "description": "Deprecated: set `runtime.state.params`. Object store params for the shared\ncluster state.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -1758,7 +1760,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "deprecated": true
         },
         "partition_assignment_interval": {
           "description": "How often the scheduler assigns accelerated table partitions to executors.",
@@ -1850,7 +1853,7 @@
           "default": true
         },
         "location": {
-          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`",
+          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`\n\nWhen not set, snapshots go to the `snapshots/` folder of\n`runtime.state.location`. A dataset's `acceleration.snapshots_location`\nwins over it.",
           "type": [
             "string",
             "null"
@@ -1861,7 +1864,7 @@
           "$ref": "#/$defs/BootstrapOnFailureBehavior"
         },
         "params": {
-          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.",
+          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.\nThey apply to this section's `location`, and replace `runtime.state.params`\nfor the `runtime.state` location. A dataset's `acceleration.snapshots_params`\nwin over them.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3286,7 +3289,7 @@
           }
         },
         "snapshots": {
-          "description": "Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
+          "description": "Enables snapshots for this dataset. Snapshots are stored in `snapshots_location`,\nor in the `snapshots/` folder of `runtime.state.location`.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
           "$ref": "#/$defs/SnapshotBehavior"
         },
         "snapshots_trigger": {
@@ -3313,6 +3316,35 @@
         },
         "snapshots_creation_policy": {
           "$ref": "#/$defs/SnapshotsCreationPolicy"
+        },
+        "snapshots_location": {
+          "description": "The object store location of this dataset's snapshots, for example\n`s3://my-bucket/spice/snapshots/`. Defaults to the `snapshots/` folder of\n`runtime.state.location`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshots_params": {
+          "description": "Object store params for this dataset's snapshots, such as `s3_region` or\n`s3_queue_url`. When set, they are the only params used. Otherwise a\n`snapshots_location` uses no params, and the `runtime.state` location uses\n`runtime.state.params`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshots_bootstrap_on_failure_behavior": {
+          "description": "The behavior when loading a snapshot fails: `warn` (default), `retry` or `fallback`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BootstrapOnFailureBehavior"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,

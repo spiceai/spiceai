@@ -626,7 +626,7 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
-                // An invalid `snapshots.params.s3_queue_url`.
+                // An invalid snapshot `s3_queue_url`.
                 | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
@@ -4553,9 +4553,9 @@ impl DataFusion {
     }
 
     /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
-    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
-    /// SQS queue that receives them. `None` when no queue is configured, and on
-    /// a scheduler, which loads no accelerations itself.
+    /// S3 event notifications, when the `s3_queue_url` in the dataset's snapshot
+    /// params names the SQS queue that receives them. `None` when no queue is
+    /// configured, and on a scheduler, which loads no accelerations itself.
     async fn subscribe_to_snapshot_notifications(
         &self,
         dataset: &Dataset,
