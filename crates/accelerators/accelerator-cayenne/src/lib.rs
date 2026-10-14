@@ -2827,8 +2827,6 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
-        let maintained_aggregate_specs =
-            maintained_aggregate_specs_for_cayenne(acceleration, &schema, &primary_keys)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -2850,6 +2848,25 @@ impl CayenneAccelerator {
             self.get_or_create_catalog(&metadata_dir, &metastore_type)
                 .await?
         };
+
+        // Maintained aggregates hold for the primary key the table has once it opens: a
+        // stored table keeps its own unless this open rebuilds it, which a key it keeps
+        // through a change must not fail for. A new table, or a rebuilt one, has the
+        // requested key.
+        let aggregates_primary_keys = if rebuilds_on_settings_change(source) {
+            primary_keys.clone()
+        } else {
+            match catalog.get_table(table_name).await {
+                Ok(stored) => stored.primary_key,
+                Err(cayenne::CatalogError::TableNotFound { .. }) => primary_keys.clone(),
+                Err(error) => return Err(error).boxed().context(AccelerationCreationFailedSnafu),
+            }
+        };
+        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(
+            acceleration,
+            &schema,
+            &aggregates_primary_keys,
+        )?;
 
         // S3 Express One Zone is file-mode only. Memory mode never builds an
         // object store; if S3 Express params linger while mode is memory, treat

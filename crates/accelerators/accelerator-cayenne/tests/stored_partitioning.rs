@@ -93,6 +93,7 @@ struct Setup<'a> {
     schema: SchemaRef,
     /// Acceleration params besides the data and metastore locations.
     params: &'a [(&'a str, &'a str)],
+    maintained_aggregates: Vec<spicepod::acceleration::MaintainedAggregate>,
 }
 
 impl Default for Setup<'_> {
@@ -102,6 +103,7 @@ impl Default for Setup<'_> {
             data: "data",
             schema: schema(),
             params: &[],
+            maintained_aggregates: Vec::new(),
         }
     }
 }
@@ -121,6 +123,7 @@ async fn table_configured(
         mode: Mode::File,
         refresh_mode: Some(refresh_mode),
         settings_rebuild,
+        maintained_aggregates: setup.maintained_aggregates.into(),
         primary_key: setup.primary_key.map(|key| {
             datafusion_table_providers::util::column_reference::ColumnReference::try_from(key)
                 .expect("valid column reference")
@@ -295,6 +298,69 @@ async fn a_partition_created_after_a_kept_change_takes_the_stored_settings() {
             child.path
         );
     }
+}
+
+/// A table whose maintained MIN/MAX need its primary key keeps serving them through a
+/// change it keeps, even one that drops the requested key: under `append`, a table keyed
+/// on `id` keeps `id`, so MIN/MAX still have the key they retract prior extrema by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintained_min_max_hold_for_the_stored_key_after_a_kept_change() {
+    use cayenne::{CayenneCatalog, MetadataCatalog};
+    use spicepod::acceleration::{
+        MaintainedAggregate, MaintainedAggregateExpr, MaintainedAggregateFunction,
+    };
+
+    let min_max = || {
+        vec![MaintainedAggregate {
+            group_by: vec!["w".to_string()],
+            aggregates: vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Min,
+                    column: Some("v".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Max,
+                    column: Some("v".to_string()),
+                },
+            ],
+            filter_sql: None,
+        }]
+    };
+    let dir = tempfile::tempdir().expect("dir");
+    // Keyed on `id`, then reopened with no key requested, which keeps `id`.
+    for primary_key in [Some("id"), None] {
+        let ctx = SessionContext::new();
+        if let Err(error) = table_configured(
+            &ctx,
+            dir.path(),
+            &[],
+            RefreshMode::Append,
+            SettingsRebuild::Allowed,
+            Setup {
+                primary_key,
+                maintained_aggregates: min_max(),
+                ..Setup::default()
+            },
+        )
+        .await
+        {
+            panic!("requested key {primary_key:?}: the table must open, got: {error}");
+        }
+    }
+    let catalog = CayenneCatalog::new(format!(
+        "sqlite://{}",
+        dir.path().join("metadata").join("cayenne.db").display()
+    ))
+    .expect("catalog");
+    catalog.init().await.expect("init catalog");
+    assert_eq!(
+        catalog
+            .get_table("t")
+            .await
+            .expect("the stored table")
+            .primary_key,
+        vec!["id".to_string()]
+    );
 }
 
 /// `t (id, w, k, e)`, where `e` is a two-dimensional embedding, so the table is served
