@@ -57,6 +57,8 @@ use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 use mysql_common::io::ParseBuf;
 
 use super::ColumnTypeChanges;
+use super::SchemaMismatchSnafu;
+use super::changes::MemberLayout;
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
@@ -630,12 +632,13 @@ pub(super) async fn adopt_current_layout(
     params: &ReplicationParams,
     database: &str,
     table: &str,
-    schema: &SchemaRef,
-    old_layout: &TableLayout,
+    old: &MemberLayout,
     primary_keys: &[String],
     dataset_name: &str,
     column_type_changes: ColumnTypeChanges,
 ) -> Result<AdoptedLayout> {
+    let schema = old.change_schemas.dataset();
+    let old_layout = &old.layout;
     let mut conn = super::setup::connect(params).await?;
     let layout = super::setup::fetch_table_layout(&mut conn, database, table).await?;
     if let Err(e) = conn.disconnect().await {
@@ -643,6 +646,9 @@ pub(super) async fn adopt_current_layout(
     }
 
     let column_map = layout.column_map(schema, database, table)?;
+    if let Some(message) = lossy_key_retype(schema, &layout, &column_map, primary_keys) {
+        return SchemaMismatchSnafu { message }.fail();
+    }
     let pk_source_indexes = compute_pk_source_indexes(schema, primary_keys, &column_map);
 
     let old_names: std::collections::HashSet<&str> =
@@ -737,6 +743,62 @@ fn type_base_name(column_type: &str) -> String {
         .take_while(char::is_ascii_alphabetic)
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// Why a primary-key column's new source type cannot be followed, or `None`
+/// when every key column's type still holds each key exactly.
+///
+/// An `ALTER` that changes a key column to a type that does not hold every
+/// value of its current one (`BIGINT` to `DOUBLE`) rewrites the stored keys in
+/// place, with no row event: `9007199254740993` becomes `9007199254740992`.
+/// The acceleration still holds the old key, so a later change matched by the
+/// rewritten key would update or delete the wrong row.
+fn lossy_key_retype(
+    schema: &SchemaRef,
+    layout: &TableLayout,
+    column_map: &[usize],
+    primary_keys: &[String],
+) -> Option<String> {
+    schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .filter(|(field, _)| primary_keys.iter().any(|pk| pk == field.name()))
+        .find_map(|(field, &source_index)| {
+            let column = layout.columns.get(source_index)?;
+            let to = numeric_arrow_type(&column.column_type)?;
+            let from = field.data_type();
+            (to != *from && !is_widening_cast(from, &to) && !integer_fits_decimal(from, &to)).then(
+                || {
+                    format!(
+                        "primary key column '{}' changed type from {from} to `{}`, which cannot \
+                     hold every key exactly, so the source may have rewritten keys the \
+                     acceleration still holds",
+                        field.name(),
+                        column.column_type
+                    )
+                },
+            )
+        })
+}
+
+/// Whether every value of integer type `from` is a `DECIMAL` of type `to`:
+/// its integer digits (`p - s`) cover the integer type's widest value.
+fn integer_fits_decimal(from: &DataType, to: &DataType) -> bool {
+    let digits: i16 = match from {
+        DataType::Int8 | DataType::UInt8 => 3,
+        DataType::Int16 | DataType::UInt16 => 5,
+        DataType::Int32 | DataType::UInt32 => 10,
+        DataType::Int64 => 19,
+        DataType::UInt64 => 20,
+        _ => return false,
+    };
+    match to {
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            i16::from(*precision) - i16::from(*scale) >= digits
+        }
+        _ => false,
+    }
 }
 
 /// `schema` with each column whose source type is now a lossless widening of
@@ -1511,6 +1573,46 @@ mod tests {
                 DataType::Float64,
                 DataType::Utf8,
             ]
+        );
+    }
+
+    #[test]
+    fn a_key_column_retyped_to_a_lossy_type_is_refused() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int32)]);
+        let keys = ["id".to_string()];
+        assert_eq!(
+            lossy_key_retype(
+                &schema,
+                &layout_of(&[("id", "double"), ("k", "double")]),
+                &[0, 1],
+                &keys
+            ),
+            Some(
+                "primary key column 'id' changed type from Int64 to `double`, which cannot hold \
+                 every key exactly, so the source may have rewritten keys the acceleration \
+                 still holds"
+                    .to_string()
+            )
+        );
+        // A widening keeps every key; a non-key column is not a key.
+        assert_eq!(
+            lossy_key_retype(
+                &schema,
+                &layout_of(&[("id", "decimal(30,0)"), ("k", "float")]),
+                &[0, 1],
+                &keys
+            ),
+            None
+        );
+        // `DECIMAL(18,0)` holds 18 integer digits; a `BIGINT` key can have 19.
+        assert!(
+            lossy_key_retype(
+                &schema,
+                &layout_of(&[("id", "decimal(18,0)"), ("k", "int")]),
+                &[0, 1],
+                &keys
+            )
+            .is_some_and(|message| message.contains("`decimal(18,0)`"))
         );
     }
 
