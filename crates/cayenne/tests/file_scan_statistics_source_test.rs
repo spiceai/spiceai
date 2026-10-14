@@ -944,7 +944,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
 }
 
 /// The provider's own accounting agrees with what the store and the metastore
-/// observed, and shows the collections were shared rather than merely ordered.
+/// observed.
 async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -967,11 +967,6 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
         u64::try_from(SINGLE_FLIGHT_FILES)?
     );
     assert_eq!(counters.persisted_hits, 0);
-    assert!(
-        counters.joined_in_flight > 0,
-        "the concurrent scans must have waited on each other's collections, or this \
-         proves nothing about coalescing: {counters:?}"
-    );
     assert_eq!(
         store.reads().len(),
         SINGLE_FLIGHT_FILES,

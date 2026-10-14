@@ -16,7 +16,7 @@ TPC-H/TPC-DS/ClickBench/CH-benCHmark/SSB/SpiceBench/SQLLancer/micro. Entry point
   ↔ standalone oracles
 
 Run with `cargo test -p cayenne --features result-correctness-duckdb|result-correctness-chdb`
-and `cargo test -p runtime --features duckdb,sqlite --test result_correctness`
+and `cargo test -p runtime --features duckdb,sqlite --test integration result_correctness::`
 — not with `cargo bench` or Criterion features. See
 `crates/cayenne/tests/correctness/README.md`. Do not treat those tests as perf
 regressions or fold them into this matrix.

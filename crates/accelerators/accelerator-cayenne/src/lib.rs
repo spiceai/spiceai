@@ -71,7 +71,7 @@ use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_sqlite::SqliteSidecar;
 use runtime_parameters::ParameterSpec;
 use search::index::native_vector::NativeVectorIndex;
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, IndexLayer, LayerWalk, find_concrete};
 use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
@@ -423,6 +423,27 @@ pub struct CayenneAccelerator {
     /// on this one budget, including those created by `CREATE TABLE …
     /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Pins a snapshot reload hands from the replaced provider to the one the
+    /// factory creates, keyed by dataset. An entry lives only for that one
+    /// create: inserted before the factory runs, removed when the reload
+    /// completes or is dropped (`InheritedPinsEntry`).
+    inherited_snapshot_dir_pins:
+        parking_lot::Mutex<HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>>,
+}
+
+/// Removes a dataset's hand-off entry when dropped, so a reload the refresh
+/// runner cancels mid-create leaves no pins for a later create to inherit.
+struct InheritedPinsEntry<'a> {
+    slot: &'a parking_lot::Mutex<
+        HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>,
+    >,
+    dataset: datafusion::common::TableReference,
+}
+
+impl Drop for InheritedPinsEntry<'_> {
+    fn drop(&mut self) {
+        self.slot.lock().remove(&self.dataset);
+    }
 }
 
 /// `(available, total)` permits of the fleet-wide compaction budget.
@@ -1376,6 +1397,7 @@ impl CayenneAccelerator {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
             compaction_semaphore: cayenne::compaction_budget(),
+            inherited_snapshot_dir_pins: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1957,14 +1979,30 @@ impl CayenneAccelerator {
             // changes/CDC refresh mode, and only when a primary key exists
             // (key mode requires one) — explicit `position`/`key` configs and
             // every non-CDC profile keep their config as-is.
+            // The mode as configured, before this and the datalake pin below resolve
+            // `auto`: the auto-tuned config line names it with the reason.
+            let configured_deletion_mode = config.deletion_mode;
             if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
                 && acceleration.refresh_mode == Some(RefreshMode::Changes)
                 && workload.has_primary_key
             {
                 config.deletion_mode = cayenne::metadata::DeletionMode::Key;
-                tracing::debug!(
-                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (CDC refresh mode with a primary key). Key-based deletes compact concurrently with writers; set `cayenne_deletion_mode: position` to opt back into merge-on-read position deletes."
-                );
+            }
+
+            // `auto` keeps a small primary-key table on position deletes, compacted
+            // whole alongside its writes, only where compaction can do that without
+            // slowing queries and writes: on Linux, with 8 or more physical CPU cores
+            // (`cayenne::auto_key_deletes_reason`). Elsewhere the table stays `auto`
+            // but keeps key deletes from the start, so it never records a position
+            // delete and still reclaims, by `auto`'s paced whole-table rewrite,
+            // deletes of rows the bake cannot reach. The auto-tuned config line below
+            // names the choice and its reason.
+            let auto_key_deletes = cayenne::auto_key_deletes_reason();
+            if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
+                && workload.has_primary_key
+                && auto_key_deletes.is_some()
+            {
+                config.auto_keeps_key_deletes = true;
             }
 
             // CDC durability mode (file | memory). Memory mode appends CDC
@@ -2448,6 +2486,30 @@ impl CayenneAccelerator {
                 tracing::warn!(target: "spiced::acceleration::cayenne", "{warning}");
             }
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
+                // `cayenne_deletion_mode` as it resolves for this table, and why.
+                let deletion_mode = cayenne::DeletionModeChoice::resolve(
+                    configured_deletion_mode,
+                    workload.has_primary_key,
+                    if acceleration.refresh_mode == Some(RefreshMode::Changes) {
+                        Some(cayenne::AutoKeyTableKind::Cdc)
+                    } else {
+                        cayenne::AutoKeyTableKind::of(
+                            if !source.is_file_accelerated() {
+                                cayenne::TableStorage::Memory
+                            } else if is_s3 {
+                                cayenne::TableStorage::ObjectStorage
+                            } else {
+                                cayenne::TableStorage::LocalDisk
+                            },
+                            !acceleration.partition_by.is_empty(),
+                            config.cold_tier_enabled(),
+                        )
+                    },
+                    auto_key_deletes,
+                    config
+                        .target_vortex_file_size_mb
+                        .saturating_mul(1024 * 1024),
+                );
                 // A `target_*` SLO with the closed loop off does nothing, and it is easy
                 // to set one and assume it took effect.
                 if targets_are_inert {
@@ -2490,7 +2552,7 @@ impl CayenneAccelerator {
                     inferred_schema_present = workload.inferred_metadata.is_present(),
                     has_primary_key = workload.has_primary_key,
                     is_upsert = workload.is_upsert,
-                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
+                    "Cayenne auto-tuned config: pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                     config.pk_keyset_cache_mb,
                     config.target_vortex_file_size_mb,
                     config.upload_concurrency,
@@ -2499,7 +2561,7 @@ impl CayenneAccelerator {
                     config.compression_strategy,
                     config.delta_encoding,
                     config.pk_conflict_detection.as_str(),
-                    config.deletion_mode,
+                    deletion_mode,
                     config.compaction_trigger_files,
                     config.compaction_trigger_protected_snapshots,
                     config.compaction_trigger_snapshot_age_ms,
@@ -2919,6 +2981,15 @@ impl CayenneAccelerator {
         if let Some(cold) = cold_object_store {
             builder = builder.with_cold_object_store(cold);
         }
+        // A reload's replacement sweeps against the replaced instance's pins, so
+        // queries still reading the replaced snapshot keep their directories.
+        if let Some(pins) = self
+            .inherited_snapshot_dir_pins
+            .lock()
+            .remove(source.name())
+        {
+            builder = builder.with_snapshot_dir_pins(pins);
+        }
         tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table = builder
             .create(table_options)
@@ -3298,7 +3369,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
-            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for every table with a primary key: key-based deletes are recorded by primary-key bytes and sequence number, compact concurrently with writers, and are pruned by the seq-prefix bake pass. It resolves to 'position' (merge-on-read) for a table without a primary key, which has no key to record: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe. 'position' explicitly opts a primary-key table into merge-on-read position deletes, where positions are captured via a row_idx() read-back after each write and any row whose position is not yet known falls back to a key-based delete.")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more physical CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.")
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
@@ -4357,7 +4428,7 @@ impl DataAccelerator for CayenneAccelerator {
     /// factory then reopens the directory tree from disk.
     async fn reload_from_snapshot(
         &self,
-        _source: &dyn AccelerationSource,
+        source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
         provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
@@ -4365,8 +4436,52 @@ impl DataAccelerator for CayenneAccelerator {
         // previous instance's maintenance must stop before the new one starts:
         // nothing in memory serializes two instances' compaction (#11581).
         change_sink::quiesce_table_maintenance(&previous_provider).await;
+        // Queries planned on the previous instance may still read its snapshot
+        // directories after the swap; they pin them in that instance's maps, so
+        // the replacement is opened over the same maps (spiceai/spiceai#14981).
+        let pins = find_concrete::<cayenne::CayenneTableProvider>(
+            previous_provider.as_ref(),
+            LayerWalk::Write,
+        )
+        .map(cayenne::CayenneTableProvider::snapshot_dir_pins);
         drop(previous_provider);
+        let Some(pins) = pins else {
+            // No single Cayenne instance to inherit from (partitioned): no pins,
+            // and `maintain_after_snapshot_restore` reclaims nothing either.
+            return provider_factory().await;
+        };
+        let dataset = source.name().clone();
+        self.inherited_snapshot_dir_pins
+            .lock()
+            .insert(dataset.clone(), pins);
+        let _entry = InheritedPinsEntry {
+            slot: &self.inherited_snapshot_dir_pins,
+            dataset,
+        };
         provider_factory().await
+    }
+
+    /// Reclaim the snapshot directories the restored snapshot no longer
+    /// references. The pins handed over in `reload_from_snapshot` keep the ones
+    /// the replaced instance's queries still read.
+    async fn maintain_after_snapshot_restore(
+        &self,
+        source: &dyn AccelerationSource,
+        provider: &Arc<dyn TableProvider>,
+    ) {
+        let Some(table) =
+            find_concrete::<cayenne::CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
+        else {
+            return;
+        };
+        match table.retire_unreferenced_snapshot_dirs().await {
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                dataset = %source.name(),
+                %error,
+                "Failed to retire the superseded snapshot directories; the next snapshot reload retries"
+            ),
+        }
     }
 
     async fn drop_table(
@@ -6146,6 +6261,122 @@ mod tests {
                 .expect("prepare missing table"),
             BootstrapStatus::None,
             "a dataset with a datalake tier must not be restored from a snapshot"
+        );
+    }
+
+    /// A Cayenne table in its own temp dir, as the provider a reload replaces.
+    async fn cayenne_table(name: &str) -> (Arc<dyn TableProvider>, tempfile::TempDir) {
+        use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = tmp.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            cayenne::CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn cayenne::MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let provider = CayenneTableProviderBuilder::new(
+            catalog,
+            datafusion::prelude::SessionContext::new().runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: name.to_string(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: tmp.path().join("data").to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        })
+        .await
+        .expect("table created");
+        (Arc::new(provider), tmp)
+    }
+
+    /// The refresh runner drops an in-flight reload when another request
+    /// arrives. A reload dropped after it parked the replaced provider's pins
+    /// but before the factory took them must leave nothing for a later create
+    /// to inherit.
+    #[tokio::test]
+    async fn a_dropped_reload_leaves_no_pins_to_inherit() {
+        let accelerator = CayenneAccelerator::new();
+        let source = TestAccelerationSource::new("ds");
+        let (previous, _tmp) = cayenne_table("ds").await;
+        let never_creates: data_accelerator_api::ReloadProviderFactory =
+            Arc::new(|| Box::pin(std::future::pending()));
+
+        let mut reload =
+            Box::pin(accelerator.reload_from_snapshot(&source, previous, never_creates));
+        // Poll until the pins are parked and the factory is pending.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                futures::poll!(reload.as_mut()).is_pending(),
+                "the factory never completes"
+            );
+            if accelerator
+                .inherited_snapshot_dir_pins
+                .lock()
+                .contains_key(&datafusion::common::TableReference::bare("ds"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pins are never parked"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(reload);
+        assert!(
+            accelerator.inherited_snapshot_dir_pins.lock().is_empty(),
+            "a dropped reload clears its hand-off entry"
+        );
+    }
+
+    /// A completed reload hands the replaced provider's pins to the provider the
+    /// factory creates, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_completed_reload_hands_the_pins_over_and_clears_the_slot() {
+        let accelerator = Arc::new(CayenneAccelerator::new());
+        let source = TestAccelerationSource::new("ds");
+        let (previous, _tmp) = cayenne_table("ds").await;
+        let previous_pins =
+            find_concrete::<cayenne::CayenneTableProvider>(previous.as_ref(), LayerWalk::Write)
+                .expect("a Cayenne provider")
+                .snapshot_dir_pins();
+
+        // The factory takes the parked pins, as `create_cayenne_table_provider` does.
+        let taken: Arc<parking_lot::Mutex<Option<cayenne::SnapshotDirPins>>> = Arc::default();
+        let factory_accelerator = Arc::clone(&accelerator);
+        let factory_taken = Arc::clone(&taken);
+        let factory: data_accelerator_api::ReloadProviderFactory = Arc::new(move || {
+            let accelerator = Arc::clone(&factory_accelerator);
+            let taken = Arc::clone(&factory_taken);
+            Box::pin(async move {
+                *taken.lock() = accelerator
+                    .inherited_snapshot_dir_pins
+                    .lock()
+                    .remove(&datafusion::common::TableReference::bare("ds"));
+                let (replacement, tmp) = cayenne_table("ds").await;
+                std::mem::forget(tmp);
+                Ok(replacement)
+            })
+        });
+        accelerator
+            .reload_from_snapshot(&source, previous, factory)
+            .await
+            .expect("the reload completes");
+        assert!(
+            taken
+                .lock()
+                .as_ref()
+                .is_some_and(|pins| pins.is_shared_with(&previous_pins)),
+            "the factory received the replaced provider's pins"
+        );
+        assert!(
+            accelerator.inherited_snapshot_dir_pins.lock().is_empty(),
+            "a completed reload clears its hand-off entry"
         );
     }
 
@@ -8112,8 +8343,10 @@ mod tests {
         .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
-        // A non-CDC profile with a PK stays Auto at config time; Cayenne's own
-        // `DeletionMode::resolved` turns it into `key` for a primary-key table.
+        // A non-CDC profile with a PK stays Auto at config time, and Cayenne
+        // chooses position or key deletes for the table as it grows. On a runtime
+        // without the cores to keep a small table compacted whole, or not on
+        // Linux, it starts on key deletes (pinned by the next two tests).
         let ds = build("full_pk", RefreshMode::Full, vec![]);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "full_pk",
@@ -8123,7 +8356,220 @@ mod tests {
         )
         .await
         .expect("config should be valid");
-        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
+        let keeps_small_tables_compacted = cfg!(target_os = "linux")
+            && cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted();
+        assert_eq!(
+            (config.deletion_mode, config.auto_keeps_key_deletes),
+            (
+                cayenne::metadata::DeletionMode::Auto,
+                !keeps_small_tables_compacted
+            )
+        );
+    }
+
+    /// The auto-tuned config line names how `cayenne_deletion_mode` resolves for
+    /// each table, and why, in the Spicepod's spelling: the CDC pin, an in-memory
+    /// dataset, a datalake tier, an explicit mode, a table without a primary key,
+    /// and a file dataset on this host.
+    #[tokio::test]
+    async fn auto_tuned_config_line_names_the_deletion_mode_and_its_reason() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let pk = autotune::WorkloadProfile {
+            has_primary_key: true,
+            is_upsert: true,
+            pk_arity: 1,
+            ..Default::default()
+        };
+        let no_pk = autotune::WorkloadProfile::default();
+        let captured = capture_logs();
+        let resolve = |name: &'static str,
+                       mode: Mode,
+                       refresh_mode: RefreshMode,
+                       params: Vec<(&'static str, &'static str)>,
+                       workload: autotune::WorkloadProfile| {
+            let app = Arc::clone(&app);
+            async move {
+                let mut dataset = TestAccelerationSource::new(name).with_app(app);
+                dataset.set_acceleration(Acceleration {
+                    engine: Engine::Cayenne,
+                    mode,
+                    refresh_mode: Some(refresh_mode),
+                    params: params
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                    ..Default::default()
+                });
+                CayenneAccelerator::get_vortex_config_with_footer_cache(
+                    name, &dataset, None, &workload,
+                )
+                .await
+                .expect("config should be valid")
+            }
+        };
+
+        for (name, mode, refresh_mode, params, workload, expected) in [
+            (
+                "deletion_mode_line_cdc",
+                Mode::File,
+                RefreshMode::Changes,
+                vec![],
+                pk.clone(),
+                "deletion_mode=key (auto: CDC dataset),",
+            ),
+            (
+                "deletion_mode_line_memory",
+                Mode::Memory,
+                RefreshMode::Full,
+                vec![],
+                pk.clone(),
+                "deletion_mode=key (auto: in-memory dataset),",
+            ),
+            (
+                "deletion_mode_line_datalake",
+                Mode::File,
+                RefreshMode::Append,
+                vec![("cayenne_datalake_location", "s3://bucket/prefix")],
+                pk.clone(),
+                "deletion_mode=key (auto: datalake tier),",
+            ),
+            (
+                "deletion_mode_line_position",
+                Mode::File,
+                RefreshMode::Full,
+                vec![("cayenne_deletion_mode", "position")],
+                pk.clone(),
+                "deletion_mode=position,",
+            ),
+            (
+                "deletion_mode_line_no_pk",
+                Mode::File,
+                RefreshMode::Full,
+                vec![],
+                no_pk.clone(),
+                "deletion_mode=position (no primary key),",
+            ),
+        ] {
+            resolve(name, mode, refresh_mode, params, workload).await;
+            assert_eq!(captured.occurrences_of(expected), 1, "{name}: {expected}");
+        }
+
+        // A file dataset with a primary key: the choice depends on this host.
+        let config = resolve(
+            "deletion_mode_line_file",
+            Mode::File,
+            RefreshMode::Full,
+            vec![],
+            pk.clone(),
+        )
+        .await;
+        let expected = if cfg!(target_os = "linux") {
+            format!(
+                "deletion_mode={},",
+                cayenne::DeletionModeChoice::resolve(
+                    cayenne::metadata::DeletionMode::Auto,
+                    true,
+                    None,
+                    cayenne::auto_key_deletes_reason(),
+                    config.target_vortex_file_size_mb * 1024 * 1024,
+                )
+            )
+        } else {
+            "deletion_mode=auto (key deletes: position deletes need Linux),".to_string()
+        };
+        assert_eq!(captured.occurrences_of(&expected), 1, "{expected}");
+    }
+
+    /// Off Linux, `spiced`'s compaction cannot run below the priority of queries
+    /// and writes, so a primary-key table with `deletion_mode: auto` keeps key
+    /// deletes from the start whatever the core count. It stays `auto`.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn test_deletion_mode_auto_keeps_key_deletes_off_linux() {
+        let mut ds = TestAccelerationSource::new("off_linux_pk");
+        ds.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            ..Default::default()
+        });
+        let workload = autotune::WorkloadProfile {
+            has_primary_key: true,
+            is_upsert: true,
+            pk_arity: 1,
+            ..Default::default()
+        };
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "off_linux_pk",
+            &ds,
+            None,
+            &workload,
+        )
+        .await
+        .expect("config should be valid");
+        assert_eq!(
+            (config.deletion_mode, config.auto_keeps_key_deletes),
+            (cayenne::metadata::DeletionMode::Auto, true),
+            "{} CPU cores",
+            cpu_budget::cpu_budget().cores()
+        );
+    }
+
+    /// On a runtime with too few cores to keep a small table compacted whole
+    /// alongside its writes, a primary-key table with `deletion_mode: auto` stays
+    /// `auto` but keeps key deletes from the start. Explicit modes and tables
+    /// without a primary key are unaffected. Runs under an installed budget of two
+    /// or three cores.
+    #[tokio::test]
+    async fn test_deletion_mode_auto_keeps_key_deletes_on_a_small_host() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "tests::test_deletion_mode_auto_keeps_key_deletes_on_a_small_host",
+        )
+        .expect("an isolated run with an installed CPU budget") else {
+            return;
+        };
+        assert!(
+            !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted(),
+            "premise: a {cores}-core budget is a small host"
+        );
+        let resolve = |name: &'static str, params: Vec<(String, String)>, has_primary_key: bool| async move {
+            let mut ds = TestAccelerationSource::new(name);
+            ds.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            let workload = autotune::WorkloadProfile {
+                has_primary_key,
+                is_upsert: has_primary_key,
+                pk_arity: usize::from(has_primary_key),
+                ..Default::default()
+            };
+            let config =
+                CayenneAccelerator::get_vortex_config_with_footer_cache(name, &ds, None, &workload)
+                    .await
+                    .expect("config should be valid");
+            (config.deletion_mode, config.auto_keeps_key_deletes)
+        };
+        assert_eq!(
+            resolve("small_host_pk", vec![], true).await,
+            (cayenne::metadata::DeletionMode::Auto, true)
+        );
+        assert_eq!(
+            resolve(
+                "small_host_pk_position",
+                vec![("cayenne_deletion_mode".to_string(), "position".to_string())],
+                true
+            )
+            .await,
+            (cayenne::metadata::DeletionMode::Position, false)
+        );
+        assert_eq!(
+            resolve("small_host_no_pk", vec![], false).await,
+            (cayenne::metadata::DeletionMode::Auto, false)
+        );
     }
 
     fn datalake_test_options(

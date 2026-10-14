@@ -103,7 +103,7 @@ curl -X POST http://localhost:8090/v1/decisions \
 
 ```json
 {
-  "model": "jev-1.13.0",
+  "model": "jev",
   "answers": [
     {"type": "predicate", "name": "urgent", "probability": 0.9},
     {"type": "choice", "name": "team", "choice": "billing",
@@ -120,6 +120,7 @@ curl -X POST http://localhost:8090/v1/decisions \
 - `input`: a string, or user messages with `input_text` parts. Image inputs return 400.
 - `reasoning_effort` (optional): `none`, `minimal`, `low`, `medium`, `high` or `xhigh`, passed to a chat model's completion request. Omitted keeps the model's setting. This is a Spice extension; OpenAI's Decisions API has no such field. A decision model returns 400 with `code` `unsupported_parameter`.
 - Any other field outside OpenAI's schema returns 400. Errors use OpenAI's envelope: `{"error": {"message", "type", "param", "code"}}`.
+- The response's `model` is the name the request used.
 - `usage` is omitted when the model did not report it.
 - Each request is recorded in `runtime.task_history` as an `ai_decision` task.
 

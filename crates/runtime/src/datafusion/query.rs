@@ -1686,10 +1686,7 @@ impl Query {
                     let session_ctx = if let Some(flight_session) =
                         owned_flight_session(&request_context)
                     {
-                        tracing::debug!(
-                            "Statement plan using Flight session: {}",
-                            flight_session.session_context().session_id()
-                        );
+                        tracing::debug!("Statement plan using the request's Flight session");
                         Arc::clone(flight_session.session_context())
                     } else {
                         tracing::debug!(
@@ -2065,6 +2062,25 @@ impl Query {
                     }
                 }
             }
+        };
+
+        // Bind any supplied parameter values the same way execution does, so the
+        // advertised schema matches the streamed one: a bound `$1` becomes a
+        // typed, non-null literal (e.g. `SELECT $1` is `Int64 NOT NULL`, not a
+        // nullable `Null`).
+        let plan = match &self.sql {
+            QueryMethod::Text {
+                parameters: Some(parameters),
+                ..
+            } => match plan.with_param_values(parameters.clone()) {
+                Ok(bound) => Box::new(bound),
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            },
+            _ => plan,
         };
 
         // Verify the plan against the restricted options

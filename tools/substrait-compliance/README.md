@@ -186,15 +186,16 @@ layout, then each layout against the default.
 
 ## CI
 
-`.github/workflows/substrait_compliance.yml` runs Mode A at SF 1 on the
-`spiceai-macos` runners for every merge-queue entry, on push to
-trunk/release/feature branches, nightly, and on `workflow_dispatch`; not
-on `pull_request`. The merge-queue run has no path filter: the consumer it
-measures moves with any DataFusion, arrow or fork-pin change in the
-workspace. Per-query FAIL/ERROR exit 0; a harness/build crash fails the job
-(no `continue-on-error`). Uploads the JSON and CSV reports as an artifact.
-The job is not in `REQUIRED_CHECKS`, so the queue does not wait on it. Do
-not gate merge on pass rate until a threshold is set from this baseline.
+`.github/workflows/substrait_compliance.yml` runs Mode A at SF 1 for every
+merge-queue entry on the `spiceai-macos-large` runners, and on push to
+trunk/release/feature branches, nightly, and on `workflow_dispatch` on the
+`spiceai-macos` runners; not on `pull_request`. The merge-queue run has no
+path filter: the consumer it measures moves with any DataFusion, arrow or
+fork-pin change in the workspace. Per-query FAIL/ERROR exit 0; a
+harness/build crash fails the job (no `continue-on-error`). Uploads the JSON
+and CSV reports as an artifact. The job is not in `REQUIRED_CHECKS`, so the
+queue does not wait on it. Do not gate merge on pass rate until a threshold
+is set from this baseline.
 
 The same workflow runs Mode B nightly and on `workflow_dispatch`, one job per
 acceleration engine (Cayenne file and memory, DuckDB file and memory, Arrow,

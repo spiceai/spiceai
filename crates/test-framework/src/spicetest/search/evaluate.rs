@@ -15,146 +15,272 @@ limitations under the License.
 */
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
-/// Retrieval-quality metrics computed over a full search run, each evaluated at the same rank
-/// cutoff `k` (see [`calculate_retrieval_metrics`]).
+use anyhow::Context;
+
+/// Id of a judged query, from the `query-id` column of the relevance judgments.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QueryId(String);
+
+impl QueryId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for QueryId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
+impl From<&str> for QueryId {
+    fn from(id: &str) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl fmt::Display for QueryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Retrieval-quality metrics at one rank cutoff `k`, for one query or as the mean over all
+/// judged queries (see [`RetrievalEvaluation`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetrievalMetrics {
     /// Normalized Discounted Cumulative Gain@k.
     pub ndcg: f64,
     /// Recall@k: fraction of all relevant documents found within the top k results.
     pub recall: f64,
-    /// Mean Reciprocal Rank@k: average of `1 / rank_of_first_relevant_result` within the top k.
+    /// Reciprocal Rank@k: `1 / rank_of_first_relevant_result` within the top k. Its mean over
+    /// queries is MRR@k.
     pub mrr: f64,
     /// Precision@k: fraction of the top k results that are relevant.
     pub precision: f64,
 }
 
-/// Calculates NDCG@k, Recall@k, MRR@k, and Precision@k in a single pass over `qrels`, following
-/// the MTEB `RetrievalEvaluator` methodology for NDCG and the standard TREC/`pytrec_eval`
-/// binary-relevance convention (relevance grade > 0 counts as relevant) for the other three.
+impl RetrievalMetrics {
+    /// Mean of each metric over `metrics`, or `None` when `metrics` is empty.
+    fn mean<'a>(metrics: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
+        let mut count = 0_u32;
+        let mut sum = Self {
+            ndcg: 0.0,
+            recall: 0.0,
+            mrr: 0.0,
+            precision: 0.0,
+        };
+        for m in metrics {
+            count += 1;
+            sum.ndcg += m.ndcg;
+            sum.recall += m.recall;
+            sum.mrr += m.mrr;
+            sum.precision += m.precision;
+        }
+        if count == 0 {
+            return None;
+        }
+        let n = f64::from(count);
+        Some(Self {
+            ndcg: sum.ndcg / n,
+            recall: sum.recall / n,
+            mrr: sum.mrr / n,
+            precision: sum.precision / n,
+        })
+    }
+}
+
+/// One judged query's metrics at every rank cutoff `1..=max_k` of its [`RetrievalEvaluation`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryRetrievalMetrics {
+    result_count: usize,
+    /// The metrics at cutoff `k` are at index `k - 1`.
+    metrics: Vec<RetrievalMetrics>,
+}
+
+impl QueryRetrievalMetrics {
+    /// Number of results the search returned for this query. Zero when it returned none.
+    #[must_use]
+    pub fn result_count(&self) -> usize {
+        self.result_count
+    }
+
+    /// The metrics at rank cutoff `k`, or `None` when `k` is outside `1..=max_k`.
+    #[must_use]
+    pub fn at_k(&self, k: usize) -> Option<&RetrievalMetrics> {
+        k.checked_sub(1).and_then(|index| self.metrics.get(index))
+    }
+}
+
+/// Per-query retrieval metrics for every judged query in `qrels`, at every rank cutoff `k` in
+/// `1..=max_k`. Every query has a value at every cutoff, so two runs over the same query set pair
+/// up query by query. The run-level metrics are the means of these values ([`Self::mean_at_k`]).
 ///
-/// # Arguments
-/// * `qrels` - Query relevance judgments mapping `query_id` -> (`doc_id` -> `relevance_score`)
-/// * `results` - Search results mapping `query_id` -> (`doc_id` -> `similarity_score`)
-/// * `k` - Rank cutoff shared by all four metrics
-///
-/// Every judged query in `qrels` contributes to each average. A query the search returned
-/// nothing for scores 0.0 rather than being dropped — dropping it would raise the mean
-/// instead of lowering it.
-///
-/// # Errors
-/// Returns an error when `qrels` is empty: an average over zero queries is undefined.
+/// NDCG follows the MTEB `RetrievalEvaluator` methodology. Recall, MRR, and precision follow the
+/// standard TREC/`pytrec_eval` binary-relevance convention (relevance grade > 0 is relevant).
+/// Queries that have search results but no relevance judgments are not evaluated.
 ///
 /// # Reference
 /// MTEB `RetrievalEvaluator`: <https://github.com/embeddings-benchmark/mteb/blob/03347ebfe4809056e0fd2894fcae69dcdd2ed964/mteb/evaluation/evaluators/RetrievalEvaluator.py#L500>
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievalEvaluation {
+    max_k: usize,
+    /// Never empty: construction rejects an empty `qrels`.
+    queries: BTreeMap<QueryId, QueryRetrievalMetrics>,
+}
+
+impl RetrievalEvaluation {
+    /// Evaluates every judged query at each rank cutoff `1..=max_k`.
+    ///
+    /// # Arguments
+    /// * `qrels` - Query relevance judgments mapping `query_id` -> (`doc_id` -> `relevance_score`)
+    /// * `results` - Search results mapping `query_id` -> (`doc_id` -> `similarity_score`)
+    ///
+    /// A judged query the search returned nothing for scores 0.0 at every cutoff rather than being
+    /// dropped: dropping it would raise the mean instead of lowering it.
+    ///
+    /// # Errors
+    /// Returns an error when `qrels` is empty: an average over zero queries is undefined.
+    pub(crate) fn new<S: ::std::hash::BuildHasher>(
+        qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+        results: &HashMap<String, HashMap<String, f64, S>, S>,
+        max_k: usize,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::from_ranked(ranked_relevance(qrels, results)?, max_k))
+    }
+
+    /// [`Self::new`] up to the largest number of results returned for any judged query. Because
+    /// those results are already retrieved, the full metric-vs-`k` curve needs no extra search.
+    /// A query that returned fewer than `k` results keeps its saturated (`take(k)`) list.
+    ///
+    /// # Errors
+    /// Returns an error when `qrels` is empty.
+    pub fn up_to_longest_result_list<S: ::std::hash::BuildHasher>(
+        qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+        results: &HashMap<String, HashMap<String, f64, S>, S>,
+    ) -> anyhow::Result<Self> {
+        let ranked = ranked_relevance(qrels, results)?;
+        let max_k = ranked
+            .values()
+            .map(|query| query.ranked_relevance.len())
+            .max()
+            .unwrap_or(0);
+        Ok(Self::from_ranked(ranked, max_k))
+    }
+
+    fn from_ranked<S: ::std::hash::BuildHasher>(
+        ranked: BTreeMap<QueryId, QueryRankedRelevance<'_, S>>,
+        max_k: usize,
+    ) -> Self {
+        let queries = ranked
+            .into_iter()
+            .map(|(query_id, query)| {
+                let metrics = (1..=max_k)
+                    .map(|k| RetrievalMetrics {
+                        ndcg: ndcg_at_k(&query.ranked_relevance, query.relevance, k),
+                        recall: recall_at_k(&query.ranked_relevance, query.relevance, k),
+                        mrr: mrr_at_k(&query.ranked_relevance, k),
+                        precision: precision_at_k(&query.ranked_relevance, k),
+                    })
+                    .collect();
+                let metrics = QueryRetrievalMetrics {
+                    result_count: query.ranked_relevance.len(),
+                    metrics,
+                };
+                (query_id, metrics)
+            })
+            .collect();
+        Self { max_k, queries }
+    }
+
+    /// Largest evaluated rank cutoff. Zero when no judged query returned any result.
+    #[must_use]
+    pub fn max_k(&self) -> usize {
+        self.max_k
+    }
+
+    /// Every judged query's metrics, ordered by query id.
+    #[must_use]
+    pub fn queries(&self) -> &BTreeMap<QueryId, QueryRetrievalMetrics> {
+        &self.queries
+    }
+
+    /// Every judged query's metrics at rank cutoff `k`. Empty when `k` is outside `1..=max_k`.
+    pub fn at_k(&self, k: usize) -> impl Iterator<Item = (&QueryId, &RetrievalMetrics)> {
+        self.queries
+            .iter()
+            .filter_map(move |(query_id, query)| query.at_k(k).map(|m| (query_id, m)))
+    }
+
+    /// Mean over all judged queries at rank cutoff `k`, or `None` when `k` is outside `1..=max_k`.
+    #[must_use]
+    pub fn mean_at_k(&self, k: usize) -> Option<RetrievalMetrics> {
+        RetrievalMetrics::mean(self.at_k(k).map(|(_, m)| m))
+    }
+
+    /// Mean over all judged queries at every rank cutoff, keyed by `k` (ascending).
+    #[must_use]
+    pub fn mean_at_all_k(&self) -> BTreeMap<usize, RetrievalMetrics> {
+        (1..=self.max_k)
+            .filter_map(|k| self.mean_at_k(k).map(|m| (k, m)))
+            .collect()
+    }
+}
+
+/// Mean NDCG@k, Recall@k, MRR@k, and Precision@k over every judged query in `qrels` (see
+/// [`RetrievalEvaluation`]).
+///
+/// # Errors
+/// Returns an error when `qrels` is empty or `k` is zero.
 pub(crate) fn calculate_retrieval_metrics<S: ::std::hash::BuildHasher>(
     qrels: &HashMap<String, HashMap<String, i32, S>, S>,
     results: &HashMap<String, HashMap<String, f64, S>, S>,
     k: usize,
 ) -> anyhow::Result<RetrievalMetrics> {
-    anyhow::ensure!(
-        !qrels.is_empty(),
-        "Cannot calculate retrieval metrics: no query relevance judgments were provided"
-    );
-
-    let mut ndcg_values = Vec::with_capacity(qrels.len());
-    let mut recall_values = Vec::with_capacity(qrels.len());
-    let mut mrr_values = Vec::with_capacity(qrels.len());
-    let mut precision_values = Vec::with_capacity(qrels.len());
-
-    for (query_id, relevance) in qrels {
-        // An unanswered query ranks nothing, which scores 0.0 for all four metrics
-        // through the same code path as a ranking that retrieved nothing relevant.
-        let ranked_relevance = if let Some(ranked_results) = results.get(query_id) {
-            score_sorted_relevance(ranked_results, relevance)
-        } else {
-            println!("No search results found for test query {query_id}");
-            Vec::new()
-        };
-
-        ndcg_values.push(ndcg_at_k(&ranked_relevance, relevance, k));
-        recall_values.push(recall_at_k(&ranked_relevance, relevance, k));
-        mrr_values.push(mrr_at_k(&ranked_relevance, k));
-        precision_values.push(precision_at_k(&ranked_relevance, k));
-    }
-
-    Ok(RetrievalMetrics {
-        ndcg: average(&ndcg_values),
-        recall: average(&recall_values),
-        mrr: average(&mrr_values),
-        precision: average(&precision_values),
-    })
+    RetrievalEvaluation::new(qrels, results, k)?
+        .mean_at_k(k)
+        .context("Cannot calculate retrieval metrics: the rank cutoff k must be at least 1")
 }
 
-/// One query's precomputed rank-ordered relevance grades (see [`score_sorted_relevance`]),
-/// paired with its full relevance judgments so per-k metrics can be recomputed cheaply.
+/// One judged query's rank-ordered relevance grades (see [`score_sorted_relevance`]), paired with
+/// its full relevance judgments so per-k metrics can be computed cheaply.
 struct QueryRankedRelevance<'a, S> {
     ranked_relevance: Vec<f64>,
     relevance: &'a HashMap<String, i32, S>,
 }
 
-/// Computes [`RetrievalMetrics`] at every rank cutoff `k` in `1..=n`, where `n` is the largest
-/// number of results returned for any evaluated query. Because the top-`n` results for a query are
-/// already retrieved, evaluating every `k` is pure post-processing over the ranked relevance list —
-/// no additional search is required — so the full metric-vs-`k` curve comes for free.
-///
-/// Each query's ranked relevance is computed once (via [`score_sorted_relevance`]) and reused across
-/// all `k`, and the same per-metric helpers as [`calculate_retrieval_metrics`] are applied, so the
-/// value at any `k` here equals `calculate_retrieval_metrics(qrels, results, k)` by construction. A
-/// query returning fewer than `k` results contributes its saturated (`take(k)`) list, exactly as the
-/// single-cutoff path already does when a query returns fewer than `k` documents.
-///
-/// The result is keyed by `k` (ascending); an empty map means no query had any results to evaluate.
-#[must_use]
-pub(crate) fn calculate_retrieval_metrics_at_all_k<S: ::std::hash::BuildHasher>(
-    qrels: &HashMap<String, HashMap<String, i32, S>, S>,
+/// Ranks the results of every judged query in `qrels`. A judged query without results gets an
+/// empty ranking, which scores 0.0 through the same code path as a ranking with nothing relevant.
+fn ranked_relevance<'a, S: ::std::hash::BuildHasher>(
+    qrels: &'a HashMap<String, HashMap<String, i32, S>, S>,
     results: &HashMap<String, HashMap<String, f64, S>, S>,
-) -> BTreeMap<usize, RetrievalMetrics> {
-    // Precompute each evaluated query's ranked relevance once, plus the max list length (`n`).
-    let mut per_query: Vec<QueryRankedRelevance<'_, S>> = Vec::new();
-    let mut max_k = 0;
+) -> anyhow::Result<BTreeMap<QueryId, QueryRankedRelevance<'a, S>>> {
+    anyhow::ensure!(
+        !qrels.is_empty(),
+        "Cannot calculate retrieval metrics: no query relevance judgments were provided"
+    );
 
-    for (query_id, relevance) in qrels {
-        let Some(ranked_results) = results.get(query_id) else {
-            println!("No search results found for test query {query_id}");
-            continue;
-        };
-
-        let ranked_relevance = score_sorted_relevance(ranked_results, relevance);
-        max_k = max_k.max(ranked_relevance.len());
-        per_query.push(QueryRankedRelevance {
-            ranked_relevance,
-            relevance,
-        });
-    }
-
-    let mut metrics_by_k = BTreeMap::new();
-    for k in 1..=max_k {
-        let mut ndcg_values = Vec::with_capacity(per_query.len());
-        let mut recall_values = Vec::with_capacity(per_query.len());
-        let mut mrr_values = Vec::with_capacity(per_query.len());
-        let mut precision_values = Vec::with_capacity(per_query.len());
-
-        for query in &per_query {
-            ndcg_values.push(ndcg_at_k(&query.ranked_relevance, query.relevance, k));
-            recall_values.push(recall_at_k(&query.ranked_relevance, query.relevance, k));
-            mrr_values.push(mrr_at_k(&query.ranked_relevance, k));
-            precision_values.push(precision_at_k(&query.ranked_relevance, k));
-        }
-
-        metrics_by_k.insert(
-            k,
-            RetrievalMetrics {
-                ndcg: average(&ndcg_values),
-                recall: average(&recall_values),
-                mrr: average(&mrr_values),
-                precision: average(&precision_values),
-            },
-        );
-    }
-
-    metrics_by_k
+    Ok(qrels
+        .iter()
+        .map(|(query_id, relevance)| {
+            let ranked_relevance = if let Some(ranked_results) = results.get(query_id) {
+                score_sorted_relevance(ranked_results, relevance)
+            } else {
+                println!("No search results found for test query {query_id}");
+                Vec::new()
+            };
+            (
+                QueryId::from(query_id.as_str()),
+                QueryRankedRelevance {
+                    ranked_relevance,
+                    relevance,
+                },
+            )
+        })
+        .collect())
 }
 
 /// Orders a query's search results by score (descending) and returns the relevance grade of each
@@ -173,13 +299,6 @@ fn score_sorted_relevance<S: ::std::hash::BuildHasher>(
         .collect()
 }
 
-/// Mean of `values`. Never called with an empty slice: `calculate_retrieval_metrics`
-/// rejects empty `qrels` and pushes exactly one value per judged query.
-#[expect(clippy::cast_precision_loss)]
-fn average(values: &[f64]) -> f64 {
-    values.iter().sum::<f64>() / values.len() as f64
-}
-
 #[expect(clippy::cast_precision_loss)]
 fn dcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
     relevance_scores
@@ -187,7 +306,9 @@ fn dcg_at_k(relevance_scores: &[f64], k: usize) -> f64 {
         .take(k)
         .enumerate()
         .map(|(i, &rel)| rel / (i as f64 + 2f64).log2())
-        .sum()
+        .sum::<f64>()
+        // An empty f64 sum is -0.0; adding 0.0 makes it 0.0, so per-query metrics never show -0.0.
+        + 0.0
 }
 
 /// Ideal DCG@k: every document judged for this query, ranked by relevance grade. Taken from
@@ -258,11 +379,59 @@ fn mrr_at_k(ranked_relevance: &[f64], k: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_retrieval_metrics, calculate_retrieval_metrics_at_all_k};
-    use std::collections::HashMap;
+    use super::{QueryId, RetrievalEvaluation, RetrievalMetrics, calculate_retrieval_metrics};
+    use std::collections::{BTreeMap, HashMap};
 
     type Qrels = HashMap<String, HashMap<String, i32>>;
     type ScoredResults = HashMap<String, HashMap<String, f64>>;
+
+    fn calculate_retrieval_metrics_at_all_k(
+        qrels: &Qrels,
+        results: &ScoredResults,
+    ) -> BTreeMap<usize, RetrievalMetrics> {
+        RetrievalEvaluation::up_to_longest_result_list(qrels, results)
+            .expect("metrics are calculable for a non-empty qrels")
+            .mean_at_all_k()
+    }
+
+    fn assert_close(actual: f64, expected: f64, what: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "{what}: expected {expected}, got {actual}"
+        );
+    }
+
+    /// q1 ranks its only relevant doc 2nd of 3, q2 ranks its two relevant docs 1st and 3rd of 3,
+    /// and q3 is judged but has no search results.
+    fn three_queries_one_unanswered() -> (Qrels, ScoredResults) {
+        let qrels = HashMap::from([
+            ("q1".to_string(), HashMap::from([("a1".to_string(), 1)])),
+            (
+                "q2".to_string(),
+                HashMap::from([("b0".to_string(), 2), ("b2".to_string(), 1)]),
+            ),
+            ("q3".to_string(), HashMap::from([("c0".to_string(), 1)])),
+        ]);
+        let results = HashMap::from([
+            (
+                "q1".to_string(),
+                HashMap::from([
+                    ("a0".to_string(), 0.9),
+                    ("a1".to_string(), 0.8),
+                    ("a2".to_string(), 0.7),
+                ]),
+            ),
+            (
+                "q2".to_string(),
+                HashMap::from([
+                    ("b0".to_string(), 0.9),
+                    ("b1".to_string(), 0.8),
+                    ("b2".to_string(), 0.7),
+                ]),
+            ),
+        ]);
+        (qrels, results)
+    }
 
     /// Six distinct relevance grades, all "relevant" (grade > 0), ranked by search score in
     /// exactly the same order as their relevance grade. Any ordering other than
@@ -523,6 +692,111 @@ mod tests {
         );
     }
 
+    /// The all-k path must score an unanswered judged query as 0.0, the same as the single-k
+    /// path. It used to skip the query, so the mean covered only the answered queries.
+    #[test]
+    fn all_k_keeps_an_unanswered_query_in_the_average() {
+        let qrels: Qrels = HashMap::from([
+            ("q1".to_string(), HashMap::from([("doc0".to_string(), 1)])),
+            ("q2".to_string(), HashMap::from([("doc1".to_string(), 1)])),
+        ]);
+        let results: ScoredResults =
+            HashMap::from([("q1".to_string(), HashMap::from([("doc0".to_string(), 0.9)]))]);
+
+        let all_k = calculate_retrieval_metrics_at_all_k(&qrels, &results);
+        let single_k = calculate_retrieval_metrics(&qrels, &results, 1)
+            .expect("metrics are calculable for a non-empty qrels");
+        assert_eq!(all_k.get(&1), Some(&single_k));
+        assert_close(single_k.ndcg, 0.5, "ndcg@1");
+    }
+
+    #[test]
+    fn per_query_metrics_cover_every_judged_query_at_every_k() {
+        let (qrels, results) = three_queries_one_unanswered();
+        let evaluation = RetrievalEvaluation::up_to_longest_result_list(&qrels, &results)
+            .expect("metrics are calculable for a non-empty qrels");
+
+        assert_eq!(evaluation.max_k(), 3);
+        let ids: Vec<&str> = evaluation.queries().keys().map(QueryId::as_str).collect();
+        assert_eq!(ids, vec!["q1", "q2", "q3"]);
+
+        let q1 = &evaluation.queries()[&QueryId::from("q1")];
+        assert_eq!(q1.result_count(), 3);
+        let q1_at_1 = q1.at_k(1).expect("k=1 is evaluated");
+        assert_close(q1_at_1.mrr, 0.0, "q1 rr@1");
+        assert_close(q1_at_1.recall, 0.0, "q1 recall@1");
+        let q1_at_3 = q1.at_k(3).expect("k=3 is evaluated");
+        assert_close(q1_at_3.mrr, 0.5, "q1 rr@3");
+        assert_close(q1_at_3.recall, 1.0, "q1 recall@3");
+        assert_close(q1_at_3.precision, 1.0 / 3.0, "q1 precision@3");
+        // DCG@3 = 1/log2(3); the ideal ranks the one relevant doc first, so IDCG@3 = 1.
+        assert_close(q1_at_3.ndcg, 1.0 / 3.0f64.log2(), "q1 ndcg@3");
+        assert!(q1.at_k(0).is_none() && q1.at_k(4).is_none());
+
+        let q2_at_3 = evaluation.queries()[&QueryId::from("q2")]
+            .at_k(3)
+            .expect("k=3 is evaluated");
+        assert_close(q2_at_3.mrr, 1.0, "q2 rr@3");
+        assert_close(q2_at_3.recall, 1.0, "q2 recall@3");
+        assert_close(q2_at_3.precision, 2.0 / 3.0, "q2 precision@3");
+        // DCG@3 = 2/log2(2) + 1/log2(4); the ideal puts grade 1 at rank 2: 2 + 1/log2(3).
+        assert_close(q2_at_3.ndcg, 2.5 / (2.0 + 1.0 / 3.0f64.log2()), "q2 ndcg@3");
+
+        // The unanswered query is kept, with 0.0 at every cutoff.
+        let q3 = &evaluation.queries()[&QueryId::from("q3")];
+        assert_eq!(q3.result_count(), 0);
+        for k in 1..=3 {
+            let zero = RetrievalMetrics {
+                ndcg: 0.0,
+                recall: 0.0,
+                mrr: 0.0,
+                precision: 0.0,
+            };
+            assert_eq!(q3.at_k(k), Some(&zero), "q3 at k={k}");
+            // `-0.0 == 0.0`, so check the sign too: a written file must show `0.0`.
+            assert!(
+                q3.at_k(k).is_some_and(|m| m.ndcg.is_sign_positive()),
+                "q3 ndcg@{k} must be +0.0"
+            );
+        }
+        assert_eq!(evaluation.at_k(2).count(), 3);
+        assert_eq!(evaluation.at_k(4).count(), 0);
+    }
+
+    /// The run-level value at each k is the plain mean of the per-query values at that k.
+    #[test]
+    fn mean_at_k_is_the_mean_of_the_per_query_metrics() {
+        let (qrels, results) = three_queries_one_unanswered();
+        let evaluation = RetrievalEvaluation::up_to_longest_result_list(&qrels, &results)
+            .expect("metrics are calculable for a non-empty qrels");
+        let means = evaluation.mean_at_all_k();
+        assert_eq!(means.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        for (&k, mean) in &means {
+            let per_query: Vec<&RetrievalMetrics> = evaluation.at_k(k).map(|(_, m)| m).collect();
+            assert_eq!(per_query.len(), 3, "every judged query counts at k={k}");
+            #[expect(clippy::cast_precision_loss)]
+            let n = per_query.len() as f64;
+            let sum =
+                |f: fn(&RetrievalMetrics) -> f64| per_query.iter().copied().map(f).sum::<f64>();
+            assert_close(mean.ndcg, sum(|m| m.ndcg) / n, &format!("ndcg@{k}"));
+            assert_close(mean.recall, sum(|m| m.recall) / n, &format!("recall@{k}"));
+            assert_close(mean.mrr, sum(|m| m.mrr) / n, &format!("mrr@{k}"));
+            assert_close(
+                mean.precision,
+                sum(|m| m.precision) / n,
+                &format!("precision@{k}"),
+            );
+            assert_eq!(
+                Some(*mean),
+                calculate_retrieval_metrics(&qrels, &results, k).ok(),
+                "all-k and single-k disagree at k={k}"
+            );
+        }
+        // MRR@3 = (1/2 + 1 + 0) / 3.
+        assert_close(means[&3].mrr, 0.5, "mrr@3");
+    }
+
     /// An empty `qrels` used to divide by zero and publish `NaN` into the benchmark metrics.
     #[test]
     fn empty_qrels_is_an_error_rather_than_nan() {
@@ -533,5 +807,7 @@ mod tests {
             calculate_retrieval_metrics(&qrels, &results, 10).is_err(),
             "expected an error when no query relevance judgments are provided"
         );
+        RetrievalEvaluation::up_to_longest_result_list(&qrels, &results)
+            .expect_err("expected an error when no query relevance judgments are provided");
     }
 }

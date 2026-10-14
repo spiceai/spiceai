@@ -885,11 +885,11 @@ pub async fn build_object_store_internal(
     io_runtime: Handle,
     state: &StateLocation,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
-    crate::object_store_state::build_object_store(
+    runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         state,
-        crate::object_store_state::StateFeature::Scheduler,
+        runtime_state_location::StateFeature::Scheduler,
     )
     .await
     .map_err(|source| Error::ObjectStoreState {

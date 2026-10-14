@@ -30,7 +30,7 @@ pub(crate) async fn handle(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<SchemaResult>, Status> {
     let _start = metrics::track_flight_request("get_schema", None).await;
-    tracing::trace!("get_schema: {request:?}");
+    tracing::trace!("get_schema: {:?}", request.get_ref());
 
     let fd = request.into_inner();
 

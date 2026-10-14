@@ -1275,15 +1275,21 @@ impl<'a> AppendMutationWriter<'a> {
                 )),
             });
         }
+        let (write_policy, scope) = if self.into_empty_table {
+            (
+                crate::provider::delta_encoding::WritePolicy::BULK_LOAD,
+                super::append_stage::ValidationScope::Empty,
+            )
+        } else {
+            (
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+                super::append_stage::ValidationScope::Locked,
+            )
+        };
         let write = super::overwrite::WriteShape {
             target_size_bytes: self.context.target_file_size_bytes(),
             target_partitions: self.task_context.session_config().target_partitions(),
-            write_policy: crate::provider::delta_encoding::WritePolicy::DELTA,
-        };
-        let scope = if self.into_empty_table {
-            super::append_stage::ValidationScope::Empty
-        } else {
-            super::append_stage::ValidationScope::Locked
+            write_policy,
         };
         let super::append_stage::StagedAppend {
             new_snapshot_id: snapshot_id,
@@ -1292,6 +1298,7 @@ impl<'a> AppendMutationWriter<'a> {
             stats,
             row_count: rows,
             superseded: superseded_rows,
+            first_load_pk_bloom,
         } = self
             .table
             .stage_resolved_append(data, resolver, write, scope)
@@ -1313,6 +1320,7 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
             superseded: superseded_rows,
             into_empty_table: self.into_empty_table,
+            first_load_pk_bloom,
         }
         .commit()
         .await

@@ -183,7 +183,7 @@ pub fn from_access_token(
 
     Databricks {
         model: model.to_string(),
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         health_check: HealthCheck::Required,
         cache: None,
     }
@@ -209,7 +209,7 @@ pub fn from_token_provider(
 
     Databricks {
         model: model.to_string(),
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         health_check,
         cache: None,
     }

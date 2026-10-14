@@ -53,7 +53,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::{RequestContextLayer, WriteRateLimitLayer};
+use middleware::{FlightSessionLayer, RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_tls::TlsConfig;
@@ -233,8 +233,19 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
+        Self::get_arrow_schema_with_params(datafusion, sql, None).await
+    }
+
+    /// Like [`Self::get_arrow_schema`], but binds `parameters` before deriving
+    /// the schema so it matches what `do_get` streams for the same values.
+    async fn get_arrow_schema_with_params(
+        datafusion: Arc<DataFusion>,
+        sql: &str,
+        parameters: Option<datafusion::common::ParamValues>,
+    ) -> Result<(Schema, Option<Schema>), Status> {
         let read_only = crate::http::v1::current_principal_requires_read_only().await;
         let query = QueryBuilder::new(sql, datafusion)
+            .parameters(parameters)
             .read_only(read_only)
             .build();
 
@@ -1192,6 +1203,7 @@ pub async fn start(
         );
 
     let server = configure_flight_server_transport(Server::builder());
+    let auth_configured = endpoint_auth.flight_basic_auth.is_some();
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
@@ -1212,7 +1224,7 @@ pub async fn start(
 
     let mut server = server
         .layer(
-            RequestContextLayer::new(rt.app(), rt.datafusion(), session_store, rt.secrets())
+            RequestContextLayer::new(rt.app(), rt.datafusion(), rt.secrets())
                 .with_job_executor(job_executor),
         )
         // mTLS principal injection runs *after* RequestContextLayer
@@ -1221,6 +1233,11 @@ pub async fn start(
         // principal is already present).
         .layer(mtls::MtlsLayer::new(identity_source))
         .layer(auth_layer)
+        .layer(FlightSessionLayer::new(
+            rt.datafusion(),
+            session_store,
+            auth_configured,
+        ))
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
             flight_write_rate_limit_enabled,

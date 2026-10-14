@@ -15,9 +15,11 @@ limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 #![allow(clippy::missing_errors_doc)]
+use std::pin::Pin;
 use std::time::SystemTime;
 
 use crate::anthropic::types::{EffortLevel, OutputConfig, OutputFormat};
+use crate::anthropic::types_stream::MessageCreateStreamResponse;
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
@@ -37,7 +39,7 @@ use async_openai::types::chat::{
     CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, ReasoningEffort,
     ResponseFormat, ResponseFormatJsonSchema, Role, StopConfiguration, ToolChoiceOptions,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde_json::json;
 
 use super::types::{
@@ -67,16 +69,27 @@ impl Chat for Anthropic {
         anth_req.stream = Some(true);
         let controls = forwarded_sampling_controls(&anth_req);
 
-        let stream = self
+        let opened = self
             .client
             .chat()
             .path("/messages")?
             .create_stream_byot(anth_req)
-            .await?;
+            .await;
 
-        // A streaming request naming a model Anthropic does not serve still returns 200 from
-        // `create_stream_byot` and delivers the `not_found_error` as a stream item, so the
-        // explanation is mapped over the items rather than over this call — and upstream of
+        // `create_stream_byot` fails to open the stream on a non-2xx status. That refusal is
+        // delivered as the stream's only item instead, so it takes the same explanation and
+        // error formatting as one Anthropic sends mid-stream.
+        let stream: Pin<
+            Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>,
+        > = match opened {
+            Ok(stream) => Box::pin(stream),
+            Err(refusal @ OpenAIError::ApiError(_)) => {
+                Box::pin(futures::stream::once(async move { Err(refusal) }))
+            }
+            Err(e) => return Err(e),
+        };
+
+        // The `not_found_error` explanation is mapped over the stream items, upstream of
         // `transform_stream`, which rewrites the error type its own way. A refused sampling
         // control is explained inside `transform_stream` instead, which is handed what that
         // takes: see `StreamErrorContext`.
@@ -433,8 +446,8 @@ fn refuse_unsupported_logprobs(
              See: https://spiceai.org/docs/components/models/anthropic"
         ),
         // The caller sent something this provider cannot serve, so it is their request that is
-        // invalid. `openai_error_to_response` reads `code` to pick the status, and anything it
-        // does not recognize becomes a 500 — which would report a client error as a server fault.
+        // invalid: `ApiErrorKind::of` reads it as an invalid request, which the HTTP layer
+        // reports as a 400 rather than as a server fault.
         r#type: Some("invalid_request_error".to_string()),
         param: Some(param.to_string()),
         code: Some("invalid_request_error".to_string()),
@@ -541,14 +554,14 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                 ResponseFormat::JsonSchema {
                     json_schema:
                         ResponseFormatJsonSchema {
-                            schema: Some(schema_v),
+                            schema: schema_v,
                             ..
                         },
                 } => Some(OutputFormat {
                     format_type: "json_schema".to_string(),
                     schema: schema_v,
                 }),
-                _ => None,
+                ResponseFormat::Text => None,
             }),
         })
     }
@@ -714,9 +727,8 @@ mod tests {
             let refusal = refusal(&err);
 
             assert_eq!(refusal.param.as_deref(), Some(param));
-            // `openai_error_to_response` picks the HTTP status from `code`, and maps anything it
-            // does not recognize to 500. This is a client error, so it has to be the code that
-            // maps to 400.
+            // This is a client error, so both fields `ApiErrorKind::of` reads name an invalid
+            // request, which the HTTP layer reports as a 400.
             assert_eq!(refusal.code.as_deref(), Some("invalid_request_error"));
             assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
 
