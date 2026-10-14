@@ -170,8 +170,7 @@ async fn read_format_version(
         Err(err) => Err(err),
     }
     .map_err(|err| CheckError::unfinished(format!("could not read '{path}': {err}")))?;
-    let record: FormatRecord =
-        serde_json::from_slice(&bytes).context(InvalidFormatFileSnafu {
+    let record: FormatRecord = serde_json::from_slice(&bytes).context(InvalidFormatFileSnafu {
         location,
         path: path.clone(),
     })?;
@@ -687,10 +686,19 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!write.is_finished(), "the write waits for the check");
-        assert!(inner.head(&Path::from("cluster/a.json")).await.is_err());
+        assert!(
+            matches!(
+                inner.head(&Path::from("cluster/a.json")).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the write has not reached the store"
+        );
 
         check.pass();
-        write.await.expect("join").expect("the write lands once the check passes");
+        write
+            .await
+            .expect("join")
+            .expect("the write lands once the check passes");
         assert_eq!(check.features(), [StateFeature::Scheduler]);
     }
 

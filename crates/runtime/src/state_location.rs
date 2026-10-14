@@ -25,12 +25,12 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use app::App;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use runtime_state_location::{
     CheckError, StateFeature, StateLocationCheck, build_object_store, check_location,
 };
-use app::App;
 use spicepod::acceleration::SnapshotBehavior;
 use spicepod::component::runtime::RuntimeState;
 use tokio::sync::OnceCell;
@@ -240,16 +240,24 @@ mod tests {
         });
 
         let (status_ref, attempts_ref, store_ref) = (&status, &attempts, &store);
-        run_check(&check, &status, &CancellationToken::new(), move || async move {
-            if attempts_ref.fetch_add(1, Ordering::SeqCst) < 2 {
-                let status = status_ref;
-                assert!(!status.is_ready(), "the instance is not ready while it waits");
-                return Err(CheckError::unfinished(
-                    "could not write a probe object: The specified bucket does not exist",
-                ));
-            }
-            check_location(store_ref, &Path::from("spice/_spice"), LOCATION).await
-        })
+        run_check(
+            &check,
+            &status,
+            &CancellationToken::new(),
+            move || async move {
+                if attempts_ref.fetch_add(1, Ordering::SeqCst) < 2 {
+                    let status = status_ref;
+                    assert!(
+                        !status.is_ready(),
+                        "the instance is not ready while it waits"
+                    );
+                    return Err(CheckError::unfinished(
+                        "could not write a probe object: The specified bucket does not exist",
+                    ));
+                }
+                check_location(store_ref, &Path::from("spice/_spice"), LOCATION).await
+            },
+        )
         .await;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
@@ -297,13 +305,18 @@ mod tests {
         let attempts = AtomicUsize::new(0);
 
         let attempts_ref = &attempts;
-        run_check(&check, &status, &CancellationToken::new(), move || async move {
-            attempts_ref.fetch_add(1, Ordering::SeqCst);
-            Err(CheckError::NewerFormat {
-                location: LOCATION.to_string(),
-                version: 2,
-            })
-        })
+        run_check(
+            &check,
+            &status,
+            &CancellationToken::new(),
+            move || async move {
+                attempts_ref.fetch_add(1, Ordering::SeqCst);
+                Err(CheckError::NewerFormat {
+                    location: LOCATION.to_string(),
+                    version: 2,
+                })
+            },
+        )
         .await;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -354,9 +367,6 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&format).expect("JSON"),
             serde_json::json!({ "format-version": runtime_state_location::FORMAT_VERSION })
         );
-        assert_eq!(
-            component_status(&rt.status()),
-            Some(ComponentStatus::Ready)
-        );
+        assert_eq!(component_status(&rt.status()), Some(ComponentStatus::Ready));
     }
 }

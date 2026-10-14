@@ -43,8 +43,7 @@ use url::Url;
 mod check;
 
 pub use check::{
-    CheckError, FORMAT_FILE, FORMAT_VERSION, RUNTIME_STATE_DOCS, StateLocationCheck,
-    check_location,
+    CheckError, FORMAT_FILE, FORMAT_VERSION, RUNTIME_STATE_DOCS, StateLocationCheck, check_location,
 };
 
 fn s3_parameters() -> Vec<ParameterSpec> {

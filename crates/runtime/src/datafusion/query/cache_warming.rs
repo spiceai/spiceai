@@ -504,9 +504,10 @@ pub(crate) async fn build_results_cache_warmer(
     {
         Ok((store, prefix)) => {
             let store = match state_location_check {
-                Some(check) => {
-                    check.guard(runtime_state_location::StateFeature::ResultsCacheWarmup, store)
-                }
+                Some(check) => check.guard(
+                    runtime_state_location::StateFeature::ResultsCacheWarmup,
+                    store,
+                ),
                 None => store,
             };
             tracing::info!(
@@ -2234,9 +2235,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let reloaded =
-            build_results_cache_warmer(true, Some(&runtime_state), None, secrets, Handle::current())
-                .await;
+        let reloaded = build_results_cache_warmer(
+            true,
+            Some(&runtime_state),
+            None,
+            secrets,
+            Handle::current(),
+        )
+        .await;
         assert_eq!(
             reloaded.templates_snapshot().len(),
             1,

@@ -971,7 +971,12 @@ async fn build_http_rate_control_registry(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (source_rate_control, state_location_check, &secrets, &io_runtime);
+    let _ = (
+        source_rate_control,
+        state_location_check,
+        &secrets,
+        &io_runtime,
+    );
     // `runtime.state` also serves the scheduler and results-cache warmup, so
     // setting it is not a request for cluster rate control: no warning.
     if runtime_state.is_some() {
