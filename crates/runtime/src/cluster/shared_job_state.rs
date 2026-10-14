@@ -230,12 +230,32 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
         }
     }
 
+    /// The job's graph as stored now, as a write condition, or `None` when the
+    /// job has a new owner.
+    ///
+    /// The graph is read before the metadata: a new owner records its claim
+    /// before it saves a graph, so a graph it saved is never seen without its
+    /// claim.
+    async fn owned_graph_version(&self, job_id: &str, epoch: u64) -> Result<Option<Expected>> {
+        let stored = self.stored_graph_version(job_id).await?;
+        let owned = self
+            .meta
+            .get(job_id)
+            .await
+            .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
+            .is_some_and(|meta| {
+                meta.owner_instance_id == Some(self.owner_instance_id) && meta.epoch == epoch
+            });
+        Ok(owned.then_some(stored))
+    }
+
     /// Persists the graph of a job this scheduler owns at `epoch`.
     ///
     /// The write is conditional on the graph this scheduler last wrote or
-    /// loaded. When another scheduler wrote it since, it is written over only
-    /// while this scheduler still owns the job at `epoch`. Returns `false` when
-    /// the job has a new owner, which keeps its own graph.
+    /// loaded. Without one, or after another writer changed the graph, it is
+    /// conditional on the graph as stored now and made only while this
+    /// scheduler still owns the job at `epoch`. Returns `false` when the job
+    /// has a new owner, which keeps its own graph.
     async fn put_graph(&self, job_id: &str, graph: &ExecutionGraphBox, epoch: u64) -> Result<bool> {
         let bytes = execution_graph_to_bytes(graph.as_ref(), &self.codec)?;
         let written = retry_on_conflict(&ConflictRetry::default(), || async {
@@ -245,30 +265,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
                 .map(|version| version.clone());
             let expected = match recorded.and_then(Expected::at_version) {
                 Some(expected) => expected,
-                None => self.stored_graph_version(job_id).await?,
+                None => match self.owned_graph_version(job_id, epoch).await? {
+                    Some(expected) => expected,
+                    None => return Ok(Attempt::Done(false)),
+                },
             };
             if let Some(version) = self.write_graph(job_id, &bytes, &expected).await? {
                 self.graph_versions.insert(job_id.to_string(), version);
                 return Ok(Attempt::Done(true));
             }
-            let owned = self
-                .meta
-                .get(job_id)
-                .await
-                .map_err(|e| BallistaError::Internal(format!("failed to read job meta: {e}")))?
-                .is_some_and(|meta| {
-                    meta.owner_instance_id == Some(self.owner_instance_id) && meta.epoch == epoch
-                });
-            if !owned {
-                return Ok(Attempt::Done(false));
-            }
-            // Still the owner: the graph was written by a scheduler that lost the
-            // job while its write was in flight. Write over it.
-            let current = self.stored_graph_version(job_id).await?;
             self.graph_versions.remove(job_id);
-            if let Expected::Version(version) = current {
-                self.graph_versions.insert(job_id.to_string(), version);
-            }
             Ok(Attempt::Conflict)
         })
         .await;
@@ -1013,7 +1019,8 @@ mod tests {
             .await
             .expect("persist the graph");
 
-        let (graph, _) = state.load_graph("j", &meta).await.expect("load the graph");
+        let (graph, version) = state.load_graph("j", &meta).await.expect("load the graph");
+        state.graph_versions.insert("j".to_string(), version);
         let Some(ExecutionStage::Successful(map_stage)) = graph.stages().get(&1) else {
             panic!("the loaded graph lost its successful stage");
         };
@@ -1062,38 +1069,57 @@ mod tests {
         );
     }
 
-    /// Runs `race` once, right before the next graph write reaches the store.
-    struct RaceBeforeGraphWrite {
+    type Race = tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>;
+
+    /// Runs `before_write` once, right before the next graph write reaches the
+    /// store, and `before_head` once, right before the next read of the graph's
+    /// version.
+    struct GraphRace {
         inner: Arc<dyn ObjectStore>,
-        race: tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+        before_write: Race,
+        before_head: Race,
     }
 
-    impl std::fmt::Display for RaceBeforeGraphWrite {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "RaceBeforeGraphWrite")
+    impl GraphRace {
+        fn on(inner: &Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                before_write: tokio::sync::Mutex::new(None),
+                before_head: tokio::sync::Mutex::new(None),
+            })
+        }
+
+        async fn run(race: &Race, location: &Path) {
+            if location.as_ref().contains("scheduler/graph/") {
+                let race = race.lock().await.take();
+                if let Some(race) = race {
+                    race.await;
+                }
+            }
         }
     }
 
-    impl std::fmt::Debug for RaceBeforeGraphWrite {
+    impl std::fmt::Display for GraphRace {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "RaceBeforeGraphWrite")
+            write!(f, "GraphRace")
+        }
+    }
+
+    impl std::fmt::Debug for GraphRace {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GraphRace")
         }
     }
 
     #[async_trait]
-    impl ObjectStore for RaceBeforeGraphWrite {
+    impl ObjectStore for GraphRace {
         async fn put_opts(
             &self,
             location: &Path,
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            if location.as_ref().contains("scheduler/graph/") {
-                let race = self.race.lock().await.take();
-                if let Some(race) = race {
-                    race.await;
-                }
-            }
+            Self::run(&self.before_write, location).await;
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
@@ -1108,6 +1134,9 @@ mod tests {
             location: &Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
+            if options.head {
+                Self::run(&self.before_head, location).await;
+            }
             self.inner.get_opts(location, options).await
         }
         fn list(
@@ -1177,10 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn a_superseded_owner_does_not_replace_the_new_owners_graph() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let racing = Arc::new(RaceBeforeGraphWrite {
-            inner: Arc::clone(&inner),
-            race: tokio::sync::Mutex::new(None),
-        });
+        let racing = GraphRace::on(&inner);
         let old_owner = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
         let new_owner = Arc::new(test_state_on(Arc::clone(&inner)));
         let job = JobId::new("j");
@@ -1191,19 +1217,7 @@ mod tests {
             .await
             .expect("submit");
 
-        let (taker, taken) = (Arc::clone(&new_owner), job.clone());
-        *racing.race.lock().await = Some(Box::pin(async move {
-            taker
-                .try_acquire_job(&taken)
-                .await
-                .expect("acquire")
-                .expect("the new owner takes the job over");
-            let graph = running_graph(&taker, "new");
-            taker
-                .save_job(&taken, &graph)
-                .await
-                .expect("the new owner saves");
-        }));
+        *racing.before_write.lock().await = Some(take_over_and_save(&new_owner, &job));
 
         old_owner
             .save_job(&job, &running_graph(&old_owner, "old-second"))
@@ -1211,7 +1225,7 @@ mod tests {
             .expect("a superseded owner yields");
 
         assert!(
-            racing.race.lock().await.is_none(),
+            racing.before_write.lock().await.is_none(),
             "the takeover must have run"
         );
         assert_eq!(
@@ -1225,23 +1239,90 @@ mod tests {
         );
     }
 
-    /// Writes a graph for `job_id` with no metadata, as a removal whose graph
-    /// delete failed leaves behind.
-    async fn leave_orphan_graph(store: &Arc<dyn ObjectStore>, state: &TestState, job_id: &str) {
-        let bytes = execution_graph_to_bytes(running_graph(state, "orphan").as_ref(), &state.codec)
-            .expect("encode");
+    /// A scheduler whose graph write meets a graph another writer changed, and
+    /// that loses the job before it retries, does not replace the graph the new
+    /// owner saved in between.
+    #[tokio::test]
+    async fn a_superseded_owner_does_not_retry_over_the_new_owners_graph() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let old_owner = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
+        let new_owner = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+
+        old_owner.accept_job(&job, "test", 0).expect("accept");
+        old_owner
+            .submit_job(job.clone(), &running_graph(&old_owner, "old-first"), None)
+            .await
+            .expect("submit");
+        write_stray_graph(&inner, &old_owner, "j", "stray").await;
+
+        *racing.before_head.lock().await = Some(take_over_and_save(&new_owner, &job));
+
+        old_owner
+            .save_job(&job, &running_graph(&old_owner, "old-second"))
+            .await
+            .expect("a superseded owner yields");
+
+        assert!(
+            racing.before_head.lock().await.is_none(),
+            "the takeover must have run"
+        );
+        assert_eq!(
+            stored_graph_session(&inner, &old_owner, "j").await,
+            "new",
+            "the new owner's graph must be kept"
+        );
+        assert!(
+            old_owner.local_jobs.get("j").is_none(),
+            "the superseded owner stops driving the job"
+        );
+    }
+
+    /// `new_owner` takes `job` over and saves a graph with session id `new`.
+    fn take_over_and_save(
+        new_owner: &Arc<TestState>,
+        job: &JobId,
+    ) -> futures::future::BoxFuture<'static, ()> {
+        let (taker, taken) = (Arc::clone(new_owner), job.clone());
+        Box::pin(async move {
+            taker
+                .try_acquire_job(&taken)
+                .await
+                .expect("acquire")
+                .expect("the new owner takes the job over");
+            let graph = running_graph(&taker, "new");
+            taker
+                .save_job(&taken, &graph)
+                .await
+                .expect("the new owner saves");
+        })
+    }
+
+    /// Writes a graph for `job_id` straight to the store, outside any
+    /// scheduler's bookkeeping.
+    async fn write_stray_graph(
+        store: &Arc<dyn ObjectStore>,
+        state: &TestState,
+        job_id: &str,
+        session_id: &str,
+    ) {
+        let bytes =
+            execution_graph_to_bytes(running_graph(state, session_id).as_ref(), &state.codec)
+                .expect("encode");
         store
             .put(&state.graph_path(job_id), bytes.into())
             .await
-            .expect("write the orphan graph");
+            .expect("write the stray graph");
     }
 
+    /// A removal whose graph delete failed leaves the graph behind.
     #[tokio::test]
     async fn a_submission_writes_over_a_graph_a_removed_job_left_behind() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state = test_state_on(Arc::clone(&store));
         let job = JobId::new("j");
-        leave_orphan_graph(&store, &state, "j").await;
+        write_stray_graph(&store, &state, "j", "orphan").await;
 
         state.accept_job(&job, "test", 0).expect("accept");
         state
@@ -1259,28 +1340,13 @@ mod tests {
     #[tokio::test]
     async fn a_submission_keeps_the_claim_of_a_scheduler_that_took_the_job_over() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let racing = Arc::new(RaceBeforeGraphWrite {
-            inner: Arc::clone(&inner),
-            race: tokio::sync::Mutex::new(None),
-        });
+        let racing = GraphRace::on(&inner);
         let submitter = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
         let new_owner = Arc::new(test_state_on(Arc::clone(&inner)));
         let job = JobId::new("j");
-        leave_orphan_graph(&inner, &submitter, "j").await;
+        write_stray_graph(&inner, &submitter, "j", "orphan").await;
 
-        let (taker, taken) = (Arc::clone(&new_owner), job.clone());
-        *racing.race.lock().await = Some(Box::pin(async move {
-            taker
-                .try_acquire_job(&taken)
-                .await
-                .expect("acquire")
-                .expect("the new owner takes the job over");
-            let graph = running_graph(&taker, "new");
-            taker
-                .save_job(&taken, &graph)
-                .await
-                .expect("the new owner saves");
-        }));
+        *racing.before_write.lock().await = Some(take_over_and_save(&new_owner, &job));
 
         submitter.accept_job(&job, "test", 0).expect("accept");
         let submitted = submitter
@@ -1305,10 +1371,7 @@ mod tests {
     async fn the_new_owner_writes_over_a_graph_the_old_owner_wrote_late() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let old_owner = Arc::new(test_state_on(Arc::clone(&inner)));
-        let racing = Arc::new(RaceBeforeGraphWrite {
-            inner: Arc::clone(&inner),
-            race: tokio::sync::Mutex::new(None),
-        });
+        let racing = GraphRace::on(&inner);
         let new_owner = test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>);
         let job = JobId::new("j");
 
@@ -1325,15 +1388,9 @@ mod tests {
 
         // The old owner's graph write lands between the takeover and the new
         // owner's first save.
-        let (late, late_job) = (Arc::clone(&old_owner), job.clone());
-        *racing.race.lock().await = Some(Box::pin(async move {
-            let bytes =
-                execution_graph_to_bytes(running_graph(&late, "old-late").as_ref(), &late.codec)
-                    .expect("encode");
-            late.store
-                .put(&late.graph_path(late_job.as_str()), bytes.into())
-                .await
-                .expect("the late write lands");
+        let (late, store) = (Arc::clone(&old_owner), Arc::clone(&inner));
+        *racing.before_write.lock().await = Some(Box::pin(async move {
+            write_stray_graph(&store, &late, "j", "old-late").await;
         }));
 
         new_owner
