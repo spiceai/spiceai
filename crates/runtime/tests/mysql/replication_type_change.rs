@@ -62,10 +62,17 @@ async fn run_query(rt: &Runtime, sql: &str) -> Result<String, anyhow::Error> {
 }
 
 /// Poll `sql` until it prints `expected`, or fail with the last result.
+///
+/// A query error is retried until the deadline: a Cayenne scan that overlaps
+/// the table's live schema evolution can fail (#15133), and the change under
+/// test is what the query returns once the evolution has settled.
 async fn wait_for(rt: &Runtime, sql: &str, expected: &str) -> Result<(), anyhow::Error> {
     let deadline = std::time::Instant::now() + CHANGE_PROPAGATION_TIMEOUT;
     loop {
-        let actual = run_query(rt, sql).await?;
+        let actual = match run_query(rt, sql).await {
+            Ok(actual) => actual,
+            Err(error) => error.to_string(),
+        };
         if actual == expected {
             return Ok(());
         }
@@ -264,8 +271,7 @@ async fn mysql_cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::E
 /// refused, never stored rounded.
 #[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
-async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<(), anyhow::Error>
-{
+async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
     test_request_context()
