@@ -39,7 +39,6 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -57,11 +56,9 @@ use runtime_auth::AuthRequestContext;
 use runtime_request_context::RequestContext;
 use sha2::{Digest, Sha256};
 
-/// How long a conversation's steps are kept after its latest turn. Matches the default
-/// retention of `runtime.task_history`.
-const DEFAULT_TIME_TO_LIVE: Duration = Duration::from_hours(8);
-
-/// Bound on the summed weight of every stored entry (see [`ToolTrace::weight`]).
+/// Bound on the summed weight of every stored entry (see [`ToolTrace::weight`]). Entries do not
+/// expire: a restored step is what the model saw, however old. At the bound, the least recently
+/// used entry is evicted.
 const DEFAULT_MAX_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Whose conversation a request continues. Steps stored for one caller are never restored for
@@ -186,7 +183,6 @@ impl Default for ToolTraceStore {
             traces: Cache::builder()
                 .max_capacity(DEFAULT_MAX_CAPACITY_BYTES)
                 .weigher(|_key: &ToolTraceKey, trace: &ToolTrace| trace.weight())
-                .time_to_live(DEFAULT_TIME_TO_LIVE)
                 // Each entry is read at most once, by the conversation's next turn, so recency
                 // is the only signal worth keeping.
                 .eviction_policy(EvictionPolicy::lru())
