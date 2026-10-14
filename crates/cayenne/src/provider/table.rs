@@ -12193,11 +12193,7 @@ impl CayenneTableProvider {
         let schema = self.table_schema();
         let configured = self.context.shard_key_columns();
         if configured.is_empty() {
-            return self
-                .pk_column_indices
-                .iter()
-                .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
-                .collect();
+            return self.primary_key_shard_key(&schema);
         }
         let missing: Vec<&String> = configured
             .iter()
@@ -12211,10 +12207,34 @@ impl CayenneTableProvider {
             missing = ?missing,
             "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
         );
-        self.pk_column_indices
+        self.primary_key_shard_key(&schema)
+    }
+
+    /// The primary key as a shard key: its columns in the table's sort order
+    /// where the sort order names them, then the rest in key order.
+    ///
+    /// A shard key's column order decides the column a range split routes on and
+    /// the order each write run is sorted in, so it decides which lookups prune.
+    /// The key's own column order is the order its row keys are encoded in, and
+    /// schema inference does not choose it for lookups: an inferred composite
+    /// key can come back in name order, leading with a column of a handful of
+    /// values that every lookup then reads all of. The sort order, where there is
+    /// one, is the source's key order or the operator's, which is the order
+    /// lookups pin the key in.
+    fn primary_key_shard_key(&self, schema: &SchemaRef) -> Vec<String> {
+        let mut key: Vec<String> = self
+            .pk_column_indices
             .iter()
             .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
-            .collect()
+            .collect();
+        let sort = self.context.sort_columns();
+        // Stable, so the columns the sort order does not name keep key order.
+        key.sort_by_key(|column| {
+            sort.iter()
+                .position(|sorted| sorted == column)
+                .unwrap_or(usize::MAX)
+        });
+        key
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
@@ -55143,14 +55163,10 @@ mod tests {
             .await;
     }
 
-    /// A checkpoint of a composite key whose leading column takes few values
-    /// routes on that column, so each key-range file holds every row of its
-    /// leading values. Those rows must come out in order of the whole key: sorted
-    /// by the leading column alone they would keep the rest of the key in arrival
-    /// order, and a lookup that pins all of it would read every zone of its
-    /// leading value instead of one.
-    #[tokio::test]
-    async fn a_checkpoint_sorts_each_key_range_file_by_its_whole_key() {
+    /// Checkpoints every `(d, o)` for `d` in 0..8 and `o` in 0..2500, scrambled,
+    /// into a table keyed on `(d, o)` with `sort_columns` inferred, and returns
+    /// each key-range file's `(d, o)` rows in file order.
+    async fn checkpointed_key_range_files(sort_columns: &[&str]) -> Vec<Vec<(i64, i64)>> {
         use arrow::array::StringArray;
 
         const ROWS: usize = 20_000;
@@ -55176,6 +55192,8 @@ mod tests {
                 // A 1 MiB target makes every ~1 MiB of rows an encode shard, so
                 // the ~4 MiB corpus below fills all four.
                 target_vortex_file_size_mb: 1,
+                sort_columns: sort_columns.iter().map(ToString::to_string).collect(),
+                sort_columns_origin: crate::metadata::SortColumnsOrigin::Inferred,
                 ..VortexConfig::default()
             },
             OnConflict::Upsert(
@@ -55188,7 +55206,6 @@ mod tests {
         .await;
         provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
-        // Every (d, o) for d in 0..8 and o in 0..2500, in a scrambled order.
         let keys: Vec<(i64, i64)> = (0..ROWS)
             .map(|i| {
                 let key = i64::try_from((i * 7919) % ROWS).expect("key fits i64");
@@ -55237,8 +55254,7 @@ mod tests {
         assert_eq!(names.len(), SHARDS, "one file per key range: {names:?}");
         let file_ctx =
             SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
-        let mut total = 0_usize;
-        let mut leading_by_file = Vec::with_capacity(names.len());
+        let mut files = Vec::with_capacity(names.len());
         for name in &names {
             let path = provider.snapshot_dir_path_for(snapshot_id).join(name);
             let table = CayenneTableProvider::create_listing_table(
@@ -55268,28 +55284,67 @@ mod tests {
                     column(0).into_iter().zip(column(1))
                 })
                 .collect();
-            let leading: std::collections::BTreeSet<i64> = pairs.iter().map(|(d, _)| *d).collect();
-            assert!(
-                leading.len() > 1 && pairs.len() > leading.len(),
-                "{name}: a range file holds several rows of several leading values: {leading:?}"
-            );
-            assert!(
-                pairs.is_sorted(),
-                "{name}: a range file's rows are in order of the whole key"
-            );
-            total += pairs.len();
-            leading_by_file.push(leading);
+            files.push(pairs);
         }
-        assert_eq!(total, ROWS, "every row is written exactly once");
-        for (index, leading) in leading_by_file.iter().enumerate() {
+        assert_eq!(
+            files.iter().map(Vec::len).sum::<usize>(),
+            ROWS,
+            "every row is written exactly once"
+        );
+        files
+    }
+
+    /// Each file must route on `leading` (no value of it spans two files) and
+    /// hold rows of several of its values in order of `order`.
+    fn assert_routed_and_sorted(
+        files: &[Vec<(i64, i64)>],
+        leading: fn(&(i64, i64)) -> i64,
+        order: fn(&(i64, i64)) -> (i64, i64),
+    ) {
+        let mut leading_by_file = Vec::with_capacity(files.len());
+        for (index, rows) in files.iter().enumerate() {
+            let values: std::collections::BTreeSet<i64> = rows.iter().map(leading).collect();
+            assert!(
+                values.len() > 1 && rows.len() > values.len(),
+                "file {index}: a range file holds several rows of several leading values: {values:?}"
+            );
+            assert!(
+                rows.iter().map(order).collect::<Vec<_>>().is_sorted(),
+                "file {index}: a range file's rows are in order of the whole key"
+            );
+            leading_by_file.push(values);
+        }
+        for (index, values) in leading_by_file.iter().enumerate() {
             for other in &leading_by_file[index + 1..] {
                 assert!(
-                    leading.is_disjoint(other),
+                    values.is_disjoint(other),
                     "files route on the leading column, so no leading value spans two: \
                      {leading_by_file:?}"
                 );
             }
         }
+    }
+
+    /// A checkpoint of a composite key whose leading column takes few values
+    /// routes on that column, so each key-range file holds every row of its
+    /// leading values. Those rows must come out in order of the whole key: sorted
+    /// by the leading column alone they would keep the rest of the key in arrival
+    /// order, and a lookup that pins all of it would read every zone of its
+    /// leading value instead of one.
+    #[tokio::test]
+    async fn a_checkpoint_sorts_each_key_range_file_by_its_whole_key() {
+        let files = checkpointed_key_range_files(&[]).await;
+        assert_routed_and_sorted(&files, |(d, _)| *d, |&(d, o)| (d, o));
+    }
+
+    /// The same key with an inferred sort order of `(o, d)`, as a source reports
+    /// for a key whose columns came back in name order: the checkpoint must route
+    /// on `o` and sort each file by `(o, d)`, the order lookups pin the key in,
+    /// rather than lead with `d`'s eight values.
+    #[tokio::test]
+    async fn a_checkpoint_routes_and_sorts_a_key_in_its_sort_order() {
+        let files = checkpointed_key_range_files(&["o", "d"]).await;
+        assert_routed_and_sorted(&files, |(_, o)| *o, |&(d, o)| (o, d));
     }
 
     /// A seq-prefix bake routes its merged output into key-range files: each file
