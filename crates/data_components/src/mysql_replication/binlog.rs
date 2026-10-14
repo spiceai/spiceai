@@ -56,6 +56,7 @@ use mysql_async::consts::ColumnType;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 use mysql_common::io::ParseBuf;
 
+use super::ColumnTypeChanges;
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
@@ -613,8 +614,9 @@ pub(super) struct AdoptedLayout {
     pub(super) column_map: Vec<usize>,
     pub(super) pk_source_indexes: Vec<usize>,
     /// The schema the member's change batches are built with from here on, when
-    /// a column's source type widened losslessly (see [`widen_to_source_types`]);
-    /// `None` when every column keeps its type.
+    /// the member widens column types and a column's source type widened
+    /// losslessly (see [`widen_to_source_types`]); `None` when every column keeps
+    /// its type.
     pub(super) widened_schema: Option<SchemaRef>,
 }
 
@@ -632,6 +634,7 @@ pub(super) async fn adopt_current_layout(
     old_layout: &TableLayout,
     primary_keys: &[String],
     dataset_name: &str,
+    column_type_changes: ColumnTypeChanges,
 ) -> Result<AdoptedLayout> {
     let mut conn = super::setup::connect(params).await?;
     let layout = super::setup::fetch_table_layout(&mut conn, database, table).await?;
@@ -665,7 +668,12 @@ pub(super) async fn adopt_current_layout(
         );
     }
 
-    let widened_schema = widen_to_source_types(schema, &layout, &column_map, primary_keys);
+    let widened_schema = match column_type_changes {
+        ColumnTypeChanges::Keep => None,
+        ColumnTypeChanges::Widen => {
+            widen_to_source_types(schema, &layout, &column_map, primary_keys)
+        }
+    };
 
     Ok(AdoptedLayout {
         layout,

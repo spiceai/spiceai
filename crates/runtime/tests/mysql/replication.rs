@@ -39,8 +39,9 @@ use async_trait::async_trait;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 use data_components::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
 use data_components::mysql_replication::{
-    CursorType, PersistedPosition, PositionStore, ReplicationMetricsCollector, ReplicationParams,
-    ReplicationStreamInput, StoreError, encode_checkpoint_schema_json, start_replication_stream,
+    ColumnTypeChanges, CursorType, PersistedPosition, PositionStore, ReplicationMetricsCollector,
+    ReplicationParams, ReplicationStreamInput, StoreError, encode_checkpoint_schema_json,
+    start_replication_stream,
 };
 use futures::StreamExt;
 use mysql_async::prelude::Queryable;
@@ -120,6 +121,7 @@ fn stream_input(
         position_store: store,
         schema_json: Some(schema_json),
         metrics: ReplicationMetricsCollector::new(),
+        column_type_changes: ColumnTypeChanges::Keep,
     }
 }
 

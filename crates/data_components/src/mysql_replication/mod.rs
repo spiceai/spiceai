@@ -459,6 +459,23 @@ pub struct ReplicationStreamInput {
     /// Shared collector the stream updates as it processes events; the
     /// connector reads it via its `MetricsProvider`.
     pub metrics: Arc<ReplicationMetricsCollector>,
+    /// What the stream does when a source `ALTER` widens a column's type.
+    pub column_type_changes: ColumnTypeChanges,
+}
+
+/// What a replication stream does when a source `ALTER` changes a column's
+/// type to one that holds every value of the old type (`INT` to `DOUBLE`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnTypeChanges {
+    /// Keep the column's registered type: a later value is stored when that
+    /// type holds it exactly and refused otherwise. The dataset's change
+    /// batches never change schema, so the stream suits `on_schema_change:
+    /// block`, which never evolves the acceleration.
+    #[default]
+    Keep,
+    /// Retype the column in the change batches to the new type, so the value
+    /// reaches the dataset's `on_schema_change` policy as a schema change.
+    Widen,
 }
 
 /// Starts the bootstrap+binlog replication stream.

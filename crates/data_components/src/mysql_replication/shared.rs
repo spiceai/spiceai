@@ -122,8 +122,9 @@ use super::config::{BinlogPosition, ReplicationParams};
 use super::metrics::MetricsCollector;
 use super::rows::{ChangeBatchSchemas, build_change_batch, truncate_change};
 use super::{
-    CursorType, Error, GtidSet, PersistedPosition, PositionStore, ReplicationStreamInput, Result,
-    check_resume_compatibility, encode_checkpoint_schema_json, stream_error,
+    ColumnTypeChanges, CursorType, Error, GtidSet, PersistedPosition, PositionStore,
+    ReplicationStreamInput, Result, check_resume_compatibility, encode_checkpoint_schema_json,
+    stream_error,
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError};
 use crate::cdc::{InitialSnapshotMode, InvalidCheckpointBehavior};
@@ -611,6 +612,8 @@ fn snapshot_boundary_envelope(
 struct MemberHandle {
     dataset_name: String,
     primary_keys: Vec<String>,
+    /// What an adopted `ALTER` does to a column whose source type widened.
+    column_type_changes: ColumnTypeChanges,
     /// Immutable decode layout behind an `Arc` swapped on a compatible ALTER
     /// (see [`adopt_current_layout`]). The pump clones the current `Arc` into a
     /// route at `TableMapEvent` time, so a snapshot handed downstream to
@@ -814,6 +817,7 @@ async fn attach_member(
         position_store,
         schema_json,
         metrics,
+        column_type_changes,
     } = input;
     let member_key: MemberKey = (database.clone(), table.clone());
     let connection = source.key.label();
@@ -925,6 +929,7 @@ async fn attach_member(
         Arc::new(MemberHandle {
             dataset_name: dataset_name.clone(),
             primary_keys: primary_keys.clone(),
+            column_type_changes,
             layout: Mutex::new(Arc::new(MemberLayout {
                 layout: layout.clone(),
                 column_map: column_map.clone(),
@@ -1764,6 +1769,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                             &old.layout,
                             &member.primary_keys,
                             &member.dataset_name,
+                            member.column_type_changes,
                         )
                         .await
                         {
@@ -2194,6 +2200,7 @@ async fn handle_statement(
                     &old.layout,
                     &member.primary_keys,
                     &member.dataset_name,
+                    member.column_type_changes,
                 )
                 .await
                 {
@@ -2649,6 +2656,7 @@ mod tests {
         let member = Arc::new(MemberHandle {
             dataset_name: "orders".to_string(),
             primary_keys: vec!["id".to_string()],
+            column_type_changes: ColumnTypeChanges::Keep,
             layout: Mutex::new(Arc::new(MemberLayout {
                 // Covers every column of `test_schema`, so anything the member
                 // builds from the layout (a truncate row included) is buildable
