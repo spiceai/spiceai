@@ -37,7 +37,12 @@ use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
 use data_components::cdc::AccelerationContents;
 use data_components::poly::PolyTableProvider;
+use data_components::incremental_append::{
+    AppendPlan, SeedMark, IncrementalAppendSource, TimeColumn, incremental_append_source,
+};
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
+use self::append_cursor::AppendCursorStore;
+use util::timestamp_filter::data_type_to_timestamp_format;
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -105,6 +110,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
+pub mod append_cursor;
 pub mod changes;
 #[cfg(test)]
 mod deletion;
@@ -275,6 +281,9 @@ pub struct RefreshTaskBuilder {
     /// replaces the entries it refreshes, so it has to claim each key for the
     /// same reason every other writer does — see [`caching::CacheKeyClaim`].
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    /// Where an append refresh keeps the source snapshot it last loaded; `None` for a
+    /// refresh that never follows snapshots.
+    append_cursor_store: Option<AppendCursorStore>,
 }
 
 impl RefreshTaskBuilder {
@@ -314,6 +323,7 @@ impl RefreshTaskBuilder {
             in_flight_revalidations: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            append_cursor_store: None,
         }
     }
 
@@ -440,6 +450,13 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    #[must_use]
+    pub fn with_append_cursor_store(mut self, store: Option<AppendCursorStore>) -> RefreshTaskBuilder {
+        self.append_cursor_store = store;
+        self
+    }
+
     /// Provide per-dataset `cdc_*` parameter overrides. These layer on top of
     /// the process-global [`changes::CdcConfig`] only for this dataset's
     /// changes stream.
@@ -520,6 +537,7 @@ impl RefreshTaskBuilder {
             cache_write_sender: self.cache_write_sender,
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
+            append_cursor_store: self.append_cursor_store,
             session_state,
         }
     }
@@ -607,6 +625,8 @@ pub struct RefreshTask {
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<AppendCursorStore>,
     /// Built once instead of a fresh `SessionContext` per stale entry.
     session_state: Arc<SessionState>,
 }
@@ -627,6 +647,67 @@ impl std::fmt::Debug for RefreshTask {
             .field("io_runtime", &self.io_runtime)
             .field("resource_monitor", &self.resource_monitor)
             .finish_non_exhaustive()
+    }
+}
+
+/// Which stored rows an append's incoming rows are compared with, by the keep-newest
+/// selection and the exact-row dedupe.
+///
+/// The comparison is always inclusive of the mark: widening the stored side can only
+/// add rows to compare with, never cause a duplicate, so the stored side needs no
+/// `>`/`>=` distinction of its own (the source filter keeps its strict `>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredRowsFrom {
+    /// Nothing: a full load overwrites the stored rows, and an append into an empty
+    /// acceleration has none.
+    None,
+    /// The stored rows at or after a mark: the high-water mark the source filter used,
+    /// or the lowest time the incoming rows can hold.
+    From(u128),
+    /// Every stored row, when no mark is safe.
+    All,
+}
+
+impl StoredRowsFrom {
+    /// The high-water mark an append read from the acceleration, when it has one.
+    fn from_mark(mark: Option<u128>) -> Self {
+        mark.map_or(Self::None, Self::From)
+    }
+
+    fn from_seed(seed: SeedMark) -> Self {
+        match seed {
+            SeedMark::Lowest(nanos) => Self::From(nanos),
+            SeedMark::AllStoredRows(_) => Self::All,
+        }
+    }
+
+    /// The filter selecting the stored rows to compare, or `None` for all of them.
+    fn filter(self, converter: &TimestampFilterConvert) -> Option<Expr> {
+        match self {
+            Self::None | Self::All => None,
+            Self::From(mark) => Some(converter.convert_at_or_after_mark(mark)),
+        }
+    }
+}
+
+/// What an append refresh read.
+enum AppendRead {
+    /// The source holds nothing the acceleration lacks, decided from its metadata
+    /// alone: no data was scanned.
+    UpToDate,
+    /// The rows to write, and the source snapshot to save as loaded once they are.
+    Update {
+        update: StreamingDataUpdate,
+        cursor: Option<String>,
+    },
+}
+
+impl AppendRead {
+    fn without_cursor(update: StreamingDataUpdate) -> Self {
+        Self::Update {
+            update,
+            cursor: None,
+        }
     }
 }
 
@@ -821,17 +902,9 @@ impl RefreshTask {
                             "Skipping refresh for {} - data unchanged",
                             self.dataset_name
                         );
-
-                        for label_set in &dataset_metrics_label_sets {
-                            metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
-                        }
-
-                        self.set_refresh_status(
-                            refresh.display_sql().as_deref(),
-                            status::ComponentStatus::Ready,
-                        )
-                        .await;
-                        return Ok(RefreshOutcome::UpToDate);
+                        return Ok(self
+                            .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                            .await);
                     }
                     Ok(_) => {
                         // Data may have changed or provider does not support skipping; continue with refresh.
@@ -864,6 +937,9 @@ impl RefreshTask {
 
         let start_time = SystemTime::now();
 
+        // The source commit an append refresh loads, saved only once its rows are
+        // written: a refresh that fails or is cancelled must be read again.
+        let mut append_cursor_to_save: Option<String> = None;
         let get_data_update_result = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -874,12 +950,26 @@ impl RefreshTask {
                     .await
                 {
                     Ok(update) if refresh.versions_by_time.is_some() => {
-                        self.select_latest_by_time(refresh, update, None).await
+                        self.select_latest_by_time(refresh, update, StoredRowsFrom::None)
+                            .await
                     }
                     other => other,
                 }
             }
-            RefreshMode::Append => self.get_incremental_append_update(refresh).await,
+            RefreshMode::Append => match self.get_incremental_append_update(refresh).await {
+                // The source holds nothing the acceleration lacks, decided from its
+                // metadata alone: no data was scanned.
+                Ok(AppendRead::UpToDate) => {
+                    return Ok(self
+                        .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                        .await);
+                }
+                Ok(AppendRead::Update { update, cursor }) => {
+                    append_cursor_to_save = cursor;
+                    Ok(update)
+                }
+                Err(e) => Err(e),
+            },
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
                 // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
@@ -968,7 +1058,29 @@ impl RefreshTask {
         )
         .await;
 
+        if let Some(cursor) = append_cursor_to_save {
+            self.save_append_cursor(&cursor).await;
+        }
+
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Ends a refresh that found nothing to fetch: the skip is counted, the dataset is
+    /// `Ready`, and the outcome says the acceleration was already up to date.
+    async fn finish_up_to_date(
+        &self,
+        refresh: &Refresh,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
+    ) -> RefreshOutcome {
+        for label_set in dataset_metrics_label_sets {
+            metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+        }
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Ready,
+        )
+        .await;
+        RefreshOutcome::UpToDate
     }
 
     fn is_metric_enabled(&self, metric_name: &str) -> bool {
@@ -1267,6 +1379,26 @@ impl RefreshTask {
         refresh: &Refresh,
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        self.get_full_or_incremental_append_update_from(
+            refresh,
+            overwrite_timestamp_in_nano,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::get_full_or_incremental_append_update`] reading from `source` instead of
+    /// the dataset's own provider (an Iceberg table pinned to one snapshot, say), and
+    /// writing as `update_type` instead of what the refresh mode implies. `None` keeps
+    /// the default for either.
+    async fn get_full_or_incremental_append_update_from(
+        &self,
+        refresh: &Refresh,
+        overwrite_timestamp_in_nano: Option<u128>,
+        source: Option<Arc<dyn TableProvider>>,
+        update_type: Option<UpdateType>,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
         let filter_converter = self.get_filter_converter(refresh);
 
@@ -1298,13 +1430,19 @@ impl RefreshTask {
             }
         }
 
-        self.get_data_update(filters, &refresh).await
+        let update_type = update_type.unwrap_or_else(|| Self::update_type_for(refresh.mode));
+        let source = match source {
+            Some(source) => source,
+            None => self.federated.table_provider().await,
+        };
+        self.get_data_update(filters, &refresh, update_type, source)
+            .await
     }
 
     async fn get_incremental_append_update(
         &self,
         refresh: &Refresh,
-    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+    ) -> Result<AppendRead, RetryError<super::Error>> {
         // If we've gotten to this point and we don't have a time column, skip trying to filter by timestamp.
         //
         // Normally we don't allow this configuration, but it's possible to get here with an accelerated dataset
@@ -1313,9 +1451,147 @@ impl RefreshTask {
         if refresh.time_column.is_none() {
             return self
                 .get_full_or_incremental_append_update(refresh, None)
-                .await;
+                .await
+                .map(AppendRead::without_cursor);
         }
 
+        // A source that records which rows each commit added has its append refresh
+        // follow its commits instead of a time window. A one-off override `refresh_sql`
+        // reads a subset of the source and keeps today's path, which saves no cursor.
+        if refresh.override_sql_raw.is_none()
+            && let Some(store) = &self.append_cursor_store
+        {
+            let federated_provider = self.federated.table_provider().await;
+            if let Some(source) = incremental_append_source(federated_provider.as_ref()) {
+                return self.incremental_append(refresh, source, store).await;
+            }
+        }
+
+        self.time_filtered_append(refresh, None)
+            .await
+            .map(AppendRead::without_cursor)
+    }
+
+    /// The append refresh of a source that records its commits: reads the rows the
+    /// commits since the saved cursor added, whatever their time values, as the source
+    /// decides. Which of those rows are kept is decided afterwards by the same
+    /// keep-newest selection or exact-row dedupe every append runs, seeded from the
+    /// lowest time the added rows can hold instead of the acceleration's high-water mark.
+    async fn incremental_append(
+        &self,
+        refresh: &Refresh,
+        source: &dyn IncrementalAppendSource,
+        store: &AppendCursorStore,
+    ) -> Result<AppendRead, RetryError<super::Error>> {
+        let saved = store.load(&self.dataset_name).await;
+        let time_column = refresh.time_column.as_ref().map(|name| TimeColumn {
+            name: name.clone(),
+            format: self.stored_time_format(name, refresh),
+        });
+        let plan = source
+            .plan_append(
+                &self.dataset_name.to_string(),
+                saved.as_deref(),
+                time_column.as_ref(),
+            )
+            .await
+            .map_err(|source| {
+                RetryError::transient(super::Error::FailedToRefreshDataset { source })
+            })?;
+
+        match plan {
+            AppendPlan::Unchanged => Ok(AppendRead::UpToDate),
+            AppendPlan::TimeFiltered { cursor, source } => {
+                let update = self.time_filtered_append(refresh, source).await?;
+                Ok(AppendRead::Update { update, cursor })
+            }
+            AppendPlan::FullReload { cursor, source, .. } => {
+                let update = self
+                    .get_full_or_incremental_append_update_from(
+                        refresh,
+                        None,
+                        source,
+                        Some(UpdateType::Overwrite),
+                    )
+                    .await?;
+                // The same post-processing a full refresh applies.
+                let update = if refresh.versions_by_time.is_some() {
+                    self.select_latest_by_time(refresh, update, StoredRowsFrom::None)
+                        .await?
+                } else {
+                    update
+                };
+                Ok(AppendRead::Update { update, cursor })
+            }
+            AppendPlan::AddedRows(read) => {
+                if read.is_empty {
+                    // The commits added no row: nothing to read, and nothing a replay
+                    // could lose, so the cursor moves now.
+                    self.save_append_cursor(&read.cursor).await;
+                    return Ok(AppendRead::UpToDate);
+                }
+                let update = self
+                    .get_data_update(vec![], refresh, UpdateType::Append, read.provider)
+                    .await?;
+                let from = read.seed.map_or(StoredRowsFrom::All, StoredRowsFrom::from_seed);
+                let update = if refresh.versions_by_time.is_some()
+                    && self.version_ordering(refresh).is_some()
+                {
+                    self.select_latest_by_time(refresh, update, from).await?
+                } else {
+                    self.except_existing_records_from(refresh, update, from)
+                        .await?
+                };
+                Ok(AppendRead::Update {
+                    update,
+                    cursor: Some(read.cursor),
+                })
+            }
+        }
+    }
+
+    /// How the acceleration stores `column`, as far as comparing a source's time bound
+    /// with it goes; `None` for a type the refresh cannot compare, which reads every
+    /// stored row, the safe side.
+    fn stored_time_format(
+        &self,
+        column: &str,
+        refresh: &Refresh,
+    ) -> Option<util::timestamp_filter::TimestampFormat> {
+        let schema = self.accelerator.schema();
+        let (_, field) = schema.column_with_name(column)?;
+        data_type_to_timestamp_format(
+            field.data_type(),
+            crate::filter_converter::time_format_to_unix_scale(refresh.time_format),
+        )
+    }
+
+    /// Saves the commit an append refresh just loaded. A save that fails only costs
+    /// the next refresh a re-read of the same commits, which its dedupe absorbs.
+    async fn save_append_cursor(&self, cursor: &str) {
+        let Some(store) = &self.append_cursor_store else {
+            return;
+        };
+        match store.save(cursor).await {
+            Ok(()) => tracing::debug!(
+                "Dataset '{}' saved the source commit its append refresh last loaded: {cursor}",
+                self.dataset_name
+            ),
+            Err(e) => tracing::warn!(
+                "Dataset '{}' loaded its source up to commit {cursor} but could not save that, so the next append refresh reads the same commits again: {e}",
+                self.dataset_name
+            ),
+        }
+    }
+
+    /// Today's append: the rows after `max(time_column) − refresh_append_overlap`, read
+    /// from `source` or the dataset's own provider, then deduplicated against the
+    /// stored rows from that same mark.
+    async fn time_filtered_append(
+        &self,
+        refresh: &Refresh,
+        source: Option<Arc<dyn TableProvider>>,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         match self
             .timestamp_nanos_for_append_query(refresh)
             .await
@@ -1330,7 +1606,7 @@ impl RefreshTask {
                 );
 
                 match self
-                    .get_full_or_incremental_append_update(refresh, timestamp)
+                    .get_full_or_incremental_append_update_from(refresh, timestamp, source, None)
                     .await
                 {
                     // Ordering versions by time replaces the exact-row dedupe: it is
@@ -1341,12 +1617,21 @@ impl RefreshTask {
                         if refresh.versions_by_time.is_some()
                             && self.version_ordering(refresh).is_some() =>
                     {
-                        self.select_latest_by_time(refresh, data, timestamp).await
+                        self.select_latest_by_time(
+                            refresh,
+                            data,
+                            StoredRowsFrom::from_mark(timestamp),
+                        )
+                        .await
                     }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
                     // source filter just used, not a freshly read one (#12492).
                     Ok(data) => match self
-                        .except_existing_records_from(refresh, data, timestamp)
+                        .except_existing_records_from(
+                            refresh,
+                            data,
+                            StoredRowsFrom::from_mark(timestamp),
+                        )
                         .await
                     {
                         Ok(data) => Ok(data),
@@ -1398,7 +1683,7 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
         update: StreamingDataUpdate,
-        window_start: Option<u128>,
+        stored_from: StoredRowsFrom,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let dataset = self.dataset_name.to_string();
         let not_applied = |error: &DataFusionError| {
@@ -1421,7 +1706,7 @@ impl RefreshTask {
         // An append with no high-water mark reads the whole source, so into an empty
         // acceleration it is such a load.
         if dedup.versions_resolved_after_write
-            && window_start.is_none()
+            && stored_from == StoredRowsFrom::None
             && self.sink.read().await.synchronized_tables().is_empty()
             && match update.update_type {
                 UpdateType::Overwrite => true,
@@ -1459,7 +1744,7 @@ impl RefreshTask {
             selector = selector.with_runtime_env(Arc::clone(runtime_env));
         }
 
-        if let Some(value) = window_start
+        if stored_from != StoredRowsFrom::None
             && let Some(filter_converter) = self.get_accelerator_filter_converter(refresh)
         {
             let federated_provider = self.federated.table_provider().await;
@@ -1493,17 +1778,18 @@ impl RefreshTask {
                         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
                     )
                 });
-            let start = if string_time {
-                value.checked_sub(MAX_UTC_OFFSET_NANOS)
-            } else {
-                Some(value)
+            let start = match stored_from {
+                StoredRowsFrom::From(value) if string_time => value
+                    .checked_sub(MAX_UTC_OFFSET_NANOS)
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::From),
+                other => other,
             };
             // Read when the write first pulls rows, which it does holding the
             // accelerator write lock, so no write lands between the read and the
             // write it decides.
             let stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
-                .and_then(|df| match start {
-                    Some(start) => df.filter(filter_converter.convert_high_water_mark(start)),
+                .and_then(|df| match start.filter(&filter_converter) {
+                    Some(filter) => df.filter(filter),
                     None => Ok(df),
                 })
                 .and_then(|df| df.select_columns(&columns))
@@ -1705,12 +1991,9 @@ impl RefreshTask {
                 );
                 let dataset_metrics_label_sets =
                     self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
-                for label_set in &dataset_metrics_label_sets {
-                    metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
-                }
-                self.set_refresh_status(None, status::ComponentStatus::Ready)
-                    .await;
-                return Ok(RefreshOutcome::UpToDate);
+                return Ok(self
+                    .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                    .await);
             }
             Err(e) => {
                 let schema_mismatch = mismatch_detail
@@ -1953,16 +2236,10 @@ impl RefreshTask {
         }
     }
 
-    async fn get_data_update(
-        &self,
-        mut filters: Vec<Expr>,
-        refresh: &Refresh,
-    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let federated_provider = self.federated.table_provider().await;
-
-        let dataset_name = self.dataset_name.clone();
-        #[expect(clippy::match_same_arms)] // Caching will have different behavior in future
-        let update_type = match refresh.mode {
+    /// How the rows a refresh in `mode` reads are written.
+    #[expect(clippy::match_same_arms)] // Caching will have different behavior in future
+    fn update_type_for(mode: RefreshMode) -> UpdateType {
+        match mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
@@ -1973,7 +2250,19 @@ impl RefreshTask {
             RefreshMode::Snapshot => {
                 unreachable!("snapshot mode is handled by refresh_from_snapshot")
             }
-        };
+        }
+    }
+
+    /// Reads the rows of one refresh from `federated_provider`, registered under the
+    /// dataset's name so its `refresh_sql` resolves against it, written as `update_type`.
+    async fn get_data_update(
+        &self,
+        mut filters: Vec<Expr>,
+        refresh: &Refresh,
+        update_type: UpdateType,
+        federated_provider: Arc<dyn TableProvider>,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        let dataset_name = self.dataset_name.clone();
 
         // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
         // spicepod), parse and use it. Transfer partition filters from the base refresh SQL.
@@ -2284,15 +2573,12 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
         mut update: StreamingDataUpdate,
-        high_water_mark: Option<u128>,
+        stored_from: StoredRowsFrom,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        let value = match high_water_mark {
-            Some(value) => value,
-            None => match self.timestamp_nanos_for_append_query(refresh).await? {
-                Some(value) => value,
-                None => return Ok(update),
-            },
-        };
+        // Nothing stored means nothing to drop.
+        if stored_from == StoredRowsFrom::None {
+            return Ok(update);
+        }
         let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
         };
@@ -2315,14 +2601,18 @@ impl RefreshTask {
             .await,
         )
         .map_err(find_datafusion_root)
-        .context(super::UnableToScanTableProviderSnafu)?
-        .filter(filter_converter.convert_high_water_mark(value))
-        .map_err(find_datafusion_root)
-        .context(super::UnableToScanTableProviderSnafu)?
-        .collect()
-        .await
-        .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
+        if let Some(filter) = stored_from.filter(&filter_converter) {
+            existing_records = existing_records
+                .filter(filter)
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?;
+        }
+        let mut existing_records = existing_records
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
 
         // ACID fix for append dedup with nullable time_column:
         // The > max_time query intentionally excludes older rows (including all
@@ -2356,7 +2646,9 @@ impl RefreshTask {
         // task. We only pay the (hopefully small) cost of loading the NULL-time
         // subset; the > max tail optimization is preserved for the non-null
         // recent data. If the time_column is non-nullable, we skip this path.
-        if let Some(tc) = &refresh.time_column
+        // Every stored row is already in the set when no mark narrowed it.
+        if stored_from != StoredRowsFrom::All
+            && let Some(tc) = &refresh.time_column
             && self
                 .accelerator
                 .schema()
@@ -3592,6 +3884,16 @@ fn schema_evolution_mismatch_refresh_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored rows an append refresh of `task` compares with: from the high-water
+    /// mark it reads out of the acceleration, as the refresh derives it.
+    async fn high_water_mark(task: &RefreshTask, refresh: &Refresh) -> StoredRowsFrom {
+        StoredRowsFrom::from_mark(
+            task.timestamp_nanos_for_append_query(refresh)
+                .await
+                .expect("the high-water mark is read"),
+        )
+    }
     use crate::federated::FederatedTable;
     use arrow::array::{
         ArrayRef, Date32Array, Date64Array, Float16Array, Float32Array, Float64Array, Int32Array,
@@ -5247,7 +5549,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update, None)
+            .except_existing_records_from(&refresh, update, high_water_mark(&task, &refresh).await)
             .await
             .expect("except_existing_records_from should succeed with column subset");
 
@@ -5368,7 +5670,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let result = task
-            .except_existing_records_from(&refresh, update, None)
+            .except_existing_records_from(&refresh, update, high_water_mark(&task, &refresh).await)
             .await
             .expect("except_existing_records_from should succeed with nullable time column");
 
@@ -5659,10 +5961,10 @@ mod tests {
         );
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
-        // `None`: let the dedupe derive the mark, which is what an append refresh without a
-        // day-granular time column does.
+        // The mark the refresh derives, as an append refresh without a day-granular time
+        // column does.
         let result = task
-            .except_existing_records_from(&refresh, update, None)
+            .except_existing_records_from(&refresh, update, high_water_mark(&task, &refresh).await)
             .await
             .expect("except_existing_records_from should succeed");
 
@@ -5762,7 +6064,7 @@ mod tests {
             .except_existing_records_from(
                 &refresh,
                 StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                Some(0),
+                StoredRowsFrom::From(0),
             )
             .await
             .expect("Cayenne timestamp normalization should allow append de-duplication");
@@ -5869,7 +6171,7 @@ mod tests {
             .except_existing_records_from(
                 &refresh,
                 StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                Some(0),
+                StoredRowsFrom::From(0),
             )
             .await
             .expect("Cayenne nanosecond deduplication should succeed");
@@ -6031,7 +6333,7 @@ mod tests {
         let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
 
         let collected = task
-            .except_existing_records_from(&refresh, update, None)
+            .except_existing_records_from(&refresh, update, high_water_mark(&task, &refresh).await)
             .await
             .expect("except_existing_records_from should succeed for a Date32 time column")
             .collect_data()

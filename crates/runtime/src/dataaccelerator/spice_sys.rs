@@ -116,6 +116,26 @@ pub async fn checkpoint_store(
     }
 }
 
+/// Where `dataset`'s append refresh keeps the source snapshot it last loaded.
+///
+/// A file-backed acceleration keeps it in its sidecar, beside the data it describes.
+/// One with no sidecar (memory mode, Arrow) keeps it for the process: its data lives no
+/// longer, so the next start takes an initial load either way. `checkpoint_store` logs
+/// why a sidecar could not be resolved, which a memory-mode dataset must not trigger.
+pub async fn append_cursor_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> crate::accelerated::refresh_task::append_cursor::AppendCursorStore {
+    use crate::accelerated::refresh_task::append_cursor::{APPEND_CURSOR_TABLE, AppendCursorStore};
+    let persisted = if dataset.is_file_accelerated() {
+        checkpoint_store(dataset, APPEND_CURSOR_TABLE)
+            .await
+            .map(AppendCursorStore::persisted)
+    } else {
+        None
+    };
+    persisted.unwrap_or_else(AppendCursorStore::in_memory)
+}
+
 /// Construct the **Kafka** checkpoint store over this dataset's accelerator.
 ///
 /// Unlike [`checkpoint_store`] this reports a resolution failure as an error: the Kafka

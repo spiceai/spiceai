@@ -4372,6 +4372,14 @@ impl DataFusion {
             .ok(),
         );
 
+        // An append refresh of a source that records its commits (Iceberg) follows
+        // them from the snapshot it last loaded.
+        if matches!(refresh_mode, RefreshMode::Append) {
+            accelerated_table_builder.append_cursor_store(
+                crate::dataaccelerator::spice_sys::append_cursor_store(dataset).await,
+            );
+        }
+
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         // Caching mode requires federation to be disabled so that queries go through
@@ -4943,6 +4951,12 @@ impl DataFusion {
 
             // Clear the checkpoint so the refresh treats this as a fresh table
             let _ = cp.delete().await;
+            // And the snapshot an append refresh last loaded, for the same reason: the
+            // recreated table holds none of it.
+            let _ = crate::dataaccelerator::spice_sys::append_cursor_store(dataset)
+                .await
+                .clear()
+                .await;
 
             // The table is recreated with a new schema; cached logical plans reference the
             // old schema and must be dropped (mirrors the in-place evolution path above).

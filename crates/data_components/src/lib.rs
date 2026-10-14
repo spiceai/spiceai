@@ -82,6 +82,7 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_replication;
 pub mod refresh_skip;
+pub mod incremental_append;
 pub mod resilient_http;
 pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
