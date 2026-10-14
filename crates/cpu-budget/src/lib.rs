@@ -1378,12 +1378,16 @@ impl CpuBudget {
 
     /// How many Cayenne `deletion_mode: auto` tables may rewrite themselves whole
     /// at once to reclaim deletes: one per four physical cores, and at least one.
+    /// An unknown CPU topology admits only one reclaim at a time.
     /// Tables written alike reach their reclaim triggers together: on eight cores,
     /// with 20 tables of 200K rows, all 20 rewriting at once stalled aggregate scans
     /// on them to 154–194 ms, against 67–74 ms on key deletes.
     #[must_use]
     pub const fn cayenne_whole_table_reclaim_permits(&self) -> usize {
-        let permits = self.physical_cores() / 4;
+        let Some(physical_cores) = self.known_physical_cores() else {
+            return 1;
+        };
+        let permits = physical_cores / 4;
         if permits == 0 { 1 } else { permits }
     }
 
@@ -1653,6 +1657,13 @@ mod tests {
                 smt_budget(cores, logical, physical).cayenne_whole_table_reclaim_permits(),
                 permits,
                 "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+        for cores in [1, 4, 8, 16, 64] {
+            assert_eq!(
+                budget(cores).cayenne_whole_table_reclaim_permits(),
+                1,
+                "{cores} logical CPUs with unknown topology admit one reclaim"
             );
         }
     }

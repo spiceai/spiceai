@@ -33,3 +33,19 @@ fn auto_position_deletes_require_known_host_topology() {
         "unknown topology must not establish eight physical cores"
     );
 }
+
+#[test]
+fn auto_reclaims_use_one_permit_when_host_topology_is_unknown() {
+    let host = HostReadings::detect();
+    let budget = CpuBudget::resolve(&CpuConfig::default(), &host).expect("valid detected budget");
+    let permits = budget.cayenne_whole_table_reclaim_permits();
+    println!(
+        "detected_smt={:?} logical_budget={} reclaim_permits={permits}",
+        host.smt,
+        budget.cores(),
+    );
+    assert!(
+        host.smt.is_some() || permits == 1,
+        "unknown topology must limit whole-table reclaims to one permit"
+    );
+}

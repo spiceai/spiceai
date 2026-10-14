@@ -39,8 +39,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, LastSmallFileCompactPath, MetadataCatalog};
+use cayenne::provider::CayenneContext;
+use cayenne::{
+    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
+    MetadataCatalog,
+};
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -50,6 +56,7 @@ test_with_backends!(key_mode_deletion_index_still_reclaims);
 test_with_backends!(default_mode_small_table_reclaims_by_rewriting_itself);
 test_with_backends!(default_mode_table_past_its_bound_reclaims_through_the_bake);
 test_with_backends!(small_write_profile_deletion_index_reclaims_through_the_bake);
+test_with_backends!(empty_table_reclaim_clears_tombstones_and_survives_reopen);
 
 /// Rows per upsert round. Above `INLINE_MAX_ROWS` so each round writes a Vortex
 /// file rather than landing in the inline memtable.
@@ -131,6 +138,10 @@ async fn build_table_with_config(
     schema: &Arc<Schema>,
     vortex_config: VortexConfig,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let context = vortex_config
+        .auto_keeps_key_deletes
+        .then(|| CayenneContext::new(&vortex_config, ctx.runtime_env(), name));
     let options = CreateTableOptions {
         table_name: name.to_string(),
         schema: Arc::clone(schema),
@@ -144,10 +155,98 @@ async fn build_table_with_config(
     };
 
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let ctx = SessionContext::new();
-    Ok(Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    ))
+    let mut builder = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env());
+    if let Some(context) = context {
+        builder = builder.with_context(context);
+    }
+    Ok(Arc::new(builder.create(options).await?))
+}
+
+/// Deleting every row still requires a durable empty rewrite before the
+/// deletion index can be reclaimed. Reinserting the keys after reopening must
+/// return only the new rows.
+async fn empty_table_reclaim_clears_tombstones_and_survives_reopen(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (mode, keep_keys) in [
+        (DeletionMode::Auto, false),
+        (DeletionMode::Auto, true),
+        (DeletionMode::Position, false),
+    ] {
+        let name = format!("empty_reclaim_{}_{keep_keys}", mode.as_str());
+        let schema = pk_schema();
+        let table = build_table_with_config(
+            &fixture,
+            &name,
+            &schema,
+            VortexConfig {
+                auto_keeps_key_deletes: keep_keys,
+                bake_deletion_index_trigger: 2,
+                ..reclaim_config(mode)
+            },
+        )
+        .await?;
+        assert_eq!(table.should_capture_positions(), !keep_keys);
+        common::write_batches(
+            &table,
+            vec![round_batch(&schema, 0, 0)],
+            InsertOp::Overwrite,
+        )
+        .await?;
+        table.drain_in_flight_maintenance().await?;
+        let ctx = SessionContext::new();
+        ctx.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+        ctx.sql(&format!("DELETE FROM {name}"))
+            .await?
+            .collect()
+            .await?;
+        let before = table.deletion_index_len();
+        assert!(
+            before >= 2,
+            "premise: all-row delete crossed the reclaim trigger"
+        );
+        let rows = ctx
+            .sql(&format!("SELECT id, value FROM {name}"))
+            .await?
+            .collect()
+            .await?;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0));
+        let committed =
+            tokio::time::timeout(PASS_TIMEOUT, table.compact_current_snapshot_small_files())
+                .await??;
+        let after = table.deletion_index_len();
+        println!(
+            "{name}: visible_rows=0 tombstones_before={before} committed={committed} tombstones_after={after}"
+        );
+        assert_eq!(after, 0, "{name}: reclaim must clear the deletion index");
+        assert!(committed, "{name}: the empty snapshot must commit");
+        ctx.deregister_table(&name)?;
+        drop(table);
+
+        let catalog: Arc<dyn MetadataCatalog> =
+            Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+        catalog.init().await?;
+        let reopened = Arc::new(
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+                .open(&name)
+                .await?,
+        );
+        assert_eq!(reopened.deletion_index_len(), 0, "{name}: durable prune");
+        ctx.register_table(&name, Arc::clone(&reopened) as Arc<dyn TableProvider>)?;
+        let rows = ctx
+            .sql(&format!("SELECT id, value FROM {name}"))
+            .await?
+            .collect()
+            .await?;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0));
+        common::insert_batch(&reopened, round_batch(&schema, 0, 1)).await?;
+        assert_eq!(
+            row_set_summary(&reopened, &name).await,
+            (ROWS_PER_ROUND, ROWS_PER_ROUND, ROWS_PER_ROUND),
+            "{name}: reinsertion returns each key once, with its new value"
+        );
+    }
+    Ok(())
 }
 
 /// Drive `ROUNDS` upsert rounds, running a maintenance pass after each, and

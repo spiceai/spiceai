@@ -24102,7 +24102,7 @@ impl CayenneTableProvider {
     /// dir and atomically flip the current-snapshot pointer to it.
     ///
     /// Returns `Ok(true)` if a new snapshot was committed, `Ok(false)` if the
-    /// pass was a no-op — the source had no live rows, a **concurrent append
+    /// pass was a no-op — a non-reclaim source had no live rows, a **concurrent append
     /// landed during the off-fence re-encode** (append fence) and the commit
     /// aborted to avoid losing it, or the **protected-snapshot set changed during
     /// the scan** (delete fence) so the folded set could no longer be determined.
@@ -24601,10 +24601,10 @@ impl CayenneTableProvider {
             }
         };
 
-        if total_rows == 0 {
-            // No live rows in the source — clean up the empty new snapshot
-            // dir and skip the catalog commit. Subsequent triggers will keep
-            // returning the same empty state and pick None, so this is rare.
+        if total_rows == 0 && !reclaim {
+            // An ordinary compaction need not publish empty output. A deletion-index
+            // reclaim must commit an empty snapshot before pruning the tombstones
+            // it folded, under the same fences that preserve concurrent writes.
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             maintenance_metrics::track_compaction(

@@ -374,6 +374,62 @@ async fn an_upsert_racing_an_auto_tables_rewrite_stays_superseded() {
     );
 }
 
+/// An empty reclaim folds the old deletions but preserves the protected
+/// snapshot and newer mutation state of an upsert published before its commit.
+#[tokio::test]
+async fn an_empty_reclaim_preserves_a_concurrent_upsert() {
+    for keep_keys in [false, true] {
+        let name = format!("empty_reclaim_racing_upsert_{keep_keys}");
+        let (provider, catalog, _tmp) = if keep_keys {
+            auto_table_keeping_key_deletes(&name).await
+        } else {
+            table(&name, DeletionMode::Auto, 256).await
+        };
+        overwrite(&provider, &[0, 1, 2, 3], 100).await;
+        let ctx = SessionContext::new();
+        let delete = provider
+            .delete_from(&ctx.state(), vec![datafusion_expr::lit(true)])
+            .await
+            .expect("plan all-row delete");
+        collect(delete, ctx.task_ctx()).await.expect("delete rows");
+        assert!(
+            collect_id_value_pairs(&ctx, &provider, &name)
+                .await
+                .is_empty()
+        );
+        assert_eq!(provider.deletion_index_len(), 4);
+
+        let racing = provider.clone_for_write();
+        *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                write(&racing, &[0, 2, 9], 300).await;
+            })
+        }));
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("empty reclaim"),
+            "the empty reclaim commits alongside the upsert"
+        );
+        let expected = vec![(0, 300), (2, 300), (9, 300)];
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, &name).await,
+            expected,
+            "the empty commit preserves the concurrent upsert"
+        );
+        let reopened = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+            .open(&name)
+            .await
+            .expect("reopen after the reclaim");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, &name).await,
+            expected,
+            "reopening preserves the concurrent upsert"
+        );
+    }
+}
+
 /// The switch to key deletes forgets the positions the read-back captured, and the
 /// upsert path stops recording position deletes, so a later upsert of a key that
 /// was located records only a key tombstone; position deletes recorded before the
