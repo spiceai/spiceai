@@ -4367,7 +4367,9 @@ impl DataAccelerator for CayenneAccelerator {
             }
 
             serialize_partition_child_writes(&mut vortex_config, &table_name);
-            // A new partition takes the stored table's conflict detection, with its key.
+            // Partitions take the stored table's conflict detection, with its key: a new
+            // one is created with it, and an existing one follows the table turning it
+            // off in place, which updates only the table's metastore row.
             vortex_config.pk_conflict_detection =
                 table_metadata.vortex_config.pk_conflict_detection;
 

@@ -1607,11 +1607,11 @@ impl CayenneCatalog {
                             changes: describe_setting_changes(&identity_changes),
                         });
                     }
-                    // Rows written with the check off may share a key. Keeping the
-                    // stored settings would keep the table's stored key handling while
-                    // the provider enforces the check the spicepod asks for (it reads
-                    // that from the requested settings), so this change is refused
-                    // rather than kept.
+                    // Rows written with the check off may share a key, so they cannot
+                    // give the one row per key the spicepod asks for. Kept, the table
+                    // would also go on writing without the check, since the provider
+                    // follows the stored mode, so this change is refused rather than
+                    // kept.
                     if enables_pk_conflict_detection(&stored_metadata, options) {
                         if options.vortex_config.settings_change
                             == SettingsChangeAction::HoldUntilSourceReadable

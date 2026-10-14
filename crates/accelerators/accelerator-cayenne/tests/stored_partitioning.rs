@@ -462,6 +462,70 @@ async fn a_kept_change_keeps_the_stored_conflict_detection() {
     }
 }
 
+/// Turning `cayenne_pk_conflict_detection` off is applied in place: the reopened table
+/// persists `none` to its metastore row, and its writes follow that row, so writing a
+/// stored `id` again adds a second row instead of replacing the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_conflict_detection_off_in_place_admits_a_repeated_key() {
+    async fn run(ctx: &SessionContext, sql: &str) {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("insert");
+    }
+
+    for partition_by in [&[][..], &["w"][..]] {
+        let dir = tempfile::tempdir().expect("dir");
+        let ctx = SessionContext::new();
+        let table = table_configured(
+            &ctx,
+            dir.path(),
+            partition_by,
+            RefreshMode::Append,
+            SettingsRebuild::Allowed,
+            Setup {
+                primary_key: Some("id"),
+                ..Setup::default()
+            },
+        )
+        .await
+        .expect("table");
+        ctx.register_table("t", table).expect("register");
+        run(&ctx, "INSERT INTO t VALUES (1, 0, 0)").await;
+        run(&ctx, "INSERT INTO t VALUES (1, 0, 3)").await;
+        assert_eq!(
+            ids(&ctx).await,
+            [1],
+            "partition_by: {partition_by:?}: conflict detection starts on"
+        );
+
+        let ctx = SessionContext::new();
+        let table = table_configured(
+            &ctx,
+            dir.path(),
+            partition_by,
+            RefreshMode::Append,
+            SettingsRebuild::Allowed,
+            Setup {
+                primary_key: Some("id"),
+                params: &[("cayenne_pk_conflict_detection", "none")],
+                ..Setup::default()
+            },
+        )
+        .await
+        .expect("turning conflict detection off opens the stored table");
+        ctx.register_table("t", table).expect("register");
+        run(&ctx, "INSERT INTO t VALUES (1, 0, 5)").await;
+        assert_eq!(
+            ids(&ctx).await,
+            [1, 1],
+            "partition_by: {partition_by:?}: writes must follow the check turned off in place"
+        );
+    }
+}
+
 /// Vector search identifies rows by the key the stored table holds them by, the key its
 /// writes and partitions use, including after a key change the table keeps. Identifying
 /// them by the requested key would give search results a key the table never adopted.
