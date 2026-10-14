@@ -487,6 +487,12 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             }
         },
 
+        // An enum or other dictionary-encoded column compares by its values.
+        DataType::Dictionary(_, value_type) => {
+            let values = arrow::compute::cast(&array.slice(index, 1), value_type)?;
+            array_value_to_string(values.as_ref(), 0)
+        }
+
         // Both sides are typed alike by the time they are compared, so Arrow's
         // own rendering of these is the same for equal values.
         DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_) => {
