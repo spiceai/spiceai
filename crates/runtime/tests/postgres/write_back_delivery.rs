@@ -45,6 +45,7 @@ use anyhow::anyhow;
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
+use runtime::status::ComponentStatus;
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, WriteMode};
 use spicepod::component::dataset::replication::Replication;
@@ -321,8 +322,28 @@ async fn create_bumping_table(source: &Client, table: &str) -> Result<(), anyhow
     Ok(())
 }
 
+/// Wait for one dataset to report `Ready`, for a test whose runtime also holds a
+/// dataset that is refused on purpose and so never passes `runtime_ready_check`.
+async fn wait_for_ready(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    let name = datafusion::common::TableReference::from(table);
+    let ready = wait_until_true(PROPAGATION_TIMEOUT, || async {
+        matches!(
+            rt.status().get_dataset_statuses().get(&name),
+            Some(ComponentStatus::Ready)
+        )
+    })
+    .await;
+    let status = rt.status().get_dataset_statuses().get(&name).cloned();
+    anyhow::ensure!(ready, "{table} should load, got {status:?}");
+    Ok(())
+}
+
 /// Wait for the dataset's bootstrap snapshot — the one seed row.
+///
+/// Waits for `Ready` first: before that the query fails with "Acceleration not
+/// ready", and `wait_for` returns a failed probe instead of retrying it.
 async fn wait_for_bootstrap(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    wait_for_ready(rt, table).await?;
     let sql = format!("SELECT count(*) FROM {table}");
     wait_for("the bootstrap snapshot", Some(1), || accel_scalar(rt, &sql)).await
 }
@@ -492,8 +513,6 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
 /// dataset, both load and follow UPDATE and DELETE.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow::Error> {
-    use runtime::status::ComponentStatus;
-
     let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
@@ -590,16 +609,7 @@ async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow:
             );
 
             for table in ["cdc_keyed", "cdc_source_key"] {
-                let name = datafusion::common::TableReference::from(table);
-                let ready = wait_until_true(Duration::from_mins(1), || async {
-                    matches!(
-                        rt.status().get_dataset_statuses().get(&name),
-                        Some(ComponentStatus::Ready)
-                    )
-                })
-                .await;
-                let status = rt.status().get_dataset_statuses().get(&name).cloned();
-                anyhow::ensure!(ready, "{table} should load, got {status:?}");
+                wait_for_ready(&rt, table).await?;
                 let sum = format!("SELECT sum(v) FROM {table}");
                 wait_for(&format!("the {table} bootstrap"), Some(3), || {
                     accel_scalar(&rt, &sum)
@@ -1019,8 +1029,6 @@ fn with_pk_conflict_detection_none(mut dataset: Dataset) -> Dataset {
 #[tokio::test(flavor = "multi_thread")]
 async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
 -> Result<(), anyhow::Error> {
-    use runtime::status::ComponentStatus;
-
     let _tracing = init_tracing(Some(tracing_filter()));
 
     test_request_context()
@@ -1123,11 +1131,7 @@ async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
 
             // A read-only dataset takes no accelerator writes, so the setting is
             // not refused there: it loads its full refresh.
-            let loaded = crate::utils::wait_until_true(Duration::from_secs(60), || async {
-                matches!(status("pkd_ro"), Some(ComponentStatus::Ready))
-            })
-            .await;
-            assert!(loaded, "pkd_ro must load, got {:?}", status("pkd_ro"));
+            wait_for_ready(&rt, "pkd_ro").await?;
             assert_eq!(
                 accel_scalar(&rt, "SELECT n FROM pkd_ro WHERE id = 1").await?,
                 Some(10)
