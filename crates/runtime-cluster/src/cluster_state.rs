@@ -35,8 +35,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
 use object_store_occ::{
-    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError,
-    conditional_put, retry_on_conflict,
+    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError, conditional_put,
+    retry_on_conflict,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -657,9 +657,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mutations_on_a_local_directory_all_land() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"),
-        );
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"));
         ClusterStateStore::new(Arc::clone(&store), "")
             .bootstrap()
             .await
@@ -674,8 +673,7 @@ mod tests {
                 for i in 0..per_writer {
                     let id = format!("w{writer}-{i}");
                     s.mutate(|cs| {
-                        cs.schedulers
-                            .insert(id.clone(), entry(&id, Uuid::new_v4()));
+                        cs.schedulers.insert(id.clone(), entry(&id, Uuid::new_v4()));
                         MutationOutcome::Apply
                     })
                     .await

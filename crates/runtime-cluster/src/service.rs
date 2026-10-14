@@ -1854,7 +1854,11 @@ mod tests {
     async fn racing_stores(
         table: &str,
         partitions: Vec<PartitionMetadata>,
-    ) -> (PartitionStore, Arc<PartitionStore>, Arc<RaceBeforeFirstWrite>) {
+    ) -> (
+        PartitionStore,
+        Arc<PartitionStore>,
+        Arc<RaceBeforeFirstWrite>,
+    ) {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let other = Arc::new(PartitionStore::accelerations(Arc::new(
             ClusterStateStore::new(Arc::clone(&inner), ""),
@@ -1873,7 +1877,10 @@ mod tests {
         (this, other, racing)
     }
 
-    fn assigned_to(meta: &crate::metadata::TablePartitionMetadata, value: &PartitionValue) -> Vec<String> {
+    fn assigned_to(
+        meta: &crate::metadata::TablePartitionMetadata,
+        value: &PartitionValue,
+    ) -> Vec<String> {
         meta.partitions
             .iter()
             .find(|p| p.partition_value == *value)

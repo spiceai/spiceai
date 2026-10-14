@@ -1776,9 +1776,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_persists_on_a_local_directory_keep_every_template() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"),
-        );
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"));
         let writers = 4;
         let mut tasks = Vec::new();
         let mut expected = Vec::new();

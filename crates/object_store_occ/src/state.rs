@@ -772,9 +772,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_modify_on_a_local_directory_loses_no_update() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            crate::LocalConditionalPut::new(dir.path()).expect("local conditional store"),
-        );
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(crate::LocalConditionalPut::new(dir.path()).expect("local conditional store"));
         let writers = 6;
         let per_writer = 10;
         let mut tasks = Vec::new();
@@ -802,7 +801,11 @@ mod tests {
         }
         let state: ObjectState<TestData> = ObjectState::new(store).with_prefix("test/");
         assert_eq!(
-            state.get("counter").await.expect("get failed").map(|d| d.value),
+            state
+                .get("counter")
+                .await
+                .expect("get failed")
+                .map(|d| d.value),
             Some(writers * per_writer)
         );
     }

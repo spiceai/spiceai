@@ -26,8 +26,8 @@ use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
 use object_store_occ::{
-    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError,
-    conditional_put, retry_on_conflict,
+    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError, conditional_put,
+    retry_on_conflict,
 };
 use parking_lot::Mutex;
 use snafu::prelude::*;
@@ -957,11 +957,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_finishers_agree_on_the_first_terminal_state() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"),
-        );
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"));
         let stores: Vec<_> = (0..3)
-            .map(|n| Arc::new(JobStore::new(Arc::clone(&store), "test", &format!("node-{n}"))))
+            .map(|n| {
+                Arc::new(JobStore::new(
+                    Arc::clone(&store),
+                    "test",
+                    &format!("node-{n}"),
+                ))
+            })
             .collect();
         for round in 0..10 {
             let job_id = stores[0]
@@ -982,7 +987,11 @@ mod tests {
                         barrier.wait().await;
                         match n {
                             0 => job_store.complete_job(&job_id, empty_result()).await,
-                            1 => job_store.fail_job(&job_id, JobErrorCode::Internal, "failed").await,
+                            1 => {
+                                job_store
+                                    .fail_job(&job_id, JobErrorCode::Internal, "failed")
+                                    .await
+                            }
                             _ => job_store.cancel_job(&job_id).await,
                         }
                     })
