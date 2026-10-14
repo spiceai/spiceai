@@ -123,7 +123,6 @@ pub mod jobs;
 mod management;
 mod metrics_server;
 pub mod model;
-mod object_store_state;
 pub mod opentelemetry;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names

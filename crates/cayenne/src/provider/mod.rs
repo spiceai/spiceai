@@ -104,6 +104,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
+pub(crate) mod pk_deletion_mode;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
 pub(crate) mod pk_validation;
@@ -150,6 +151,10 @@ pub use mem_tier_budget::{
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_deletion_mode::{
+    AutoKeyDeletesReason, AutoKeyTableKind, DeletionModeChoice, TableStorage,
+    auto_keeps_small_tables_compacted, auto_key_deletes_reason,
+};
 pub use pk_keyset_budget::{
     force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
     release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,

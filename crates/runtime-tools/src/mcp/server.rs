@@ -707,6 +707,8 @@ impl RuntimeServer {
                     None,
                 ));
             }
+            // MCP reports an unknown tool as invalid params: the method exists, its
+            // `name` does not.
             ResolveOutcome::Missing => {
                 return Err(McpError::invalid_params(
                     format!("Unknown tool: {tool_name}"),
@@ -4629,12 +4631,16 @@ mod tests {
             http::StatusCode::OK,
             "MCP returns 200 with error payload: {json}"
         );
-        // Tool error becomes MCP internal_error or isError result depending on path.
-        let is_error = json.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
-            || json.get("error").is_some();
-        let text = json.to_string();
+        // A refused write is the tool's own failure, reported in its result.
+        assert_eq!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RO key must reject write_gated tool; got {json}"
+        );
         assert!(
-            is_error && text.contains("read-only"),
+            json.pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("read-only")),
             "RO key must reject write_gated tool; got {json}"
         );
     }
@@ -4654,6 +4660,104 @@ mod tests {
         let payload: Value =
             serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
         assert_eq!(payload.get("wrote"), Some(&Value::Bool(true)));
+    }
+
+    /// Tool that reads a required `query` argument, as `sql` does.
+    struct QueryArgTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for QueryArgTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("query_arg")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("reads a required query argument"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }))
+        }
+        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            #[derive(serde::Deserialize)]
+            struct Args {
+                query: String,
+            }
+            let Args { query } = serde_json::from_str(arg)?;
+            Ok(json!({ "query": query }))
+        }
+    }
+
+    fn query_arg_server() -> RuntimeServer {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "query_arg".to_string(),
+            Tooling::Tool(Arc::new(QueryArgTool) as Arc<dyn SpiceModelTool>),
+        );
+        RuntimeServer::new(Arc::new(RwLock::new(tools)))
+    }
+
+    // regression test for #14901: an unknown tool was `-32601` with the message
+    // "tools/call", which names neither the tool nor the problem.
+    #[tokio::test]
+    async fn an_unknown_tool_is_invalid_params_naming_the_tool() {
+        let service = mcp_http_service(query_arg_server());
+        let expected = json!({
+            "code": -32602,
+            "message": "Unknown tool: no_such_tool"
+        });
+
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "no_such_tool",
+            Some(spice_ctx_with_api_key("test-key:rw")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json.get("error"), Some(&expected), "{json}");
+
+        // A legacy session reports the same error, in an HTTP 200.
+        let session_id = initialize_legacy_mcp_session(&service).await;
+        let (status, json) = post_legacy_tools_call_with_session(
+            &service,
+            &session_id,
+            "no_such_tool",
+            Some(spice_ctx_with_api_key("test-key:rw")),
+            2,
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{json}");
+        assert_eq!(json.get("error"), Some(&expected), "{json}");
+    }
+
+    // regression test for #14902: a tool that failed on its arguments was a JSON-RPC
+    // internal error, which MCP clients do not show the model.
+    #[tokio::test]
+    async fn a_tool_that_fails_on_its_arguments_reports_it_in_its_result() {
+        let service = mcp_http_service(query_arg_server());
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "query_arg",
+            Some(spice_ctx_with_api_key("test-key:rw")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{json}");
+        assert_eq!(json.get("error"), None, "{json}");
+        assert_eq!(
+            json.pointer("/result/isError"),
+            Some(&Value::Bool(true)),
+            "{json}"
+        );
+        assert_eq!(
+            json.pointer("/result/content"),
+            Some(&json!([{
+                "type": "text",
+                "text": "missing field `query` at line 1 column 2"
+            }])),
+            "{json}"
+        );
     }
 
     /// Initialize a legacy-era MCP session and return its `Mcp-Session-Id`.

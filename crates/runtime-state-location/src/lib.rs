@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Builds the object store behind a location where Spice keeps shared state:
+//! the cluster scheduler, source rate control, SQL results-cache warmup and
+//! acceleration snapshots all resolve their location to a store here.
+//!
+//! The features still differ in a few ways, kept as they were configured
+//! before they shared this builder; [`StateFeature`] lists each one.
+
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock};
 
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
@@ -26,12 +34,13 @@ use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use spicepod::component::runtime::{StateLocation, StateSource};
+use spicepod::component::snapshot::SNAPSHOTS_STATE_FOLDER;
 use spicepod::param::Params;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use url::Url;
 
-static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+fn s3_parameters() -> Vec<ParameterSpec> {
     vec![
         ParameterSpec::component("region").secret(),
         ParameterSpec::component("endpoint").secret(),
@@ -46,6 +55,24 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("client_timeout").description("The timeout setting for S3 client."),
         ParameterSpec::runtime("allow_http").description("Allow HTTP protocol for S3 endpoint."),
     ]
+}
+
+static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(s3_parameters);
+
+/// The `params` key, without its `s3_` prefix, that names the SQS queue receiving a
+/// snapshot location's S3 event notifications.
+pub const SNAPSHOT_QUEUE_URL_PARAM: &str = "queue_url";
+
+/// A snapshot location's S3 parameters: the state location's, and the queue that
+/// receives its S3 event notifications.
+static SNAPSHOT_S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut parameters = s3_parameters();
+    parameters.push(
+        ParameterSpec::component(SNAPSHOT_QUEUE_URL_PARAM)
+            .description("The URL of an SQS queue that receives the snapshot location's S3 event notifications. Datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published instead of waiting for `refresh_check_interval`.")
+            .secret(),
+    );
+    parameters
 });
 
 /// The GCS data connector's object-store parameters, so a `gs://` location takes the
@@ -67,7 +94,7 @@ static GCS_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Snafu)]
-pub(crate) enum Error {
+pub enum Error {
     #[snafu(display("Failed to parse {usage} location {location}: {source}"))]
     InvalidStateLocation {
         usage: &'static str,
@@ -80,6 +107,13 @@ pub(crate) enum Error {
         usage: &'static str,
         location: String,
         source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Failed to initialize {usage} object store for {location}: {source}"))]
+    ObjectStoreParse {
+        usage: &'static str,
+        location: String,
+        source: object_store::Error,
     },
 
     #[snafu(display("Failed to build S3 object store for {usage} at {location}: {source}"))]
@@ -118,6 +152,13 @@ pub(crate) enum Error {
     },
 
     #[snafu(display("Failed to initialize local filesystem for {usage} at {location}: {source}"))]
+    CreateLocalDirectory {
+        usage: &'static str,
+        location: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to initialize local filesystem for {usage} at {location}: {source}"))]
     LocalFileSystemInit {
         usage: &'static str,
         location: String,
@@ -125,14 +166,15 @@ pub(crate) enum Error {
     },
 }
 
-pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A runtime feature that keeps shared state in a state location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StateFeature {
+pub enum StateFeature {
     Scheduler,
     RateControl,
     ResultsCacheWarmup,
+    Snapshots,
 }
 
 impl StateFeature {
@@ -142,6 +184,7 @@ impl StateFeature {
             Self::Scheduler => "cluster",
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
+            Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
         }
     }
 
@@ -150,7 +193,31 @@ impl StateFeature {
             Self::Scheduler => "scheduler state",
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
+            Self::Snapshots => "snapshot",
         }
+    }
+
+    /// The S3 parameters the feature's `params` are validated against.
+    fn s3_parameters(self) -> &'static [ParameterSpec] {
+        match self {
+            Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup => &S3_PARAMETERS,
+            Self::Snapshots => &SNAPSHOT_S3_PARAMETERS,
+        }
+    }
+
+    /// Whether a `gs://` location's `params` take the GCS data connector's names
+    /// and are validated. Snapshot `params` take the GCS store's own names
+    /// (`skip_signature`, ...) as written, unless they use the connector's `gcs_`
+    /// names, as `runtime.state.params` do; see [`uses_gcs_connector_names`].
+    fn validates_gcs_parameters(self) -> bool {
+        !matches!(self, Self::Snapshots)
+    }
+
+    /// Whether the feature's own location setting keeps an `abfs://` or `abfss://`
+    /// URL path. The scheduler, rate control and warmup settings keep their state
+    /// at the container root, where earlier versions wrote it.
+    fn keeps_abfs_path_in_own_setting(self) -> bool {
+        matches!(self, Self::Snapshots)
     }
 }
 
@@ -159,9 +226,19 @@ impl StateFeature {
 ///
 /// A `runtime.state` location puts each feature in its own folder below the
 /// location's path. A feature's own location setting puts the feature at the
-/// location root; for `abfs://` and `abfss://` that root is the container root,
-/// whatever path the URL has.
-pub(crate) async fn build_object_store(
+/// location's path; for the scheduler, rate control and warmup on `abfs://` and
+/// `abfss://` that is the container root, whatever path the URL has.
+///
+/// `s3://`, `abfs://`, `abfss://`, `gs://` and `file://` locations build the
+/// same store for every feature. A snapshot location with another scheme is
+/// built by `object_store`'s URL parsing; other features resolve it through the
+/// runtime's object-store registry.
+///
+/// # Errors
+///
+/// Returns an error when the location is not a valid URL, its `params` are
+/// invalid, or the store cannot be built.
+pub async fn build_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,
@@ -190,10 +267,9 @@ pub(crate) async fn build_object_store(
 
         tokio::fs::create_dir_all(&local_path)
             .await
-            .map_err(|source| Error::LocalFileSystemInit {
+            .context(CreateLocalDirectorySnafu {
                 usage,
                 location: local_path.display().to_string(),
-                source: Box::new(source),
             })?;
 
         let store: Arc<dyn ObjectStore> = Arc::new(
@@ -211,6 +287,7 @@ pub(crate) async fn build_object_store(
 
     let base_prefix = if matches!(url.scheme(), "abfs" | "abfss")
         && state.source == StateSource::FeatureSetting
+        && !feature.keeps_abfs_path_in_own_setting()
     {
         String::new()
     } else {
@@ -219,7 +296,7 @@ pub(crate) async fn build_object_store(
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
         let params = params.map(Params::as_string_map);
-        let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref(), usage).await?;
+        let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref(), feature).await?;
 
         S3ObjectStoreBuilder::from_url(&url, io_runtime)
             .context(S3ObjectStoreInitSnafu {
@@ -250,11 +327,25 @@ pub(crate) async fn build_object_store(
             location: url.to_string(),
         })?;
         let params = params.map(Params::as_string_map);
-        let gcs_params = build_gcs_parameters(secrets, params.as_ref(), usage).await?;
+        let gcs_params = if feature.validates_gcs_parameters()
+            || params.as_ref().is_some_and(uses_gcs_connector_names)
+        {
+            build_gcs_parameters(secrets, params.as_ref(), usage).await?
+        } else {
+            build_secret_resolved_parameters(secrets, params.as_ref()).await
+        };
         build_gcs_object_store(bucket, &gcs_params, io_runtime).context(ObjectStoreInitSnafu {
             usage,
             location: url.to_string(),
         })?
+    } else if feature == StateFeature::Snapshots {
+        object_store::parse_url(&url)
+            .context(ObjectStoreParseSnafu {
+                usage,
+                location: url.to_string(),
+            })?
+            .0
+            .into()
     } else {
         let registry = SpiceObjectStoreRegistry::new(io_runtime);
         datafusion::execution::object_store::ObjectStoreRegistry::get_store(&registry, &url)
@@ -267,27 +358,49 @@ pub(crate) async fn build_object_store(
     Ok((store, base_prefix))
 }
 
-async fn build_s3_parameters(
+/// Validates an `s3://` location's `params` against `feature`'s S3 parameters,
+/// resolving `${ secrets:… }` references.
+///
+/// An invalid parameter is an error, not a reason to fall back to the defaults:
+/// the defaults drop every other parameter too, the endpoint, the region and the
+/// keys, so the store would silently point somewhere other than configured.
+///
+/// # Errors
+///
+/// Returns [`Error::S3ParameterValidation`] when a parameter is invalid.
+pub async fn build_s3_parameters<S: BuildHasher>(
     secrets: Arc<RwLock<Secrets>>,
-    params: Option<&HashMap<String, String>>,
-    usage: &'static str,
+    params: Option<&HashMap<String, String, S>>,
+    feature: StateFeature,
 ) -> Result<Parameters> {
-    let default_params = || Parameters::new(vec![], "s3", &S3_PARAMETERS);
+    let usage = feature.usage();
+    let s3_parameters = feature.s3_parameters();
     match params {
         Some(params) => {
-            let secret_params = get_params_with_secrets(Arc::clone(&secrets), params).await;
+            let params: HashMap<String, String> = params
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let secret_params = get_params_with_secrets(Arc::clone(&secrets), &params).await;
             Parameters::try_new(
                 usage,
                 secret_params.into_iter().collect(),
                 "s3",
                 secrets,
-                &S3_PARAMETERS,
+                s3_parameters,
             )
             .await
             .map_err(|source| Error::S3ParameterValidation { usage, source })
         }
-        None => Ok(default_params()),
+        None => Ok(Parameters::new(vec![], "s3", s3_parameters)),
     }
+}
+
+/// Whether `params` name a GCS setting the way the GCS data connector does
+/// (`gcs_skip_signature`), which the GCS store does not read until they are
+/// validated and mapped to its own names.
+fn uses_gcs_connector_names(params: &HashMap<String, String>) -> bool {
+    params.keys().any(|key| key.starts_with("gcs_"))
 }
 
 /// Resolves a `gs://` location's `params`, given under the GCS data connector's
@@ -312,7 +425,7 @@ async fn build_gcs_parameters(
     .map_err(|source| Error::GcsParameterValidation { usage, source })?;
     // Same contract as the GCS data connector: `build_gcs_object_store` uses only one
     // method, so a second one would be silently ignored.
-    data_connector_api::parameters::gcs::validate_auth(&params).map_err(|source| {
+    runtime_parameters::gcs::validate_auth(&params).map_err(|source| {
         Error::GcsParameterValidation {
             usage,
             source: Box::new(source),
@@ -401,6 +514,7 @@ mod tests {
             (StateFeature::Scheduler, "cluster"),
             (StateFeature::RateControl, "rate-control"),
             (StateFeature::ResultsCacheWarmup, "results-cache"),
+            (StateFeature::Snapshots, "snapshots"),
         ] {
             let (store, prefix) = build_object_store(
                 secrets(),
@@ -430,7 +544,10 @@ mod tests {
             .filter(|name| name != ".spice-object-store-occ.lock")
             .collect();
         root.sort();
-        assert_eq!(root, ["cluster", "rate-control", "results-cache"]);
+        assert_eq!(
+            root,
+            ["cluster", "rate-control", "results-cache", "snapshots"]
+        );
     }
 
     const S3_KEY_PARAMS: &[(&str, &str)] = &[
@@ -613,7 +730,7 @@ mod tests {
             "${ secrets:S3_SECRET }".to_string(),
         );
 
-        let s3_params = build_s3_parameters(secrets, Some(&params), "test state")
+        let s3_params = build_s3_parameters(secrets, Some(&params), StateFeature::RateControl)
             .await
             .expect("S3 parameters should validate");
         let secret_map = s3_params.to_secret_map();
@@ -633,7 +750,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("s3_auth".to_string(), "not-valid".to_string());
 
-        let err = build_s3_parameters(secrets(), Some(&params), "test state")
+        let err = build_s3_parameters(secrets(), Some(&params), StateFeature::RateControl)
             .await
             .expect_err("invalid S3 parameters should fail");
 
@@ -778,5 +895,116 @@ mod tests {
         assert!(result.is_ok(), "abfss state store should build: {result:?}");
         let (_, prefix) = result.expect("abfss state store should build");
         assert_eq!(prefix, "");
+    }
+
+    /// A snapshot location keeps its URL path as the prefix for every scheme,
+    /// `abfs://` included, where the scheduler's own setting uses the container root.
+    #[tokio::test]
+    async fn snapshot_location_prefix_is_its_path() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let file_location = format!("file://{}/snapshots/", temp_dir.path().display());
+        let abfs_params = Params::from_string_map(HashMap::from([(
+            "use_emulator".to_string(),
+            "true".to_string(),
+        )]));
+        let s3_params = Params::from_string_map(
+            S3_KEY_PARAMS
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        );
+
+        for (state, expected_prefix) in [
+            (
+                feature_setting("s3://bucket/spice/snapshots/", Some(&s3_params)),
+                "spice/snapshots",
+            ),
+            (
+                feature_setting("abfs://container/spice/snapshots/", Some(&abfs_params)),
+                "spice/snapshots",
+            ),
+            (feature_setting("gs://bucket/snapshots", None), "snapshots"),
+            (feature_setting(&file_location, None), ""),
+        ] {
+            let (_, prefix) = build_object_store(
+                secrets(),
+                Handle::current(),
+                &state,
+                StateFeature::Snapshots,
+            )
+            .await
+            .expect("snapshot store should build");
+            assert_eq!(prefix, expected_prefix, "{}", state.location);
+        }
+
+        let (_, scheduler_prefix) = build_object_store(
+            secrets(),
+            Handle::current(),
+            &feature_setting("abfs://container/spice/snapshots/", Some(&abfs_params)),
+            StateFeature::Scheduler,
+        )
+        .await
+        .expect("scheduler store should build");
+        assert_eq!(scheduler_prefix, "");
+    }
+
+    /// A snapshot location's S3 `params` take the queue that receives its S3 event
+    /// notifications.
+    #[tokio::test]
+    async fn snapshot_s3_parameters_take_the_notification_queue() {
+        let params = HashMap::from([(
+            "s3_queue_url".to_string(),
+            "https://sqs.us-east-1.amazonaws.com/123456789012/snapshots".to_string(),
+        )]);
+
+        let parameters = build_s3_parameters(secrets(), Some(&params), StateFeature::Snapshots)
+            .await
+            .expect("snapshot S3 parameters should validate");
+
+        assert_eq!(
+            parameters.get(SNAPSHOT_QUEUE_URL_PARAM).expose().ok(),
+            Some("https://sqs.us-east-1.amazonaws.com/123456789012/snapshots")
+        );
+    }
+
+    /// A snapshot location's `gs://` `params` reach the GCS store as written when
+    /// they use its own names. With the GCS data connector's `gcs_` names, which
+    /// a location inherited from `runtime.state` has, they are validated and
+    /// mapped as for every other state location, not ignored.
+    #[tokio::test]
+    async fn snapshot_gcs_parameters_take_store_or_connector_names() {
+        for (key, value) in [("skip_signature", "true"), ("gcs_skip_signature", "true")] {
+            let params =
+                Params::from_string_map(HashMap::from([(key.to_string(), value.to_string())]));
+            let (store, _) = build_object_store(
+                secrets(),
+                Handle::current(),
+                &feature_setting("gs://snapshot-bucket/snapshots/", Some(&params)),
+                StateFeature::Snapshots,
+            )
+            .await
+            .expect("snapshot GCS store should build");
+            assert!(
+                format!("{store:?}").contains("skip_signature: true"),
+                "`{key}: true` must build an unsigned store: {store:?}"
+            );
+        }
+
+        let not_a_bool = Params::from_string_map(HashMap::from([(
+            "gcs_skip_signature".to_string(),
+            "not-a-bool".to_string(),
+        )]));
+        let err = build_object_store(
+            secrets(),
+            Handle::current(),
+            &feature_setting("gs://snapshot-bucket/snapshots/", Some(&not_a_bool)),
+            StateFeature::Snapshots,
+        )
+        .await
+        .expect_err("an invalid GCS connector parameter is reported, not ignored");
+        assert_eq!(
+            err.to_string(),
+            "Failed to validate GCS parameters for snapshot: Invalid configuration for snapshot. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
+        );
     }
 }

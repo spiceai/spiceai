@@ -16,9 +16,6 @@ limitations under the License.
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
-use aws_sdk_credential_bridge::object_store_builder::{
-    S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
-};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::BoxStream};
@@ -31,14 +28,17 @@ use object_store_occ::{
     RetryOnConflictError, conditional_put, probe_conditional_writes, retry_on_conflict,
 };
 use opentelemetry::KeyValue;
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
-use secrecy::ExposeSecret;
+use runtime_parameters::Parameters;
+use runtime_secrets::Secrets;
+use runtime_state_location::StateFeature;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
-use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
+use spicepod::component::{
+    runtime::{StateLocation, StateSource},
+    snapshot::BootstrapOnFailureBehavior,
+};
 use std::{
     collections::HashMap,
     fmt::Write,
@@ -3967,38 +3967,6 @@ fn encode_hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    vec![
-        ParameterSpec::component("region").secret(),
-        ParameterSpec::component("endpoint").secret(),
-        ParameterSpec::component("key").secret(),
-        ParameterSpec::component("secret").secret(),
-        ParameterSpec::component("session_token").secret(),
-        ParameterSpec::component("auth")
-            .description("Configures the authentication method for S3. Supported methods are: iam_role, key.")
-            .default("iam_role")
-            .one_of(&["iam_role", "key"])
-            .secret(),
-        ParameterSpec::runtime("client_timeout")
-            .description("The timeout setting for S3 client."),
-        ParameterSpec::runtime("allow_http")
-            .description("Allow HTTP protocol for S3 endpoint."),
-        ParameterSpec::component(notifications::QUEUE_URL_PARAM)
-            .description("The URL of an SQS queue that receives the snapshot location's S3 event notifications. Datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published instead of waiting for `refresh_check_interval`.")
-            .secret(),
-    ]
-});
-
-#[derive(Debug, Snafu)]
-enum S3ObjectStoreError {
-    #[snafu(display("Failed to build S3 object store: {source}"))]
-    BuilderError { source: S3ObjectStoreBuilderError },
-    #[snafu(display("'snapshots.params' is invalid: {source}"))]
-    InvalidParameters {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
 /// The object path of an `s3://` snapshot location inside its bucket. The
 /// notification consumer matches S3 event keys against the same path, so both
 /// derive it here.
@@ -4006,8 +3974,7 @@ fn s3_location_path(url: &Url) -> ObjectPath {
     ObjectPath::from(url.path())
 }
 
-/// Build the object store backing a snapshot location, dispatching on the
-/// URL scheme to the correct credential-aware builder.
+/// Build the object store backing a snapshot location.
 ///
 /// Returns `None` on failure after logging the error — matching the existing
 /// behavior of snapshot construction, which treats a failed store as "no
@@ -4019,163 +3986,132 @@ async fn build_snapshot_object_store(
     io_runtime: Handle,
     dataset_name: &str,
 ) -> Option<(Arc<dyn ObjectStore>, ObjectPath)> {
-    match snapshots_location_url.scheme() {
-        "s3" => {
-            let store = build_s3_object_store(
-                snapshots_location_url,
-                secrets,
-                snapshot_config.params.as_ref().map(Params::as_string_map),
-                io_runtime,
-            )
-            .await
-            .inspect_err(|e| match e {
-                S3ObjectStoreError::InvalidParameters { .. } => {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because {e}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
-                    );
-                }
-                S3ObjectStoreError::BuilderError { .. } => {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to connect to S3 snapshot location",
-                    );
-                }
-            })
-            .ok()?;
-            Some((store, s3_location_path(snapshots_location_url)))
-        }
-        "abfss" | "abfs" => {
-            let params = resolve_secret_params(secrets, snapshot_config.params.as_ref()).await;
-            let store = runtime_object_store::build_azure_object_store(
-                snapshots_location_url,
-                &params,
-                io_runtime,
-            )
-            .inspect_err(|e| {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    error = %e,
-                    "Failed to connect to Azure ADLS snapshot location",
-                );
-            })
-            .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
-            Some((store, path))
-        }
-        "gs" | "gcs" => {
-            let Some(bucket_name) = snapshots_location_url.host_str() else {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "GCS snapshot location is missing a bucket name",
-                );
-                return None;
-            };
-            let params = resolve_secret_params(secrets, snapshot_config.params.as_ref()).await;
-            let store =
-                runtime_object_store::build_gcs_object_store(bucket_name, &params, io_runtime)
-                    .inspect_err(|e| {
-                        tracing::error!(
-                            dataset = %dataset_name,
-                            location = %snapshots_location_url,
-                            error = %e,
-                            "Failed to connect to GCS snapshot location",
-                        );
-                    })
-                    .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
-            Some((store, path))
-        }
-        "file" => {
-            // Every publish after the first updates `metadata.json` at the version it read,
-            // which `LocalFileSystem` cannot do; `LocalConditionalPut` can, so a local
-            // directory holds snapshots the way an object store does.
-            let Ok(local_path) = snapshots_location_url.to_file_path() else {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not a local directory path. See: {SNAPSHOTS_DOCS}",
-                );
-                return None;
-            };
-            if let Err(e) = fs::create_dir_all(&local_path).await {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "Snapshots are disabled for dataset '{dataset_name}': failed to create the snapshot directory '{}'. Cause: {e}",
-                    local_path.display(),
-                );
-                return None;
-            }
-            let store = object_store_occ::LocalConditionalPut::new(&local_path)
-                .inspect_err(|e| {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to build snapshot object store",
-                    );
-                })
-                .ok()?;
-            Some((Arc::new(store), ObjectPath::default()))
-        }
-        _ => {
-            let (store, path) = object_store::parse_url(snapshots_location_url)
-                .inspect_err(|e| {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to build snapshot object store",
-                    );
-                })
-                .ok()?;
-            Some((store.into(), path))
+    let location = StateLocation {
+        location: snapshots_location_url.to_string(),
+        params: snapshot_config.params.clone(),
+        source: StateSource::FeatureSetting,
+    };
+    match runtime_state_location::build_object_store(
+        secrets,
+        io_runtime,
+        &location,
+        StateFeature::Snapshots,
+    )
+    .await
+    {
+        Ok((store, prefix)) => Some((store, ObjectPath::from(prefix))),
+        Err(error) => {
+            log_snapshot_store_error(dataset_name, snapshots_location_url, &error);
+            None
         }
     }
 }
 
-/// Resolves `${ secrets:… }` references in a snapshot location's `params`, for the
-/// builders that take plain strings.
-async fn resolve_secret_params(
-    secrets: Arc<RwLock<Secrets>>,
-    params: Option<&Params>,
-) -> HashMap<String, String> {
-    let Some(params) = params else {
-        return HashMap::new();
-    };
-    get_params_with_secrets(secrets, &params.as_string_map())
-        .await
-        .into_iter()
-        .map(|(key, value)| (key, value.expose_secret().to_string()))
-        .collect()
+/// Logs why a snapshot location's store could not be built, which disables
+/// snapshots for the dataset.
+fn log_snapshot_store_error(
+    dataset_name: &str,
+    snapshots_location_url: &Url,
+    error: &runtime_state_location::Error,
+) {
+    use runtime_state_location::Error;
+    match error {
+        Error::S3ParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because 'snapshots.params' is invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::GcsParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because its GCS parameters are invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::S3ObjectStoreInit { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %format!("Failed to build S3 object store: {source}"),
+                "Failed to connect to S3 snapshot location",
+            );
+        }
+        Error::ObjectStoreInit { source, .. }
+            if matches!(snapshots_location_url.scheme(), "abfs" | "abfss") =>
+        {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to connect to Azure ADLS snapshot location",
+            );
+        }
+        Error::ObjectStoreInit { source, .. }
+            if matches!(snapshots_location_url.scheme(), "gs" | "gcs") =>
+        {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to connect to GCS snapshot location",
+            );
+        }
+        Error::InvalidGcsLocation { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "GCS snapshot location is missing a bucket name",
+            );
+        }
+        Error::InvalidFileLocation { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not a local directory path. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::CreateLocalDirectory {
+            location: path,
+            source,
+            ..
+        } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': failed to create the snapshot directory '{path}'. Cause: {source}",
+            );
+        }
+        Error::LocalFileSystemInit { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to build snapshot object store",
+            );
+        }
+        Error::ObjectStoreParse { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to build snapshot object store",
+            );
+        }
+        Error::InvalidStateLocation { .. } | Error::ObjectStoreInit { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %error,
+                "Failed to build snapshot object store",
+            );
+        }
+    }
 }
 
-async fn build_s3_object_store(
-    snapshots_url: &Url,
-    secrets: Arc<RwLock<Secrets>>,
-    params: Option<HashMap<String, String>>,
-    io_runtime: Handle,
-) -> Result<Arc<dyn ObjectStore>, S3ObjectStoreError> {
-    let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref())
-        .await
-        .map_err(|source| S3ObjectStoreError::InvalidParameters { source })?;
-
-    S3ObjectStoreBuilder::from_url(snapshots_url, io_runtime)
-        .context(BuilderSnafu)?
-        .with_secret_params(&s3_params.to_secret_map())
-        .context(BuilderSnafu)?
-        .build()
-        .await
-        .context(BuilderSnafu)
-}
-
-/// Validates a snapshot location's S3 `params`.
+/// Validates a snapshot location's S3 `params`, which also take the queue that
+/// receives its S3 event notifications.
 ///
 /// An invalid parameter is an error, not a reason to fall back to the defaults: the
 /// defaults drop every other parameter too — the endpoint, the region and the keys — so
@@ -4185,20 +4121,12 @@ async fn build_s3_parameters(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<&HashMap<String, String>>,
 ) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
-    match params {
-        Some(p) => {
-            let secret_params = get_params_with_secrets(Arc::clone(&secrets), p).await;
-            Parameters::try_new(
-                "snapshot",
-                secret_params.into_iter().collect(),
-                "s3",
-                secrets,
-                &S3_PARAMETERS,
-            )
-            .await
-        }
-        None => Ok(Parameters::new(vec![], "s3", &S3_PARAMETERS)),
-    }
+    runtime_state_location::build_s3_parameters(secrets, params, StateFeature::Snapshots)
+        .await
+        .map_err(|error| match error {
+            runtime_state_location::Error::S3ParameterValidation { source, .. } => source,
+            other => Box::new(other),
+        })
 }
 
 #[cfg(test)]
