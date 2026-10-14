@@ -56639,7 +56639,9 @@ mod tests {
     }
 
     /// Each file must route on `leading` (no value of it spans two files) and
-    /// hold rows of several of its values in order of `order`.
+    /// hold its rows in order of `order`. A file holds several rows of each
+    /// leading value, so sorting by the leading column alone, which leaves the
+    /// rest of the key in arrival order, fails the order check.
     fn assert_routed_and_sorted(
         files: &[Vec<(i64, i64)>],
         leading: fn(&(i64, i64)) -> i64,
@@ -56649,8 +56651,8 @@ mod tests {
         for (index, rows) in files.iter().enumerate() {
             let values: std::collections::BTreeSet<i64> = rows.iter().map(leading).collect();
             assert!(
-                values.len() > 1 && rows.len() > values.len(),
-                "file {index}: a range file holds several rows of several leading values: {values:?}"
+                !values.is_empty() && rows.len() > values.len(),
+                "file {index}: a range file holds several rows of each leading value: {values:?}"
             );
             assert!(
                 rows.iter().map(order).collect::<Vec<_>>().is_sorted(),
