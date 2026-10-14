@@ -74,11 +74,12 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
+use super::delta_encoding::{ShardRouting, WriteClass, WritePolicy};
 use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_postpass::CopyOrder;
 use super::table::{
-    CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
-    RangePartitioning, serialize_batches_to_ipc,
+    CayenneTableProvider, EncodeFanOut, InlinedOverwritePublish, OverwriteRangePlan,
+    OverwriteRouting, RangePartitioning, serialize_batches_to_ipc,
 };
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
@@ -960,8 +961,9 @@ impl CayenneTableProvider {
     }
 
     /// Rewrite the files of an unpublished snapshot that hold the superseded
-    /// copies at `superseded`, without them, and return the statistics of the
-    /// snapshot that results: the files left as written, plus the rewritten ones.
+    /// copies at `superseded`, each without them, and return the statistics of
+    /// the snapshot that results: the files left as written, plus the rewritten
+    /// ones.
     ///
     /// `written` describes every row written to the snapshot; a rewrite that
     /// leaves anything but those rows less the superseded copies is an error.
@@ -981,20 +983,73 @@ impl CayenneTableProvider {
                     .map(str::to_string)
             })
             .collect();
-        let survivors = self
-            .scan_snapshot_files_excluding(snapshot_id, superseded)
-            .await?;
-        let (rewritten_rows, _files, rewritten) = self
-            .write_to_snapshot_range_partitioned(
-                survivors,
-                write.target_size_bytes,
-                snapshot_id,
-                write.target_partitions,
-                None,
-                write.write_policy,
-                Some(RangePartitioning::hashed_run_sorted()),
-            )
-            .await?;
+        // Each file folds on its own, through one writer, so no two source
+        // files' rows are merged. The writer still rolls to a new file at the
+        // target size, so one source file may fold into several, and its rows
+        // need not keep their order: the scan may split a large file into
+        // ranges. Merging every file's
+        // survivors into one stream would feed the rewrite from a single task,
+        // however many encoders it had. Each write holds one encode permit. A
+        // maintenance fold (a load into an empty table) runs as many files at
+        // once as maintenance may hold, and the maintenance gate bounds that
+        // across every table. A delta fold takes its permits outside that
+        // gate, so it runs no more files at once than the table's own writes
+        // have shards, the permits one sharded write of the survivors would
+        // hold. A coupled writer (a partition child) takes no permits and
+        // keeps to one encode stream, so it folds one file at a time: its
+        // siblings fold alongside.
+        let policy = WritePolicy {
+            class: write.write_policy.class,
+            fan_out: EncodeFanOut::PerCaller,
+            routing: ShardRouting::Key,
+        };
+        let in_flight = if self.context().is_coupled_writer() {
+            1
+        } else if write.write_policy.class == WriteClass::Maintenance {
+            super::write_budget::encode_budget_snapshot()
+                .and_then(|budget| usize::try_from(budget.total).ok())
+                .map_or(
+                    write.target_partitions,
+                    super::write_budget::maintenance_gate_cap,
+                )
+                .max(1)
+        } else {
+            self.snapshot_write_concurrency(write.target_partitions)
+        };
+        let folds: Vec<FileFold<'_>> = superseded
+            .iter()
+            .map(|(location, positions)| {
+                let file = HashMap::from([(location.clone(), positions.clone())]);
+                let fold: FileFold<'_> = Box::pin(async move {
+                    let survivors = self
+                        .scan_snapshot_files_excluding(snapshot_id, &file)
+                        .await?;
+                    let (rows, _files, stats) = self
+                        .write_to_snapshot_range_partitioned(
+                            survivors,
+                            write.target_size_bytes,
+                            snapshot_id,
+                            1,
+                            None,
+                            policy,
+                            None,
+                        )
+                        .await?;
+                    Ok((rows, stats))
+                });
+                fold
+            })
+            .collect();
+        // Every fold runs to its end before the first error is returned: a
+        // fold dropped mid-write could leave its writer finishing files in the
+        // snapshot while the caller's error path removes it.
+        let outcomes: Vec<Result<(u64, Arc<ColumnStatsAccumulator>)>> =
+            futures::stream::iter(folds)
+                .buffer_unordered(in_flight)
+                .collect()
+                .await;
+        let rewritten = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
+        let rewritten_rows: u64 = rewritten.iter().map(|(rows, _)| rows).sum();
         self.remove_snapshot_files(
             snapshot_id,
             superseded
@@ -1017,7 +1072,9 @@ impl CayenneTableProvider {
                 folded.merge_from(&stats);
             }
         }
-        folded.merge_from(&rewritten);
+        for (_, stats) in &rewritten {
+            folded.merge_from(stats);
+        }
         // Distinct counts are estimates whichever rows they cover, and the copies
         // the fold dropped share their keys with copies it kept.
         folded.merge_ndv_from(written);
@@ -1041,6 +1098,12 @@ impl CayenneTableProvider {
         Ok(Arc::new(folded))
     }
 }
+
+/// One file's fold in `fold_superseded_copies`: the rows it wrote and their
+/// statistics.
+type FileFold<'f> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(u64, Arc<ColumnStatsAccumulator>)>> + Send + 'f>,
+>;
 
 /// How a write that rewrites files of an unpublished snapshot shapes them.
 #[derive(Clone, Copy)]

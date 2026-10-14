@@ -800,12 +800,9 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         Ok(resolved_cluster_config) => {
             // Validate that scheduler mode has state_location configured
             if resolved_cluster_config.effective_role() == Some(ClusterRole::Scheduler) {
-                let has_state_location = app.as_ref().is_some_and(|a| {
-                    a.runtime
-                        .resolved_scheduler()
-                        .and_then(|s| s.state_location)
-                        .is_some()
-                });
+                let has_state_location = app
+                    .as_ref()
+                    .is_some_and(|a| a.runtime.scheduler_state().is_some());
                 if !has_state_location {
                     return Err(Error::InvalidClusterConfig {
                         source: std::io::Error::new(
@@ -1853,6 +1850,7 @@ async fn start_anonymous_telemetry(
         telemetry::anonymous::start(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
+            cpu_budget::cpu_budget().configured_cores(),
         )
         .await;
     }

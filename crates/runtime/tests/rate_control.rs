@@ -647,20 +647,96 @@ mod adaptive_config_validation {
             .await
             .expect_err("a different failure threshold on the same origin must be rejected");
 
+        // The explicit 10s window resolves to the unset default, so only the
+        // failure threshold differs.
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("different rate-control settings"),
-                    "message must name the conflict: {message}"
+                    message.contains(
+                        "differs from those already targeting it: `rate_control_failure_threshold` is 50% here and 10% there. Set `rate_control_failure_threshold` to matching values"
+                    ),
+                    "message must name the differing parameter and both values: {message}"
                 );
+            }
+            other => panic!("expected an invalid-configuration error, got {other:?}"),
+        }
+    }
+
+    /// Cluster rate control resolves an unset `rate_control_window` to its
+    /// `refresh_interval` and raises a shorter one to it, so whether an
+    /// explicit window conflicts with an unset one depends on that interval.
+    #[tokio::test]
+    async fn an_explicit_window_conflicts_only_where_it_resolves_differently() {
+        let cluster_registry = |refresh_interval| {
+            Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
+                Arc::new(InMemory::new()),
+                "",
+                refresh_interval,
+            ))
+        };
+        let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
+        let unset = config(AdaptiveRateControl::default(), Some(10));
+        let explicit = config(
+            AdaptiveRateControl::new(0.1, Duration::from_secs(10))
+                .expect("test control should be valid"),
+            Some(10),
+        );
+
+        // A 30s interval raises the explicit 10s window to 30s: the same half-life.
+        let registry = cluster_registry(Duration::from_secs(30));
+        let mut controllers = Vec::new();
+        for settings in [&unset, &explicit] {
+            let shared = registry
+                .shared_rate_controller_for_component(
+                    &origin,
+                    settings,
+                    "spicepod",
+                    &test_component(),
+                    "https",
+                )
+                .await
+                .expect("windows that resolve to one half-life share the origin");
+            controllers.push(
+                shared
+                    .controller
+                    .expect("a rate-limited origin has a controller"),
+            );
+        }
+        assert!(
+            Arc::ptr_eq(&controllers[0], &controllers[1]),
+            "both components must be given the one controller of the origin"
+        );
+
+        // A 1s interval keeps the explicit 10s window, and the unset one is 1s.
+        let registry = cluster_registry(Duration::from_secs(1));
+        registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &unset,
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect("the first component sets the origin's config");
+        let error = registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &explicit,
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect_err("windows that resolve to different half-lives must be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("rate_control_failure_threshold")
-                        && message.contains("rate_control_window"),
-                    "message must name the adaptive parameters: {message}"
-                );
-                assert!(
-                    !message.contains("rate_control_mode"),
-                    "message must not name a removed parameter: {message}"
+                    message.contains(
+                        "differs from those already targeting it: `rate_control_window` is 10s here and 1s there. Set `rate_control_window` to matching values on every component that targets this origin. With cluster rate control, an unset `rate_control_window` resolves to `runtime.source_rate_control.refresh_interval`"
+                    ),
+                    "message must name the window, both resolved values, and the cluster default: {message}"
                 );
             }
             other => panic!("expected an invalid-configuration error, got {other:?}"),
@@ -715,7 +791,7 @@ mod shared_origin_acquire_timeout {
         graphql_config.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
 
         assert_eq!(
-            https_config, graphql_config,
+            https_config.acquire_timeout, graphql_config.acquire_timeout,
             "the two connectors must derive the same acquire bound for a shared origin"
         );
 
@@ -782,4 +858,46 @@ mod shared_origin_acquire_timeout {
             other => panic!("expected an invalid-configuration error, got {other:?}"),
         }
     }
+}
+
+/// Rate control keeps its state in the `rate-control/` folder of a
+/// `runtime.state` location.
+#[tokio::test]
+async fn runtime_state_rate_control_writes_under_its_folder() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state_dir = temp_dir.path().join("state");
+    let app = app_with_file_rate_control(&state_url(&state_dir), "1s");
+    let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+    let dataset = dataset_for_runtime(&app, &runtime);
+    let shared = runtime
+        .http_rate_control_registry()
+        .shared_rate_controller_for_component(
+            &Url::parse(ORIGIN_URL).expect("origin URL parse"),
+            &rps_config(10),
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(&dataset),
+            "https",
+        )
+        .await
+        .expect("controller builds");
+    let controller = shared.controller.expect("a rate-limited origin is enabled");
+    controller.acquire().await.expect("permit");
+
+    let spicepod_dir = state_dir.join("rate-control").join(APP_NAME);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_dir(&spicepod_dir).is_ok_and(|mut entries| {
+        entries
+            .any(|entry| entry.is_ok_and(|entry| entry.path().extension() == Some("json".as_ref())))
+    }) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rate control wrote no state under {}",
+            spicepod_dir.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !state_dir.join(APP_NAME).exists(),
+        "rate control must not write at the location root"
+    );
 }

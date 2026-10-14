@@ -692,7 +692,7 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. A `runtime.scheduler.state_location` overrides it for the scheduler.",
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. Each feature writes under its own folder: `results-cache/`, `rate-control/` and `cluster/`. A `runtime.scheduler.state_location` overrides it for the scheduler.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"
@@ -1517,7 +1517,7 @@
       "type": "object",
       "properties": {
         "allowed_hosts": {
-          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nDefaults to rmcp defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
+          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nUnset or empty uses the defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
           "type": [
             "array",
             "null"

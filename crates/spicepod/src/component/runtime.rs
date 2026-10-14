@@ -107,8 +107,9 @@ pub struct Runtime {
 
     /// Shared object-store location for runtime state (`file://`, `s3://`,
     /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
-    /// source rate control, and distributed query state. A
-    /// `runtime.scheduler.state_location` overrides it for the scheduler.
+    /// source rate control, and distributed query state. Each feature writes
+    /// under its own folder: `results-cache/`, `rate-control/` and `cluster/`.
+    /// A `runtime.scheduler.state_location` overrides it for the scheduler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<RuntimeState>,
 
@@ -123,28 +124,37 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Scheduler config with field-level fallback onto [`Self::state`].
-    ///
-    /// `runtime.scheduler.state_location` (and params) may be omitted when
-    /// `runtime.state` is set; other scheduler tuning fields are preserved.
+    /// Scheduler tuning config. When only `runtime.state` is set, the scheduler
+    /// runs with default tuning. [`Self::scheduler_state`] gives where the
+    /// scheduler keeps its state.
     #[must_use]
     pub fn resolved_scheduler(&self) -> Option<Scheduler> {
         match (&self.scheduler, &self.state) {
-            (Some(scheduler), state) => {
-                let mut resolved = scheduler.clone();
-                if resolved.state_location.is_none()
-                    && let Some(state) = state
-                {
-                    resolved.state_location = Some(state.location.clone());
-                    if resolved.params.is_none() {
-                        resolved.params.clone_from(&state.params);
-                    }
-                }
-                Some(resolved)
-            }
-            (None, Some(state)) => Some(Scheduler::from_shared_state(state)),
+            (Some(scheduler), _) => Some(scheduler.clone()),
+            (None, Some(_)) => Some(Scheduler::default()),
             (None, None) => None,
         }
+    }
+
+    /// Where the scheduler keeps cluster state: `runtime.scheduler.state_location`
+    /// when set, else `runtime.state`. `runtime.scheduler.params`, when set,
+    /// apply to either location.
+    #[must_use]
+    pub fn scheduler_state(&self) -> Option<StateLocation> {
+        let scheduler = self.scheduler.as_ref();
+        let params = scheduler.and_then(|scheduler| scheduler.params.as_ref());
+        if let Some(location) = scheduler.and_then(|scheduler| scheduler.state_location.as_ref()) {
+            return Some(StateLocation {
+                location: location.clone(),
+                params: params.cloned(),
+                source: StateSource::FeatureSetting,
+            });
+        }
+        self.state.as_ref().map(|state| StateLocation {
+            location: state.location.clone(),
+            params: params.or(state.params.as_ref()).cloned(),
+            source: StateSource::RuntimeState,
+        })
     }
 
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
@@ -807,7 +817,7 @@ pub struct McpConfig {
     /// Used to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),
     /// host-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).
     /// Set to `["*"]` to disable host checking entirely.
-    /// Defaults to rmcp defaults (`["localhost", "127.0.0.1", "::1"]`).
+    /// Unset or empty uses the defaults (`["localhost", "127.0.0.1", "::1"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
 }
@@ -1193,7 +1203,7 @@ fn default_allowed_origins() -> Vec<String> {
 /// Localhost origins used when `runtime.cors.allowed_origins` is `"*"` or
 /// empty. `"*"` is not a valid RFC 6454 origin; expanding it here keeps the
 /// rmcp allow-list non-empty so default spicepods enforce the 2026-07-28
-/// Origin check. Entries omit a port so rmcp matches any port on that host.
+/// Origin check. Entries omit a port so any port on that host matches.
 const DEFAULT_MCP_ALLOWED_ORIGINS: &[&str] = &[
     "http://localhost",
     "http://127.0.0.1",
@@ -1212,29 +1222,57 @@ impl Default for CorsConfig {
     }
 }
 
+/// The `Origin` allow-list for `/v1/mcp`, derived from
+/// [`CorsConfig::allowed_origins`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpOrigins<'a> {
+    /// `"*"` or an empty list: the localhost defaults, on any port.
+    LocalhostDefaults,
+    /// A concrete list: an `Origin` must match the scheme, host and port of
+    /// one entry. An omitted default port (80, 443) equals the explicit one.
+    Explicit(&'a [String]),
+}
+
+impl McpOrigins<'_> {
+    /// The allow-list entries. The localhost defaults carry no port.
+    #[must_use]
+    pub fn entries(self) -> Vec<String> {
+        match self {
+            Self::LocalhostDefaults => DEFAULT_MCP_ALLOWED_ORIGINS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            Self::Explicit(origins) => origins.to_vec(),
+        }
+    }
+}
+
 impl CorsConfig {
-    /// Origins to install on rmcp Streamable HTTP.
+    /// The `/v1/mcp` `Origin` policy.
     ///
     /// `"*"` is not a valid RFC 6454 origin. CORS treats it as allow-all for
     /// browser HTTP, but MCP Streamable HTTP must validate `Origin` (DNS
     /// rebinding). Both `"*"` (the CORS default) and an empty list expand to
-    /// localhost defaults so the rmcp list is never empty — empty accepts
-    /// every `Origin`.
+    /// localhost defaults so the allow-list is never empty — an empty rmcp
+    /// list accepts every `Origin`.
     ///
     /// A concrete list is the 2026-07-28 Streamable HTTP origin policy:
     /// a mismatched `Origin` is 403. Requests with no `Origin` still pass.
     #[must_use]
-    pub fn mcp_allowed_origins(&self) -> Vec<String> {
+    pub fn mcp_origins(&self) -> McpOrigins<'_> {
         if self.allowed_origins.iter().any(|origin| origin == "*")
             || self.allowed_origins.is_empty()
         {
-            DEFAULT_MCP_ALLOWED_ORIGINS
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+            McpOrigins::LocalhostDefaults
         } else {
-            self.allowed_origins.clone()
+            McpOrigins::Explicit(&self.allowed_origins)
         }
+    }
+
+    /// Origins to install on rmcp Streamable HTTP. See [`Self::mcp_origins`].
+    #[must_use]
+    pub fn mcp_allowed_origins(&self) -> Vec<String> {
+        self.mcp_origins().entries()
     }
 }
 
@@ -1575,12 +1613,46 @@ pub struct RuntimeState {
     pub params: Option<Params>,
 }
 
+/// An object-store location for one feature's shared state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateLocation {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).
+    pub location: String,
+
+    /// Object store params for the location.
+    pub params: Option<Params>,
+
+    /// The setting that gave the location.
+    pub source: StateSource,
+}
+
+impl From<&RuntimeState> for StateLocation {
+    fn from(state: &RuntimeState) -> Self {
+        Self {
+            location: state.location.clone(),
+            params: state.params.clone(),
+            source: StateSource::RuntimeState,
+        }
+    }
+}
+
+/// The setting that gave a feature its state location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSource {
+    /// `runtime.state`. Each feature keeps its objects in its own folder under
+    /// the location.
+    RuntimeState,
+    /// The feature's own setting, such as `runtime.scheduler.state_location`.
+    /// The feature keeps its objects at the location root.
+    FeatureSetting,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
     /// Root URI for shared cluster state. Optional when [`Runtime::state`]
-    /// provides the location via [`Runtime::resolved_scheduler`].
+    /// provides the location (see [`Runtime::scheduler_state`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_location: Option<String>,
 
@@ -1605,13 +1677,11 @@ pub struct Scheduler {
     pub partition_discovery_timeout: String,
 }
 
-impl Scheduler {
-    /// Build scheduler config that stores cluster state at the shared runtime location.
-    #[must_use]
-    pub fn from_shared_state(state: &RuntimeState) -> Self {
+impl Default for Scheduler {
+    fn default() -> Self {
         Self {
-            state_location: Some(state.location.clone()),
-            params: state.params.clone(),
+            state_location: None,
+            params: None,
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
             ),

@@ -428,6 +428,128 @@ async fn mysql_btrim_evaluates_locally_on_both_registration_paths() -> Result<()
         .await
 }
 
+/// `MySQL`'s bare `DATETIME` keeps no fractional seconds, so a timestamp filter
+/// pushed down as `CAST(<literal> AS DATETIME)` compares a different instant and
+/// selects the wrong rows. Covers both registration paths, which each build their
+/// own `MySQLTableFactory`.
+#[tokio::test]
+async fn mysql_fractional_second_filters_select_their_rows_on_both_registration_paths()
+-> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_mysql_docker_container().await.map_err(|e| {
+                tracing::error!("start_mysql_docker_container: {e}");
+                e.to_string()
+            })?;
+            let port = running_container
+                .host_port(3306)
+                .map_err(|e| e.to_string())?;
+
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_fractional_second_table(port)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let mut catalog = Catalog::new("mysql".to_string(), "mycat".to_string());
+            catalog.params = Some(spicepod::param::Params::from_string_map(
+                mysql_connection_params(port),
+            ));
+
+            let app = AppBuilder::new("mysql_fractional_seconds")
+                .with_dataset(make_mysql_dataset("ts_src", "myds", port, false))
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
+                    return Err("Timed out waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let run = |query: String| {
+                let rt = rt.clone();
+                async move {
+                    rt.datafusion()
+                        .query_builder(&query)
+                        .build()
+                        .run()
+                        .await
+                        .map_err(|e| format!("`{query}` failed: {e}"))?
+                        .data
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                        .map_err(|e| format!("`{query}` collection failed: {e}"))
+                }
+            };
+
+            for table in ["myds", "mycat.mysqldb.ts_src"] {
+                // Cast to a whole second, the first literal matches no row and the
+                // second admits row 2 as well.
+                for predicate in [
+                    "ts = TIMESTAMP '1994-06-15 12:30:00.5'",
+                    "ts > TIMESTAMP '1994-06-15 12:30:00.25'",
+                ] {
+                    let batches = run(format!("SELECT id FROM {table} WHERE {predicate}")).await?;
+                    let mut ids = Vec::new();
+                    for batch in &batches {
+                        let column = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int32Array>()
+                            .ok_or_else(|| format!("`id` on `{table}` is not Int32"))?;
+                        ids.extend(column.iter().flatten());
+                    }
+                    assert_eq!(
+                        ids,
+                        [3],
+                        "`{predicate}` on `{table}` selected the wrong rows"
+                    );
+                }
+
+                // The filter has to be evaluated by MySQL for the rows above to
+                // test the rendering at all.
+                let plan = run(format!(
+                    "EXPLAIN SELECT id FROM {table} WHERE ts = TIMESTAMP '1994-06-15 12:30:00.5'"
+                ))
+                .await?;
+                let plan = arrow::util::pretty::pretty_format_batches(&plan)
+                    .map_err(|e| format!("formatting the plan failed: {e}"))?
+                    .to_string();
+                let base_sql = plan
+                    .split_once("VirtualExecutionPlan name=mysql")
+                    .and_then(|(_, rest)| rest.split_once("base_sql="))
+                    .map(|(_, sql)| sql)
+                    .ok_or_else(|| format!("no MySQL scan in the plan for `{table}`:\n{plan}"))?;
+                assert!(
+                    base_sql.contains("AS DATETIME(6))"),
+                    "the filter should reach MySQL cast to DATETIME(6) for `{table}`; the \
+                     pushed-down SQL was:\n{base_sql}"
+                );
+            }
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
 /// The connection parameters `make_mysql_dataset` uses, for the catalog
 /// component — which takes the same set but as its own `Params`.
 fn mysql_connection_params(port: u16) -> std::collections::HashMap<String, String> {
@@ -469,6 +591,31 @@ async fn init_trim_table(port: u16) -> Result<(), anyhow::Error> {
             // future rewrite that federated them to a wider remote `trim`.
             "INSERT INTO trim_src VALUES (1, '  alpha  '), (2, 'xxbetaxx'), (3, '  gamma'), \
              (4, '\u{a0}nbsp\u{a0}'), (5, '\u{2003}emsp\u{2003}'), (6, '\u{3000}ideo\u{3000}')",
+            Params::Empty,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Rows at 12:30:00 and a quarter and a half second past it, so a filter whose
+/// literal is rounded to the second selects a different set.
+#[instrument]
+async fn init_fractional_second_table(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+    let _: Vec<Row> = conn
+        .exec("DROP TABLE IF EXISTS ts_src", Params::Empty)
+        .await?;
+    let _: Vec<Row> = conn
+        .exec(
+            "CREATE TABLE ts_src (id INT, ts DATETIME(6))",
+            Params::Empty,
+        )
+        .await?;
+    let _: Vec<Row> = conn
+        .exec(
+            "INSERT INTO ts_src VALUES (1, '1994-06-15 12:30:00'), \
+             (2, '1994-06-15 12:30:00.25'), (3, '1994-06-15 12:30:00.5')",
             Params::Empty,
         )
         .await?;

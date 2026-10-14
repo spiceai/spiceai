@@ -41,15 +41,9 @@ limitations under the License.
 //! always primary-keyed with `OnConflict::Upsert`, mirroring how the runtime
 //! configures a keyed `refresh_mode: changes` Cayenne dataset.
 
-#![cfg(not(windows))]
-#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
-// Accelerator engines are their own crates and self-register through a linkme slice. Each
-// integration test is a separate binary that links independently, and the linker drops an
-// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
-use accelerator_cayenne as _;
+use super::make_refresh_task;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -72,7 +66,6 @@ use data_components::debezium::arrow::changes::to_change_batch;
 use data_components::debezium::change_event::ChangeEvent;
 #[cfg(feature = "debezium")]
 use data_components::schema_projection::SchemaProjection;
-use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
@@ -81,11 +74,7 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::StreamExt;
 use futures::stream as fstream;
 use runtime::accelerated::refresh::Refresh;
-use runtime::accelerated::refresh_task::RefreshTaskBuilder;
-use runtime::federated::FederatedTable;
-use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
-use tokio::runtime::Handle;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 /// Schema of the table under test: an `Int64` primary key and a nullable string.
@@ -239,25 +228,6 @@ async fn setup_keyed_cayenne_with_schema(
     (temp, catalog, Arc::new(table))
 }
 
-/// Build a [`RefreshTask`] whose accelerator and (unused) federated source both
-/// point at the given Cayenne table.
-fn make_refresh_task(
-    accelerator: Arc<dyn TableProvider>,
-    table_name: &str,
-) -> runtime::accelerated::refresh_task::RefreshTask {
-    let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-    RefreshTaskBuilder::new(
-        RuntimeStatus::new(),
-        TableReference::bare(table_name),
-        federated,
-        None,
-        accelerator,
-        Handle::current(),
-        Arc::new(tokio::sync::Mutex::new(())),
-    )
-    .build()
-}
-
 /// Drive one finite Debezium-style change stream to completion against `table`,
 /// returning the recorded commit-offset sequence.
 async fn apply_stream(
@@ -265,7 +235,7 @@ async fn apply_stream(
     table_name: &str,
     ops: &[Op<'_>],
 ) -> Vec<i64> {
-    let task = make_refresh_task(Arc::clone(table) as Arc<dyn TableProvider>, table_name);
+    let task = make_refresh_task(Arc::clone(table) as Arc<dyn TableProvider>, table_name).await;
     let commits = Arc::new(TokioMutex::new(Vec::new()));
     let stream = stream_of(ops, &commits);
     let refresh = Arc::new(RwLock::new(Refresh::default()));
@@ -529,7 +499,8 @@ async fn debezium_json_nesting_folds_into_catch_all() {
     let task = make_refresh_task(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "dbz_json_nest",
-    );
+    )
+    .await;
     let refresh = Arc::new(RwLock::new(Refresh::default()));
     task.start_changes_stream(
         refresh,

@@ -937,6 +937,18 @@ pub trait DataAccelerator: Send + Sync {
         }))
     }
 
+    /// Perform the engine's maintenance after a snapshot was restored and
+    /// `provider` serves it: after the initial provider is installed, and after
+    /// each reload's replacement is swapped in — never before a swap, since the
+    /// replaced provider keeps serving if the swap is refused. The default does
+    /// nothing.
+    async fn maintain_after_snapshot_restore(
+        &self,
+        _source: &dyn AccelerationSource,
+        _provider: &Arc<dyn TableProvider>,
+    ) {
+    }
+
     /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
     ///
     /// Engines that need to customise the on-disk archive contents (e.g.

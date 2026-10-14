@@ -154,6 +154,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::OnceCell;
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 use vortex_datafusion::VortexSource;
@@ -800,6 +801,38 @@ struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
+    /// These files with their statistics, built once for every scan that shares
+    /// this capture — every scan of one [`ScanView`] — instead of once per scan.
+    /// See [`CayenneTableProvider::snapshot_files_with_stats`].
+    with_statistics: Arc<OnceCell<SnapshotFilesWithStatistics>>,
+}
+
+impl CapturedSnapshotFiles {
+    fn new(dir_generation: u64, listing_epoch: u64, files: Arc<Vec<PartitionedFile>>) -> Self {
+        Self {
+            dir_generation,
+            listing_epoch,
+            files,
+            with_statistics: Arc::default(),
+        }
+    }
+}
+
+/// A captured file set with each file's statistics, computed against
+/// `statistics_schema`.
+struct SnapshotFilesWithStatistics {
+    statistics_schema: SchemaRef,
+    files: Arc<Vec<PartitionedFile>>,
+}
+
+/// Why a shared statistics listing was not stored in its capture's cell.
+enum SharedListingError {
+    /// The build failed. Nothing is stored, so a later scan builds it again.
+    Failed(datafusion_common::DataFusionError),
+    /// The table's file set or statistics were invalidated while the listing was
+    /// built. The listing still answers the scan that built it, as a build that
+    /// was never shared does, but it is not stored for scans that start later.
+    Invalidated(Arc<Vec<PartitionedFile>>),
 }
 
 /// The live state one sweep reads, owned so it can cross into `spawn_blocking`.
@@ -818,6 +851,12 @@ struct SnapshotSweepPins {
 /// See [`CayenneTableProvider::hold_file_deletions`].
 pub struct FileDeletionHold {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+/// Keeps the table's persisted secondary index runs as they were written until
+/// dropped. See [`CayenneTableProvider::persist_lookup_index_for_snapshot`].
+pub struct LookupIndexSnapshotHold {
+    _runs: Option<super::lookup_index::PersistedRunsHold>,
 }
 
 /// What one superseded-snapshot sweep must preserve.
@@ -1779,6 +1818,20 @@ type TestSchemaStatisticsLockProbe = (
 #[cfg(test)]
 type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// Test-only counters and fault injection for the statistics listing.
+#[cfg(test)]
+#[derive(Default)]
+struct TestListingSeams {
+    /// Listings built with statistics rather than served from a cache, so a
+    /// test can tell a shared or carried-forward listing from a rebuild.
+    builds: AtomicU64,
+    /// Scans that asked a capture's shared listing for their files, so a test
+    /// can release a held build once every scan has joined it.
+    shared_requests: AtomicU64,
+    /// Fail the next listing build. Consumed on first use.
+    fail_next: AtomicBool,
+}
+
 /// Test-only synchronous hook fired at the start of the checkpoint's fold-and-union
 /// task, on the blocking pool. See `CayenneTableProvider::test_checkpoint_union_hook`.
 #[cfg(test)]
@@ -2046,6 +2099,9 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only counters and fault injection for the statistics listing.
+    #[cfg(test)]
+    test_listing: Arc<TestListingSeams>,
     /// Test-only seam fired by `load_existing_pk_index` after its fenced capture
     /// and before its scans, so a test can run a checkpoint in the window a keyset
     /// rebuild reads the table after that capture. Consumed on first fire.
@@ -2873,6 +2929,7 @@ pub struct CayenneTableProviderBuilder {
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
+    snapshot_dir_pins: Option<SnapshotDirPins>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -3026,6 +3083,29 @@ struct CayenneTableProviderOpenOptions {
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
+    snapshot_dir_pins: Option<SnapshotDirPins>,
+}
+
+/// What a sweep consults before deleting a snapshot directory: in-flight scan
+/// ref-counts, each directory's last listing time, and the retired-directory
+/// ledger. A reload opens its replacement provider over the replaced provider's
+/// pins ([`CayenneTableProviderBuilder::with_snapshot_dir_pins`]), so queries
+/// still reading the replaced snapshot keep their directories.
+#[derive(Clone, Default)]
+pub struct SnapshotDirPins {
+    scan_refs: Arc<ParkingMutex<HashMap<String, usize>>>,
+    last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
+}
+
+impl SnapshotDirPins {
+    /// Whether both share the same maps, i.e. one was opened over the other.
+    #[must_use]
+    pub fn is_shared_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.scan_refs, &other.scan_refs)
+            && Arc::ptr_eq(&self.last_listed, &other.last_listed)
+            && Arc::ptr_eq(&self.retired, &other.retired)
+    }
 }
 
 impl CayenneTableProviderBuilder {
@@ -3047,7 +3127,16 @@ impl CayenneTableProviderBuilder {
             index_persistence: IndexPersistence::default(),
             index_word_bits: None,
             dataset_name: None,
+            snapshot_dir_pins: None,
         }
+    }
+
+    /// Open the table over the pins of the instance this one replaces, so this
+    /// instance's sweeps defer the directories that instance's queries still read.
+    #[must_use]
+    pub fn with_snapshot_dir_pins(mut self, pins: SnapshotDirPins) -> Self {
+        self.snapshot_dir_pins = Some(pins);
+        self
     }
 
     /// Name the dataset a user knows the table by in messages, when it differs from
@@ -3189,6 +3278,7 @@ impl CayenneTableProviderBuilder {
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
+            snapshot_dir_pins: self.snapshot_dir_pins,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3224,6 +3314,7 @@ impl CayenneTableProviderBuilder {
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
+            snapshot_dir_pins: self.snapshot_dir_pins,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -4235,6 +4326,11 @@ pub(crate) enum EncodeFanOut {
     /// Size the fan-out from the configured write concurrency and the byte
     /// estimate. The overwhelming majority of writes.
     Sized,
+    /// One encoder for one of many writes the caller runs side by side, as the
+    /// per-file fold does. The parallelism lives in the caller, so the write
+    /// is not recorded as the table's write shape: a fan-out of one here says
+    /// nothing about how the table's own writes are sharded.
+    PerCaller,
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
@@ -7098,6 +7194,122 @@ impl CayenneTableProvider {
         }
     }
 
+    /// The pins the instance replacing this one must be opened over.
+    #[must_use]
+    pub fn snapshot_dir_pins(&self) -> SnapshotDirPins {
+        SnapshotDirPins {
+            scan_refs: Arc::clone(&self.snapshot_scan_refs),
+            last_listed: Arc::clone(&self.snapshot_last_listed),
+            retired: Arc::clone(&self.retired_snapshot_dirs),
+        }
+    }
+
+    /// Retire every snapshot directory under the table root that the catalog no
+    /// longer references, and sweep them once their grace elapses.
+    ///
+    /// A `refresh_mode: snapshot` reader imports a new metastore slice on each
+    /// reload, which leaves the previous snapshot's directory unreferenced, and it
+    /// never commits, so no commit-scheduled sweep reclaims it
+    /// (spiceai/spiceai#14981). Called once the replacement provider is serving,
+    /// never before the swap.
+    ///
+    /// Live: the current snapshot, the protected snapshots, and the directory of
+    /// every referenced deletion file. Only uuid-named directories are candidates.
+    /// Uses the retired-directory ledger, not the uuid7-age sweep: the age sweep
+    /// keeps every directory newer than current, which on a CDC writer is every
+    /// merged-away checkpoint.
+    ///
+    /// Returns the retired ids, sorted. Partitioned and object-store tables retire
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// The table root cannot be listed, or the deletion files cannot be read.
+    pub async fn retire_unreferenced_snapshot_dirs(&self) -> CatalogResult<Vec<String>> {
+        if self.table_metadata.partition_column.is_some()
+            || self.table_metadata.path.starts_with("s3://")
+        {
+            return Ok(Vec::new());
+        }
+        let table_dir =
+            std::path::PathBuf::from(&self.table_metadata.path).join(&self.table_metadata.table_id);
+        let mut live = self.protected_snapshot_ids();
+        live.insert(self.get_current_snapshot_id());
+        for delete_file in self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await?
+        {
+            if let Some(id) = Self::snapshot_dir_holding(&table_dir, &delete_file.path) {
+                live.insert(id);
+            }
+        }
+        let mut on_disk = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&table_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                on_disk.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        let unreferenced = Self::unreferenced_snapshot_dir_ids(on_disk, &live);
+        if unreferenced.is_empty() {
+            return Ok(unreferenced);
+        }
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            retired = unreferenced.len(),
+            "Retired the snapshot directories the table's snapshot no longer references; each is deleted once no query reads it"
+        );
+        self.retire_snapshot_dirs(unreferenced.iter().map(String::as_str));
+        self.follow_up_retired_snapshot_dirs();
+        Ok(unreferenced)
+    }
+
+    /// The uuid-named entries of `on_disk` outside `live`, sorted. Anything
+    /// else — reserved `_`-prefixed directories included — is never a candidate.
+    fn unreferenced_snapshot_dir_ids(on_disk: Vec<String>, live: &HashSet<String>) -> Vec<String> {
+        let mut unreferenced: Vec<String> = on_disk
+            .into_iter()
+            .filter(|name| uuid::Uuid::parse_str(name).is_ok() && !live.contains(name))
+            .collect();
+        unreferenced.sort();
+        unreferenced
+    }
+
+    /// The snapshot directory under `table_dir` that `path` lies in, if any.
+    fn snapshot_dir_holding(table_dir: &std::path::Path, path: &str) -> Option<String> {
+        std::path::Path::new(path)
+            .strip_prefix(table_dir)
+            .ok()?
+            .components()
+            .next()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+    }
+
+    /// Re-sweep after each grace, up to the follow-up budget. A reader never
+    /// commits, so nothing else re-sweeps a directory a query held past the first
+    /// pass.
+    fn follow_up_retired_snapshot_dirs(&self) {
+        if !self.maintenance_still_admitted() {
+            return;
+        }
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            for _ in 0..Self::SNAPSHOT_CLEANUP_REARMS {
+                tokio::time::sleep(Self::SNAPSHOT_CLEANUP_GRACE).await;
+                if table.is_maintenance_closed() || table.retired_snapshot_dirs.lock().is_empty() {
+                    return;
+                }
+                table.sweep_retired_snapshot_dirs();
+            }
+        });
+    }
+
     /// Note that a scan resolved a file listing for `snapshot_id`; the sweep
     /// defers that dir's deletion a full grace past this point so the scan can
     /// open its files however long it runs.
@@ -9335,6 +9547,7 @@ impl CayenneTableProvider {
             index_persistence,
             index_word_bits,
             dataset_name,
+            snapshot_dir_pins,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
@@ -9499,6 +9712,9 @@ impl CayenneTableProvider {
         }));
 
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
+        // A replacement inherits the replaced instance's pins; any other
+        // instance starts with none.
+        let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
 
         // Register the S3 object store in the shared RuntimeEnv once during
         // construction. Every code path that creates a SessionContext from
@@ -9608,6 +9824,8 @@ impl CayenneTableProvider {
             test_post_scan_view_selection_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_listing: Arc::default(),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
@@ -9745,9 +9963,9 @@ impl CayenneTableProvider {
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             publication_outcome_unknown: Arc::new(AtomicBool::new(false)),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
-            retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
-            snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
-            snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
+            retired_snapshot_dirs: snapshot_dir_pins.retired,
+            snapshot_last_listed: snapshot_dir_pins.last_listed,
+            snapshot_scan_refs: snapshot_dir_pins.scan_refs,
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
                 ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
@@ -10409,7 +10627,14 @@ impl CayenneTableProvider {
         let super::delta_encoding::WritePolicy {
             class: write_class,
             fan_out,
+            routing,
         } = policy;
+        // A range plan routes on its key column, whatever the policy asked for.
+        let routing = if range.is_some() {
+            super::delta_encoding::ShardRouting::Key
+        } else {
+            routing
+        };
 
         // Materialize the snapshot directory before the write, unconditionally.
         // The Vortex sink creates it lazily when it writes its first file, so a
@@ -10487,9 +10712,10 @@ impl CayenneTableProvider {
 
         // Build the write-path Vortex format for this snapshot. Unsorted writes
         // are sharded across `target_partitions` concurrent encoders (PK-hashed
-        // for keyed tables, round-robin otherwise) so the encode saturates all
-        // cores; sorted rewrites and single-writer configs fall back to one
-        // serial writer. Scans are unaffected — they never read the write-shard
+        // for keyed tables, round-robin otherwise, and whole batches in turn
+        // when `routing` asks for them and the table requested no layout) so
+        // the encode saturates all cores; sorted rewrites and single-writer
+        // configs fall back to one serial writer. Scans are unaffected — they never read the write-shard
         // config (only `create_writer_physical_plan` does). The shard count is
         // size-aware: a write smaller than one target file stays a single shard
         // regardless of `target_partitions` (see `snapshot_shard_count`).
@@ -10508,6 +10734,7 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
+                routing,
                 range.as_ref().map(|range| range.bounds),
             )
             .map(|mut config| {
@@ -10962,6 +11189,11 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
     ) -> usize {
+        // The caller runs many such writes side by side, so each takes one
+        // encoder and records no write shape.
+        if matches!(fan_out, EncodeFanOut::PerCaller) {
+            return 1;
+        }
         // The caller requires a single sequence of output files. Checked before
         // the configured concurrency, which must not be able to override it.
         if matches!(fan_out, EncodeFanOut::Serial) {
@@ -11650,6 +11882,7 @@ impl CayenneTableProvider {
             target_size_bytes,
             estimated_bytes,
             fan_out,
+            super::delta_encoding::ShardRouting::Key,
             range_bounds,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
@@ -11700,6 +11933,19 @@ impl CayenneTableProvider {
             .then_some(bounds)
     }
 
+    /// Whether a write routed by `routing` hands whole batches to its shards
+    /// instead of splitting them on the shard key. Only when the table requested
+    /// no layout: no shard key and no [`CayenneContext::has_requested_layout`].
+    /// This changes which file a row lands in, never which rows are written.
+    fn routes_whole_batches(&self, routing: super::delta_encoding::ShardRouting) -> bool {
+        match routing {
+            super::delta_encoding::ShardRouting::Key => false,
+            super::delta_encoding::ShardRouting::WholeBatch => {
+                self.context.shard_key_columns().is_empty() && !self.context.has_requested_layout()
+            }
+        }
+    }
+
     /// The intra-write shard configuration this write earns, or `None` for a
     /// single serial writer. Shared by [`Self::write_shard_format`] (default
     /// encoding) and the delta-encoding strategy-override path
@@ -11711,20 +11957,17 @@ impl CayenneTableProvider {
     /// source's declared shard key) and every column resolves against the
     /// schema. That is an explicit request for key-clustered files, so it wins.
     ///
-    /// Otherwise the shards are filled with CONTIGUOUS runs of the arrival
-    /// stream. This is the default because hashing destroys the arrival order,
-    /// and the arrival order is what a CDC table's zone maps are built on: with
-    /// a hash (or round-robin) split, every output file spans the whole range of
-    /// a monotonic column, so a point lookup can prune nothing and must open all
-    /// of them. A serial write never had that problem — it wrote one file per
-    /// range — and preserving contiguity is what keeps the parallel encode from
-    /// giving that pruning away.
+    /// Otherwise a keyed table hashes on its primary key and an unkeyed table
+    /// hands whole batches to the shards in turn. A keyed table's write does the
+    /// same when `routing` asks for whole batches and the table requested no
+    /// layout (see [`Self::routes_whole_batches`]).
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        routing: super::delta_encoding::ShardRouting,
         range_bounds: Option<&[ScalarValue]>,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
@@ -11739,8 +11982,13 @@ impl CayenneTableProvider {
         // Bounds describe one column — the first `shard_key_columns` entry after
         // the caller leads with `range.column`. The rest of the key is kept so
         // an estimated-bounds hash fallback can still rebalance a composite key;
-        // a single-column key hashes that same column.
-        let shard_key_columns = self.resolved_shard_key_columns();
+        // a single-column key hashes that same column. An empty key is the
+        // sink's whole-batch round-robin.
+        let shard_key_columns = if self.routes_whole_batches(routing) {
+            Vec::new()
+        } else {
+            self.resolved_shard_key_columns()
+        };
         let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
         Some(WriteShardConfig {
             write_concurrency: shard_count,
@@ -11826,7 +12074,7 @@ impl CayenneTableProvider {
     /// config, encode permits — equal to the shards actually written. Split
     /// points computed for more shards would be cut down to their first few,
     /// leaving the last shard nearly all of the rows.
-    fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
+    pub(super) fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
         let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         self.context
@@ -11913,6 +12161,8 @@ impl CayenneTableProvider {
             ),
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
+            #[cfg(test)]
+            test_listing: Arc::clone(&self.test_listing),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
@@ -12452,7 +12702,7 @@ impl CayenneTableProvider {
 
     /// Effective byte budget for the table-wide PK keyset cache
     /// (`pk_keyset_cache`).
-    fn effective_single_keyset_budget(&self) -> usize {
+    pub(crate) fn effective_single_keyset_budget(&self) -> usize {
         self.effective_pk_keyset_budget(self.pk_keyset_bytes_single.load(Ordering::Relaxed))
     }
 
@@ -12588,6 +12838,13 @@ impl CayenneTableProvider {
             telemetry::KeyValue::new("site", site),
             telemetry::KeyValue::new("kind", Self::pk_index_kind_label(is_bloom)),
         ]);
+    }
+
+    /// Cache the filter a first load built of the keys it wrote, as the
+    /// table-wide index (see `first_load_pk`).
+    pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkBloom) {
+        let (_, checkout) = self.take_cached_pk_index();
+        self.store_cached_pk_index(CachedPkIndex::Bloom(bloom), checkout);
     }
 
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
@@ -13937,7 +14194,7 @@ impl CayenneTableProvider {
     }
 
     /// Build a `RowConverter` for the primary key columns.
-    fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
+    pub(crate) fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
         let table_schema = self.table_schema();
         let mut sort_fields = Vec::with_capacity(pk_indices.len());
         for idx in pk_indices {
@@ -18944,7 +19201,7 @@ impl CayenneTableProvider {
         // for any shard count a write uses.
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if self.context.has_requested_layout() {
             return OverwriteRouting::Hash;
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
@@ -19059,7 +19316,7 @@ impl CayenneTableProvider {
         // for any shard count a write uses (as `overwrite_range_plan`).
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if self.context.has_requested_layout() {
             return Ok((data, None));
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
@@ -20642,6 +20899,30 @@ impl CayenneTableProvider {
         FileDeletionHold {
             _guard: Arc::clone(&self.file_deletion_fence).read_owned().await,
         }
+    }
+
+    /// Write the secondary index's runs to disk and keep them as they are until
+    /// the returned hold drops, for an acceleration snapshot: the runs of a
+    /// write that just returned otherwise persist in the background, and a
+    /// snapshot taken before they do restores with those files unindexed. Take
+    /// it under the dataset's write lock, after [`Self::hold_file_deletions`],
+    /// and hold it until the archive is written. Best-effort: when the runs
+    /// cannot be written, the snapshot carries the runs persisted so far, and a
+    /// table restored from it indexes the rest before it serves queries.
+    pub async fn persist_lookup_index_for_snapshot(&self) -> LookupIndexSnapshotHold {
+        let runs = match self.lookup_index.as_ref() {
+            Some(state) => state.persist_for_snapshot().await,
+            None => None,
+        };
+        let runs = match runs {
+            Some(Ok(hold)) => Some(hold),
+            Some(Err(error)) => {
+                tracing::debug!(table = %self.table_metadata.table_name, %error, "Secondary index runs were not all persisted before a snapshot; a table restored from it indexes the rest before serving");
+                None
+            }
+            None => None,
+        };
+        LookupIndexSnapshotHold { _runs: runs }
     }
 
     /// Claim file deletion for a snapshot-directory sweep, held until its
@@ -24336,7 +24617,14 @@ impl CayenneTableProvider {
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
         // Cold promotion streams its rows, so it has no key range to split on.
-        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out, None);
+        let shard = self.write_shard_config(
+            1,
+            target_size_bytes,
+            None,
+            fan_out,
+            super::delta_encoding::ShardRouting::Key,
+            None,
+        );
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -31049,11 +31337,11 @@ impl CayenneTableProvider {
                     .await?,
             )
         };
-        Ok(CapturedSnapshotFiles {
+        Ok(CapturedSnapshotFiles::new(
             dir_generation,
             listing_epoch,
             files,
-        })
+        ))
     }
 
     /// Resolve the cold-tier manifest that belongs to `snapshot_id`, for a caller
@@ -31487,6 +31775,68 @@ impl CayenneTableProvider {
                 }
             };
         }
+    }
+
+    /// Build the scan view of the table as it is now, with its files' statistics,
+    /// so the scans that follow a refresh find both ready instead of building
+    /// them. A refresh calls this once its write has finished, index maintenance
+    /// included, and before it reports completion: the queries a completed
+    /// refresh lets through then plan against a ready view.
+    ///
+    /// Best-effort, and safe to cancel. The write is already committed and
+    /// visible, and a scan that arrives first builds the same view and listing
+    /// itself, so a failure here costs only that scan's latency.
+    ///
+    /// A table that lists its files from the manifest (`scan_from_manifest`) is
+    /// skipped: an append's files reach the manifest only with the post-write
+    /// maintenance pass, so a listing built now could miss them.
+    pub async fn prepare_scan_view_for_reads(&self) {
+        if self.context.scan_from_manifest() {
+            return;
+        }
+        if let Err(error) = self.build_current_scan_view_with_statistics().await {
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                %error,
+                "Did not prepare the scan view after a write; the next scan builds it"
+            );
+        }
+    }
+
+    /// Whether the table's newest scan view is of its current snapshot and its
+    /// files' statistics are already listed, so the next scan builds neither.
+    /// Exposed so the refresh path's tests can assert it prepared the table.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scan_view_is_prepared(&self) -> bool {
+        self.scan_view_cache
+            .latest_complete
+            .load_full()
+            .is_some_and(|completed| {
+                completed.view.raw.current_snapshot_id == self.get_current_snapshot_id()
+                    && completed.order == self.scan_input_version.load(Ordering::Acquire)
+                    && completed
+                        .view
+                        .raw
+                        .warm_files
+                        .with_statistics
+                        .get()
+                        .is_some()
+            })
+    }
+
+    /// Plan a full scan of the table as it is now: the scan builds the scan view
+    /// and its files' statistics exactly as a query's would. `CurrentScanView`
+    /// makes it capture the table as it is now, whatever its reuse mode, since a
+    /// lag-tolerant table would otherwise be handed a view from before this
+    /// write and publishing that as the newest would hide the write.
+    async fn build_current_scan_view_with_statistics(&self) -> datafusion_common::Result<()> {
+        let mut config =
+            util::session_state::session_config().with_extension(Arc::new(CurrentScanView));
+        config.options_mut().execution.collect_statistics = true;
+        let ctx =
+            SessionContext::new_with_config_rt(config, Arc::clone(self.context.runtime_env()));
+        self.scan(&ctx.state(), None, &[], None).await.map(|_| ())
     }
 
     fn mem_tier_deletion_maps(
@@ -36935,17 +37285,79 @@ impl CayenneTableProvider {
         .await
     }
 
-    /// Return the snapshot's files with statistics, using
-    /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
-    /// generation, and listing-cache epoch still match. A complete listing
-    /// (not truncated by LIMIT) is stored so later point lookups prune in
-    /// memory instead of re-LISTing.
+    /// Return the snapshot's files with statistics. Scans that share a captured
+    /// file set — every scan of one [`ScanView`] — share one build of it, used
+    /// only while the capture's directory generation and listing-cache epoch are
+    /// still the table's; see [`SharedListingError`] for what is not stored.
     async fn snapshot_files_with_stats(
         &self,
         request: &SnapshotScanListingRequest<'_>,
         collect_stats: bool,
         dir_generation: u64,
     ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        if collect_stats
+            && let Some(captured) = request.captured_files
+            && self.captured_files_are_current(captured)
+        {
+            #[cfg(test)]
+            self.test_listing
+                .shared_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let shared = captured
+                .with_statistics
+                .get_or_try_init(|| async {
+                    let (files, stored) = self
+                        .build_snapshot_files_with_stats(request, true, dir_generation)
+                        .await
+                        .map_err(SharedListingError::Failed)?;
+                    if stored {
+                        Ok(SnapshotFilesWithStatistics {
+                            statistics_schema: Arc::clone(&request.file_statistics_schema),
+                            files,
+                        })
+                    } else {
+                        Err(SharedListingError::Invalidated(files))
+                    }
+                })
+                .await;
+            match shared {
+                Ok(shared) if shared.statistics_schema == request.file_statistics_schema => {
+                    return Ok(Arc::clone(&shared.files));
+                }
+                // Statistics for another schema; build this scan's own below.
+                Ok(_) => {}
+                Err(SharedListingError::Invalidated(files)) => return Ok(files),
+                Err(SharedListingError::Failed(error)) => return Err(error),
+            }
+        }
+        self.build_snapshot_files_with_stats(request, collect_stats, dir_generation)
+            .await
+            .map(|(files, _)| files)
+    }
+
+    /// Whether `captured` still has the table's directory generation and
+    /// listing-cache epoch, so a listing built for it is the one a capture taken
+    /// now would get.
+    fn captured_files_are_current(&self, captured: &CapturedSnapshotFiles) -> bool {
+        captured.dir_generation == self.current_dir_generation.load(Ordering::Acquire)
+            && captured.listing_epoch == self.listing_cache_epoch.load(Ordering::Acquire)
+    }
+
+    /// Build the snapshot's files with statistics, using
+    /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
+    /// generation, and listing-cache epoch still match. A complete listing
+    /// (not truncated by LIMIT) is stored so later point lookups prune in
+    /// memory instead of re-LISTing, and so a new view of the same snapshot —
+    /// which CDC writes mint without changing its files — starts from it.
+    ///
+    /// Also returns whether the listing is the slot's: a hit, or a build that
+    /// was stored because no generation or epoch change overtook it.
+    async fn build_snapshot_files_with_stats(
+        &self,
+        request: &SnapshotScanListingRequest<'_>,
+        collect_stats: bool,
+        dir_generation: u64,
+    ) -> datafusion_common::Result<(Arc<Vec<PartitionedFile>>, bool)> {
         let listing_epoch = request.captured_files.map_or_else(
             || self.listing_cache_epoch.load(Ordering::Acquire),
             |files| files.listing_epoch,
@@ -36964,7 +37376,14 @@ impl CayenneTableProvider {
                         .is_some_and(|source| Arc::ptr_eq(&captured.files, source))
             })
         {
-            return Ok(Arc::clone(&cached.files));
+            return Ok((Arc::clone(&cached.files), true));
+        }
+
+        #[cfg(test)]
+        if collect_stats && self.test_listing.fail_next.swap(false, Ordering::AcqRel) {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "injected snapshot listing failure".to_string(),
+            ));
         }
 
         let store = request
@@ -37010,7 +37429,12 @@ impl CayenneTableProvider {
             Self::collect_scan_files_with_limit(files, None, collect_stats).await?;
         let files = Arc::new(file_group.into_inner());
         #[cfg(test)]
+        if collect_stats {
+            self.test_listing.builds.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
+        let mut stored = false;
         if collect_stats && !truncated {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
@@ -37026,9 +37450,10 @@ impl CayenneTableProvider {
                             .captured_files
                             .map(|captured| Arc::clone(&captured.files)),
                     })));
+                stored = true;
             }
         }
-        Ok(files)
+        Ok((files, stored))
     }
 
     fn file_group_with_limit(
@@ -37904,32 +38329,73 @@ impl CayenneTableProvider {
     /// snapshots', and starts the background build `claim` holds over the ones
     /// no run covers, or frees the claim when the files cannot be listed.
     async fn start_lookup_index_build(self: &Arc<Self>, claim: super::lookup_index::BuildClaim) {
+        let Some((store, uncovered)) = self.lookup_index_uncovered_files().await else {
+            claim.unpublished();
+            return;
+        };
+        super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
+    }
+
+    /// Indexes every file a lookup reads that no secondary index run covers yet,
+    /// and returns once that build has finished. Called before an opened table
+    /// is served — one restored from a snapshot taken behind its index, or one
+    /// whose persisted runs could not all be loaded — so its first lookups are
+    /// answered from the index rather than by reading those files in full. A
+    /// safety net: when the loaded runs cover every file, as they do after a
+    /// clean shutdown or a snapshot that carried its runs, it starts no build.
+    /// Returns at once when every file is covered, when the table declares
+    /// no file-mode index, or when a build is already running. Files the build
+    /// cannot index (the memory pool refuses it, or a read fails) stay read in
+    /// full and are indexed in the background as usual.
+    pub async fn catch_up_lookup_index(&self) {
         let Some(index_state) = &self.lookup_index else {
             return;
         };
+        let Some((store, uncovered)) = self.lookup_index_uncovered_files().await else {
+            return;
+        };
+        if uncovered.is_empty() {
+            return;
+        }
+        let Some(claim) = index_state.claim_build() else {
+            return;
+        };
+        let build = super::lookup_index::spawn_build(
+            claim,
+            store,
+            uncovered,
+            self.lookup_index_list_live(),
+        );
+        if let Err(error) = build.await {
+            tracing::debug!(table = %self.table_metadata.table_name, %error, "Secondary index catch-up build did not complete");
+        }
+    }
+
+    /// The files a lookup reads, the current snapshot's and the protected
+    /// snapshots', that no published run covers, with the store they are read
+    /// from. `None` when the files cannot be listed.
+    async fn lookup_index_uncovered_files(
+        &self,
+    ) -> Option<(Arc<dyn ObjectStore>, Vec<super::lookup_index::IndexedFile>)> {
+        let index_state = self.lookup_index.as_ref()?;
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
         let snapshot_id = self.get_current_snapshot_id();
-        let Some((store, files)) = self
+        let (store, files) = self
             .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
-            .await
-        else {
-            claim.unpublished();
-            return;
-        };
+            .await?;
         // A lookup reads the protected snapshots' files too (an upsert's rows
         // stay there until compaction folds them in), so they are indexed with
         // the current snapshot's.
         let protected_map = self.protected_snapshots.load_full();
-        let Ok((_, protected_files)) = self.lookup_index_protected_files(&protected_map).await
-        else {
-            claim.unpublished();
-            return;
-        };
+        let (_, protected_files) = self
+            .lookup_index_protected_files(&protected_map)
+            .await
+            .ok()?;
         let view = index_state.published();
         let mut seen: HashSet<String> = HashSet::new();
-        let uncovered: Vec<super::lookup_index::IndexedFile> = files
+        let uncovered = files
             .into_iter()
             .chain(
                 protected_files
@@ -37938,7 +38404,7 @@ impl CayenneTableProvider {
             )
             .filter(|file| !view.covers(&file.path) && seen.insert(file.path.clone()))
             .collect();
-        super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
+        Some((store, uncovered))
     }
 
     /// Lists the files a reader sees now under the listing fence, the current
@@ -38682,7 +39148,7 @@ impl TableProvider for CayenneTableProvider {
         // collected. Gating this on `has_sort_columns()` instead is what made the
         // adaptive layout inert on every catalog-visible CDC deployment, since
         // inference fills `cayenne_sort_columns` on all of them.
-        if !self.context.has_cluster_by() && !self.context.sort_columns_are_authoritative() {
+        if !self.context.has_requested_layout() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -51791,6 +52257,76 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::no_layout(0, true)]
+    #[case::shard_key(1, false)]
+    #[case::cluster_by(2, false)]
+    #[case::user_sort(3, false)]
+    #[case::inferred_sort(4, true)]
+    #[tokio::test]
+    async fn test_bulk_load_shard_routing_respects_requested_layout(
+        #[case] layout: usize,
+        #[case] whole_batch: bool,
+    ) {
+        use crate::metadata::SortColumnsOrigin;
+        use crate::provider::delta_encoding::ShardRouting;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let configs = [
+            VortexConfig::default(),
+            VortexConfig {
+                shard_key_columns: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                cluster_by: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::User,
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::Inferred,
+                ..Default::default()
+            },
+        ];
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "bulk_routing",
+            Arc::clone(&schema),
+            configs[layout].clone(),
+            vec!["id".into()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let shard = provider
+            .write_shard_config(
+                4,
+                provider.context.target_file_size_bytes(),
+                None,
+                EncodeFanOut::Sized,
+                ShardRouting::WholeBatch,
+                None,
+            )
+            .expect("bulk load enables sharding");
+        let expected_key = if whole_batch {
+            vec![]
+        } else {
+            vec!["id".to_string()]
+        };
+        assert_eq!(
+            (
+                provider.routes_whole_batches(ShardRouting::WholeBatch),
+                provider.routes_whole_batches(ShardRouting::Key),
+                shard.shard_key_columns,
+            ),
+            (whole_batch, false, expected_key),
+        );
+    }
+
     #[tokio::test]
     async fn test_write_shard_format_keyed_hashes_by_primary_key() {
         let schema = Arc::new(Schema::new(vec![
@@ -55068,6 +55604,592 @@ mod tests {
         );
     }
 
+    /// A file-backed table with no primary key and no background compaction, for
+    /// the shared-listing tests. `inline_max_rows` decides whether small appends
+    /// land in the inline tier, leaving the snapshot's files unchanged.
+    async fn shared_listing_table(
+        name: &str,
+        inline_max_rows: usize,
+    ) -> (Arc<CayenneTableProvider>, SessionContext, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, temp_dir) = create_cayenne_table_with_config(
+            name,
+            schema,
+            VortexConfig {
+                inline_max_rows,
+                compaction_background_interval_ms: 0,
+                compaction_trigger_files: usize::MAX,
+                compaction_trigger_protected_snapshots: usize::MAX,
+                compaction_trigger_snapshot_age_ms: u64::MAX,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        (provider, ctx, temp_dir)
+    }
+
+    /// [`shared_listing_table`] holding ids `0..100` (`value = id * 10 + 1`), at a
+    /// listing-cache epoch no publish or scan has listed yet, which a new scan
+    /// view keys to.
+    async fn unlisted_shared_listing_table(
+        name: &str,
+    ) -> (Arc<CayenneTableProvider>, SessionContext, tempfile::TempDir) {
+        let (provider, ctx, dir) = shared_listing_table(name, 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.drop_cached_snapshot_listing();
+        provider.notify_scan_input_change();
+        (provider, ctx, dir)
+    }
+
+    /// Replace the table's rows with ids `0..rows`, each with value `id * 10 + tag`,
+    /// through the `INSERT OVERWRITE` path a full refresh takes.
+    async fn overwrite_ids(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        rows: i64,
+        tag: i64,
+    ) {
+        let ids: Vec<i64> = (0..rows).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 10 + tag).collect();
+        let batch = id_value_batch(provider.table_schema(), &ids, &values);
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                    .expect("overwrite source"),
+                InsertOp::Overwrite,
+            )
+            .await
+            .expect("overwrite plan");
+        collect(plan, ctx.task_ctx())
+            .await
+            .expect("overwrite completes");
+    }
+
+    /// `SELECT value WHERE id = ?`.
+    async fn lookup_value(
+        provider: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+    ) -> Vec<i64> {
+        query_pk_i64(
+            Arc::clone(provider) as Arc<dyn TableProvider>,
+            ctx,
+            id,
+            "value",
+        )
+        .await
+    }
+
+    fn snapshot_listing_builds(provider: &CayenneTableProvider) -> u64 {
+        provider.test_listing.builds.load(Ordering::Relaxed)
+    }
+
+    fn shared_listing_requests(provider: &CayenneTableProvider) -> u64 {
+        provider
+            .test_listing
+            .shared_requests
+            .load(Ordering::Relaxed)
+    }
+
+    fn latest_scan_view(provider: &CayenneTableProvider) -> Arc<ScanView> {
+        Arc::clone(
+            &provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("a completed scan view")
+                .view,
+        )
+    }
+
+    /// The listing with statistics `view`'s scans share, if one was built.
+    fn shared_listing(view: &ScanView) -> Option<&Arc<Vec<PartitionedFile>>> {
+        view.raw
+            .warm_files
+            .with_statistics
+            .get()
+            .map(|listing| &listing.files)
+    }
+
+    /// Every file a listing returned lies in `snapshot_id`'s directory.
+    fn assert_listing_in_snapshot(files: &[PartitionedFile], snapshot_id: &str) {
+        assert!(!files.is_empty(), "the snapshot has files");
+        for file in files {
+            assert!(
+                file.object_meta.location.as_ref().contains(snapshot_id),
+                "{} is not a file of snapshot {snapshot_id}",
+                file.object_meta.location
+            );
+        }
+    }
+
+    /// Preparing the table after an overwrite (a full refresh) builds the new
+    /// snapshot's scan view and statistics listing: the scans that the refresh
+    /// lets through build neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_overwrite_needs_no_listing_build() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_overwrite", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        overwrite_ids(&ctx, &provider, 100, 2).await;
+        assert!(!provider.scan_view_is_prepared());
+        provider.prepare_scan_view_for_reads().await;
+        assert!(provider.scan_view_is_prepared());
+        let snapshot_id = provider.get_current_snapshot_id();
+
+        let view = latest_scan_view(&provider);
+        assert_eq!(view.raw.current_snapshot_id, snapshot_id);
+        let prepared = shared_listing(&view).expect("preparation built the new snapshot's listing");
+        assert_listing_in_snapshot(prepared, &snapshot_id);
+        let builds = snapshot_listing_builds(&provider);
+
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![72],
+            "the first lookup after the overwrite reads the new rows"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "the first scan after an overwrite must not build a listing"
+        );
+        assert!(
+            Arc::ptr_eq(&latest_scan_view(&provider), &view),
+            "the first scan after preparation must use the prepared view"
+        );
+    }
+
+    /// Preparing the table after an append (an `append` refresh) builds the
+    /// listing of the files it published, so the next scan builds none and still
+    /// sees the appended rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_append_needs_no_listing_build() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_append", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.prepare_scan_view_for_reads().await;
+        let before = latest_scan_view(&provider);
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(provider.table_schema(), &[5_000], &[42]),
+        )
+        .await;
+        provider.prepare_scan_view_for_reads().await;
+        let view = latest_scan_view(&provider);
+        assert!(
+            !Arc::ptr_eq(&view, &before),
+            "preparation built a scan view of the files the append published"
+        );
+        let prepared =
+            shared_listing(&view).expect("preparation built the listing of the appended files");
+        assert_eq!(prepared.len(), before.raw.warm_files.files.len() + 1);
+        let builds = snapshot_listing_builds(&provider);
+
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "the appended row"
+        );
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "and the rows before it"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "the first scan after an append must not build a listing"
+        );
+    }
+
+    /// A table that reuses scan views within a lag (read-only `changes`) is
+    /// prepared as it is now: preparing after an append must not publish the
+    /// pre-append view as the newest, which would hide the append from the
+    /// scans that follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preparing_a_lag_tolerant_table_does_not_hide_a_write() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (mut provider, _dir) = create_cayenne_table_with_config(
+            "shared_listing_lag",
+            Arc::clone(&schema),
+            VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        provider.scan_view_reuse = ScanViewReuse::WithinLag(Duration::from_secs(3_600));
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.prepare_scan_view_for_reads().await;
+
+        insert_batch_with_context(&ctx, &provider, id_value_batch(schema, &[5_000], &[42])).await;
+        provider.prepare_scan_view_for_reads().await;
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "a scan after preparation must see the append"
+        );
+    }
+
+    /// Listings that do not share a scan view — a protected snapshot's, an
+    /// internal read's, two views over the same files — still share each file's
+    /// statistics collection: concurrent cold listings read each footer once and
+    /// persist each file's statistics once, and later ones wait on the collection
+    /// already in flight rather than starting their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn listings_outside_a_scan_view_share_each_files_statistics() {
+        const LISTINGS: usize = 4;
+        const FILES: usize = 3;
+        let (provider, ctx, _dir) = shared_listing_table("per_file_statistics_sharing", 0).await;
+        for file in 0..FILES {
+            let start = i64::try_from(file).expect("file index") * 100;
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                id_value_batch_for_range(provider.table_schema(), start, 100),
+            )
+            .await;
+        }
+        // Cold: no persisted statistics and nothing cached, so every file goes
+        // to its footer.
+        provider
+            .catalog
+            .clear_snapshot_file_statistics(provider.table_id())
+            .await
+            .expect("clear persisted statistics");
+        provider.clear_scan_file_statistics_cache();
+        let before = provider.scan_file_statistics_counters();
+
+        // Hold the first footer collection until another listing has joined it.
+        let (entered, on_entered) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_file_statistics_publish_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered.send(());
+                let _ = released.await;
+            })
+        }));
+        let snapshot_id = provider.get_current_snapshot_id();
+        let listings: Vec<_> = (0..LISTINGS)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let state = ctx.state();
+                let snapshot_id = snapshot_id.clone();
+                tokio::spawn(async move {
+                    let url = ListingTableUrl::parse(CayenneTableProvider::snapshot_dir_url(
+                        &provider.table_metadata.path,
+                        &provider.table_metadata.table_id,
+                        &snapshot_id,
+                    ))
+                    .expect("snapshot URL");
+                    let options = CayenneTableProvider::create_listing_options(
+                        provider.context.file_format(),
+                        &provider.pk_deletion_strategy,
+                        state.config(),
+                    )
+                    .with_collect_stat(true);
+                    let schema = provider.table_schema();
+                    let listed = provider
+                        .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                            state: &state,
+                            table_url: &url,
+                            options: &options,
+                            partition_filters: &[],
+                            data_filters: &[],
+                            snapshot_id: &snapshot_id,
+                            limit: None,
+                            scan_schema: CayenneTableProvider::snapshot_scan_schema(
+                                &schema, &options,
+                            ),
+                            file_statistics_schema: schema,
+                            captured_files: None,
+                        })
+                        .await
+                        .expect("listing");
+                    let mut paths: Vec<String> = file_group_paths(&listed.file_groups)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    paths.sort();
+                    paths
+                })
+            })
+            .collect();
+        on_entered.await.expect("a footer collection started");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while provider.scan_file_statistics_counters().joined_in_flight
+                == before.joined_in_flight
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("another listing must join the held collection");
+        release.send(()).expect("the held collection is waiting");
+
+        let mut listed = Vec::new();
+        for listing in listings {
+            listed.push(listing.await.expect("listing task"));
+        }
+        assert_eq!(listed[0].len(), FILES, "every listing sees every file");
+        assert!(
+            listed.iter().all(|paths| paths == &listed[0]),
+            "every listing sees the same files"
+        );
+        let after = provider.scan_file_statistics_counters();
+        assert_eq!(
+            after.footer_reads - before.footer_reads,
+            u64::try_from(FILES).expect("file count"),
+            "{LISTINGS} concurrent cold listings must read each footer once: {after:?}"
+        );
+        assert_eq!(
+            after.persisted_upserts - before.persisted_upserts,
+            u64::try_from(FILES).expect("file count"),
+            "{LISTINGS} concurrent cold listings must persist each file's statistics once: {after:?}"
+        );
+        assert!(after.joined_in_flight > before.joined_in_flight);
+    }
+
+    /// Scans that reach a snapshot state nothing has listed yet wait on one shared
+    /// listing build instead of each building their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scans_share_one_listing_build() {
+        const SCANS: u64 = 8;
+        let (provider, ctx, _dir) =
+            unlisted_shared_listing_table("shared_listing_concurrent").await;
+        let builds = snapshot_listing_builds(&provider);
+        let requests = shared_listing_requests(&provider);
+
+        // Hold the first build until every scan has asked for the listing.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_post_snapshot_list_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = released.await;
+            })
+        }));
+        let scans: Vec<_> = (0..SCANS)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let ctx = ctx.clone();
+                tokio::spawn(async move { lookup_value(&provider, &ctx, 7).await })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while shared_listing_requests(&provider) - requests < SCANS {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "every scan must ask the shared listing for its files; {} of {SCANS} did",
+                shared_listing_requests(&provider) - requests
+            )
+        });
+        release.send(()).expect("the held build is waiting");
+        for scan in scans {
+            assert_eq!(scan.await.expect("scan task"), vec![71]);
+        }
+        assert_eq!(
+            snapshot_listing_builds(&provider) - builds,
+            1,
+            "{SCANS} concurrent scans of one view must build its listing once"
+        );
+    }
+
+    /// A failed listing build is not stored: the scan that hit it fails, and the
+    /// next scan of the same view builds the listing again and succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_listing_build_is_rebuilt_by_the_next_scan() {
+        let (provider, ctx, _dir) = unlisted_shared_listing_table("shared_listing_failure").await;
+        let builds = snapshot_listing_builds(&provider);
+
+        provider
+            .test_listing
+            .fail_next
+            .store(true, Ordering::Release);
+        let error = provider
+            .scan(&ctx.state(), None, &[col("id").eq(lit_i64(7))], None)
+            .await
+            .expect_err("the injected listing failure fails the scan");
+        assert!(
+            error
+                .to_string()
+                .contains("injected snapshot listing failure"),
+            "unexpected error: {error}"
+        );
+        let view = latest_scan_view(&provider);
+        assert!(
+            shared_listing(&view).is_none(),
+            "a failed listing must not be stored in the view"
+        );
+        assert!(provider.cached_snapshot_listing.load_full().is_none());
+
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
+        assert!(
+            Arc::ptr_eq(&latest_scan_view(&provider), &view),
+            "the retry scans the same view"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider) - builds,
+            1,
+            "the scan after a failure builds the listing once"
+        );
+        assert!(shared_listing(&view).is_some());
+    }
+
+    /// A listing whose build a listing-cache invalidation overtook still answers
+    /// the scan that built it, but is not stored for the view's later scans.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listing_overtaken_by_an_invalidation_is_not_stored() {
+        let (provider, ctx, _dir) = unlisted_shared_listing_table("shared_listing_overtaken").await;
+        let builds = snapshot_listing_builds(&provider);
+
+        let invalidating = Arc::clone(&provider);
+        *provider.test_post_snapshot_list_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                invalidating.drop_cached_snapshot_listing();
+            })
+        }));
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "the overtaken listing still answers its own scan"
+        );
+        assert_eq!(snapshot_listing_builds(&provider) - builds, 1);
+        assert!(
+            shared_listing(&latest_scan_view(&provider)).is_none(),
+            "a listing an invalidation overtook must not be stored in the view"
+        );
+        assert!(provider.cached_snapshot_listing.load_full().is_none());
+    }
+
+    /// A write that changes what a scan sees without changing the snapshot's files
+    /// — here an append into the inline tier, as a CDC write does — mints a new
+    /// scan view, which starts from the snapshot's existing listing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_view_of_unchanged_files_reuses_their_listing() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_carry", 50).await;
+        overwrite_ids(&ctx, &provider, 1_000, 1).await;
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
+        let before = latest_scan_view(&provider);
+        let listed = Arc::clone(shared_listing(&before).expect("the snapshot was listed"));
+        let builds = snapshot_listing_builds(&provider);
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(provider.table_schema(), &[5_000], &[42]),
+        )
+        .await;
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "the inline row"
+        );
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "and the snapshot's rows"
+        );
+        let after = latest_scan_view(&provider);
+        assert!(
+            !Arc::ptr_eq(&after, &before),
+            "the append must mint a new scan view"
+        );
+        assert_eq!(
+            after.raw.current_snapshot_id,
+            before.raw.current_snapshot_id
+        );
+        let reused = shared_listing(&after).expect("the new view's scans listed its files");
+        assert!(
+            Arc::ptr_eq(reused, &listed),
+            "the new view must reuse the snapshot's listing"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "a new view of unchanged files must not rebuild their listing"
+        );
+    }
+
+    /// A listing shared by a view, or built by an overwrite, never answers for a
+    /// different snapshot, directory generation, or listing-cache epoch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_listing_never_serves_another_snapshot_generation_or_epoch() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_identity", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
+        let first = latest_scan_view(&provider);
+        let first_snapshot = provider.get_current_snapshot_id();
+
+        // A new snapshot gets its own listing.
+        overwrite_ids(&ctx, &provider, 100, 2).await;
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![72]);
+        let second = latest_scan_view(&provider);
+        let second_snapshot = provider.get_current_snapshot_id();
+        assert_ne!(first_snapshot, second_snapshot);
+        assert_listing_in_snapshot(
+            shared_listing(&first).expect("first snapshot listed"),
+            &first_snapshot,
+        );
+        assert_listing_in_snapshot(
+            shared_listing(&second).expect("second snapshot listed"),
+            &second_snapshot,
+        );
+
+        // Invalidate the listing cache without anything else changing, so scans
+        // keep being served the same view. Its listing belongs to the previous
+        // epoch and must not answer them; each scan builds its own instead.
+        provider.drop_cached_snapshot_listing();
+        assert_scans_bypass_view_listing(&provider, &ctx, &second, "listing-cache epoch").await;
+        provider
+            .current_dir_generation
+            .fetch_add(1, Ordering::AcqRel);
+        assert_scans_bypass_view_listing(&provider, &ctx, &second, "directory generation").await;
+    }
+
+    /// Two scans each served `view`, whose `what` has moved since it was built,
+    /// read the right rows and each build their own listing rather than using
+    /// the view's.
+    async fn assert_scans_bypass_view_listing(
+        provider: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        view: &Arc<ScanView>,
+        what: &str,
+    ) {
+        for scan in 1..=2 {
+            let builds = snapshot_listing_builds(provider);
+            assert_eq!(lookup_value(provider, ctx, 7).await, vec![72]);
+            assert!(
+                Arc::ptr_eq(&latest_scan_view(provider), view),
+                "the scan is served the view whose {what} moved"
+            );
+            assert_eq!(
+                snapshot_listing_builds(provider) - builds,
+                1,
+                "scan {scan} after the {what} moved must not use the view's listing"
+            );
+        }
+    }
+
     /// `refresh_listing_table` can add files to the current snapshot without
     /// bumping `current_dir_generation` (position-based checkpoint, schema
     /// evolution). The snapshot listing cache must drop so the next PK lookup
@@ -55222,9 +56344,11 @@ mod tests {
             "warmup scan must populate the snapshot listing cache"
         );
         let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
-        // Force a LIST without bumping `listing_cache_epoch`, matching an
-        // in-flight listing that sampled the epoch before refresh.
-        provider.cached_snapshot_listing.store(None);
+        // Force a LIST: a new listing-cache epoch keys a new scan view with no
+        // listing yet. The refresh in the hook below moves the epoch again while
+        // that LIST is in flight, as a refresh does to a listing that sampled the
+        // epoch before it.
+        provider.drop_cached_snapshot_listing();
 
         let extra = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -74586,6 +75710,493 @@ mod tests {
             "an earlier abandoned checkout must not force every later restore to \
              discard its keyset, which rebuilds the whole keyset on every write"
         );
+    }
+
+    mod first_load_pk_filter;
+
+    /// A snapshot reader reclaims the directories a reload leaves unreferenced
+    /// without touching one a query still reads (spiceai/spiceai#14981). The
+    /// reader is built as the runtime builds it: export the writer's slice, copy
+    /// the referenced directories, import the slice, open a provider; a reload
+    /// repeats that over the replaced provider's pins.
+    mod snapshot_reader_reclaim {
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        /// A reader's metastore and data directory.
+        struct Reader {
+            _tmp: TempDir,
+            catalog: Arc<dyn MetadataCatalog>,
+            data_dir: PathBuf,
+        }
+
+        impl Reader {
+            async fn new() -> Self {
+                let tmp = tempfile::tempdir().expect("reader temp dir");
+                let metadata_dir = tmp.path().join("metadata");
+                std::fs::create_dir_all(&metadata_dir).expect("reader metadata dir");
+                let catalog = Arc::new(
+                    CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                        .expect("reader catalog"),
+                ) as Arc<dyn MetadataCatalog>;
+                catalog.init().await.expect("reader catalog initialized");
+                Self {
+                    data_dir: tmp.path().join("data"),
+                    _tmp: tmp,
+                    catalog,
+                }
+            }
+
+            /// Deliver the writer's current snapshot as an archive would: the
+            /// slice, and the directories it references, skipping existing files.
+            async fn replicate(&self, writer: &CayenneTableProvider) {
+                let writer_dir = Path::new(&writer.table_metadata.path);
+                let slice = writer
+                    .catalog
+                    .export_dataset_slice(&writer.table_metadata.table_name, writer_dir)
+                    .await
+                    .expect("export the writer's slice");
+                let mut referenced = writer.protected_snapshot_ids();
+                referenced.insert(writer.get_current_snapshot_id());
+                let writer_table_dir = writer_dir.join(&writer.table_metadata.table_id);
+                let reader_table_dir = self.data_dir.join(&writer.table_metadata.table_id);
+                for id in &referenced {
+                    let from = writer_table_dir.join(id);
+                    if from.is_dir() {
+                        copy_tree_skip_existing(&from, &reader_table_dir.join(id));
+                    }
+                }
+                self.catalog
+                    .import_dataset_slice(&slice, &self.data_dir)
+                    .await
+                    .expect("import the slice into the reader");
+            }
+
+            /// The initial provider, or a reload's replacement over the replaced
+            /// provider's pins.
+            async fn open(
+                &self,
+                table_name: &str,
+                ctx: &SessionContext,
+                replacing: Option<&CayenneTableProvider>,
+            ) -> CayenneTableProvider {
+                let mut builder =
+                    CayenneTableProviderBuilder::new(Arc::clone(&self.catalog), ctx.runtime_env());
+                if let Some(previous) = replacing {
+                    builder = builder.with_snapshot_dir_pins(previous.snapshot_dir_pins());
+                }
+                builder
+                    .open(table_name)
+                    .await
+                    .expect("open the reader's table")
+            }
+        }
+
+        fn copy_tree_skip_existing(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).expect("target dir");
+            for entry in std::fs::read_dir(from).expect("list source dir") {
+                let entry = entry.expect("source entry");
+                let target = to.join(entry.file_name());
+                if entry.file_type().expect("source entry type").is_dir() {
+                    copy_tree_skip_existing(&entry.path(), &target);
+                } else if !target.exists() {
+                    std::fs::copy(entry.path(), &target).expect("copy file");
+                }
+            }
+        }
+
+        /// The uuid-named snapshot directories under the table root, sorted.
+        fn snapshot_dirs(provider: &CayenneTableProvider) -> BTreeSet<String> {
+            let table_dir = provider.snapshot_dir_path_for("");
+            std::fs::read_dir(&table_dir)
+                .expect("list the table root")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| !name.starts_with('_'))
+                .collect()
+        }
+
+        /// Elapse the grace for every retired dir and listing, so a sweep judges
+        /// the pins alone.
+        fn elapse_grace(provider: &CayenneTableProvider) {
+            let past = Instant::now()
+                .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
+                .expect("the clock has run longer than two graces");
+            for at in provider.retired_snapshot_dirs.lock().values_mut() {
+                *at = past;
+            }
+            for at in provider.snapshot_last_listed.lock().values_mut() {
+                *at = past;
+            }
+        }
+
+        /// Plan a scan without executing it: the plan pins the dirs it will read.
+        async fn plan_scan(
+            ctx: &SessionContext,
+            provider: &CayenneTableProvider,
+        ) -> Arc<dyn ExecutionPlan> {
+            provider
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("plan the scan")
+        }
+
+        async fn id_value_pairs_of(
+            ctx: &SessionContext,
+            plan: Arc<dyn ExecutionPlan>,
+        ) -> Vec<(i64, i64)> {
+            let batches = collect(plan, ctx.task_ctx())
+                .await
+                .expect("execute the scan");
+            let mut pairs = collect_id_value_pairs_from_batches(&batches);
+            pairs.sort_unstable();
+            pairs
+        }
+
+        /// A `refresh_mode: full` writer: each overwrite publishes a new current
+        /// snapshot. Files, not inlined rows, so the snapshot has a directory.
+        async fn full_refresh_writer(
+            table_name: &str,
+            ctx: &SessionContext,
+        ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+            create_cdc_upsert_table_with_vortex_config(
+                table_name,
+                ctx.runtime_env(),
+                VortexConfig {
+                    inline_max_rows: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            )
+            .await
+        }
+
+        async fn overwrite(
+            ctx: &SessionContext,
+            writer: &CayenneTableProvider,
+            rows: &[(i64, i64)],
+        ) {
+            let schema = writer.table_schema();
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            let values: Vec<i64> = rows.iter().map(|(_, value)| *value).collect();
+            let source = MemorySourceConfig::try_new_exec(
+                &[vec![id_value_batch(Arc::clone(&schema), &ids, &values)]],
+                schema,
+                None,
+            )
+            .expect("overwrite source");
+            let plan = writer
+                .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(plan, ctx.task_ctx()).await.expect("overwrite");
+        }
+
+        /// Full refresh: each reload supersedes the previous current snapshot,
+        /// which the reader reclaims; the writer's directories are untouched.
+        #[tokio::test]
+        async fn a_reload_reclaims_the_superseded_current_snapshot() {
+            let table_name = "reader_reclaims_superseded_current";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                full_refresh_writer(table_name, &ctx).await;
+            overwrite(&ctx, &writer, &[(1, 10), (2, 20)]).await;
+            let first = writer.get_current_snapshot_id();
+
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+            let initial = reader.open(table_name, &ctx, None).await;
+            assert_eq!(snapshot_dirs(&initial), BTreeSet::from([first.clone()]));
+
+            overwrite(&ctx, &writer, &[(1, 11), (3, 30)]).await;
+            let second = writer.get_current_snapshot_id();
+            assert_ne!(
+                first, second,
+                "an overwrite publishes a new current snapshot"
+            );
+            reader.replicate(&writer).await;
+            let writer_dirs_before = snapshot_dirs(&writer);
+            let replacement = reader.open(table_name, &ctx, Some(&initial)).await;
+            assert_eq!(
+                snapshot_dirs(&replacement),
+                BTreeSet::from([first.clone(), second.clone()]),
+                "before the fix the superseded directory stays forever; this is the state a reload leaves"
+            );
+
+            assert_eq!(
+                replacement
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire"),
+                vec![first.clone()]
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            wait_until_removed(&replacement.snapshot_dir_path_for(&first)).await;
+            assert_eq!(
+                snapshot_dirs(&replacement),
+                BTreeSet::from([second.clone()])
+            );
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
+                vec![(1, 11), (3, 30)]
+            );
+            assert_eq!(
+                snapshot_dirs(&writer),
+                writer_dirs_before,
+                "the reader reclaims its own copy only; the writer's directories are its own sweep's business"
+            );
+        }
+
+        /// A query planned before the swap still reads the superseded snapshot
+        /// after it. The replacement sees its pin only through the handed-over
+        /// pins: it defers the directory until the query completes, then deletes.
+        #[tokio::test]
+        async fn a_reload_keeps_a_directory_a_query_on_the_replaced_instance_still_reads() {
+            let table_name = "reader_keeps_dir_under_query";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                full_refresh_writer(table_name, &ctx).await;
+            overwrite(&ctx, &writer, &[(1, 10), (2, 20)]).await;
+            let first = writer.get_current_snapshot_id();
+
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+            let initial = reader.open(table_name, &ctx, None).await;
+            // Planned against the first snapshot; no file opened yet.
+            let in_flight = plan_scan(&ctx, &initial).await;
+
+            overwrite(&ctx, &writer, &[(1, 11), (3, 30)]).await;
+            let second = writer.get_current_snapshot_id();
+            reader.replicate(&writer).await;
+            let replacement = reader.open(table_name, &ctx, Some(&initial)).await;
+            assert_eq!(
+                replacement
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire"),
+                vec![first.clone()]
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            // Still pinned: deferred, and the query reads every file it planned for.
+            assert!(
+                replacement
+                    .retired_snapshot_dirs
+                    .lock()
+                    .contains_key(&first),
+                "a pinned directory stays in the ledger"
+            );
+            assert_eq!(
+                id_value_pairs_of(&ctx, in_flight).await,
+                vec![(1, 10), (2, 20)],
+                "the query sees the snapshot it was planned against, in full"
+            );
+            // As after a swap, nothing holds the replaced instance; its cached scan
+            // view released the last pin.
+            drop(initial);
+            assert!(
+                !replacement.in_flight_scan_snapshot_ids().contains(&first),
+                "the completed query released its pin"
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            wait_until_removed(&replacement.snapshot_dir_path_for(&first)).await;
+            assert_eq!(snapshot_dirs(&replacement), BTreeSet::from([second]));
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
+                vec![(1, 11), (3, 30)]
+            );
+        }
+
+        /// CDC: the current snapshot never rotates and each checkpoint is a
+        /// protected snapshot newer than it. Once merged away they leave the
+        /// slice; the age sweep keeps them (newer than current), the ledger path
+        /// reclaims them and keeps the merged snapshot.
+        #[tokio::test]
+        async fn a_reload_reclaims_merged_away_protected_snapshots_the_age_sweep_keeps() {
+            let table_name = "reader_reclaims_merged_protected";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                three_unmerged_protected_snapshots(table_name, &ctx).await;
+            let current = writer.get_current_snapshot_id();
+            let checkpoints: BTreeSet<String> =
+                writer.protected_snapshot_ids().into_iter().collect();
+            assert_eq!(checkpoints.len(), 3);
+
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+            let initial = reader.open(table_name, &ctx, None).await;
+            assert_eq!(
+                initial
+                    .protected_snapshot_ids()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                checkpoints,
+                "the slice carries the protected snapshots"
+            );
+
+            assert!(
+                writer
+                    .compact_protected_snapshots_subset(usize::MAX)
+                    .await
+                    .expect("merge the protected snapshots"),
+                "precondition: the writer merges its three checkpoints"
+            );
+            let merged: BTreeSet<String> = writer.protected_snapshot_ids().into_iter().collect();
+            assert_eq!(merged.len(), 1);
+            assert_eq!(
+                writer.get_current_snapshot_id(),
+                current,
+                "current never rotates"
+            );
+            reader.replicate(&writer).await;
+            let replacement = reader.open(table_name, &ctx, Some(&initial)).await;
+            let mut expected_on_disk = checkpoints.clone();
+            expected_on_disk.extend(merged.iter().cloned());
+            expected_on_disk.insert(current.clone());
+            assert_eq!(snapshot_dirs(&replacement), expected_on_disk);
+
+            // The age sweep keeps them: newer than current.
+            replacement
+                .cleanup_old_snapshots_now_for_test(&current)
+                .await
+                .expect("age sweep");
+            assert_eq!(
+                snapshot_dirs(&replacement),
+                expected_on_disk,
+                "the uuid7-age sweep cannot reclaim a directory newer than the current snapshot"
+            );
+
+            assert_eq!(
+                replacement
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire")
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                checkpoints
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            for checkpoint in &checkpoints {
+                wait_until_removed(&replacement.snapshot_dir_path_for(checkpoint)).await;
+            }
+            let mut expected_after = merged;
+            expected_after.insert(current);
+            assert_eq!(snapshot_dirs(&replacement), expected_after);
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
+                vec![(0, 0), (1, 10), (2, 20)]
+            );
+        }
+
+        /// A restart over directories an earlier process leaked reclaims them;
+        /// reserved and foreign directories are left alone.
+        #[tokio::test]
+        async fn opening_over_a_leaked_directory_reclaims_it() {
+            let table_name = "reader_heals_leaked_dirs";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                full_refresh_writer(table_name, &ctx).await;
+            overwrite(&ctx, &writer, &[(1, 10)]).await;
+            let current = writer.get_current_snapshot_id();
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+
+            let table_dir = reader.data_dir.join(&writer.table_metadata.table_id);
+            let leaked = uuid::Uuid::now_v7().to_string();
+            std::fs::create_dir_all(table_dir.join(&leaked)).expect("leaked dir");
+            std::fs::write(table_dir.join(&leaked).join("stale.vortex"), b"stale")
+                .expect("stale file");
+            std::fs::create_dir_all(table_dir.join("_lookup_index").join("run"))
+                .expect("reserved dir");
+            std::fs::create_dir_all(table_dir.join("not-a-snapshot")).expect("foreign dir");
+
+            let provider = reader.open(table_name, &ctx, None).await;
+            assert_eq!(
+                provider
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire"),
+                vec![leaked.clone()]
+            );
+            elapse_grace(&provider);
+            provider.sweep_retired_snapshot_dirs();
+            wait_until_removed(&table_dir.join(&leaked)).await;
+            let mut remaining: Vec<String> = std::fs::read_dir(&table_dir)
+                .expect("list")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            remaining.sort();
+            let mut expected = vec![
+                current,
+                "_lookup_index".to_string(),
+                "not-a-snapshot".to_string(),
+            ];
+            expected.sort();
+            assert_eq!(remaining, expected);
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &provider).await).await,
+                vec![(1, 10)]
+            );
+        }
+
+        #[test]
+        fn unreferenced_snapshot_dir_ids_keeps_live_reserved_and_foreign_entries() {
+            let current = uuid::Uuid::now_v7().to_string();
+            let protected = uuid::Uuid::now_v7().to_string();
+            let stale_a = uuid::Uuid::now_v7().to_string();
+            let stale_b = uuid::Uuid::now_v7().to_string();
+            let live = HashSet::from([current.clone(), protected.clone()]);
+            let on_disk = vec![
+                stale_b.clone(),
+                "_staging".to_string(),
+                current,
+                "notes".to_string(),
+                stale_a.clone(),
+                protected,
+                "_lookup_index".to_string(),
+            ];
+            let mut expected = vec![stale_a, stale_b];
+            expected.sort();
+            assert_eq!(
+                CayenneTableProvider::unreferenced_snapshot_dir_ids(on_disk, &live),
+                expected
+            );
+        }
+
+        #[test]
+        fn snapshot_dir_holding_names_the_first_component_below_the_table_root() {
+            let table_dir = Path::new("/data/t/tid");
+            assert_eq!(
+                CayenneTableProvider::snapshot_dir_holding(
+                    table_dir,
+                    "/data/t/tid/snap/deletions/d.arrow"
+                ),
+                Some("snap".to_string())
+            );
+            assert_eq!(
+                CayenneTableProvider::snapshot_dir_holding(
+                    table_dir,
+                    "/data/t/snap/deletions/d.arrow"
+                ),
+                None,
+                "a deletion file beside the table root is in no snapshot directory under it"
+            );
+        }
     }
 
     mod layered_upsert_state;

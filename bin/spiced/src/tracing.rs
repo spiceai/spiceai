@@ -101,7 +101,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry=warn,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn,text_embeddings_backend_candle=error";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn,text_embeddings_backend_candle=error,rmcp::service=error";
 
 fn specific_env_filter(filter: &str) -> String {
     format!("{OFF_FILTERS},{filter}")

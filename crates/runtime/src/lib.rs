@@ -655,26 +655,16 @@ pub struct LogErrors(pub bool);
 
 /// State of the initial [`Runtime::load_components`] pass.
 ///
-/// The load has no deadline: `load_dataset` retries a transient failure for as
-/// long as the runtime is up, so a spicepod the runtime cannot satisfy — an
-/// unreachable source, a `${ secrets:… }` reference nothing resolves — leaves
-/// the load running indefinitely. A caller holding the configuration that fixes
-/// that (Spice Cloud Connect applying a deployment) needs to supersede the load
-/// rather than race it: a load left running keeps registering datasets from the
-/// app it started against, after a new app has replaced it.
-///
 /// `in_flight` starts `true` — a load is pending from the moment the runtime
-/// exists — so a supersede that lands before the load begins still stops it,
-/// and `load_components` returns without starting.
+/// exists — and turns `false` once the load is over, however it ends. See
+/// [`Runtime::initial_load_in_flight`].
 struct InitialLoad {
-    cancel: CancellationToken,
     in_flight: AtomicBool,
 }
 
 impl Default for InitialLoad {
     fn default() -> Self {
         Self {
-            cancel: CancellationToken::new(),
             in_flight: AtomicBool::new(true),
         }
     }
@@ -696,9 +686,9 @@ pub struct Runtime {
     /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
-    /// State of the process's one-time initial component load, so a caller that
-    /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
-    /// Shared, not copied, so every clone of the runtime supersedes the same load.
+    /// State of the process's one-time initial component load. See
+    /// [`Runtime::initial_load_in_flight`]. Shared, not copied, so every clone of
+    /// the runtime reports the same load.
     initial_load: Arc<InitialLoad>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
@@ -707,7 +697,7 @@ pub struct Runtime {
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
     /// LLM-as-reranker usage is needed — chat models are resolved from
-    /// `completion_llms` as a fallback.
+    /// `completion_llms`, then evaluation models from `evaluate_models`, as fallbacks.
     rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
@@ -1924,32 +1914,6 @@ impl Runtime {
         }
     }
 
-    /// Abandon the initial component load.
-    ///
-    /// The load has no deadline — `load_dataset` retries a transient failure for
-    /// as long as the runtime is up — so a process that is on its way out (a
-    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
-    /// stop it: left running it keeps registering datasets from the
-    /// configuration being replaced, for the whole of the shutdown drain.
-    ///
-    /// Returns `true` only when this call is the one that stopped a pending or
-    /// running load, and `false` once the load has finished or was already
-    /// superseded.
-    ///
-    /// Components already registered when this fires stay registered; only the
-    /// load's remaining work is dropped.
-    pub fn supersede_initial_load(&self) -> bool {
-        if self.initial_load.in_flight.swap(false, Ordering::SeqCst) {
-            tracing::info!(
-                "Superseding the initial component load: a new configuration replaces the one being loaded"
-            );
-            self.initial_load.cancel.cancel();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Whether the initial component load is still running.
     ///
     /// While it is, what is registered is not yet what the loaded app describes,
@@ -1997,18 +1961,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    ///
-    /// [`Runtime::supersede_initial_load`] abandons the load — including before
-    /// it starts, in which case this returns immediately and the superseding
-    /// caller loads the app it applied.
     pub async fn load_components(self: Arc<Self>) {
-        if self.initial_load.cancel.is_cancelled() {
-            tracing::info!(
-                "Skipping the initial component load: it was superseded before it started"
-            );
-            return;
-        }
-
         self.secrets_preflight().await;
 
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
@@ -2097,8 +2050,7 @@ impl Runtime {
         let components = vec![task_history, datasets, catalogs, models];
 
         // Signal that the load must be canceled if the runtime is shut down before the components are loaded.
-        // A child of the initial-load token so `supersede_initial_load` abandons the load through this same path.
-        let cancel_loading = self.initial_load.cancel.child_token();
+        let cancel_loading = CancellationToken::new();
 
         // Wait for all components to load returning the first error
         // or canceling spawned tokio tasks if the runtime is shutting down
@@ -2129,8 +2081,7 @@ impl Runtime {
 
         let load_outcome = load_result.await;
 
-        // The initial load is over — completed, failed, or cancelled — so a
-        // later deployment has nothing left to supersede and applies normally.
+        // The initial load is over — completed, failed, or cancelled.
         self.initial_load.in_flight.store(false, Ordering::SeqCst);
 
         if let Err(err) = load_outcome {

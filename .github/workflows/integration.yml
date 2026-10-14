@@ -260,7 +260,9 @@ jobs:
           # gate sits inside an `any(...)` that `postgres`/`duckdb`/`sqlite` already satisfy.
           # `turso` alongside `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the
           # combination `make test-integration` runs.
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb,turso"
+          # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
+          # are gated on it and run nowhere else.
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb,turso"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -280,7 +282,7 @@ jobs:
           archive all_targets cargo nextest archive ${PKGS} \
             --test integration --test retention_oom --test integration_aws_sdk \
             --test integration_snapshot_refresh --test credential_provider \
-            --test partition_table_provider --test hadoop_catalog_test \
+            --test partition_table_provider \
             --features ${FEAT} --archive-file integration_tests.tar.zst
 
           echo "--- archive size ---"
@@ -309,7 +311,7 @@ jobs:
 
       - name: Upload test archive (artifact fallback)
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive
           path: ./integration_tests.tar.zst
@@ -388,7 +390,7 @@ jobs:
 
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -537,7 +539,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
@@ -595,7 +597,7 @@ jobs:
 
       - name: Download test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -847,7 +849,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -935,7 +937,7 @@ jobs:
 
       - name: Download GitHub test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -974,7 +976,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub permission diagnostics
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: github-api-permissions
           path: github-api-results/
@@ -997,7 +999,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-snapshots-part-github
           path: integration-snapshots-part-github.tar.gz
@@ -1041,7 +1043,7 @@ jobs:
 
       - name: Download AWS SDK test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -1104,7 +1106,7 @@ jobs:
 
       - name: Download AWS SDK credential bridge test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -1170,7 +1172,7 @@ jobs:
 
       - name: Download snapshot refresh test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -1232,7 +1234,7 @@ jobs:
 
       - name: Download data components test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -1246,7 +1248,7 @@ jobs:
           MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::hadoop_catalog_test)'
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
     name: Partition Table Integration Tests
@@ -1284,7 +1286,7 @@ jobs:
 
       - name: Download partition table test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests

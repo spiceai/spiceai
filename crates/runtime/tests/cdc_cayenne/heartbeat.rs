@@ -31,15 +31,9 @@ limitations under the License.
 //! source slot advances only when a real durability event covers the RAM
 //! tier, never because a heartbeat arrived.
 
-#![cfg(not(windows))]
-#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
-// Accelerator engines are their own crates and self-register through a linkme slice. Each
-// integration test is a separate binary that links independently, and the linker drops an
-// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
-use accelerator_cayenne as _;
+use super::make_refresh_task;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -55,7 +49,6 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, CommitChange, CommitError, StreamError, build_heartbeat_envelope,
     changes_schema, now_unix_ms,
 };
-use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
@@ -65,11 +58,7 @@ use datafusion_table_providers::util::{
 use futures::StreamExt;
 use runtime::accelerated::refresh::Refresh;
 use runtime::accelerated::refresh_completion::RefreshCompletion;
-use runtime::accelerated::refresh_task::RefreshTaskBuilder;
-use runtime::federated::FederatedTable;
-use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
-use tokio::runtime::Handle;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 /// All-nullable data schema, matching what CDC sources produce (and what the
@@ -187,23 +176,6 @@ async fn setup_memory_mode_cayenne(table_name: &str) -> (TempDir, Arc<CayenneTab
     (temp, Arc::new(table))
 }
 
-fn make_refresh_task(
-    accelerator: Arc<dyn TableProvider>,
-    table_name: &str,
-) -> runtime::accelerated::refresh_task::RefreshTask {
-    let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-    RefreshTaskBuilder::new(
-        RuntimeStatus::new(),
-        TableReference::bare(table_name),
-        federated,
-        None,
-        accelerator,
-        Handle::current(),
-        Arc::new(tokio::sync::Mutex::new(())),
-    )
-    .build()
-}
-
 /// Count the rows currently visible via `TableProvider::scan`.
 async fn count_rows(provider: &Arc<CayenneTableProvider>) -> usize {
     let ctx = SessionContext::new();
@@ -241,7 +213,8 @@ async fn heartbeat_must_not_force_mem_tier_checkpoint_or_ack_deferred_commits() 
     let task = make_refresh_task(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "cdc_heartbeat_no_checkpoint",
-    );
+    )
+    .await;
 
     let commits: Arc<TokioMutex<Vec<i64>>> = Arc::new(TokioMutex::new(Vec::new()));
     let initial_load = Arc::new(AtomicBool::new(false));
