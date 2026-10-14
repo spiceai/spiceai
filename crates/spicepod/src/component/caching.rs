@@ -250,20 +250,11 @@ pub struct SQLResultsCacheConfig {
     /// compatibility. See <https://spiceai.org/docs/features/caching>.
     #[serde(default)]
     pub engine: CacheEngine,
-    /// Maximum age for serving stale cached results while revalidating in the background.
-    /// When set, cached results past their TTL (but within this additional window) will be
-    /// served immediately while a background refresh is triggered.
-    ///
-    /// Setting this also changes what an accelerated refresh (or DML) does to the cached
-    /// results that read the affected dataset: instead of evicting them, it marks them stale
-    /// as of the refresh, and this window then runs from that instant. Requests arriving
-    /// inside it are served the previous result while a single background revalidation
-    /// replaces the entry, rather than every dependent result becoming a synchronous miss on
-    /// the same refresh tick; if that revalidation does not land, the previous result keeps
-    /// being served until the window closes. An entry is still dropped
-    /// `item_ttl` + `stale_while_revalidate_ttl` after it was stored, so a refresh late in an
-    /// entry's life may leave less than the full window. Leaving this unset keeps a refresh a
-    /// hard invalidation.
+    /// Entries past `item_ttl` and within this extra window are served stale
+    /// while one background revalidation replaces them. Age counts from when
+    /// the query that produced the entry started. Accelerated refreshes do not
+    /// invalidate cached results; results reflect a refresh once they age past
+    /// `item_ttl` and revalidation completes.
     ///
     /// Format: duration string (e.g., "30s", "5m"). This is a response directive.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -485,8 +485,7 @@ name = "rate_control"
 path = "tests/rate_control.rs"
 required-features = ["rate-control"]
 
-# Installs the process-wide OpenTelemetry meter provider before any instrument
-# binds to it.
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
 [[test]]
 name = "metrics"
 path = "tests/metrics.rs"
