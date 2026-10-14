@@ -14,7 +14,9 @@ anyhow.workspace = true
 arrow.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 chrono.workspace = true
-sqlparser.workspace = true
+# `visitor` for the ORDER BY walk in `sort_order`; declared here rather than
+# relied on through another crate's feature selection.
+sqlparser = { workspace = true, features = ["visitor"] }
 
 [dev-dependencies]
 rstest = "0.26.1"

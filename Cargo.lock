@@ -975,7 +975,7 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "criterion 0.7.0",
- "datafusion",
+ "datafusion-common",
  "flatbuffers",
  "insta",
  "serde_json",
