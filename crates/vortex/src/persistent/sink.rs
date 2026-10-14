@@ -3903,14 +3903,14 @@ mod tests {
         Ok(())
     }
 
-    fn two_col_schema() -> SchemaRef {
+    fn nullable_pair_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, true),
             Field::new("b", DataType::Int64, true),
         ]))
     }
 
-    fn two_col_batch(schema: &SchemaRef, rows: &[(Option<i64>, Option<i64>)]) -> RecordBatch {
+    fn nullable_pair_batch(schema: &SchemaRef, rows: &[(Option<i64>, Option<i64>)]) -> RecordBatch {
         RecordBatch::try_new(
             Arc::clone(schema),
             vec![
@@ -3947,18 +3947,18 @@ mod tests {
     /// NULLs first in each.
     #[test]
     fn run_sorter_orders_a_run_by_every_key_column() -> anyhow::Result<()> {
-        let schema = two_col_schema();
+        let schema = nullable_pair_schema();
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let mut sorter = RunSorter::new(
             vec![Arc::new(Column::new("a", 0)), Arc::new(Column::new("b", 1))],
             u64::MAX,
             MemoryConsumer::new("test run sort").register(&pool),
         );
-        sorter.push(two_col_batch(
+        sorter.push(nullable_pair_batch(
             &schema,
             &[(Some(1), Some(5)), (Some(0), None), (Some(1), None)],
         ))?;
-        sorter.push(two_col_batch(
+        sorter.push(nullable_pair_batch(
             &schema,
             &[(Some(0), Some(3)), (Some(1), Some(2)), (None, Some(9))],
         ))?;
@@ -3986,7 +3986,7 @@ mod tests {
     #[tokio::test]
     async fn test_sharding_with_run_sort_orders_each_shard_by_its_whole_key() -> anyhow::Result<()>
     {
-        let schema = two_col_schema();
+        let schema = nullable_pair_schema();
         // (a, b) for a in 0..4 and b in 0..250, in a scrambled arrival order.
         let rows: Vec<(Option<i64>, Option<i64>)> = (0..1000_i64)
             .map(|i| (i * 7919) % 1000)
@@ -4014,7 +4014,7 @@ mod tests {
             let ctx = TestSessionContext::default();
             let batches: Vec<RecordBatch> = rows
                 .chunks(100)
-                .map(|chunk| two_col_batch(&schema, chunk))
+                .map(|chunk| nullable_pair_batch(&schema, chunk))
                 .collect();
             let results = run_sharded_write(
                 ctx.store.clone(),
