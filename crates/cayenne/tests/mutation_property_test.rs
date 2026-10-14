@@ -137,6 +137,20 @@ enum Mode {
     Key,
     /// Explicit `deletion_mode: position` (merge-on-read position deletes).
     Position,
+    /// The default `deletion_mode: auto`, with the default target file size: these
+    /// tables stay inside its position-delete bound, so the whole run is on
+    /// position deletes, reclaimed by whole-table rewrites that race the writers
+    /// (the reclaim trigger is two tombstones). `run_workload` checks it never left
+    /// position deletes.
+    Auto,
+    /// `deletion_mode: auto` with a 1 MiB target file size, a 32 KiB bound that
+    /// every run is meant to cross under live writers: position deletes and
+    /// whole-table reclaims first, then key deletes and the reclaims of rows the
+    /// bake cannot reach. Non-vacuity of that crossing is pinned by
+    /// `prop_auto_crossing_observes_position_then_key_switch_impl`: the random
+    /// walks alone would still pass if adaptive sizing regressed and stayed on
+    /// position deletes.
+    AutoCrossing,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +270,17 @@ fn config(
         },
         Mode::Position => VortexConfig {
             deletion_mode: DeletionMode::Position,
+            ..base
+        },
+        Mode::Auto => VortexConfig {
+            deletion_mode: DeletionMode::Auto,
+            target_vortex_file_size_mb: VortexConfig::default().target_vortex_file_size_mb,
+            bake_deletion_index_trigger: 2,
+            ..base
+        },
+        Mode::AutoCrossing => VortexConfig {
+            deletion_mode: DeletionMode::Auto,
+            bake_deletion_index_trigger: 2,
             ..base
         },
     }
@@ -802,7 +827,9 @@ fn apply_model(model: &mut Model, op: &Op) {
 // Harness
 // ============================================================================
 
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+/// Returns whether the table was seen on key deletes after it opened on position
+/// deletes (see [`Mode::Auto`]).
+async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -813,6 +840,14 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.cold,
     )
     .await?;
+    if matches!(w.mode, Mode::AutoCrossing) {
+        assert!(
+            table.should_capture_positions(),
+            "AutoCrossing non-vacuity: a fresh auto table must start on position deletes (seed={seed})"
+        );
+    }
+    let opened_on_positions = table.should_capture_positions();
+    let mut left_positions = false;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
@@ -846,6 +881,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     table.checkpoint_mem_tier().await?;
                 }
                 table.drain_in_flight_maintenance().await?;
+                left_positions |= opened_on_positions && !table.should_capture_positions();
                 let (t, c) = reopen_table(fixture, &name).await?;
                 table = t;
                 ctx = c;
@@ -889,6 +925,7 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // before reopening from the catalog (see the loop's Op::Restart).
     settle(&table, w.durability).await?;
     table.drain_in_flight_maintenance().await?;
+    left_positions |= opened_on_positions && !table.should_capture_positions();
     let (t, c) = reopen_table(fixture, &name).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
@@ -897,10 +934,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&final_state, &model, &msg);
     verify_aggregate_queries(&c, t.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(())
+    Ok(left_positions)
 }
 
-async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+/// Returns whether the table was seen on key deletes after it opened on position
+/// deletes (see [`Mode::Auto`]).
+async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (table0, ctx0) = create_table(
         fixture,
@@ -911,6 +950,14 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.cold,
     )
     .await?;
+    if matches!(w.mode, Mode::AutoCrossing) {
+        assert!(
+            table0.should_capture_positions(),
+            "AutoCrossing non-vacuity: a fresh auto table must start on position deletes (seed={seed})"
+        );
+    }
+    let opened_on_positions = table0.should_capture_positions();
+    let mut left_positions = false;
     let mut rng = Rng::new(seed);
 
     for start in (0..w.population).step_by(20) {
@@ -1006,6 +1053,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     guard.checkpoint_mem_tier().await?;
                 }
                 guard.drain_in_flight_maintenance().await?;
+                left_positions |= opened_on_positions && !guard.should_capture_positions();
                 let (nt, nc) = reopen_table(fixture, &name).await?;
                 if w.durability == Durability::Memory {
                     nt.install_slot_advancer(Arc::new(NoopSlotAdvancer));
@@ -1040,6 +1088,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // Quiesce before the final assertion so no detached compaction from this (or
     // an earlier, since-replaced) instance commits mid-read.
     table.drain_in_flight_maintenance().await?;
+    left_positions |= opened_on_positions && !table.should_capture_positions();
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(
@@ -1048,15 +1097,24 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&live, &model, &msg);
     verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(())
+    Ok(left_positions)
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
-        match w.concurrency {
+        let left_positions = match w.concurrency {
             Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
             Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
-        }
+        };
+        seeds_that_left_positions += usize::from(left_positions);
+    }
+    match w.mode {
+        Mode::Auto => assert_eq!(
+            seeds_that_left_positions, 0,
+            "Auto non-vacuity: a table inside its bound must stay on position deletes"
+        ),
+        Mode::Key | Mode::Position | Mode::AutoCrossing => {}
     }
     Ok(())
 }
@@ -1360,6 +1418,77 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
 }
 test_with_backends!(prop_harness_stack_headroom_impl);
 
+// --- AutoCrossing non-vacuity (mode transition, not only model convergence) ---
+//
+// SplitMix64 of the key — values that do not compress, so listed bytes track
+// row count (same recipe as the unit tests in `auto_deletion_mode.rs`).
+fn incompressible_value(id: i64) -> i64 {
+    let mut z = u64::from_ne_bytes(id.to_ne_bytes()).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    i64::from_ne_bytes((z ^ (z >> 31)).to_ne_bytes())
+}
+
+/// Observe position mode before growth and key mode afterward on an
+/// `AutoCrossing` table. The random `AutoCrossing` walks would still pass if
+/// adaptive sizing regressed and never left position deletes; this pins the
+/// transition through `should_capture_positions` and listed bytes.
+async fn prop_auto_crossing_observes_position_then_key_switch_impl(
+    f: TestFixture,
+) -> TestResult<()> {
+    // `AutoCrossing`'s bound: its 1 MiB target file size / 32.
+    const BOUND: u64 = 32 * 1024;
+    let name = "auto_crossing_mode_switch";
+    let (table, _ctx) =
+        create_table(&f, name, Mode::AutoCrossing, Durability::File, None, false).await?;
+
+    assert!(
+        table.should_capture_positions(),
+        "AutoCrossing non-vacuity: empty auto table must start on position deletes"
+    );
+
+    // Seed a few keys, then upsert them so the deletion index is past the
+    // reclaim trigger (2) before the size-driven switch.
+    let seed: Vec<(i64, i64)> = (0..16).map(|id| (id, 100)).collect();
+    upsert(&table, &seed, Durability::File).await?;
+    let upserted: Vec<(i64, i64)> = (0..8).map(|id| (id, 200)).collect();
+    upsert(&table, &upserted, Durability::File).await?;
+    table.flush_pending_maintenance().await?;
+
+    // Grow past the bound.
+    let grow: Vec<(i64, i64)> = (1_000..61_000)
+        .map(|id| (id, incompressible_value(id)))
+        .collect();
+    for chunk in grow.chunks(8_000) {
+        upsert(&table, chunk, Durability::File).await?;
+    }
+    table.flush_pending_maintenance().await?;
+
+    let bytes = table.warm_listed_bytes().await?;
+    assert!(
+        bytes > BOUND,
+        "AutoCrossing non-vacuity premise: grown table ({bytes} B) must exceed the {BOUND} B bound"
+    );
+
+    // Growth + flush may already have requested/run the switch; if not, the
+    // reclaim pass under compaction_lock does it (same path as production).
+    if table.should_capture_positions() {
+        assert!(
+            table
+                .compact_current_snapshot_small_files()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+            "AutoCrossing non-vacuity: reclaim pass must run after growth past the bound"
+        );
+    }
+    assert!(
+        !table.should_capture_positions(),
+        "AutoCrossing non-vacuity: after growth past the bound the table must be on key deletes"
+    );
+    Ok(())
+}
+test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
+
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::Key)).await
@@ -1367,8 +1496,16 @@ async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::Position)).await
 }
+async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::Auto)).await
+}
+async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::AutoCrossing)).await
+}
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
+test_with_backends!(prop_sequential_auto_impl);
+test_with_backends!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1507,7 +1644,7 @@ async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
 // cause instead of surfacing as a rare seed-dependent walk failure. Run in both
 // deletion modes, which take different prune paths (key index vs position).
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
-    for mode in [Mode::Key, Mode::Position] {
+    for mode in [Mode::Key, Mode::Position, Mode::Auto, Mode::AutoCrossing] {
         let name = format!("reupsert_min_{mode:?}");
         let (table, ctx) = create_table(&f, &name, mode, Durability::File, None, false).await?;
 
@@ -1611,6 +1748,58 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
+// The same concurrent stresses on the default `deletion_mode: auto`: whole-table
+// reclaims that run alongside the writers, and (crossing) the switch to key
+// deletes under them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_upsert_only(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::AutoCrossing))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::AutoCrossing, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
 // ============================================================================
 // Snapshot-isolation under concurrent reads (overwrite torn-publish class)
 // ============================================================================
@@ -1708,6 +1897,14 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestR
 async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_reads_mode(&f, Mode::Auto).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })

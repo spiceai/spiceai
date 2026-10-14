@@ -144,7 +144,7 @@ pub async fn list_snapshots(
     // Create a snapshot manager to query the metadata
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.snapshots.clone(),
+        readable_app.effective_snapshots(),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -240,7 +240,7 @@ pub async fn get_snapshot(
 
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.snapshots.clone(),
+        readable_app.effective_snapshots(),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -342,7 +342,7 @@ pub async fn set_current_snapshot(
 
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.snapshots.clone(),
+        readable_app.effective_snapshots(),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),

@@ -131,36 +131,39 @@ impl IcebergCatalogProvider {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
 
-        let schema_names: Vec<_> = match client.list_namespaces(root_namespace).await {
-            Ok(namespaces) => namespaces
-                .iter()
-                .flat_map(|ns| ns.as_ref().clone())
-                .collect(),
-            Err(e) => match e.kind() {
-                iceberg::ErrorKind::DataInvalid => {
-                    // Unfortunately, there isn't a better way to handle this
-                    let err_msg = e.to_string();
+        // Keep each child namespace as a full `NamespaceIdent`. A REST catalog
+        // returns children of `root_namespace` as multi-level identifiers (e.g.
+        // `["spice", "public"]`); splitting them into single-level identifiers
+        // would list tables under `/v1/namespaces/public` instead of
+        // `/v1/namespaces/spice%1Fpublic`.
+        let child_namespaces: Vec<NamespaceIdent> =
+            match client.list_namespaces(root_namespace).await {
+                Ok(namespaces) => namespaces,
+                Err(e) => match e.kind() {
+                    iceberg::ErrorKind::DataInvalid => {
+                        // Unfortunately, there isn't a better way to handle this
+                        let err_msg = e.to_string();
 
-                    if let Some(namespace) = root_namespace
-                        && (err_msg.contains("NoSuchNamespaceException")
-                            || err_msg.contains("Namespace does not exist"))
-                    {
-                        return Err(Error::NamespaceDoesNotExist {
-                            namespace: namespace.join("."),
-                        });
+                        if let Some(namespace) = root_namespace
+                            && (err_msg.contains("NoSuchNamespaceException")
+                                || err_msg.contains("Namespace does not exist"))
+                        {
+                            return Err(Error::NamespaceDoesNotExist {
+                                namespace: namespace.join("."),
+                            });
+                        }
+
+                        return Err(handle_iceberg_error(e));
                     }
+                    _ => return Err(handle_iceberg_error(e)),
+                },
+            };
 
-                    return Err(handle_iceberg_error(e));
-                }
-                _ => return Err(handle_iceberg_error(e)),
-            },
-        };
-
-        let providers = try_join_all(schema_names.iter().map(|name| {
+        let providers = try_join_all(child_namespaces.iter().map(|namespace| {
             let semaphore_clone = Arc::clone(&load_semaphore);
             IcebergSchemaProvider::try_new(
                 Arc::clone(&client),
-                NamespaceIdent::new(name.clone()),
+                namespace.clone(),
                 semaphore_clone,
                 selector,
                 table_wrapper.cloned(),
@@ -168,8 +171,9 @@ impl IcebergCatalogProvider {
         }))
         .await?;
 
-        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
-            .into_iter()
+        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = child_namespaces
+            .iter()
+            .map(schema_name_for_namespace)
             .zip(providers)
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
@@ -179,6 +183,11 @@ impl IcebergCatalogProvider {
 
         Ok(schemas)
     }
+}
+
+/// The schema name a child namespace is registered under: its last level.
+fn schema_name_for_namespace(namespace: &NamespaceIdent) -> String {
+    namespace.as_ref().last().cloned().unwrap_or_default()
 }
 
 impl CatalogProvider for IcebergCatalogProvider {
@@ -541,6 +550,72 @@ mod tests {
     use iceberg::{CatalogBuilder, TableCreation};
 
     use super::*;
+
+    /// A spec-compliant REST catalog lists the children of `spice` as full
+    /// multi-level identifiers. Tables must be listed under the encoded full
+    /// identifier (`spice%1Fpublic`), not under the last level alone, and the
+    /// schema is registered under that last level.
+    #[tokio::test]
+    async fn load_schemas_keeps_nested_child_namespace() {
+        use iceberg::io::LocalFsStorageFactory;
+        use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"defaults": {}, "overrides": {}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces"))
+            .and(query_param("parent", "spice"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"namespaces": [["spice", "public"]]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/v1/namespaces/spice(%1F|%1f|\x1f)public/tables$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"identifiers": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Anything else (e.g. `/v1/namespaces/public/tables`) falls through to
+        // wiremock's default 404, which surfaces as an error.
+
+        let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "rest",
+                HashMap::from([(REST_CATALOG_PROP_URI.to_string(), server.uri())]),
+            )
+            .await
+            .expect("load REST catalog");
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+
+        let root = NamespaceIdent::new("spice".to_string());
+        let schemas = IcebergCatalogProvider::load_schemas(
+            catalog,
+            Some(&root),
+            &TableSelector::new(None, None),
+            None,
+        )
+        .await
+        .expect("nested child namespace loads");
+
+        let names: Vec<_> = schemas.keys().cloned().collect();
+        assert_eq!(names, vec!["public".to_string()]);
+    }
 
     const NAMESPACE: &str = "guard_ns";
     const TABLE: &str = "pinned";
