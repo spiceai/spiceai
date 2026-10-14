@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+        Array, AsArray, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
         Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array,
         Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
         StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -486,6 +486,27 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                 )
             }
         },
+
+        // Both sides are typed alike by the time they are compared, so Arrow's
+        // own rendering of these is the same for equal values.
+        DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_) => {
+            Ok(Some(arrow::util::display::array_value_to_string(array, index)?))
+        }
+
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            let values = match array.data_type() {
+                DataType::List(_) => array.as_list::<i32>().value(index),
+                DataType::LargeList(_) => array.as_list::<i64>().value(index),
+                _ => array.as_fixed_size_list().value(index),
+            };
+            let elements = (0..values.len())
+                .map(|i| {
+                    Ok(array_value_to_string(values.as_ref(), i)?
+                        .map_or_else(|| "NULL".to_string(), |v| format!("{v:?}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(format!("[{}]", elements.join(", "))))
+        }
 
         dt => Err(anyhow::anyhow!(
             "Unsupported data type for validation: {dt:?}",
