@@ -93,10 +93,21 @@ pub struct SearchRequest {
     pub keywords: Vec<String>,
 }
 
+/// Rejects empty or whitespace-only search text for every consumer of
+/// [`SearchRequestBaseJson`] / [`SearchRequestHTTPJson`] (HTTP `/v1/search` and
+/// the MCP/search tool).
+fn reject_empty_search_text(text: &str) -> std::result::Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Search text must not be empty".to_string());
+    }
+    Ok(())
+}
+
 impl TryFrom<SearchRequestHTTPJson> for SearchRequest {
     type Error = String;
 
     fn try_from(req: SearchRequestHTTPJson) -> Result<Self, Self::Error> {
+        reject_empty_search_text(&req.base.text)?;
         Ok(SearchRequest::new(
             req.base.text,
             req.base.datasets,
@@ -116,6 +127,7 @@ impl TryFrom<SearchRequestBaseJson> for SearchRequest {
     type Error = String;
 
     fn try_from(req: SearchRequestBaseJson) -> Result<Self, Self::Error> {
+        reject_empty_search_text(&req.text)?;
         Ok(SearchRequest::new(
             req.text,
             req.datasets,
@@ -600,5 +612,46 @@ pub(crate) mod tests {
         } else {
             panic!("Expected BinaryOp expression");
         }
+    }
+
+    #[test]
+    fn try_from_rejects_empty_and_whitespace_text() {
+        for text in ["", "   ", "\t\n "] {
+            let base = SearchRequestBaseJson {
+                text: text.to_string(),
+                datasets: Some(vec!["products".to_string()]),
+                limit: Some(3),
+                where_cond: None,
+                additional_columns: vec![],
+            };
+            let err = SearchRequest::try_from(base).expect_err("empty text must fail");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+
+            let http = SearchRequestHTTPJson {
+                base: SearchRequestBaseJson {
+                    text: text.to_string(),
+                    datasets: Some(vec!["products".to_string()]),
+                    limit: Some(3),
+                    where_cond: None,
+                    additional_columns: vec![],
+                },
+                keywords: None,
+            };
+            let err = SearchRequest::try_from(http).expect_err("empty text must fail");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+        }
+    }
+
+    #[test]
+    fn try_from_accepts_non_empty_text() {
+        let base = SearchRequestBaseJson {
+            text: " boots ".to_string(),
+            datasets: Some(vec!["products".to_string()]),
+            limit: Some(3),
+            where_cond: None,
+            additional_columns: vec![],
+        };
+        let req = SearchRequest::try_from(base).expect("non-empty text must succeed");
+        assert_eq!(req.text, " boots ");
     }
 }

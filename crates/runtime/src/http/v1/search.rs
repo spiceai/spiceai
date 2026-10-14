@@ -133,10 +133,8 @@ fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
         return Some("Limit must be greater than 0");
     }
 
-    if payload.base.text.trim().is_empty() {
-        return Some("Search text must not be empty");
-    }
-
+    // Empty/whitespace `text` is rejected in `SearchRequest::try_from` so HTTP
+    // and MCP share one enforcement path; that error maps to HTTP 400 below.
     None
 }
 
@@ -242,24 +240,22 @@ mod validate_tests {
     }
 
     #[test]
-    fn rejects_empty_and_whitespace_text() {
-        for text in ["", "   ", "\t\n "] {
-            let r = req(serde_json::json!({"datasets": ["products"], "text": text, "limit": 3}));
-            assert_eq!(validate_request(&r), Some("Search text must not be empty"), "text={text:?}");
-        }
-    }
-
-    #[test]
-    fn accepts_non_empty_text() {
-        let r = req(serde_json::json!({"datasets": ["products"], "text": " boots ", "limit": 3}));
-        assert_eq!(validate_request(&r), None);
-    }
-
-    #[test]
     fn rejects_zero_limit_and_empty_datasets() {
         let r = req(serde_json::json!({"datasets": ["products"], "text": "boots", "limit": 0}));
         assert_eq!(validate_request(&r), Some("Limit must be greater than 0"));
         let r = req(serde_json::json!({"datasets": [], "text": "boots"}));
         assert_eq!(validate_request(&r), Some("No data sources provided"));
+    }
+
+    #[test]
+    fn empty_text_passes_http_only_checks_then_fails_try_from() {
+        // HTTP-only validate_request no longer duplicates the shared text check;
+        // TryFrom (used by both HTTP and MCP) is the enforcement point.
+        for text in ["", "   ", "\t\n "] {
+            let r = req(serde_json::json!({"datasets": ["products"], "text": text, "limit": 3}));
+            assert_eq!(validate_request(&r), None, "text={text:?}");
+            let err = SearchRequest::try_from(r).expect_err("empty text must fail try_from");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+        }
     }
 }
