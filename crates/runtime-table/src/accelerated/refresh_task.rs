@@ -1379,25 +1379,18 @@ impl RefreshTask {
         refresh: &Refresh,
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
-        self.get_full_or_incremental_append_update_from(
-            refresh,
-            overwrite_timestamp_in_nano,
-            None,
-            None,
-        )
-        .await
+        self.get_full_or_incremental_append_update_from(refresh, overwrite_timestamp_in_nano, None)
+            .await
     }
 
     /// [`Self::get_full_or_incremental_append_update`] reading from `source` instead of
-    /// the dataset's own provider (an Iceberg table pinned to one snapshot, say), and
-    /// writing as `update_type` instead of what the refresh mode implies. `None` keeps
-    /// the default for either.
+    /// the dataset's own provider (a table pinned to one commit, say); `None` reads the
+    /// dataset's own.
     async fn get_full_or_incremental_append_update_from(
         &self,
         refresh: &Refresh,
         overwrite_timestamp_in_nano: Option<u128>,
         source: Option<Arc<dyn TableProvider>>,
-        update_type: Option<UpdateType>,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
         let filter_converter = self.get_filter_converter(refresh);
@@ -1430,7 +1423,7 @@ impl RefreshTask {
             }
         }
 
-        let update_type = update_type.unwrap_or_else(|| Self::update_type_for(refresh.mode));
+        let update_type = Self::update_type_for(refresh.mode);
         let source = match source {
             Some(source) => source,
             None => self.federated.table_provider().await,
@@ -1501,26 +1494,18 @@ impl RefreshTask {
 
         match plan {
             AppendPlan::Unchanged => Ok(AppendRead::UpToDate),
-            AppendPlan::TimeFiltered { cursor, source } => {
+            AppendPlan::TimeFiltered {
+                cursor,
+                source,
+                fallback,
+            } => {
+                if let Some(reason) = fallback {
+                    tracing::warn!(
+                        "Dataset '{}' reads new rows by time for this append refresh instead of following its source commits: {reason}. Run a full refresh to rebuild the acceleration from the source.",
+                        self.dataset_name
+                    );
+                }
                 let update = self.time_filtered_append(refresh, source).await?;
-                Ok(AppendRead::Update { update, cursor })
-            }
-            AppendPlan::FullReload { cursor, source, .. } => {
-                let update = self
-                    .get_full_or_incremental_append_update_from(
-                        refresh,
-                        None,
-                        source,
-                        Some(UpdateType::Overwrite),
-                    )
-                    .await?;
-                // The same post-processing a full refresh applies.
-                let update = if refresh.versions_by_time.is_some() {
-                    self.select_latest_by_time(refresh, update, StoredRowsFrom::None)
-                        .await?
-                } else {
-                    update
-                };
                 Ok(AppendRead::Update { update, cursor })
             }
             AppendPlan::AddedRows(read) => {
@@ -1606,7 +1591,7 @@ impl RefreshTask {
                 );
 
                 match self
-                    .get_full_or_incremental_append_update_from(refresh, timestamp, source, None)
+                    .get_full_or_incremental_append_update_from(refresh, timestamp, source)
                     .await
                 {
                     // Ordering versions by time replaces the exact-row dedupe: it is

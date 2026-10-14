@@ -396,17 +396,19 @@ async fn a_compaction_inside_the_interval_keeps_the_late_rows() -> anyhow::Resul
     Ok(())
 }
 
-/// Expiring a snapshot inside the interval, or the saved one, breaks the lineage walk:
-/// exactly one full reload, then the refresh follows snapshots again.
+/// Expiring a snapshot the walk needs, inside the interval or the saved one itself,
+/// makes that refresh read by time once, never reload, and follow snapshots again
+/// from the current one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn an_expired_snapshot_forces_exactly_one_full_reload() -> anyhow::Result<()> {
+async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
-    let c2 = lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
+    lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
     assert_eq!(row_count(&rt, ACCELERATED).await?, 110, "initial load");
 
+    // The interval holds a late row and newer rows; the late row's snapshot expires.
     let c3 = lab.append(&[Row::at("k301", 300, "late_out")]).await?;
     lab.append(&keys("k", 111..=115, 1900, "v1")).await?;
     lab.expire(&[c3]).await?;
@@ -414,35 +416,44 @@ async fn an_expired_snapshot_forces_exactly_one_full_reload() -> anyhow::Result<
     refresh(&rt).await?;
     assert_eq!(
         counter(ROWS_PROCESSED) - processed_before,
-        116.0,
-        "an expired snapshot inside the interval reloads the whole table"
+        5.0,
+        "the time window reads the newer rows and nothing is reloaded"
     );
-    let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the expiry").await?;
-    assert_eq!(rows.len(), 116);
-    assert!(row(&rows, "k301").is_some(), "the expired snapshot's row is in the table");
+    let rows = accelerated_rows(&rt).await?;
+    assert_eq!(rows.len(), 115);
+    assert!(
+        row(&rows, "k301").is_none(),
+        "the late row is outside the window the fallback reads"
+    );
 
     let skipped_before = counter(FETCHES_SKIPPED);
     refresh(&rt).await?;
-    assert_eq!(counter(FETCHES_SKIPPED) - skipped_before, 1.0, "the reload set the cursor");
+    assert_eq!(counter(FETCHES_SKIPPED) - skipped_before, 1.0, "the fallback set the cursor");
+
+    // Snapshots are followed again: a late row loads.
+    let c5 = lab.append(&[Row::at("k302", 310, "late_out")]).await?;
+    refresh(&rt).await?;
+    assert!(row(&accelerated_rows(&rt).await?, "k302").is_some());
 
     // Now the saved snapshot itself expires.
-    lab.append(&[Row::at("k302", 310, "late_out")]).await?;
-    lab.expire(&[c2]).await?;
-    let processed_before = counter(ROWS_PROCESSED);
+    lab.append(&[Row::at("k303", 320, "late_out")]).await?;
+    lab.expire(&[c5]).await?;
     refresh(&rt).await?;
-    assert_eq!(
-        counter(ROWS_PROCESSED) - processed_before,
-        117.0,
-        "an expired saved snapshot reloads the whole table"
-    );
-    assert_matches_source(&rt, TimeKind::Timestamp, "after the saved snapshot expired").await?;
+    let rows = accelerated_rows(&rt).await?;
+    assert_eq!(rows.len(), 116, "nothing reloaded, nothing removed");
+    assert!(row(&rows, "k303").is_none(), "read by time once more");
+
+    lab.append(&[Row::at("k304", 330, "late_out")]).await?;
+    refresh(&rt).await?;
+    assert!(row(&accelerated_rows(&rt).await?, "k304").is_some());
     Ok(())
 }
 
 /// Rolling the table back makes the saved snapshot a descendant of the current one:
-/// one full reload, which also removes the rolled-back rows.
+/// that refresh reads by time once; the rolled-back rows stay, since an append refresh
+/// never removes a row; later appends are followed from the rolled-back snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_rollback_forces_one_full_reload() -> anyhow::Result<()> {
+async fn a_rollback_reads_by_time_once_and_removes_nothing() -> anyhow::Result<()> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
@@ -453,12 +464,18 @@ async fn a_rollback_forces_one_full_reload() -> anyhow::Result<()> {
 
     lab.set_main(c1).await?;
     refresh(&rt).await?;
-    let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the rollback").await?;
-    assert_eq!(rows.len(), 100, "the rolled-back rows are gone");
+    assert_eq!(
+        row_count(&rt, ACCELERATED).await?,
+        110,
+        "the rolled-back rows stay; nothing is reloaded"
+    );
 
-    let skipped_before = counter(FETCHES_SKIPPED);
+    lab.append(&[Row::at("k301", 300, "late_out"), Row::at("k111", 1900, "v1")])
+        .await?;
     refresh(&rt).await?;
-    assert_eq!(counter(FETCHES_SKIPPED) - skipped_before, 1.0);
+    let rows = accelerated_rows(&rt).await?;
+    assert_eq!(rows.len(), 112, "snapshots are followed again from the rolled-back one");
+    assert!(row(&rows, "k301").is_some());
     Ok(())
 }
 
@@ -580,10 +597,11 @@ async fn an_unchanged_table_scans_no_data() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A table dropped and created again under the same name has a new UUID: one full
-/// reload replaces the old rows with the new table's.
+/// A table dropped and created again under the same name has a new UUID: that refresh
+/// reads by time once (the old table's rows stay, newer versions win), then the new
+/// table's snapshots are followed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_recreated_table_is_reloaded() -> anyhow::Result<()> {
+async fn a_recreated_table_is_read_by_time_once() -> anyhow::Result<()> {
     let _tracing = crate::init_tracing(Some("integration=debug,info"));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
@@ -591,11 +609,23 @@ async fn a_recreated_table_is_reloaded() -> anyhow::Result<()> {
 
     lab.recreate_with(&keys("k", 1..=50, 60, "fresh")).await?;
     refresh(&rt).await?;
-    let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the recreate").await?;
-    assert_eq!(rows.len(), 50);
+    let rows = accelerated_rows(&rt).await?;
+    assert_eq!(rows.len(), 100, "the old table's rows stay");
     assert_eq!(
         row(&rows, "k1"),
-        Some(&("k1".to_string(), Some(at_text(60)), "fresh".to_string()))
+        Some(&("k1".to_string(), Some(at_text(60)), "fresh".to_string())),
+        "the new table's newer version wins"
+    );
+    assert_eq!(
+        row(&rows, "k51"),
+        Some(&("k51".to_string(), Some(at_text(0)), "v1".to_string()))
+    );
+
+    lab.append(&[Row::at("k200", 5, "late_out")]).await?;
+    refresh(&rt).await?;
+    assert!(
+        row(&accelerated_rows(&rt).await?, "k200").is_some(),
+        "the new table's snapshots are followed"
     );
     Ok(())
 }

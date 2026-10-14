@@ -83,6 +83,10 @@ pub struct AddedRowsRead {
 
 /// What one append refresh reads, decided by the source from the saved cursor.
 ///
+/// An append refresh only ever adds rows: it never reloads the source and never removes
+/// a row. Whatever the source cannot express as added rows is read the way every append
+/// refresh reads, by time, once, and the cursor moves on from there.
+///
 /// The reads that go through the dataset's own scan carry a provider pinned to the
 /// commit the cursor names, so a commit that lands during the read waits for the next
 /// refresh and the saved cursor names what was read.
@@ -90,18 +94,18 @@ pub struct AddedRowsRead {
 pub enum AppendPlan {
     /// The source is at the saved cursor: nothing to read.
     Unchanged,
-    /// Read the source as the append refresh does by time, then save `cursor`: the
-    /// first refresh with no cursor, or an interval the source cannot express as added
-    /// rows. Both are `None` when the source has no commit to pin or save.
+    /// Read the source as the append refresh does by time, then save `cursor`. `cursor`
+    /// and `source` are `None` when the source has no commit to pin or save.
+    ///
+    /// `fallback` is `None` on the first refresh, which has no cursor to follow. It
+    /// names the reason when the source has a cursor it cannot follow: a commit that
+    /// removed rows, an expired or rolled-back cursor, a replaced table. That read is
+    /// the refresh the dataset would have run without the cursor, so it misses what
+    /// the time window misses, and the reason is reported to the user.
     TimeFiltered {
         cursor: Option<String>,
         source: Option<Arc<dyn TableProvider>>,
-    },
-    /// Reload the whole source as an overwrite, then save `cursor`.
-    FullReload {
-        cursor: Option<String>,
-        source: Option<Arc<dyn TableProvider>>,
-        reason: String,
+        fallback: Option<String>,
     },
     /// Read the rows the commits since the cursor added.
     AddedRows(AddedRowsRead),

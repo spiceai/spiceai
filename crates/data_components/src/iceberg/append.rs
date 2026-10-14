@@ -160,9 +160,9 @@ impl AppendCursor {
     }
 }
 
-/// Why an append refresh reloads the whole table instead of following snapshots.
+/// Why an append refresh reads the table by time instead of following its snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FullReloadReason {
+pub enum FallbackReason {
     /// The table was dropped and recreated under the same name.
     TableReplaced { saved_uuid: String, current_uuid: String },
     /// The saved snapshot is no longer an ancestor of the current one: it expired,
@@ -170,9 +170,11 @@ pub enum FullReloadReason {
     SnapshotNotAncestor { saved: i64, current: i64 },
     /// The table has no snapshot at all any more.
     TableHasNoSnapshot { saved: i64 },
+    /// A snapshot since the saved one deleted or overwrote rows.
+    RowsRemoved { saved: i64, walked: WalkedSnapshots },
 }
 
-impl std::fmt::Display for FullReloadReason {
+impl std::fmt::Display for FallbackReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TableReplaced {
@@ -180,15 +182,19 @@ impl std::fmt::Display for FullReloadReason {
                 current_uuid,
             } => write!(
                 f,
-                "the table was replaced (its UUID changed from {saved_uuid} to {current_uuid})"
+                "the Iceberg table was replaced (its UUID changed from {saved_uuid} to {current_uuid}), so rows of the old table stay in the acceleration"
             ),
             Self::SnapshotNotAncestor { saved, current } => write!(
                 f,
-                "the last loaded snapshot {saved} is no longer an ancestor of the current snapshot {current} (expired, rolled back, or on another branch)"
+                "the last loaded Iceberg snapshot {saved} is no longer an ancestor of the current snapshot {current} (expired, rolled back, or on another branch), so rows removed at the source stay in the acceleration"
             ),
             Self::TableHasNoSnapshot { saved } => write!(
                 f,
-                "the table has no snapshot any more (the last loaded one was {saved})"
+                "the Iceberg table has no snapshot any more (the last loaded one was {saved}), so its rows stay in the acceleration"
+            ),
+            Self::RowsRemoved { saved, walked } => write!(
+                f,
+                "{walked} since the last loaded Iceberg snapshot {saved}, and a snapshot deleted or overwrote rows, which an append refresh does not remove"
             ),
         }
     }
@@ -313,29 +319,27 @@ pub async fn plan_append(
         return Ok(AppendPlan::TimeFiltered {
             cursor: cursor_at(current),
             source: source_at(current),
+            fallback: None,
         });
     };
 
-    let full_reload = |reason: FullReloadReason| {
-        tracing::debug!(
-            "Dataset '{dataset}' reloads every row from its Iceberg table as of snapshot {current:?}: {reason}"
-        );
-        AppendPlan::FullReload {
-            cursor: cursor_at(current),
-            source: source_at(current),
-            reason: reason.to_string(),
-        }
+    // A cursor the planner cannot follow: the refresh reads by time once, as it would
+    // without a cursor, and follows snapshots again from the current one.
+    let fall_back = |reason: FallbackReason| AppendPlan::TimeFiltered {
+        cursor: cursor_at(current),
+        source: source_at(current),
+        fallback: Some(reason.to_string()),
     };
 
     if saved.table_uuid != table_uuid {
-        return Ok(full_reload(FullReloadReason::TableReplaced {
+        return Ok(fall_back(FallbackReason::TableReplaced {
             saved_uuid: saved.table_uuid.clone(),
             current_uuid: table_uuid.clone(),
         }));
     }
 
     let Some(current) = current else {
-        return Ok(full_reload(FullReloadReason::TableHasNoSnapshot {
+        return Ok(fall_back(FallbackReason::TableHasNoSnapshot {
             saved: saved.snapshot_id,
         }));
     };
@@ -348,28 +352,24 @@ pub async fn plan_append(
     }
 
     let Some(interval) = snapshots_between(metadata, saved.snapshot_id, current) else {
-        return Ok(full_reload(FullReloadReason::SnapshotNotAncestor {
+        return Ok(fall_back(FallbackReason::SnapshotNotAncestor {
             saved: saved.snapshot_id,
             current,
         }));
     };
 
     let cursor = AppendCursor {
-        table_uuid,
+        table_uuid: table_uuid.clone(),
         snapshot_id: current,
     }
     .to_json();
     let (walked, added) = classify_interval(&table, &interval).await?;
 
     if walked.has_mutation() {
-        tracing::debug!(
-            "Dataset '{dataset}' has {walked} since Iceberg snapshot {}; a snapshot deleted or overwrote rows, so this append refresh reads the table by time as before, pinned to snapshot {current}",
-            saved.snapshot_id
-        );
-        return Ok(AppendPlan::TimeFiltered {
-            cursor: Some(cursor),
-            source: Some(pinned(provider, current)),
-        });
+        return Ok(fall_back(FallbackReason::RowsRemoved {
+            saved: saved.snapshot_id,
+            walked,
+        }));
     }
 
     let seed = time_column.map(|time| seed_mark(&added, time, metadata.current_schema()));
@@ -950,7 +950,8 @@ mod tests {
                 plan,
                 AppendPlan::TimeFiltered {
                     cursor: None,
-                    source: None
+                    source: None,
+                    fallback: None
                 }
             ),
             "an empty table has nothing to pin or save: {plan:?}"
@@ -961,6 +962,7 @@ mod tests {
         let AppendPlan::TimeFiltered {
             cursor: Some(cursor),
             source: Some(_),
+            fallback: None,
         } = plan
         else {
             panic!("no cursor reads the table as today and saves the current snapshot: {plan:?}");
@@ -1093,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_replaced_table_and_an_unknown_saved_snapshot_reload_everything() {
+    async fn a_replaced_table_and_an_unknown_saved_snapshot_read_by_time_once() {
         let (catalog, ident) = catalog_with_table().await;
         let provider = provider_for(&catalog, &ident).await;
         let first = append(&catalog, &ident, &[(1, 100)]).await;
@@ -1104,7 +1106,12 @@ mod tests {
             snapshot_id: first,
         };
         let plan = plan_for("events", &provider, Some(&replaced), Some(&temporal("ts"))).await;
-        let AppendPlan::FullReload { cursor, reason, .. } = plan else {
+        let AppendPlan::TimeFiltered {
+            cursor,
+            source: Some(_),
+            fallback: Some(reason),
+        } = plan
+        else {
             panic!("a UUID the table does not have means it was recreated: {plan:?}");
         };
         let cursor = cursor_of(&cursor.expect("the current snapshot is the cursor"));
@@ -1112,7 +1119,7 @@ mod tests {
         assert_eq!(
             reason,
             format!(
-                "the table was replaced (its UUID changed from 00000000-0000-0000-0000-000000000000 to {uuid})"
+                "the Iceberg table was replaced (its UUID changed from 00000000-0000-0000-0000-000000000000 to {uuid}), so rows of the old table stay in the acceleration"
             )
         );
 
@@ -1121,13 +1128,17 @@ mod tests {
             snapshot_id: first + 1,
         };
         let plan = plan_for("events", &provider, Some(&expired), Some(&temporal("ts"))).await;
-        let AppendPlan::FullReload { reason, .. } = plan else {
+        let AppendPlan::TimeFiltered {
+            fallback: Some(reason),
+            ..
+        } = plan
+        else {
             panic!("a saved snapshot the walk from the current one never meets: {plan:?}");
         };
         assert_eq!(
             reason,
             format!(
-                "the last loaded snapshot {} is no longer an ancestor of the current snapshot {first} (expired, rolled back, or on another branch)",
+                "the last loaded Iceberg snapshot {} is no longer an ancestor of the current snapshot {first} (expired, rolled back, or on another branch), so rows removed at the source stay in the acceleration",
                 first + 1
             )
         );
