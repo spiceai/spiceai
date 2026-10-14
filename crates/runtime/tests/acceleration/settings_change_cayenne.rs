@@ -1205,3 +1205,57 @@ async fn an_accelerated_view_is_held_while_every_read_of_its_source_fails()
     assert_eq!(second.primary_key, vec!["id".to_string()]);
     Ok(())
 }
+
+/// A dataset whose `refresh_sql` cannot run over its source holds a rebuild too, though
+/// the bare source still reads: the reload runs the refresh SQL. Here the refresh SQL
+/// filters on `10 / (id - 9)`, which a source row with `id` 9 makes fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_primary_key_is_held_while_the_refresh_sql_fails() -> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    let fixture = Fixture::new()?;
+    let dataset = |primary_key: Option<&'static str>| {
+        let mut dataset = fixture.dataset(
+            "trips",
+            &Settings {
+                refresh_mode: Some(RefreshMode::Full),
+                primary_key,
+                ..Settings::default()
+            },
+        );
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_sql =
+                Some("SELECT id, name, ts FROM trips WHERE 10 / (id - 9) <> 0".to_string());
+        }
+        dataset
+    };
+
+    // Built with no primary key: the refresh SQL passes every source row.
+    assert_eq!(
+        fixture.ids_after_restart_with(dataset(None)).await?,
+        [1, 1, 2, 2, 3]
+    );
+    let first = fixture.stored("trips").await?;
+
+    // A source row with `id` 9 makes the refresh SQL fail. Restarted with a primary key,
+    // the acceleration could not reload, so the existing one keeps serving.
+    fixture.write_source(&format!("{CSV}9,z,1704499200\n"))?;
+    assert_eq!(
+        fixture.ids_after_restart_with(dataset(Some("id"))).await?,
+        [1, 1, 2, 2, 3],
+        "while the refresh SQL fails, the existing acceleration must keep serving"
+    );
+    let held = fixture.stored("trips").await?;
+    assert_eq!(held.table_id, first.table_id);
+    assert!(held.primary_key.is_empty());
+
+    // Without that row the refresh SQL runs again, and the next restart rebuilds.
+    fixture.write_source(CSV)?;
+    assert_eq!(
+        fixture.ids_after_restart_with(dataset(Some("id"))).await?,
+        [1, 2, 3]
+    );
+    let rebuilt = fixture.stored("trips").await?;
+    assert_ne!(rebuilt.table_id, first.table_id);
+    assert_eq!(rebuilt.primary_key, vec!["id".to_string()]);
+    Ok(())
+}
