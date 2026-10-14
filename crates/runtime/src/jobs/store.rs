@@ -732,7 +732,7 @@ impl JobStore {
         let change = Mutex::new(change);
         retry_on_conflict(&ConflictRetry::default(), || async {
             let mut state = self.get_job(job_id).await?;
-            if !(&mut *change.lock())(&mut state) {
+            if !(*change.lock())(&mut state) {
                 return Ok(Attempt::Done(state));
             }
             match self.write_job_state(&mut state).await {
@@ -964,7 +964,7 @@ mod tests {
                 Arc::new(JobStore::new(
                     Arc::clone(&store),
                     "test",
-                    &format!("node-{n}"),
+                    format!("node-{n}"),
                 ))
             })
             .collect();
@@ -1007,10 +1007,10 @@ mod tests {
                         .status,
                 );
             }
-            let stored = stores[0].get_job(&job_id).await.expect("to get job").status;
+            let landed = stores[0].get_job(&job_id).await.expect("to get job").status;
             assert!(
-                statuses.iter().all(|status| *status == stored),
-                "round {round}: every finisher must report the stored status {stored:?}: {statuses:?}"
+                statuses.iter().all(|status| *status == landed),
+                "round {round}: every finisher must report the stored status {landed:?}: {statuses:?}"
             );
         }
     }

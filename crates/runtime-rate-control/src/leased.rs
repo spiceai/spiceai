@@ -1764,8 +1764,8 @@ impl LeasedBucket {
                         origin: self.config.origin.clone(),
                     },
                     ModifyError::State(
-                        source @ object_store_occ::Error::ObjectStore { .. }
-                        | source @ object_store_occ::Error::Deserialization { .. },
+                        source @ (object_store_occ::Error::ObjectStore { .. }
+                        | object_store_occ::Error::Deserialization { .. }),
                     ) => Error::Read {
                         origin: self.config.origin.clone(),
                         source: Box::new(source),

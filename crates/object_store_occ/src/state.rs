@@ -224,7 +224,7 @@ where
                 ),
                 None => (None, Expected::Absent),
             };
-            let decision = (&mut *change.lock())(current).map_err(ModifyError::Rejected)?;
+            let decision = (*change.lock())(current).map_err(ModifyError::Rejected)?;
             match decision {
                 Change::Keep(result) => Ok(Attempt::Done(result)),
                 Change::Write(value, result) => {
@@ -269,7 +269,7 @@ where
             Err(ConditionalWriteError::Conflict { .. }) => Ok(false),
             Err(source) => Err(Error::ConditionalWrite {
                 key: key.to_string(),
-                source,
+                source: Box::new(source),
             }),
         }
     }
