@@ -502,12 +502,22 @@ impl PkConflictDetection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeletionMode {
-    /// Resolve the mode from the table's configuration (the default). `Auto`
-    /// resolves to [`Self::Key`] for tables with a primary key (key-based deletes
-    /// compact concurrently with writers and are pruned by seq-prefix bake),
-    /// and to [`Self::Position`] for PK-less tables (using the long-standing
-    /// `PositionBased` strategy). Use [`Self::Position`] to explicitly opt into
-    /// position deletes on a PK table. See [`Self::resolved`].
+    /// Let Cayenne choose (the default). On a table with a primary key, `Auto`
+    /// keeps [`Self::Position`] deletes while the table is small enough to
+    /// reclaim them by rewriting it whole — at most 1/32 of the target file
+    /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
+    /// deletes once it outgrows that. The switch holds until the table is next
+    /// opened, which sizes it again. On a runtime with fewer than 8 physical CPU
+    /// cores, or not on Linux, an `Auto` table keeps key deletes from the start
+    /// ([`VortexConfig::auto_keeps_key_deletes`]); it is still `Auto`, so it still
+    /// reclaims, by its paced whole-table rewrite, deletes of rows the bake
+    /// cannot reach. A table on object storage, in `mode: memory`, partitioned,
+    /// or with a cold tier uses key deletes throughout, as does a
+    /// `refresh_mode: changes` table, which the accelerator pins to [`Self::Key`].
+    /// While it uses position deletes, `Auto` rewrites alongside writers rather
+    /// than holding them off, and folds a key repeated within one write out of
+    /// the files as key mode does. A table without a primary key has no key to
+    /// record and always uses position deletes. See [`Self::resolved`].
     #[default]
     Auto,
     /// Record deletions by primary-key bytes + sequence number and apply them
@@ -524,6 +534,19 @@ pub enum DeletionMode {
     /// (cold-rebuilt keysets, over-budget bloom tables, inlined rows) fall back
     /// to the `Key` path, so a table can mix both within one snapshot.
     Position,
+}
+
+/// What a [`DeletionMode`] means for one table once its primary key is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedDeletionMode {
+    /// Key deletes.
+    Key,
+    /// Position deletes, falling back to key deletes for rows whose position is
+    /// unknown.
+    Position,
+    /// `auto` on a primary-key table: position deletes while the table is small
+    /// enough to rewrite whole, key deletes once it is not.
+    Adaptive,
 }
 
 impl DeletionMode {
@@ -548,37 +571,24 @@ impl DeletionMode {
         }
     }
 
-    /// Resolve `Auto` against the table's configuration, returning a concrete
-    /// [`Self::Key`] or [`Self::Position`].
+    /// Resolve the mode for a table, given whether it has a primary key.
     ///
-    /// For a table **with** a primary key, `Auto` resolves to [`Self::Key`] —
-    /// key-based deletions are recorded by PK bytes and sequence number, compact
-    /// concurrently with writers, and are garbage-collected by the seq-prefix bake
-    /// pass. For a table **without** a primary key, `Auto` resolves to
-    /// [`Self::Position`] (the long-standing `PositionBased` strategy).
+    /// [`Self::Key`] is only honored when there is a key to record; a table
+    /// without a primary key resolves every mode to position deletes. On a table
+    /// with a primary key, [`Self::Auto`] resolves to
+    /// [`ResolvedDeletionMode::Adaptive`]: the table chooses as it grows (see
+    /// [`Self::Auto`]).
     ///
-    /// [`Self::Position`] can be explicitly configured on a PK table to push
-    /// per-file position deletes into the Vortex scan.
-    ///
-    /// [`Self::Key`] on a PK-less table has no key to record, so it resolves to
-    /// [`Self::Position`].
+    /// The accelerator pins `Auto` to [`Self::Key`] before the table opens for a
+    /// `refresh_mode: changes` table with a primary key and for a table with a
+    /// datalake tier, so neither reaches the adaptive resolution.
     #[must_use]
-    pub const fn resolved(self, has_primary_key: bool) -> Self {
+    pub const fn resolved(self, has_primary_key: bool) -> ResolvedDeletionMode {
         match self {
-            // `Key` is only honored when there is a key to record.
-            // `Auto` resolves to `Key` for primary-key tables.
-            Self::Auto | Self::Key if has_primary_key => Self::Key,
-            // Everything else is position-based: `Position` always,
-            // and `Auto` or `Key` on a PK-less table (there is no key to record).
-            Self::Auto | Self::Position | Self::Key => Self::Position,
+            Self::Key if has_primary_key => ResolvedDeletionMode::Key,
+            Self::Auto if has_primary_key => ResolvedDeletionMode::Adaptive,
+            Self::Auto | Self::Position | Self::Key => ResolvedDeletionMode::Position,
         }
-    }
-
-    /// Whether this mode (already resolved via [`Self::resolved`]) records and
-    /// applies deletions as per-file row positions.
-    #[must_use]
-    pub const fn is_position(self) -> bool {
-        matches!(self, Self::Position)
     }
 }
 
@@ -949,12 +959,22 @@ pub struct VortexConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// Defaults to [`DeletionMode::Auto`], which resolves to `key` for PK tables
-    /// (key-based deletes compact concurrently and are pruned by seq-prefix bake)
-    /// and `position` for PK-less tables. Set `cayenne_deletion_mode: position` to
-    /// explicitly opt into merge-on-read position deletes on a PK table.
+    /// Defaults to [`DeletionMode::Auto`], which keeps a PK table on position
+    /// deletes while it is small enough to reclaim them by rewriting it whole and
+    /// moves it to key deletes once it outgrows that; a PK-less table always uses
+    /// position deletes. `key` and `position` pin the mode.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Whether `deletion_mode: auto` keeps key deletes from the start on this
+    /// runtime. The accelerator and the Cayenne catalog set it where `auto` may not
+    /// keep a small table compacted whole alongside its writes: with fewer than 8
+    /// physical CPU cores, or not on Linux
+    /// ([`crate::auto_keeps_small_tables_compacted`]). Such a table is still
+    /// `auto`, as one past its bound is, so it still reclaims, by the paced
+    /// whole-table rewrite, deletes of rows the bake cannot reach. Never stored
+    /// with the table, so a table chooses again wherever it next opens.
+    #[serde(skip)]
+    pub auto_keeps_key_deletes: bool,
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
     /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
     /// data files are ever written (checkpoint + compaction disabled), it is
@@ -1567,6 +1587,7 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            auto_keeps_key_deletes: false,
             memory_mode: false,
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
@@ -1615,17 +1636,27 @@ mod tests {
 
     #[test]
     fn test_deletion_mode_resolved() {
-        assert_eq!(DeletionMode::Auto.resolved(true), DeletionMode::Key);
-        assert_eq!(DeletionMode::Auto.resolved(false), DeletionMode::Position);
-        assert_eq!(DeletionMode::Key.resolved(true), DeletionMode::Key);
-        assert_eq!(DeletionMode::Key.resolved(false), DeletionMode::Position);
+        use super::ResolvedDeletionMode;
+        assert_eq!(
+            DeletionMode::Auto.resolved(true),
+            ResolvedDeletionMode::Adaptive
+        );
+        assert_eq!(
+            DeletionMode::Auto.resolved(false),
+            ResolvedDeletionMode::Position
+        );
+        assert_eq!(DeletionMode::Key.resolved(true), ResolvedDeletionMode::Key);
+        assert_eq!(
+            DeletionMode::Key.resolved(false),
+            ResolvedDeletionMode::Position
+        );
         assert_eq!(
             DeletionMode::Position.resolved(true),
-            DeletionMode::Position
+            ResolvedDeletionMode::Position
         );
         assert_eq!(
             DeletionMode::Position.resolved(false),
-            DeletionMode::Position
+            ResolvedDeletionMode::Position
         );
     }
 

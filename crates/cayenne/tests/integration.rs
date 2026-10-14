@@ -52,6 +52,7 @@ mod cross_partition_overwrite_test;
 mod cte_materialization_query_test;
 mod data_inlining_test;
 mod datafusion_dynamic_filter_backports_test;
+mod deletion_mode_harness;
 mod deletion_strategy_detection_test;
 mod deletion_strategy_test;
 mod deletion_test;
