@@ -195,6 +195,9 @@ pub enum Error {
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
     UnableToStartServers { source: Box<runtime::Error> },
 
+    #[snafu(display("{source}"))]
+    StateLocationRefused { source: Box<runtime::Error> },
+
     #[snafu(display("Failed to load dataset: {source}"))]
     UnableToLoadDataset { source: Box<runtime::Error> },
 
@@ -1283,6 +1286,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     let result = match server_thread.await {
         // Don't treat force terminated as an error
         Ok(Err(runtime::Error::ForceTerminated)) => Ok(()),
+        Ok(Err(e @ runtime::Error::StateLocationRefused { .. })) => {
+            Err(Error::StateLocationRefused {
+                source: Box::new(e),
+            })
+        }
         Ok(ok) => ok.map_err(|e| Error::UnableToStartServers {
             source: Box::new(e),
         }),
