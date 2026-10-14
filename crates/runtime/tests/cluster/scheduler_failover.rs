@@ -582,10 +582,11 @@ async fn run_runtime_state_layout() -> Result<(), anyhow::Error> {
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<Result<_, _>>()?;
     root.retain(|name| name != ".spice-object-store-occ.lock");
+    root.sort();
     assert_eq!(
         root,
-        ["cluster"],
-        "the scheduler must write only under cluster/"
+        ["_spice", "cluster"],
+        "the scheduler must write only under cluster/, next to the startup check's _spice/"
     );
 
     scheduler.rt.shutdown().await;
