@@ -1454,6 +1454,18 @@ async fn path_exists(path: impl AsRef<Path>) -> bool {
     matches!(tokio::fs::try_exists(path).await, Ok(true))
 }
 
+/// Whether the local directory `inner` lies inside the local directory `outer`, compared
+/// as absolute paths component by component, so `/data/orders2` is not inside
+/// `/data/orders`. An object-store location lies inside nothing local.
+fn lies_inside(inner: &str, outer: &str) -> std::io::Result<bool> {
+    Ok(
+        match (absolute_data_dir(inner)?, absolute_data_dir(outer)?) {
+            (Some(inner), Some(outer)) => inner.starts_with(outer),
+            _ => false,
+        },
+    )
+}
+
 /// Process-wide counter giving each [`CayenneAccelerator`] instance a unique id,
 /// used to name its in-memory (`memdb`) metastore so distinct instances never
 /// share one in-memory database.
@@ -4632,8 +4644,10 @@ impl DataAccelerator for CayenneAccelerator {
         // table's files and delete whatever the new location already holds. A
         // table stored in an object store keeps its files, wherever the dataset
         // now puts its data, since this teardown deletes local directories only;
-        // the log names the prefixes they are under.
-        let mut removed_dir = Some(dir_path.clone());
+        // the log names the prefixes they are under. When the configured directory
+        // lies inside the stored one, removing the stored directory would remove the
+        // configured one with it, so only the stored table's own directories go.
+        let mut removed_dirs = vec![dir_path.clone()];
         let mut left_in_place = None;
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
@@ -4649,7 +4663,7 @@ impl DataAccelerator for CayenneAccelerator {
             // table that is not there leaves the configured directory to clear.
             match catalog.get_table(table_name).await {
                 Ok(stored) if stored.path.starts_with("s3://") => {
-                    removed_dir = None;
+                    removed_dirs.clear();
                     left_in_place = Some(
                         object_store_table_prefixes(catalog.as_ref(), table_name, &stored)
                             .await
@@ -4661,7 +4675,13 @@ impl DataAccelerator for CayenneAccelerator {
                 {
                     Self::ensure_metastore_outside_data_dir(source, &stored.path).await?;
                     Self::ensure_no_catalog_under_data_dir(source, &stored.path).await?;
-                    removed_dir = Some(stored.path);
+                    removed_dirs = if lies_inside(&dir_path, &stored.path).boxed()? {
+                        object_store_table_prefixes(catalog.as_ref(), table_name, &stored)
+                            .await
+                            .boxed()?
+                    } else {
+                        vec![stored.path]
+                    };
                 }
                 Ok(_) | Err(cayenne::CatalogError::TableNotFound { .. }) => {}
                 Err(error) => return Err(Box::new(error)),
@@ -4671,15 +4691,16 @@ impl DataAccelerator for CayenneAccelerator {
 
         // A local location can be spelled as a `file://` URI. The directory it names is
         // what exists, and what is removed or recreated.
-        if let Some(removed_dir) = removed_dir
-            && let Some(local_dir) = absolute_data_dir(&removed_dir).boxed()?
-            && path_exists(&local_dir).await
-        {
-            let local_dir = local_dir.to_string_lossy().into_owned();
-            Self::remove_acceleration_data_dir(source, &local_dir).await?;
-            tracing::info!(
-                "Removed the Cayenne data directory '{local_dir}' of dataset '{table_name}' to recreate its acceleration"
-            );
+        for removed_dir in removed_dirs {
+            if let Some(local_dir) = absolute_data_dir(&removed_dir).boxed()?
+                && path_exists(&local_dir).await
+            {
+                let local_dir = local_dir.to_string_lossy().into_owned();
+                Self::remove_acceleration_data_dir(source, &local_dir).await?;
+                tracing::info!(
+                    "Removed the Cayenne data directory '{local_dir}' of dataset '{table_name}' to recreate its acceleration"
+                );
+            }
         }
         if let Some(prefixes) = left_in_place {
             tracing::warn!(
@@ -6850,6 +6871,84 @@ mod tests {
 
         assert!(
             !old_dir.exists(),
+            "the stored table's files must be removed"
+        );
+        assert!(
+            new_file.exists(),
+            "the newly configured location's contents must be left alone"
+        );
+    }
+
+    /// A rebuild for a data location moved inside the stored one removes the stored
+    /// table's own directory, and leaves the configured location, which lies inside the
+    /// stored directory, with what it already holds.
+    #[tokio::test]
+    async fn drop_table_keeps_a_configured_location_nested_inside_the_stored_one() {
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        // Stored at `data/orders`; the dataset now puts its data under
+        // `data/orders/moved`, so its configured directory, `data/orders/moved/orders`,
+        // lies inside the stored one.
+        let stored_dir = base.path().join("data").join("orders");
+        let moved = stored_dir.join("moved");
+        let new_dir = moved.join("orders");
+
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: stored_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the stored table");
+        let old_file = stored_dir.join(&table_id).join("data.vortex");
+        std::fs::create_dir_all(old_file.parent().expect("parent")).expect("old table dir");
+        std::fs::write(&old_file, b"rows").expect("old file");
+        drop(catalog);
+
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_file = new_dir.join("unrelated");
+        std::fs::write(&new_file, b"keep").expect("new file");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    moved.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        CayenneAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await
+            .expect("drop the stored table");
+
+        assert!(
+            !stored_dir.join(&table_id).exists(),
             "the stored table's files must be removed"
         );
         assert!(
