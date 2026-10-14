@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub struct SearchRequestBaseJson {
-    /// The text to search documents for similarity
+    /// The text to search documents for similarity. Must contain at least one non-whitespace character.
     pub text: String,
 
     /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.
