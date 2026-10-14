@@ -587,15 +587,22 @@ impl RewriteFiles {
             writer.add_file(file.clone(), sequence_number)?;
         }
         for entry in &rewritten {
+            // The lab's files are written once and never rewritten before this, so their
+            // file sequence number is the data sequence number of the append that added
+            // them; a carried entry must state both.
             let entry_sequence = entry.sequence_number().unwrap_or(sequence_number);
             if self.removed.contains(entry.file_path()) {
-                writer.add_delete_file(entry.data_file().clone(), entry_sequence, None)?;
+                writer.add_delete_file(
+                    entry.data_file().clone(),
+                    entry_sequence,
+                    Some(entry_sequence),
+                )?;
             } else {
                 writer.add_existing_file(
                     entry.data_file().clone(),
                     entry.snapshot_id().unwrap_or(snapshot_id),
                     entry_sequence,
-                    None,
+                    Some(entry_sequence),
                 )?;
             }
         }
