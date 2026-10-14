@@ -1072,6 +1072,37 @@ mod tests {
         assert_eq!(ids_of(&Arc::new(provider)).await, ALL_IDS);
     }
 
+    /// A Hadoop writer writes a new version as `<uuid>.metadata.json` and commits it
+    /// by renaming it to `v<N>.metadata.json`. With no version hint, an uncommitted
+    /// file whose UUID starts with digits is not read as the newest version.
+    #[tokio::test]
+    async fn a_hadoop_writers_uncommitted_metadata_is_not_read_without_a_hint() {
+        let warehouse = tempfile::tempdir().expect("temp warehouse is created");
+        let table_root = write_table(warehouse.path(), &APPENDS).await;
+        let files = rename_to_hadoop_names(&table_root);
+        std::fs::rename(
+            &files[11],
+            table_root
+                .join("metadata")
+                .join("12345678-abcd-4abc-8abc-123456789abc.metadata.json"),
+        )
+        .expect("the newest version is left uncommitted");
+
+        let catalog = table_root_catalog(&table_root);
+        assert_eq!(
+            ids_through(catalog.clone()).await,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            catalog
+                .current_metadata()
+                .await
+                .expect("current metadata is found")
+                .location,
+            format!("file://{}", files[10].display())
+        );
+    }
+
     /// A version hint is read again on every load, through both the table root and
     /// a pin on the hint file itself. A file name stem (`DuckDB`) names the metadata
     /// file even when newer files exist. A version (Java's Hadoop tables) is where
