@@ -1208,6 +1208,19 @@ impl CpuBudget {
         self.detected_cores
     }
 
+    /// The entitlement in whole cores when an explicit quantity set it —
+    /// `--cpu-cores`, `SPICE_CPU_CORES` or `runtime.cpu.cores` — and `None` when it
+    /// was detected. `all` and `auto` name no quantity of their own, so both are
+    /// `None`.
+    #[must_use]
+    pub const fn configured_cores(&self) -> Option<usize> {
+        if matches!(self.source, CpuSource::Configured) {
+            Some(self.cores)
+        } else {
+            None
+        }
+    }
+
     /// The physical cores behind [`Self::cores`]: the budget scaled by the
     /// physical cores per logical CPU among the CPUs this process may run on,
     /// rounded down and at least one. Equal to `cores` without SMT, or where the
@@ -2724,6 +2737,32 @@ mod tests {
         .expect("valid");
         assert_eq!(auto.cores(), 18);
         assert_eq!(auto.source(), CpuSource::Affinity);
+    }
+
+    #[test]
+    fn configured_cores_reports_only_an_explicit_quantity() {
+        let configured = |cli: Option<&str>,
+                          env: Option<&str>,
+                          spicepod: Option<&str>,
+                          readings: &HostReadings| {
+            CpuBudget::resolve(&CpuConfig::from_sources(cli, env, spicepod), readings)
+                .expect("valid")
+                .configured_cores()
+        };
+
+        // Every surface that names a quantity reports it, rounded up as `cores()` is.
+        assert_eq!(configured(Some("2"), None, None, &host(16)), Some(2));
+        assert_eq!(configured(None, Some("5"), None, &host(16)), Some(5));
+        assert_eq!(configured(None, None, Some("3.5"), &host(16)), Some(4));
+        // Above the host's CPUs it is still the value the runtime sizes itself for.
+        assert_eq!(configured(None, None, Some("64"), &host(16)), Some(64));
+
+        // `auto` and `all` name no quantity, and a detected budget is not configured.
+        assert_eq!(configured(None, None, Some("auto"), &host(16)), None);
+        assert_eq!(configured(None, None, Some("all"), &quota(16, 4000)), None);
+        assert_eq!(configured(None, None, None, &quota(16, 4000)), None);
+        assert_eq!(configured(None, None, None, &request_only(16, 2000)), None);
+        assert_eq!(configured(None, None, None, &host(16)), None);
     }
 
     #[test]
