@@ -22,7 +22,6 @@ use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use aws_sdk_credential_bridge::S3CredentialProvider;
-use data_components::iceberg::catalog::hadoop::HadoopCatalogBuilder;
 use data_components::iceberg::catalog::metadata_file::MetadataFileCatalog;
 use datafusion::catalog::TableProvider;
 use iceberg::{
@@ -38,8 +37,8 @@ use super::DataConnectorFactory;
 use super::iceberg_cluster::IcebergClusterTableProvider;
 use crate::{
     catalogconnector::iceberg::{
-        ICEBERG_PARAM_LEN, get_rest_catalog, is_storage_url, map_param_name_to_iceberg_prop,
-        parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
+        ICEBERG_PARAM_LEN, build_opendal_operator, get_rest_catalog, is_storage_url,
+        map_param_name_to_iceberg_prop, parse_table_url, verify_s3_endpoint,
     },
     component::dataset::DatasetSpec,
     dataconnector::{
@@ -77,7 +76,7 @@ pub(crate) const HADOOP_PARAMETERS: [ParameterSpec; HADOOP_PARAM_LEN] = [
     // unprefixed `metadata_path` shares its unprefixed name, and the two must
     // resolve to distinct keys for both spellings to be accepted.
     ParameterSpec::runtime(METADATA_PATH_PARAM)
-        .description("The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog."),
+        .description("The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead, and names the metadata file to read."),
     ParameterSpec::runtime(LEGACY_METADATA_PATH_PARAM)
         .deprecated("Use `iceberg_metadata_path`, which accepts the same full URL and also a path relative to `from`, such as `/metadata/v1.metadata.json`."),
 ];
@@ -227,8 +226,8 @@ impl IcebergDataConnector {
                 .await;
             }
             TableSource::StoragePath => {
-                return IcebergDataConnector::load_hadoop_catalog(
-                    props,
+                return IcebergDataConnector::load_table_root(
+                    &props,
                     storage_factory,
                     dataset,
                     source,
@@ -310,9 +309,9 @@ impl IcebergDataConnector {
             })
     }
 
-    /// Loads the table from exactly the metadata file `metadata_path` names, with no
-    /// catalog and no listing of the table's `metadata/` directory, so the table
-    /// root needs no particular layout.
+    /// Loads the table from the file `iceberg_metadata_path` names, with no catalog
+    /// and no listing of the table's `metadata/` directory. A metadata file is read
+    /// once; a version hint file is read on every query.
     async fn load_pinned_table(
         props: &HashMap<String, String>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
@@ -329,22 +328,8 @@ impl IcebergDataConnector {
                     message,
                 })?;
 
-        let factory = storage_factory.unwrap_or_else(|| default_storage_factory(&location));
-        let file_io = FileIOBuilder::new(factory)
-            .with_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .build();
-
-        // The table is served under the dataset's own name, so two datasets reading
-        // tables from paths that end alike never share an identity.
-        let table_identifier = TableIdent::new(
-            NamespaceIdent::new(dataset.name.schema().unwrap_or("public").to_string()),
-            dataset.name.table().to_string(),
-        );
-
-        tracing::debug!(
-            "Dataset '{}' reads Iceberg metadata file '{location}'",
-            dataset.name
-        );
+        let file_io = file_io(props, storage_factory, &location);
+        let table_identifier = dataset_table_ident(dataset);
         let catalog = MetadataFileCatalog::try_new(&location, table_identifier.clone(), file_io)
             .await
             .map_err(|e| Error::UnableToGetReadProvider {
@@ -352,56 +337,32 @@ impl IcebergDataConnector {
                 connector_component: ConnectorComponent::from(dataset),
                 source: unreadable_metadata_file_message(&location, &e).into(),
             })?;
-        let catalog_client: Arc<dyn Catalog> = Arc::new(catalog);
 
-        table_parts(catalog_client, table_identifier, dataset).await
+        serve_table(catalog, table_identifier, dataset, &location).await
     }
 
-    async fn load_hadoop_catalog(
-        props: HashMap<String, String>,
+    /// Loads the table rooted at `from`, with no catalog. Each query reads the
+    /// metadata file `metadata/version-hint.text` names, or else the one with the
+    /// highest version number in `metadata/`, so new commits are read as they land.
+    async fn load_table_root(
+        props: &HashMap<String, String>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         dataset: &DatasetSpec,
         source: &str,
     ) -> super::DataConnectorResult<IcebergTableParts> {
-        let (base_uri, namespace, table_name) = parse_hadoop_table_url(source, None).map_err(|e| {
-                Error::InvalidConfiguration {
-                    dataconnector: "iceberg".into(),
-                    message: format!("A Dataset Path is required for Iceberg in the format of: file:///tmp/hadoop_warehouse/<namespace>/<table_name>, s3://<bucket>/<namespace>/<table_name>, gs://<bucket>/<namespace>/<table_name>, or gcs://<bucket>/<namespace>/<table_name>. For details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from. {e}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                }
-            })?;
-
-        // Load the specific table
-        let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
-
-        // Determine storage factory from scheme if not explicitly provided
-        let factory = storage_factory.unwrap_or_else(|| default_storage_factory(source));
-
-        // Build an opendal operator for directory listing (scoped to the warehouse root, not the table URL)
-        let operator = crate::catalogconnector::iceberg::build_opendal_operator(&base_uri, &props)
-            .map_err(|e| Error::UnableToGetReadProvider {
+        let root = with_gcs_scheme_as_gs(source.trim_end_matches('/').to_string());
+        let operator =
+            build_opendal_operator(&root, props).map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
                 source: e,
             })?;
+        let file_io = file_io(props, storage_factory, &root);
+        let table_identifier = dataset_table_ident(dataset);
+        let catalog =
+            MetadataFileCatalog::for_table_root(&root, operator, table_identifier.clone(), file_io);
 
-        let catalog_builder = HadoopCatalogBuilder::default()
-            .with_warehouse_root(base_uri)
-            .with_storage_factory(factory)
-            .with_operator(operator)
-            .with_properties(props);
-
-        let catalog_client: Arc<dyn Catalog> =
-            Arc::new(catalog_builder.build().await.map_err(|e| {
-                Error::UnableToGetReadProvider {
-                    dataconnector: "iceberg".into(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                }
-            })?);
-
-        table_parts(catalog_client, table_identifier, dataset).await
+        serve_table(catalog, table_identifier, dataset, &root).await
     }
 }
 
@@ -520,6 +481,60 @@ async fn table_parts(
     })
 }
 
+/// Serves the table `catalog` reads under `table_identifier`, after checking that
+/// its current metadata file can be found, so a misconfigured dataset fails to
+/// load rather than on its first query.
+async fn serve_table(
+    catalog: MetadataFileCatalog,
+    table_identifier: TableIdent,
+    dataset: &DatasetSpec,
+    location: &str,
+) -> super::DataConnectorResult<IcebergTableParts> {
+    let current = catalog
+        .current_metadata()
+        .await
+        .map_err(|e| Error::UnableToGetReadProvider {
+            dataconnector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: unresolved_metadata_message(location, &e).into(),
+        })?;
+    if current.listed {
+        tracing::warn!(
+            "{}",
+            found_by_listing_message(&dataset.name, location, &current.location)
+        );
+    } else {
+        tracing::debug!(
+            "Dataset '{}' reads Iceberg metadata file '{}'",
+            dataset.name,
+            current.location
+        );
+    }
+
+    table_parts(Arc::new(catalog), table_identifier, dataset).await
+}
+
+/// The identity a catalog-less table is served under: the dataset's own name, so
+/// two datasets reading tables from paths that end alike never share an identity.
+fn dataset_table_ident(dataset: &DatasetSpec) -> TableIdent {
+    TableIdent::new(
+        NamespaceIdent::new(dataset.name.schema().unwrap_or("public").to_string()),
+        dataset.name.table().to_string(),
+    )
+}
+
+/// The `FileIO` that reads `location`, with the configured credentials.
+fn file_io(
+    props: &HashMap<String, String>,
+    storage_factory: Option<Arc<dyn StorageFactory>>,
+    location: &str,
+) -> iceberg::io::FileIO {
+    let factory = storage_factory.unwrap_or_else(|| default_storage_factory(location));
+    FileIOBuilder::new(factory)
+        .with_props(props.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .build()
+}
+
 /// The metadata file a dataset pins, with the parameter that named it.
 struct PinnedMetadata {
     param: &'static str,
@@ -617,6 +632,26 @@ fn metadata_file_in_from_message(source: &str) -> String {
 fn ignored_pin_on_rest_catalog_message(dataset: &impl std::fmt::Display, param: &str) -> String {
     format!(
         "Dataset '{dataset}' ignores `{param}`, so it reads the table's current metadata from its REST catalog: `{param}` applies only when `from` is the table root on object storage or a file path. Remove `{param}`, or set `from` to the table root to read the pinned file without a catalog. See: {ICEBERG_DOCS}"
+    )
+}
+
+/// The cause reported when the current metadata file of the table at `location`
+/// (a table root or a version hint) cannot be found.
+fn unresolved_metadata_message(location: &str, error: &iceberg::Error) -> String {
+    format!(
+        "Failed to find the current Iceberg metadata file for '{location}': {error}. Verify `from` is the table root, the directory that contains 'metadata/', or set `iceberg_metadata_path` to the metadata file to read. See: {ICEBERG_DOCS}"
+    )
+}
+
+/// The warning for a table whose current metadata file is found by listing, which
+/// can pick up a commit that is still in progress or that failed.
+fn found_by_listing_message(
+    dataset: &impl std::fmt::Display,
+    table_root: &str,
+    metadata_file: &str,
+) -> String {
+    format!(
+        "Dataset '{dataset}' has no 'metadata/version-hint.text', so each query reads the Iceberg table at '{table_root}' from the metadata file with the highest version number (now '{metadata_file}'). Without a catalog, a commit that is in progress or that failed can be read as the current table. To read a fixed snapshot, set `iceberg_metadata_path`. See: {ICEBERG_DOCS}"
     )
 }
 
@@ -772,5 +807,13 @@ mod tests {
         )));
         assert!(!is_metadata_file(ROOT));
         assert!(!is_metadata_file(&format!("{ROOT}/metadata")));
+    }
+
+    #[test]
+    fn a_table_found_by_listing_is_reported_with_how_to_pin_it() {
+        assert_eq!(
+            found_by_listing_message(&"taxis", ROOT, &format!("{ROOT}/metadata/{FILE}")),
+            "Dataset 'taxis' has no 'metadata/version-hint.text', so each query reads the Iceberg table at 's3://my-bucket/warehouse/db/taxis' from the metadata file with the highest version number (now 's3://my-bucket/warehouse/db/taxis/metadata/00003-8f2c.metadata.json'). Without a catalog, a commit that is in progress or that failed can be read as the current table. To read a fixed snapshot, set `iceberg_metadata_path`. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+        );
     }
 }
