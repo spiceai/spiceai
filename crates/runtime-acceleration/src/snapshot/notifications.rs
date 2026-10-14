@@ -129,7 +129,7 @@ pub struct NotificationConfig {
 }
 
 /// An SQS queue, and the region and credentials that reach it. Snapshot
-/// locations that name the same queue share its consumer.
+/// locations that name the same queue URL share its consumer.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Queue {
     url: String,
@@ -287,7 +287,9 @@ type Announced = HashMap<String, u64>;
 #[derive(Default)]
 pub struct SnapshotNotifications {
     runtime_state_location: Option<String>,
-    consumers: Mutex<HashMap<Queue, Weak<Consumer>>>,
+    /// Keyed by queue URL alone: SQS gives each message to one receiver, so a
+    /// second consumer of the queue would take messages its locations do not hold.
+    consumers: Mutex<HashMap<String, Weak<Consumer>>>,
 }
 
 impl SnapshotNotifications {
@@ -350,15 +352,23 @@ impl SnapshotNotifications {
         let consumer = {
             let mut consumers = self.consumers.lock();
             consumers.retain(|_, consumer| consumer.strong_count() > 0);
-            if let Some(consumer) = consumers.get(&config.queue).and_then(Weak::upgrade) {
+            if let Some(consumer) = consumers.get(&config.queue.url).and_then(Weak::upgrade) {
+                if consumer.credentials != config.queue.credentials {
+                    tracing::warn!(
+                        "{}",
+                        shared_queue_credentials_warning(&config.location, &consumer.opened_for)
+                    );
+                }
                 consumer
             } else {
                 let feeds = Arc::new(Feeds::default());
                 let consumer = Arc::new(Consumer {
+                    credentials: config.queue.credentials.clone(),
+                    opened_for: config.location.clone(),
                     feeds: Arc::clone(&feeds),
                     task: spawn(feeds),
                 });
-                consumers.insert(config.queue.clone(), Arc::downgrade(&consumer));
+                consumers.insert(config.queue.url.clone(), Arc::downgrade(&consumer));
                 consumer
             }
         };
@@ -374,6 +384,10 @@ impl SnapshotNotifications {
 /// One queue's consumer task. Dropping the last [`Feed`] that holds it stops
 /// the task.
 struct Consumer {
+    /// The credentials it reads the queue with: those of `opened_for`.
+    credentials: SqsCredentials,
+    /// The location whose subscription started it.
+    opened_for: NotificationLocation,
     feeds: Arc<Feeds>,
     task: JoinHandle<()>,
 }
@@ -794,6 +808,15 @@ pub fn unread_queue_warning(setting: &str) -> String {
     )
 }
 
+fn shared_queue_credentials_warning(
+    location: &NotificationLocation,
+    opened_for: &NotificationLocation,
+) -> String {
+    format!(
+        "Snapshot location '{location}' names the same SQS queue in `s3_queue_url` as snapshot location '{opened_for}', but with other AWS credentials. A queue has one consumer, so it is read with the credentials of '{opened_for}'. Use the same credentials for every location on the queue, or a queue per location. See: {SNAPSHOTS_DOCS}"
+    )
+}
+
 fn listening_message(location: &NotificationLocation) -> String {
     format!(
         "Snapshot location '{location}' is listening for S3 event notifications on the SQS queue in `s3_queue_url`, so datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published."
@@ -1001,16 +1024,19 @@ mod tests {
         manager: Arc<SnapshotManager>,
     ) -> Arc<Feed> {
         let (announce, announced) = watch::channel(Announced::new());
+        let consumer = Arc::new(Consumer {
+            credentials: SqsCredentials::DefaultChain,
+            opened_for: location.clone(),
+            feeds: Arc::default(),
+            task: tokio::spawn(futures::future::pending()),
+        });
         Arc::new(Feed {
             location,
             state_root,
             manager,
             announce,
             announced,
-            _consumer: Arc::new(Consumer {
-                feeds: Arc::default(),
-                task: tokio::spawn(futures::future::pending()),
-            }),
+            _consumer: consumer,
         })
     }
 
@@ -1437,15 +1463,27 @@ mod tests {
         let first = subscribe(&config());
         let second = subscribe(&config());
         let other_location = subscribe(&config_at(at("s3://archive-bucket/snapshots/")));
+        let other_credentials = subscribe(&NotificationConfig {
+            queue: Queue {
+                credentials: SqsCredentials::Static {
+                    access_key: "other-key".to_string(),
+                    secret_key: "other-secret".to_string(),
+                    session_token: None,
+                },
+                ..queue()
+            },
+            ..config_at(at("s3://other-bucket/snapshots/"))
+        });
         assert_eq!(
             spawns.load(Ordering::SeqCst),
             1,
-            "subscriptions to one queue share its consumer, whatever their location"
+            "subscriptions to one queue URL share its consumer, whatever their location or credentials"
         );
         assert_eq!(running(), 1);
 
         drop(first);
         drop(second);
+        drop(other_credentials);
         assert_eq!(running(), 1, "still used by `other_location`");
         drop(other_location);
         assert_eq!(
@@ -1585,6 +1623,13 @@ mod tests {
         assert!(outside.contains("left on the queue (not deleted)"));
         assert!(outside.contains(SNAPSHOTS_DOCS));
 
+        let other_credentials =
+            shared_queue_credentials_warning(&at("s3://archive-bucket/snapshots/"), &location);
+        assert!(
+            other_credentials.starts_with("Snapshot location 's3://archive-bucket/snapshots' names the same SQS queue in `s3_queue_url` as snapshot location 's3://my-bucket/spice/snapshots', but with other AWS credentials."),
+            "{other_credentials}"
+        );
+
         let shared = Routes {
             locations: vec![location.clone(), at("s3://archive-bucket/snapshots/")],
             state_roots: Vec::new(),
@@ -1618,6 +1663,7 @@ mod tests {
             outside,
             metadata_read_warning(&location, &error),
             invalid_notification_warning(&served, "expected value at line 1 column 1"),
+            other_credentials,
         ] {
             assert!(!line.contains(QUEUE_URL), "never log the queue URL: {line}");
             assert!(!line.contains('\n'), "log lines are single-line: {line}");

@@ -44,12 +44,9 @@ pub fn section_deprecation_warning(section: &Snapshots, state: Option<&RuntimeSt
         if keys.is_empty() {
             String::new()
         } else {
-            format!(" Move {keys} from `snapshots.params` into `{to}`.")
+            format!(" Move {keys} from `snapshots.params` into {to}.")
         }
     };
-    let bootstrap = (section.bootstrap_on_failure_behavior
-        != BootstrapOnFailureBehavior::default())
-    .then(|| behavior_name(section.bootstrap_on_failure_behavior));
 
     let remedy = match (section.location.as_deref(), state) {
         (None, Some(_)) => Remedy::AlreadyThere,
@@ -70,58 +67,45 @@ pub fn section_deprecation_warning(section: &Snapshots, state: Option<&RuntimeSt
     let mut warning = String::from(
         "The top-level `snapshots` section is deprecated and will be removed in a future release. Snapshots are stored in the `snapshots/` folder of `runtime.state.location`.",
     );
-    match &remedy {
+    match remedy {
         Remedy::AlreadyThere => {
             warning.push_str(" Your snapshots are already there: delete the section.");
-            warning.push_str(&move_keys("runtime.state.params"));
+            warning.push_str(&move_keys("`runtime.state.params`"));
         }
         Remedy::SetRuntimeState => {
             warning.push_str(" Delete the section and set `runtime.state.location`.");
-            warning.push_str(&move_keys("runtime.state.params"));
+            warning.push_str(&move_keys("`runtime.state.params`"));
         }
         Remedy::RuntimeState(state_location) => {
             let _ = write!(
                 warning,
-                " To keep your snapshots where they are, replace the section with:\n  runtime:\n    state:\n      location: {state_location}"
+                " To keep your snapshots where they are, delete the section and set `runtime.state.location: {state_location}`."
             );
-            if !keys.is_empty() {
-                let _ = write!(
-                    warning,
-                    "\n      params: # move {keys} from snapshots.params"
-                );
-            }
+            warning.push_str(&move_keys("`runtime.state.params`"));
         }
         Remedy::Datasets(location) => {
             let _ = write!(
                 warning,
-                " To keep your snapshots where they are, delete the section and set on each dataset that enables snapshots:\n  acceleration:\n    snapshots_location: {location}"
+                " To keep your snapshots where they are, delete the section and set `acceleration.snapshots_location: {location}` on each dataset that enables snapshots."
             );
-            if !keys.is_empty() {
-                let _ = write!(
-                    warning,
-                    "\n    snapshots_params: # move {keys} from snapshots.params"
-                );
-            }
-            if let Some(bootstrap) = bootstrap {
-                let _ = write!(
-                    warning,
-                    "\n    snapshots_bootstrap_on_failure_behavior: {bootstrap}"
-                );
-            }
+            warning.push_str(&move_keys(
+                "`acceleration.snapshots_params` on each of those datasets",
+            ));
         }
     }
-    if let Some(bootstrap) = bootstrap.filter(|_| !matches!(remedy, Remedy::Datasets(_))) {
+    if section.bootstrap_on_failure_behavior != BootstrapOnFailureBehavior::default() {
         let _ = write!(
             warning,
-            "\nReplace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: {bootstrap}` on each dataset that enables snapshots."
+            " Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: {}` on each dataset that enables snapshots.",
+            behavior_name(section.bootstrap_on_failure_behavior)
         );
     }
     if !section.enabled {
         warning.push_str(
-            "\n`snapshots.enabled: false` has no replacement: set `snapshots: disabled`, the default, on each dataset instead.",
+            " `snapshots.enabled: false` has no replacement: set `snapshots: disabled`, the default, on each dataset instead.",
         );
     }
-    warning.push_str("\nSee: ");
+    warning.push_str(" See: ");
     warning.push_str(SNAPSHOTS_DOCS);
     warning
 }
@@ -192,9 +176,10 @@ mod tests {
             "{warning}"
         );
         assert!(
-            warning.ends_with(&format!("\nSee: {SNAPSHOTS_DOCS}")),
+            warning.ends_with(&format!(". See: {SNAPSHOTS_DOCS}")),
             "{warning}"
         );
+        assert!(!warning.contains('\n'), "one log line: {warning}");
     }
 
     #[test]
@@ -207,7 +192,7 @@ mod tests {
         assert_eq!(
             warning,
             format!(
-                "The top-level `snapshots` section is deprecated and will be removed in a future release. Snapshots are stored in the `snapshots/` folder of `runtime.state.location`. To keep your snapshots where they are, replace the section with:\n  runtime:\n    state:\n      location: s3://my-bucket/spice/\n      params: # move s3_auth, s3_key, s3_region from snapshots.params\nSee: {SNAPSHOTS_DOCS}"
+                "The top-level `snapshots` section is deprecated and will be removed in a future release. Snapshots are stored in the `snapshots/` folder of `runtime.state.location`. To keep your snapshots where they are, delete the section and set `runtime.state.location: s3://my-bucket/spice/`. Move s3_auth, s3_key, s3_region from `snapshots.params` into `runtime.state.params`. See: {SNAPSHOTS_DOCS}"
             )
         );
 
@@ -216,8 +201,11 @@ mod tests {
             ("file:///var/spice/snapshots/", "file:///var/spice/"),
         ] {
             let warning = section_deprecation_warning(&section(Some(location), None), None);
+            assert_safe(&warning);
             assert!(
-                warning.contains(&format!("      location: {state_location}\nSee:")),
+                warning.contains(&format!(
+                    " set `runtime.state.location: {state_location}`. See:"
+                )),
                 "{warning}"
             );
         }
@@ -235,7 +223,7 @@ mod tests {
             );
             assert_safe(&warning);
             assert!(
-                warning.contains(" Your snapshots are already there: delete the section. Move s3_auth, s3_key, s3_region from `snapshots.params` into `runtime.state.params`.\nSee:"),
+                warning.contains(" Your snapshots are already there: delete the section. Move s3_auth, s3_key, s3_region from `snapshots.params` into `runtime.state.params`. See:"),
                 "{warning}"
             );
         }
@@ -246,7 +234,7 @@ mod tests {
         );
         assert!(
             without_location
-                .contains(" Your snapshots are already there: delete the section.\nSee:"),
+                .contains(" Your snapshots are already there: delete the section. See:"),
             "{without_location}"
         );
     }
@@ -266,16 +254,19 @@ mod tests {
             );
             assert_safe(&warning);
             assert!(
-                warning.contains(&format!(" To keep your snapshots where they are, delete the section and set on each dataset that enables snapshots:\n  acceleration:\n    snapshots_location: {location}\n    snapshots_params: # move s3_auth, s3_key, s3_region from snapshots.params\nSee:")),
+                warning.contains(&format!(" To keep your snapshots where they are, delete the section and set `acceleration.snapshots_location: {location}` on each dataset that enables snapshots. Move s3_auth, s3_key, s3_region from `snapshots.params` into `acceleration.snapshots_params` on each of those datasets. See:")),
                 "{warning}"
             );
         }
 
         let without_params =
             section_deprecation_warning(&section(Some("s3://archive-bucket/snaps/"), None), None);
+        assert_safe(&without_params);
         assert!(
-            without_params.contains("    snapshots_location: s3://archive-bucket/snaps/\nSee:"),
-            "no `snapshots_params` without params to move: {without_params}"
+            without_params.contains(
+                "`acceleration.snapshots_location: s3://archive-bucket/snaps/` on each dataset that enables snapshots. See:"
+            ),
+            "no params to move: {without_params}"
         );
     }
 
@@ -286,9 +277,10 @@ mod tests {
             ..section(Some("s3://archive-bucket/snaps/"), None)
         };
         let warning = section_deprecation_warning(&fallback, None);
+        assert_safe(&warning);
         assert!(
             warning.contains(
-                "    snapshots_location: s3://archive-bucket/snaps/\n    snapshots_bootstrap_on_failure_behavior: fallback\nSee:"
+                " on each dataset that enables snapshots. Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: fallback` on each dataset that enables snapshots. See:"
             ),
             "{warning}"
         );
@@ -301,7 +293,7 @@ mod tests {
         let warning = section_deprecation_warning(&retry, Some(&state("s3://my-bucket/spice/")));
         assert_safe(&warning);
         assert!(
-            warning.contains("\nReplace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: retry` on each dataset that enables snapshots.\n`snapshots.enabled: false` has no replacement: set `snapshots: disabled`, the default, on each dataset instead.\nSee:"),
+            warning.contains(" Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: retry` on each dataset that enables snapshots. `snapshots.enabled: false` has no replacement: set `snapshots: disabled`, the default, on each dataset instead. See:"),
             "{warning}"
         );
     }
@@ -311,7 +303,7 @@ mod tests {
         let warning = section_deprecation_warning(&section(None, Some(params())), None);
         assert_safe(&warning);
         assert!(
-            warning.contains(" Delete the section and set `runtime.state.location`. Move s3_auth, s3_key, s3_region from `snapshots.params` into `runtime.state.params`.\nSee:"),
+            warning.contains(" Delete the section and set `runtime.state.location`. Move s3_auth, s3_key, s3_region from `snapshots.params` into `runtime.state.params`. See:"),
             "{warning}"
         );
     }

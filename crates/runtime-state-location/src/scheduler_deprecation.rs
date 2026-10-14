@@ -70,7 +70,6 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
     let mut warning = format!(
         "{settings} deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`."
     );
-    let mut keys_moved = false;
     if let Some(location) = location {
         // The scheduler's own setting keeps `abfs://` and `abfss://` state at the
         // container root, which no `runtime.state` folder is.
@@ -98,15 +97,8 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
             Remedy::RuntimeState(state_location) => {
                 let _ = write!(
                     warning,
-                    " To keep its state where it is, replace `runtime.scheduler.state_location` with:\n  runtime:\n    state:\n      location: {state_location}"
+                    " To keep its state where it is, remove `runtime.scheduler.state_location` and set `runtime.state.location: {state_location}`."
                 );
-                if !keys.is_empty() {
-                    let _ = write!(
-                        warning,
-                        "\n      params: # move {keys} from runtime.scheduler.params"
-                    );
-                    keys_moved = true;
-                }
             }
             Remedy::StartEmpty => {
                 let set_state = if state.is_some() {
@@ -135,7 +127,7 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
             }
         }
     }
-    if !keys_moved && params.is_some() {
+    if params.is_some() {
         if keys.is_empty() {
             warning.push_str(" Remove `runtime.scheduler.params`.");
         } else {
@@ -145,7 +137,7 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
             );
         }
     }
-    let _ = write!(warning, "\nSee: {SCHEDULER_DOCS}");
+    let _ = write!(warning, " See: {SCHEDULER_DOCS}");
     Some(warning)
 }
 
@@ -195,9 +187,10 @@ mod tests {
             "a param value leaked: {warning}"
         );
         assert!(
-            warning.ends_with(&format!("\nSee: {SCHEDULER_DOCS}")),
+            warning.ends_with(&format!(". See: {SCHEDULER_DOCS}")),
             "{warning}"
         );
+        assert!(!warning.contains('\n'), "one log line: {warning}");
         warning
     }
 
@@ -222,7 +215,7 @@ mod tests {
             assert_eq!(
                 warning,
                 format!(
-                    "`runtime.scheduler.state_location` and `runtime.scheduler.params` are deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`. Its state is already there: remove `runtime.scheduler.state_location`. Move s3_key, s3_region from `runtime.scheduler.params` into `runtime.state.params`.\nSee: {SCHEDULER_DOCS}"
+                    "`runtime.scheduler.state_location` and `runtime.scheduler.params` are deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`. Its state is already there: remove `runtime.scheduler.state_location`. Move s3_key, s3_region from `runtime.scheduler.params` into `runtime.state.params`. See: {SCHEDULER_DOCS}"
                 )
             );
         }
@@ -238,7 +231,7 @@ mod tests {
         assert_eq!(
             warning,
             format!(
-                "`runtime.scheduler.state_location` and `runtime.scheduler.params` are deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`. To keep its state where it is, replace `runtime.scheduler.state_location` with:\n  runtime:\n    state:\n      location: s3://b/spice/\n      params: # move s3_key, s3_region from runtime.scheduler.params\nSee: {SCHEDULER_DOCS}"
+                "`runtime.scheduler.state_location` and `runtime.scheduler.params` are deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`. To keep its state where it is, remove `runtime.scheduler.state_location` and set `runtime.state.location: s3://b/spice/`. Move s3_key, s3_region from `runtime.scheduler.params` into `runtime.state.params`. See: {SCHEDULER_DOCS}"
             )
         );
 
@@ -249,7 +242,7 @@ mod tests {
             "{without_params}"
         );
         assert!(
-            without_params.contains("      location: file:///var/spice/\nSee:"),
+            without_params.contains(" set `runtime.state.location: file:///var/spice/`. See:"),
             "{without_params}"
         );
     }
@@ -309,7 +302,10 @@ mod tests {
                 "{warning}"
             );
             assert!(!warning.contains("already there"), "{warning}");
-            assert!(!warning.contains("    state:\n"), "{warning}");
+            assert!(
+                !warning.contains("set `runtime.state.location: "),
+                "{warning}"
+            );
             assert!(
                 warning.contains(
                     " Move s3_key, s3_region from `runtime.scheduler.params` into `runtime.state.params`."
@@ -325,7 +321,7 @@ mod tests {
         assert_eq!(
             warning,
             format!(
-                "`runtime.scheduler.params` is deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`. Move s3_key, s3_region from `runtime.scheduler.params` into `runtime.state.params`.\nSee: {SCHEDULER_DOCS}"
+                "`runtime.scheduler.params` is deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`. Move s3_key, s3_region from `runtime.scheduler.params` into `runtime.state.params`. See: {SCHEDULER_DOCS}"
             )
         );
 
@@ -335,7 +331,7 @@ mod tests {
             None,
         ));
         assert!(
-            empty.contains(" Remove `runtime.scheduler.params`.\nSee:"),
+            empty.contains(" Remove `runtime.scheduler.params`. See:"),
             "{empty}"
         );
     }
