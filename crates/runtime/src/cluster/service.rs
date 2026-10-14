@@ -82,6 +82,7 @@ use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
+use runtime_cluster::{ExecutorRegistration, Registered};
 use telemetry::metrics_reader::MetricsReader;
 
 /// Handle for sending messages to a connected executor.
@@ -190,6 +191,17 @@ pub struct ClusterServiceImpl {
 }
 
 impl ClusterServiceImpl {
+    /// Where the cluster keeps its shared state, for messages about it: the
+    /// scheduler state location, or this scheduler's address when there is none.
+    async fn state_location(&self) -> String {
+        self.app
+            .read()
+            .await
+            .as_ref()
+            .and_then(|app| app.runtime.scheduler_state())
+            .map_or_else(|| self.advertise_address.clone(), |state| state.location)
+    }
+
     /// Creates a new cluster service implementation.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
@@ -580,8 +592,9 @@ impl ClusterService for ClusterServiceImpl {
         let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();
+        let state_location = self.state_location().await;
         let inbound_task = tokio::spawn(async move {
-            let executor_id = match inbound.next().await {
+            let (executor_id, process_id) = match inbound.next().await {
                 Some(Ok(msg)) => {
                     let executor_id = msg.executor_id.clone();
                     if executor_id.is_empty() {
@@ -594,7 +607,7 @@ impl ClusterService for ClusterServiceImpl {
                     if let Some(message) = msg.message {
                         handle_executor_message(&executor_id, &message, &datafusion).await;
                     }
-                    executor_id
+                    (executor_id, msg.process_id)
                 }
                 Some(Err(e)) => {
                     tracing::warn!("Error receiving first executor control message: {e}");
@@ -607,9 +620,48 @@ impl ClusterService for ClusterServiceImpl {
             };
 
             // Register the executor with the registry.
-            let handles = executor_registry
-                .register(executor_id.clone(), outbound_tx_for_registry)
+            let Registered {
+                handles,
+                registration,
+                connection,
+            } = executor_registry
+                .register(executor_id.clone(), &process_id, outbound_tx_for_registry)
                 .await;
+            match registration {
+                ExecutorRegistration::Duplicate => {
+                    tracing::error!(
+                        "{}",
+                        util::instance_id::duplicate_instance_message(
+                            &executor_id,
+                            &state_location
+                        )
+                    );
+                    // Keep the stream open and ignore it, so the duplicate does not
+                    // reconnect and register again.
+                    while let Some(Ok(_)) = inbound.next().await {}
+                    return;
+                }
+                ExecutorRegistration::Restarted => {
+                    tracing::info!(
+                        "Executor '{executor_id}' restarted, so the tasks and shuffle output of its earlier run are rescheduled"
+                    );
+                    if let Err(err) = notify_scheduler_executor_shutdown(
+                        &datafusion,
+                        &executor_id,
+                        "the executor restarted",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to reschedule the work of executor '{executor_id}' after its restart, so queries running on its earlier run wait until it is reaped: {err}"
+                        );
+                    }
+                    if let Some(tracker) = datafusion.partition_load_tracker.as_ref() {
+                        tracker.drop_executor(&executor_id).await;
+                    }
+                }
+                ExecutorRegistration::New | ExecutorRegistration::Reconnected => {}
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
@@ -618,6 +670,7 @@ impl ClusterService for ClusterServiceImpl {
             // Register the executor stream for PollNow broadcasts.
             executor_streams.register(&executor_id, registration_tx);
 
+            let mut reported_duplicate = false;
             loop {
                 tokio::select! {
                     () = inbound_cancel.cancelled() => {
@@ -626,6 +679,20 @@ impl ClusterService for ClusterServiceImpl {
                     }
                     result = inbound.next() => {
                         match result {
+                            // A later process registered under this id while this
+                            // one is still sending: two processes share the id.
+                            Some(Ok(_)) if !executor_registry.is_current(&executor_id, connection) => {
+                                if !reported_duplicate {
+                                    reported_duplicate = true;
+                                    tracing::error!(
+                                        "{}",
+                                        util::instance_id::duplicate_instance_message(
+                                            &executor_id,
+                                            &state_location
+                                        )
+                                    );
+                                }
+                            }
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
                                     // Route correlated responses (metrics, acks) to their waiters;
@@ -677,8 +744,12 @@ impl ClusterService for ClusterServiceImpl {
                 }
             }
 
-            // Unregister the executor when the stream ends.
-            executor_registry.unregister(&executor_id).await;
+            // Unregister the executor when the stream ends, unless a later
+            // connection under its id replaced this one.
+            if !executor_registry.unregister(&executor_id, connection).await {
+                tracing::debug!("Replaced executor control stream ended: {executor_id}");
+                return;
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
@@ -711,10 +782,16 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
-        let AllocateInitialPartitionsRequest { executor_url } = request.into_inner();
+        let AllocateInitialPartitionsRequest {
+            executor_url,
+            executor_id,
+        } = request.into_inner();
 
-        // Current standard is to have executor id be without scheme.
-        let executor_id = if let Some(index) = executor_url.find("://") {
+        // An executor that sends no id is identified by its advertise address,
+        // without the scheme.
+        let executor_id = if !executor_id.is_empty() {
+            executor_id.as_str()
+        } else if let Some(index) = executor_url.find("://") {
             &executor_url[index + 3..]
         } else {
             &executor_url

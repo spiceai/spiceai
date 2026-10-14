@@ -793,6 +793,8 @@ pub struct ResolvedClusterConfig {
     scheduler_address_url: Option<Url>,
     /// Advertise address with port stripped (if present in the original input).
     node_advertise_host: Option<String>,
+    /// Instance identity set for this runtime instead of the process-wide one.
+    instance_id: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -949,7 +951,27 @@ impl ResolvedClusterConfig {
             scheduler_url,
             scheduler_address_url,
             node_advertise_host,
+            instance_id: None,
         })
+    }
+
+    /// Sets the instance identity of this runtime, for processes that run several
+    /// cluster nodes, such as integration tests.
+    #[must_use]
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = Some(instance_id.into());
+        self
+    }
+
+    /// The identity this node registers under in shared cluster state:
+    /// [`util::instance_id::instance_id`] unless set with [`Self::with_instance_id`].
+    /// Distinct from the advertise address, which is how other nodes reach it.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        match &self.instance_id {
+            Some(instance_id) => instance_id,
+            None => util::instance_id::instance_id(),
+        }
     }
 
     /// Returns the cluster role.
@@ -1319,7 +1341,7 @@ pub async fn initialize_cluster_executor(
             (hostname, bind_addr.port())
         };
 
-    let executor_id = format!("{advertise_host}:{advertise_port}");
+    let executor_id = rt.df.cluster_config.instance_id().to_string();
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
@@ -1784,6 +1806,7 @@ pub async fn initialize_cluster_executor(
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
+                    rt.datafusion().cluster_config.instance_id().to_string(),
                     task_ctx.as_ref(),
                 )
                 .await

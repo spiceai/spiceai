@@ -156,7 +156,8 @@ async fn build_scheduler(
             .with_runtime_config(config.clone())
             .with_resolved_cluster_config(
                 ResolvedClusterConfig::try_new(config.cluster.clone())
-                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                    .with_instance_id(name),
             )
             .with_app(app)
             .build()
@@ -233,7 +234,8 @@ async fn build_executor(
             .with_runtime_config(config.clone())
             .with_resolved_cluster_config(
                 ResolvedClusterConfig::try_new(config.cluster.clone())
-                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                    .with_instance_id(name),
             )
             .with_app(app)
             .build()
@@ -572,7 +574,7 @@ async fn run_runtime_state_layout() -> Result<(), anyhow::Error> {
     let cluster = state_tempdir.path().join("cluster");
     for path in [
         cluster.join("cluster.json"),
-        cluster.join(format!("heartbeats/{}.json", scheduler.cluster_addr)),
+        cluster.join("heartbeats/scheduler.json"),
         cluster.join(format!("jobs/{job_id}.json")),
         cluster.join("scheduler/meta"),
     ] {
@@ -586,6 +588,24 @@ async fn run_runtime_state_layout() -> Result<(), anyhow::Error> {
         root,
         ["cluster"],
         "the scheduler must write only under cluster/"
+    );
+
+    // The scheduler registers under its instance identity; other nodes reach it
+    // at its advertise address.
+    let cluster_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cluster.join("cluster.json"))?)?;
+    let schedulers = cluster_json["schedulers"]
+        .as_object()
+        .expect("cluster.json lists the schedulers");
+    assert_eq!(
+        schedulers.keys().collect::<Vec<_>>(),
+        ["scheduler"],
+        "the scheduler is registered under its instance identity"
+    );
+    assert_eq!(
+        schedulers["scheduler"]["advertise_address"],
+        scheduler.cluster_addr.as_str(),
+        "the advertise address stays host:port"
     );
 
     scheduler.rt.shutdown().await;

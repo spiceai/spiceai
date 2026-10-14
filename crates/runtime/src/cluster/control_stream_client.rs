@@ -110,6 +110,7 @@ async fn teardown_scheduler_stream(
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
+    process_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
     executor: Option<Arc<Executor>>,
@@ -227,6 +228,7 @@ fn spawn_control_stream(
                                 message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
                                     timestamp_ms,
                                 })),
+                                process_id: String::new(),
                             };
 
                             if heartbeat_tx.send(msg).await.is_err() {
@@ -245,6 +247,7 @@ fn spawn_control_stream(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
                 })),
+                process_id: process_id.clone(),
             };
             if outbound_tx.send(init_msg).await.is_err() {
                 teardown_scheduler_stream(
@@ -434,6 +437,7 @@ async fn handle_scheduler_message(
                     request_id: request.request_id,
                     otlp_metrics,
                 })),
+                process_id: String::new(),
             };
 
             if let Err(e) = outbound_tx.send(response).await {
@@ -488,6 +492,7 @@ async fn handle_scheduler_message(
                         request_id,
                         error: result.err(),
                     })),
+                    process_id: String::new(),
                 };
                 if let Err(e) = outbound_tx.send(ack).await {
                     tracing::warn!(
@@ -569,6 +574,9 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 /// handle that is signaled when any scheduler sends a [`PollNow`] command.
 pub struct ControlStreamManager {
     executor_id: String,
+    /// Per-process id sent when a stream opens, so a scheduler tells a restart
+    /// of this executor from a reconnect.
+    process_id: String,
     ballista_executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
@@ -602,6 +610,7 @@ impl ControlStreamManager {
     ) -> Self {
         Self {
             executor_id,
+            process_id: uuid::Uuid::new_v4().to_string(),
             ballista_executor_id,
             client_tls_config,
             metrics_reader: metrics_reader.map(Arc::new),
@@ -636,6 +645,7 @@ impl ControlStreamManager {
                 ballista_executor_id: self.ballista_executor_id.clone(),
                 reason: reason.to_string(),
             })),
+            process_id: String::new(),
         };
 
         let mut sent = 0usize;
@@ -688,6 +698,7 @@ impl ControlStreamManager {
             let handle = spawn_control_stream(
                 address.clone(),
                 self.executor_id.clone(),
+                self.process_id.clone(),
                 self.client_tls_config.clone(),
                 self.metrics_reader.clone(),
                 self.executor.clone(),

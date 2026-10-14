@@ -327,7 +327,7 @@ mod tests {
         assert!(ready <= connected);
         for i in 0..connected {
             let (tx, _rx) = mpsc::channel(1);
-            registry.register(format!("e{i}"), tx).await;
+            registry.register(format!("e{i}"), "", tx).await;
         }
         for i in 0..ready {
             registry

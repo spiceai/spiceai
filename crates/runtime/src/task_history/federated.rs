@@ -227,7 +227,8 @@ impl TableProvider for FederatedTaskHistoryTable {
         // Get the list of peer schedulers
         let peers = self.scheduler_peers.read().await;
         let peer_addresses: Vec<String> = peers
-            .keys()
+            .values()
+            .map(|peer| &peer.advertise_address)
             .filter(|addr| *addr != &self.local_node_id)
             .cloned()
             .collect();
@@ -586,6 +587,53 @@ mod tests {
 
         assert_eq!(projected_col_0.value(0), "value_7");
         assert_eq!(projected_col_1.value(0), "value_10");
+    }
+
+    /// Schedulers register under their instance identity, so this scheduler finds
+    /// itself among its peers by advertise address and does not query itself.
+    #[tokio::test]
+    async fn the_local_scheduler_is_matched_by_advertise_address_not_identity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["local"])) as ArrayRef],
+        )
+        .expect("record batch should build");
+        let local_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("local memtable should build");
+        let peers = SchedulerPeers::from([(
+            "sched-a".to_string(),
+            crate::cluster::SchedulerEntry {
+                scheduler_id: "sched-a".to_string(),
+                instance_id: uuid::Uuid::new_v4(),
+                advertise_address: "127.0.0.1:50052".to_string(),
+                grpc_address: "127.0.0.1:50051".to_string(),
+                http_address: "127.0.0.1:8090".to_string(),
+                started_at_ms: 0,
+                ttl_ms: 30_000,
+                build_version: "test".to_string(),
+                labels: HashMap::new(),
+            },
+        )]);
+
+        let table = FederatedTaskHistoryTable::new(
+            Arc::clone(&schema),
+            Arc::new(local_table),
+            Arc::new(RwLock::new(peers)),
+            Arc::new(RwLock::new(HashMap::new())),
+            None,
+            "127.0.0.1:50052".to_string(),
+        );
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("a scan that reaches no peer should succeed");
+        let results = collect(plan, ctx.task_ctx())
+            .await
+            .expect("collecting the local rows should succeed");
+        assert_eq!(results.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     }
 
     #[test]
