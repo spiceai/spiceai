@@ -73,8 +73,8 @@ use crate::{
     },
 };
 
-mod empty_text;
 mod elasticsearch;
+mod empty_text;
 pub mod megascience;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;

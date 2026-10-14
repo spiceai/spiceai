@@ -38,6 +38,28 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
+/// Validates basic `/v1/search` request parameters, returning an error message
+/// for a `400 Bad Request` if the request is invalid.
+fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
+    // For now, force the user to specify which data.
+    if payload
+        .base
+        .datasets
+        .as_ref()
+        .is_some_and(std::vec::Vec::is_empty)
+    {
+        return Some("No data sources provided");
+    }
+
+    if payload.base.limit.is_some_and(|limit| limit == 0) {
+        return Some("Limit must be greater than 0");
+    }
+
+    // Empty/whitespace `text` is rejected in `SearchRequest::try_from` so HTTP
+    // and MCP share one enforcement path; that error maps to HTTP 400 below.
+    None
+}
+
 /// Search
 ///
 /// Perform a vector similarity search (VSS) operation on a dataset.
@@ -116,28 +138,6 @@ struct SearchResponse {
         )
     )
 ))]
-/// Validates basic `/v1/search` request parameters, returning an error message
-/// for a `400 Bad Request` if the request is invalid.
-fn validate_request(payload: &SearchRequestHTTPJson) -> Option<&'static str> {
-    // For now, force the user to specify which data.
-    if payload
-        .base
-        .datasets
-        .as_ref()
-        .is_some_and(std::vec::Vec::is_empty)
-    {
-        return Some("No data sources provided");
-    }
-
-    if payload.base.limit.is_some_and(|limit| limit == 0) {
-        return Some("Limit must be greater than 0");
-    }
-
-    // Empty/whitespace `text` is rejected in `SearchRequest::try_from` so HTTP
-    // and MCP share one enforcement path; that error maps to HTTP 400 below.
-    None
-}
-
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<SearchEngine<crate::search::util::RuntimeTableProviderExplorer>>>,
     Json(payload): Json<SearchRequestHTTPJson>,
