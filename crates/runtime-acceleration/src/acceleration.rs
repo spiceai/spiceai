@@ -229,6 +229,10 @@ pub enum SettingsRebuild {
     /// could not reload until the source can be read again, so the stored settings are
     /// kept meanwhile.
     HeldUntilSourceReadable,
+    /// The caller has no way to rebuild the acceleration (an Iceberg DDL table, whose
+    /// acceleration its `CREATE TABLE` creates), so a stored table keeps the settings it
+    /// was built with, as under a refresh mode a reload cannot restore.
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2308,6 +2312,10 @@ mod tests {
                 settings_rebuild: SettingsRebuild::HeldUntilSourceReadable,
                 ..acceleration.clone()
             };
+            let unsupported = Acceleration {
+                settings_rebuild: SettingsRebuild::Unsupported,
+                ..acceleration.clone()
+            };
             // Writes that only the acceleration holds, for good or until delivered, are
             // rows no reload brings back, whatever the refresh mode.
             let writes_only_here = [
@@ -2327,6 +2335,10 @@ mod tests {
                 assert!(
                     !held.rebuilds_on_settings_change(*refresh_mode),
                     "a source that cannot be read holds the rebuild: mode: {mode}, refresh_mode: {refresh_mode:?}"
+                );
+                assert!(
+                    !unsupported.rebuilds_on_settings_change(*refresh_mode),
+                    "a caller with no rebuild path keeps the stored settings: mode: {mode}, refresh_mode: {refresh_mode:?}"
                 );
                 for writes in &writes_only_here {
                     assert!(
