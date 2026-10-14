@@ -690,6 +690,144 @@ async fn a_changed_primary_key_rebuilds_an_acceleration_served_before_its_source
     Ok(())
 }
 
+/// A source the dataset reaches, but whose every read fails, holds the rebuild as well. A
+/// connector can build the table for a source without reading it, so only a read shows
+/// that a rebuilt acceleration could reload. Dropping the existing one on less would leave
+/// the dataset with no rows until the source answers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_primary_key_is_held_while_every_read_of_the_source_fails()
+-> Result<(), anyhow::Error> {
+    use crate::source_unavailable::{UnreachableSource, dataset_status};
+    use crate::utils::run_query;
+    use runtime::status::ComponentStatus;
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    let dir = tempfile::tempdir()?;
+    let metadata_dir = dir.path().join("metadata");
+    let source = UnreachableSource::new("settings-unreadable", 1);
+    source.register().await;
+    source.read_lazily();
+    source.bring_up();
+    let dataset = |primary_key: Option<&str>| {
+        let mut dataset = Dataset::new(format!("{}://orders", source.prefix), "orders");
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            primary_key: primary_key.map(ToString::to_string),
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.path().join("data").to_string_lossy().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().to_string(),
+                ),
+            ]))),
+            ..Acceleration::default()
+        });
+        dataset
+    };
+    let start = |dataset: Dataset| async move {
+        let app = AppBuilder::new("settings_change_cayenne")
+            .with_dataset(dataset)
+            .build();
+        crate::configure_test_datafusion();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        (rt, loader)
+    };
+    let sum_and_count = |rt: Arc<Runtime>| async move {
+        let batches = run_query(&rt, "SELECT CAST(SUM(v) AS BIGINT), COUNT(*) FROM orders")
+            .await
+            .ok()?;
+        let batch = batches.first()?;
+        let value = |column: usize| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|values| values.value(0))
+        };
+        Some((value(0)?, value(1)?))
+    };
+    let loads = |rt: Arc<Runtime>, expected: (i64, i64)| async move {
+        wait_until_true(Duration::from_secs(60), || {
+            let rt = Arc::clone(&rt);
+            async move {
+                dataset_status(&rt, "orders") == Some(ComponentStatus::Ready)
+                    && sum_and_count(Arc::clone(&rt)).await == Some(expected)
+            }
+        })
+        .await
+    };
+    let stored = || async {
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))?;
+        catalog.init().await?;
+        Ok::<_, anyhow::Error>(catalog.get_table("orders").await?)
+    };
+
+    // Built with no primary key from the source's first value.
+    let (rt, loader) = start(dataset(None)).await;
+    let built = loads(Arc::clone(&rt), (3, 3)).await;
+    let observed = sum_and_count(Arc::clone(&rt)).await;
+    let checkpointed = wait_for_checkpoint(&rt, dataset(None)).await;
+    rt.shutdown().await;
+    loader.abort();
+    anyhow::ensure!(built, "building the acceleration, got {observed:?}");
+    checkpointed?;
+    let first = stored().await?;
+    assert!(first.primary_key.is_empty());
+
+    // The source changes, and the dataset restarts with a primary key while the source
+    // still builds its table but fails every read of it. A rebuilt acceleration could
+    // not reload, so the existing one keeps serving with the settings it was built with.
+    source.set_value(2);
+    source.set_scans_failing(true);
+    let (rt, loader) = start(dataset(Some("id"))).await;
+    let kept = loads(Arc::clone(&rt), (3, 3)).await;
+    let observed = sum_and_count(Arc::clone(&rt)).await;
+    let status = dataset_status(&rt, "orders");
+    rt.shutdown().await;
+    loader.abort();
+    assert!(
+        source.failed_scans() > 0,
+        "the restart must have tried to read the source"
+    );
+    assert!(
+        kept,
+        "while every read of its source fails, the existing acceleration must keep serving, got {observed:?} ({status:?})"
+    );
+    let held = stored().await?;
+    assert_eq!(held.table_id, first.table_id);
+    assert!(held.primary_key.is_empty());
+
+    // Once the source can be read, the next restart rebuilds with the new key and loads
+    // the source's new value.
+    source.set_scans_failing(false);
+    let (rt, loader) = start(dataset(Some("id"))).await;
+    let rebuilt = loads(Arc::clone(&rt), (6, 3)).await;
+    let observed = sum_and_count(Arc::clone(&rt)).await;
+    rt.shutdown().await;
+    loader.abort();
+    assert!(
+        rebuilt,
+        "a source that can be read again must let the held rebuild happen, got {observed:?}"
+    );
+    let second = stored().await?;
+    assert_ne!(second.table_id, first.table_id);
+    assert_eq!(second.primary_key, vec!["id".to_string()]);
+    Ok(())
+}
+
 /// [`a_changed_primary_key_is_held_while_a_source_schema_change_is_blocked`] for a dataset
 /// that registers against its existing acceleration before its source is reached. Its
 /// source answers, but on a changed schema, so it never resolves on the schema the dataset

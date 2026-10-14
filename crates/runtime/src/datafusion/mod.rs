@@ -649,29 +649,64 @@ impl Error {
     }
 }
 
-/// How long a dataset whose acceleration needs a rebuild waits for a source it has not
-/// reached yet, before keeping the settings its acceleration was built with.
+/// How long a dataset whose acceleration needs a rebuild waits for its source to answer a
+/// read, reaching it first if it has not been reached yet, before keeping the settings its
+/// acceleration was built with.
 const REBUILD_SOURCE_WAIT: Duration = Duration::from_secs(30);
 
-/// Whether a rebuilt acceleration could reload from `source_table_provider`: its source can
-/// be read on the schema the dataset registered with. A source the registration reached
-/// can; one whose schema change `on_schema_change` holds back cannot; one not reached yet
-/// can once it resolves, which is waited for up to [`REBUILD_SOURCE_WAIT`].
-async fn source_readable_for_rebuild(source_table_provider: &FederatedTable) -> bool {
+/// Whether a rebuilt acceleration could reload from `source_table_provider`: its source
+/// answers a read on the schema the dataset registered with. A source whose schema change
+/// `on_schema_change` holds back cannot. Any other source is read, one row through the
+/// table the reload reads, after waiting for it to be reached if it has not been yet, all
+/// within [`REBUILD_SOURCE_WAIT`].
+///
+/// A built table alone shows nothing about reads: a connector can build one without
+/// reading its source (from a lazily connecting pool, say) while every read fails, and
+/// dropping the acceleration on that would leave the dataset with no rows until the
+/// source answers again.
+async fn source_readable_for_rebuild(
+    ctx: &SessionContext,
+    dataset_name: &TableReference,
+    source_table_provider: &FederatedTable,
+) -> bool {
     if source_table_provider.holds_schema_change() {
         return false;
     }
-    if !source_table_provider.awaits_source() {
-        return true;
+    let read = async {
+        let Ok(table_provider) = source_table_provider.try_wait_table_provider().await else {
+            return false;
+        };
+        match read_one_row(ctx, table_provider).await {
+            Ok(()) => true,
+            Err(error) => {
+                let error = error.to_string();
+                let cause = util::single_line(&error);
+                tracing::debug!(
+                    "Dataset '{dataset_name}' keeps its acceleration for now: reading its source before a rebuild failed: {cause}"
+                );
+                false
+            }
+        }
+    };
+    tokio::time::timeout(REBUILD_SOURCE_WAIT, read)
+        .await
+        .unwrap_or(false)
+}
+
+/// Reads at most one row through `table_provider`, so an empty source answers too.
+async fn read_one_row(
+    ctx: &SessionContext,
+    table_provider: Arc<dyn TableProvider>,
+) -> datafusion::error::Result<()> {
+    let mut rows = ctx
+        .read_table(table_provider)?
+        .limit(0, Some(1))?
+        .execute_stream()
+        .await?;
+    while let Some(batch) = rows.next().await {
+        batch?;
     }
-    matches!(
-        tokio::time::timeout(
-            REBUILD_SOURCE_WAIT,
-            source_table_provider.try_wait_table_provider()
-        )
-        .await,
-        Ok(Ok(_))
-    )
+    Ok(())
 }
 
 /// The line an operator reads when an acceleration is rebuilt for changed settings.
@@ -5037,9 +5072,10 @@ impl DataFusion {
 
     /// [`Self::create_accelerator_table_adopting_settings`] for a dataset, whose rebuilt
     /// acceleration reloads from its source: the acceleration is dropped only once the
-    /// source can be read on the schema the dataset registered with
-    /// ([`source_readable_for_rebuild`]). While it cannot — it is unreachable, or
-    /// `on_schema_change` holds back its schema change — a rebuilt table could not reload,
+    /// source answers a read on the schema the dataset registered with
+    /// ([`source_readable_for_rebuild`]). While it does not — it is unreachable, a read of
+    /// it fails, or `on_schema_change` holds back its schema change — a rebuilt table could
+    /// not reload,
     /// so the engine keeps the settings the acceleration was built with
     /// ([`SettingsRebuild::HeldUntilSourceReadable`]) and the dataset keeps serving it.
     async fn create_dataset_accelerator_table(
@@ -5062,7 +5098,9 @@ impl DataFusion {
             .await
         {
             Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
-                if source_readable_for_rebuild(source_table_provider).await {
+                if source_readable_for_rebuild(&self.ctx, &dataset.name, source_table_provider)
+                    .await
+                {
                     self.rebuild_acceleration(dataset, acceleration_settings, &cause.to_string())
                         .await?;
                     return self

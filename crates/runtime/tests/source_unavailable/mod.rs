@@ -172,6 +172,23 @@ impl UnreachableSource {
         self.extra_column.store(true, Ordering::SeqCst);
     }
 
+    /// Builds each read provider without reading the source, the way a connector with a
+    /// lazily connecting pool does, so only a scan finds out whether the source answers.
+    pub(crate) fn read_lazily(&self) {
+        self.dynamic_reads.store(true, Ordering::SeqCst);
+    }
+
+    /// Fails every scan of a lazily built read provider ([`Self::read_lazily`]) while
+    /// `failing` is set.
+    pub(crate) fn set_scans_failing(&self, failing: bool) {
+        self.fail_scans.store(failing, Ordering::SeqCst);
+    }
+
+    /// How many scans failed because [`Self::set_scans_failing`] was set.
+    pub(crate) fn failed_scans(&self) -> usize {
+        self.failed_scans.load(Ordering::SeqCst)
+    }
+
     fn report_primary_key(&self) {
         self.primary_key.store(true, Ordering::SeqCst);
     }
