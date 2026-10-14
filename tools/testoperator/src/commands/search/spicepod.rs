@@ -68,7 +68,7 @@ fn has_table(app: &App, name: &str) -> bool {
 ///   benchmark_dataset: fiqa_retrieval
 /// ```
 ///
-/// A spicepod without it reports [`BenchmarkDataset::UNLABELED`].
+/// A spicepod without it reports `custom`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BenchmarkDataset(String);
 
