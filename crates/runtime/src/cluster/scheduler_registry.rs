@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use app::spicepod::component::runtime::StateLocation;
+use app::spicepod::component::runtime::{StateLocation, StateSource};
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
 use object_store::ObjectStore;
@@ -876,16 +876,20 @@ pub(super) async fn build_object_store(
         Arc::clone(&rt.secrets()),
         rt.tokio_io_runtime().clone(),
         state,
+        rt.state_location_check(),
     )
     .await
 }
 
+/// Builds the scheduler's store at `state`. A store in `runtime.state` writes
+/// only once `check` has passed.
 pub async fn build_object_store_internal(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,
+    check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
-    runtime_state_location::build_object_store(
+    let (store, prefix) = runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         state,
@@ -894,7 +898,14 @@ pub async fn build_object_store_internal(
     .await
     .map_err(|source| Error::ObjectStoreState {
         source: Box::new(source),
-    })
+    })?;
+    let store = match check {
+        Some(check) if state.source == StateSource::RuntimeState => {
+            check.guard(runtime_state_location::StateFeature::Scheduler, store)
+        }
+        _ => store,
+    };
+    Ok((store, prefix))
 }
 
 fn now_ms() -> Result<u64> {
