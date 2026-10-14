@@ -7290,7 +7290,7 @@
           },
           "model": {
             "type": "string",
-            "description": "The model that answered."
+            "description": "The model that answered, by the name the request used."
           },
           "usage": {
             "oneOf": [
