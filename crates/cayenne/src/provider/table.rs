@@ -2987,6 +2987,7 @@ pub struct CayenneTableProviderBuilder {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -3141,6 +3142,14 @@ struct CayenneTableProviderOpenOptions {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    /// The conflict detection recorded for the partitioned table this table is a
+    /// partition of, if it is one. A partition follows that table turning the check
+    /// off, with the conflict action it records cleared to match, as the table's own is:
+    /// the change is applied in place to the table's metastore row, not to the rows of
+    /// the partitions it already has, which would otherwise keep checking and keep
+    /// resolving a key repeated within one write. A partition is never given the check
+    /// this way, since one written without it may hold more than one row per key.
+    partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// What a sweep consults before deleting a snapshot directory: in-flight scan
@@ -3185,7 +3194,20 @@ impl CayenneTableProviderBuilder {
             index_word_bits: None,
             dataset_name: None,
             snapshot_dir_pins: None,
+            partitioned_table_conflict_detection: None,
         }
+    }
+
+    /// Open or create a partition of a partitioned table whose metastore row records
+    /// `detection`. A partition follows that table turning conflict detection off; see
+    /// [`CayenneTableProviderOpenOptions::partitioned_table_conflict_detection`].
+    #[must_use]
+    pub(crate) fn with_partitioned_table_conflict_detection(
+        mut self,
+        detection: PkConflictDetection,
+    ) -> Self {
+        self.partitioned_table_conflict_detection = Some(detection);
+        self
     }
 
     /// Open the table over the pins of the instance this one replaces, so this
@@ -3336,6 +3358,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3372,6 +3395,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -3384,7 +3408,7 @@ impl CayenneTableProviderBuilder {
 /// created with `DoNothing` by an earlier release included — it upserts on that key.
 /// A table without one, or with no `on_conflict` (`pk_conflict_detection: none`),
 /// is left as recorded.
-fn upsert_on_primary_key(
+pub(crate) fn upsert_on_primary_key(
     primary_key: &[String],
     on_conflict: Option<OnConflict>,
 ) -> Option<OnConflict> {
@@ -9605,11 +9629,16 @@ impl CayenneTableProvider {
             index_word_bits,
             dataset_name,
             snapshot_dir_pins,
+            partitioned_table_conflict_detection,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
         table_metadata.on_conflict =
             upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
+        if partitioned_table_conflict_detection == Some(PkConflictDetection::None) {
+            table_metadata.vortex_config.pk_conflict_detection = PkConflictDetection::None;
+            table_metadata.on_conflict = None;
+        }
 
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
@@ -10415,6 +10444,15 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn metadata(&self) -> &TableMetadata {
         &self.table_metadata
+    }
+
+    /// The primary-key conflict detection this table's writes run with: the mode its
+    /// metastore row records. That is the requested mode unless the table kept its
+    /// settings through a change it cannot adopt in place, or holds them until its source
+    /// can be read. Such a table keeps its key handling with them, so its writes do not
+    /// follow the requested mode the shared context was built from.
+    fn pk_conflict_detection(&self) -> PkConflictDetection {
+        self.table_metadata.vortex_config.pk_conflict_detection
     }
 
     /// The configured CDC durability mode for this table.
@@ -15705,7 +15743,7 @@ impl CayenneTableProvider {
             return Ok(PreparedInsertStream::immediate(stream));
         };
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+        if self.pk_conflict_detection() == PkConflictDetection::None {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for append"
@@ -15921,7 +15959,7 @@ impl CayenneTableProvider {
             .clone()
             .unwrap_or(OnConflict::DoNothingAll);
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+        if self.pk_conflict_detection() == PkConflictDetection::None {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for sharded append"
