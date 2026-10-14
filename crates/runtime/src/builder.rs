@@ -976,11 +976,11 @@ async fn build_http_rate_control_registry(
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         &state.into(),
-        crate::object_store_state::StateFeature::RateControl,
+        runtime_state_location::StateFeature::RateControl,
     )
     .await
     {

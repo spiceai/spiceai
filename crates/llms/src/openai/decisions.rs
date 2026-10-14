@@ -216,15 +216,18 @@ impl Evaluate for OpenAiDecisions {
         } else {
             self.ask(&body).await?
         };
-        let answered = decision_response_to_system_one(&request, decision).map_err(|detail| {
-            evaluate_api::Error::UnparseableResponse {
-                model: self.name.clone(),
-                response: detail,
-            }
-        })?;
+        let mut answered =
+            decision_response_to_system_one(&request, decision).map_err(|detail| {
+                evaluate_api::Error::UnparseableResponse {
+                    model: self.name.clone(),
+                    response: detail,
+                }
+            })?;
         // A 200 that drops, re-types, or answers outside its own options is a wrong
         // result, not a success.
         evaluate_api::check_answers(&self.name, &request.questions, &answered)?;
+        // Responses name the model the caller asked for, as chat completions do.
+        answered.model.clone_from(&self.name);
         Ok(answered)
     }
 
@@ -361,7 +364,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&answered).expect("serializes"),
             json!({
-                "model": "gpt-6-luna",
+                "model": "luna",
                 "answers": {
                     "damaged": {"type": "noul", "noul": 0.95},
                     "team": {"type": "choice", "choice": "support", "probabilities": {"billing": 0.1, "support": 0.9}, "confidence": 0.8}
@@ -450,7 +453,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&answered).expect("serializes"),
             json!({
-                "model": "gpt-6-luna",
+                "model": "luna",
                 "answers": {"only": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.0}}
             })
         );
@@ -539,7 +542,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&response).expect("serializes"),
             json!({
-                "model": "gpt-6-luna",
+                "model": "luna",
                 "answers": [
                     {"type": "choice", "name": "valid", "choice": false, "probabilities": [{"value": true, "probability": 0.25}, {"value": false, "probability": 0.75}], "confidence": 0.5},
                     {"type": "choice", "name": null, "choice": "true", "probabilities": [{"value": true, "probability": 0.25}, {"value": "true", "probability": 0.625}, {"value": "maybe", "probability": 0.125}], "confidence": 0.4}

@@ -1192,16 +1192,18 @@ params:
         parse_jsonrpc_body(&body)
     }
 
-    /// Asserts that a `tools/call` was refused with `message`: a JSON-RPC
-    /// internal error carrying the tool's error.
+    /// Asserts that a `tools/call` was refused with `message`: a tool result
+    /// with `isError: true` carrying the tool's error.
     fn assert_read_only_rejection(response: &Value, message: &str) {
         assert_eq!(
-            response.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32603),
+            response.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
             "a read-only API key's write must be refused: {response}"
         );
         assert_eq!(
-            response.pointer("/error/message").and_then(Value::as_str),
+            response
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str),
             Some(message),
             "unexpected refusal: {response}"
         );
@@ -1219,11 +1221,9 @@ params:
             .ok_or_else(|| anyhow::anyhow!("tools/call returned no text content: {response}"))
     }
 
-    /// The rows a successful `sql` tool call returned. Its result is a JSON
-    /// string that holds the rows as a JSON array.
+    /// The rows a successful `sql` tool call returned, as a JSON array.
     fn sql_tool_rows(response: &Value) -> anyhow::Result<Value> {
-        let rows: String = serde_json::from_str(tool_result_text(response)?)?;
-        Ok(serde_json::from_str(&rows)?)
+        Ok(serde_json::from_str(tool_result_text(response)?)?)
     }
 
     /// An INSERT of one row whose `id` and `value` are `value` into
