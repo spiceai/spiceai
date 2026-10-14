@@ -38,7 +38,7 @@ use cayenne::{CayennePartitionCreator, ScanViewReuse};
 // half — a metastore on disk that no parameter names — stays in this file, beside the
 // teardown it guards.
 use cayenne::metastore_layout::{
-    absolute_data_dir, fs_probe_path, is_local_path, overlapping_metastore_dir,
+    absolute_data_dir, fs_probe_path, is_local_path, overlapping_metastore_dir, resolved_data_dir,
 };
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -1454,12 +1454,16 @@ async fn path_exists(path: impl AsRef<Path>) -> bool {
     matches!(tokio::fs::try_exists(path).await, Ok(true))
 }
 
-/// Whether the local directory `inner` lies inside the local directory `outer`, compared
-/// as absolute paths component by component, so `/data/orders2` is not inside
+/// Whether the local directory `inner` lies inside the local directory `outer` as the
+/// filesystem resolves them ([`resolved_data_dir`]): through a symlink that aliases
+/// `outer` too. Paths compare component by component, so `/data/orders2` is not inside
 /// `/data/orders`. An object-store location lies inside nothing local.
-fn lies_inside(inner: &str, outer: &str) -> std::io::Result<bool> {
+async fn lies_inside(inner: &str, outer: &str) -> std::io::Result<bool> {
     Ok(
-        match (absolute_data_dir(inner)?, absolute_data_dir(outer)?) {
+        match (
+            resolved_data_dir(inner).await?,
+            resolved_data_dir(outer).await?,
+        ) {
             (Some(inner), Some(outer)) => inner.starts_with(outer),
             _ => false,
         },
@@ -4675,7 +4679,7 @@ impl DataAccelerator for CayenneAccelerator {
                 {
                     Self::ensure_metastore_outside_data_dir(source, &stored.path).await?;
                     Self::ensure_no_catalog_under_data_dir(source, &stored.path).await?;
-                    removed_dirs = if lies_inside(&dir_path, &stored.path).boxed()? {
+                    removed_dirs = if lies_inside(&dir_path, &stored.path).await.boxed()? {
                         object_store_table_prefixes(catalog.as_ref(), table_name, &stored)
                             .await
                             .boxed()?
@@ -6920,6 +6924,86 @@ mod tests {
         std::fs::write(&old_file, b"rows").expect("old file");
         drop(catalog);
 
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_file = new_dir.join("unrelated");
+        std::fs::write(&new_file, b"keep").expect("new file");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    moved.to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        CayenneAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await
+            .expect("drop the stored table");
+
+        assert!(
+            !stored_dir.join(&table_id).exists(),
+            "the stored table's files must be removed"
+        );
+        assert!(
+            new_file.exists(),
+            "the newly configured location's contents must be left alone"
+        );
+    }
+
+    /// [`drop_table_keeps_a_configured_location_nested_inside_the_stored_one`] for a
+    /// configured location reached through a symlink to the stored directory: it lies
+    /// inside the stored one on disk, though not as spelled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_table_keeps_a_configured_location_reached_through_an_alias() {
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        // Stored at `data/orders`; `alias` is a symlink to it, and the dataset now puts its
+        // data under `alias/moved`.
+        let stored_dir = base.path().join("data").join("orders");
+        let alias = base.path().join("alias");
+        let moved = alias.join("moved");
+        let new_dir = moved.join("orders");
+
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: stored_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the stored table");
+        let old_file = stored_dir.join(&table_id).join("data.vortex");
+        std::fs::create_dir_all(old_file.parent().expect("parent")).expect("old table dir");
+        std::fs::write(&old_file, b"rows").expect("old file");
+        drop(catalog);
+
+        std::os::unix::fs::symlink(&stored_dir, &alias).expect("alias the stored directory");
         std::fs::create_dir_all(&new_dir).expect("new dir");
         let new_file = new_dir.join("unrelated");
         std::fs::write(&new_file, b"keep").expect("new file");
