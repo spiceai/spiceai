@@ -700,9 +700,9 @@ impl ExecutorRegistry {
     /// connects to `address` (`host:port`) and was registered by the executor
     /// process `process_id` (empty for executors that send none). Returns
     /// `false`, inserting nothing, when a later process under the same id
-    /// replaced `process_id` or already registered its own endpoint: an earlier
-    /// process's endpoint must not displace its successor's, whichever arrives
-    /// first. Process ids sort by creation time.
+    /// is newer than `process_id`, by its control stream or its endpoint: an
+    /// earlier process's endpoint must not displace its successor's, whichever
+    /// arrives first. Process ids sort by creation time.
     pub async fn insert_flight_sql_client(
         &self,
         executor_id: String,
@@ -711,15 +711,18 @@ impl ExecutorRegistry {
         client: FlightSqlClient,
     ) -> bool {
         let mut clients = self.flight_sql_clients.write().await;
-        let superseded =
-            !process_id.is_empty()
-                && (self.processes.lock().get(&executor_id).is_some_and(|seen| {
-                    seen.replaced.iter().any(|replaced| replaced == process_id)
-                }) || self
-                    .flight_sql_endpoints
-                    .read()
-                    .get(&executor_id)
-                    .is_some_and(|endpoint| endpoint.process_id.as_str() > process_id));
+        // Older than the process registered last (a replaced run or a refused
+        // duplicate), or older than the process whose endpoint is registered.
+        let superseded = !process_id.is_empty()
+            && (self.processes.lock().get(&executor_id).is_some_and(|seen| {
+                seen.current
+                    .as_deref()
+                    .is_some_and(|current| process_id < current)
+            }) || self
+                .flight_sql_endpoints
+                .read()
+                .get(&executor_id)
+                .is_some_and(|endpoint| endpoint.process_id.as_str() > process_id));
         if superseded {
             return false;
         }
@@ -1477,6 +1480,19 @@ mod tests {
         assert_eq!(newer.registration, ExecutorRegistration::New);
         assert_eq!(older.registration, ExecutorRegistration::Duplicate);
         assert!(registry.is_current("exec-a", newer.connection));
+
+        // Its endpoint is refused too, even before the newer process registers one.
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(registry.ready_executor_addresses_sync().is_empty());
     }
 
     /// An executor that sends no process id is registered as before: a second
