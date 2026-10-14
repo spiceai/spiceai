@@ -44,6 +44,7 @@ use datafusion::catalog::CatalogProviderList;
 
 use crate::component::dataset::acceleration::{Acceleration as RuntimeAcceleration, Mode};
 use crate::dataaccelerator::AccelerationSource;
+use runtime_acceleration::acceleration::SettingsRebuild;
 
 /// Creates a result schema for DDL operations (single "result" column).
 fn ddl_result_schema() -> SchemaRef {
@@ -87,13 +88,16 @@ impl IcebergDdlAccelerationSource {
     fn new(
         app_name: String,
         name: TableReference,
-        acceleration: RuntimeAcceleration,
+        mut acceleration: RuntimeAcceleration,
         time_column: Option<String>,
     ) -> Self {
         let app = App {
             name: app_name,
             ..App::default()
         };
+        // `CREATE TABLE` has no path that rebuilds an acceleration, so a stored table
+        // keeps the settings it was built with when they change.
+        acceleration.settings_rebuild = SettingsRebuild::Unsupported;
 
         Self {
             app: Arc::new(app),
@@ -1384,5 +1388,38 @@ impl ExecutionPlan for IcebergDropTableExec {
             ddl_result_schema(),
             stream,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::acceleration::RefreshMode;
+
+    /// A table `CREATE TABLE` accelerates is never rebuilt for changed settings, though
+    /// its acceleration reads as a rebuildable one (`file` mode, `full` refresh,
+    /// write-through). Nothing on this path handles a rebuild, so a stored table keeps the
+    /// settings it was built with instead of failing to register.
+    #[test]
+    fn an_iceberg_ddl_table_keeps_its_stored_settings() {
+        let acceleration = RuntimeAcceleration {
+            mode: Mode::File,
+            ..RuntimeAcceleration::default()
+        };
+        assert!(
+            acceleration.rebuilds_on_settings_change(RefreshMode::Full),
+            "the acceleration alone qualifies for a rebuild"
+        );
+
+        let source = IcebergDdlAccelerationSource::new(
+            "app".to_string(),
+            TableReference::bare("t"),
+            acceleration,
+            None,
+        );
+        assert!(
+            !runtime_acceleration::acceleration_source::rebuilds_on_settings_change(&source),
+            "an Iceberg DDL table must keep its stored settings"
+        );
     }
 }
