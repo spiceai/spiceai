@@ -1006,9 +1006,13 @@ mod tests {
         };
         assert!(has_ddl_extensions(create_table), "precondition");
 
-        let plan = plan_create_table(statement, &state, &new_shared_store())
-            .await
-            .expect("plan");
+        let plan = plan_create_table(
+            statement,
+            &state,
+            &new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+        )
+        .await
+        .expect("plan");
 
         let mut spellings = Vec::new();
         plan.apply_with_subqueries(|node| {

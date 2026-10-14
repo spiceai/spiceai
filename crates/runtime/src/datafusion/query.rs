@@ -3735,6 +3735,39 @@ mod tests {
         );
     }
 
+    /// `VALUES (CAST(<lossy token> AS DECIMAL))` through `Query::run`. The
+    /// `Values` plan names its output columns, but a cast inside a row is not
+    /// one of those columns: its token spelling has to survive so the cast is
+    /// `4.0700000000000003`, not the `f64` `4.07`.
+    #[tokio::test]
+    async fn runtime_query_casts_a_values_literal_to_the_decimal_it_spells() {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let mut query =
+            QueryBuilder::new("VALUES (CAST(4.0700000000000003 AS DECIMAL(38, 17)))", df)
+                .build()
+                .run()
+                .await
+                .expect("Query::run");
+        let mut values = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .expect("decimal");
+            values.extend(column.values().iter().copied());
+        }
+        assert_eq!(values, vec![407_000_000_000_000_030]);
+    }
+
     #[tokio::test]
     async fn parameterized_query() {
         let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");

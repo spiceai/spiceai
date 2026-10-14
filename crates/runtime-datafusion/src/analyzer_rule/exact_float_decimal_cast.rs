@@ -107,13 +107,11 @@ impl AnalyzerRule for ExactFloatLiteralDecimalCast {
 }
 
 fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
-    let (inner, data_type) = match &expr {
-        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
-            (expr.as_ref(), field.data_type())
-        }
-        _ => return Transformed::no(expr),
-    };
-    if let Expr::Literal(value, metadata) = inner {
+    if let Expr::Cast(Cast { expr: inner, field }) | Expr::TryCast(TryCast { expr: inner, field }) =
+        &expr
+        && let Expr::Literal(value, metadata) = inner.as_ref()
+    {
+        let data_type = field.data_type();
         let token_spelling = metadata
             .as_ref()
             .and_then(|metadata| metadata.inner().get(FLOAT_LITERAL_SPELLING_KEY));
@@ -130,7 +128,9 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
         }
     }
     // The spelling only matters to the rewrite above; drop it from any literal
-    // it did not apply to so it never reaches the physical plan.
+    // it did not apply to so it never reaches the physical plan. This includes
+    // a literal that is not inside a cast, and the literal of a cast this
+    // function left unchanged: `transform_down` visits that literal next.
     match expr {
         Expr::Literal(value, Some(metadata)) if has_spelling(&metadata) => {
             Transformed::yes(Expr::Literal(value, without_spelling(Some(&metadata))))
@@ -308,7 +308,8 @@ impl FloatLiteralSpellings {
     ///
     /// A literal that is a whole projection or `VALUES` entry is left alone:
     /// those positions name an output column, and the spelling must not become
-    /// part of its field metadata.
+    /// part of its field metadata. A cast or other expression in either
+    /// position still has its float literals marked.
     ///
     /// # Errors
     ///
@@ -318,8 +319,7 @@ impl FloatLiteralSpellings {
             return Ok(plan);
         }
         plan.transform_up_with_subqueries(|plan| match plan {
-            LogicalPlan::Values(_) => Ok(Transformed::no(plan)),
-            LogicalPlan::Projection(_) => plan.map_expressions(|expr| {
+            LogicalPlan::Values(_) | LogicalPlan::Projection(_) => plan.map_expressions(|expr| {
                 if is_bare_literal(&expr) {
                     Ok(Transformed::no(expr))
                 } else {
@@ -421,8 +421,9 @@ fn plain_decimal(token: &str) -> Option<String> {
         return None;
     }
     let digits = format!("{integer}{fraction}");
-    // `digits` scaled by 10^-scale is the value.
-    let scale = i64::try_from(fraction.len()).ok()? - exponent;
+    // `digits` scaled by 10^-scale is the value. `checked_sub` rejects an
+    // exponent of `i64::MIN`, which overflows the subtraction.
+    let scale = i64::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
     // Bound the expansion: a token this far out of range is not finite anyway.
     if scale.unsigned_abs() > 400 {
         return None;
@@ -595,6 +596,61 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    /// `i64::MIN` as an exponent overflows `fraction_len - exponent` before the
+    /// expansion bound can reject it. Collection visits every numeric token.
+    #[test]
+    fn an_extreme_exponent_does_not_overflow_the_scale() {
+        assert_eq!(plain_decimal("1e-9223372036854775808"), None);
+        assert_eq!(plain_decimal("0.0e-9223372036854775808"), None);
+        assert_eq!(token_spelling("1e-9223372036854775808"), None);
+    }
+
+    /// A spelling the cast does not consume has to leave the literal.
+    /// `transform_down` visits the literal after the cast, and a non-cast
+    /// expression is only that literal.
+    #[test]
+    fn a_spelling_the_cast_does_not_use_is_removed() {
+        use datafusion::common::tree_node::TreeNodeRecursion;
+        use datafusion::logical_expr::{Operator, expr::BinaryExpr};
+
+        let marked = Expr::Literal(
+            ScalarValue::Float64(Some(4.07)),
+            Some(FieldMetadata::new(BTreeMap::from([(
+                FLOAT_LITERAL_SPELLING_KEY.to_string(),
+                "4.0700000000000003".to_string(),
+            )]))),
+        );
+        let has_spelling_key = |expr: &Expr| {
+            let mut leftover = false;
+            expr.apply(|expr| {
+                if let Expr::Literal(_, Some(metadata)) = expr {
+                    leftover |= metadata.inner().contains_key(FLOAT_LITERAL_SPELLING_KEY);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walk");
+            leftover
+        };
+        let rewritten = |expr: Expr| {
+            expr.transform_down(|expr| Ok(rewrite_expr(expr)))
+                .expect("rewrite")
+                .data
+        };
+
+        let cast = rewritten(Expr::Cast(Cast::new(
+            Box::new(marked.clone()),
+            DataType::Int64,
+        )));
+        assert!(!has_spelling_key(&cast), "cast: {cast:?}");
+
+        let sum = rewritten(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(marked),
+            Operator::Plus,
+            Box::new(Expr::Literal(ScalarValue::Int64(Some(1)), None)),
+        )));
+        assert!(!has_spelling_key(&sum), "sum: {sum:?}");
     }
 
     #[test]
@@ -849,6 +905,58 @@ mod tests {
             .downcast_ref::<Decimal128Array>()
             .expect("decimal");
         assert_eq!(exact.value(0), 407_000_000_000_000_030);
+    }
+
+    async fn planned(sql: &str) -> RecordBatch {
+        let ctx = SessionContext::new();
+        ctx.add_analyzer_rule(Arc::new(ExactFloatLiteralDecimalCast::new()));
+        let state = ctx.state();
+        let statement = state
+            .sql_to_statement(sql, &datafusion::common::config::Dialect::PostgreSQL)
+            .expect("parse");
+        let plan = FloatLiteralSpellings::collect(&statement)
+            .retain(state.statement_to_plan(statement).await.expect("plan"))
+            .expect("retain");
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .expect("execute")
+            .collect()
+            .await
+            .expect("collect");
+        batches.into_iter().next().expect("one batch")
+    }
+
+    /// A cast inside `VALUES` is not a bare entry. Skipping the whole `Values`
+    /// plan drops the token, and `4.0700000000000003` is then cast as `4.07`.
+    #[tokio::test]
+    async fn a_values_cast_keeps_the_token_not_the_float() {
+        let batch = planned("VALUES (CAST(4.0700000000000003 AS DECIMAL(38, 17)))").await;
+        for field in batch.schema().fields() {
+            assert!(
+                !field.metadata().contains_key(FLOAT_LITERAL_SPELLING_KEY),
+                "{field:?}"
+            );
+        }
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal");
+        assert_eq!(column.value(0), 407_000_000_000_000_030);
+    }
+
+    /// A bare `VALUES` entry names the output column, so its spelling stays off
+    /// the field.
+    #[tokio::test]
+    async fn a_bare_values_literal_keeps_its_field_metadata_clean() {
+        let batch = planned("VALUES (4.0700000000000003)").await;
+        for field in batch.schema().fields() {
+            assert!(
+                !field.metadata().contains_key(FLOAT_LITERAL_SPELLING_KEY),
+                "{field:?}"
+            );
+        }
     }
 
     async fn count_matches(sql: &str, params: Option<Vec<ScalarValue>>, scale: i8) -> i64 {
