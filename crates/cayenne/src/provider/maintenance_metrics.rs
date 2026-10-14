@@ -114,8 +114,8 @@ pub(crate) enum CompactionOutcome {
     /// A permanent state rather than a transient one, so a steady count here is
     /// the expected shape, not a problem.
     DeclinedNotConfigured,
-    /// The CDC apply is at or over capacity, so the bake yields the shared write
-    /// path to the foreground writer.
+    /// The CDC apply is at or over capacity, so the bake, or an `auto` table's
+    /// whole-table reclaim, yields the shared write path to the foreground writer.
     DeclinedApplyBackpressure,
     /// Fewer than two inputs qualified.
     DeclinedNoCandidates,
@@ -132,6 +132,19 @@ pub(crate) enum CompactionOutcome {
     /// A live snapshot is not clean past the prefix cutoff, so the bake's prune
     /// would be withheld and the merge write-amplification wasted.
     DeclinedNoCleanPrefix,
+    /// A `deletion_mode: auto` table's whole-table reclaim is held back by the
+    /// pace that keeps such reclaims to a tenth of the time, though the deletion
+    /// index is past its trigger.
+    DeclinedPaced,
+    /// A background pass found every permit of the process-wide budget for
+    /// whole-table reclaims in use, so it declined a `deletion_mode: auto` table's
+    /// reclaim rather than wait holding its compaction permit. A later tick tries
+    /// again. A sustained rate says many tables are reclaiming at once.
+    DeclinedReclaimBudgetBusy,
+    /// A `deletion_mode: auto` table on position deletes captured more than its
+    /// position-delete bound for a whole-table reclaim, so it moved to key
+    /// deletes instead of rewriting itself whole.
+    DeclinedOverPositionBound,
 }
 
 impl CompactionOutcome {
@@ -161,6 +174,9 @@ impl CompactionOutcome {
         Self::DeclinedNoQualifyingTier,
         Self::DeclinedSizingFailed,
         Self::DeclinedNoCleanPrefix,
+        Self::DeclinedPaced,
+        Self::DeclinedReclaimBudgetBusy,
+        Self::DeclinedOverPositionBound,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -182,6 +198,9 @@ impl CompactionOutcome {
             Self::DeclinedNoQualifyingTier => "declined_no_qualifying_tier",
             Self::DeclinedSizingFailed => "declined_sizing_failed",
             Self::DeclinedNoCleanPrefix => "declined_no_clean_prefix",
+            Self::DeclinedPaced => "declined_paced",
+            Self::DeclinedReclaimBudgetBusy => "declined_reclaim_budget_busy",
+            Self::DeclinedOverPositionBound => "declined_over_position_bound",
         }
     }
 }

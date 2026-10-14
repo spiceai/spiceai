@@ -476,6 +476,211 @@ mod tests {
         }
     }
 
+    /// A partitioned Cayenne table as the accelerator builds it: the partitioned
+    /// table under a poly layer and an index layer, so no sink holds it directly.
+    #[cfg(not(windows))]
+    struct LayeredPartitionedCayenne {
+        _dir: tempfile::TempDir,
+        schema: SchemaRef,
+        partitioned: Arc<PartitionTableProvider>,
+        layered: Arc<dyn TableProvider>,
+    }
+
+    #[cfg(not(windows))]
+    impl LayeredPartitionedCayenne {
+        async fn new() -> Self {
+            use std::collections::HashMap;
+
+            use cayenne::metadata::{CreateTableOptions, VortexConfig};
+            use cayenne::{CayenneCatalog, CayennePartitionCreator, MetadataCatalog};
+            use data_components::poly::PolyTableProvider;
+            use datafusion::logical_expr::col;
+            use datafusion_table_providers::UnsupportedTypeAction;
+            use runtime_table_partition::expression::PartitionedBy;
+
+            let schema = schema(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("k", DataType::Utf8, false),
+            ]);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let catalog = Arc::new(
+                CayenneCatalog::new(format!(
+                    "sqlite://{}",
+                    dir.path().join("catalog.db").display()
+                ))
+                .expect("catalog"),
+            );
+            catalog.init().await.expect("catalog init");
+            let data_path = dir.path().join("data");
+            std::fs::create_dir_all(&data_path).expect("data dir");
+            let vortex_config = VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            };
+            let table_id = catalog
+                .create_table(CreateTableOptions {
+                    table_name: "partitioned_after_refresh".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: data_path.display().to_string(),
+                    partition_column: Some("k".to_string()),
+                    vortex_config: vortex_config.clone(),
+                })
+                .await
+                .expect("partitioned table registers");
+            let partition_by = vec![PartitionedBy {
+                name: "k".to_string(),
+                expression: col("k"),
+            }];
+            let creator = Arc::new(
+                CayennePartitionCreator::new(
+                    "partitioned_after_refresh".to_string(),
+                    data_path,
+                    partition_by.clone(),
+                    Arc::clone(&schema),
+                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                    table_id,
+                    UnsupportedTypeAction::Error,
+                    Vec::new(),
+                    None,
+                    vortex_config,
+                    None,
+                    Vec::new(),
+                    None,
+                    util::session_state::session_context().runtime_env(),
+                )
+                .with_direct_partition_writes(),
+            );
+            let partitioned = Arc::new(
+                PartitionTableProvider::new(creator, partition_by, Arc::clone(&schema))
+                    .await
+                    .expect("partitioned provider"),
+            );
+            let write = Arc::clone(&partitioned) as Arc<dyn TableProvider>;
+            let poly = Arc::new(PolyTableProvider::new_with_schema_metadata(
+                Arc::clone(&write),
+                write,
+                HashMap::new(),
+            ))
+            .into_table() as Arc<dyn TableProvider>;
+            let layered = SpiceTable::over(Arc::new(spice_table::IndexLayer::new()), poly);
+            Self {
+                _dir: dir,
+                schema,
+                partitioned,
+                layered,
+            }
+        }
+
+        fn rows(&self, rows: &[(i64, &str)]) -> Pin<Box<dyn RecordBatchStream + Send>> {
+            use arrow::array::{Int64Array, RecordBatch, StringArray};
+            use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            let keys: Vec<&str> = rows.iter().map(|(_, key)| *key).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&self.schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(keys)),
+                ],
+            )
+            .expect("batch");
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::iter([Ok(batch)]),
+            ))
+        }
+
+        /// Whether each partition's scan view and listing are built, sorted.
+        async fn partitions_prepared(&self) -> Vec<bool> {
+            let mut prepared: Vec<bool> = self
+                .partitioned
+                .partition_table_providers()
+                .await
+                .iter()
+                .map(|partition| {
+                    partition
+                        .downcast_ref::<cayenne::CayenneTableProvider>()
+                        .expect("a Cayenne partition")
+                        .scan_view_is_prepared()
+                })
+                .collect();
+            prepared.sort_unstable();
+            prepared
+        }
+    }
+
+    /// The same for every partition of a partitioned Cayenne table under the
+    /// layers the accelerator stacks over it, the partitions a write creates
+    /// included.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_write_prepares_every_partition_of_a_layered_cayenne_table() {
+        let table = LayeredPartitionedCayenne::new().await;
+        let sink = TableSink::new(
+            Arc::clone(&table.layered),
+            "partitioned_after_refresh".to_string(),
+        );
+
+        // The append reaches a partition the overwrite did not create.
+        for (write, op, rows, partitions) in [
+            (
+                "overwrite",
+                InsertOp::Overwrite,
+                vec![(1, "a"), (2, "b")],
+                2,
+            ),
+            ("append", InsertOp::Append, vec![(3, "c")], 3),
+        ] {
+            sink.insert_into(
+                table.rows(&rows),
+                op,
+                &super::super::RefreshWrite::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{write} failed: {error:?}"));
+            assert_eq!(
+                table.partitions_prepared().await,
+                vec![true; partitions],
+                "a completed {write} must leave every partition's scan view and listing built"
+            );
+        }
+    }
+
+    /// The same when the partitioned table is the parent of synchronized
+    /// datasets, written through `MultiSink`.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synchronized_refresh_write_prepares_every_partition_of_a_layered_cayenne_table() {
+        let table = LayeredPartitionedCayenne::new().await;
+        let sink = super::super::multi::MultiSink::new(Arc::clone(&table.layered), vec![]);
+
+        for (write, op, rows, partitions) in [
+            (
+                "overwrite",
+                InsertOp::Overwrite,
+                vec![(1, "a"), (2, "b")],
+                2,
+            ),
+            ("append", InsertOp::Append, vec![(3, "c")], 3),
+        ] {
+            sink.insert_into(
+                table.rows(&rows),
+                op,
+                &super::super::RefreshWrite::default(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{write} failed: {error:?}"));
+            assert_eq!(
+                table.partitions_prepared().await,
+                vec![true; partitions],
+                "a completed {write} must leave every partition's scan view and listing built"
+            );
+        }
+    }
+
     /// `DuckDB`'s normalization of a timezone-aware timestamp to microseconds — the
     /// engine rewrite these tests exercise. Spelled out rather than imported because
     /// the `DuckDB` accelerator sits above this crate.

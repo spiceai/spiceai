@@ -200,7 +200,7 @@ pub struct ScoreLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DecisionResponse {
-    /// The model that answered.
+    /// The model that answered, by the name the request used.
     pub model: String,
     /// One answer per question, in question order.
     pub answers: Vec<DecisionAnswer>,

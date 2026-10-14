@@ -168,6 +168,7 @@ runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-state-location = { path = "../runtime-state-location" }
 runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
@@ -484,8 +485,7 @@ name = "rate_control"
 path = "tests/rate_control.rs"
 required-features = ["rate-control"]
 
-# Installs the process-wide OpenTelemetry meter provider before any instrument
-# binds to it.
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
 [[test]]
 name = "metrics"
 path = "tests/metrics.rs"

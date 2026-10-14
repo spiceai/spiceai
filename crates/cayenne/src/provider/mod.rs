@@ -87,6 +87,7 @@ pub(crate) mod delta_encoding;
 pub(crate) mod fadvise_tier;
 pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
+mod first_load_pk;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
 pub(crate) mod key_conflicts;
@@ -103,6 +104,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
+pub(crate) mod pk_deletion_mode;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
 pub(crate) mod pk_validation;
@@ -149,6 +151,10 @@ pub use mem_tier_budget::{
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_deletion_mode::{
+    AutoKeyDeletesReason, AutoKeyTableKind, DeletionModeChoice, TableStorage,
+    auto_keeps_small_tables_compacted, auto_key_deletes_reason,
+};
 pub use pk_keyset_budget::{
     force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
     release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,
@@ -1826,8 +1832,8 @@ mod tests {
             "PK type widening must classify Incompatible and pin the stored schema"
         );
 
-        // Non-schema config differences must keep today's behavior even when
-        // the schema also widened (schema must be the ONLY difference).
+        // A difference in a setting that defines the stored rows keeps the stored
+        // settings wholesale, schema included, even when the schema also widened.
         let table = "t_mixed_diff";
         catalog
             .create_table(options_for(
@@ -1838,7 +1844,7 @@ mod tests {
             .await
             .expect("create");
         let mut mixed = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
-        mixed.vortex_config.sort_columns = vec!["id".to_string()];
+        mixed.primary_key = vec!["id".to_string(), "v".to_string()];
         catalog
             .create_table(mixed)
             .await
@@ -1846,8 +1852,32 @@ mod tests {
         assert_eq!(
             catalog.get_table(table).await.expect("get").schema.as_ref(),
             stored_schema.as_ref(),
-            "a non-schema config difference must keep the legacy pin path"
+            "a primary key difference must keep the stored schema pinned"
         );
+
+        // A layout difference is applied in place and does not stop the widening.
+        let table = "t_layout_diff";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        let mut sorted = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
+        sorted.vortex_config.sort_columns = vec!["id".to_string()];
+        catalog
+            .create_table(sorted)
+            .await
+            .expect("re-create with a layout change + schema widening");
+        let evolved = catalog.get_table(table).await.expect("get");
+        assert_eq!(
+            evolved.schema.as_ref(),
+            widened_schema.as_ref(),
+            "a layout difference must not stop the widening"
+        );
+        assert_eq!(evolved.vortex_config.sort_columns, vec!["id".to_string()]);
     }
 
     /// Repairing the stored declaration rewrites no file, so a table that already holds rows
