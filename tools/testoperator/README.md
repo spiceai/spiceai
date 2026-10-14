@@ -311,9 +311,11 @@ Where `bodies.jsonl` might look like
 
 ### Running Vector Search Tests
 
-Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Running search tests with the testoperator is still experimental. Search tests support the common options.
 
-`testoperator run search [OPTIONS]`
+`testoperator run search [OPTIONS] -p <SPICEPOD>`
+
+The spicepod loads its own data (for example, parquet files on Hugging Face) and must define the `corpus`, `test_queries`, and `relevance_data` tables. The `benchmark_dataset` metric attribute comes from the spicepod's top-level `metadata.benchmark_dataset` value, or is `custom` when the spicepod does not set it. Refer to [`test/spicepods/search/README.md`](../../test/spicepods/search/README.md) for the table schema.
 
 ### Running Text-to-SQL tests
 
