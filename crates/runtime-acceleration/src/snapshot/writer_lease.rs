@@ -48,8 +48,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use object_store::{ObjectStoreExt, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath};
-use object_store_occ::{ConditionalWriteError, Expected};
+use object_store::{ObjectStoreExt, PutPayload, UpdateVersion, path::Path as ObjectPath};
+use object_store_occ::{
+    Attempt, ConditionalWriteError, Expected, RetryOnConflictError, conditional_put,
+    retry_on_conflict,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use util::{RetryError, retry};
@@ -71,10 +74,6 @@ const MIN_LEASE_DURATION: Duration = Duration::from_secs(30);
 /// A lease never lasts more than this, so a lease that claims a longer
 /// duration cannot keep the other instances waiting indefinitely.
 const MAX_LEASE_DURATION: Duration = Duration::from_hours(24);
-/// Writes of the lease per snapshot. A write is refused only when another
-/// write changed the lease first, so this bounds a run of conflicts that
-/// leave no holder.
-const LEASE_WRITE_ATTEMPTS: usize = 3;
 /// The dataset property, in the snapshot metadata, recording the lease
 /// generation that published the dataset's latest snapshot.
 const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
@@ -351,18 +350,21 @@ impl SnapshotManager {
             ..record
         };
         let path = self.writer_lease_path();
-        let result = match serde_json::to_vec_pretty(&released) {
-            Ok(body) => self
-                .object_store
-                .put_opts(
-                    &path,
-                    PutPayload::from(body),
-                    PutMode::Update(version).into(),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
+        let result = match (
+            serde_json::to_vec_pretty(&released),
+            Expected::at_version(version),
+        ) {
+            (Ok(body), Some(expected)) => conditional_put(
+                self.object_store.as_ref(),
+                &path,
+                PutPayload::from(body),
+                &expected,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+            (Err(error), _) => Err(error.to_string()),
+            (_, None) => Err("the lease was written without a version".to_string()),
         };
         match result {
             Ok(()) => {
@@ -379,27 +381,28 @@ impl SnapshotManager {
         let lease = &self.writer_lease;
         // The lease as this instance last tried to write it, when the store
         // refused the write.
-        let mut refused: Option<(LeaseRecord, Acquired)> = None;
+        let refused: Mutex<Option<(LeaseRecord, Acquired)>> = Mutex::new(None);
 
-        for _ in 0..LEASE_WRITE_ATTEMPTS {
+        let role = retry_on_conflict(&self.conflict_retry, || async {
             let observed = self.read_writer_lease(&path).await?;
             if let Some(observed) = &observed {
                 // A refused write can still have landed: a retry after a lost
                 // response is refused by the write it repeats.
-                if let Some((record, acquired)) = refused.take()
+                let last_refused = refused.lock().take();
+                if let Some((record, acquired)) = last_refused
                     && observed.record.as_ref() == Some(&record)
                 {
                     let generation = record.generation;
                     self.writer_lease.state.lock().written =
                         Some((observed.version.clone(), record));
-                    return Ok(Role::Holder {
+                    return Ok(Attempt::Done(Role::Holder {
                         generation,
                         acquired,
-                    });
+                    }));
                 }
                 // Nothing to match a conditional write against.
                 if observed.version.e_tag.is_none() && observed.version.version.is_none() {
-                    return Ok(Role::Unsupported);
+                    return Ok(Attempt::Done(Role::Unsupported));
                 }
             }
 
@@ -410,10 +413,10 @@ impl SnapshotManager {
                     holder,
                     lease_duration,
                 } => {
-                    return Ok(Role::Standby {
+                    return Ok(Attempt::Done(Role::Standby {
                         holder,
                         lease_duration,
-                    });
+                    }));
                 }
                 Plan::Create => (
                     Expected::Absent,
@@ -463,30 +466,40 @@ impl SnapshotManager {
                         version: result.version,
                     };
                     self.writer_lease.state.lock().written = Some((version, record));
-                    return Ok(Role::Holder {
+                    Ok(Attempt::Done(Role::Holder {
                         generation,
                         acquired,
-                    });
+                    }))
                 }
                 // Another write changed the lease first; read it again.
-                Err(ConditionalWriteError::Conflict { .. }) => refused = Some((record, acquired)),
-                Err(ConditionalWriteError::Unsupported { .. }) => return Ok(Role::Unsupported),
+                Err(ConditionalWriteError::Conflict { .. }) => {
+                    *refused.lock() = Some((record, acquired));
+                    Ok(Attempt::Conflict)
+                }
+                Err(ConditionalWriteError::Unsupported { .. }) => {
+                    Ok(Attempt::Done(Role::Unsupported))
+                }
                 Err(ConditionalWriteError::Store { source, .. }) => {
-                    return Err(SnapshotUploadError::WriterLease {
+                    Err(SnapshotUploadError::WriterLease {
                         dataset: self.dataset_name.clone(),
                         path: path.to_string(),
                         source,
-                    });
+                    })
                 }
             }
-        }
-
-        // Every write met a conflicting one. Skip this snapshot and look again
-        // before the next.
-        Ok(Role::Standby {
-            holder: None,
-            lease_duration: lease.duration,
         })
+        .await;
+
+        match role {
+            Ok(role) => Ok(role),
+            // Every write met a conflicting one. Skip this snapshot and look again
+            // before the next.
+            Err(RetryOnConflictError::ConflictsExhausted { .. }) => Ok(Role::Standby {
+                holder: None,
+                lease_duration: lease.duration,
+            }),
+            Err(RetryOnConflictError::Failed(err)) => Err(err),
+        }
     }
 
     fn lease_record(
@@ -731,7 +744,7 @@ mod tests {
     use futures::stream::BoxStream;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutResult, memory::InMemory, path::Path,
+        PutMode, PutMultipartOptions, PutOptions, PutResult, memory::InMemory, path::Path,
     };
     use util::retry_strategy::RetryBackoffBuilder;
 

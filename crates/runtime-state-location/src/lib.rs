@@ -456,7 +456,7 @@ async fn build_secret_resolved_parameters(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use object_store_occ::{ObjectState, UpdateResult, WriteResult};
+    use object_store_occ::{InsertResult, ObjectState, UpdateResult};
     use runtime_secrets::ClusterSecretExpander;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
@@ -626,24 +626,28 @@ mod tests {
         let initial = TestState { value: 1 };
         assert_eq!(
             first_writer
-                .insert_or_update("origin", &initial)
+                .insert("origin", &initial)
                 .await
                 .expect("initial write failed"),
-            WriteResult::Inserted
+            InsertResult::Ok
         );
 
-        assert_eq!(
-            second_writer
-                .get("origin")
-                .await
-                .expect("second writer get failed"),
-            Some(initial)
-        );
+        let (read, stale_version) = second_writer
+            .get_with_version("origin")
+            .await
+            .expect("second writer get failed")
+            .expect("origin exists");
+        assert_eq!(read, initial);
 
+        let (_, version) = first_writer
+            .get_with_version("origin")
+            .await
+            .expect("first writer get failed")
+            .expect("origin exists");
         let remote_update = TestState { value: 2 };
         assert_eq!(
             first_writer
-                .update("origin", &remote_update)
+                .update_with_version("origin", &remote_update, version)
                 .await
                 .expect("first writer update failed"),
             UpdateResult::Ok
@@ -651,12 +655,12 @@ mod tests {
 
         let stale_update = TestState { value: 3 };
         let result = second_writer
-            .insert_or_update("origin", &stale_update)
+            .update_with_version("origin", &stale_update, stale_version)
             .await
             .expect("stale write failed");
 
         match result {
-            WriteResult::Conflict { current } => assert_eq!(current, remote_update),
+            UpdateResult::Conflict { current } => assert_eq!(current, remote_update),
             other => panic!("expected Conflict, got {other:?}"),
         }
     }

@@ -24,9 +24,12 @@ use arrow_ipc::writer::StreamWriter;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
+use object_store_occ::{
+    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError,
+    conditional_put, retry_on_conflict,
 };
+use parking_lot::Mutex;
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -213,47 +216,16 @@ impl JobStore {
         Ok(state)
     }
 
-    /// Marks a job as cancelled.
-    ///
-    /// Retries with fibonacci backoff on concurrent modification errors (e.g.,
-    /// background task updated the state between our read and write). On retry,
-    /// re-reads the state and returns early if the job already reached a terminal
-    /// state.
+    /// Marks a job as cancelled. A job that already finished keeps its status.
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobState> {
-        use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
-
-        loop {
-            let mut state = self.get_job(job_id).await?;
+        self.modify_job(job_id, |state| {
             if state.is_terminal() {
-                return Ok(state);
+                return false;
             }
             state.set_cancelled();
-            match self.write_job_state(&mut state).await {
-                Ok(()) => return Ok(state),
-                Err(super::error::Error::ConcurrentModification { .. }) => {
-                    if let Some(duration) = backoff.next_duration() {
-                        tracing::debug!(
-                            job_id = %job_id,
-                            "Concurrent modification on cancel, retrying"
-                        );
-                        tokio::time::sleep(duration).await;
-                    } else {
-                        // Max retries exhausted — re-read state in case another
-                        // writer already cancelled the job.
-                        let state = self.get_job(job_id).await?;
-                        if state.is_terminal() {
-                            return Ok(state);
-                        }
-                        return Err(super::error::Error::ConcurrentModification {
-                            job_id: job_id.to_string(),
-                        });
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+            true
+        })
+        .await
     }
 
     /// Writes result chunks for a completed job from a stream of record batches.
@@ -460,17 +432,15 @@ impl JobStore {
         let path = self.chunk_path(job_id, chunk_index);
         let bytes_len = buffer.len();
 
-        // Use PutMode::Create to ensure chunks are only written once.
-        // If another scheduler already wrote this chunk, we'll get an AlreadyExists error.
-        self.store
-            .put_opts(&path, buffer.into(), PutOptions::from(PutMode::Create))
+        // A chunk is written once: another scheduler that already wrote it wins.
+        conditional_put(self.store.as_ref(), &path, buffer.into(), &Expected::Absent)
             .await
             .map_err(|e| match e {
-                ObjectStoreError::AlreadyExists { .. } => super::error::Error::ChunkAlreadyExists {
+                ConditionalWriteError::Conflict { .. } => super::error::Error::ChunkAlreadyExists {
                     job_id: job_id.to_string(),
                     chunk_index,
                 },
-                other => super::error::Error::ObjectStoreWrite { source: other },
+                source => super::error::Error::ObjectStoreWrite { source },
             })?;
 
         Ok(bytes_len)
@@ -505,18 +475,19 @@ impl JobStore {
     /// The first terminal state wins: a job that was cancelled or failed while its
     /// results were being written stays that way.
     pub async fn complete_job(&self, job_id: &str, result: JobResult) -> Result<JobState> {
-        let mut state = self.get_job(job_id).await?;
-        if state.is_terminal() {
-            tracing::debug!(
-                job_id,
-                status = %state.status,
-                "Job already finished; not marking it succeeded"
-            );
-            return Ok(state);
-        }
-        state.set_succeeded(result, self.result_ttl);
-        self.write_job_state(&mut state).await?;
-        Ok(state)
+        self.modify_job(job_id, |state| {
+            if state.is_terminal() {
+                tracing::debug!(
+                    job_id,
+                    status = %state.status,
+                    "Job already finished; not marking it succeeded"
+                );
+                return false;
+            }
+            state.set_succeeded(result.clone(), self.result_ttl);
+            true
+        })
+        .await
     }
 
     /// Marks a job as failed with the given error.
@@ -529,22 +500,24 @@ impl JobStore {
         error_code: JobErrorCode,
         message: impl Into<String>,
     ) -> Result<JobState> {
-        let mut state = self.get_job(job_id).await?;
-        if state.is_terminal() {
-            tracing::debug!(
-                job_id,
-                status = %state.status,
-                "Job already finished; not marking it failed"
-            );
-            return Ok(state);
-        }
-        state.set_failed(super::state::JobError {
+        let error = super::state::JobError {
             error_code,
             message: message.into(),
             sql_state: None,
-        });
-        self.write_job_state(&mut state).await?;
-        Ok(state)
+        };
+        self.modify_job(job_id, |state| {
+            if state.is_terminal() {
+                tracing::debug!(
+                    job_id,
+                    status = %state.status,
+                    "Job already finished; not marking it failed"
+                );
+                return false;
+            }
+            state.set_failed(error.clone());
+            true
+        })
+        .await
     }
 
     /// Deletes a job and all its result chunks.
@@ -748,26 +721,66 @@ impl JobStore {
         )
     }
 
+    /// Applies `change` to the job's current state and writes it back, starting
+    /// again from a fresh read when another writer changed the job first.
+    /// `change` returns `false` to leave the job as it is.
+    async fn modify_job(
+        &self,
+        job_id: &str,
+        change: impl FnMut(&mut JobState) -> bool + Send,
+    ) -> Result<JobState> {
+        let change = Mutex::new(change);
+        retry_on_conflict(&ConflictRetry::default(), || async {
+            let mut state = self.get_job(job_id).await?;
+            if !(&mut *change.lock())(&mut state) {
+                return Ok(Attempt::Done(state));
+            }
+            match self.write_job_state(&mut state).await {
+                Ok(()) => Ok(Attempt::Done(state)),
+                Err(super::error::Error::ConcurrentModification { .. }) => Ok(Attempt::Conflict),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|err| match err {
+            RetryOnConflictError::ConflictsExhausted { .. } => {
+                super::error::Error::ConcurrentModification {
+                    job_id: job_id.to_string(),
+                }
+            }
+            RetryOnConflictError::Failed(err) => err,
+        })
+    }
+
+    /// Writes the job's state if it is still at the version it was read at, or
+    /// creates it when it has no version yet.
     async fn write_job_state(&self, state: &mut JobState) -> Result<()> {
         let path = self.job_state_path(&state.job_id);
         let payload = serde_json::to_vec(state).context(SerializeStateSnafu)?;
 
-        let put_mode = match &state.version {
-            Some(version) => PutMode::Update(version.clone()),
-            None => PutMode::Create,
+        let expected = match &state.version {
+            Some(version) => Expected::at_version(version.clone()).ok_or_else(|| {
+                super::error::Error::ObjectStoreWrite {
+                    source: ConditionalWriteError::Unsupported {
+                        path: path.to_string(),
+                        source: ObjectStoreError::NotSupported {
+                            source: "the store reported neither an ETag nor a version".into(),
+                        },
+                    },
+                }
+            })?,
+            None => Expected::Absent,
         };
 
-        let result = self
-            .store
-            .put_opts(&path, payload.into(), PutOptions::from(put_mode))
+        let result = conditional_put(self.store.as_ref(), &path, payload.into(), &expected)
             .await
             .map_err(|e| match e {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                ConditionalWriteError::Conflict { .. } => {
                     super::error::Error::ConcurrentModification {
                         job_id: state.job_id.clone(),
                     }
                 }
-                other => super::error::Error::ObjectStoreWrite { source: other },
+                source => super::error::Error::ObjectStoreWrite { source },
             })?;
 
         // Update the version for future writes
@@ -937,6 +950,60 @@ mod tests {
             .expect("failing a succeeded job is a no-op");
         assert_eq!(state.status, JobStatus::Succeeded);
         assert!(state.error.is_none());
+    }
+
+    /// Schedulers that finish one job at the same time on one local directory
+    /// all succeed and agree on the one terminal state that landed first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_finishers_agree_on_the_first_terminal_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"),
+        );
+        let stores: Vec<_> = (0..3)
+            .map(|n| Arc::new(JobStore::new(Arc::clone(&store), "test", &format!("node-{n}"))))
+            .collect();
+        for round in 0..10 {
+            let job_id = stores[0]
+                .create_job(make_request(format!("SELECT {round}")), false, test_owner())
+                .await
+                .expect("to create job")
+                .job_id;
+            stores[0].set_job_running(&job_id).await.expect("running");
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let finishers: Vec<_> = stores
+                .iter()
+                .enumerate()
+                .map(|(n, job_store)| {
+                    let (job_store, job_id, barrier) =
+                        (Arc::clone(job_store), job_id.clone(), Arc::clone(&barrier));
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        match n {
+                            0 => job_store.complete_job(&job_id, empty_result()).await,
+                            1 => job_store.fail_job(&job_id, JobErrorCode::Internal, "failed").await,
+                            _ => job_store.cancel_job(&job_id).await,
+                        }
+                    })
+                })
+                .collect();
+            let mut statuses = Vec::new();
+            for finisher in finishers {
+                statuses.push(
+                    finisher
+                        .await
+                        .expect("finisher task")
+                        .expect("a lost race is not an error")
+                        .status,
+                );
+            }
+            let stored = stores[0].get_job(&job_id).await.expect("to get job").status;
+            assert!(
+                statuses.iter().all(|status| *status == stored),
+                "round {round}: every finisher must report the stored status {stored:?}: {statuses:?}"
+            );
+        }
     }
 
     /// Expired jobs are deleted together with their result chunks; live jobs stay.

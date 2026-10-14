@@ -409,6 +409,124 @@ impl PartitionStore {
         self.apply_assignments(&requests).await
     }
 
+    /// Adds each of `partition_values` the table does not have yet, unassigned,
+    /// in one cluster-document write. Returns whether any partition was added.
+    ///
+    /// The change is computed from the document each write attempt reads, so a
+    /// concurrent change to the same table is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TableMetadataNotFound`] when the table has no partition
+    /// metadata, or an error if the cluster state mutation fails.
+    pub async fn add_partitions(
+        &self,
+        table: &TableReference,
+        partition_values: &[PartitionValue],
+    ) -> Result<bool> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut missing = false;
+        let res = self
+            .cluster
+            .mutate(|state| {
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let Some(metadata) = scope.map_mut(state).get_mut(&key) else {
+                    missing = true;
+                    return MutationOutcome::NoChange;
+                };
+                missing = false;
+                let mut added = false;
+                for partition_value in partition_values {
+                    if !metadata
+                        .partitions
+                        .iter()
+                        .any(|p| p.partition_value == *partition_value)
+                    {
+                        metadata.add_partition(PartitionMetadata::new(partition_value.clone()));
+                        added = true;
+                    }
+                }
+                if !added {
+                    return MutationOutcome::NoChange;
+                }
+                metadata.updated_at = now_ms;
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        if missing {
+            return Err(Error::TableMetadataNotFound { table: key });
+        }
+        Ok(res == MutateOk::Committed)
+    }
+
+    /// Removes each of `partition_values` from the table in one
+    /// cluster-document write. Returns, per executor, the removed partitions
+    /// that were assigned to it.
+    ///
+    /// The change is computed from the document each write attempt reads, so a
+    /// concurrent change to the same table is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TableMetadataNotFound`] when the table has no partition
+    /// metadata, or an error if the cluster state mutation fails.
+    pub async fn remove_partitions(
+        &self,
+        table: &TableReference,
+        partition_values: &[PartitionValue],
+    ) -> Result<HashMap<String, Vec<PartitionValue>>> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut missing = false;
+        let mut removed: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+        self.cluster
+            .mutate(|state| {
+                removed.clear();
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let Some(metadata) = scope.map_mut(state).get_mut(&key) else {
+                    missing = true;
+                    return MutationOutcome::NoChange;
+                };
+                missing = false;
+                let mut removed_any = false;
+                for partition_value in partition_values {
+                    if let Some(pos) = metadata
+                        .partitions
+                        .iter()
+                        .position(|p| p.partition_value == *partition_value)
+                    {
+                        let partition = metadata.partitions.remove(pos);
+                        for executor_id in partition.assigned_executors {
+                            removed
+                                .entry(executor_id)
+                                .or_default()
+                                .push(partition_value.clone());
+                        }
+                        removed_any = true;
+                    }
+                }
+                if !removed_any {
+                    return MutationOutcome::NoChange;
+                }
+                metadata.updated_at = now_ms;
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        if missing {
+            return Err(Error::TableMetadataNotFound { table: key });
+        }
+        Ok(removed)
+    }
+
     /// Replace this table's metadata wholesale (atomic OCC write). Used
     /// by callers that compute the new metadata externally and just need
     /// to persist it.
@@ -532,6 +650,18 @@ impl PartitionStore {
             })?;
         let _ = res;
         Ok(outcome.unwrap_or(CopyAssignmentsResult::NoSourceMetadata))
+    }
+}
+
+fn mutate_error(table: &str, err: MutateError) -> Error {
+    match err {
+        MutateError::ConcurrentModification { .. } => Error::ConcurrentModification {
+            table: table.to_string(),
+        },
+        other => Error::MetadataAccess {
+            table: table.to_string(),
+            source: Box::new(other),
+        },
     }
 }
 

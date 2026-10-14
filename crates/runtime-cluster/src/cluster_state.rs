@@ -29,16 +29,18 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
+use object_store_occ::{
+    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError,
+    conditional_put, retry_on_conflict,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use snafu::{OptionExt, ResultExt, Snafu};
 use uuid::Uuid;
 
 use crate::metadata::TablePartitionMetadata;
@@ -46,11 +48,6 @@ use crate::metadata::TablePartitionMetadata;
 /// Current schema version for `cluster.json`. Bump if the on-disk shape
 /// changes; readers reject unknown versions.
 pub const CLUSTER_STATE_SCHEMA_VERSION: u32 = 1;
-
-/// Maximum number of conditional-write attempts for [`ClusterStateStore::mutate`].
-/// Bumped from the 5 used per-table in the old layout because the document is
-/// now shared across all schedulers and partition operations.
-const MAX_MUTATE_ATTEMPTS: usize = 8;
 
 /// Logical scheduler identifier (`host:port` style, stable across restarts).
 pub type SchedulerId = String;
@@ -186,11 +183,13 @@ pub enum MutateError {
         source: ObjectStoreError,
     },
 
-    #[snafu(display("Failed to write cluster document at {path}: {source}"))]
-    Write {
-        path: String,
-        source: ObjectStoreError,
-    },
+    #[snafu(display("{source}"))]
+    Write { source: ConditionalWriteError },
+
+    #[snafu(display(
+        "The object store reported neither an ETag nor a version for the cluster document at {path}, so it cannot be updated conditionally"
+    ))]
+    Unversioned { path: String },
 
     #[snafu(display("Failed to (de)serialize cluster document at {path}: {source}"))]
     Serde {
@@ -228,6 +227,7 @@ pub struct ClusterStateStore {
     /// Full path of the cluster document, e.g. `prefix/cluster.json`.
     path: Path,
     cache: RwLock<Option<CachedState>>,
+    conflict_retry: ConflictRetry,
 }
 
 impl ClusterStateStore {
@@ -245,6 +245,7 @@ impl ClusterStateStore {
             store,
             path,
             cache: RwLock::new(None),
+            conflict_retry: ConflictRetry::default(),
         }
     }
 
@@ -267,25 +268,21 @@ impl ClusterStateStore {
             path: self.path.to_string(),
         })?;
 
-        match self
-            .store
-            .put_opts(
-                &self.path,
-                payload.into(),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
+        match conditional_put(
+            self.store.as_ref(),
+            &self.path,
+            payload.into(),
+            &Expected::Absent,
+        )
+        .await
         {
             Ok(result) => {
                 let version = UpdateVersion::from(result);
                 self.update_cache(state, version);
                 Ok(())
             }
-            Err(ObjectStoreError::AlreadyExists { .. }) => Ok(()),
-            Err(source) => Err(MutateError::Write {
-                path: self.path.to_string(),
-                source,
-            }),
+            Err(err) if err.is_conflict() => Ok(()),
+            Err(source) => Err(MutateError::Write { source }),
         }
     }
 
@@ -295,13 +292,7 @@ impl ClusterStateStore {
     ///
     /// Returns an error if the object-store read or deserialization fails.
     pub async fn read(&self) -> Result<Arc<ClusterState>> {
-        let (state, version) = self.fetch().await?;
-        let arc = Arc::new(state);
-        *self.cache.write() = Some(CachedState {
-            value: Arc::clone(&arc),
-            version,
-        });
-        Ok(arc)
+        self.fetch_and_cache().await.map(|(state, _)| state)
     }
 
     /// Returns the in-memory snapshot if any has been observed so far.
@@ -323,130 +314,106 @@ impl ClusterStateStore {
         self.read().await
     }
 
-    /// Centralised OCC mutation. See module docs and the project plan
-    /// (`plans/consolidate-cluster-state-into-cluster-json.md`) for the
-    /// full semantics. Key invariants:
+    /// Centralised OCC mutation. Key invariants:
     ///
     /// - The mutator must be pure and IO-free; it will be re-run on
     ///   conflicts and on stale-cache verification.
     /// - [`MutationOutcome::NoChange`] returned against a cached
     ///   snapshot is *not* trusted: the store forces one fresh read and
     ///   re-invokes the mutator before declaring `AlreadySatisfied`.
-    /// - [`MutationOutcome::Apply`] starts from cache (fast path), then
-    ///   on `Conflict` re-reads and re-runs against the fresh state.
+    /// - [`MutationOutcome::Apply`] starts from cache (fast path). The write
+    ///   is conditional on the version the mutator ran against; when another
+    ///   writer changed the document first, the mutator runs again against a
+    ///   fresh read, under the shared conflict-retry policy.
     /// - `NotFound` mid-flight is *not* auto-bootstrapped; it is
     ///   surfaced as [`MutateError::ClusterDocMissing`].
     ///
     /// # Errors
     ///
     /// Returns an error if the mutator aborts, if the document is missing,
-    /// if serialization fails, or if the maximum number of OCC retries is exceeded.
-    pub async fn mutate<F>(&self, mut mutator: F) -> Result<MutateOk>
+    /// if serialization fails, or if every attempt lost to another writer.
+    pub async fn mutate<F>(&self, mutator: F) -> Result<MutateOk>
     where
         F: FnMut(&mut ClusterState) -> MutationOutcome,
     {
-        // Track whether the next mutator invocation will run against a
-        // cached (potentially stale) snapshot. If so, a `NoChange` result
-        // must be re-confirmed against a fresh read before being trusted.
-        let mut state_arc: Arc<ClusterState>;
-        let mut current_version: UpdateVersion;
-        let mut used_cache: bool;
-        if let Some(cached) = self.cached_pair() {
-            state_arc = cached.0;
-            current_version = cached.1;
-            used_cache = true;
-        } else {
-            let (state, version) = self.fetch().await?;
-            current_version = version.clone();
-            state_arc = Arc::new(state);
-            *self.cache.write() = Some(CachedState {
-                value: Arc::clone(&state_arc),
-                version,
-            });
-            used_cache = false;
-        }
-
-        let mut backoff = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_MUTATE_ATTEMPTS))
-            .build();
-        let mut attempts = 0usize;
-
-        loop {
-            attempts += 1;
-            let mut draft = (*state_arc).clone();
-            match mutator(&mut draft) {
-                MutationOutcome::Abort(err) => return Err(err),
-                MutationOutcome::NoChange => {
-                    if used_cache {
-                        // Cached state may be stale; verify against fresh read.
-                        let (fresh, fresh_version) = self.fetch().await?;
-                        current_version = fresh_version.clone();
-                        state_arc = Arc::new(fresh);
-                        *self.cache.write() = Some(CachedState {
-                            value: Arc::clone(&state_arc),
-                            version: fresh_version,
-                        });
-                        used_cache = false;
-                        continue;
-                    }
-                    return Ok(MutateOk::AlreadySatisfied);
+        let mutator = Mutex::new(mutator);
+        // Only the first attempt may start from the cached snapshot.
+        let from_cache = AtomicBool::new(true);
+        retry_on_conflict(&self.conflict_retry, || async {
+            let cached = if from_cache.swap(false, Ordering::Relaxed) {
+                self.cached_pair()
+            } else {
+                None
+            };
+            let (mut state, mut version, mut used_cache) = match cached {
+                Some((state, version)) => (state, version, true),
+                None => {
+                    let (state, version) = self.fetch_and_cache().await?;
+                    (state, version, false)
                 }
-                MutationOutcome::Apply => {
-                    draft.updated_at_ms = now_ms()?;
-                    let payload = serde_json::to_vec(&draft).context(SerdeSnafu {
-                        path: self.path.to_string(),
-                    })?;
-                    match self
-                        .store
-                        .put_opts(
-                            &self.path,
-                            payload.into(),
-                            PutOptions::from(PutMode::Update(current_version.clone())),
-                        )
-                        .await
-                    {
-                        Ok(result) => {
-                            let new_version = UpdateVersion::from(result);
-                            let new_arc = Arc::new(draft);
-                            *self.cache.write() = Some(CachedState {
-                                value: Arc::clone(&new_arc),
-                                version: new_version,
-                            });
-                            return Ok(MutateOk::Committed);
-                        }
-                        Err(ObjectStoreError::NotFound { .. }) => {
-                            return Err(MutateError::ClusterDocMissing {
-                                path: self.path.to_string(),
-                            });
-                        }
-                        Err(ObjectStoreError::Precondition { .. }) => {
-                            // Conflict: refresh and retry.
-                            let Some(delay) = backoff.next_duration() else {
-                                return Err(MutateError::ConcurrentModification {
-                                    path: self.path.to_string(),
-                                    attempts,
-                                });
-                            };
-                            tokio::time::sleep(delay).await;
-                            let (fresh, fresh_version) = self.fetch().await?;
-                            current_version = fresh_version.clone();
-                            state_arc = Arc::new(fresh);
-                            *self.cache.write() = Some(CachedState {
-                                value: Arc::clone(&state_arc),
-                                version: fresh_version,
-                            });
-                            used_cache = false;
-                        }
-                        Err(source) => {
-                            return Err(MutateError::Write {
-                                path: self.path.to_string(),
-                                source,
-                            });
-                        }
+            };
+            loop {
+                let mut draft = (*state).clone();
+                let outcome = (&mut *mutator.lock())(&mut draft);
+                match outcome {
+                    MutationOutcome::Abort(err) => return Err(err),
+                    MutationOutcome::NoChange if used_cache => {
+                        // Cached state may be stale; verify against a fresh read.
+                        (state, version) = self.fetch_and_cache().await?;
+                        used_cache = false;
+                    }
+                    MutationOutcome::NoChange => {
+                        return Ok(Attempt::Done(MutateOk::AlreadySatisfied));
+                    }
+                    MutationOutcome::Apply => {
+                        draft.updated_at_ms = now_ms()?;
+                        return self.write(draft, version).await;
                     }
                 }
             }
+        })
+        .await
+        .map_err(|err| match err {
+            RetryOnConflictError::ConflictsExhausted { attempts } => {
+                MutateError::ConcurrentModification {
+                    path: self.path.to_string(),
+                    attempts,
+                }
+            }
+            RetryOnConflictError::Failed(err) => err,
+        })
+    }
+
+    /// Writes `state` if the document is still at `version`, and caches it.
+    async fn write(
+        &self,
+        state: ClusterState,
+        version: UpdateVersion,
+    ) -> Result<Attempt<MutateOk>> {
+        let expected = Expected::at_version(version).context(UnversionedSnafu {
+            path: self.path.to_string(),
+        })?;
+        let payload = serde_json::to_vec(&state).context(SerdeSnafu {
+            path: self.path.to_string(),
+        })?;
+        match conditional_put(self.store.as_ref(), &self.path, payload.into(), &expected).await {
+            Ok(result) => {
+                self.update_cache(state, UpdateVersion::from(result));
+                Ok(Attempt::Done(MutateOk::Committed))
+            }
+            Err(err) if err.is_conflict() => Ok(Attempt::Conflict),
+            Err(source) => Err(MutateError::Write { source }),
         }
+    }
+
+    async fn fetch_and_cache(&self) -> Result<(Arc<ClusterState>, UpdateVersion)> {
+        let (state, version) = self.fetch().await?;
+        let state = Arc::new(state);
+        *self.cache.write() = Some(CachedState {
+            value: Arc::clone(&state),
+            version: version.clone(),
+        });
+        Ok((state, version))
     }
 
     fn cached_pair(&self) -> Option<(Arc<ClusterState>, UpdateVersion)> {
@@ -683,5 +650,47 @@ mod tests {
         let a = s.read_cached().expect("cached");
         let b = s.read_cached().expect("cached");
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    /// Schedulers mutating `cluster.json` concurrently on one local directory
+    /// lose no update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mutations_on_a_local_directory_all_land() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"),
+        );
+        ClusterStateStore::new(Arc::clone(&store), "")
+            .bootstrap()
+            .await
+            .expect("bootstrap");
+
+        let writers = 4;
+        let per_writer = 10;
+        let mut tasks = Vec::new();
+        for writer in 0..writers {
+            let s = ClusterStateStore::new(Arc::clone(&store), "");
+            tasks.push(tokio::spawn(async move {
+                for i in 0..per_writer {
+                    let id = format!("w{writer}-{i}");
+                    s.mutate(|cs| {
+                        cs.schedulers
+                            .insert(id.clone(), entry(&id, Uuid::new_v4()));
+                        MutationOutcome::Apply
+                    })
+                    .await
+                    .expect("mutation lands within the retry budget");
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("writer task");
+        }
+
+        let read = ClusterStateStore::new(store, "")
+            .read()
+            .await
+            .expect("read");
+        assert_eq!(read.schedulers.len(), writers * per_writer);
     }
 }
