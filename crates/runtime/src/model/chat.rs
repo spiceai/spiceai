@@ -152,7 +152,6 @@ pub async fn try_to_chat_model(
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
             Arc::new(ToolUsingChat::new(
                 Arc::clone(&model),
-                Arc::clone(&rt),
                 tools,
                 spice_recursion_limit,
             ))
