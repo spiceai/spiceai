@@ -864,6 +864,25 @@ impl ClusterService for ClusterServiceImpl {
             }
         }
 
+        // Partitions assigned while this executor was identified by its advertise
+        // address follow it to its instance identity.
+        if executor_id != executor_address {
+            for store in [
+                self.executor_registry.accelerations_partition_store(),
+                self.executor_registry.federated_partition_store(),
+            ] {
+                match store.move_assignments(executor_address, executor_id).await {
+                    Ok(0) => {}
+                    Ok(moved) => tracing::info!(
+                        "Moved {moved} partition assignments of executor '{executor_address}' to its instance identity '{executor_id}'"
+                    ),
+                    Err(err) => tracing::warn!(
+                        "Failed to move the partition assignments of executor '{executor_address}' to its instance identity '{executor_id}', so it does not serve those partitions: {err}"
+                    ),
+                }
+            }
+        }
+
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
         let partition_store = self.executor_registry().accelerations_partition_store();
