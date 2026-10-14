@@ -529,9 +529,7 @@ fn next_round_tool_choice(
             ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)
         }
         Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
-            for entry in &mut allowed.allowed_tools {
-                entry.mode = ToolChoiceAllowedMode::Auto;
-            }
+            allowed.allowed_tools.mode = ToolChoiceAllowedMode::Auto;
             ChatCompletionToolChoiceOption::AllowedTools(allowed)
         }
         Some(
@@ -1626,13 +1624,13 @@ mod tests {
 
     fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
         ChatCompletionToolChoiceOption::AllowedTools(ChatCompletionAllowedToolsChoice {
-            allowed_tools: vec![ChatCompletionAllowedTools {
+            allowed_tools: ChatCompletionAllowedTools {
                 mode,
                 tools: vec![serde_json::json!({
                     "type": "function",
                     "function": { "name": "list_datasets" }
                 })],
-            }],
+            },
         })
     }
 

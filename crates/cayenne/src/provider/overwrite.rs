@@ -723,7 +723,7 @@ impl CayenneTableProvider {
         let target_size_bytes = self.target_file_size_bytes();
         // A key-deletion table rewrites files containing superseded copies.
         // Per-file statistics preserve exact counts for the surviving files.
-        let file_stats = (postpass.is_some() && !self.should_capture_positions())
+        let file_stats = (postpass.is_some() && !self.hides_repeated_keys_with_position_deletes())
             .then(|| {
                 FileStatsObserver::new(self.table_name(), &self.table_schema(), None).map(Arc::new)
             })
@@ -983,9 +983,11 @@ impl CayenneTableProvider {
                     .map(str::to_string)
             })
             .collect();
-        // Each file folds on its own, through one writer: its rows stay in one
-        // file, though not necessarily in the order it held them, since the
-        // scan may split a large file into ranges. Merging every file's
+        // Each file folds on its own, through one writer, so no two source
+        // files' rows are merged. The writer still rolls to a new file at the
+        // target size, so one source file may fold into several, and its rows
+        // need not keep their order: the scan may split a large file into
+        // ranges. Merging every file's
         // survivors into one stream would feed the rewrite from a single task,
         // however many encoders it had. Each write holds one encode permit. A
         // maintenance fold (a load into an empty table) runs as many files at
@@ -999,6 +1001,7 @@ impl CayenneTableProvider {
         let policy = WritePolicy {
             class: write.write_policy.class,
             fan_out: EncodeFanOut::PerCaller,
+            encode_budget: write.write_policy.encode_budget,
             routing: ShardRouting::Key,
         };
         let in_flight = if self.context().is_coupled_writer() {

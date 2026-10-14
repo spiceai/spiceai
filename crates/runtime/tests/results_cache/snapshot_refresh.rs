@@ -196,6 +196,18 @@ async fn snapshot_refresh_without_newer_snapshot_keeps_cached_results() {
                 (ROW.to_string(), CacheStatus::CacheHit)
             );
 
+            // A completed refresh invalidates derived caches while retaining SQL results.
+            reader
+                .datafusion()
+                .caching()
+                .invalidate_for_refresh(table.clone())
+                .await
+                .expect("refresh invalidation");
+            assert_eq!(
+                query(&reader).await,
+                (ROW.to_string(), CacheStatus::CacheHit)
+            );
+
             // Several snapshot checks, none of which finds a newer snapshot. The
             // check interval is what is under test, so this waits on the clock.
             tokio::time::sleep(Duration::from_millis(3500)).await;

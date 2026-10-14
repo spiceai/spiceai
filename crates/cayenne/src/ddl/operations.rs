@@ -40,12 +40,14 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
+use crate::MetadataCatalog;
 use crate::catalog::CatalogError;
-use crate::catalog_provider::{CayenneCatalogProvider, CayenneSchemaProvider};
+use crate::catalog_provider::{
+    CayenneCatalogProvider, CayenneSchemaProvider, catalog_table_builder,
+};
 use crate::metadata::CreateTableOptions;
 use crate::partition_creator::CayennePartitionCreator;
 use crate::schema::transform_schema_for_vortex;
-use crate::{CayenneTableProviderBuilder, MetadataCatalog};
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
@@ -150,12 +152,12 @@ pub async fn create_table(
     let metadata_table_name = format!("{}/{}", params.schema_name, params.table_name);
 
     // ── Existence check ───────────────────────────────────────────────────────
-    let exists = match metadata_catalog.get_table(&metadata_table_name).await {
-        Ok(_) => true,
-        Err(CatalogError::TableNotFound { .. }) => false,
+    let existing = match metadata_catalog.get_table(&metadata_table_name).await {
+        Ok(metadata) => Some(metadata),
+        Err(CatalogError::TableNotFound { .. }) => None,
         Err(e) => return Err(DataFusionError::External(Box::new(e))),
     };
-    if exists {
+    if let Some(existing) = existing {
         if params.if_not_exists {
             // Re-register in the in-memory schema provider if absent (e.g. after restart).
             let schema_provider = ensure_schema_provider(
@@ -165,9 +167,11 @@ pub async fn create_table(
                 &runtime_env,
             )?;
             if !schema_provider.table_exist(&params.table_name) {
-                let builder = CayenneTableProviderBuilder::new(
-                    Arc::clone(&metadata_catalog),
-                    Arc::clone(&runtime_env),
+                let builder = catalog_table_builder(
+                    &metadata_catalog,
+                    &runtime_env,
+                    &metadata_table_name,
+                    &existing.vortex_config,
                 );
                 if let Ok(provider) = builder.open(&metadata_table_name).await {
                     let wrapped: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(provider);
@@ -279,9 +283,11 @@ pub async fn create_table(
         )
         .await?
     } else {
-        let builder = CayenneTableProviderBuilder::new(
-            Arc::clone(&metadata_catalog),
-            Arc::clone(&runtime_env),
+        let builder = catalog_table_builder(
+            &metadata_catalog,
+            &runtime_env,
+            &metadata_table_name,
+            &vortex_config,
         );
         let provider = builder.open(&metadata_table_name).await.map_err(|e| {
             DataFusionError::Execution(format!(

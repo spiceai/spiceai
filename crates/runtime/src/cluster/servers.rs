@@ -19,7 +19,7 @@ use crate::Runtime;
 use crate::auth::EndpointAuth;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
-use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
+use crate::flight::middleware::{FlightSessionLayer, RequestContextLayer, WriteRateLimitLayer};
 use crate::flight::{
     Error, Service as SpiceFlightService, configure_flight_server_transport,
     is_address_in_use_error, session_auth,
@@ -265,10 +265,15 @@ pub async fn start_executor_flight_server(
     let rate_limits = &rt.rate_limits;
     let mut server = server
         .layer(
-            RequestContextLayer::new(rt.app(), rt.datafusion(), session_store, rt.secrets())
+            RequestContextLayer::new(rt.app(), rt.datafusion(), rt.secrets())
                 .with_job_executor(job_executor),
         )
         .layer(auth_layer)
+        .layer(FlightSessionLayer::new(
+            rt.datafusion(),
+            session_store,
+            has_flight_auth,
+        ))
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
             flight_write_rate_limit_enabled,
