@@ -137,7 +137,7 @@ fn passed_message(check: &StateLocationCheck) -> String {
     let location = check.location();
     match feature_list(&check.features()) {
         Some(features) => format!(
-            "Shared state location '{location}' enforces conditional writes, and {features} keep state in it."
+            "Shared state location '{location}' enforces conditional writes and holds state for {features}."
         ),
         None => format!(
             "Shared state location '{location}' enforces conditional writes. No enabled feature keeps state in it."
@@ -147,8 +147,10 @@ fn passed_message(check: &StateLocationCheck) -> String {
 
 fn retry_message(check: &StateLocationCheck, err: &CheckError, delay: Duration) -> String {
     let location = check.location();
-    let waiting = match feature_list(&check.features()) {
-        Some(features) => format!("the instance is not ready, and {features} wait to write state"),
+    let waiting = match feature_list(&check.guarded_features()) {
+        Some(features) => {
+            format!("the instance is not ready, and state writes for {features} wait")
+        }
         None => "the instance is not ready".to_string(),
     };
     format!(
@@ -278,7 +280,7 @@ mod tests {
         for retry in retries {
             assert!(
                 retry.contains(
-                    "Could not check shared state location 's3://my-bucket/spice/': could not write a probe object: The specified bucket does not exist. An instance with 'runtime.state' needs read and write access to its location. Until the check passes, the instance is not ready, and the cluster scheduler and acceleration snapshots wait to write state. Retrying in "
+                    "Could not check shared state location 's3://my-bucket/spice/': could not write a probe object: The specified bucket does not exist. An instance with 'runtime.state' needs read and write access to its location. Until the check passes, the instance is not ready, and state writes for the cluster scheduler wait. Retrying in "
                 ),
                 "{retry}"
             );
@@ -290,7 +292,7 @@ mod tests {
         assert_eq!(infos.len(), 1, "one INFO line: {logged:#?}");
         assert!(
             infos[0].ends_with(
-                "Shared state location 's3://my-bucket/spice/' enforces conditional writes, and the cluster scheduler and acceleration snapshots keep state in it."
+                "Shared state location 's3://my-bucket/spice/' enforces conditional writes and holds state for the cluster scheduler and acceleration snapshots."
             ),
             "{}",
             infos[0]
@@ -345,7 +347,7 @@ mod tests {
         check.record_feature(StateFeature::ResultsCacheWarmup);
         assert_eq!(
             passed_message(&check),
-            "Shared state location 's3://my-bucket/spice/' enforces conditional writes, and the cluster scheduler, source rate control and SQL results cache warmup keep state in it."
+            "Shared state location 's3://my-bucket/spice/' enforces conditional writes and holds state for the cluster scheduler, source rate control and SQL results cache warmup."
         );
     }
 

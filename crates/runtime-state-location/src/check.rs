@@ -223,6 +223,7 @@ pub struct StateLocationCheck {
     location: String,
     outcome: watch::Sender<Outcome>,
     features: parking_lot::Mutex<BTreeSet<StateFeature>>,
+    guarded: parking_lot::Mutex<BTreeSet<StateFeature>>,
 }
 
 impl StateLocationCheck {
@@ -232,6 +233,7 @@ impl StateLocationCheck {
             location: location.into(),
             outcome: watch::Sender::new(Outcome::Pending),
             features: parking_lot::Mutex::default(),
+            guarded: parking_lot::Mutex::default(),
         })
     }
 
@@ -251,6 +253,13 @@ impl StateLocationCheck {
         self.features.lock().iter().copied().collect()
     }
 
+    /// The features whose writes wait for the check: those recorded with
+    /// [`Self::guard`].
+    #[must_use]
+    pub fn guarded_features(&self) -> Vec<StateFeature> {
+        self.guarded.lock().iter().copied().collect()
+    }
+
     /// Wraps `feature`'s store in the location so that its writes wait until
     /// the check has passed, and fail once it has refused the location. Reads
     /// do not wait.
@@ -261,6 +270,7 @@ impl StateLocationCheck {
         store: Arc<dyn ObjectStore>,
     ) -> Arc<dyn ObjectStore> {
         self.record_feature(feature);
+        self.guarded.lock().insert(feature);
         Arc::new(GuardedStore {
             inner: store,
             check: Arc::clone(self),
@@ -700,6 +710,7 @@ mod tests {
             .expect("join")
             .expect("the write lands once the check passes");
         assert_eq!(check.features(), [StateFeature::Scheduler]);
+        assert_eq!(check.guarded_features(), [StateFeature::Scheduler]);
     }
 
     #[tokio::test]
