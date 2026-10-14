@@ -1968,3 +1968,173 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
 
     Ok(())
 }
+
+/// How long [`start_slow_openai_stub`] takes to answer. A duration recorded in seconds
+/// instead of milliseconds lands three orders of magnitude below it.
+#[cfg(feature = "models")]
+const STUB_PROVIDER_DELAY: Duration = Duration::from_millis(200);
+
+/// An `OpenAI`-compatible provider that answers every chat completion and embedding
+/// request after [`STUB_PROVIDER_DELAY`].
+#[cfg(feature = "models")]
+async fn start_slow_openai_stub() -> SocketAddr {
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+
+    async fn chat_completions(Json(body): Json<Value>) -> Json<Value> {
+        tokio::time::sleep(STUB_PROVIDER_DELAY).await;
+        Json(json!({
+            "id": "chatcmpl-stub",
+            "object": "chat.completion",
+            "created": 0,
+            "model": body["model"],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+    }
+
+    async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
+        tokio::time::sleep(STUB_PROVIDER_DELAY).await;
+        let inputs = body["input"].as_array().map_or(1, Vec::len);
+        let data: Vec<Value> = (0..inputs)
+            .map(|index| json!({"object": "embedding", "index": index, "embedding": [0.1, 0.2, 0.3]}))
+            .collect();
+        Json(json!({
+            "object": "list",
+            "model": body["model"],
+            "data": data,
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        }))
+    }
+
+    let listener = tokio::net::TcpListener::bind((LOCALHOST, 0))
+        .await
+        .expect("to bind the stub provider");
+    let addr = listener.local_addr().expect("the stub provider's address");
+    let router = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    addr
+}
+
+/// The sample count and sum of histogram `name`, over all of its series.
+#[cfg(feature = "models")]
+fn histogram_totals(registry: &prometheus::Registry, name: &str) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// `llm_internal_request_duration_ms` and `embeddings_internal_request_duration_ms`
+/// record milliseconds, as their names and units say: a request the provider takes
+/// [`STUB_PROVIDER_DELAY`] to answer records at least that many milliseconds.
+#[cfg(feature = "models")]
+#[tokio::test]
+async fn model_request_durations_are_recorded_in_milliseconds() {
+    use llms::{chat::Chat as _, embeddings::Embed as _};
+    use spicepod::component::{embeddings::Embeddings, model::Model};
+
+    let registry = &*PROMETHEUS;
+
+    let endpoint = format!("http://{}/v1", start_slow_openai_stub().await);
+    let provider_params = || {
+        HashMap::from([
+            ("endpoint".to_string(), endpoint.clone().into()),
+            (
+                "openai_api_key".to_string(),
+                "sk-not-a-real-key".to_string().into(),
+            ),
+        ])
+    };
+    let mut model = Model::new("openai:stub-chat", "stub_chat");
+    model.params = provider_params();
+    let mut embedding = Embeddings::new("openai:stub-embed", "stub_embed");
+    embedding.params = provider_params();
+    let app = AppBuilder::new("metrics_model_request_durations")
+        .with_model(model)
+        .with_embedding(embedding)
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the model and embedding to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the model or embedding never loaded"
+    );
+
+    let chat = rt
+        .completion_llms()
+        .read()
+        .await
+        .get("stub_chat")
+        .cloned()
+        .expect("the chat model to be loaded");
+    let embed = rt
+        .embeds()
+        .read()
+        .await
+        .get("stub_embed")
+        .cloned()
+        .expect("the embedding model to be loaded");
+
+    let llm_before = histogram_totals(registry, "llm_internal_request_duration_ms");
+    chat.chat_request(
+        serde_json::from_value(serde_json::json!({
+            "model": "stub_chat",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat completion request"),
+    )
+    .await
+    .expect("the stub to answer the chat completion");
+    let llm_after = histogram_totals(registry, "llm_internal_request_duration_ms");
+
+    let embeddings_before = histogram_totals(registry, "embeddings_internal_request_duration_ms");
+    embed
+        .embed(llms::embeddings::EmbeddingInput::String(
+            "a text no other request embeds".to_string(),
+        ))
+        .await
+        .expect("the stub to answer the embedding request");
+    let embeddings_after = histogram_totals(registry, "embeddings_internal_request_duration_ms");
+
+    let floor_ms = STUB_PROVIDER_DELAY.as_secs_f64() * 1000.0;
+    for (name, before, after) in [
+        ("llm_internal_request_duration_ms", llm_before, llm_after),
+        (
+            "embeddings_internal_request_duration_ms",
+            embeddings_before,
+            embeddings_after,
+        ),
+    ] {
+        let (samples, recorded) = (after.0 - before.0, after.1 - before.1);
+        assert_eq!(samples, 1, "{name}: one request records one sample");
+        assert!(
+            (floor_ms..60_000.0).contains(&recorded),
+            "{name} recorded {recorded} for a request the provider took {floor_ms} ms to answer, \
+             so it is not in milliseconds"
+        );
+    }
+}
