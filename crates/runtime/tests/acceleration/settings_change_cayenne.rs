@@ -944,3 +944,93 @@ async fn a_changed_primary_key_is_held_while_a_source_reached_after_registration
     );
     Ok(())
 }
+
+/// An accelerated view reads from the runtime itself, so a restart that changes an
+/// identity setting of its Cayenne acceleration rebuilds it with no source to wait for:
+/// the stored table is replaced and the rows reload under the new key. A restart with
+/// unchanged settings then keeps the rebuilt table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accelerated_view_rebuilds_for_a_changed_primary_key_on_restart()
+-> Result<(), anyhow::Error> {
+    use spicepod::component::view::View;
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    let fixture = Fixture::new()?;
+    let view = |primary_key: Option<&str>| {
+        let mut view = View::new("trips_view".to_string());
+        view.sql = Some("SELECT id, name FROM trips".to_string());
+        view.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            primary_key: primary_key.map(ToString::to_string),
+            params: Some(Params::from_string_map(HashMap::from([
+                ("cayenne_file_path".to_string(), fixture.data_dir.clone()),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    fixture.metadata_dir.clone(),
+                ),
+            ]))),
+            ..Acceleration::default()
+        });
+        view
+    };
+    // Serves the view over the unaccelerated `trips` dataset until its rows are `expected`,
+    // then shuts down. Returns the rows it last saw.
+    let ids_after_restart = |view: View, expected: Vec<i64>| {
+        let source = Dataset::new(format!("file:{}", fixture.csv), "trips");
+        async move {
+            let app = AppBuilder::new("settings_change_cayenne")
+                .with_dataset(source)
+                .with_view(view)
+                .build();
+            crate::configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for the view to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            wait_until_true(Duration::from_secs(60), || {
+                let rt = Arc::clone(&rt);
+                let expected = expected.clone();
+                async move { ids(&rt, "trips_view").await.ok() == Some(expected) }
+            })
+            .await;
+            let observed = ids(&rt, "trips_view").await;
+            rt.shutdown().await;
+            observed
+        }
+    };
+
+    // Built with no primary key: every row of the source.
+    let unkeyed = ids_after_restart(view(None), vec![1, 1, 2, 2, 3]).await?;
+    assert_eq!(unkeyed, [1, 1, 2, 2, 3]);
+    let first = fixture.stored("trips_view").await?;
+    assert!(first.primary_key.is_empty());
+
+    // Restarted with a primary key: the acceleration is rebuilt and reloads one row
+    // per key.
+    let keyed = ids_after_restart(view(Some("id")), vec![1, 2, 3]).await?;
+    assert_eq!(
+        keyed,
+        [1, 2, 3],
+        "a changed primary key must rebuild the view's acceleration"
+    );
+    let rebuilt = fixture.stored("trips_view").await?;
+    assert_ne!(rebuilt.table_id, first.table_id);
+    assert_eq!(rebuilt.primary_key, vec!["id".to_string()]);
+
+    // Restarted with the same settings: the rebuilt table is kept.
+    let kept = ids_after_restart(view(Some("id")), vec![1, 2, 3]).await?;
+    assert_eq!(kept, [1, 2, 3]);
+    assert_eq!(
+        fixture.stored("trips_view").await?.table_id,
+        rebuilt.table_id,
+        "a restart with unchanged settings must keep the rebuilt table"
+    );
+    Ok(())
+}
