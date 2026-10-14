@@ -693,6 +693,33 @@ async fn source_readable_for_rebuild(
         .unwrap_or(false)
 }
 
+/// Whether a rebuilt view acceleration could reload: a row of the view's query can be read
+/// through `view_table` within [`REBUILD_SOURCE_WAIT`]. Planning the view reads none of the
+/// sources its query reads, so only a read shows that they answer.
+async fn view_readable_for_rebuild(
+    ctx: &SessionContext,
+    view_name: &TableReference,
+    view_table: &Arc<dyn TableProvider>,
+) -> bool {
+    match tokio::time::timeout(
+        REBUILD_SOURCE_WAIT,
+        read_one_row(ctx, Arc::clone(view_table)),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            let error = error.to_string();
+            let cause = util::single_line(&error);
+            tracing::debug!(
+                "View '{view_name}' keeps its acceleration for now: reading its query before a rebuild failed: {cause}"
+            );
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 /// Reads at most one row through `table_provider`, so an empty source answers too.
 async fn read_one_row(
     ctx: &SessionContext,
@@ -5025,42 +5052,55 @@ impl DataFusion {
         Ok(None)
     }
 
-    /// Creates `source`'s accelerator table, rebuilding the acceleration once when the
+    /// Creates `view`'s accelerator table, rebuilding the acceleration once when the
     /// engine reports that its stored table was built with settings it cannot adopt in
     /// place ([`dataaccelerator::Error::RebuildRequired`]).
     ///
-    /// An engine reports that only for a source whose settings let it be rebuilt
-    /// (`acceleration_source::rebuilds_on_settings_change`: `refresh_mode: full`), so the
-    /// rebuild loses no row a reload does not bring back. Used for an accelerated view,
-    /// whose source is the runtime itself; a dataset goes through
-    /// [`Self::create_dataset_accelerator_table`], which first checks that its source can
-    /// be read.
-    async fn create_accelerator_table_adopting_settings(
+    /// An engine reports that only for a view whose settings let it be rebuilt
+    /// (`acceleration_source::rebuilds_on_settings_change`), so the rebuild loses no row a
+    /// reload does not bring back. The reload runs the view's query, which reads sources
+    /// that can fail, so the acceleration is dropped only once a row of the query can be
+    /// read through `view_table` ([`view_readable_for_rebuild`]). Until then, the engine
+    /// keeps the settings the acceleration was built with
+    /// ([`SettingsRebuild::HeldUntilSourceReadable`]) and the view keeps serving it.
+    async fn create_view_accelerator_table(
         &self,
-        source: &dyn AccelerationSource,
+        view: &View,
+        view_table: &Arc<dyn TableProvider>,
         schema: SchemaRef,
-        constraints: Option<&Constraints>,
         acceleration_settings: &Acceleration,
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Arc<dyn TableProvider>> {
         match self
-            .create_accelerator_table_for(
-                source,
-                &schema,
-                constraints,
-                acceleration_settings,
-                &secrets,
-            )
+            .create_accelerator_table_for(view, &schema, None, acceleration_settings, &secrets)
             .await
         {
             Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
-                self.rebuild_acceleration(source, acceleration_settings, &cause.to_string())
-                    .await?;
+                if view_readable_for_rebuild(&self.ctx, &view.name, view_table).await {
+                    self.rebuild_acceleration(view, acceleration_settings, &cause.to_string())
+                        .await?;
+                    return self
+                        .create_accelerator_table_for(
+                            view,
+                            &schema,
+                            None,
+                            acceleration_settings,
+                            &secrets,
+                        )
+                        .await
+                        .context(UnableToCreateDataAcceleratorSnafu);
+                }
+                let mut held_view = view.clone();
+                if let Some(acceleration) = held_view.spec.acceleration.as_mut() {
+                    acceleration.settings_rebuild = SettingsRebuild::HeldUntilSourceReadable;
+                }
+                let mut held_settings = acceleration_settings.clone();
+                held_settings.settings_rebuild = SettingsRebuild::HeldUntilSourceReadable;
                 self.create_accelerator_table_for(
-                    source,
+                    &held_view,
                     &schema,
-                    constraints,
-                    acceleration_settings,
+                    None,
+                    &held_settings,
                     &secrets,
                 )
                 .await
@@ -5070,7 +5110,7 @@ impl DataFusion {
         }
     }
 
-    /// [`Self::create_accelerator_table_adopting_settings`] for a dataset, whose rebuilt
+    /// [`Self::create_view_accelerator_table`] for a dataset, whose rebuilt
     /// acceleration reloads from its source: the acceleration is dropped only once the
     /// source answers a read on the schema the dataset registered with
     /// ([`source_readable_for_rebuild`]). While it does not — it is unreachable, a read of
@@ -5199,8 +5239,7 @@ impl DataFusion {
     /// `checkpoint`, when given, is cleared after the drop, the order a schema-change
     /// recreate needs: its checkpoint records the old schema, which is how a restart
     /// after a failed drop detects the change again. A settings rebuild clears its
-    /// checkpoint itself, before the drop (see
-    /// [`Self::create_accelerator_table_adopting_settings`]).
+    /// checkpoint itself, before the drop (see [`Self::rebuild_acceleration`]).
     async fn drop_acceleration_for_recreate(
         &self,
         source: &dyn AccelerationSource,
@@ -6387,7 +6426,7 @@ impl DataFusion {
         )?;
 
         let accelerated_table_provider = self
-            .create_accelerator_table_adopting_settings(view, schema, None, acceleration, secrets)
+            .create_view_accelerator_table(view, &view_table, schema, acceleration, secrets)
             .await
             .map_err(|e| Error::UnableToCreateView {
                 reason: match e {

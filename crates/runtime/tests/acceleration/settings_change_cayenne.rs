@@ -1034,3 +1034,174 @@ async fn an_accelerated_view_rebuilds_for_a_changed_primary_key_on_restart()
     );
     Ok(())
 }
+
+/// [`a_changed_primary_key_is_held_while_every_read_of_the_source_fails`] for an
+/// accelerated view. The view's query reads a dataset whose source builds its table but
+/// fails every read, so a rebuilt view acceleration could not reload: the key change is
+/// held, and the view keeps serving the rows it has until a restart can read the source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accelerated_view_is_held_while_every_read_of_its_source_fails()
+-> Result<(), anyhow::Error> {
+    use crate::source_unavailable::UnreachableSource;
+    use crate::utils::run_query;
+    use runtime::component::view::ViewBuilder;
+    use spicepod::component::view::View;
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    let dir = tempfile::tempdir()?;
+    let metadata_dir = dir.path().join("metadata");
+    let source = UnreachableSource::new("settings-view-unreadable", 1);
+    source.register().await;
+    source.read_lazily();
+    source.bring_up();
+    let view = |primary_key: Option<&str>| {
+        let mut view = View::new("orders_view".to_string());
+        view.sql = Some("SELECT id, v FROM orders".to_string());
+        view.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            primary_key: primary_key.map(ToString::to_string),
+            params: Some(Params::from_string_map(HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    dir.path().join("data").to_string_lossy().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().to_string(),
+                ),
+            ]))),
+            ..Acceleration::default()
+        });
+        view
+    };
+    // The view over an unaccelerated `orders`, read from the source on every query.
+    let start = |view: View| {
+        let dataset = Dataset::new(format!("{}://orders", source.prefix), "orders");
+        async move {
+            let app = AppBuilder::new("settings_change_cayenne")
+                .with_dataset(dataset)
+                .with_view(view)
+                .build();
+            crate::configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let loader = tokio::spawn({
+                let rt = Arc::clone(&rt);
+                async move { rt.load_components().await }
+            });
+            (rt, loader)
+        }
+    };
+    let sum_and_count = |rt: Arc<Runtime>| async move {
+        let batches = run_query(
+            &rt,
+            "SELECT CAST(SUM(v) AS BIGINT), COUNT(*) FROM orders_view",
+        )
+        .await
+        .ok()?;
+        let batch = batches.first()?;
+        let value = |column: usize| {
+            batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|values| values.value(0))
+        };
+        Some((value(0)?, value(1)?))
+    };
+    let loads = |rt: Arc<Runtime>, expected: (i64, i64)| async move {
+        wait_until_true(Duration::from_secs(60), || {
+            let rt = Arc::clone(&rt);
+            async move { sum_and_count(rt).await == Some(expected) }
+        })
+        .await
+    };
+    let stored = || async {
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))?;
+        catalog.init().await?;
+        Ok::<_, anyhow::Error>(catalog.get_table("orders_view").await?)
+    };
+    // Waits for the checkpoint the view's acceleration writes once it has loaded. A
+    // restart serves the existing acceleration without reloading it only when it exists.
+    let checkpointed = |rt: Arc<Runtime>, view: View| async move {
+        let app = rt
+            .app()
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the runtime has no app"))?;
+        let view = ViewBuilder::try_from(view)?.build_with(Arc::clone(&rt), app);
+        let checkpoint = dataset_checkpointer(
+            &view,
+            rt.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to open the checkpoint of view 'orders_view': {e}"))?;
+        anyhow::ensure!(
+            wait_until_true(Duration::from_secs(30), || async {
+                checkpoint.exists().await
+            })
+            .await,
+            "view 'orders_view' wrote no checkpoint within 30 s"
+        );
+        Ok::<_, anyhow::Error>(())
+    };
+
+    // Built with no primary key from the source's first value.
+    let (rt, loader) = start(view(None)).await;
+    let built = loads(Arc::clone(&rt), (3, 3)).await;
+    let observed = sum_and_count(Arc::clone(&rt)).await;
+    let checkpoint = checkpointed(Arc::clone(&rt), view(None)).await;
+    rt.shutdown().await;
+    loader.abort();
+    anyhow::ensure!(built, "building the view's acceleration, got {observed:?}");
+    checkpoint?;
+    let first = stored().await?;
+    assert!(first.primary_key.is_empty());
+
+    // The source changes, and the view restarts with a primary key while the source still
+    // builds its table but fails every read of it. A rebuilt acceleration could not
+    // reload, so the existing one keeps serving with the settings it was built with.
+    source.set_value(2);
+    source.set_scans_failing(true);
+    let (rt, loader) = start(view(Some("id"))).await;
+    let kept = loads(Arc::clone(&rt), (3, 3)).await;
+    let observed = sum_and_count(Arc::clone(&rt)).await;
+    rt.shutdown().await;
+    loader.abort();
+    assert!(
+        source.failed_scans() > 0,
+        "the restart must have tried to read the view's source"
+    );
+    assert!(
+        kept,
+        "while every read of its source fails, the view's existing acceleration must keep serving, got {observed:?}"
+    );
+    let held = stored().await?;
+    assert_eq!(held.table_id, first.table_id);
+    assert!(held.primary_key.is_empty());
+
+    // Once the source can be read, the next restart rebuilds with the new key and loads
+    // the source's new value.
+    source.set_scans_failing(false);
+    let (rt, loader) = start(view(Some("id"))).await;
+    let rebuilt = loads(Arc::clone(&rt), (6, 3)).await;
+    let observed = sum_and_count(Arc::clone(&rt)).await;
+    rt.shutdown().await;
+    loader.abort();
+    assert!(
+        rebuilt,
+        "a view whose source can be read again must be rebuilt, got {observed:?}"
+    );
+    let second = stored().await?;
+    assert_ne!(second.table_id, first.table_id);
+    assert_eq!(second.primary_key, vec!["id".to_string()]);
+    Ok(())
+}
