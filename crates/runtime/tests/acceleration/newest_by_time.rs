@@ -47,6 +47,7 @@ use arrow::array::AsArray;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode, WriteMode};
 use spicepod::component::access::AccessMode;
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 
@@ -134,8 +135,13 @@ async fn load_with(
     configure(&mut dataset);
 
     configure_test_datafusion();
+    // Refresh leaves cached SQL results in place; reads after one must skip the cache.
     let app = AppBuilder::new(format!("newest_by_time_{label}"))
         .with_dataset(dataset)
+        .with_sql_cache(SQLResultsCacheConfig {
+            enabled: false,
+            ..Default::default()
+        })
         .build();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     tokio::select! {
@@ -661,6 +667,10 @@ async fn a_synchronized_child_keeps_the_same_versions_as_its_parent() {
             let app = AppBuilder::new("newest_by_time_synchronized_child")
                 .with_dataset(parent)
                 .with_dataset(child)
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             tokio::select! {

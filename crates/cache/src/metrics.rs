@@ -29,18 +29,19 @@ use crate::result::{
 /// Why an entry left the cache, reported as the `reason` attribute on
 /// `*_cache_evictions`.
 ///
-/// The attribute is what lets the counter carry invalidation at all. On an
-/// accelerated dataset with a periodic refresh, [`EvictionReason::Invalidated`]
-/// is the dominant — often the only — cause, so folding it into an unlabelled
-/// total would swamp the size and expiry counts that indicate actual cache
-/// pressure. Split by reason, each stays readable on its own.
+/// The attribute keeps invalidation apart from cache pressure. On a dataset with
+/// frequent client writes, [`EvictionReason::Invalidated`] can dominate, so
+/// folding it into an unlabelled total would swamp the size and expiry counts
+/// that indicate actual cache pressure. Split by reason, each stays readable on
+/// its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionReason {
     /// The cache exceeded `max_size` and reclaimed an entry.
     Size,
     /// The entry outlived `item_ttl`.
     Expired,
-    /// A refresh or a DML write dropped the entries referencing a table.
+    /// A client write, dataset reload or unload dropped the entries that read a
+    /// table. Counted per entry dropped.
     Invalidated,
 }
 
@@ -227,31 +228,25 @@ pub fn init_interner_metrics() {
     LazyLock::force(&INTERNER_METRICS);
 }
 
-/// What an invalidation did to the entries that read the table, reported as the
-/// `mode` attribute on `*_cache_table_invalidations`.
+/// Hard table invalidations from client writes, dataset reload and unload,
+/// reported as the `mode` attribute on `*_cache_table_invalidations`.
 ///
-/// Without this attribute the mode switch is invisible: a cache configured with
-/// `stale_while_revalidate_ttl` stops reporting
-/// [`EvictionReason::Invalidated`] entirely, because there is no longer an
-/// eviction to report, and nothing else records that a refresh happened at all.
+/// Every table invalidation evicts dependent entries and reports `evict`.
+/// SQL results do not record table invalidations for refresh, CDC or retention;
+/// those operations leave SQL results to expire by age.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationMode {
     /// The entries that read the table were dropped from the cache.
     Evict,
-    /// The entries were left resident and marked stale as of this instant, to
-    /// be served once more inside `stale_while_revalidate_ttl` while a
-    /// background revalidation replaces each of them.
-    MarkStale,
 }
 
 impl InvalidationMode {
     /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 2] = [Self::Evict, Self::MarkStale];
+    pub const ALL: [Self; 1] = [Self::Evict];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Evict => "evict",
-            Self::MarkStale => "mark_stale",
         }
     }
 
@@ -263,36 +258,23 @@ impl InvalidationMode {
 /// Why a lookup found an entry but would not serve it, reported as the `reason`
 /// attribute on `*_cache_stale_rejections`.
 ///
-/// The three are operationally distinct, and an unlabelled total cannot be
-/// acted on: only [`StaleRejectionReason::WindowExpired`] says the configured
-/// `stale_while_revalidate_ttl` is too short for the rate queries arrive at.
+/// An entry that is simply too old is not a rejection: the lookup counts it as an
+/// ordinary miss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleRejectionReason {
-    /// No `stale_while_revalidate_ttl` is configured, so an invalidation is a
-    /// hard one and the entry stopped being servable the moment it was marked.
-    NoStaleWindow,
-    /// A window is configured but the query arrived after it closed, so the
-    /// entry expired unserved instead of absorbing the refresh it was kept for.
-    WindowExpired,
-    /// The entry is inside the window, but this lookup serves only fresh
-    /// results and so declined it — a miss the stale-while-revalidate path
-    /// would have absorbed.
-    FreshRequired,
+    /// A client write, dataset reload or unload changed a table the entry read,
+    /// at or after the query that produced it started. The entry may hold rows
+    /// from before the change, so it is never served.
+    WriteDuringRead,
 }
 
 impl StaleRejectionReason {
-    /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 3] = [
-        Self::NoStaleWindow,
-        Self::WindowExpired,
-        Self::FreshRequired,
-    ];
+    /// Every rejection reason, for seeding the metric series.
+    pub const ALL: [Self; 1] = [Self::WriteDuringRead];
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::NoStaleWindow => "no_window",
-            Self::WindowExpired => "window_expired",
-            Self::FreshRequired => "fresh_required",
+            Self::WriteDuringRead => "write_during_read",
         }
     }
 
@@ -430,7 +412,7 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_evictions"))
                     .with_description(
-                        "Number of entries evicted because they expired or the cache was over capacity. Entries dropped by table invalidation are counted by the invalidations metric instead.",
+                        "Number of entries evicted, split by `reason`: `expired` past their age, `size` to stay under max_size, or `invalidated` dropped by a client write, dataset reload or unload of a table they read.",
                     )
                     .build()
             });
@@ -439,7 +421,7 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_stale_rejections"))
                     .with_description(
-                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. Split by `reason` into whether no stale-while-revalidate window is configured, the window had closed, or the caller serves only fresh results. These are also counted as misses.",
+                        "Number of lookups that found an entry but refused to serve it because a client write, dataset reload or unload changed a table it read after its query started. Reported with reason `write_during_read`. These are also counted as misses.",
                     )
                     .build()
             });
@@ -448,7 +430,7 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_table_invalidations"))
                     .with_description(
-                        "Number of table invalidations applied to this cache, split by `mode` into whether the dependent entries were evicted or left resident and marked stale. Counts invalidations, not the entries each one affected.",
+                        "Number of hard table invalidations applied to this cache, always with mode `evict`. SQL results record client writes, dataset reload and unload, but not refresh, CDC or retention. Counts invalidations, not the entries each one affected.",
                     )
                     .build()
             });
@@ -458,15 +440,6 @@ macro_rules! generate_cache_metrics {
                     .u64_counter(concat!($prefix, "_cache_swr_revalidations"))
                     .with_description(
                         "Number of completed background stale-while-revalidate revalidations, split by `outcome`. Any outcome other than `stored` leaves the previous entry in place to be served stale until it expires.",
-                    )
-                    .build()
-            });
-
-            pub static INVALIDATION_STALE_HITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-                METER
-                    .u64_counter(concat!($prefix, "_cache_invalidation_stale_hits"))
-                    .with_description(
-                        "Number of results served from an entry a table invalidation had marked stale, within the configured stale-while-revalidate window. Counted where the result is handed back, so a request whose own `max-stale` is shorter than the window, or whose entry fails to decode, is not counted here even though the entry was found.",
                     )
                     .build()
             });
@@ -512,7 +485,6 @@ macro_rules! generate_cache_metrics {
                 REQUESTS.add(0, &[]);
                 HITS.add(0, &[]);
                 MISSES.add(0, &[]);
-                INVALIDATION_STALE_HITS.add(0, &[]);
                 STALE_WHILE_REVALIDATE_SKIPPED.add(0, &[]);
                 STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(0, &[]);
                 for reason in EvictionReason::ALL {
@@ -570,15 +542,15 @@ pub trait CacheMetrics: Send + Sync {
     where
         Self: Sized;
     /// Records a lookup that found an entry but could not serve it because a
-    /// table it read had since been invalidated.
+    /// client write, dataset reload or unload changed a table it read after its
+    /// query started.
     fn record_stale_rejection(reason: StaleRejectionReason)
     where
         Self: Sized;
     /// Records a table invalidation applied to this cache, and what it did to
     /// the dependent entries. Counts invalidations, not the entries each one
     /// affected — the per-entry count is [`Self::record_eviction`] under
-    /// [`EvictionReason::Invalidated`], which reports nothing at all when the
-    /// invalidation marks entries stale instead of removing them.
+    /// [`EvictionReason::Invalidated`].
     fn record_table_invalidation(mode: InvalidationMode)
     where
         Self: Sized;

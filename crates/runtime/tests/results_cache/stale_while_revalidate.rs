@@ -178,7 +178,7 @@ async fn post_sql(
 /// A revalidation that cannot be reconstructed fails silently — the stale entry
 /// is simply served again — so what proves it landed is the status returning to
 /// `HIT`: only a stored result makes the entry fresh again.
-async fn assert_revalidation_lands(base: &str, client_cache_key: Option<&str>) {
+async fn assert_revalidation_lands(rt: &Runtime, base: &str, client_cache_key: Option<&str>) {
     let client = reqwest::Client::new();
 
     let populated = post_sql(&client, base, client_cache_key).await;
@@ -191,6 +191,21 @@ async fn assert_revalidation_lands(base: &str, client_cache_key: Option<&str>) {
         BOUND_VAL.to_string(),
         "binding {BOUND_ID} must select its own row"
     );
+
+    if let Err(error) = rt
+        .datafusion()
+        .caching()
+        .invalidate_for_refresh(datafusion::common::TableReference::bare("swr_values"))
+        .await
+    {
+        panic!("refresh invalidates derived caches: {error}");
+    }
+    let fresh = post_sql(&client, base, client_cache_key).await;
+    assert_eq!(
+        fresh.cache_status, "HIT",
+        "refresh leaves the SQL result fresh"
+    );
+    assert_eq!(fresh.single_val(), BOUND_VAL.to_string());
 
     // Age the entry past `item_ttl` into the stale-while-revalidate window. The
     // sleep is the behavior under test (TTL expiry), not a readiness wait.
@@ -245,13 +260,13 @@ async fn swr_revalidation_of_a_parameterized_query_rebinds_its_values() {
 
     test_request_context()
         .scope(async {
-            let (_rt, base) = start_runtime(swr_app(
+            let (rt, base) = start_runtime(swr_app(
                 "swr_param_sql_key",
                 spicepod::component::caching::CacheKeyType::Sql,
             ))
             .await;
 
-            assert_revalidation_lands(&base, None).await;
+            assert_revalidation_lands(&rt, &base, None).await;
         })
         .await;
 }
@@ -268,13 +283,13 @@ async fn swr_revalidation_of_a_client_keyed_parameterized_query_rebinds_its_valu
 
     test_request_context()
         .scope(async {
-            let (_rt, base) = start_runtime(swr_app(
+            let (rt, base) = start_runtime(swr_app(
                 "swr_param_client_key",
                 spicepod::component::caching::CacheKeyType::Plan,
             ))
             .await;
 
-            assert_revalidation_lands(&base, Some("swr-param-client-key")).await;
+            assert_revalidation_lands(&rt, &base, Some("swr-param-client-key")).await;
         })
         .await;
 }

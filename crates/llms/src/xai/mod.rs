@@ -66,7 +66,7 @@ impl Xai {
 
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
-            client: Client::with_config(cfg),
+            client: crate::provider::client_without_retry(cfg),
             rate_controller: default_rate_controller(),
         }
     }
