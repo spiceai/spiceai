@@ -53,7 +53,7 @@ jobs:
     # stay on push: merge_group checks out the queue merge commit, which
     # contains the queued pull request, and a spiceio miss must not fall
     # through to those credentials.
-    runs-on: spiceai-macos
+    runs-on: spiceai-macos-large
     env:
       HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
