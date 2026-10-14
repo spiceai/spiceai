@@ -168,13 +168,31 @@ impl From<String> for EntryType {
 ///
 /// Used for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s
 /// non-empty `list[str | object | array]` criteria shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(untagged)]
 pub enum NonNullEntry {
     String(String),
     Array(Vec<Value>),
     Object(Map<String, Value>),
+}
+
+/// Written by hand so a level of the wrong kind is refused by saying which kinds a level
+/// may be, rather than that no variant of an untagged enum matched.
+impl<'de> Deserialize<'de> for NonNullEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = match Value::deserialize(deserializer)? {
+            Value::String(text) => return Ok(Self::String(text)),
+            Value::Array(items) => return Ok(Self::Array(items)),
+            Value::Object(fields) => return Ok(Self::Object(fields)),
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+        };
+        Err(serde::de::Error::custom(format!(
+            "a score level must be a string, an object, or an array, not {kind}"
+        )))
+    }
 }
 
 impl From<&str> for NonNullEntry {
@@ -594,7 +612,7 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateResponse {
-    /// Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it.
+    /// The Spicepod model name the request named, as `/v1/chat/completions` reports it.
     pub model: String,
     #[serde(deserialize_with = "deserialize_nonempty_answers")]
     #[schemars(extend("minProperties" = 1))]
@@ -610,7 +628,8 @@ pub trait Evaluate: Send + Sync + Debug {
     /// Run an evaluation against `state` and `questions`.
     ///
     /// The runtime sets `request.model` to the Spicepod model *name*; providers
-    /// should substitute their upstream model id before calling the remote API.
+    /// should substitute their upstream model id before calling the remote API, and
+    /// report the Spicepod name back in [`EvaluateResponse::model`].
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
     /// Checks the model can answer, e.g. by listing the provider's models.
@@ -804,6 +823,38 @@ mod tests {
         } else {
             panic!("expected Score");
         }
+    }
+
+    #[test]
+    fn score_levels_must_be_strings_objects_or_arrays() {
+        for (level, kind) in [(json!(null), "null"), (json!(3), "a number")] {
+            let error = serde_json::from_value::<Question>(json!({
+                "type": "score",
+                "criteria": ["low", level]
+            }))
+            .expect_err("a level that is not a string, object, or array must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("a score level must be a string, an object, or an array, not {kind}")
+            );
+        }
+
+        let ok: Question = serde_json::from_value(json!({
+            "type": "score",
+            "criteria": ["low", {"label": "mid"}, ["high"]]
+        }))
+        .expect("string, object, and array levels");
+        let Question::Score { criteria, .. } = ok else {
+            panic!("expected a score question, got {ok:?}");
+        };
+        assert_eq!(
+            criteria,
+            vec![
+                NonNullEntry::String("low".to_string()),
+                NonNullEntry::Object(Map::from_iter([("label".to_string(), json!("mid"))])),
+                NonNullEntry::Array(vec![json!("high")]),
+            ]
+        );
     }
 
     #[test]

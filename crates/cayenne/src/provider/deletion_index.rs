@@ -710,10 +710,15 @@ where
     ///
     /// - **delete side** is kept iff `delete_seq > cutoff`; a delete at or below
     ///   `cutoff` is cleared (it was baked into the consolidated file).
-    /// - **insert side** is always preserved: an upsert re-insertion above the
-    ///   cutoff still resolves visibility against any surviving `> cutoff` delete,
-    ///   and an insert-only entry is harmless to keep. An entry that loses its
-    ///   delete side and has no insert record is dropped entirely.
+    /// - **insert side** is kept iff `insert_seq > cutoff`: an upsert re-insertion
+    ///   above the cutoff still resolves visibility against a surviving `> cutoff`
+    ///   delete that it may postdate. A re-insertion at or below the cutoff never
+    ///   can — every surviving delete of its key is newer — so it decides no probe
+    ///   and is cleared, as the durable insert records at or below a fenced
+    ///   rewrite's cutoff are. Kept, such entries would accumulate one per key ever
+    ///   upserted: every scan's tombstone pushdown walks them and the index's
+    ///   memory reservation holds them. An entry left with neither side is dropped
+    ///   entirely.
     ///
     /// ## Why a single consolidated base run (no per-run tag surgery)
     ///
@@ -761,7 +766,11 @@ where
             } else {
                 SEQUENCE_ABSENT
             };
-            let insert_seq = entry.insert_seq;
+            let insert_seq = if entry.insert_seq != SEQUENCE_ABSENT && entry.insert_seq > cutoff {
+                entry.insert_seq
+            } else {
+                SEQUENCE_ABSENT
+            };
             if delete_seq == SEQUENCE_ABSENT && insert_seq == SEQUENCE_ABSENT {
                 continue; // fully dead: delete baked, no re-insertion to track.
             }
@@ -1182,7 +1191,8 @@ impl DeletionIndex {
     }
 
     /// Build a new index with every **deletion** at or below `cutoff` removed,
-    /// retaining deletions with `delete_seq > cutoff` and all insert records.
+    /// retaining deletions with `delete_seq > cutoff` and insert records with
+    /// `insert_seq > cutoff`.
     ///
     /// Used by a seq-prefix compaction after the rewrite has physically applied
     /// every deletion with `delete_seq <= cutoff` (= `T`): those tombstones are
@@ -1696,8 +1706,8 @@ mod tests {
                     7 => {
                         // Seq-prefix prune: drop deletions at or below a cutoff
                         // (the seq-prefix-compaction bake). Mirror the same cut on
-                        // the naive reference: clear a delete side <= cutoff, keep
-                        // the insert side, drop now-empty entries.
+                        // the naive reference: clear a delete side <= cutoff and an
+                        // insert side <= cutoff, drop now-empty entries.
                         let cutoff = match rng() % 5 {
                             0 => -1,       // no-op floor (no real seq is <= -1)
                             1 => 0,        // boundary
@@ -1711,9 +1721,12 @@ mod tests {
                             }
                         };
                         idx = idx.prune_deletes_at_or_below(cutoff, |pk| hash_key_i64(*pk));
-                        for (d, _) in naive.values_mut() {
+                        for (d, i) in naive.values_mut() {
                             if *d != SEQUENCE_ABSENT && *d <= cutoff {
                                 *d = SEQUENCE_ABSENT;
+                            }
+                            if *i != SEQUENCE_ABSENT && *i <= cutoff {
+                                *i = SEQUENCE_ABSENT;
                             }
                         }
                         naive.retain(|_, (d, i)| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT);
@@ -1912,6 +1925,100 @@ mod tests {
             !pruned.might_contain(7),
             "insert-only key absent from delete bloom"
         );
+    }
+
+    #[test]
+    fn prune_drops_insert_records_at_or_below_cutoff() {
+        // Key 7: deleted @2, re-inserted @3 — both at or below the cutoff, so the
+        // entry decides nothing any more and is dropped entirely.
+        // Key 8: re-inserted @1, deleted again @6 — the delete survives the cutoff
+        // and still hides the key; the older re-insertion (<= cutoff) can never
+        // outrank it, so it is dropped.
+        // Key 9: deleted @2, re-inserted @5 — the re-insertion is above the cutoff
+        // and survives (`prune_keeps_insert_records_when_delete_side_dropped`).
+        let idx = DeletionIndex::empty()
+            .extend_max_conflicts([7_i64], 2, 3)
+            .extend_max_conflicts([8_i64], 6, 1)
+            .extend_max_conflicts([9_i64], 2, 5);
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.insert_len(), 3);
+
+        let pruned = idx.prune_deletes_at_or_below(3);
+        assert_eq!(pruned.len(), 2, "key 7 is dropped entirely");
+        assert_eq!(pruned.insert_len(), 1, "only key 9's re-insertion survives");
+        assert_eq!(pruned.delete_len(), 1, "only key 8's delete survives");
+        assert_eq!(pruned.get(7), None);
+        assert_eq!(
+            pruned
+                .get(8)
+                .map(|t| (t.delete_sequence, t.insert_sequence)),
+            Some((6, None)),
+            "key 8 stays hidden by its surviving delete"
+        );
+        assert_eq!(pruned.get(9), None, "key 9 has no surviving delete");
+    }
+
+    /// The pruned index answers every key's visibility exactly as the rule that
+    /// kept every insert side does, under both insert-record handlings: an insert
+    /// at or below the cutoff can never outrank a surviving delete, so dropping it
+    /// changes no probe. Seeded; the seed is in the failure message.
+    #[test]
+    fn prune_dropping_old_insert_records_changes_no_visibility() {
+        // SplitMix64, so the case set is reproducible from `seed`.
+        fn next(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        for seed in 0..64_u64 {
+            let mut state = seed;
+            let mut idx = DeletionIndex::empty();
+            // (delete, insert) per key, SEQUENCE_ABSENT for an unset side.
+            let mut model = std::collections::BTreeMap::<i64, (i64, i64)>::new();
+            for key in 0..200_i64 {
+                let delete = i64::try_from(next(&mut state) % 40).expect("small") + 1;
+                if next(&mut state).is_multiple_of(3) {
+                    idx = idx.extend_max_deletes([(key, delete)]);
+                    model.insert(key, (delete, SEQUENCE_ABSENT));
+                } else {
+                    let insert = i64::try_from(next(&mut state) % 40).expect("small") + 1;
+                    idx = idx.extend_max_conflicts([key], delete, insert);
+                    model.insert(key, (delete, insert));
+                }
+            }
+            let cutoff = i64::try_from(next(&mut state) % 42).expect("small");
+            let pruned = idx.prune_deletes_at_or_below(cutoff);
+            for (&key, &(delete, insert)) in &model {
+                // The rule that kept every insert side.
+                let surviving_delete = delete > cutoff;
+                let kept_all_apply = !(surviving_delete && insert <= delete);
+                let kept_all_ignore = !surviving_delete;
+                // The pruned index.
+                let tombstone = pruned.get(key);
+                let pruned_apply = tombstone.is_none_or(|t| {
+                    t.insert_sequence
+                        .is_some_and(|insert| insert > t.delete_sequence)
+                });
+                let pruned_ignore = tombstone.is_none();
+                assert_eq!(
+                    (pruned_apply, pruned_ignore),
+                    (kept_all_apply, kept_all_ignore),
+                    "seed {seed}: key {key} (delete {delete}, insert {insert}) at cutoff {cutoff}"
+                );
+            }
+            // No insert side at or below the cutoff survives.
+            let surviving_inserts = model
+                .values()
+                .filter(|(_, insert)| *insert > cutoff)
+                .count();
+            assert_eq!(
+                pruned.insert_len(),
+                surviving_inserts,
+                "seed {seed}: insert sides above cutoff {cutoff}"
+            );
+        }
     }
 
     #[test]

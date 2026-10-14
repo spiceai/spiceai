@@ -39,16 +39,24 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, LastSmallFileCompactPath, MetadataCatalog};
+use cayenne::provider::CayenneContext;
+use cayenne::{
+    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
+    MetadataCatalog,
+};
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
 test_with_backends!(position_mode_deletion_index_reaches_bounded_steady_state);
 test_with_backends!(key_mode_deletion_index_still_reclaims);
-test_with_backends!(default_mode_deletion_index_reclaims_through_the_bake);
+test_with_backends!(default_mode_small_table_reclaims_by_rewriting_itself);
+test_with_backends!(default_mode_table_past_its_bound_reclaims_through_the_bake);
 test_with_backends!(small_write_profile_deletion_index_reclaims_through_the_bake);
+test_with_backends!(empty_table_reclaim_clears_tombstones_and_survives_reopen);
 
 /// Rows per upsert round. Above `INLINE_MAX_ROWS` so each round writes a Vortex
 /// file rather than landing in the inline memtable.
@@ -130,6 +138,10 @@ async fn build_table_with_config(
     schema: &Arc<Schema>,
     vortex_config: VortexConfig,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let context = vortex_config
+        .auto_keeps_key_deletes
+        .then(|| CayenneContext::new(&vortex_config, ctx.runtime_env(), name));
     let options = CreateTableOptions {
         table_name: name.to_string(),
         schema: Arc::clone(schema),
@@ -143,10 +155,98 @@ async fn build_table_with_config(
     };
 
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let ctx = SessionContext::new();
-    Ok(Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    ))
+    let mut builder = CayenneTableProviderBuilder::new(catalog, ctx.runtime_env());
+    if let Some(context) = context {
+        builder = builder.with_context(context);
+    }
+    Ok(Arc::new(builder.create(options).await?))
+}
+
+/// Deleting every row still requires a durable empty rewrite before the
+/// deletion index can be reclaimed. Reinserting the keys after reopening must
+/// return only the new rows.
+async fn empty_table_reclaim_clears_tombstones_and_survives_reopen(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (mode, keep_keys) in [
+        (DeletionMode::Auto, false),
+        (DeletionMode::Auto, true),
+        (DeletionMode::Position, false),
+    ] {
+        let name = format!("empty_reclaim_{}_{keep_keys}", mode.as_str());
+        let schema = pk_schema();
+        let table = build_table_with_config(
+            &fixture,
+            &name,
+            &schema,
+            VortexConfig {
+                auto_keeps_key_deletes: keep_keys,
+                bake_deletion_index_trigger: 2,
+                ..reclaim_config(mode)
+            },
+        )
+        .await?;
+        assert_eq!(table.should_capture_positions(), !keep_keys);
+        common::write_batches(
+            &table,
+            vec![round_batch(&schema, 0, 0)],
+            InsertOp::Overwrite,
+        )
+        .await?;
+        table.drain_in_flight_maintenance().await?;
+        let ctx = SessionContext::new();
+        ctx.register_table(&name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
+        ctx.sql(&format!("DELETE FROM {name}"))
+            .await?
+            .collect()
+            .await?;
+        let before = table.deletion_index_len();
+        assert!(
+            before >= 2,
+            "premise: all-row delete crossed the reclaim trigger"
+        );
+        let rows = ctx
+            .sql(&format!("SELECT id, value FROM {name}"))
+            .await?
+            .collect()
+            .await?;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0));
+        let committed =
+            tokio::time::timeout(PASS_TIMEOUT, table.compact_current_snapshot_small_files())
+                .await??;
+        let after = table.deletion_index_len();
+        println!(
+            "{name}: visible_rows=0 tombstones_before={before} committed={committed} tombstones_after={after}"
+        );
+        assert_eq!(after, 0, "{name}: reclaim must clear the deletion index");
+        assert!(committed, "{name}: the empty snapshot must commit");
+        ctx.deregister_table(&name)?;
+        drop(table);
+
+        let catalog: Arc<dyn MetadataCatalog> =
+            Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+        catalog.init().await?;
+        let reopened = Arc::new(
+            CayenneTableProviderBuilder::new(catalog, ctx.runtime_env())
+                .open(&name)
+                .await?,
+        );
+        assert_eq!(reopened.deletion_index_len(), 0, "{name}: durable prune");
+        ctx.register_table(&name, Arc::clone(&reopened) as Arc<dyn TableProvider>)?;
+        let rows = ctx
+            .sql(&format!("SELECT id, value FROM {name}"))
+            .await?
+            .collect()
+            .await?;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0));
+        common::insert_batch(&reopened, round_batch(&schema, 0, 1)).await?;
+        assert_eq!(
+            row_set_summary(&reopened, &name).await,
+            (ROWS_PER_ROUND, ROWS_PER_ROUND, ROWS_PER_ROUND),
+            "{name}: reinsertion returns each key once, with its new value"
+        );
+    }
+    Ok(())
 }
 
 /// Drive `ROUNDS` upsert rounds, running a maintenance pass after each, and
@@ -310,17 +410,132 @@ async fn key_mode_deletion_index_still_reclaims(
 }
 
 /// The same workload on the DEFAULT `deletion_mode` (`auto`), the configuration
-/// issue #13620 reports: a primary-key table left on `auto` resolved to
-/// `position`, so the seq-prefix bake declined it on every pass and its key
-/// deletion index grew by one tombstone per superseded row for the life of the
-/// process. `auto` now resolves to `key` for a primary-key table, so the bake
-/// reclaims the index — the incremental pass, not the whole-snapshot rewrite an
-/// explicit `position` table falls back to.
-async fn default_mode_deletion_index_reclaims_through_the_bake(
+/// issue #13620 reports: its deletion index grew by one tombstone per superseded
+/// row for the life of the process. This table is far inside `auto`'s
+/// position-delete bound (1/32 of the 256 MiB target file size), so `auto`
+/// keeps it on position deletes and reclaims the index the way a position table
+/// does — by rewriting the whole table, which is cheap at this size and leaves
+/// one compact snapshot — and the index stays bounded.
+///
+/// `auto` paces those rewrites to a tenth of the time, so rounds written back to
+/// back can run ahead of them: the index grows past the trigger until the pace
+/// lets the next rewrite run, and then comes back under it.
+async fn default_mode_small_table_reclaims_by_rewriting_itself(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
     let table = build_table(&fixture, "auto_reclaim", &schema, DeletionMode::Auto).await?;
+
+    let observed = drive_rounds(&table, &schema).await?;
+
+    assert!(
+        observed.windows(2).any(|pair| pair[1] < pair[0]),
+        "the index never shrank while the rounds ran, so nothing reclaimed it: {observed:?}"
+    );
+    let bound = RECLAIM_TRIGGER + usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
+    // `drive_rounds` already proved a paced rewrite can shrink the index; the
+    // pace then waits nine times that rewrite's duration before the next. On CI
+    // a whole-table rewrite of this fixture can take several seconds, so the
+    // wait outruns a short poll and leaves the index above the bound (signoff
+    // 38257591389: observations ending at 7500 with bound 3500). Clear the pace
+    // so the poll's reclaim is due at once.
+    table.forget_auto_reclaim_pace();
+    common::lookup_index::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(20),
+        async || {
+            table
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("reclaim pass");
+            table
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain maintenance");
+            let len = table.deletion_index_len();
+            if len <= bound { Ok(len) } else { Err(len) }
+        },
+        |len| {
+            format!(
+                "a default-mode primary-key table's deletion index stayed past its steady state: {len} > {bound}, observations {observed:?}"
+            )
+        },
+    )
+    .await;
+    assert!(
+        table.should_capture_positions(),
+        "the small default-mode table left position deletes: {observed:?}"
+    );
+    // Reclaimed by the whole-table rewrite: the seq-prefix bake declines a
+    // position table.
+    assert_eq!(
+        table.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "the small default-mode table was not reclaimed by a rewrite: {observed:?}"
+    );
+
+    assert_latest_row_per_key(&table, "auto_reclaim").await;
+
+    Ok(())
+}
+
+/// Rows of incompressible payload that put a table past the 32 KiB position-delete
+/// bound a 1 MiB target file size gives `auto`, on keys no upsert round touches.
+fn ballast_batch(schema: &Arc<Schema>) -> RecordBatch {
+    const BALLAST_ROWS: i64 = 40_000;
+    let start = ROUNDS * ROWS_PER_ROUND;
+    let ids: Vec<i64> = (start..start + BALLAST_ROWS).collect();
+    let values: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            // SplitMix64 of the key, as hex: no run or dictionary to compress.
+            let mut z = id.cast_unsigned().wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let a = z ^ (z >> 31);
+            let b = a.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            format!("{a:016x}{b:016x}")
+        })
+        .collect();
+    RecordBatch::try_new(
+        Arc::clone(schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(values)),
+        ],
+    )
+    .expect("ballast batch is valid")
+}
+
+/// A default-mode table past `auto`'s position-delete bound reclaims its deletion
+/// index the way a key table does, through the incremental seq-prefix bake,
+/// never by rewriting the whole table — the rewrite the bound exists to keep
+/// cheap.
+async fn default_mode_table_past_its_bound_reclaims_through_the_bake(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let table = build_table_with_config(
+        &fixture,
+        "auto_past_bound_reclaim",
+        &schema,
+        VortexConfig {
+            target_vortex_file_size_mb: 1,
+            ..reclaim_config(DeletionMode::Auto)
+        },
+    )
+    .await?;
+    common::insert_batch(&table, ballast_batch(&schema)).await?;
+    table.drain_in_flight_maintenance().await?;
+    let stats = fixture
+        .catalog
+        .table_storage_stats(&table.metadata().table_id)
+        .await?;
+    let bytes = stats.current_bytes + stats.protected_bytes;
+    assert!(
+        bytes > 32 * 1024,
+        "premise: the ballast ({bytes} B) must put the table past the 32 KiB bound"
+    );
 
     let observed = drive_rounds(&table, &schema).await?;
 
@@ -329,35 +544,58 @@ async fn default_mode_deletion_index_reclaims_through_the_bake(
     let peak = observed.iter().copied().max().unwrap_or(0);
     assert!(
         peak < unbounded,
-        "a default-mode primary-key table accumulated every tombstone: peak {peak}, observations {observed:?}"
+        "a default-mode table past its bound accumulated every tombstone: peak {peak}, observations {observed:?}"
     );
     assert!(
         observed.iter().any(|len| *len >= RECLAIM_TRIGGER)
             || observed.windows(2).any(|pair| pair[1] < pair[0]),
         "the index never crossed the reclaim trigger and never shrank, so this test proved nothing: {observed:?}"
     );
-    // Reclaimed by the bake, not by the full current-snapshot rewrite: the
-    // rewrite is the expensive fallback reserved for an explicit `position`
-    // table, and no current-dir small files accumulate on this workload, so a
-    // `Full` here means `auto` still resolved to `position`.
     assert_eq!(
         table.last_small_file_compact_path(),
         LastSmallFileCompactPath::None,
-        "the default-mode table was reclaimed by a full rewrite, so `auto` did not resolve to `key`: {observed:?}"
+        "a table past its bound must not be rewritten whole: {observed:?}"
     );
 
-    assert_latest_row_per_key(&table, "auto_reclaim").await;
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "auto_past_bound_reclaim",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+    let batches = ctx
+        .sql(
+            "SELECT COUNT(*), COUNT(DISTINCT id), \
+             SUM(CASE WHEN value LIKE 'gen_0001_%' THEN 1 ELSE 0 END) FROM auto_past_bound_reclaim",
+        )
+        .await?
+        .collect()
+        .await?;
+    let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
+    let column = |index: usize| {
+        merged
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("integer summary column")
+            .value(0)
+    };
+    let upserted = ROUNDS * ROWS_PER_ROUND;
+    assert_eq!(
+        (column(0), column(1), column(2)),
+        (upserted + 40_000, upserted + 40_000, upserted),
+        "(rows, distinct keys, rows with the final payload)"
+    );
 
     Ok(())
 }
 
-/// The default mode under the protected-snapshot merge trigger the accelerator
+/// A key-delete table under the protected-snapshot merge trigger the accelerator
 /// gives every `refresh_mode: append` and `changes` table (its small-write
 /// profile merges at 4). The seq-prefix bake needs the snapshots it leaves
 /// unbaked plus two more, and the merge folds the protected set as soon as 4
 /// accumulate — so with the bake's floor at 5 the merge always got there first,
 /// the bake never found a candidate, and the deletion index grew for the life of
-/// the table even though `auto` now resolves to `key`.
+/// the table.
 async fn small_write_profile_deletion_index_reclaims_through_the_bake(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -368,7 +606,7 @@ async fn small_write_profile_deletion_index_reclaims_through_the_bake(
         &schema,
         VortexConfig {
             compaction_trigger_protected_snapshots: 4,
-            ..reclaim_config(DeletionMode::Auto)
+            ..reclaim_config(DeletionMode::Key)
         },
     )
     .await?;
