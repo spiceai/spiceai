@@ -237,6 +237,9 @@ Every Spice replica must have its own replication slot. Spice handles this autom
 | ------------------------------- | --------------------------------------------------------------- |
 | `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica.                      |
 | `HOSTNAME` / `COMPUTERNAME` env | Fallback — works on k8s where each pod has a distinct hostname. |
+| The host name                   | Last fallback, when none of the variables above is set.         |
+
+An empty variable counts as unset.
 
 ### Example: Kubernetes StatefulSet
 

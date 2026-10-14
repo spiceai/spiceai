@@ -200,6 +200,22 @@ fn spawn_control_stream(
 
             // Create channels for outbound messages
             let (outbound_tx, outbound_rx) = mpsc::channel::<ExecutorControlMessage>(32);
+
+            // The identification message goes first: the scheduler reads the
+            // process id from a stream's first message, so it is queued before
+            // the heartbeat task or a broadcast can write to the stream.
+            let init_msg = ExecutorControlMessage {
+                executor_id: executor_id.clone(),
+                message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
+                })),
+                process_id: process_id.clone(),
+            };
+            if outbound_tx.send(init_msg).await.is_err() {
+                continue;
+            }
             {
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = Some(outbound_tx.clone());
@@ -238,27 +254,6 @@ fn spawn_control_stream(
                     }
                 }
             });
-
-            // Send initial identification message
-            let init_msg = ExecutorControlMessage {
-                executor_id: executor_id.clone(),
-                message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
-                })),
-                process_id: process_id.clone(),
-            };
-            if outbound_tx.send(init_msg).await.is_err() {
-                teardown_scheduler_stream(
-                    &heartbeat_task,
-                    &outbound_tx_state_for_task,
-                    broadcaster.as_ref(),
-                    &scheduler_address,
-                )
-                .await;
-                continue;
-            }
 
             // Create the bidirectional stream
             let outbound_stream = ReceiverStream::new(outbound_rx);
@@ -600,6 +595,7 @@ impl ControlStreamManager {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         executor_id: String,
+        process_id: String,
         ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
@@ -610,7 +606,7 @@ impl ControlStreamManager {
     ) -> Self {
         Self {
             executor_id,
-            process_id: uuid::Uuid::new_v4().to_string(),
+            process_id,
             ballista_executor_id,
             client_tls_config,
             metrics_reader: metrics_reader.map(Arc::new),
@@ -784,6 +780,7 @@ mod tests {
     fn test_control_stream_manager_new() {
         let manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "process-1".to_string(),
             "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
@@ -801,6 +798,7 @@ mod tests {
     fn test_control_stream_manager_update_schedulers_empty() {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "process-1".to_string(),
             "executor-1".to_string(),
             None,
             None,
@@ -818,6 +816,7 @@ mod tests {
     fn test_control_stream_manager_shutdown_empty() {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "process-1".to_string(),
             "executor-1".to_string(),
             None,
             None,

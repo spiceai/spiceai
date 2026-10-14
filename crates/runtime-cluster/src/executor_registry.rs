@@ -205,6 +205,16 @@ struct ExecutorProcesses {
     replaced: VecDeque<String>,
 }
 
+/// An executor's `FlightSQL` endpoint.
+#[derive(Debug, Clone)]
+struct FlightEndpoint {
+    /// `host:port`, without a scheme.
+    address: String,
+    /// The process that registered the endpoint; empty for executors that send
+    /// no process id.
+    process_id: String,
+}
+
 /// Classifies a registration by the process it comes from and updates `seen`.
 /// `was_connected` says whether a connection is registered under the id.
 fn classify_registration(
@@ -350,6 +360,11 @@ pub struct ExecutorRegistry {
     /// An executor with a `FlightSqlClient` is considered "ready" — the scheduler can route queries to it.
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
 
+    /// Map of `executor_id` -> where its `FlightSqlClient` connects and which
+    /// process registered it. Changed only while `flight_sql_clients` is
+    /// write-locked.
+    flight_sql_endpoints: Arc<parking_lot::RwLock<HashMap<String, FlightEndpoint>>>,
+
     /// Map of `executor_id` -> table partitions for that executor
     partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
 
@@ -417,6 +432,7 @@ impl ExecutorRegistry {
             processes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             next_connection: Arc::new(AtomicU64::new(1)),
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
+            flight_sql_endpoints: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
@@ -573,6 +589,21 @@ impl ExecutorRegistry {
             }
         }
 
+        // The earlier run's endpoint may be gone, and the new process has not
+        // loaded its partitions yet, so it is not ready until it registers its
+        // own endpoint.
+        if registration == ExecutorRegistration::Restarted {
+            let mut clients = self.flight_sql_clients.write().await;
+            let mut endpoints = self.flight_sql_endpoints.write();
+            if endpoints
+                .get(&executor_id)
+                .is_none_or(|endpoint| endpoint.process_id != process_id)
+            {
+                clients.remove(&executor_id);
+                endpoints.remove(&executor_id);
+            }
+        }
+
         Registered {
             handles,
             registration,
@@ -607,7 +638,11 @@ impl ExecutorRegistry {
             tracing::debug!("Executor {executor_id} disconnected");
         }
         drop(connections);
-        self.flight_sql_clients.write().await.remove(executor_id);
+        {
+            let mut clients = self.flight_sql_clients.write().await;
+            clients.remove(executor_id);
+            self.flight_sql_endpoints.write().remove(executor_id);
+        }
         self.partitions.write().await.remove(executor_id);
 
         // Drop the disconnected executor's reported statistics across all tables
@@ -636,12 +671,25 @@ impl ExecutorRegistry {
         self.flight_sql_clients.read().await.clone()
     }
 
-    /// Inserts or replaces the `FlightSqlClient` for `executor_id`.
-    pub async fn insert_flight_sql_client(&self, executor_id: String, client: FlightSqlClient) {
-        self.flight_sql_clients
-            .write()
-            .await
-            .insert(executor_id, client);
+    /// Inserts or replaces the `FlightSqlClient` for `executor_id`, which
+    /// connects to `address` (`host:port`) and was registered by the executor
+    /// process `process_id` (empty for executors that send none).
+    pub async fn insert_flight_sql_client(
+        &self,
+        executor_id: String,
+        address: String,
+        process_id: &str,
+        client: FlightSqlClient,
+    ) {
+        let mut clients = self.flight_sql_clients.write().await;
+        self.flight_sql_endpoints.write().insert(
+            executor_id.clone(),
+            FlightEndpoint {
+                address,
+                process_id: process_id.to_string(),
+            },
+        );
+        clients.insert(executor_id, client);
     }
 
     /// Replaces the cached `TablePartitions` for `executor_id`.
@@ -689,16 +737,19 @@ impl ExecutorRegistry {
         connections.keys().cloned().collect()
     }
 
-    /// Best-effort SYNCHRONOUS snapshot of ready executor IDs (`host:port`, no
-    /// scheme — the same form `executor_table` expects after prepending a
-    /// scheme). Returns empty if the lock is momentarily contended. Used by the
-    /// broadcast-join physical optimizer rule, which runs in a sync planning
-    /// context and cannot await.
+    /// Best-effort SYNCHRONOUS snapshot of ready executors' addresses
+    /// (`host:port`, no scheme — the same form `executor_table` expects after
+    /// prepending a scheme). Returns empty if the lock is momentarily contended.
+    /// Used by the broadcast-join physical optimizer rule, which runs in a sync
+    /// planning context and cannot await.
     #[must_use]
-    pub fn ready_executor_ids_sync(&self) -> Vec<String> {
-        match self.flight_sql_clients.try_read() {
-            Ok(clients) => clients.keys().cloned().collect(),
-            Err(_) => Vec::new(),
+    pub fn ready_executor_addresses_sync(&self) -> Vec<String> {
+        match self.flight_sql_endpoints.try_read() {
+            Some(endpoints) => endpoints
+                .values()
+                .map(|endpoint| endpoint.address.clone())
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -1235,6 +1286,51 @@ mod tests {
         assert!(registry.connected_executors().await.is_empty());
     }
 
+    /// A restart drops the endpoint the earlier run registered, so the executor
+    /// is not ready until the new process registers its own. An endpoint the new
+    /// process registered before its control stream connected is kept. Broadcast
+    /// joins reach executors at these endpoints, not at their identity.
+    #[tokio::test]
+    async fn a_restart_drops_the_endpoint_of_the_earlier_run() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50101".to_string(),
+                "run-1",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
+
+        registry.register("exec-a".to_string(), "run-2", tx2).await;
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+        assert!(registry.ready_executor_addresses_sync().is_empty());
+
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "run-3",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        registry.register("exec-a".to_string(), "run-3", tx3).await;
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+    }
+
     /// A replaced process that connects again is still running, so two processes
     /// share the id. It is refused and the later process stays registered.
     #[tokio::test]
@@ -1469,10 +1565,20 @@ mod tests {
 
         // Two of them complete the handshake (AllocateInitialPartitions) → ready.
         registry
-            .insert_flight_sql_client("e1".to_string(), dummy_flight_sql_client())
+            .insert_flight_sql_client(
+                "e1".to_string(),
+                "127.0.0.1:50101".to_string(),
+                "",
+                dummy_flight_sql_client(),
+            )
             .await;
         registry
-            .insert_flight_sql_client("e2".to_string(), dummy_flight_sql_client())
+            .insert_flight_sql_client(
+                "e2".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "",
+                dummy_flight_sql_client(),
+            )
             .await;
         assert_eq!(registry.connected_executor_count().await, 3);
         assert_eq!(registry.flight_sql_clients_count().await, 2);

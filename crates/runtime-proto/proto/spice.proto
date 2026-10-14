@@ -204,6 +204,8 @@ message AllocateInitialPartitionsRequest {
   // Executor's instance identity. Empty from executors that use their advertise
   // address as their identity.
   string executor_id = 2;
+  // Per-process id of the executor, the one its control stream sends.
+  string process_id = 3;
 }
 
 message BytesArray {

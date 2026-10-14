@@ -1342,6 +1342,8 @@ pub async fn initialize_cluster_executor(
         };
 
     let executor_id = rt.df.cluster_config.instance_id().to_string();
+    // Tells the scheduler this process apart from an earlier run under the same id.
+    let process_id = uuid::Uuid::new_v4().to_string();
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
@@ -1606,6 +1608,7 @@ pub async fn initialize_cluster_executor(
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     let control_stream_executor_id = executor_id.clone();
+    let control_stream_process_id = process_id.clone();
     let control_stream_ballista_id = executor_id.clone();
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
@@ -1673,6 +1676,7 @@ pub async fn initialize_cluster_executor(
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
             control_stream_executor_id,
+            control_stream_process_id,
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
@@ -1807,6 +1811,7 @@ pub async fn initialize_cluster_executor(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
                     rt.datafusion().cluster_config.instance_id().to_string(),
+                    process_id.clone(),
                     task_ctx.as_ref(),
                 )
                 .await

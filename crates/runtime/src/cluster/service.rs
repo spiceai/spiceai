@@ -785,16 +785,18 @@ impl ClusterService for ClusterServiceImpl {
         let AllocateInitialPartitionsRequest {
             executor_url,
             executor_id,
+            process_id,
         } = request.into_inner();
 
-        // An executor that sends no id is identified by its advertise address,
-        // without the scheme.
-        let executor_id = if !executor_id.is_empty() {
-            executor_id.as_str()
-        } else if let Some(index) = executor_url.find("://") {
-            &executor_url[index + 3..]
+        // The executor's advertise address, without the scheme. An executor that
+        // sends no id is identified by it.
+        let executor_address = executor_url
+            .split_once("://")
+            .map_or(executor_url.as_str(), |(_, address)| address);
+        let executor_id = if executor_id.is_empty() {
+            executor_address
         } else {
-            &executor_url
+            executor_id.as_str()
         };
 
         // Gate on dataset readiness. Partition-expression serialization needs
@@ -841,7 +843,12 @@ impl ClusterService for ClusterServiceImpl {
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
                 self.executor_registry
-                    .insert_flight_sql_client(executor_id.to_string(), client)
+                    .insert_flight_sql_client(
+                        executor_id.to_string(),
+                        executor_address.to_string(),
+                        &process_id,
+                        client,
+                    )
                     .await;
             }
             Err(e) => {
