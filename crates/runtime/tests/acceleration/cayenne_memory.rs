@@ -40,6 +40,7 @@ use datafusion::{assert_batches_eq, common::TableReference};
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::{
     acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
     component::{access::AccessMode, dataset::Dataset},
@@ -118,8 +119,13 @@ async fn test_cayenne_memory_mode_full_refresh_and_query() -> Result<(), anyhow:
                 ..Acceleration::default()
             });
 
+            // Refresh leaves cached SQL results in place; reads after one must skip the cache.
             let app = AppBuilder::new("test_cayenne_memory")
                 .with_dataset(dataset)
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
