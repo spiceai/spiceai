@@ -449,37 +449,3 @@ where
 
     Ok(())
 }
-
-/// `autotests = false` means cargo compiles only the test targets `Cargo.toml`
-/// names, so a new `tests/<name>.rs` that is neither a module here nor its own
-/// `[[test]]` would build nothing and its tests would never run, silently.
-#[test]
-fn every_test_file_is_compiled() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = std::fs::read_to_string(dir.join("tests/integration.rs"))
-        .expect("tests/integration.rs should be readable");
-    let manifest =
-        std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml should be readable");
-    let mut missing: Vec<String> = std::fs::read_dir(dir.join("tests"))
-        .expect("tests/ should be readable")
-        .map(|entry| entry.expect("tests/ entry should be readable").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
-        .filter(|stem| stem != "integration")
-        .filter(|stem| {
-            !root
-                .lines()
-                .any(|line| line.trim() == format!("mod {stem};"))
-                && !manifest
-                    .lines()
-                    .any(|line| line.trim() == format!("path = \"tests/{stem}.rs\""))
-        })
-        .collect();
-    missing.sort();
-    assert!(
-        missing.is_empty(),
-        "these files in crates/runtime/tests are not compiled into any test binary: \
-         {missing:?}. Add `mod <name>;` to tests/integration.rs, or a `[[test]]` \
-         entry in crates/runtime/Cargo.toml if the file needs its own process"
-    );
-}

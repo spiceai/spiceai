@@ -1858,6 +1858,7 @@ async fn start_anonymous_telemetry(
         telemetry::anonymous::start(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
+            cpu_budget::cpu_budget().configured_cores(),
         )
         .await;
     }
