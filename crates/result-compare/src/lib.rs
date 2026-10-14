@@ -35,6 +35,24 @@ use arrow_tools::schema::schema_difference;
 
 pub mod sort_order;
 
+/// Whether mismatch diagnostics are printed to stdout (the default). A
+/// harness that retries comparisons until they converge turns this off and
+/// reports the final mismatch itself.
+static PRINT_DIAGNOSTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Turns the printing of mismatch diagnostics on or off, for the whole process.
+pub fn set_print_diagnostics(enabled: bool) {
+    PRINT_DIAGNOSTICS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+macro_rules! diag {
+    ($($arg:tt)*) => {
+        if PRINT_DIAGNOSTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
+
 pub use sort_order::{
     KeyedSortLimit, SortKeyCells, SortKeyColumn, SortKeyResolution, SortOrderViolation,
     UnorderedLimit, has_top_level_limit, has_top_level_order_by, projected_sort_limit,
@@ -752,12 +770,12 @@ pub fn validate_with_expected_batches(
     };
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
-        println!("Query '{query_name}' schema mismatch:");
+        diag!("Query '{query_name}' schema mismatch:");
         if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
-            println!("{diff}");
+            diag!("{diff}");
         } else {
-            println!("  expected_schema: {expected_schema:?}");
-            println!("  actual_schema: {actual_schema:?}");
+            diag!("  expected_schema: {expected_schema:?}");
+            diag!("  actual_schema: {actual_schema:?}");
         }
 
         return Ok(QueryValidationResult::Fail(
@@ -771,9 +789,9 @@ pub fn validate_with_expected_batches(
 
     // check the row counts are equal
     if expected_batches.num_rows() != actual_batches.num_rows() {
-        println!("Query '{query_name}' row count mismatch:");
-        println!("  expected: {}", expected_batches.num_rows());
-        println!("  actual: {}", actual_batches.num_rows());
+        diag!("Query '{query_name}' row count mismatch:");
+        diag!("  expected: {}", expected_batches.num_rows());
+        diag!("  actual: {}", actual_batches.num_rows());
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::RowCountMismatch {
@@ -800,9 +818,9 @@ pub fn validate_row_count(
     if actual_row_count == expected_row_count {
         Ok(QueryValidationResult::Pass)
     } else {
-        println!("Query '{query_name}' row count mismatch:");
-        println!("  expected: {expected_row_count}");
-        println!("  actual: {actual_row_count}");
+        diag!("Query '{query_name}' row count mismatch:");
+        diag!("  expected: {expected_row_count}");
+        diag!("  actual: {actual_row_count}");
 
         Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::RowCountMismatch {
@@ -978,12 +996,12 @@ pub fn compare_query_result_batches(
     // representation differences the way `validate_batches_as_strings` already
     // does for TPCH CSV answers.
     if left_schema.fields().len() != right_schema.fields().len() {
-        println!("Query '{query_name}' schema arity mismatch (left vs right):");
+        diag!("Query '{query_name}' schema arity mismatch (left vs right):");
         if let Some(diff) = schema_difference(&left_schema, &right_schema) {
-            println!("{diff}");
+            diag!("{diff}");
         } else {
-            println!("  left_schema: {left_schema:?}");
-            println!("  right_schema: {right_schema:?}");
+            diag!("  left_schema: {left_schema:?}");
+            diag!("  right_schema: {right_schema:?}");
         }
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,
@@ -992,7 +1010,7 @@ pub fn compare_query_result_batches(
     if !equivalent_schemas(&left_schema, &right_schema) {
         // Log but continue — positional string compare still validates content.
         if let Some(diff) = schema_difference(&left_schema, &right_schema) {
-            println!(
+            diag!(
                 "Query '{query_name}' logical schema differs (continuing value compare):\n{diff}"
             );
         }
@@ -1002,9 +1020,9 @@ pub fn compare_query_result_batches(
     let mut right = arrow::compute::concat_batches(&right_schema, right_batches)?;
 
     if left.num_rows() != right.num_rows() {
-        println!("Query '{query_name}' row count mismatch:");
-        println!("  left: {}", left.num_rows());
-        println!("  right: {}", right.num_rows());
+        diag!("Query '{query_name}' row count mismatch:");
+        diag!("  left: {}", left.num_rows());
+        diag!("  right: {}", right.num_rows());
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::RowCountMismatch {
                 expected: left.num_rows(),
@@ -1023,7 +1041,7 @@ pub fn compare_query_result_batches(
     // treated as the reference side in mismatch messages.
     let result = validate_batches_as_strings(&left, &right)?;
     if let QueryValidationResult::Fail(ref reason) = result {
-        println!("Query '{query_name}' content mismatch: {reason:?}");
+        diag!("Query '{query_name}' content mismatch: {reason:?}");
     }
     Ok(result)
 }
@@ -1091,11 +1109,11 @@ pub fn compare_query_result_batches_with_sort_check(
         match sort_order::check_sort_order_parsed(statement.as_ref(), &batch)? {
             SortCheck::Ordered => {}
             SortCheck::PartiallyOrdered { unchecked: reason } | SortCheck::Skipped { reason } => {
-                println!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
+                diag!("Query '{query_name}' ({side}) sort order unchecked: {reason}");
                 unchecked.push(format!("{side}: {reason}"));
             }
             SortCheck::Violation(v) => {
-                println!(
+                diag!(
                     "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
                     v.column, v.row_number, v.previous, v.current
                 );
@@ -1767,7 +1785,7 @@ fn compare_limit_results_allowing_cutoff_ties(
     while run_start < n {
         let run_key = row_sort_key(&left, run_start, &key)?;
         if let Some(mismatch) = sort_key_mismatch(&left, &right, run_start, &key, &run_key)? {
-            println!(
+            diag!(
                 "Query '{query_name}' ORDER BY key mismatch at row {} (left vs right cutoff)",
                 run_start + 1
             );
