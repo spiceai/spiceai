@@ -98,7 +98,7 @@ start_scheduler() {
         mkdir -p "${workdir}"
         
         pushd "${workdir}" > /dev/null
-        ~/.spice/bin/spiced --role scheduler \
+        SPICE_INSTANCE_ID=scheduler1 ~/.spice/bin/spiced --role scheduler \
           --node-bind-address 127.0.0.1:${SCHEDULER_NODE_PORT} \
           --node-advertise-address 127.0.0.1:${SCHEDULER_NODE_PORT} \
           --http 127.0.0.1:${SCHEDULER_HTTP_PORT} \
@@ -115,7 +115,7 @@ start_scheduler() {
         echo "  Log: ${LOG_DIR}/scheduler.log"
     else
         echo -e "${YELLOW}  Run in a separate terminal:${NC}"
-        echo "  ~/.spice/bin/spiced --role scheduler \\"
+        echo "  SPICE_INSTANCE_ID=scheduler1 ~/.spice/bin/spiced --role scheduler \\"
         echo "    --node-bind-address 127.0.0.1:${SCHEDULER_NODE_PORT} \\"
         echo "    --node-advertise-address 127.0.0.1:${SCHEDULER_NODE_PORT} \\"
         echo "    --http 127.0.0.1:${SCHEDULER_HTTP_PORT} \\"
@@ -153,7 +153,7 @@ start_executor() {
         mkdir -p "${workdir}"
 
         pushd "${workdir}" > /dev/null
-        ~/.spice/bin/spiced --role executor \
+        SPICE_INSTANCE_ID=${executor_name} ~/.spice/bin/spiced --role executor \
           --http 127.0.0.1:${http_port} \
           --scheduler-address ${SCHEDULER_ADDRESS} \
           --node-mtls-ca-certificate-file ~/.spice/pki/ca.crt \
@@ -171,7 +171,7 @@ start_executor() {
         echo "  Log: ${LOG_DIR}/${executor_name}.log"
     else
         echo -e "${YELLOW}  Run in a separate terminal:${NC}"
-        echo "  ~/.spice/bin/spiced --role executor \\"
+        echo "  SPICE_INSTANCE_ID=${executor_name} ~/.spice/bin/spiced --role executor \\"
         echo "    --http 127.0.0.1:${http_port} \\"
         echo "    --scheduler-address ${SCHEDULER_ADDRESS} \\"
         echo "    --node-mtls-ca-certificate-file ~/.spice/pki/ca.crt \\"
