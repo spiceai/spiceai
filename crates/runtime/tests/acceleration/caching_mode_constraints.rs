@@ -668,3 +668,145 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
     shutdown.send(()).ok();
     Ok(())
 }
+
+/// A key over the request columns makes every lookup a primary-key point lookup.
+/// Once Cayenne holds two protected snapshots, the accelerator scan reads one
+/// partition per snapshot, and the cache lookup above it must still read all of
+/// them as one: every lookup returns its row, and keys cached earlier are
+/// served without another fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Cayenne is not built on Windows, so neither is a test that loads it.
+#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), anyhow::Error> {
+    use arrow::util::display::array_value_to_string;
+    use futures::TryStreamExt;
+
+    /// Runs `sql` through the runtime's query path, as a client's SQL request does,
+    /// and renders every row as strings.
+    async fn query_rows(rt: &Runtime, sql: &str) -> Result<Vec<Vec<String>>, anyhow::Error> {
+        let result = rt
+            .datafusion()
+            .query_builder(sql)
+            .build()
+            .run()
+            .await
+            .map_err(|e| anyhow::anyhow!("{sql}: {e}"))?;
+        let batches: Vec<arrow::array::RecordBatch> = result.data.try_collect().await?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| array_value_to_string(column, row))
+                        .collect::<Result<_, _>>()?,
+                );
+            }
+        }
+        Ok(rows)
+    }
+
+    /// A client's lookup of one cache entry: an equality on every key column.
+    fn point_lookup_sql(key: &str) -> String {
+        format!(
+            "SELECT request_query, content FROM http_data \
+             WHERE request_path = '/items' AND request_query = '{key}'"
+        )
+    }
+
+    /// The row the mock origin returns for `key`, as a point lookup reads it.
+    fn expected_row(key: &str) -> Vec<Vec<String>> {
+        vec![vec![
+            key.to_string(),
+            format!(r#"{{"rank":1,"query":"{key}"}}"#),
+        ]]
+    }
+
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let (shutdown, addr, fetches) = start_mock(1).await;
+    let temp = tempfile::tempdir()?;
+    let registry = temp.path().join("cayenne").to_string_lossy().to_string();
+    let dataset = caching_dataset_with(
+        addr,
+        "cayenne",
+        Some("(request_query,request_path)"),
+        vec![
+            ("cayenne_file_path".to_string(), registry),
+            ("cayenne_deletion_mode".to_string(), "key".to_string()),
+            // Checkpoint each cached response into a protected snapshot within
+            // about a second, instead of the default ten.
+            (
+                "cayenne_cdc_mem_tier_max_age_ms".to_string(),
+                "500".to_string(),
+            ),
+            ("caching_ttl".to_string(), "1h".to_string()),
+        ],
+        true,
+        false,
+    );
+    let rt = build_runtime(dataset, "caching_point_lookup_cayenne").await;
+
+    // Cache one new key a second until the accelerator scan is a union of
+    // snapshots, so it has more than one partition.
+    let mut keys: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        let key = format!("key={}", keys.len());
+        assert_eq!(
+            query_rows(&rt, &point_lookup_sql(&key)).await?,
+            expected_row(&key),
+            "lookup of '{key}' after caching {} key(s)",
+            keys.len()
+        );
+        keys.push(key);
+        let plan = query_rows(&rt, &format!("EXPLAIN {}", point_lookup_sql(&keys[0])))
+            .await?
+            .concat()
+            .join("\n");
+        if plan.contains("UnionExec") {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the accelerator scan never read more than one snapshot after caching {} keys, \
+             so a multi-partition lookup was never exercised:\n{plan}",
+            keys.len()
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    wait_for_cached_rows(&rt, keys.len(), Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("every looked-up key should be cached: {e}"))?;
+    let cached_fetches = fetches.load(Ordering::SeqCst);
+    for key in &keys {
+        assert_eq!(
+            query_rows(&rt, &point_lookup_sql(key)).await?,
+            expected_row(key),
+            "cached lookup of '{key}'"
+        );
+    }
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        cached_fetches,
+        "a cached key was fetched again, so its lookup missed a snapshot that holds it"
+    );
+
+    let key = format!("key={}", keys.len());
+    assert_eq!(
+        query_rows(&rt, &point_lookup_sql(&key)).await?,
+        expected_row(&key),
+        "lookup of a new key '{key}'"
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        cached_fetches + 1,
+        "a new key should be fetched from the origin once"
+    );
+
+    shutdown.send(()).ok();
+    Ok(())
+}

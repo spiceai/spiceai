@@ -226,9 +226,20 @@ impl DataConnectorFactory for SinkConnectorFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        &[]
+        PARAMETERS
     }
 }
+
+const PARAMETERS: &[ParameterSpec] = &[
+    // Read by the OTLP metrics service from the dataset's params. Listing it here keeps
+    // parameter processing from warning that it is unsupported, and rejects any other value
+    // when the dataset is built.
+    ParameterSpec::runtime(crate::opentelemetry_store::OTLP_METRICS_PARAM)
+        .one_of_ignore_ascii_case(&[crate::opentelemetry_store::OTLP_METRICS_PARAM_ALL])
+        .description(
+            "Set to `all` to store every metric received on `/v1/metrics` in this dataset.",
+        ),
+];
 
 #[async_trait]
 impl DataConnector for SinkConnector {
