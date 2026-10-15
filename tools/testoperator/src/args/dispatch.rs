@@ -1243,13 +1243,16 @@ benchmark_dataset: fiqa_retrieval
         );
 
         let test_file = format!("tests:\n  search:\n{}", indent(args, "    "));
-        assert!(yaml::from_str::<DispatchTestFile>(&test_file).is_err());
+        yaml::from_str::<DispatchTestFile>(&test_file).unwrap_err();
     }
 
     fn indent(text: &str, prefix: &str) -> String {
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| format!("{prefix}{line}\n"))
-            .collect()
+        let mut out = String::new();
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            out.push_str(prefix);
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 }
