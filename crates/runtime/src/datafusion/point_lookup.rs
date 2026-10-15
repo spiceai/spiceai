@@ -56,7 +56,8 @@ use datafusion::physical_plan::ExecutionPlan;
 ///
 /// `EnsureRequirements` is here because the shape has no distribution or ordering requirement;
 /// that holds only while `LIMIT` stays excluded (a global limit needs a single input partition,
-/// which `EnsureRequirements` would provide). Rules that act on a scan
+/// which `EnsureRequirements` would provide). An operator a table scan returns must therefore meet
+/// its own input requirements, such as coalescing a multi-partition input. Rules that act on a scan
 /// of a particular connector (`HttpParamsPushdown`, the `DuckDB` rules) and
 /// `propagate_empty_relation` (which shapes the plan of a contradictory predicate) are not here:
 /// they cost well under a microsecond and are not worth reasoning about per connector.

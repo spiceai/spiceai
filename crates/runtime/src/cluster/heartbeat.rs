@@ -33,10 +33,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use object_store::UpdateVersion;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
+use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
+use object_store_occ::{ConditionalWriteError, Expected, conditional_put};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use uuid::Uuid;
 
 use crate::cluster::cluster_state::{ClusterState, SchedulerId};
@@ -45,11 +45,6 @@ use crate::cluster::cluster_state::{ClusterState, SchedulerId};
 /// freshness, in milliseconds.
 pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 5_000;
 
-/// Maximum write retries for a single heartbeat write. Heartbeats live in
-/// per-scheduler files so contention is essentially impossible in steady
-/// state; retries handle the bootstrap race only.
-const MAX_HEARTBEAT_ATTEMPTS: usize = 5;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to read heartbeat at {path}: {source}"))]
@@ -57,11 +52,8 @@ pub enum Error {
         path: String,
         source: ObjectStoreError,
     },
-    #[snafu(display("Failed to write heartbeat at {path}: {source}"))]
-    Write {
-        path: String,
-        source: ObjectStoreError,
-    },
+    #[snafu(display("Failed to write heartbeat: {source}"))]
+    Write { source: ConditionalWriteError },
     #[snafu(display("Failed to delete heartbeat at {path}: {source}"))]
     Delete {
         path: String,
@@ -78,12 +70,6 @@ pub enum Error {
         "Heartbeat for {scheduler_id} was written by another incarnation during this write"
     ))]
     HeartbeatSupersededDuringWrite { scheduler_id: String },
-
-    #[snafu(display("Heartbeat write for {scheduler_id} exhausted retries: {source}"))]
-    RetryExhausted {
-        scheduler_id: String,
-        source: ObjectStoreError,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -141,9 +127,10 @@ impl SchedulerHeartbeatStore {
         Path::from(format!("{}{}.json", self.prefix, scheduler_id))
     }
 
-    /// Writes (or overwrites) the heartbeat for a scheduler, returning the
-    /// version written where the store reports one. Callers keep that version so
-    /// a later write can stay conditional even if the object cannot be read.
+    /// Writes the heartbeat for a scheduler without any condition, standing in
+    /// for another incarnation's write in tests. Production code writes through
+    /// [`Self::heartbeat_if_unchanged`].
+    #[cfg(test)]
     pub async fn heartbeat(
         &self,
         scheduler_id: &str,
@@ -158,45 +145,17 @@ impl SchedulerHeartbeatStore {
             ttl_ms,
         };
         let payload = serde_json::to_vec(&beat).context(SerdeSnafu)?;
-        let path = self.path_for(scheduler_id);
-
-        let mut backoff = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_HEARTBEAT_ATTEMPTS))
-            .build();
-
-        let mut last_err: Option<ObjectStoreError> = None;
-        loop {
-            match self
-                .store
-                .put_opts(
-                    &path,
-                    payload.clone().into(),
-                    PutOptions::from(PutMode::Overwrite),
-                )
-                .await
-            {
-                Ok(result) => {
-                    return Ok(Self::usable_version_of(result.e_tag, result.version));
-                }
-                Err(source) => {
-                    let Some(delay) = backoff.next_duration() else {
-                        return Err(Error::RetryExhausted {
-                            scheduler_id: scheduler_id.to_string(),
-                            source: last_err.unwrap_or(source),
-                        });
-                    };
-                    tracing::debug!(
-                        scheduler_id,
-                        path = %path,
-                        error = %source,
-                        retry_in_ms = delay.as_millis(),
-                        "Heartbeat write failed, retrying"
-                    );
-                    last_err = Some(source);
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
+        let result = self
+            .store
+            .put(&self.path_for(scheduler_id), payload.into())
+            .await
+            .map_err(|source| Error::Write {
+                source: ConditionalWriteError::Store {
+                    path: self.path_for(scheduler_id).to_string(),
+                    source,
+                },
+            })?;
+        Ok(Self::usable_version_of(result.e_tag, result.version))
     }
 
     /// Reads the heartbeat together with the object version needed to write it
@@ -285,9 +244,16 @@ impl SchedulerHeartbeatStore {
         };
         let payload = serde_json::to_vec(&beat).context(SerdeSnafu)?;
         let path = self.path_for(scheduler_id);
-        let mode = match expected {
-            Some(version) => PutMode::Update(version.clone()),
-            None => PutMode::Create,
+        let expected = match expected {
+            Some(version) => Expected::at_version(version.clone()).ok_or_else(|| Error::Write {
+                source: ConditionalWriteError::Unsupported {
+                    path: path.to_string(),
+                    source: ObjectStoreError::NotSupported {
+                        source: "the store reported neither an ETag nor a version".into(),
+                    },
+                },
+            })?,
+            None => Expected::Absent,
         };
 
         // Deliberately a single attempt. Retrying a *conditional* write after an
@@ -297,30 +263,17 @@ impl SchedulerHeartbeatStore {
         // unknown outcome as "the retained version can no longer be trusted"
         // instead, and the store's own retry policy still covers transport
         // errors.
-        match self
-            .store
-            .put_opts(&path, payload.into(), PutOptions::from(mode))
-            .await
-        {
+        //
+        // A conditional update whose target was deleted since it was read has
+        // lost the same race, and counts as a conflict too: the caller re-reads
+        // and creates the key instead of aborting registration after membership
+        // was committed.
+        match conditional_put(self.store.as_ref(), &path, payload.into(), &expected).await {
             Ok(result) => Ok(Self::usable_version_of(result.e_tag, result.version)),
-            // `NotFound` belongs with the conflict cases: a conditional update
-            // whose target has been deleted since it was read has lost the same
-            // race, and some stores report it that way rather than as a
-            // precondition failure. Treating it as a hard error would abort
-            // registration *after* membership was committed, leaving a registered
-            // entry with no running registry, where the caller can simply re-read
-            // and create the key instead.
-            Err(
-                ObjectStoreError::Precondition { .. }
-                | ObjectStoreError::AlreadyExists { .. }
-                | ObjectStoreError::NotFound { .. },
-            ) => Err(Error::HeartbeatSupersededDuringWrite {
+            Err(err) if err.is_conflict() => Err(Error::HeartbeatSupersededDuringWrite {
                 scheduler_id: scheduler_id.to_string(),
             }),
-            Err(source) => Err(Error::Write {
-                path: path.to_string(),
-                source,
-            }),
+            Err(source) => Err(Error::Write { source }),
         }
     }
 
