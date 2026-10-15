@@ -75,9 +75,9 @@ use std::cmp::Ordering;
 use std::ops::ControlFlow;
 
 use anyhow::Result;
-use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Float32Type, Float64Type, SchemaRef};
 use sqlparser::ast::{
     Expr, GroupByExpr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, Select,
     SelectItem, SetExpr, Statement, Value, Visit, Visitor,
@@ -579,7 +579,8 @@ pub fn verify_sorted_batch(batch: &RecordBatch, key: &[SortKeyColumn]) -> Result
             // otherwise such pairs are skipped before the comparator is called.
             nulls_first: column.nulls_first.unwrap_or(false),
         };
-        match make_comparator(array.as_ref(), array.as_ref(), options) {
+        let ordered = sql_float_order(array);
+        match make_comparator(ordered.as_ref(), ordered.as_ref(), options) {
             Ok(compare) => comparators.push(KeyComparator {
                 column,
                 array,
@@ -604,6 +605,24 @@ pub fn verify_sorted_batch(batch: &RecordBatch, key: &[SortKeyColumn]) -> Result
         return Ok(found);
     }
     Ok(SortCheck::Ordered)
+}
+
+/// `array` with every negative zero made positive, so the comparator ties `-0`
+/// with `0` as SQL does (`-0 = 0`) rather than ordering them as arrow's total
+/// order on floats does. `NaN` keeps arrow's placement above every other
+/// value, which is also PostgreSQL's.
+fn sql_float_order(array: &ArrayRef) -> ArrayRef {
+    // Adding positive zero turns `-0.0` into `0.0` and leaves every other value,
+    // `NaN` included, as it was.
+    match array.data_type() {
+        DataType::Float32 => std::sync::Arc::new(
+            array.as_primitive::<Float32Type>().unary::<_, Float32Type>(|v| v + 0.0),
+        ),
+        DataType::Float64 => std::sync::Arc::new(
+            array.as_primitive::<Float64Type>().unary::<_, Float64Type>(|v| v + 0.0),
+        ),
+        _ => ArrayRef::clone(array),
+    }
 }
 
 /// The ordinary walk: each row against the one before it, most significant key
@@ -1315,6 +1334,41 @@ mod tests {
         SortKeyCells, projected_sort_limit, top_level_limit_count, top_level_offset_count,
         unordered_limit, unprojected_sort_limit,
     };
+
+    /// `ORDER BY f DESC, id` over (-0, 4) and (0, 5): SQL holds -0 = 0, so the
+    /// tie goes to `id` and PostgreSQL returns 4 first. Arrow's total order on
+    /// floats ranks 0 above -0 and would call that a violation, while the
+    /// order that total order produces breaks the tie on `id` the wrong way.
+    #[test]
+    fn negative_zero_ties_with_zero() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = |f: [f64; 3], id: [i32; 3]| {
+            arrow::array::RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::Float64Array::from(f.to_vec())),
+                    Arc::new(arrow::array::Int32Array::from(id.to_vec())),
+                ],
+            )
+            .expect("batch")
+        };
+        let sql = "SELECT f, id FROM e ORDER BY f DESC, id";
+        let tied = super::check_sort_order(sql, &[batch([f64::NAN, -0.0, 0.0], [1, 4, 5])])
+            .expect("check");
+        assert!(matches!(tied, super::SortCheck::Ordered), "{tied:?}");
+        let total_order = super::check_sort_order(sql, &[batch([f64::NAN, 0.0, -0.0], [1, 5, 4])])
+            .expect("check");
+        let super::SortCheck::Violation(violation) = total_order else {
+            panic!("expected a violation on `id`, got {total_order:?}");
+        };
+        assert_eq!(violation.column, "id");
+        let nan_last = super::check_sort_order(sql, &[batch([0.0, f64::NAN, -0.0], [5, 1, 4])])
+            .expect("check");
+        assert!(matches!(nan_last, super::SortCheck::Violation(_)), "{nan_last:?}");
+    }
 
     /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
     /// lands on the first function and leaves the second undocumented.

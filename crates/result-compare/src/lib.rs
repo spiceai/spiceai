@@ -306,8 +306,28 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
         DataType::UInt32 => downcast_and_stringify!(array, index, UInt32Array),
         DataType::UInt16 => downcast_and_stringify!(array, index, UInt16Array),
         DataType::UInt8 => downcast_and_stringify!(array, index, UInt8Array),
-        DataType::Float32 => downcast_and_stringify!(array, index, Float32Array),
-        DataType::Float64 => downcast_and_stringify!(array, index, Float64Array),
+        // SQL holds -0 = 0, and an engine may answer either (a group of the
+        // two takes whichever it met first), so both render as `0` and sort
+        // to the same place; adding positive zero turns -0 into 0 and leaves
+        // every other value, NaN included, as it was.
+        DataType::Float32 => Ok(Some(
+            (array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast array"))?
+                .value(index)
+                + 0.0)
+                .to_string(),
+        )),
+        DataType::Float64 => Ok(Some(
+            (array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast array"))?
+                .value(index)
+                + 0.0)
+                .to_string(),
+        )),
         DataType::Utf8 => Ok(Some(text_to_string(
             array
                 .as_any()
@@ -1939,8 +1959,39 @@ fn sort_batch_lexicographic_as_strings(batch: &RecordBatch) -> Result<RecordBatc
 #[cfg(test)]
 mod test {
     use super::*;
-    use arrow::datatypes::TimeUnit;
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use std::sync::Arc;
 
+
+    /// `GROUP BY f` over -inf, -0, 0: `PostgreSQL` names the -0/0 group `-0`,
+    /// `DataFusion` `0`, and SQL holds them equal; rendered apart they sorted to
+    /// different places in the multiset and paired `-0` with `-inf`.
+    #[test]
+    fn test_negative_zero_matches_zero_in_a_multiset() {
+        let batch = |keys: Vec<f64>, counts: Vec<i64>| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("f", DataType::Float64, true),
+                Field::new("n", DataType::Int64, false),
+            ]));
+            let n = Int64Array::from(counts);
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(keys)), Arc::new(n)])
+                .expect("batch")
+        };
+        let postgres = batch(vec![f64::NEG_INFINITY, -0.0, f64::NAN], vec![1, 2, 1]);
+        let datafusion = batch(vec![f64::NAN, f64::NEG_INFINITY, 0.0], vec![1, 1, 2]);
+        let result = compare_query_result_batches("q", &[postgres], &[datafusion], RowOrder::Multiset)
+            .expect("compare");
+        assert!(matches!(result, QueryValidationResult::Pass), "{result:?}");
+        let different = batch(vec![f64::NAN, f64::NEG_INFINITY, 1.0], vec![1, 1, 2]);
+        let result = compare_query_result_batches(
+            "q",
+            &[batch(vec![f64::NEG_INFINITY, -0.0, f64::NAN], vec![1, 2, 1])],
+            &[different],
+            RowOrder::Multiset,
+        )
+        .expect("compare");
+        assert!(matches!(result, QueryValidationResult::Fail(_)), "{result:?}");
+    }
 
     #[test]
     fn test_numeric_strings_match_only_rounding_of_the_same_value() {
