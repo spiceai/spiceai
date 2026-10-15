@@ -935,11 +935,7 @@ async fn attach_member(
     );
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
-        let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(
-            pump_source,
-            crate::cdc::ShutdownDrainGuard::hold(),
-        ));
+        spawn_pump(Arc::clone(source));
     } else if !snapshotting {
         // A resuming/rejoining member needs the pump to reconnect so it
         // repositions to the (possibly lower) new min and re-runs promotion. A
@@ -1374,6 +1370,38 @@ fn apply_invalid_checkpoint(
 
 /// Mark the source dead and drop it from the registry (only if the registry
 /// still points at this instance).
+/// Start the shared pump on a thread of its own, driven by its own current-thread runtime.
+///
+/// The pump reads the dump socket for every member of the group, so every moment it waits
+/// to be polled is a moment the socket goes undrained: the source then stalls in TCP flow
+/// control and the whole group falls behind together. Spawned onto the CDC apply runtime,
+/// the pump's yields queued behind the members' own apply work, and under a sustained
+/// stream that capped how fast the group could replicate. On its own thread a yield
+/// returns to the pump at once.
+///
+/// If the thread cannot be started, the pump runs on the current runtime instead.
+fn spawn_pump(source: Arc<SharedSource>) {
+    let thread_source = Arc::clone(&source);
+    let started = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .and_then(|runtime| {
+            let guard = crate::cdc::ShutdownDrainGuard::hold();
+            std::thread::Builder::new()
+                .name("mysql-binlog-pump".to_string())
+                .spawn(move || runtime.block_on(run_pump(thread_source, guard)))
+        });
+    if let Err(e) = started {
+        tracing::warn!(
+            connection = %source.key.label(),
+            error = %e,
+            "Failed to start a dedicated thread to read the MySQL binlog for connection '{}', so the binlog is read on the shared CDC apply runtime and replication may fall behind under a heavy write load. Cause: {e}",
+            source.key.label()
+        );
+        tokio::spawn(run_pump(source, crate::cdc::ShutdownDrainGuard::hold()));
+    }
+}
+
 fn finish_pump(source: &Arc<SharedSource>) {
     source.dead.store(true, Ordering::Release);
     let mut registry = lock(&REGISTRY);
