@@ -53,14 +53,67 @@ fn record(seen: &Seen, path: &str, body: &Value) -> String {
     model
 }
 
+/// The question the NSQL path asks, and the SQL the mock answers it with.
+const NSQL_QUESTION: &str = "How many documents are there?";
+const NSQL_SQL: &str = "SELECT 42 AS answer";
+
+/// The answer schema of a decision asked through chat: in `response_format`, or in the
+/// system prompt when the evaluator prompts for JSON instead.
+fn decision_schema(body: &Value) -> Option<Value> {
+    let schema = &body["response_format"]["json_schema"]["schema"];
+    if schema["properties"]["answers"].is_object() {
+        return Some(schema.clone());
+    }
+    body["messages"].as_array()?.iter().find_map(|message| {
+        let (_, schema) = message["content"]
+            .as_str()?
+            .split_once("matches this schema exactly:")?;
+        serde_json::from_str(schema.trim_start().lines().next()?).ok()
+    })
+}
+
+/// What the mock replies to a chat request: SQL for NSQL, answers for a decision asked
+/// through chat, scores for a rerank prompt, and `pong` for anything else.
+fn chat_reply(body: &Value) -> String {
+    let format = &body["response_format"];
+    if format["json_schema"]["name"] == "sql_mode" {
+        return json!({"sql": NSQL_SQL}).to_string();
+    }
+    if let Some(schema) = decision_schema(body)
+        && let Some(questions) = schema["properties"]["answers"]["properties"].as_object()
+    {
+        let answers: serde_json::Map<String, Value> = questions
+            .keys()
+            .map(|id| (id.clone(), json!(0.9)))
+            .collect();
+        return json!({"answers": answers}).to_string();
+    }
+    let prompt = body["messages"].to_string();
+    if prompt.contains(NSQL_QUESTION) {
+        return if format["type"] == "json_object" {
+            json!({"sql": NSQL_SQL}).to_string()
+        } else {
+            NSQL_SQL.to_string()
+        };
+    }
+    if prompt.contains("relevance reranker") {
+        return json!([{"id": 1, "score": 0.9}]).to_string();
+    }
+    "pong".to_string()
+}
+
 /// An `OpenAI` chat completion, streamed when the request asks.
 async fn chat(State(seen): State<Seen>, Json(body): Json<Value>) -> Response {
     let model = record(&seen, "/v1/chat/completions", &body);
+    let content = chat_reply(&body);
     if body["stream"] == json!(true) {
         let chunk = |delta: Value, finish: Value| json!({"id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
         let events = format!(
             "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            chunk(json!({"role": "assistant", "content": "pong"}), Value::Null),
+            chunk(
+                json!({"role": "assistant", "content": content}),
+                Value::Null
+            ),
             chunk(json!({}), json!("stop")),
         );
         return ([(header::CONTENT_TYPE, "text/event-stream")], events).into_response();
@@ -70,7 +123,7 @@ async fn chat(State(seen): State<Seen>, Json(body): Json<Value>) -> Response {
         "object": "chat.completion",
         "created": 0,
         "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     }))
     .into_response()
@@ -344,7 +397,7 @@ impl Path {
                 post_json(
                     routes,
                     "/v1/nsql",
-                    &json!({"query": "How many documents are there?", "model": name}),
+                    &json!({"query": NSQL_QUESTION, "model": name}),
                 )
                 .await
             }
@@ -387,6 +440,17 @@ impl Path {
         (status.is_success(), body)
     }
 
+    /// Text that the answer of a call that succeeded contains.
+    fn answer(self) -> &'static str {
+        match self {
+            Path::ChatCompletions | Path::Worker | Path::Ai | Path::Responses => "pong",
+            Path::Nsql => "42",
+            Path::Decisions => r#""probability":0.9"#,
+            Path::AiIf => "true",
+            Path::Rerank => r#"{"id":1}"#,
+        }
+    }
+
     /// The provider paths a call reaches for a model with `capabilities`; none when the
     /// model lacks what the path needs.
     fn reaches(self, capabilities: &ModelCapabilities, native: &'static str) -> Vec<&'static str> {
@@ -425,8 +489,8 @@ impl Path {
 }
 
 /// For a decision-only, a chat-and-decisions, a chat-only, and an unlisted model, every
-/// path accepts exactly the models whose capabilities include what it needs, and reaches
-/// the provider the way those capabilities say.
+/// path answers exactly the models whose capabilities include what it needs, reaches the
+/// provider the way those capabilities say, and refuses the rest without calling it.
 #[tokio::test]
 async fn every_path_accepts_what_the_capabilities_say() {
     let seen = Seen::default();
@@ -504,9 +568,14 @@ async fn every_path_accepts_what_the_capabilities_say() {
             let mut reached_paths = reached.clone();
             reached_paths.dedup();
             let expected = path.reaches(&registered[name], native);
-            // A refused call never reaches the provider and never answers.
-            let refused_cleanly = !expected.is_empty() || !answered;
-            if reached_paths != expected || !refused_cleanly {
+            // An accepted call answers with the provider's reply; a refused call does neither.
+            let accepted = !expected.is_empty();
+            let answered_as_expected = if accepted {
+                answered && body.contains(path.answer())
+            } else {
+                !answered
+            };
+            if reached_paths != expected || !answered_as_expected {
                 mismatches.push(format!(
                     "{name} via {path:?}: expected the provider to see {expected:?}, it saw {reached:?}; answered={answered}: {body}"
                 ));
