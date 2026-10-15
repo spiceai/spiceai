@@ -59202,6 +59202,8 @@ mod tests {
             listed.iter().all(|paths| paths == &listed[0]),
             "every listing sees the same files"
         );
+        // Persistence runs in the background, off the listings' path: wait for it.
+        provider.wait_for_scan_file_statistics_persistence().await;
         let after = provider.scan_file_statistics_counters();
         assert_eq!(
             after.footer_reads - before.footer_reads,
