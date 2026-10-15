@@ -18065,6 +18065,7 @@ dependencies = [
  "snafu",
  "spicepod",
  "telemetry",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
