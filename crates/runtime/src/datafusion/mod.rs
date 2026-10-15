@@ -132,6 +132,7 @@ use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
+use spicepod::component::runtime::QueryErrorLogging;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -1493,6 +1494,8 @@ pub struct DataFusion {
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    pub(crate) query_error_logging: QueryErrorLogging,
     /// Whether a query's output preview is recorded: task history is enabled and the
     /// `captured_output` column of `runtime.task_history` is not `none`. When nothing
     /// records it, queries do not build it.

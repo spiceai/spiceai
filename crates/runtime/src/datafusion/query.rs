@@ -5294,6 +5294,7 @@ mod tests {
         let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
@@ -5354,6 +5355,7 @@ mod tests {
         let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
@@ -5421,6 +5423,7 @@ mod tests {
         let query_id = Arc::<str>::from(uuid::Uuid::new_v4().to_string());
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors: spicepod::component::runtime::QueryErrorLogging::None,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
