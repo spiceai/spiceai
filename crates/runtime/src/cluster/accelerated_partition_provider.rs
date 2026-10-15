@@ -41,7 +41,9 @@ impl AcceleratedPartitionProvider {
     }
 }
 
-/// Whether `table_provider` is (or wraps) an [`AcceleratedTable`].
+/// Whether `table_provider` is (or wraps) an [`AcceleratedTable`] whose rows the executors
+/// hold. A node-local table, such as `runtime.local_task_history`, holds this node's own rows
+/// and is read where it is.
 ///
 /// The registered provider for an accelerated dataset is decorated depending on its
 /// configuration: a `FederatedTableProviderAdaptor` (`PolyTableProvider` engines),
@@ -56,7 +58,7 @@ fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> boo
         table_provider.as_ref(),
         spice_table::LayerWalk::Read,
     )
-    .is_some()
+    .is_some_and(|table| !table.is_node_local())
 }
 
 impl TablePartitionProvider for AcceleratedPartitionProvider {

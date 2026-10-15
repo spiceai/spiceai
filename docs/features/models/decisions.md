@@ -8,7 +8,7 @@ Ask typed questions about your data in SQL, or over an HTTP API compatible with 
 | OpenAI decision model | `openai:gpt-6-luna` | The model's estimates. OpenAI recommends setting thresholds from your own labeled examples. |
 | Any chat model | `openai:gpt-4o-mini`, `anthropic:claude-haiku-4-5`, `bedrock:…` | The model's own estimates. A chat model's `0.9` is not a 90% likelihood the way a calibrated model's is. |
 
-A decision model answers decisions only; `/v1/chat/completions` returns 400 for it. An OpenAI decision model takes the same params as other OpenAI models:
+TypeSafe models answer decisions only; `/v1/chat/completions` returns 400 for them. OpenAI's `gpt-6-luna` also supports chat completions and text-to-SQL through NSQL, while decision requests use its native Decisions API. It takes the same params as other OpenAI models:
 
 ```yaml
 models:
