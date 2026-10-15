@@ -55,12 +55,13 @@ struct Node {
     cluster_addr: String,
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+/// `N` distinct free ports. Every listener stays bound until all `N` are picked, so the
+/// operating system cannot return the same port twice.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port")
+    });
+    listeners.map(|listener| listener.local_addr().expect("local addr").port())
 }
 
 async fn start_node(
@@ -71,10 +72,11 @@ async fn start_node(
     runtime: SpicepodRuntime,
 ) -> Result<Node, anyhow::Error> {
     let cert = pki.create_client_cert(name).map_err(anyhow::Error::msg)?;
-    let cluster_addr = format!("127.0.0.1:{}", free_port());
+    let [cluster_port, http_port, flight_port] = free_ports();
+    let cluster_addr = format!("127.0.0.1:{cluster_port}");
     let config = Config {
-        http_bind_address: format!("127.0.0.1:{}", free_port()).parse()?,
-        flight_bind_address: format!("127.0.0.1:{}", free_port()).parse()?,
+        http_bind_address: format!("127.0.0.1:{http_port}").parse()?,
+        flight_bind_address: format!("127.0.0.1:{flight_port}").parse()?,
         cluster: ClusterConfig {
             role: Some(role),
             node_bind_address: cluster_addr.parse()?,
