@@ -2156,3 +2156,105 @@ async fn duckdb_file_acceleration_set_operations_match_nulls() -> Result<(), Str
         })
         .await
 }
+
+/// A union input's own `ORDER BY` and `LIMIT` choose which of *that input's*
+/// rows reach the union, and must keep doing so when the union is federated.
+/// The unparser used to write them on the union's query, after the last
+/// operand, so they bounded the whole `UNION ALL`: `u UNION ALL` the top row of
+/// `v` came back as that one row (issue #14737).
+///
+/// Differential: each query also runs straight against the `DuckDB` file, and
+/// the federated answer must be the same multiset of rows. Each query must be
+/// federated whole — the union inside `base_sql` — or the comparison would only
+/// show that `DataFusion` evaluates a union locally.
+#[tokio::test]
+async fn duckdb_federated_union_keeps_each_inputs_own_bound() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let db_dir = tempfile::tempdir().expect("should create temp dir");
+            let db_path = db_dir.path().join("union_bounds.db");
+            let oracle = duckdb::Connection::open(&db_path)
+                .map_err(|e| format!("failed to open duckdb file: {e}"))?;
+            oracle
+                .execute_batch(
+                    "CREATE TABLE u (a BIGINT);
+                     INSERT INTO u VALUES (1), (2), (3), (4), (5);
+                     CREATE TABLE v (a BIGINT);
+                     INSERT INTO v VALUES (10), (20), (30);",
+                )
+                .map_err(|e| format!("failed to seed duckdb file: {e}"))?;
+
+            let mut app = AppBuilder::new("duckdb_federated_union_bounds");
+            for table in ["u", "v"] {
+                let mut dataset = Dataset::new(format!("duckdb:{table}"), table);
+                dataset.params = Some(spicepod::param::Params::from_string_map(
+                    vec![("duckdb_open".to_string(), db_path.display().to_string())]
+                        .into_iter()
+                        .collect(),
+                ));
+                app = app.with_dataset(dataset);
+            }
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app.build()).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            let cases = [
+                (
+                    "SELECT a FROM u UNION ALL (SELECT a FROM v ORDER BY a DESC LIMIT 1)",
+                    vec![1, 2, 3, 4, 5, 30],
+                ),
+                (
+                    "(SELECT a FROM u ORDER BY a LIMIT 2) \
+                     UNION ALL (SELECT a FROM v ORDER BY a DESC LIMIT 1)",
+                    vec![1, 2, 30],
+                ),
+                (
+                    "SELECT a FROM u UNION ALL (SELECT a FROM v ORDER BY a LIMIT 1 OFFSET 1)",
+                    vec![1, 2, 3, 4, 5, 20],
+                ),
+            ];
+            for (sql, expected) in cases {
+                let mut from_duckdb: Vec<i64> = oracle
+                    .prepare(sql)
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map([], |row| row.get::<_, i64>(0))?
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map_err(|e| format!("`{sql}` failed in DuckDB: {e}"))?;
+                from_duckdb.sort_unstable();
+                assert_eq!(
+                    from_duckdb, expected,
+                    "the oracle itself disagrees with the expected rows for `{sql}`"
+                );
+
+                let plan = formatted_explain(&rt, sql).await?;
+                assert!(
+                    plan.lines()
+                        .any(|line| line.contains("base_sql=") && line.contains("UNION ALL")),
+                    "`{sql}` must be federated to DuckDB as one union; plan was:\n{plan}"
+                );
+
+                assert_eq!(
+                    sorted_int64_column(&rt, sql).await?,
+                    from_duckdb,
+                    "federated `{sql}` must return the rows DuckDB returns for the same \
+                     SQL; plan was:\n{plan}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}
