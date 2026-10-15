@@ -198,7 +198,7 @@ impl JobExecutor {
                 None
             }
             Err(e) => {
-                tracing::warn!("Failed to take over async query job '{job_id}': {e}");
+                report_job_end(job_id, Err(e), "Job recovery failed");
                 None
             }
         };

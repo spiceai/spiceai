@@ -33,11 +33,17 @@ limitations under the License.
 //! the reader's, so clock skew between schedulers cannot make a live one look
 //! gone. A process that has just started has seen no version yet, so it judges
 //! no scheduler gone for its first TTL.
+//!
+//! A registered scheduler whose heartbeat file is missing counts as alive until
+//! the reader has seen the file missing for its TTL: the file of a scheduler
+//! that restarts under its name can be deleted by another scheduler's cleanup,
+//! and the scheduler writes it again at its next beat.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::UpdateVersion;
 use object_store::path::Path;
@@ -343,6 +349,28 @@ impl SchedulerHeartbeatStore {
         }
     }
 
+    /// Lists the heartbeat files in the store, with the time the store last
+    /// wrote each.
+    pub async fn list_files(&self) -> Result<Vec<(SchedulerId, DateTime<Utc>)>> {
+        let prefix_path = Path::from(self.prefix.trim_end_matches('/'));
+        let mut stream = self.store.list(Some(&prefix_path));
+        let mut files = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|source| Error::List {
+                prefix: self.prefix.clone(),
+                source,
+            })?;
+            let path = meta.location.to_string();
+            if let Some(id) = path
+                .strip_prefix(&self.prefix)
+                .and_then(|rest| rest.strip_suffix(".json"))
+            {
+                files.push((id.to_string(), meta.last_modified));
+            }
+        }
+        Ok(files)
+    }
+
     /// Lists every heartbeat present in the store, with how long this process
     /// has seen each one unchanged. Always performs a fresh `list` + `get`;
     /// never reads from a cache.
@@ -412,22 +440,23 @@ impl SchedulerHeartbeatStore {
         Ok(out)
     }
 
-    /// Returns the heartbeats that are (a) registered in `cluster_state`,
-    /// (b) carry the matching `instance_id`, and (c) have not lapsed.
-    pub async fn list_alive(
-        &self,
-        cluster_state: &ClusterState,
-    ) -> Result<HashMap<SchedulerId, SchedulerHeartbeat>> {
+    /// Returns the schedulers registered in `cluster_state` that are alive:
+    /// their heartbeat carries the matching `instance_id` and has not lapsed,
+    /// or they have no heartbeat file and this process has not yet seen it
+    /// missing for their TTL.
+    pub async fn list_alive(&self, cluster_state: &ClusterState) -> Result<HashSet<SchedulerId>> {
         let all = self.list_all().await?;
-        let mut alive = HashMap::with_capacity(all.len());
-        for (id, observed) in all {
-            let Some(entry) = cluster_state.schedulers.get(&id) else {
-                continue;
+        let mut alive = HashSet::with_capacity(cluster_state.schedulers.len());
+        for (id, entry) in &cluster_state.schedulers {
+            let live = match all.get(id) {
+                Some(observed) => {
+                    entry.instance_id == observed.beat.instance_id && !observed.lapsed()
+                }
+                None => self.observe(id, None) < Duration::from_millis(entry.ttl_ms),
             };
-            if entry.instance_id != observed.beat.instance_id || observed.lapsed() {
-                continue;
+            if live {
+                alive.insert(id.clone());
             }
-            alive.insert(id, observed.beat);
         }
         Ok(alive)
     }
@@ -522,7 +551,7 @@ mod tests {
 
         // A first read judges neither gone, however old their timestamps.
         let alive = s.list_alive(&cluster).await.expect("list");
-        assert!(alive.contains_key("a") && alive.contains_key("b"));
+        assert!(alive.contains("a") && alive.contains("b"));
 
         // a renews every 10s; b stops.
         for renewal in 1..=3_u64 {
@@ -531,8 +560,8 @@ mod tests {
                 .await
                 .expect("a renews");
             let alive = s.list_alive(&cluster).await.expect("list");
-            assert!(alive.contains_key("a"));
-            assert_eq!(alive.contains_key("b"), renewal < 3, "after {renewal}0s");
+            assert!(alive.contains("a"));
+            assert_eq!(alive.contains("b"), renewal < 3, "after {renewal}0s");
         }
     }
 
@@ -561,7 +590,7 @@ mod tests {
                 .expect("ahead");
             let alive = s.list_alive(&cluster).await.expect("list");
             assert!(
-                alive.contains_key("behind") && alive.contains_key("ahead"),
+                alive.contains("behind") && alive.contains("ahead"),
                 "renewal {renewal}"
             );
             tokio::time::advance(Duration::from_secs(10)).await;
@@ -580,7 +609,7 @@ mod tests {
 
         let cluster = cluster_with(&[entry("a", cluster_id)]).await;
         let alive = s.list_alive(&cluster).await.expect("list");
-        assert!(!alive.contains_key("a"));
+        assert!(!alive.contains("a"));
     }
 
     #[tokio::test]

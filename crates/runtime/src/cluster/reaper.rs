@@ -21,17 +21,19 @@ limitations under the License.
 //! heartbeat object, once this process has seen it without one for its TTL. A
 //! reaper that has just started therefore evicts nothing for its first TTL.
 //!
-//! Heartbeat files are deliberately *not* deleted by the reaper. Object
-//! stores have no conditional-delete primitive, so deleting after a
-//! takeover would race the new process's freshly written heartbeat.
+//! Heartbeat files are deliberately *not* deleted when a scheduler is
+//! evicted. Object stores have no conditional-delete primitive, so deleting
+//! after a takeover would race the new process's freshly written heartbeat.
 //! Orphan heartbeats (those whose `instance_id` no longer matches any
 //! entry in `cluster.json`) are filtered out at read time by
-//! [`crate::cluster::heartbeat::SchedulerHeartbeatStore::list_alive`],
-//! so leaving them in place is harmless.
+//! [`crate::cluster::heartbeat::SchedulerHeartbeatStore::list_alive`].
+//! [`Reaper::delete_departed_heartbeats`] deletes a file only once its
+//! scheduler has been gone from `cluster.json` for [`HEARTBEAT_RETENTION`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use snafu::Snafu;
 use uuid::Uuid;
 
@@ -51,7 +53,13 @@ pub enum Error {
 
     #[snafu(display("Failed to list scheduler heartbeats in reaper: {source}"))]
     ListHeartbeats { source: heartbeat::Error },
+
+    #[snafu(display("Failed to delete a scheduler heartbeat: {source}"))]
+    DeleteHeartbeat { source: heartbeat::Error },
 }
+
+/// How long the heartbeat file of a scheduler that left `cluster.json` stays.
+pub const HEARTBEAT_RETENTION: Duration = Duration::from_hours(24);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -146,6 +154,71 @@ impl Reaper {
 
         Ok(outcome)
     }
+
+    /// Deletes the heartbeat file of every scheduler that has no
+    /// `cluster.json` entry and whose heartbeat the store last wrote more than
+    /// `retention` ago, and returns how many it deleted.
+    ///
+    /// Every scheduler runs this, without a lease: a delete of a file that is
+    /// already gone counts as done. A delete cannot be conditional, and a
+    /// scheduler that restarts under its name writes the same file, so the
+    /// files are listed before `cluster.json` is read, and a scheduler that
+    /// registered by then keeps its file. One that registers after the read can
+    /// lose its new file to the delete: it writes the file again at its next
+    /// beat, and peers count it alive while the file is missing for less than
+    /// its TTL. The age compares this process's clock with the store's write
+    /// time, which over a retention of hours no clock skew changes.
+    pub async fn delete_departed_heartbeats(&self, retention: Duration) -> Result<usize> {
+        let departed = self.departed_heartbeats(retention).await?;
+        self.delete_heartbeats(&departed).await
+    }
+
+    /// The schedulers whose heartbeat files [`Self::delete_departed_heartbeats`]
+    /// deletes.
+    pub(crate) async fn departed_heartbeats(&self, retention: Duration) -> Result<Vec<SchedulerId>> {
+        let files = self
+            .heartbeats
+            .list_files()
+            .await
+            .map_err(|source| Error::ListHeartbeats { source })?;
+        let snapshot = self
+            .cluster
+            .read()
+            .await
+            .map_err(|source| Error::ClusterRead { source })?;
+        let now = Utc::now();
+        Ok(files
+            .into_iter()
+            .filter(|(id, written)| {
+                !snapshot.schedulers.contains_key(id)
+                    && now
+                        .signed_duration_since(*written)
+                        .to_std()
+                        .is_ok_and(|age| age >= retention)
+            })
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    pub(crate) async fn delete_heartbeats(&self, scheduler_ids: &[SchedulerId]) -> Result<usize> {
+        for id in scheduler_ids {
+            self.heartbeats
+                .delete(id)
+                .await
+                .map_err(|source| Error::DeleteHeartbeat { source })?;
+        }
+        Ok(scheduler_ids.len())
+    }
+}
+
+/// The line a heartbeat cleanup run logs.
+#[must_use]
+pub fn heartbeat_cleanup_message(deleted: usize, retention: Duration) -> String {
+    let files = if deleted == 1 { "file" } else { "files" };
+    format!(
+        "Deleted {deleted} heartbeat {files} of schedulers that left the cluster more than {} hours ago.",
+        retention.as_secs() / 3600
+    )
 }
 
 #[cfg(test)]
@@ -351,6 +424,59 @@ mod tests {
                 last_heartbeat_ms: 1_000,
                 ttl_ms: 30_000,
             })
+        );
+    }
+
+    /// A heartbeat file is deleted once its scheduler has been out of
+    /// `cluster.json` for the retention; a registered scheduler's never is.
+    #[tokio::test]
+    async fn deletes_the_heartbeat_of_a_scheduler_gone_for_the_retention() {
+        let (cs, hb) = setup().await;
+        let gone = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        hb.heartbeat("gone", gone, 1_000, 30_000).await.expect("hb");
+        hb.heartbeat("live", live, 1_000, 30_000).await.expect("hb");
+        add_entry(&cs, entry("live", live, 0, 30_000)).await;
+        let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
+
+        // Written moments ago: within 24 h, nothing goes.
+        assert_eq!(
+            r.delete_departed_heartbeats(HEARTBEAT_RETENTION)
+                .await
+                .expect("cleanup"),
+            0
+        );
+        assert!(hb.read("gone").await.expect("read").is_some());
+
+        // The test shortens the retention to nothing: the departed scheduler's
+        // file goes, the registered one's stays.
+        assert_eq!(
+            r.delete_departed_heartbeats(Duration::ZERO)
+                .await
+                .expect("cleanup"),
+            1
+        );
+        assert!(hb.read("gone").await.expect("read").is_none());
+        assert!(hb.read("live").await.expect("read").is_some());
+
+        // A second run finds nothing left to delete.
+        assert_eq!(
+            r.delete_departed_heartbeats(Duration::ZERO)
+                .await
+                .expect("cleanup"),
+            0
+        );
+    }
+
+    #[test]
+    fn heartbeat_cleanup_message_names_the_count_and_the_retention() {
+        assert_eq!(
+            heartbeat_cleanup_message(3, HEARTBEAT_RETENTION),
+            "Deleted 3 heartbeat files of schedulers that left the cluster more than 24 hours ago."
+        );
+        assert_eq!(
+            heartbeat_cleanup_message(1, HEARTBEAT_RETENTION),
+            "Deleted 1 heartbeat file of schedulers that left the cluster more than 24 hours ago."
         );
     }
 }

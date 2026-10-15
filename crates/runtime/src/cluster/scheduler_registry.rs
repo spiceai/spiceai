@@ -44,7 +44,7 @@ use crate::cluster::cluster_state::{
     self, ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerEntry,
 };
 use crate::cluster::heartbeat::{self, SchedulerHeartbeatStore};
-use crate::cluster::reaper::Reaper;
+use crate::cluster::reaper::{self, Reaper};
 use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
@@ -96,6 +96,35 @@ const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 /// read as expired; this only reclaims their state and result chunks.
 const JOB_CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
+/// How often a scheduler deletes the heartbeat files of schedulers that left
+/// the cluster, before a random delay of up to half of it either way.
+const HEARTBEAT_CLEANUP_INTERVAL: Duration = Duration::from_hours(1);
+
+/// The heartbeat cleanup's interval and retention. A development build takes
+/// overrides, in milliseconds, from `SPICED_DEV_HEARTBEAT_CLEANUP_INTERVAL_MS`
+/// and `SPICED_DEV_HEARTBEAT_RETENTION_MS`, so an end-to-end test can run the
+/// cleanup in seconds.
+fn heartbeat_cleanup_timing() -> (Duration, Duration) {
+    let overridden = |name: &str, default: Duration| {
+        if !cfg!(feature = "dev") {
+            return default;
+        }
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map_or(default, Duration::from_millis)
+    };
+    (
+        overridden(
+            "SPICED_DEV_HEARTBEAT_CLEANUP_INTERVAL_MS",
+            HEARTBEAT_CLEANUP_INTERVAL,
+        ),
+        overridden(
+            "SPICED_DEV_HEARTBEAT_RETENTION_MS",
+            reaper::HEARTBEAT_RETENTION,
+        ),
+    )
+}
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
 /// Contention means another incarnation is writing the same key, which is
@@ -322,6 +351,11 @@ impl SchedulerRegistryRunner {
         // so it runs beside the other arms rather than inside one: a long pass must not
         // hold up the heartbeat that tells peers this scheduler is alive.
         let mut cleanup = std::pin::pin!(Fuse::terminated());
+        let (heartbeat_cleanup_interval, heartbeat_retention) = heartbeat_cleanup_timing();
+        let mut heartbeat_cleanup = std::pin::pin!(tokio::time::sleep(heartbeat::jitter(
+            heartbeat_cleanup_interval,
+            0.5
+        )));
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -370,6 +404,21 @@ impl SchedulerRegistryRunner {
                         "Failed to delete expired async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
                     ),
                 },
+                () = &mut heartbeat_cleanup => {
+                    match self.reaper.delete_departed_heartbeats(heartbeat_retention).await {
+                        Ok(deleted) => tracing::info!(
+                            "{}",
+                            reaper::heartbeat_cleanup_message(deleted, heartbeat_retention)
+                        ),
+                        Err(err) => tracing::warn!(
+                            "Failed to delete the heartbeat files of schedulers that left the cluster, so they stay in the scheduler state location until the next attempt: {err}"
+                        ),
+                    }
+                    heartbeat_cleanup.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + heartbeat::jitter(heartbeat_cleanup_interval, 0.5),
+                    );
+                }
             }
         }
 
@@ -844,7 +893,7 @@ impl SchedulerRegistryRunner {
 
         let mut next: HashMap<String, SchedulerEntry> = HashMap::new();
         for (id, entry) in &snap.schedulers {
-            if alive.contains_key(id) || id == &self.scheduler_id {
+            if alive.contains(id) || id == &self.scheduler_id {
                 next.insert(id.clone(), entry.clone());
             }
         }
@@ -1017,7 +1066,7 @@ mod tests {
             .list_alive(&snap)
             .await
             .expect("list alive");
-        assert!(!alive.contains_key("test:50051"));
+        assert!(!alive.contains("test:50051"));
     }
 
     /// A superseded incarnation must stop claiming the shared heartbeat key.
@@ -2850,6 +2899,82 @@ mod tests {
             .map(|entry| entry.instance_id);
         assert_ne!(registered, Some(holder));
         assert_eq!(registered, Some(second.instance_id));
+    }
+
+    /// A scheduler that restarts under its name while another scheduler's
+    /// heartbeat cleanup runs keeps a live heartbeat and its `cluster.json`
+    /// entry, even when the cleanup chose its old file before the restart and
+    /// deletes the file after the restarted scheduler wrote it.
+    #[tokio::test(start_paused = true)]
+    async fn a_scheduler_restarting_during_the_heartbeat_cleanup_stays_live() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let first = runner_over(&cluster, &heartbeats, &store, Uuid::new_v4());
+        first.register_self().await.expect("register");
+        first.shutdown().await;
+
+        // A peer's cleanup chooses the departed scheduler's file; the test
+        // shortens the retention to nothing.
+        let peer_cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let peer_heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        let peer_reaper = Reaper::new(Arc::clone(&peer_cluster), Arc::clone(&peer_heartbeats));
+        let departed = peer_reaper
+            .departed_heartbeats(Duration::ZERO)
+            .await
+            .expect("departed");
+        assert_eq!(departed, vec!["test:50051".to_string()]);
+
+        // The scheduler restarts under its name; then the delete lands on the
+        // file it just wrote.
+        let restarted = runner_over(&cluster, &heartbeats, &store, Uuid::new_v4());
+        restarted.register_self().await.expect("register");
+        assert_eq!(
+            peer_reaper
+                .delete_heartbeats(&departed)
+                .await
+                .expect("delete"),
+            1
+        );
+        assert!(heartbeats.read("test:50051").await.expect("read").is_none());
+
+        // Peers still count it alive and keep its entry while the file is
+        // missing for less than its TTL.
+        let snap = peer_cluster.read().await.expect("read");
+        assert!(
+            peer_heartbeats
+                .list_alive(&snap)
+                .await
+                .expect("list alive")
+                .contains("test:50051")
+        );
+        assert!(peer_reaper.tick().await.expect("tick").evicted.is_empty());
+
+        // Its next beat writes the file again.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        restarted.send_heartbeat().await.expect("heartbeat");
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("the heartbeat is written again");
+        assert_eq!(beat.instance_id, restarted.instance_id);
+        let snap = peer_cluster.read().await.expect("read");
+        assert!(
+            peer_heartbeats
+                .list_alive(&snap)
+                .await
+                .expect("list alive")
+                .contains("test:50051")
+        );
+        assert!(peer_reaper.tick().await.expect("tick").evicted.is_empty());
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(restarted.instance_id)
+        );
     }
 
     /// A scheduler registered under both its previous `host:port` key and its
