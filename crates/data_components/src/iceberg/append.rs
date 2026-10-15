@@ -403,8 +403,12 @@ pub async fn plan_append(
 }
 
 /// The snapshots after `saved` up to and including `current`, oldest first, found by
-/// walking parent pointers from `current`. `None` when `saved` is not reached: it
-/// expired, or `current` is on another line of history.
+/// walking parent pointers from `current`. `None` when `saved` is not reached: a
+/// snapshot between the two expired, or `current` is on another line of history.
+///
+/// `saved` itself may have expired: its child's parent pointer still names it, and the
+/// snapshots after it are exactly the chain's, so following goes on. Only a gap inside
+/// the chain, or a chain that ends elsewhere, breaks it.
 ///
 /// Written here rather than with `ancestors_between`, which walks to the root when
 /// `saved` is missing and so cannot tell that case apart.

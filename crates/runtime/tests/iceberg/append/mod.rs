@@ -36,7 +36,6 @@ use runtime::datafusion::query::ResultsCacheMode;
 use data_components::iceberg::append::AppendCursor;
 use iceberg::spec::Operation;
 use runtime::Runtime;
-use runtime::accelerated::refresh_task::append_cursor::APPEND_CURSOR_TABLE;
 use spicepod::acceleration::Mode;
 
 use crate::acceleration::{load_runtime_datasets, refresh_and_wait};
@@ -426,9 +425,9 @@ async fn a_compaction_inside_the_interval_keeps_the_late_rows() -> anyhow::Resul
     Ok(())
 }
 
-/// Expiring a snapshot the walk needs, inside the interval or the saved one itself,
-/// makes that refresh read by time once, never reload, and follow snapshots again
-/// from the current one.
+/// Expiring a snapshot inside the interval breaks the chain: that refresh reads by time
+/// once, never reloads, and follows snapshots again from the current one. Expiring the
+/// saved snapshot itself does not break it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
     let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
@@ -465,13 +464,17 @@ async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
     refresh(&rt).await?;
     assert!(row(&accelerated_rows(&rt).await?, "k302").is_some());
 
-    // Now the saved snapshot itself expires.
+    // The saved snapshot itself expires. Its child's parent pointer still names it,
+    // so the chain is intact and following goes on: the late row loads.
     lab.append(&[Row::at("k303", 320, "late_out")]).await?;
     lab.expire(&[c5]).await?;
+    let processed_before = counter(ROWS_PROCESSED);
     refresh(&rt).await?;
+    assert_eq!(counter(ROWS_PROCESSED) - processed_before, 1.0, "only the new file is read");
+    // Not compared with the source: k301 stays absent from the first fallback by design.
     let rows = accelerated_rows(&rt).await?;
-    assert_eq!(rows.len(), 116, "nothing reloaded, nothing removed");
-    assert!(row(&rows, "k303").is_none(), "read by time once more");
+    assert_eq!(rows.len(), 117, "nothing reloaded, nothing removed, the new row added");
+    assert!(row(&rows, "k303").is_some(), "following went on past the expired saved snapshot");
 
     lab.append(&[Row::at("k304", 330, "late_out")]).await?;
     refresh(&rt).await?;
@@ -573,28 +576,27 @@ async fn a_cursor_behind_the_written_rows_is_absorbed() -> anyhow::Result<()> {
             ..Accel::default()
         };
         let (rt, datasets) = start_spice(&lab, &accel).await?;
-        lab.append(&[keys("k", 101..=110, 1800, "v1"), vec![Row::at("k301", 300, "late")]].concat())
+        let c2 = lab
+            .append(&[keys("k", 101..=110, 1800, "v1"), vec![Row::at("k301", 300, "late")]].concat())
             .await?;
+        let lab_uuid = lab.table_uuid().await?;
         refresh(&rt).await?;
         assert_eq!(accelerated_count(&rt).await?, 111, "primary_key={primary_key}");
 
-        // The rows of the last refresh are stored, but its cursor save is lost.
+        // The rows of the last refresh are stored, but its cursor save is lost: the
+        // store still says the previous commit is written and this one is in flight.
         let dataset = datasets
             .iter()
             .find(|d| d.name.to_string() == ACCELERATED)
             .ok_or_else(|| anyhow::anyhow!("the accelerated dataset is registered"))?;
-        let store = runtime::dataaccelerator::spice_sys::checkpoint_store(dataset, APPEND_CURSOR_TABLE)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("the acceleration has a sidecar"))?;
-        store
-            .upsert(
-                &AppendCursor {
-                    table_uuid: lab.table_uuid().await?,
-                    snapshot_id: c1,
-                }
-                .to_json(),
-            )
-            .await?;
+        let store = runtime::dataaccelerator::spice_sys::append_cursor_store(dataset).await;
+        let cursor = |snapshot_id| AppendCursor {
+            table_uuid: lab_uuid.clone(),
+            snapshot_id,
+        }
+        .to_json();
+        store.save_committed(&cursor(c1)).await?;
+        store.save_pending(&cursor(c2)).await?;
 
         refresh(&rt).await?;
         let rows = assert_matches_source(
@@ -606,6 +608,39 @@ async fn a_cursor_behind_the_written_rows_is_absorbed() -> anyhow::Result<()> {
         assert_eq!(rows.len(), 111, "the replayed rows are dropped as copies");
         rt.shutdown().await;
     }
+    Ok(())
+}
+
+/// Without a primary key, a row the source appends twice in two commits is stored
+/// twice: the rows a commit added are new rows, so nothing is compared with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_unkeyed_dataset_keeps_a_legitimate_duplicate() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let lab = Lab::start(TimeKind::Timestamp).await?;
+    lab.append(&keys("k", 1..=10, 0, "v1")).await?;
+    let accel = Accel {
+        primary_key: false,
+        ..Accel::default()
+    };
+    let (rt, _) = start_spice(&lab, &accel).await?;
+
+    // The same row again, in a later commit.
+    lab.append(&[Row::at("k5", 0, "v1")]).await?;
+    refresh(&rt).await?;
+    assert_eq!(accelerated_count(&rt).await?, 11);
+    let copies = query(
+        &rt,
+        &format!("SELECT COUNT(*) AS cnt FROM {ACCELERATED} WHERE hash_key = 'k5'"),
+    )
+    .await?;
+    assert_eq!(
+        copies[0].column(0).as_primitive::<Int64Type>().value(0),
+        2,
+        "both copies of the legitimately duplicated row are stored"
+    );
+
+    refresh(&rt).await?;
+    assert_eq!(accelerated_count(&rt).await?, 11, "a repeated refresh adds nothing");
     Ok(())
 }
 

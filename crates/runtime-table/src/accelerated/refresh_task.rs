@@ -1484,7 +1484,7 @@ impl RefreshTask {
         let plan = source
             .plan_append(
                 &self.dataset_name.to_string(),
-                saved.as_deref(),
+                saved.committed.as_deref(),
                 time_column.as_ref(),
             )
             .await
@@ -1505,6 +1505,9 @@ impl RefreshTask {
                         self.dataset_name
                     );
                 }
+                if let Some(cursor) = &cursor {
+                    let _ = self.save_pending_cursor(store, cursor).await;
+                }
                 let update = self.time_filtered_append(refresh, source).await?;
                 Ok(AppendRead::Update { update, cursor })
             }
@@ -1515,6 +1518,12 @@ impl RefreshTask {
                     self.save_append_cursor(&read.cursor).await;
                     return Ok(AppendRead::UpToDate);
                 }
+                // A write that may have landed in part (a crash between the last write
+                // and its save) is re-read, and the re-read rows must be compared with
+                // the stored ones. So must they be when this write's marker cannot be
+                // saved, since the next refresh could not tell a crash apart.
+                let replaying = saved.write_may_have_landed()
+                    || self.save_pending_cursor(store, &read.cursor).await.is_err();
                 let update = self
                     .get_data_update(vec![], refresh, UpdateType::Append, read.provider)
                     .await?;
@@ -1522,10 +1531,16 @@ impl RefreshTask {
                 let update = if refresh.versions_by_time.is_some()
                     && self.version_ordering(refresh).is_some()
                 {
+                    // Keep-newest compares every incoming row with its key's stored
+                    // version, which also drops a replayed row as a re-read.
                     self.select_latest_by_time(refresh, update, from).await?
-                } else {
+                } else if replaying {
                     self.except_existing_records_from(refresh, update, from)
                         .await?
+                } else {
+                    // The rows a commit added are new rows: nothing to compare, and a
+                    // legitimate duplicate among them is kept.
+                    update
                 };
                 Ok(AppendRead::Update {
                     update,
@@ -1551,13 +1566,29 @@ impl RefreshTask {
         )
     }
 
+    /// Marks a write for `cursor` as in flight, so a crash before its save is known to
+    /// the next refresh.
+    async fn save_pending_cursor(
+        &self,
+        store: &AppendCursorStore,
+        cursor: &str,
+    ) -> Result<(), runtime_checkpoint_api::CheckpointError> {
+        store.save_pending(cursor).await.inspect_err(|e| {
+            tracing::debug!(
+                "Dataset '{}' could not mark its append write as in flight ({e}); the rows it reads are compared with the stored ones instead",
+                self.dataset_name
+            );
+        })
+    }
+
     /// Saves the commit an append refresh just loaded. A save that fails only costs
-    /// the next refresh a re-read of the same commits, which its dedupe absorbs.
+    /// the next refresh a re-read of the same commits, which it then compares with the
+    /// stored rows.
     async fn save_append_cursor(&self, cursor: &str) {
         let Some(store) = &self.append_cursor_store else {
             return;
         };
-        match store.save(cursor).await {
+        match store.save_committed(cursor).await {
             Ok(()) => tracing::debug!(
                 "Dataset '{}' saved the source commit its append refresh last loaded: {cursor}",
                 self.dataset_name
