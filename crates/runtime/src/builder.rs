@@ -330,6 +330,14 @@ impl RuntimeBuilder {
             );
         }
 
+        // A cluster executor lends a task's slot while all of the task waits on
+        // remote I/O marked with `io_wait()`. Outside an executor task the hook
+        // does nothing. Process-wide, so a runtime built later in the same
+        // process keeps the hook the first one set.
+        match datafusion::common::runtime::set_io_wait_hook(&ballista_executor::VcoreHook) {
+            Ok(()) | Err(datafusion::common::runtime::IoWaitHookError::AlreadySet) => {}
+        }
+
         // Cayenne compaction shutdown state is process-global. Reset it when a
         // fresh Runtime is built so embedded/test runtimes created after a prior
         // shutdown can start maintenance passes again, including when dedicated
