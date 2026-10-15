@@ -13016,6 +13016,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-capabilities"
+version = "2.4.0-unstable"
+dependencies = [
+ "spicepod",
+]
+
+[[package]]
 name = "model2vec-rs"
 version = "0.1.3"
 source = "git+https://github.com/spiceai/model2vec-rs.git?rev=55fef28a3556895b20204634b788f7c836b610bc#55fef28a3556895b20204634b788f7c836b610bc"
@@ -17687,6 +17694,7 @@ dependencies = [
  "llms",
  "logos",
  "mediatype",
+ "model-capabilities",
  "moka",
  "mongodb",
  "mysql_async",
@@ -18192,6 +18200,7 @@ dependencies = [
  "insta",
  "linkme",
  "llms",
+ "model-capabilities",
  "opentelemetry 0.32.0",
  "reqwest 0.13.4",
  "runtime-auth",
@@ -18228,11 +18237,13 @@ dependencies = [
  "futures",
  "insta",
  "linkme",
+ "model-capabilities",
  "runtime-request-context",
  "runtime-status",
  "runtime-udfs-api",
  "serde",
  "serde_json",
+ "spicepod",
  "tokio",
  "tracing",
 ]
@@ -18469,6 +18480,7 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "llms",
+ "model-capabilities",
  "moka",
  "rayon",
  "runtime-acceleration",
@@ -25815,6 +25827,7 @@ dependencies = [
  "async-trait",
  "futures",
  "llms",
+ "model-capabilities",
  "rand 0.10.1",
  "spicepod",
  "tokio",

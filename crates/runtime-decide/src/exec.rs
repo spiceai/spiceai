@@ -29,6 +29,7 @@ use evaluate_api::{
     Question,
 };
 use futures::{StreamExt, TryStreamExt, stream};
+use model_capabilities::{Capability, CapabilityStore, DecisionsBackend, require};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_status::RuntimeStatus;
 use serde_json::Value;
@@ -58,25 +59,35 @@ pub(crate) type RowAnswers = Option<BTreeMap<String, Answer>>;
 #[derive(Debug)]
 pub(crate) struct Decider {
     models: Arc<RwLock<EvaluateModelStore>>,
+    capabilities: Arc<RwLock<CapabilityStore>>,
     status: Arc<RuntimeStatus>,
 }
 
 impl Decider {
-    pub(crate) fn new(models: Arc<RwLock<EvaluateModelStore>>, status: Arc<RuntimeStatus>) -> Self {
-        Self { models, status }
+    pub(crate) fn new(
+        models: Arc<RwLock<EvaluateModelStore>>,
+        capabilities: Arc<RwLock<CapabilityStore>>,
+        status: Arc<RuntimeStatus>,
+    ) -> Self {
+        Self {
+            models,
+            capabilities,
+            status,
+        }
     }
 
     /// The model a call names, or the one it means when it names none: the only model
-    /// that can answer, or else the only decision model among several.
+    /// that can answer, or else the only one among several that answers natively.
     async fn resolve_model(
         &self,
         function: &str,
         requested: Option<&str>,
     ) -> Result<(String, Arc<dyn Evaluate>)> {
+        let capabilities = self.capabilities.read().await;
         let models = self.models.read().await;
         if let Some(name) = requested {
-            if let Some(model) = models.get(name) {
-                return Ok((name.to_string(), Arc::clone(model)));
+            if let Ok(model) = require(&capabilities, &models, name, Capability::Decisions) {
+                return Ok((name.to_string(), model));
             }
             if let Some(reason) = self.status.unavailable_model_reason(name) {
                 return exec_err!("{function}: {reason}");
@@ -118,7 +129,12 @@ impl Decider {
             several => {
                 let decision_models: Vec<&&String> = several
                     .iter()
-                    .filter(|name| models[name.as_str()].is_decision_model())
+                    .filter(|name| {
+                        capabilities
+                            .get(name.as_str())
+                            .and_then(|found| found.decisions())
+                            == Some(DecisionsBackend::Native)
+                    })
                     .collect();
                 if let [only] = decision_models.as_slice() {
                     return Ok(((**only).clone(), Arc::clone(&models[only.as_str()])));

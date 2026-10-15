@@ -43,6 +43,7 @@ members = [
     "crates/rerank-api",
     "crates/evaluate-api",
     "crates/evaluate-chat",
+    "crates/model-capabilities",
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/object_store_spawn",
