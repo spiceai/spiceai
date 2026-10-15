@@ -839,19 +839,29 @@ async fn shared_pump_reads_while_the_subscribing_runtime_is_blocked() -> Result<
 /// metrics and the freshness goal report and act on that age as lag.
 ///
 /// The container shares the host clock, so each commit falls between the moment its
-/// `INSERT` is sent and the moment it returns. A whole-second time lands inside that
-/// window only when the commit happens in the first milliseconds of a second; for five
-/// commits in a row that is not a chance the test can lose to.
+/// `INSERT` is sent and the moment it returns. A whole-second time fits that window,
+/// widened by the slack, only when the window holds a whole second. The test keeps
+/// committing until three windows do not, so it tells the two apart whatever the phase
+/// of the clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_change_carries_its_source_commit_time_to_the_millisecond() -> Result<(), anyhow::Error> {
     // Allows for the timer granularity on either side of the window.
     const SLACK_MS: i64 = 50;
+    // Windows holding no whole second, each of which a whole-second time fails.
+    const DISCRIMINATING_WINDOWS: usize = 3;
+    // Inserts allowed to find them; a window holds a whole second about one time in eight.
+    const MAX_INSERTS: i32 = 40;
 
     fn unix_ms() -> i64 {
         let since_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("the clock is after the epoch");
         i64::try_from(since_epoch.as_millis()).expect("milliseconds since the epoch fit in i64")
+    }
+
+    /// Whether some whole second, a multiple of 1000 ms, lies in `[lo, hi]`.
+    fn holds_a_whole_second(lo: i64, hi: i64) -> bool {
+        (lo + 999).div_euclid(1000) <= hi.div_euclid(1000)
     }
 
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
@@ -866,7 +876,8 @@ async fn a_change_carries_its_source_commit_time_to_the_millisecond() -> Result<
     drain_bootstrap(&mut stream, "commit_time member", &[1]).await?;
     wait_for_ready(&mut stream, "commit_time member readiness").await?;
 
-    for id in 2..7 {
+    let mut discriminating = 0;
+    for id in 2..2 + MAX_INSERTS {
         let sent = unix_ms();
         exec(
             &pool,
@@ -879,13 +890,25 @@ async fn a_change_carries_its_source_commit_time_to_the_millisecond() -> Result<
         let committed = envelope
             .source_commit_ts_ms()
             .expect("a change carries its source commit time");
+        let (lo, hi) = (sent - SLACK_MS, returned + SLACK_MS);
         assert!(
-            (sent - SLACK_MS..=returned + SLACK_MS).contains(&committed),
+            (lo..=hi).contains(&committed),
             "insert {id}: source commit time {committed} ms is outside [{sent}, {returned}] ms, \
              when the INSERT was sent and returned"
         );
         envelope.commit().await?;
+        if !holds_a_whole_second(lo, hi) {
+            discriminating += 1;
+            if discriminating == DISCRIMINATING_WINDOWS {
+                break;
+            }
+        }
     }
+    assert_eq!(
+        discriminating, DISCRIMINATING_WINDOWS,
+        "only {discriminating} windows held no whole second, so the test could not tell a \
+         whole-second time from the commit time"
+    );
 
     drop(stream);
     pool.disconnect().await?;
