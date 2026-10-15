@@ -281,11 +281,11 @@ pub struct WriteShardConfig {
     /// estimated-bounds hash fallback can rebalance when the unsampled
     /// remainder is one value of that leading column.
     pub range_bounds: Option<Vec<ScalarValue>>,
-    /// Sort each shard's rows by the leading shard key column in runs of at
-    /// most this many uncompressed bytes before encoding them. Applies to
-    /// range- and hash-partitioned writes; a round-robin or single-writer write
-    /// has no key to sort by and ignores it. `None` ⇒ rows keep their arrival
-    /// order within a shard.
+    /// Sort each shard's rows by the shard key — every column, leading one
+    /// first — in runs of at most this many uncompressed bytes before encoding
+    /// them. Applies to range- and hash-partitioned writes; a round-robin or
+    /// single-writer write has no key to sort by and ignores it. `None` ⇒ rows
+    /// keep their arrival order within a shard.
     pub run_sort_bytes: Option<u64>,
     /// The `range_bounds` were estimated from a sample that may not describe
     /// every row the write will see (a table's first load samples the head of

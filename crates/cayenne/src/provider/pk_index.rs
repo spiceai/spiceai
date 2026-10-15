@@ -239,6 +239,13 @@ pub(crate) struct CachedPkKeyset {
     /// capture pass can skip them. Reset whenever the keyset is rebuilt (e.g.
     /// after compaction), which is exactly when the file set changes.
     pub(crate) captured_files: HashSet<Arc<str>>,
+    /// Whether any entry may be [`RowLocation::Inlined`]: set by every write of
+    /// that location (and by [`Self::location_mut`], whose writes this cannot
+    /// see), cleared by [`Self::relocate_inlined_to_file_unlocated`] once it has
+    /// relabeled them all. A CDC mem-tier table records its keys as
+    /// [`RowLocation::MEM_TIER`], never `Inlined`, so its checkpoints skip a walk
+    /// over every key the table holds.
+    may_hold_inlined: bool,
 }
 
 impl CachedPkKeyset {
@@ -247,6 +254,7 @@ impl CachedPkKeyset {
             keys: HashMap::with_capacity_and_hasher(capacity, PrehashedBuildHasher),
             approx_bytes: 0,
             captured_files: HashSet::new(),
+            may_hold_inlined: false,
         }
     }
 
@@ -277,6 +285,7 @@ impl CachedPkKeyset {
             pk_digest(&key),
             "insert_with_digest called with a digest that does not match the key"
         );
+        self.note_location(&location);
         match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().location = location;
@@ -314,6 +323,7 @@ impl CachedPkKeyset {
         );
         match self.keys.entry(digest) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
+                self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
                 entry.get_mut().location = location;
                 PkKeysetInsertOutcome::Updated
             }
@@ -322,6 +332,7 @@ impl CachedPkKeyset {
                 if self.approx_bytes.saturating_add(entry_bytes) > max_bytes {
                     return PkKeysetInsertOutcome::OverBudget;
                 }
+                self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
                 self.approx_bytes = self.approx_bytes.saturating_add(entry_bytes);
                 entry.insert(PkKeysetEntry {
                     row: key.clone(),
@@ -340,6 +351,7 @@ impl CachedPkKeyset {
     /// with `FileUnlocated`.
     pub(crate) fn insert_if_absent(&mut self, key: OwnedRow, location: RowLocation) {
         if let std::collections::hash_map::Entry::Vacant(entry) = self.keys.entry(pk_digest(&key)) {
+            self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
             self.approx_bytes = self
                 .approx_bytes
                 .saturating_add(approx_pk_keyset_entry_bytes(&key));
@@ -384,12 +396,16 @@ impl CachedPkKeyset {
         }
     }
 
-    /// Mutable access to a key's [`RowLocation`] (position-capture upgrade).
+    /// Mutable access to a key's [`RowLocation`] (position-capture upgrade). The
+    /// caller may write any location, so the keyset assumes it wrote `Inlined`.
     #[inline]
     pub(crate) fn location_mut(&mut self, key: &OwnedRow) -> Option<&mut RowLocation> {
-        self.keys
+        let location = self
+            .keys
             .get_mut(&pk_digest(key))
-            .map(|entry| &mut entry.location)
+            .map(|entry| &mut entry.location);
+        self.may_hold_inlined |= location.is_some();
+        location
     }
 
     /// Iterate every retained key's [`OwnedRow`] bytes (bloom rebuild, sharding).
@@ -406,10 +422,24 @@ impl CachedPkKeyset {
 
     /// Relabel every `Inlined` entry `FileUnlocated`: a checkpoint moved the inline
     /// rows into files, so each now names a file row whose position is unknown.
-    pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) {
-        for entry in self.keys.values_mut() {
-            relocate_inlined(&mut entry.location);
+    /// Returns whether any entry was `Inlined`. Walks the keyset only when an
+    /// entry may be `Inlined`; a checkpoint runs this under the listing fence, and
+    /// the walk visits every key the table holds.
+    pub(crate) fn relocate_inlined_to_file_unlocated(&mut self) -> bool {
+        if !self.may_hold_inlined {
+            return false;
         }
+        let mut relocated = false;
+        for entry in self.keys.values_mut() {
+            relocated |= relocate_inlined(&mut entry.location);
+        }
+        self.may_hold_inlined = false;
+        relocated
+    }
+
+    /// Record a location about to be written into the keyset.
+    fn note_location(&mut self, location: &RowLocation) {
+        self.may_hold_inlined |= matches!(location, RowLocation::Inlined);
     }
 
     /// Forget every captured row position: relabel each `FilePositioned` entry
@@ -1350,6 +1380,8 @@ pub(crate) struct PendingPkKeys {
     /// relabeled then; batches recorded after it keep the location they were
     /// committed with.
     inline_flushed: bool,
+    /// The flush relabeled at least one held batch's `Inlined` keys.
+    inline_keys_relocated: bool,
 }
 
 impl PendingPkKeys {
@@ -1382,6 +1414,7 @@ impl PendingPkKeys {
         self.batches.clear();
         self.approx_bytes = 0;
         self.inline_flushed = false;
+        self.inline_keys_relocated = false;
         self.outstanding = self.outstanding.saturating_add(1);
     }
 
@@ -1397,6 +1430,7 @@ impl PendingPkKeys {
         self.batches.clear();
         self.approx_bytes = 0;
         self.inline_flushed = false;
+        self.inline_keys_relocated = false;
     }
 
     /// Report that a checkpoint moved every inline row into files while an index
@@ -1416,13 +1450,19 @@ impl PendingPkKeys {
     /// it in `append_to_shard`, after the restore. An index rebuilt during the
     /// checkout holds the moved keys too: the rebuild reads the inline rows under
     /// the same listing fence as the snapshot list the flush registers its file
-    /// in, so each moved row is in one or the other.
+    /// in, so each moved row is in one or the other. The table-wide index qualifies
+    /// too: it is checked out by an apply holding `write_lock`, or by a durable write
+    /// holding the checkpoint lock this flush runs under from before its checkout
+    /// until it records its keys (`lock_mem_tier_checkpoint_for_durable_write`), so
+    /// no inline row is written during a checkout that a flush can land in. Its
+    /// per-key OCC stamps predate the flush, so the restore that relabels it marks
+    /// per-key OCC degraded (`store_cached_pk_index`).
     pub(crate) fn relocate_inlined_after_flush(&mut self) {
         if self.outstanding == 0 {
             return;
         }
         for batch in &mut self.batches {
-            relocate_inlined(&mut batch.location);
+            self.inline_keys_relocated |= relocate_inlined(&mut batch.location);
         }
         self.inline_flushed = true;
     }
@@ -1453,6 +1493,7 @@ impl PendingPkKeys {
             self.batches.clear();
             self.approx_bytes = 0;
             self.inline_flushed = false;
+            self.inline_keys_relocated = false;
             return;
         }
         self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
@@ -1475,6 +1516,7 @@ impl PendingPkKeys {
             overflowed: self.overflowed,
             invalidated: self.invalidated,
             inline_flushed: std::mem::take(&mut self.inline_flushed),
+            inline_keys_relocated: std::mem::take(&mut self.inline_keys_relocated),
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1645,15 +1687,20 @@ pub(crate) struct RestoredPkKeys {
     /// See [`PendingPkKeys::relocate_inlined_after_flush`]: a checkpoint moved the
     /// inline rows into files during the checkout.
     inline_flushed: bool,
+    /// That flush relabeled at least one of `batches`' `Inlined` keys.
+    inline_keys_relocated: bool,
 }
 
 /// The location a key lives at after a checkpoint moved every inline row into a
 /// file: an `Inlined` entry now names a file row whose position is unknown.
 /// Everything else is unchanged.
-fn relocate_inlined(location: &mut RowLocation) {
-    if matches!(location, RowLocation::Inlined) {
+/// Returns whether it was `Inlined`.
+fn relocate_inlined(location: &mut RowLocation) -> bool {
+    let inlined = matches!(location, RowLocation::Inlined);
+    if inlined {
         *location = RowLocation::FileUnlocated;
     }
+    inlined
 }
 
 impl RestoredPkKeys {
@@ -1663,6 +1710,11 @@ impl RestoredPkKeys {
     /// were relabeled when it happened.
     pub(crate) const fn relocates_inlined(&self) -> bool {
         self.inline_flushed
+    }
+
+    /// Whether the flush relabeled any of the held batches' `Inlined` keys.
+    pub(crate) const fn relocated_inline_keys(&self) -> bool {
+        self.inline_keys_relocated
     }
 
     /// Whether the index that was checked out must be dropped rather than cached:
@@ -3058,6 +3110,81 @@ mod tests {
         let existence = ColdPkExistence::new(Vec::new());
         assert!(!existence.maybe_contains(&key(1)));
         assert_eq!(existence.approx_bytes(), 0);
+    }
+
+    /// Every way a keyset entry can come to say `Inlined` must leave it for the
+    /// relabel to find: the relabel walks only a keyset flagged as possibly
+    /// holding one, so a write path that set the location without the flag would
+    /// leave a flushed row labeled inline, and a later upsert would tombstone the
+    /// inline copy only, keeping the file row live beside the new one. A keyset
+    /// that only ever held other locations is not walked.
+    #[test]
+    fn a_relabel_finds_an_inlined_entry_from_every_write_path() {
+        let paths: [(&str, fn(&mut CachedPkKeyset, &super::OwnedRow)); 6] = [
+            ("insert", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::Inlined)
+            }),
+            ("insert_with_digest over an entry", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::MEM_TIER);
+                keyset.insert_with_digest(pk_digest(row), row.clone(), RowLocation::Inlined);
+            }),
+            ("try_insert_with_digest, new", |keyset, row| {
+                keyset.try_insert_with_digest(
+                    pk_digest(row),
+                    row,
+                    RowLocation::Inlined,
+                    usize::MAX,
+                );
+            }),
+            ("try_insert_with_digest, present", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::MEM_TIER);
+                keyset.relocate_inlined_to_file_unlocated();
+                keyset.try_insert_with_digest(
+                    pk_digest(row),
+                    row,
+                    RowLocation::Inlined,
+                    usize::MAX,
+                );
+            }),
+            ("insert_if_absent", |keyset, row| {
+                keyset.insert_if_absent(row.clone(), RowLocation::Inlined);
+            }),
+            ("location_mut", |keyset, row| {
+                keyset.insert(row.clone(), RowLocation::MEM_TIER);
+                keyset.relocate_inlined_to_file_unlocated();
+                *keyset.location_mut(row).expect("present") = RowLocation::Inlined;
+            }),
+        ];
+        for (path, write) in paths {
+            let mut keyset = CachedPkKeyset::with_capacity(4);
+            let row = owned_key(b"pk-a");
+            keyset.insert(owned_key(b"pk-b"), RowLocation::MEM_TIER);
+            write(&mut keyset, &row);
+            assert!(
+                matches!(
+                    keyset.location_by_digest(pk_digest(&row)),
+                    Some(RowLocation::Inlined)
+                ),
+                "{path}: the write stores an inline location"
+            );
+            assert!(keyset.relocate_inlined_to_file_unlocated(), "{path}");
+            assert!(
+                matches!(
+                    keyset.location_by_digest(pk_digest(&row)),
+                    Some(RowLocation::FileUnlocated)
+                ),
+                "{path}: the relabel moves the entry to a file"
+            );
+            assert!(!keyset.relocate_inlined_to_file_unlocated(), "{path}");
+        }
+
+        let mut keyset = CachedPkKeyset::with_capacity(4);
+        keyset.insert(owned_key(b"pk-a"), RowLocation::MEM_TIER);
+        keyset.insert_if_absent(owned_key(b"pk-b"), RowLocation::MEM_TIER);
+        assert!(
+            !keyset.may_hold_inlined,
+            "a keyset that never held an inline location is not walked"
+        );
     }
 
     #[test]

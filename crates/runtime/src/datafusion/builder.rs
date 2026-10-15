@@ -1479,6 +1479,7 @@ impl DataFusionBuilder {
             task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            interactive_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
