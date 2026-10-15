@@ -57,7 +57,6 @@ criterion = { version = "0.7", features = ["html_reports"] }
 datafusion-spark.workspace = true
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-pruning.workspace = true
-datafusion-table-providers = { workspace = true, features = ["federation"] }
 insta.workspace = true
 object_store.workspace = true
 regex.workspace = true

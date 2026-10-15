@@ -4065,8 +4065,9 @@ mod tests {
 
     /// The federated scan of a `SqlTable` built through
     /// `create_spice_federated_table_provider`, refusing `json_get_str`, and the
-    /// physical plan of each statement against it.
-    mod sort_pushdown {
+    /// physical plan of each statement against it: which sorts and limits reach
+    /// the remote SQL.
+    mod scan_pushdown {
         use super::*;
         use datafusion::arrow::compute::SortOptions;
         use datafusion::execution::session_state::SessionStateBuilder;
@@ -4319,6 +4320,132 @@ mod tests {
                 takes(&id_widened, &sort_on("val", 1)),
                 "a column the cast keeps still does"
             );
+        }
+
+        /// Registers `t` and `u`, `SqlTable`s on one remote that refuse
+        /// `json_get_str`, so a join between them federates as one statement.
+        fn register_shared_tables(ctx: &SessionContext) {
+            let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
+                Arc::new(SharedContextPool {});
+            for name in ["t", "u"] {
+                let table = shared_context_sql_table(&pool, name);
+                let schema = table.schema();
+                let provider = create_spice_federated_table_provider(
+                    table,
+                    schema,
+                    TableReference::bare(name),
+                    Some(deny_support(&["json_get_str"])),
+                );
+                ctx.register_table(name, Arc::new(provider))
+                    .expect("register the federated table");
+            }
+        }
+
+        /// Regression test for the fork patches that carry a limit into a
+        /// federated scan: `datafusion-federation`'s `VirtualExecutionPlan::with_fetch`,
+        /// passed through by `SchemaCastScanExec`, and `datafusion`'s
+        /// `RepartitionExec::with_fetch`.
+        ///
+        /// Once the source refuses the projection that calls a Spice-only
+        /// function, the analyzer federates the scan or join beneath it, and a
+        /// `LIMIT` or `ORDER BY … LIMIT` sits above the refused projection.
+        /// `DataFusion` hands the limit down through the projection and, for a
+        /// sort, through the round-robin repartition it puts above a
+        /// single-partition scan; the federated scan takes it into its SQL.
+        /// Without the patches the remote is asked for every row, sorted.
+        #[tokio::test]
+        async fn a_limit_above_a_refused_projection_reaches_the_source() {
+            let ctx = context();
+            register_shared_tables(&ctx);
+            let mut mismatches = vec![];
+            // (statement, SQL the source receives, a node the local plan must
+            // keep, a node it must not)
+            for (sql, expected_remote, keeps, drops) in [
+                (
+                    "SELECT json_get_str(val) FROM t LIMIT 3",
+                    "SELECT t.val FROM t LIMIT 3",
+                    None,
+                    Some("LimitExec"),
+                ),
+                (
+                    "SELECT json_get_str(val) FROM t ORDER BY id LIMIT 3",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id ASC NULLS LAST LIMIT 3",
+                    None,
+                    Some("SortExec"),
+                ),
+                // The source returns the rows the offset skips as well, and the
+                // offset is applied here.
+                (
+                    "SELECT json_get_str(val) FROM t ORDER BY id DESC LIMIT 3 OFFSET 2",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id DESC NULLS FIRST LIMIT 5",
+                    Some("GlobalLimitExec: skip=2, fetch=3"),
+                    Some("SortExec"),
+                ),
+                // The function above a join: the join federates, and so does the
+                // limit, over the join's own select list.
+                (
+                    "SELECT json_get_str(t.val) FROM t JOIN u ON t.id = u.id LIMIT 3",
+                    "SELECT t.id, t.val, u.id FROM t INNER JOIN u ON (t.id = u.id) LIMIT 3",
+                    None,
+                    Some("LimitExec"),
+                ),
+                (
+                    "SELECT json_get_str(t.val), t.id, u.id FROM t JOIN u ON t.id = u.id LIMIT 3",
+                    "SELECT t.id, t.val, u.id FROM t INNER JOIN u ON (t.id = u.id) LIMIT 3",
+                    None,
+                    Some("LimitExec"),
+                ),
+            ] {
+                let plan = physical_plan(&ctx, sql).await;
+                let rendered = rendered(&plan);
+                let remote = all_pushed_sql(&plan);
+                if remote != [expected_remote] {
+                    mismatches.push(format!("{sql}\n  remote SQL: {remote:?}\n{rendered}"));
+                }
+                if keeps.is_some_and(|node| !rendered.contains(node)) {
+                    mismatches.push(format!("{sql}\n  must keep {keeps:?}\n{rendered}"));
+                }
+                if drops.is_some_and(|node| rendered.contains(node)) {
+                    mismatches.push(format!("{sql}\n  must not keep {drops:?}\n{rendered}"));
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        }
+
+        /// The limit stays above what it cannot cross, and out of the SQL when
+        /// the remote could not take it as a `LIMIT`.
+        #[tokio::test]
+        async fn a_limit_stays_where_the_source_cannot_take_it() {
+            let ctx = context();
+            register_shared_tables(&ctx);
+            let mut mismatches = vec![];
+            for (sql, expected_remote) in [
+                // A limit taken before the filter would keep rows the filter drops.
+                (
+                    "SELECT id FROM t WHERE json_get_str(val) = 'x' LIMIT 3",
+                    "SELECT t.id, t.val FROM t",
+                ),
+                // The source cannot order by a value only Spice computes.
+                (
+                    "SELECT json_get_str(val) AS j FROM t ORDER BY j LIMIT 3",
+                    "SELECT t.val FROM t",
+                ),
+                // Offset plus count is past the signed 64-bit `LIMIT` a source
+                // takes (`PostgreSQL`: "bigint out of range"); each alone is not.
+                (
+                    "SELECT json_get_str(val) FROM t ORDER BY id \
+                     LIMIT 9223372036854775807 OFFSET 9223372036854775807",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id ASC NULLS LAST",
+                ),
+            ] {
+                let plan = physical_plan(&ctx, sql).await;
+                let rendered = rendered(&plan);
+                let remote = all_pushed_sql(&plan);
+                if remote != [expected_remote] {
+                    mismatches.push(format!("{sql}\n  remote SQL: {remote:?}\n{rendered}"));
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
         }
     }
 

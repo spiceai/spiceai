@@ -50,21 +50,17 @@ use datafusion_federation::{
     sql::optimizer::{OptimizeProjectionsFederation, PushDownFilterFederation},
 };
 
-use super::limit_below_projection::PushLimitBelowProjection;
-
 /// The federation analyzer rule Spice registers.
 ///
 /// This is `datafusion_federation::sql::federation_analyzer_rule()` with its
-/// filter pushdown wrapped in [`CorrelatedFilterPushDown`], plus
-/// [`PushLimitBelowProjection`]; keep the remaining rules in step with that
-/// function.
+/// filter pushdown wrapped in [`CorrelatedFilterPushDown`]; keep the remaining
+/// rules in step with that function.
 #[must_use]
 pub fn federation_analyzer_rule() -> FederationAnalyzerRule {
     FederationAnalyzerRule::new().with_optimizer(Optimizer::with_rules(vec![
         Arc::new(OptimizeUnions::new()),
         Arc::new(CorrelatedFilterPushDown::default()),
         Arc::new(OptimizeProjectionsFederation::new()),
-        Arc::new(PushLimitBelowProjection),
     ]))
 }
 
@@ -250,7 +246,7 @@ fn collect_outer_references(subquery: &Subquery, columns: &mut HashSet<Column>) 
 /// example over a function the source cannot run) has the analyzer federate
 /// each side separately, and the pushed predicate then reaches the source
 /// without the table it references.
-pub(super) fn federates_whole(plan: &LogicalPlan) -> Result<bool> {
+fn federates_whole(plan: &LogicalPlan) -> Result<bool> {
     let mut sole: Option<FederationProviderRef> = None;
     let mut single = true;
     plan.apply_with_subqueries(|node| {
