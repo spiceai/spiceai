@@ -123,8 +123,12 @@ fn f64_values(array: &ArrayRef) -> Result<Float64Array> {
         .clone())
 }
 
-/// Times as Unix nanoseconds. Timestamps of any unit are converted to nanoseconds; integers
-/// are taken to be nanoseconds already.
+/// Times as Unix nanoseconds in `i64`. Timestamps of any unit are converted to nanoseconds;
+/// integers are taken to be nanoseconds already.
+///
+/// `UInt64` times (such as `time_unix_nano`) are shifted down by 2^63 so the whole `u64` range
+/// fits. One aggregate sees only one time type, and `increase`/`rate` use only the order of
+/// times and the differences between them, which the shift preserves.
 fn nanos_values(array: &ArrayRef) -> Result<Int64Array> {
     let nanos = match array.data_type() {
         DataType::Timestamp(_, tz) => cast(
@@ -134,6 +138,12 @@ fn nanos_values(array: &ArrayRef) -> Result<Int64Array> {
             )?,
             &DataType::Int64,
         )?,
+        DataType::UInt64 => {
+            // Flipping the top bit of the two's-complement reinterpretation is `t - 2^63`.
+            return Ok(array
+                .as_primitive::<UInt64Type>()
+                .unary::<_, Int64Type>(|t| t.cast_signed() ^ i64::MIN));
+        }
         _ => cast(array, &DataType::Int64)?,
     };
     Ok(nanos.as_primitive::<Int64Type>().clone())
@@ -199,7 +209,8 @@ pub fn bucket_quantile(q: f64, bounds: &[f64], counts: &[u64]) -> f64 {
     let end = bounds[bucket];
     let in_bucket = cumulative[bucket] - below;
     if in_bucket == 0 {
-        return end;
+        // Only q = 0 over a leading empty bucket lands here; Prometheus divides 0 by 0.
+        return f64::NAN;
     }
     // At q = 1 the rank is the exact top of the bucket; f64 may not hold `total - below`.
     let offset = if q >= 1.0 {
@@ -550,6 +561,7 @@ impl AggregateUDFImpl for CounterGrowth {
         }
         let time = match time {
             DataType::Timestamp(_, _) => time.clone(),
+            t if t.is_unsigned_integer() => DataType::UInt64,
             t if t.is_integer() || t.is_null() => DataType::Int64,
             t => {
                 return plan_err!(
@@ -1164,6 +1176,75 @@ mod tests {
         )
         .await;
         assert!(close(unsigned[0].expect("increase"), 3.0));
+    }
+
+    #[tokio::test]
+    async fn unsigned_nanos_past_i64_max_are_kept() {
+        let ctx = ctx();
+        // `time_unix_nano` is UInt64: times past i64::MAX are valid and must not be dropped.
+        let rows = format!(
+            "(VALUES (arrow_cast({a}, 'UInt64'), 0), (arrow_cast({b}, 'UInt64'), 10), (arrow_cast({c}, 'UInt64'), 4)) AS t(ts, v)",
+            a = i64::MAX - 1_000_000_000,
+            b = u64::MAX - 1_000_000_000,
+            c = u64::MAX
+        );
+        // 10 + reset(4) = 14 across both sides of i64::MAX.
+        assert_eq!(
+            query_scalar(&ctx, &format!("SELECT increase(v, ts) FROM {rows}")).await,
+            ScalarValue::Int64(Some(14))
+        );
+        // 14 over (u64::MAX - i64::MAX + 1e9) ns = 2^63 + 1e9 ns.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "expected value for a float rate"
+        )]
+        let expected = 14.0 / ((u64::MAX - i64::MAX.cast_unsigned() + 1_000_000_000) as f64 / 1e9);
+        let ScalarValue::Float64(Some(rate)) =
+            query_scalar(&ctx, &format!("SELECT rate(v, ts) FROM {rows}")).await
+        else {
+            panic!("rate is a Float64");
+        };
+        assert!(
+            (rate - expected).abs() / expected < 1e-12,
+            "{rate} != {expected}"
+        );
+    }
+
+    #[test]
+    fn unsigned_time_state_merges_exactly() {
+        // Partial states carry times past i64::MAX into the final accumulator unchanged.
+        let mut merged = CounterGrowthAccumulator {
+            per_second: true,
+            samples: CounterSamples::new(CounterKind::Signed),
+        };
+        for (v, t) in [(0_i64, u64::MAX - 2_000_000_000), (4, u64::MAX)] {
+            let mut partial = CounterGrowthAccumulator {
+                per_second: true,
+                samples: CounterSamples::new(CounterKind::Signed),
+            };
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![v]));
+            let times: ArrayRef = Arc::new(arrow::array::UInt64Array::from(vec![t]));
+            partial.update_batch(&[values, times]).expect("update");
+            let state: Vec<ArrayRef> = partial
+                .state()
+                .expect("state")
+                .into_iter()
+                .map(|s| s.to_array().expect("array"))
+                .collect();
+            merged.merge_batch(&state).expect("merge");
+        }
+        assert_eq!(
+            merged.evaluate().expect("rate"),
+            ScalarValue::Float64(Some(2.0))
+        );
+    }
+
+    /// Prometheus `BucketQuantile` divides 0 by 0 for q = 0 in a leading empty bucket.
+    #[test]
+    fn bucket_quantile_of_an_empty_bucket_is_nan() {
+        assert!(bucket_quantile(0.0, &[1.0, 2.0], &[0, 1, 0]).is_nan());
+        // A non-empty first bucket interpolates to its start.
+        assert!(close(bucket_quantile(0.0, &[1.0, 2.0], &[1, 1, 0]), 0.0));
     }
 
     #[tokio::test]
