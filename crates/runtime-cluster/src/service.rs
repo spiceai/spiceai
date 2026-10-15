@@ -32,7 +32,7 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use app::App;
 use datafusion::common::TableReference;
@@ -51,7 +51,7 @@ use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
 use crate::metrics;
 use crate::scheduler_task_config::PartitionAssignmentConfig;
-use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
+use crate::{PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -61,23 +61,11 @@ pub enum Error {
     #[snafu(display("Failed to list tables: {source}"))]
     ListTables { source: store::Error },
 
-    #[snafu(display("Failed to get table metadata for {table}: {source}"))]
-    GetTableMetadata { table: String, source: store::Error },
-
     #[snafu(display("Table metadata not found for {table}"))]
     TableMetadataNotFound { table: String },
 
     #[snafu(display("Failed to write metadata for {table}: {source}"))]
     WriteMetadata { table: String, source: store::Error },
-
-    #[snafu(display(
-        "Concurrent modification detected for {table} partition {partition} after {retries} retries"
-    ))]
-    MaxRetriesExceeded {
-        table: String,
-        partition: String,
-        retries: u32,
-    },
 
     #[snafu(display("Failed to send command to executor {executor_id}: {source}"))]
     SendCommand {
@@ -98,9 +86,6 @@ pub enum Error {
 
     #[snafu(display("Partition discovery timed out for table {table}"))]
     DiscoveryTimeout { table: String },
-
-    #[snafu(display("Failed to read current system time: {source}"))]
-    SystemTime { source: std::time::SystemTimeError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -732,60 +717,23 @@ async fn add_partitions_with_retry(
     table: &TableReference,
     partition_values: Vec<PartitionValue>,
 ) -> Result<()> {
-    let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
-
-    loop {
-        let mut metadata = partition_store
-            .get_table_metadata(table)
-            .await
-            .context(GetTableMetadataSnafu {
-                table: table.to_string(),
-            })?
-            .ok_or_else(|| Error::TableMetadataNotFound {
-                table: table.to_string(),
-            })?;
-
-        let now = now_ms()?;
-        let mut added_any = false;
-        for partition_value in &partition_values {
-            if metadata
-                .partitions
-                .iter()
-                .any(|p| p.partition_value == *partition_value)
-            {
-                continue;
-            }
-            metadata.add_partition(PartitionMetadata::new(partition_value.clone()));
-            added_any = true;
-        }
-
-        if !added_any {
-            return Ok(());
-        }
-
-        metadata.updated_at = now;
-        match partition_store.write_metadata(table, metadata).await {
-            Ok(()) => {
+    match partition_store
+        .add_partitions(table, &partition_values)
+        .await
+    {
+        Ok(added) => {
+            if added {
                 tracing::debug!(table = %table, count = partition_values.len(), "Added new partitions to metadata");
-                return Ok(());
             }
-            Err(store::Error::ConcurrentModification { .. }) => match backoff.next_duration() {
-                Some(duration) => tokio::time::sleep(duration).await,
-                None => {
-                    return Err(Error::MaxRetriesExceeded {
-                        table: table.to_string(),
-                        partition: format!("{} partitions", partition_values.len()),
-                        retries: 5,
-                    });
-                }
-            },
-            Err(e) => {
-                return Err(Error::WriteMetadata {
-                    table: table.to_string(),
-                    source: e,
-                });
-            }
+            Ok(())
         }
+        Err(store::Error::TableMetadataNotFound { .. }) => Err(Error::TableMetadataNotFound {
+            table: table.to_string(),
+        }),
+        Err(source) => Err(Error::WriteMetadata {
+            table: table.to_string(),
+            source,
+        }),
     }
 }
 
@@ -796,71 +744,25 @@ async fn remove_partitions_with_cleanup(
     table: &TableReference,
     partition_values: Vec<PartitionValue>,
 ) -> Result<()> {
-    let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
-    // Rebuilt inside the loop every iteration so that retries on
-    // ConcurrentModification don't accumulate duplicate unload notifications.
-    let mut executors_to_notify: HashMap<String, Vec<PartitionValue>> = HashMap::new();
-
-    loop {
-        let mut this_attempt: HashMap<String, Vec<PartitionValue>> = HashMap::new();
-        let mut metadata = partition_store
-            .get_table_metadata(table)
-            .await
-            .context(GetTableMetadataSnafu {
+    let executors_to_notify = match partition_store
+        .remove_partitions(table, &partition_values)
+        .await
+    {
+        Ok(removed) => removed,
+        Err(store::Error::TableMetadataNotFound { .. }) => {
+            return Err(Error::TableMetadataNotFound {
                 table: table.to_string(),
-            })?
-            .ok_or_else(|| Error::TableMetadataNotFound {
+            });
+        }
+        Err(source) => {
+            return Err(Error::WriteMetadata {
                 table: table.to_string(),
-            })?;
-
-        let mut removed_any = false;
-        for partition_value in &partition_values {
-            if let Some(pos) = metadata
-                .partitions
-                .iter()
-                .position(|p| p.partition_value == *partition_value)
-            {
-                let partition = &metadata.partitions[pos];
-                for executor_id in &partition.assigned_executors {
-                    this_attempt
-                        .entry(executor_id.clone())
-                        .or_default()
-                        .push(partition_value.clone());
-                }
-                metadata.partitions.remove(pos);
-                removed_any = true;
-            }
+                source,
+            });
         }
-
-        if !removed_any {
-            break;
-        }
-
-        metadata.updated_at = now_ms()?;
-
-        match partition_store.write_metadata(table, metadata).await {
-            Ok(()) => {
-                tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
-                executors_to_notify = this_attempt;
-                break;
-            }
-            Err(store::Error::ConcurrentModification { .. }) => match backoff.next_duration() {
-                Some(duration) => tokio::time::sleep(duration).await,
-                None => {
-                    return Err(Error::MaxRetriesExceeded {
-                        table: table.to_string(),
-                        partition: format!("{} partitions", partition_values.len()),
-                        retries: 5,
-                    });
-                }
-            },
-            Err(e) => {
-                return Err(Error::WriteMetadata {
-                    table: table.to_string(),
-                    source: e,
-                });
-            }
-        }
+    };
+    if !executors_to_notify.is_empty() {
+        tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
     }
 
     for (executor_id, partitions) in &executors_to_notify {
@@ -1173,39 +1075,12 @@ async fn assign_partition_with_retry(
     partition_value: &PartitionValue,
     executor_id: &str,
 ) -> Result<()> {
-    let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
-
-    loop {
-        match partition_store
-            .assign_partition(table, partition_value, executor_id)
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(store::Error::ConcurrentModification { .. }) => match backoff.next_duration() {
-                Some(duration) => {
-                    tracing::debug!(
-                        table = %table,
-                        partition = ?partition_value,
-                        "Concurrent modification detected, retrying"
-                    );
-                    tokio::time::sleep(duration).await;
-                }
-                None => {
-                    return Err(Error::MaxRetriesExceeded {
-                        table: table.to_string(),
-                        partition: format!("{partition_value:?}"),
-                        retries: 3,
-                    });
-                }
-            },
-            Err(e) => {
-                return Err(Error::WriteMetadata {
-                    table: table.to_string(),
-                    source: e,
-                });
-            }
-        }
-    }
+    partition_store
+        .assign_partition(table, partition_value, executor_id)
+        .await
+        .context(WriteMetadataSnafu {
+            table: table.to_string(),
+        })
 }
 
 async fn notify_executors(
@@ -1368,18 +1243,12 @@ async fn notify_executor_of_assignments(
     Ok(())
 }
 
-fn now_ms() -> Result<u128> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .context(SystemTimeSnafu)
-}
-
 #[cfg(test)]
 mod tests {
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
 
+    use crate::PartitionMetadata;
     use crate::cluster_state::ClusterStateStore;
 
     use super::*;
@@ -1888,5 +1757,204 @@ mod tests {
             "Duplicate partition should not be added"
         );
         assert!(metadata.partitions[0].is_assigned_to("exec1"));
+    }
+
+    /// Runs `race` once, right before the first `cluster.json` write reaches the
+    /// store: another scheduler commits between this scheduler's read and its
+    /// write.
+    struct RaceBeforeFirstWrite {
+        inner: Arc<dyn ObjectStore>,
+        race: tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+    }
+
+    impl std::fmt::Display for RaceBeforeFirstWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RaceBeforeFirstWrite")
+        }
+    }
+
+    impl std::fmt::Debug for RaceBeforeFirstWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RaceBeforeFirstWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RaceBeforeFirstWrite {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let race = self.race.lock().await.take();
+            if let Some(race) = race {
+                race.await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Two schedulers' partition stores on one object store. The first one's
+    /// next write is preceded by `race`, which the second one performs.
+    async fn racing_stores(
+        table: &str,
+        partitions: Vec<PartitionMetadata>,
+    ) -> (
+        PartitionStore,
+        Arc<PartitionStore>,
+        Arc<RaceBeforeFirstWrite>,
+    ) {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let other = Arc::new(PartitionStore::accelerations(Arc::new(
+            ClusterStateStore::new(Arc::clone(&inner), ""),
+        )));
+        other.cluster_state().bootstrap().await.expect("bootstrap");
+        setup_table(&other, table, partitions).await;
+        let racing = Arc::new(RaceBeforeFirstWrite {
+            inner,
+            race: tokio::sync::Mutex::new(None),
+        });
+        let this = PartitionStore::accelerations(Arc::new(ClusterStateStore::new(
+            Arc::clone(&racing) as Arc<dyn ObjectStore>,
+            "",
+        )));
+        this.refresh().await.expect("refresh");
+        (this, other, racing)
+    }
+
+    fn assigned_to(
+        meta: &crate::metadata::TablePartitionMetadata,
+        value: &PartitionValue,
+    ) -> Vec<String> {
+        meta.partitions
+            .iter()
+            .find(|p| p.partition_value == *value)
+            .map(|p| p.assigned_executors.clone())
+            .unwrap_or_default()
+    }
+
+    /// An assignment another scheduler commits while this one adds new
+    /// partitions to the same table is kept.
+    #[tokio::test]
+    async fn adding_partitions_keeps_a_concurrent_assignment() {
+        let table = TableReference::parse_str("t");
+        let existing = pv("date", "2024-01-01");
+        let (this, other, racing) =
+            racing_stores("t", vec![unassigned_partition("date", "2024-01-01")]).await;
+        let (race_table, race_value) = (table.clone(), existing.clone());
+        *racing.race.lock().await = Some(Box::pin(async move {
+            other
+                .assign_partition(&race_table, &race_value, "exec1")
+                .await
+                .expect("the other scheduler assigns");
+        }));
+
+        add_partitions_with_retry(&this, &table, vec![pv("date", "2024-01-02")])
+            .await
+            .expect("add partitions");
+
+        let meta = this
+            .get_table_metadata(&table)
+            .await
+            .expect("read")
+            .expect("table metadata");
+        assert_eq!(meta.partitions.len(), 2, "{meta:?}");
+        assert_eq!(
+            assigned_to(&meta, &existing),
+            vec!["exec1".to_string()],
+            "the concurrent assignment must survive: {meta:?}"
+        );
+    }
+
+    /// An assignment another scheduler commits while this one removes other
+    /// partitions of the same table is kept.
+    #[tokio::test]
+    async fn removing_partitions_keeps_a_concurrent_assignment() {
+        let table = TableReference::parse_str("t");
+        let kept = pv("date", "2024-01-01");
+        let (this, other, racing) = racing_stores(
+            "t",
+            vec![
+                unassigned_partition("date", "2024-01-01"),
+                unassigned_partition("date", "2024-01-02"),
+            ],
+        )
+        .await;
+        let registry = ExecutorRegistry::new(Arc::clone(&other), Arc::clone(&other));
+        let (race_table, race_value) = (table.clone(), kept.clone());
+        *racing.race.lock().await = Some(Box::pin(async move {
+            other
+                .assign_partition(&race_table, &race_value, "exec1")
+                .await
+                .expect("the other scheduler assigns");
+        }));
+
+        remove_partitions_with_cleanup(
+            &this,
+            &registry,
+            &EmptySourceOps,
+            &table,
+            vec![pv("date", "2024-01-02")],
+        )
+        .await
+        .expect("remove partitions");
+
+        let meta = this
+            .get_table_metadata(&table)
+            .await
+            .expect("read")
+            .expect("table metadata");
+        assert_eq!(meta.partitions.len(), 1, "{meta:?}");
+        assert_eq!(
+            assigned_to(&meta, &kept),
+            vec!["exec1".to_string()],
+            "the concurrent assignment must survive: {meta:?}"
+        );
     }
 }

@@ -39,8 +39,8 @@ use object_store::ObjectStoreExt;
 use object_store::UpdateVersion;
 use object_store::aws::AmazonS3Builder;
 use object_store_occ::{
-    Attempt, ConditionalWriteError, ConflictRetry, Expected, InsertResult, ObjectState,
-    UpdateResult, WriteResult, conditional_put, probe_conditional_writes, retry_on_conflict,
+    Attempt, Change, ConditionalWriteError, ConflictRetry, Expected, InsertResult, ObjectState,
+    UpdateResult, conditional_put, probe_conditional_writes, retry_on_conflict,
 };
 use serde::{Deserialize, Serialize};
 
@@ -138,9 +138,17 @@ async fn test_concurrent_update_conflict() {
         .await
         .expect("insert failed");
 
-    // Both readers fetch the current state (populating their caches with same ETag)
-    let _ = state1.get("item1").await.expect("get failed");
-    let _ = state2.get("item1").await.expect("get failed");
+    // Both writers read the same version
+    let (_, version1) = state1
+        .get_with_version("item1")
+        .await
+        .expect("get failed")
+        .expect("item1 exists");
+    let (_, version2) = state2
+        .get_with_version("item1")
+        .await
+        .expect("get failed")
+        .expect("item1 exists");
 
     // First writer updates successfully
     let update1 = TestRecord {
@@ -149,7 +157,7 @@ async fn test_concurrent_update_conflict() {
         data: "updated by writer 1".to_string(),
     };
     let result1 = state1
-        .update("item1", &update1)
+        .update_with_version("item1", &update1, version1)
         .await
         .expect("update failed");
     assert_eq!(result1, UpdateResult::Ok);
@@ -161,7 +169,7 @@ async fn test_concurrent_update_conflict() {
         data: "updated by writer 2".to_string(),
     };
     let result2 = state2
-        .update("item1", &update2)
+        .update_with_version("item1", &update2, version2)
         .await
         .expect("update failed");
 
@@ -175,8 +183,33 @@ async fn test_concurrent_update_conflict() {
     }
 }
 
+fn retry_policy() -> ConflictRetry {
+    ConflictRetry {
+        max_attempts: 64,
+        ..ConflictRetry::default()
+    }
+}
+
+/// Writes `data` through `modify`, creating the record or bumping its version.
+async fn modify_record(state: &ObjectState<TestRecord>, key: &str, data: &str) -> u64 {
+    state
+        .modify(key, &retry_policy(), |current| {
+            let version = current.map_or(0, |r| r.version) + 1;
+            Ok::<_, std::convert::Infallible>(Change::Write(
+                TestRecord {
+                    id: key.to_string(),
+                    version,
+                    data: data.to_string(),
+                },
+                version,
+            ))
+        })
+        .await
+        .expect("modify failed")
+}
+
 #[tokio::test]
-async fn test_insert_or_update_distributed() {
+async fn test_modify_distributed() {
     let Some(store) = create_store() else {
         return;
     };
@@ -187,31 +220,9 @@ async fn test_insert_or_update_distributed() {
     let state2: ObjectState<TestRecord> =
         ObjectState::new(Arc::clone(&store)).with_prefix(format!("{prefix}records/"));
 
-    let record1 = TestRecord {
-        id: "item1".to_string(),
-        version: 1,
-        data: "from writer 1".to_string(),
-    };
-
-    let record2 = TestRecord {
-        id: "item1".to_string(),
-        version: 1,
-        data: "from writer 2".to_string(),
-    };
-
-    // First writer creates the record
-    let result1 = state1
-        .insert_or_update("item1", &record1)
-        .await
-        .expect("insert_or_update failed");
-    assert_eq!(result1, WriteResult::Inserted);
-
-    // Second writer updates (since record exists)
-    let result2 = state2
-        .insert_or_update("item1", &record2)
-        .await
-        .expect("insert_or_update failed");
-    assert_eq!(result2, WriteResult::Updated);
+    // First writer creates the record, the second updates it
+    assert_eq!(modify_record(&state1, "item1", "from writer 1").await, 1);
+    assert_eq!(modify_record(&state2, "item1", "from writer 2").await, 2);
 
     // Verify final state
     let final_record = state1.get("item1").await.expect("get failed");
@@ -314,11 +325,16 @@ async fn test_sequential_updates_same_writer() {
 
     // Sequential updates should all succeed
     for i in 1..=5 {
+        let (_, version) = state
+            .get_with_version("counter")
+            .await
+            .expect("get failed")
+            .expect("counter exists");
         record.version = i;
         record.data = format!("update {i}");
 
         let result = state
-            .update("counter", &record)
+            .update_with_version("counter", &record, version)
             .await
             .expect("update failed");
         assert_eq!(result, UpdateResult::Ok, "update {i} failed");
@@ -347,23 +363,19 @@ async fn test_update_after_external_modification() {
         data: "initial".to_string(),
     };
 
-    // Writer 1 creates and caches
+    // Writer 1 creates the record and reads its version
     state1
         .insert("item1", &initial)
         .await
         .expect("insert failed");
-
-    // Writer 2 modifies externally
-    let external_update = TestRecord {
-        id: "item1".to_string(),
-        version: 2,
-        data: "external update".to_string(),
-    };
-    let _ = state2.get("item1").await; // Populate cache
-    state2
-        .update("item1", &external_update)
+    let (_, stale_version) = state1
+        .get_with_version("item1")
         .await
-        .expect("update failed");
+        .expect("get failed")
+        .expect("item1 exists");
+
+    // Writer 2 modifies it
+    assert_eq!(modify_record(&state2, "item1", "external update").await, 2);
 
     // Writer 1 tries to update with stale cache
     let stale_update = TestRecord {
@@ -372,7 +384,7 @@ async fn test_update_after_external_modification() {
         data: "stale update".to_string(),
     };
     let result = state1
-        .update("item1", &stale_update)
+        .update_with_version("item1", &stale_update, stale_version)
         .await
         .expect("update failed");
 
@@ -384,17 +396,11 @@ async fn test_update_after_external_modification() {
         other => panic!("expected Conflict, got {other:?}"),
     }
 
-    // After conflict, cache should be updated - next update should succeed
-    let retry_update = TestRecord {
-        id: "item1".to_string(),
-        version: 3,
-        data: "retry after conflict".to_string(),
-    };
-    let retry_result = state1
-        .update("item1", &retry_update)
-        .await
-        .expect("retry update failed");
-    assert_eq!(retry_result, UpdateResult::Ok);
+    // A change computed from a fresh read lands
+    assert_eq!(
+        modify_record(&state1, "item1", "retry after conflict").await,
+        3
+    );
 }
 
 #[tokio::test]
@@ -433,17 +439,20 @@ async fn test_concurrent_async_writers() {
 
         for i in 1..=10 {
             // Fetch current state
-            let current = state.get("counter").await.expect("get failed");
-            let current_version = current.map_or(0, |r| r.version);
+            let (current, version) = state
+                .get_with_version("counter")
+                .await
+                .expect("get failed")
+                .expect("counter exists");
 
             let update = TestRecord {
                 id: "counter".to_string(),
-                version: current_version + 1,
+                version: current.version + 1,
                 data: format!("writer1 update {i}"),
             };
 
             match state
-                .update("counter", &update)
+                .update_with_version("counter", &update, version)
                 .await
                 .expect("update call failed")
             {
@@ -468,17 +477,20 @@ async fn test_concurrent_async_writers() {
 
         for i in 1..=10 {
             // Fetch current state
-            let current = state.get("counter").await.expect("get failed");
-            let current_version = current.map_or(0, |r| r.version);
+            let (current, version) = state
+                .get_with_version("counter")
+                .await
+                .expect("get failed")
+                .expect("counter exists");
 
             let update = TestRecord {
                 id: "counter".to_string(),
-                version: current_version + 1,
+                version: current.version + 1,
                 data: format!("writer2 update {i}"),
             };
 
             match state
-                .update("counter", &update)
+                .update_with_version("counter", &update, version)
                 .await
                 .expect("update call failed")
             {
@@ -532,41 +544,27 @@ async fn write_with_retry(
     let state: ObjectState<TestRecord> =
         ObjectState::new(store).with_prefix(format!("{prefix}retry/"));
 
-    let mut successful_increments = 0;
-    let mut total_attempts = 0;
-
-    while successful_increments < target_increments {
-        total_attempts += 1;
-
-        // Fetch current state
-        let current = state.get("counter").await.expect("get failed");
-        let current_version = current.as_ref().map_or(0, |r| r.version);
-
-        let update = TestRecord {
-            id: "counter".to_string(),
-            version: current_version + 1,
-            data: format!("{writer_name} increment {}", successful_increments + 1),
-        };
-
-        match state
-            .update("counter", &update)
+    let total_attempts = std::sync::atomic::AtomicU32::new(0);
+    for increment in 1..=target_increments {
+        state
+            .modify("counter", &retry_policy(), |current| {
+                total_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let current = current.expect("counter exists");
+                Ok::<_, std::convert::Infallible>(Change::Write(
+                    TestRecord {
+                        id: "counter".to_string(),
+                        version: current.version + 1,
+                        data: format!("{writer_name} increment {increment}"),
+                    },
+                    (),
+                ))
+            })
             .await
-            .expect("update failed")
-        {
-            UpdateResult::Ok => {
-                successful_increments += 1;
-            }
-            UpdateResult::Conflict { .. } => {
-                // Retry - the loop will fetch fresh state
-            }
-            UpdateResult::NotFound => panic!("unexpected NotFound"),
-        }
-
-        // Small delay
-        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            .expect("increment lands within the retry budget");
     }
 
-    println!("{writer_name}: {successful_increments} increments in {total_attempts} attempts");
+    let total_attempts = total_attempts.into_inner();
+    println!("{writer_name}: {target_increments} increments in {total_attempts} attempts");
     total_attempts
 }
 
@@ -623,7 +621,7 @@ async fn test_concurrent_async_writers_with_retry() {
 }
 
 /// Tests that an update fails with `Conflict` when an external process modifies the object
-/// between our `get()` (which caches the `ETag`) and `update()` calls.
+/// between our `get_with_version()` and `update_with_version()` calls.
 /// This verifies S3's conditional write mechanism (If-Match headers) at the protocol level.
 #[tokio::test]
 async fn test_update_races_with_external_write() {
@@ -641,9 +639,13 @@ async fn test_update_races_with_external_write() {
         data: "initial".to_string(),
     };
 
-    // Insert and cache ETag
+    // Insert and read its version
     state.insert("item", &initial).await.expect("insert failed");
-    let _ = state.get("item").await.expect("get failed"); // Cache ETag
+    let (_, version) = state
+        .get_with_version("item")
+        .await
+        .expect("get failed")
+        .expect("item exists");
 
     // External write directly to S3 (simulates another process bypassing ObjectState)
     let path = object_store::path::Path::from(format!("{prefix}race/item.json"));
@@ -665,7 +667,7 @@ async fn test_update_races_with_external_write() {
         data: "our update".to_string(),
     };
     let result = state
-        .update("item", &our_update)
+        .update_with_version("item", &our_update, version)
         .await
         .expect("update call failed");
 
