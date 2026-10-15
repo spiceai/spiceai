@@ -278,6 +278,7 @@ impl DeliveryQueue {
     /// [`DeadLetterStore::discarded`](crate::dead_letter::DeadLetterStore::discarded)
     /// for the ones it gave up on.
     #[cfg(test)]
+    #[must_use]
     pub fn dead_lettered(&self) -> u64 {
         self.dead_lettered.load(Ordering::Relaxed)
     }
