@@ -179,7 +179,12 @@ fn session(with_decisions: bool) -> SessionContext {
     let ctx = SessionContext::new_with_state(state);
     if with_decisions {
         let store: HashMap<String, Arc<dyn Evaluate>> = HashMap::new();
-        DecisionFunctions::new(Arc::new(RwLock::new(store)), RuntimeStatus::new()).register(&ctx);
+        DecisionFunctions::new(
+            Arc::new(RwLock::new(store)),
+            Arc::default(),
+            RuntimeStatus::new(),
+        )
+        .register(&ctx);
     }
     register_tpch(&ctx);
     ctx

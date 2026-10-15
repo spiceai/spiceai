@@ -4085,4 +4085,46 @@ mod tests {
              its input's row count"
         );
     }
+
+    /// MySQL's bare `DATETIME` keeps no fractional seconds, so a timestamp
+    /// pushed down as `CAST('… .5' AS DATETIME)` compares against the whole
+    /// second and a filter on a fractional-second value selects the wrong rows
+    /// (#14929). The cast names the precision of the literal's unit, at most the
+    /// six digits MySQL holds, and longer literals are cut to six, not rounded.
+    #[test]
+    fn a_mysql_timestamp_literal_keeps_its_fractional_seconds() {
+        let unparser = Unparser::new(&MySqlDialect {});
+        let render = |value: ScalarValue| {
+            unparser
+                .expr_to_sql(&lit(value))
+                .expect("unparse timestamp literal")
+                .to_string()
+        };
+        // 1994-06-15 12:30:00 UTC plus a fraction, in each unit.
+        assert_eq!(
+            render(ScalarValue::TimestampNanosecond(
+                Some(771_683_400_500_000_000),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampNanosecond(
+                Some(771_683_400_123_456_789),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampMillisecond(
+                Some(771_683_400_500),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(3))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampSecond(Some(771_683_400), None)),
+            "CAST('1994-06-15 12:30:00' AS DATETIME(0))"
+        );
+    }
 }

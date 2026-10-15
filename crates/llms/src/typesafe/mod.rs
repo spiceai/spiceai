@@ -244,11 +244,6 @@ impl Evaluate for TypeSafe {
         }
     }
 
-    /// Jev is a System One model: a decision model, not a chat model.
-    fn is_decision_model(&self) -> bool {
-        true
-    }
-
     async fn health(&self) -> Result<()> {
         let response = self
             .client
