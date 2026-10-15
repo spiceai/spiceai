@@ -385,7 +385,7 @@ Under `queued`, the replication log is no longer what replays a failure — the 
 
 `forwarding: disabled` keeps a whole block in place without publishing anything, so it can be switched off and back on without reconstructing the endpoint, labels and keys.
 
-Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source, and they default to `on_delivery_error: skip` — blocking the runtime's telemetry writer on a downstream outage buys nothing:
+Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source:
 
 ```yaml
 runtime:
@@ -395,9 +395,13 @@ runtime:
       drasi_http_endpoint: http://localhost:9000
     tables:
       - name: task_history
+      - name: metrics
+        key: [time_unix_nano, name, series_id]
 ```
 
-Runtime tables are always queued — they have no replication position to hold, so there is nothing for blocking to protect. Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
+Runtime tables are always queued. `RuntimeDrasi` has no `on_delivery_error` field and rejects it. An unreachable Drasi does not stall the writer. A change that cannot be delivered is retried from the dead-letter store, or counted and discarded when it cannot succeed.
+
+Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`). `runtime.metrics` declares no primary key, so name its columns with `key:`. `series_id` is a scalar identity of the attribute set: two rows that share `time_unix_nano` and `name` and differ in `attributes` stay distinct nodes. The list-typed `attributes` column is not a key. A synthesized id would publish a duplicate node on every delivery retry.
 
 ## Supported Catalogs
 

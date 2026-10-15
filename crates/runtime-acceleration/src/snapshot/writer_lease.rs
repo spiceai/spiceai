@@ -40,9 +40,9 @@ limitations under the License.
 //! therefore cannot publish over the newer snapshot of the instance that took
 //! the lease over.
 //!
-//! An instance is identified by `SPICE_INSTANCE_ID`, or else its host name: the
-//! identity Postgres replication slots use. It is stable across restarts, so a
-//! restarted replica resumes the lease it held.
+//! An instance is identified by [`util::instance_id::instance_id`], the identity
+//! every feature that coordinates through shared state uses. It is stable across
+//! restarts, so a restarted replica resumes the lease it held.
 
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -79,14 +79,9 @@ const LEASE_WRITE_ATTEMPTS: usize = 3;
 /// generation that published the dataset's latest snapshot.
 const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 
-/// This replica's identity: `SPICE_INSTANCE_ID`, else the host name.
-static INSTANCE_IDENTITY: LazyLock<Arc<str>> = LazyLock::new(|| {
-    std::env::var("SPICE_INSTANCE_ID")
-        .ok()
-        .filter(|identity| !identity.is_empty())
-        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned())
-        .into()
-});
+/// This replica's identity.
+static INSTANCE_IDENTITY: LazyLock<Arc<str>> =
+    LazyLock::new(|| util::instance_id::instance_id().into());
 
 /// This process. It tells the lease a replica's previous run held apart from
 /// one written by another process that has the same identity.
@@ -628,9 +623,12 @@ impl SnapshotManager {
                 tracing::info!("{}", unheld_lease_taken_message(dataset));
             }
             Role::Holder { .. } if shared_identity => {
-                tracing::warn!(
+                tracing::error!(
                     "{}",
-                    shared_identity_message(dataset, &self.writer_lease.identity)
+                    util::instance_id::duplicate_instance_message(
+                        &self.writer_lease.identity,
+                        &self.snapshot_location_uri,
+                    )
                 );
             }
             Role::Holder { generation, .. } => {
@@ -698,12 +696,6 @@ fn took_over_message(dataset: &str, holder: Option<&str>, unrenewed_for: Duratio
 fn unheld_lease_taken_message(dataset: &str) -> String {
     format!(
         "Dataset '{dataset}' took its snapshot writer lease, which no instance held any more; this instance now creates the dataset's snapshots."
-    )
-}
-
-fn shared_identity_message(dataset: &str, identity: &str) -> String {
-    format!(
-        "Dataset '{dataset}' found its snapshot writer lease renewed by another process with the same instance identity '{identity}', so both processes create the dataset's snapshots. Give each replica a distinct `SPICE_INSTANCE_ID`. See: {SNAPSHOTS_DOCS}"
     )
 }
 
@@ -918,18 +910,6 @@ mod tests {
             WriterLease::default().duration,
             lease_duration(DEFAULT_SNAPSHOT_INTERVAL)
         );
-    }
-
-    #[test]
-    fn the_instance_identity_is_the_host_name_without_spice_instance_id() {
-        if std::env::var("SPICE_INSTANCE_ID").is_ok_and(|identity| !identity.is_empty()) {
-            return;
-        }
-        assert_eq!(
-            &**INSTANCE_IDENTITY,
-            &*gethostname::gethostname().to_string_lossy()
-        );
-        uuid::Uuid::parse_str(&PROCESS_ID).expect("the process id is a UUID");
     }
 
     #[test]
@@ -1311,16 +1291,6 @@ mod tests {
         assert_eq!(
             unheld_lease_taken_message("orders"),
             "Dataset 'orders' took its snapshot writer lease, which no instance held any more; this instance now creates the dataset's snapshots."
-        );
-    }
-
-    #[test]
-    fn shared_identity_message_names_the_identity_and_the_fix() {
-        assert_eq!(
-            shared_identity_message("orders", "spice-1"),
-            format!(
-                "Dataset 'orders' found its snapshot writer lease renewed by another process with the same instance identity 'spice-1', so both processes create the dataset's snapshots. Give each replica a distinct `SPICE_INSTANCE_ID`. See: {SNAPSHOTS_DOCS}"
-            )
         );
     }
 
