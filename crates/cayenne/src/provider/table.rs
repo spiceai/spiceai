@@ -43040,7 +43040,10 @@ mod tests {
         let hold = provider.hold_file_deletions().await;
         overwrite(&ctx, &provider, 11).await;
         let current = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
-        assert_ne!(superseded, current, "the overwrite publishes a new snapshot");
+        assert_ne!(
+            superseded, current,
+            "the overwrite publishes a new snapshot"
+        );
         // Let the overwrite's sweep run, and skip, under the hold.
         let deadline = Instant::now() + Duration::from_secs(10);
         while provider.snapshot_cleanup_scheduled.load(Ordering::Acquire) {
