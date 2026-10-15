@@ -105,6 +105,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::cdc::post,
+        v1::otlp::post,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -422,6 +423,8 @@ pub(crate) fn routes(
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
+        // OTLP/HTTP metrics receiver; same handler as the gRPC receiver on the Flight port.
+        .route(v1::otlp::PATH, post(v1::otlp::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -604,7 +607,12 @@ pub(crate) fn routes(
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
+    let otlp_metrics_service = Arc::new(crate::opentelemetry::build_metrics_service(
+        rt.datafusion(),
+        Some(Arc::downgrade(rt)),
+    ));
     authenticated_router = authenticated_router
+        .layer(Extension(otlp_metrics_service))
         .layer(Extension(Arc::clone(rt)))
         // Handlers that report a model's load state take the status on its own, so they can be
         // exercised without building a `Runtime`.
@@ -632,6 +640,11 @@ pub(crate) fn routes(
     // non-probe request whose connection presented no verified peer cert.
     authenticated_router = authenticated_router
         .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
+
+    // OTLP/HTTP needs every `/v1/metrics` error as a `google.rpc.Status` in the request's
+    // encoding, including the auth, mTLS, and body-limit rejections above, so this wraps them.
+    authenticated_router =
+        authenticated_router.route_layer(middleware::from_fn(v1::otlp::encode_layer_errors));
 
     // The executor registry only exists when the runtime is in scheduler role; it is `None`
     // otherwise. `/v1/ready`'s executor gating reads it through this layer.

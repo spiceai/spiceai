@@ -124,6 +124,7 @@ mod management;
 mod metrics_server;
 pub mod model;
 pub mod opentelemetry;
+pub mod opentelemetry_store;
 // Moved to `runtime-otel-push`; re-exported so `runtime::otel_push_exporter` still resolves.
 pub use runtime_otel_push as otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
