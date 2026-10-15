@@ -45,6 +45,7 @@ use runtime_rate_control::{
     AdaptiveRateControlError, DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, JitterConfig,
     LeasedBucketMetrics, RateController, RateControllerMetrics,
 };
+use runtime_state_location::StateFeature;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -149,21 +150,31 @@ async fn delete_unused_rate_control_state(store: &dyn ObjectStore, prefix: &str)
     let retention = object_store_occ::cleanup::describe(object_store_occ::cleanup::age(
         runtime_rate_control::cleanup::UNUSED_ORIGIN_RETENTION,
     ));
-    match runtime_rate_control::cleanup::delete_unused_state(
+    let deleted = match runtime_rate_control::cleanup::delete_unused_state(
         store,
         prefix,
         std::time::SystemTime::now(),
     )
     .await
     {
-        Ok(0) => tracing::debug!("State cleanup pass finished: no rate-control state to delete"),
-        Ok(deleted) => tracing::info!(
-            "State cleanup deleted the shared rate-control state of {deleted} origins that no instance has sent requests to for {retention}."
-        ),
-        Err(error) => tracing::warn!(
-            "Failed to delete the shared rate-control state of origins unused for {retention}, so it stays in the rate-control state location until the next attempt: {error}"
-        ),
-    }
+        Ok(0) => {
+            tracing::debug!("State cleanup pass finished: no rate-control state to delete");
+            0
+        }
+        Ok(deleted) => {
+            tracing::info!(
+                "State cleanup deleted the shared rate-control state of {deleted} origins that no instance has sent requests to for {retention}."
+            );
+            deleted
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to delete the shared rate-control state of origins unused for {retention}, so it stays in the rate-control state location until the next attempt: {error}"
+            );
+            error.deleted
+        }
+    };
+    runtime_state_location::metrics::record_cleanup_deleted(StateFeature::RateControl, deleted);
 }
 
 #[must_use]

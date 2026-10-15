@@ -39,8 +39,10 @@ pub mod wal;
 
 use snafu::Snafu;
 
-pub use capabilities::{ConditionalWriteSupport, Enforcement, probe_conditional_writes};
-pub use conditional::{ConditionalWriteError, Expected, conditional_put};
+pub use capabilities::{
+    ConditionalWriteSupport, Enforcement, is_probe_object, probe_conditional_writes,
+};
+pub use conditional::{ConditionalWriteError, Expected, conditional_put, refused_as_conflict};
 pub use local_conditional_put::LocalConditionalPut;
 pub use object_store::UpdateVersion;
 pub use retry::{Attempt, ConflictRetry, RetryOnConflictError, retry_on_conflict};
