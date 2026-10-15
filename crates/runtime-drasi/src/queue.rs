@@ -69,6 +69,7 @@ pub struct QueuedBatch {
 
 impl QueuedBatch {
     /// Builds a batch whose rows all share one operation and one key.
+    #[must_use]
     pub fn uniform(
         op_code: &str,
         key: &[String],
