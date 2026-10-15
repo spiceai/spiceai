@@ -134,6 +134,8 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 prost.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+# Issues the cluster nodes' mTLS certificates for the executor export test.
+test-framework = { path = "../../crates/test-framework" }
 
 [features]
 adbc = ["dep:connector-adbc", "runtime/adbc"]

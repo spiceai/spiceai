@@ -20525,6 +20525,7 @@ dependencies = [
  "spice-cloud",
  "telemetry",
  "tempfile",
+ "test-framework",
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",

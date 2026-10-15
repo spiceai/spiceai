@@ -314,6 +314,7 @@ mod tests {
     use super::*;
     use runtime_request_context::{Protocol, RequestContextBuilder};
     use std::sync::Mutex;
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// Everything a probe subscriber wrote while a tracker finished with
@@ -337,7 +338,14 @@ mod tests {
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .without_time()
-                .with_writer(move || WriteTo(Arc::clone(&writer))),
+                .with_writer(move || WriteTo(Arc::clone(&writer)))
+                // The tracker's own records only: the first query in a process
+                // also creates the meters it records to, and `opentelemetry`
+                // logs each creation at `debug`.
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("runtime::datafusion::query::tracker", Level::TRACE),
+                ),
         );
 
         let request_context = RequestContextBuilder::new(Protocol::Internal).build();

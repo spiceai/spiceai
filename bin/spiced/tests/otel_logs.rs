@@ -20,8 +20,9 @@ limitations under the License.
 //! Two halves. In process, the layer's events go through the real SDK pipeline
 //! to a collecting exporter, where each record's mapping can be asserted
 //! exactly, trace ids included. End to end, a built `spiced` sends to an OTLP
-//! receiver this test serves — gRPC for one run, HTTP for the other — the way it
-//! would send to an OpenTelemetry Collector.
+//! receiver this test serves — gRPC for one run, HTTP for another, and a
+//! scheduler and its executor over cluster mTLS — the way it would send to an
+//! OpenTelemetry Collector.
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
@@ -58,6 +59,9 @@ use tracing_subscriber::{Layer as _, filter, layer::SubscriberExt as _};
 
 /// A trace id a client pins with `spice-trace-id`.
 const PINNED: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+/// The export request header the receivers record with each record.
+const TOKEN_HEADER: &str = "x-otel-token";
 
 /// A log exporter that keeps every record it is sent.
 #[derive(Clone, Debug, Default)]
@@ -356,6 +360,70 @@ fn the_exports_own_events_are_not_exported() {
     );
 }
 
+/// A slow endpoint holds the export task while records fill its queue, and the
+/// SDK refuses a flush while the queue is full: `shutdown` retries until the
+/// queue drains, so every record queued before it is still delivered.
+#[test]
+fn shutdown_delivers_a_full_queue_to_a_slow_endpoint() {
+    crate::require_process_per_test(
+        "it starts the process's one log export, sized by the environment",
+    );
+    // SAFETY: the test runs in a process of its own (checked above), and no
+    // thread that reads the environment has started yet.
+    unsafe {
+        // Room for four queued records, and an export for each record.
+        std::env::set_var("OTEL_BLRP_MAX_QUEUE_SIZE", "4");
+        std::env::set_var("OTEL_BLRP_MAX_EXPORT_BATCH_SIZE", "1");
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("receiver runtime");
+    let inbox = Inbox::default();
+    let (receiver, _) = serve_grpc_answering_after(&rt, inbox.clone(), Duration::from_millis(300));
+    let sink = LogsSink::default();
+    let config = app::spicepod::component::runtime::OtelExporterConfig {
+        enabled: true,
+        endpoint: receiver.to_string(),
+        push_interval: "60s".to_string(),
+        metrics: vec![],
+        headers: std::collections::HashMap::new(),
+        temporality: app::spicepod::component::runtime::OtelTemporality::default(),
+        signals: vec![app::spicepod::component::runtime::OtelSignal::Logs],
+    };
+    otel_logs::start(
+        &sink,
+        &config,
+        std::collections::HashMap::new(),
+        opentelemetry_sdk::Resource::builder().build(),
+    )
+    .expect("log export starts");
+
+    tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(otel_logs::layer(sink)),
+        || {
+            tracing::info!(target: "runtime", "record 0");
+            // The endpoint holds record 0's export, so the export task takes
+            // nothing more from the queue until it answers: the next four
+            // records fill the queue.
+            inbox.wait_for("for the first record", Duration::from_secs(10), |r| {
+                r.body == "record 0"
+            });
+            for n in 1..=4 {
+                tracing::info!(target: "runtime", "record {n}");
+            }
+        },
+    );
+    otel_logs::shutdown();
+
+    assert_eq!(
+        inbox
+            .all()
+            .iter()
+            .map(|r| r.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["record 0", "record 1", "record 2", "record 3", "record 4"]
+    );
+}
+
 #[test]
 fn a_log_crate_record_keeps_its_own_target_and_level() {
     let records = exported_by(false, || {
@@ -423,6 +491,10 @@ struct Received {
     attributes: BTreeMap<String, String>,
     trace_id: String,
     span_id: String,
+    /// The `service.name` of the resource it was sent under.
+    service: String,
+    /// The [`TOKEN_HEADER`] of the request that carried it.
+    token: Option<String>,
 }
 
 fn typed(value: Option<&Value>) -> String {
@@ -450,9 +522,21 @@ fn hex(bytes: &[u8]) -> String {
 struct Inbox(Arc<Mutex<Vec<Received>>>);
 
 impl Inbox {
-    fn push(&self, request: ExportLogsServiceRequest) {
+    fn push(&self, request: ExportLogsServiceRequest, token: Option<&str>) {
         let mut received = self.0.lock().expect("inbox");
         for resource in request.resource_logs {
+            let service = resource
+                .resource
+                .iter()
+                .flat_map(|resource| &resource.attributes)
+                .find(|kv| kv.key == "service.name")
+                .and_then(
+                    |kv| match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
+                        Some(Value::StringValue(name)) => Some(name.clone()),
+                        _ => None,
+                    },
+                )
+                .unwrap_or_default();
             for scope_logs in resource.scope_logs {
                 let scope = scope_logs.scope.map(|s| s.name).unwrap_or_default();
                 for record in scope_logs.log_records {
@@ -471,6 +555,8 @@ impl Inbox {
                             .collect(),
                         trace_id: hex(&record.trace_id),
                         span_id: hex(&record.span_id),
+                        service: service.clone(),
+                        token: token.map(str::to_string),
                     });
                 }
             }
@@ -516,7 +602,11 @@ impl Inbox {
     }
 }
 
-struct GrpcReceiver(Inbox);
+struct GrpcReceiver {
+    inbox: Inbox,
+    /// How long it holds each export before answering, as a slow endpoint does.
+    answer_after: Duration,
+}
 
 #[tonic::async_trait]
 impl LogsService for GrpcReceiver {
@@ -524,7 +614,13 @@ impl LogsService for GrpcReceiver {
         &self,
         request: tonic::Request<ExportLogsServiceRequest>,
     ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
-        self.0.push(request.into_inner());
+        let token = request
+            .metadata()
+            .get(TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        self.inbox.push(request.into_inner(), token.as_deref());
+        tokio::time::sleep(self.answer_after).await;
         Ok(tonic::Response::new(ExportLogsServiceResponse::default()))
     }
 }
@@ -549,6 +645,15 @@ fn serve_grpc(
     rt: &tokio::runtime::Runtime,
     inbox: Inbox,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    serve_grpc_answering_after(rt, inbox, Duration::ZERO)
+}
+
+/// [`serve_grpc`], holding each logs export for `answer_after` before answering it.
+fn serve_grpc_answering_after(
+    rt: &tokio::runtime::Runtime,
+    inbox: Inbox,
+    answer_after: Duration,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .expect("bind the gRPC receiver");
@@ -556,7 +661,10 @@ fn serve_grpc(
     let metrics_exports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     rt.spawn(
         tonic::transport::Server::builder()
-            .add_service(LogsServiceServer::new(GrpcReceiver(inbox)))
+            .add_service(LogsServiceServer::new(GrpcReceiver {
+                inbox,
+                answer_after,
+            }))
             .add_service(MetricsServiceServer::new(MetricsCounter(Arc::clone(
                 &metrics_exports,
             ))))
@@ -570,26 +678,31 @@ fn serve_grpc(
 fn serve_http(rt: &tokio::runtime::Runtime, inbox: Inbox) -> SocketAddr {
     let app = axum::Router::new().route(
         "/v1/logs",
-        axum::routing::post(move |body: axum::body::Bytes| {
-            let inbox = inbox.clone();
-            async move {
-                match ExportLogsServiceRequest::decode(body) {
-                    Ok(request) => {
-                        inbox.push(request);
-                        (
-                            axum::http::StatusCode::OK,
-                            [(axum::http::header::CONTENT_TYPE, "application/x-protobuf")],
-                            ExportLogsServiceResponse::default().encode_to_vec(),
-                        )
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let inbox = inbox.clone();
+                async move {
+                    match ExportLogsServiceRequest::decode(body) {
+                        Ok(request) => {
+                            let token = headers
+                                .get(TOKEN_HEADER)
+                                .and_then(|value| value.to_str().ok());
+                            inbox.push(request, token);
+                            (
+                                axum::http::StatusCode::OK,
+                                [(axum::http::header::CONTENT_TYPE, "application/x-protobuf")],
+                                ExportLogsServiceResponse::default().encode_to_vec(),
+                            )
+                        }
+                        Err(_) => (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                            b"not an OTLP logs request".to_vec(),
+                        ),
                     }
-                    Err(_) => (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                        b"not an OTLP logs request".to_vec(),
-                    ),
                 }
-            }
-        }),
+            },
+        ),
     );
     let listener = rt
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -618,24 +731,30 @@ impl Drop for Spiced {
     }
 }
 
-/// Starts `spiced` on the Spicepod in `dir`, with its stdout kept in
+/// A `spiced` command on the Spicepod in `dir`, with its stdout kept in
 /// `dir/spiced.log` for the failure messages below.
 ///
 /// It runs in `dir`, which is also its instance directory: two runtimes in one
 /// directory refuse to start, and tests run side by side.
-fn start_spiced(dir: &Path, http: SocketAddr) -> Spiced {
+fn spiced_in(dir: &Path, http: SocketAddr) -> Command {
     let log = std::fs::File::create(dir.join("spiced.log")).expect("create the log file");
-    Spiced(
-        Command::new(env!("CARGO_BIN_EXE_spiced"))
-            .arg(dir)
-            .args(["--http", &http.to_string()])
-            .args(["--flight", &unused_local_addr().to_string()])
-            .current_dir(dir)
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start spiced"),
-    )
+    let mut command = Command::new(env!("CARGO_BIN_EXE_spiced"));
+    command
+        .arg(dir)
+        .args(["--http", &http.to_string()])
+        .args(["--flight", &unused_local_addr().to_string()])
+        .current_dir(dir)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::null());
+    command
+}
+
+fn start_spiced(dir: &Path, http: SocketAddr) -> Spiced {
+    spawn(&mut spiced_in(dir, http))
+}
+
+fn spawn(command: &mut Command) -> Spiced {
+    Spiced(command.spawn().expect("start spiced"))
 }
 
 fn stdout_of(dir: &Path) -> String {
@@ -655,6 +774,20 @@ fn exit_status(spiced: &mut Spiced, within: Duration) -> std::process::ExitStatu
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Sends `spiced` the `SIGTERM` an orchestrator stops it with, and waits for
+/// it to exit.
+#[cfg(unix)]
+fn terminate(spiced: &mut Spiced) -> std::process::ExitStatus {
+    let pid = libc::pid_t::try_from(spiced.0.id()).expect("a pid fits pid_t");
+    // SAFETY: `kill` only sends a signal to the child this test started.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGTERM) },
+        0,
+        "signal spiced"
+    );
+    exit_status(spiced, Duration::from_mins(1))
 }
 
 /// A default-feature `spiced` is large; cold loading on a busy macOS builder can
@@ -806,14 +939,7 @@ datasets:
     );
 
     // A graceful shutdown flushes everything, `Goodbye!` included.
-    let pid = libc::pid_t::try_from(child.0.id()).expect("a pid fits pid_t");
-    // SAFETY: `kill` only sends a signal to the child this test started.
-    assert_eq!(
-        unsafe { libc::kill(pid, libc::SIGTERM) },
-        0,
-        "signal spiced"
-    );
-    let status = exit_status(&mut child, Duration::from_mins(1));
+    let status = terminate(&mut child);
     assert!(
         status.success(),
         "spiced exits cleanly: {status}\n{}",
@@ -893,5 +1019,125 @@ runtime:
         "saying goodbye",
         Duration::from_secs(5),
         |r| r.body == "Goodbye!",
+    );
+}
+
+/// Cluster end to end, over mTLS: an executor has no exporter settings of its
+/// own. It exports its log with the scheduler's once it joins, and resolves
+/// their header template through the scheduler, the only node that holds the
+/// secret. It does so before loading the app's components, so a catalog that
+/// cannot be reached, which it retries for as long as it runs, does not hold
+/// its log back.
+#[cfg(unix)]
+#[test]
+fn a_cluster_executor_exports_its_log_with_the_schedulers_settings() {
+    const TOKEN: &str = "known-only-to-the-scheduler";
+
+    let rt = tokio::runtime::Runtime::new().expect("receiver runtime");
+    let inbox = Inbox::default();
+    let (receiver, _) = serve_grpc(&rt, inbox.clone());
+
+    let root = tempfile::tempdir().expect("create the cluster directory");
+    let pki = test_framework::pki::init_pki(&root.path().join("pki"))
+        .expect("create the cluster's certificate authority");
+    let state = root.path().join("state");
+    let scheduler_dir = root.path().join("scheduler");
+    let executor_dir = root.path().join("executor");
+    for dir in [&state, &scheduler_dir, &executor_dir] {
+        std::fs::create_dir(dir).expect("create a cluster directory");
+    }
+    std::fs::write(
+        scheduler_dir.join("spicepod.yaml"),
+        format!(
+            "version: v1
+kind: Spicepod
+name: otel-logs-cluster
+runtime:
+  state:
+    location: file://{state}
+  telemetry:
+    otel_exporter:
+      endpoint: {receiver}
+      signals: [logs]
+      headers:
+        {TOKEN_HEADER}: ${{ secrets:otel_logs_test_token }}
+catalogs:
+  - from: iceberg:http://{unreachable}/v1/namespaces
+    name: unreachable
+",
+            state = state.display(),
+            unreachable = unused_local_addr()
+        ),
+    )
+    .expect("write the scheduler's spicepod");
+
+    // A node is named by its role, as a cluster member and as the
+    // `service.name` its records are sent under.
+    let node = |role: &str, dir: &Path, cluster: SocketAddr| {
+        let certificate = pki
+            .create_client_cert(role)
+            .expect("issue the node's certificate");
+        let mut command = spiced_in(dir, unused_local_addr());
+        command
+            .args(["--role", role])
+            .args(["--node-bind-address", &cluster.to_string()])
+            .args(["--node-advertise-address", "localhost"])
+            .arg("--node-mtls-ca-certificate-file")
+            .arg(&pki.ca_cert_path)
+            .arg("--node-mtls-certificate-file")
+            .arg(&certificate.cert_path)
+            .arg("--node-mtls-key-file")
+            .arg(&certificate.key_path)
+            .env("SPICE_INSTANCE_ID", role)
+            .env("OTEL_SERVICE_NAME", role);
+        command
+    };
+    let exporting = |service: &'static str| {
+        move |r: &Received| r.service == service && r.body == "OTEL logs exporter enabled"
+    };
+
+    let scheduler_cluster = unused_local_addr();
+    let _scheduler = spawn(
+        node("scheduler", &scheduler_dir, scheduler_cluster).env("OTEL_LOGS_TEST_TOKEN", TOKEN),
+    );
+    let scheduler = inbox.wait_for_spiced(
+        Some(&scheduler_dir),
+        "from the scheduler starting export",
+        STARTUP,
+        exporting("scheduler"),
+    );
+    assert_eq!(scheduler.token.as_deref(), Some(TOKEN));
+
+    // The executor's Spicepod directory is empty, and the secret is not in its
+    // environment.
+    let mut executor = spawn(
+        node("executor", &executor_dir, unused_local_addr())
+            .args([
+                "--scheduler-address",
+                &format!("https://localhost:{}", scheduler_cluster.port()),
+            ])
+            .env_remove("OTEL_LOGS_TEST_TOKEN"),
+    );
+    let joined = inbox.wait_for_spiced(
+        Some(&executor_dir),
+        "from the executor starting export",
+        STARTUP,
+        exporting("executor"),
+    );
+    assert_eq!(
+        joined.token.as_deref(),
+        Some(TOKEN),
+        "the executor resolves the header through the scheduler: {joined:?}"
+    );
+
+    // An executor flushes its export when it stops, as any runtime does. This
+    // one is still retrying the catalog, so it stops only once the runtime's
+    // 30 s wait for connections to drain has run out.
+    let stopped = terminate(&mut executor);
+    inbox.wait_for_spiced(
+        Some(&executor_dir),
+        &format!("from the executor saying goodbye (it exited {stopped})"),
+        Duration::from_secs(5),
+        |r| r.service == "executor" && r.body == "Goodbye!",
     );
 }
