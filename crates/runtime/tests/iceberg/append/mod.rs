@@ -31,11 +31,14 @@ use std::time::Duration;
 use app::AppBuilder;
 use arrow::array::{Array as _, AsArray as _, RecordBatch};
 use arrow::datatypes::Int64Type;
-use futures::StreamExt as _;
-use runtime::datafusion::query::ResultsCacheMode;
 use data_components::iceberg::append::AppendCursor;
+use datafusion::common::TableReference;
+use futures::StreamExt as _;
 use iceberg::spec::Operation;
 use runtime::Runtime;
+use runtime::accelerated::refresh::RefreshOverrides;
+use runtime::component::dataset::acceleration::RefreshMode;
+use runtime::datafusion::query::ResultsCacheMode;
 use spicepod::acceleration::Mode;
 
 use crate::acceleration::{load_runtime_datasets, refresh_and_wait};
@@ -52,8 +55,17 @@ fn counter(name: &str) -> f64 {
     counter_with_label(&PROMETHEUS, name, "dataset", ACCELERATED)
 }
 
+/// Asserts that a counter reading, or the difference of two, equals `expected`.
+fn assert_count(recorded: f64, expected: u32, what: &str) {
+    assert!(
+        (recorded - f64::from(expected)).abs() < f64::EPSILON,
+        "{what}: recorded {recorded}, expected {expected}"
+    );
+}
+
 const ROWS_PROCESSED: &str = "dataset_acceleration_refresh_processed_rows";
 const FETCHES_SKIPPED: &str = "dataset_acceleration_refresh_data_fetches_skipped";
+const FALLBACKS: &str = "dataset_acceleration_refresh_fallbacks";
 
 /// The runtime serving the accelerated dataset and the oracle, with the initial load
 /// done, and the runtime's view of its datasets.
@@ -61,6 +73,9 @@ async fn start_spice(
     lab: &Lab,
     accel: &Accel,
 ) -> anyhow::Result<(Arc<Runtime>, Vec<runtime::component::dataset::Dataset>)> {
+    crate::utils::require_process_per_test(
+        "these scenarios install the process-global OpenTelemetry meter provider and read exact counts from it",
+    );
     // Instruments bind to the provider installed when they are first used, so the
     // registry exists before the runtime does.
     LazyLock::force(&PROMETHEUS);
@@ -77,6 +92,28 @@ async fn start_spice(
 /// Runs one append refresh to completion.
 async fn refresh(rt: &Arc<Runtime>) -> anyhow::Result<()> {
     refresh_and_wait(rt, ACCELERATED, Duration::from_mins(3)).await
+}
+
+/// Runs one full refresh to completion, as a user repairing the dataset does.
+async fn full_refresh(rt: &Arc<Runtime>) -> anyhow::Result<()> {
+    let waiter = rt
+        .datafusion()
+        .refresh_table(
+            &TableReference::from(ACCELERATED),
+            Some(RefreshOverrides {
+                sql: None,
+                mode: Some(RefreshMode::Full),
+                max_jitter: None,
+            }),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {ACCELERATED}"))?;
+    let outcome = tokio::time::timeout(Duration::from_mins(3), waiter.wait()).await?;
+    anyhow::ensure!(
+        outcome.is_answered(),
+        "the full refresh did not complete: {outcome:?}"
+    );
+    Ok(())
 }
 
 /// Runs `sql` against the current table state, past the results cache: the scenarios
@@ -207,7 +244,9 @@ fn row<'a>(rows: &'a Rows, key: &str) -> Option<&'a (String, Option<String>, Str
 /// a repeated refresh adds nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn late_rows_outside_the_overlap_window_are_loaded() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     // c1: k1..k100 at 10:00.
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
@@ -221,24 +260,28 @@ async fn late_rows_outside_the_overlap_window_are_loaded() -> anyhow::Result<()>
 
     // c3, inside the window: new keys, a newer k1, a stale k101, and a row exactly at
     // the window start. c4, outside it: new keys, a newer k2, one second outside.
-    lab.append(&[
-        keys("k", 201..=205, 900, "late_in"),
-        vec![
-            Row::at("k1", 720, "v2_in"),
-            Row::at("k101", 1200, "stale_in"),
-            Row::at("k401", 600, "boundary"),
-        ],
-    ]
-    .concat())
+    lab.append(
+        &[
+            keys("k", 201..=205, 900, "late_in"),
+            vec![
+                Row::at("k1", 720, "v2_in"),
+                Row::at("k101", 1200, "stale_in"),
+                Row::at("k401", 600, "boundary"),
+            ],
+        ]
+        .concat(),
+    )
     .await?;
-    lab.append(&[
-        keys("k", 301..=305, 300, "late_out"),
-        vec![
-            Row::at("k2", 480, "v2_out"),
-            Row::at("k402", 599, "just_outside"),
-        ],
-    ]
-    .concat())
+    lab.append(
+        &[
+            keys("k", 301..=305, 300, "late_out"),
+            vec![
+                Row::at("k2", 480, "v2_out"),
+                Row::at("k402", 599, "just_outside"),
+            ],
+        ]
+        .concat(),
+    )
     .await?;
     refresh(&rt).await?;
     let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after c3 and c4").await?;
@@ -258,7 +301,10 @@ async fn late_rows_outside_the_overlap_window_are_loaded() -> anyhow::Result<()>
         Some(&("k1".to_string(), Some(at_text(720)), "v2_in".to_string()))
     );
     for key in ["k301", "k401", "k402"] {
-        assert!(row(&rows, key).is_some(), "{key} was appended late and must load");
+        assert!(
+            row(&rows, key).is_some(),
+            "{key} was appended late and must load"
+        );
     }
 
     refresh(&rt).await?;
@@ -270,7 +316,9 @@ async fn late_rows_outside_the_overlap_window_are_loaded() -> anyhow::Result<()>
 /// A late row with a NULL time is older than any timed version of its key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_late_null_time_row_does_not_overwrite_a_timed_version() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=10, 0, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
@@ -278,7 +326,8 @@ async fn a_late_null_time_row_does_not_overwrite_a_timed_version() -> anyhow::Re
     lab.append(&[Row::null_time("k1", "null_v"), Row::null_time("k900", "n")])
         .await?;
     refresh(&rt).await?;
-    let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the NULL-time append").await?;
+    let rows =
+        assert_matches_source(&rt, TimeKind::Timestamp, "after the NULL-time append").await?;
     assert_eq!(
         row(&rows, "k1"),
         Some(&("k1".to_string(), Some(at_text(0)), "v1".to_string())),
@@ -296,7 +345,9 @@ async fn a_late_null_time_row_does_not_overwrite_a_timed_version() -> anyhow::Re
 /// are not instant bounds, so every stored row is compared, as instants.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_string_time_column_with_mixed_offsets_keeps_the_newest_instant() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Text).await?;
     lab.append(&[
         Row::text("k1", "2026-10-14T10:30:00+00:00", "v1"),
@@ -338,7 +389,9 @@ async fn a_string_time_column_with_mixed_offsets_keeps_the_newest_instant() -> a
 /// rows it rewrote are not stored twice. A later append is still read on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_compaction_of_loaded_files_reads_nothing_and_adds_no_duplicate() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     let c2 = lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
@@ -349,21 +402,25 @@ async fn a_compaction_of_loaded_files_reads_nothing_and_adds_no_duplicate() -> a
     lab.rewrite(
         Operation::Replace,
         &compacted,
-        &[keys("k", 1..=100, 0, "v1"), keys("k", 101..=110, 1800, "v1")].concat(),
+        &[
+            keys("k", 1..=100, 0, "v1"),
+            keys("k", 101..=110, 1800, "v1"),
+        ]
+        .concat(),
     )
     .await?;
     let processed_before = counter(ROWS_PROCESSED);
     let skipped_before = counter(FETCHES_SKIPPED);
     refresh(&rt).await?;
-    assert_eq!(
+    assert_count(
         counter(ROWS_PROCESSED) - processed_before,
-        0.0,
-        "a replace snapshot changes no row, so none is read"
+        0,
+        "a replace snapshot changes no row, so none is read",
     );
-    assert_eq!(
+    assert_count(
         counter(FETCHES_SKIPPED) - skipped_before,
-        1.0,
-        "the refresh found nothing to fetch"
+        1,
+        "the refresh found nothing to fetch",
     );
     let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the compaction").await?;
     assert_eq!(rows.len(), 110);
@@ -371,12 +428,17 @@ async fn a_compaction_of_loaded_files_reads_nothing_and_adds_no_duplicate() -> a
     lab.append(&keys("k", 111..=115, 1900, "v1")).await?;
     let processed_before = counter(ROWS_PROCESSED);
     refresh(&rt).await?;
-    assert_eq!(
+    assert_count(
         counter(ROWS_PROCESSED) - processed_before,
-        5.0,
-        "only the appended file is read"
+        5,
+        "only the appended file is read",
     );
-    assert_matches_source(&rt, TimeKind::Timestamp, "after the append following the compaction").await?;
+    assert_matches_source(
+        &rt,
+        TimeKind::Timestamp,
+        "after the append following the compaction",
+    )
+    .await?;
     Ok(())
 }
 
@@ -385,13 +447,19 @@ async fn a_compaction_of_loaded_files_reads_nothing_and_adds_no_duplicate() -> a
 /// and the compacted file is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_compaction_inside_the_interval_keeps_the_late_rows() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
 
-    let late = [keys("k", 301..=305, 300, "late_out"), vec![Row::at("k2", 480, "v2_out")]].concat();
+    let late = [
+        keys("k", 301..=305, 300, "late_out"),
+        vec![Row::at("k2", 480, "v2_out")],
+    ]
+    .concat();
     let newer = keys("k", 111..=112, 2000, "v1");
     let c3 = lab.append(&late).await?;
     let c4 = lab.append(&newer).await?;
@@ -410,13 +478,17 @@ async fn a_compaction_inside_the_interval_keeps_the_late_rows() -> anyhow::Resul
 
     let processed_before = counter(ROWS_PROCESSED);
     refresh(&rt).await?;
-    assert_eq!(
+    assert_count(
         counter(ROWS_PROCESSED) - processed_before,
-        (late.len() + newer.len()) as f64,
-        "the two appends are read from their own files; the compacted file is not"
+        u32::try_from(late.len() + newer.len())?,
+        "the two appends are read from their own files; the compacted file is not",
     );
     let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the compaction").await?;
-    assert_eq!(rows.len(), 117, "110 keys, five late new keys, two newer keys; k2 is replaced");
+    assert_eq!(
+        rows.len(),
+        117,
+        "110 keys, five late new keys, two newer keys; k2 is replaced"
+    );
     assert_eq!(
         row(&rows, "k2"),
         Some(&("k2".to_string(), Some(at_text(480)), "v2_out".to_string()))
@@ -430,7 +502,9 @@ async fn a_compaction_inside_the_interval_keeps_the_late_rows() -> anyhow::Resul
 /// saved snapshot itself does not break it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
@@ -443,10 +517,10 @@ async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
     lab.expire(&[c3]).await?;
     let processed_before = counter(ROWS_PROCESSED);
     refresh(&rt).await?;
-    assert_eq!(
+    assert_count(
         counter(ROWS_PROCESSED) - processed_before,
-        5.0,
-        "the time window reads the newer rows and nothing is reloaded"
+        5,
+        "the time window reads the newer rows and nothing is reloaded",
     );
     let rows = accelerated_rows(&rt).await?;
     assert_eq!(rows.len(), 115);
@@ -457,7 +531,11 @@ async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
 
     let skipped_before = counter(FETCHES_SKIPPED);
     refresh(&rt).await?;
-    assert_eq!(counter(FETCHES_SKIPPED) - skipped_before, 1.0, "the fallback set the cursor");
+    assert_count(
+        counter(FETCHES_SKIPPED) - skipped_before,
+        1,
+        "the fallback set the cursor",
+    );
 
     // Snapshots are followed again: a late row loads.
     let c5 = lab.append(&[Row::at("k302", 310, "late_out")]).await?;
@@ -470,11 +548,22 @@ async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
     lab.expire(&[c5]).await?;
     let processed_before = counter(ROWS_PROCESSED);
     refresh(&rt).await?;
-    assert_eq!(counter(ROWS_PROCESSED) - processed_before, 1.0, "only the new file is read");
+    assert_count(
+        counter(ROWS_PROCESSED) - processed_before,
+        1,
+        "only the new file is read",
+    );
     // Not compared with the source: k301 stays absent from the first fallback by design.
     let rows = accelerated_rows(&rt).await?;
-    assert_eq!(rows.len(), 117, "nothing reloaded, nothing removed, the new row added");
-    assert!(row(&rows, "k303").is_some(), "following went on past the expired saved snapshot");
+    assert_eq!(
+        rows.len(),
+        117,
+        "nothing reloaded, nothing removed, the new row added"
+    );
+    assert!(
+        row(&rows, "k303").is_some(),
+        "following went on past the expired saved snapshot"
+    );
 
     lab.append(&[Row::at("k304", 330, "late_out")]).await?;
     refresh(&rt).await?;
@@ -487,7 +576,9 @@ async fn an_expired_snapshot_reads_by_time_once() -> anyhow::Result<()> {
 /// never removes a row; later appends are followed from the rolled-back snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_rollback_reads_by_time_once_and_removes_nothing() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
@@ -503,62 +594,261 @@ async fn a_rollback_reads_by_time_once_and_removes_nothing() -> anyhow::Result<(
         "the rolled-back rows stay; nothing is reloaded"
     );
 
-    lab.append(&[Row::at("k301", 300, "late_out"), Row::at("k111", 1900, "v1")])
-        .await?;
+    lab.append(&[
+        Row::at("k301", 300, "late_out"),
+        Row::at("k111", 1900, "v1"),
+    ])
+    .await?;
     refresh(&rt).await?;
     let rows = accelerated_rows(&rt).await?;
-    assert_eq!(rows.len(), 112, "snapshots are followed again from the rolled-back one");
+    assert_eq!(
+        rows.len(),
+        112,
+        "snapshots are followed again from the rolled-back one"
+    );
     assert!(row(&rows, "k301").is_some());
     Ok(())
 }
 
-/// A snapshot that deletes or overwrites rows makes that refresh read by time, as
-/// before this change: rows inside the overlap window load, deleted rows stay, and a
-/// late row outside the window from the same interval is not read (the decided
-/// trade-off; a full refresh repairs it).
+/// Each snapshot is decided on its own, so a delete or an overwrite does not hide the
+/// late appends committed beside it. With a primary key an overwrite's files are read:
+/// keep-newest drops its copies of stored rows and keeps its changed row. A snapshot
+/// that only deletes (a retention job) is skipped, and its rows stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_delete_or_overwrite_snapshot_falls_back_to_the_time_window() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+async fn a_delete_or_overwrite_does_not_hide_the_late_rows_beside_it() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     let c2 = lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
+
+    // A copy-on-write update of k5 rewrites c1's file: 99 copies and the new k5.
+    let updated: Vec<Row> = keys("k", 1..=100, 0, "v1")
+        .into_iter()
+        .map(|r| {
+            if r.key == "k5" {
+                Row::at("k5", 60, "v2")
+            } else {
+                r
+            }
+        })
+        .collect();
+    lab.rewrite(Operation::Overwrite, &lab.added_files(c1).await?, &updated)
+        .await?;
+    lab.append(&[
+        Row::at("k301", 300, "late_out"),
+        Row::at("k501", 2400, "in_window"),
+    ])
+    .await?;
+    refresh(&rt).await?;
+    let rows = assert_matches_source(
+        &rt,
+        TimeKind::Timestamp,
+        "after an overwrite and a late append",
+    )
+    .await?;
+    assert_eq!(
+        rows.len(),
+        112,
+        "110 keys plus k301 and k501, each stored once"
+    );
+    assert_eq!(
+        row(&rows, "k5"),
+        Some(&("k5".to_string(), Some(at_text(60)), "v2".to_string())),
+        "the overwrite's changed row loads"
+    );
+    assert!(
+        row(&rows, "k301").is_some(),
+        "a late row beside an overwrite loads"
+    );
+
+    // A whole-file delete of c2, as a retention job commits, beside a late append.
+    lab.rewrite(Operation::Delete, &lab.added_files(c2).await?, &[])
+        .await?;
+    lab.append(&[Row::at("k302", 310, "late_out")]).await?;
+    refresh(&rt).await?;
+    let rows = accelerated_rows(&rt).await?;
+    assert!(
+        row(&rows, "k302").is_some(),
+        "a late row beside a delete loads"
+    );
+    assert!(
+        row(&rows, "k101").is_some(),
+        "append refresh does not remove deleted rows"
+    );
+    assert_eq!(rows.len(), 113);
+    assert_count(counter(FALLBACKS), 0, "no refresh read by time");
+    Ok(())
+}
+
+/// An overwrite that writes a row and deletes it in the same commit (a streaming
+/// upsert that changed a key twice between commits) is read with its own position
+/// deletes: the deleted versions never existed and do not load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_overwrite_is_read_with_its_own_position_deletes() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
+    let lab = Lab::start(TimeKind::Timestamp).await?;
+    lab.append(&keys("k", 1..=100, 0, "v1")).await?;
+    let (rt, _) = start_spice(&lab, &Accel::default()).await?;
+
+    // Positions 0 and 1 are deleted by the commit that writes them: k7 is gone again,
+    // and k8's first version gives way to its second, older-stamped one.
+    lab.append_with_own_deletes(
+        &[
+            Row::at("k7", 600, "deleted"),
+            Row::at("k8", 700, "deleted"),
+            Row::at("k8", 650, "v2"),
+            Row::at("k601", 300, "late"),
+        ],
+        &[0, 1],
+    )
+    .await?;
+    refresh(&rt).await?;
+    let rows = assert_matches_source(
+        &rt,
+        TimeKind::Timestamp,
+        "after an overwrite with its own deletes",
+    )
+    .await?;
+    assert_eq!(rows.len(), 101);
+    assert_eq!(
+        row(&rows, "k8"),
+        Some(&("k8".to_string(), Some(at_text(650)), "v2".to_string()))
+    );
+    assert_eq!(
+        row(&rows, "k7"),
+        Some(&("k7".to_string(), Some(at_text(0)), "v1".to_string()))
+    );
+    assert_count(counter(FALLBACKS), 0, "no refresh read by time");
+    Ok(())
+}
+
+/// Without a primary key a snapshot that only deletes is skipped too, but an overwrite
+/// makes that refresh read by time: nothing tells its copies of stored rows from new
+/// rows. The refresh after it follows snapshots again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_overwrite_without_a_primary_key_reads_by_time_once() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
+    let lab = Lab::start(TimeKind::Timestamp).await?;
+    let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
+    let c2 = lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
+    let accel = Accel {
+        primary_key: false,
+        ..Accel::default()
+    };
+    let (rt, _) = start_spice(&lab, &accel).await?;
+
+    lab.rewrite(Operation::Delete, &lab.added_files(c2).await?, &[])
+        .await?;
+    lab.append(&[Row::at("k301", 300, "late_out")]).await?;
+    refresh(&rt).await?;
+    let rows = accelerated_rows(&rt).await?;
+    assert!(
+        row(&rows, "k301").is_some(),
+        "a late row beside a delete loads"
+    );
+    assert_eq!(
+        rows.len(),
+        111,
+        "the deleted rows stay, nothing is stored twice"
+    );
+    assert_count(counter(FALLBACKS), 0, "no refresh read by time");
 
     // A copy-on-write delete of k5 rewrites c1's file without it.
     let without_k5: Vec<Row> = keys("k", 1..=100, 0, "v1")
         .into_iter()
         .filter(|r| r.key != "k5")
         .collect();
-    lab.rewrite(Operation::Overwrite, &lab.added_files(c1).await?, &without_k5)
-        .await?;
-    lab.append(&[Row::at("k301", 300, "late_out"), Row::at("k501", 2400, "in_window")])
-        .await?;
+    lab.rewrite(
+        Operation::Overwrite,
+        &lab.added_files(c1).await?,
+        &without_k5,
+    )
+    .await?;
+    lab.append(&[
+        Row::at("k302", 300, "late_out"),
+        Row::at("k501", 2400, "in_window"),
+    ])
+    .await?;
     refresh(&rt).await?;
     let rows = accelerated_rows(&rt).await?;
-    assert!(row(&rows, "k501").is_some(), "a row inside the window loads");
-    assert!(row(&rows, "k5").is_some(), "append refresh does not remove deleted rows");
     assert!(
-        row(&rows, "k301").is_none(),
-        "the time-filtered fallback does not read a late row outside the window"
+        row(&rows, "k501").is_some(),
+        "a row inside the window loads"
     );
-    assert_eq!(rows.len(), 111, "110 stored rows plus k501, nothing stored twice");
+    assert!(
+        row(&rows, "k5").is_some(),
+        "append refresh does not remove deleted rows"
+    );
+    assert!(
+        row(&rows, "k302").is_none(),
+        "the time-filtered read does not reach a late row outside the window"
+    );
+    assert_eq!(
+        rows.len(),
+        112,
+        "the overwrite's copies are not stored twice"
+    );
+    assert_count(counter(FALLBACKS), 1, "the fallback is counted");
 
-    // A whole-file delete of c2, with another append in the same interval.
-    lab.rewrite(Operation::Delete, &lab.added_files(c2).await?, &[])
-        .await?;
-    lab.append(&[Row::at("k502", 2500, "in_window")]).await?;
+    lab.append(&[Row::at("k303", 310, "late_out")]).await?;
     refresh(&rt).await?;
     let rows = accelerated_rows(&rt).await?;
-    assert!(row(&rows, "k502").is_some());
-    assert!(row(&rows, "k101").is_some(), "the deleted file's rows stay");
-    assert_eq!(rows.len(), 112);
-
-    // The refresh after a fallback follows snapshots again.
-    lab.append(&[Row::at("k302", 310, "late_out")]).await?;
-    refresh(&rt).await?;
-    let rows = accelerated_rows(&rt).await?;
-    assert!(row(&rows, "k302").is_some(), "the next interval is pure append");
+    assert!(
+        row(&rows, "k303").is_some(),
+        "the next interval is followed again"
+    );
     assert_eq!(rows.len(), 113);
+    assert_count(counter(FALLBACKS), 1, "the fallback is counted once");
+    Ok(())
+}
+
+/// A full refresh reads the table pinned to its current snapshot and saves it, so the
+/// next append refresh reads only the commits after it and stores nothing twice, with
+/// and without a primary key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_full_refresh_moves_the_cursor() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
+    for primary_key in [false, true] {
+        let lab = Lab::start(TimeKind::Timestamp).await?;
+        lab.append(&keys("k", 1..=100, 0, "v1")).await?;
+        let accel = Accel {
+            primary_key,
+            ..Accel::default()
+        };
+        let (rt, _) = start_spice(&lab, &accel).await?;
+
+        lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
+        full_refresh(&rt).await?;
+        assert_eq!(
+            accelerated_count(&rt).await?,
+            110,
+            "primary_key={primary_key}"
+        );
+
+        lab.append(&[Row::at("k301", 300, "late")]).await?;
+        refresh(&rt).await?;
+        let rows = assert_matches_source(
+            &rt,
+            TimeKind::Timestamp,
+            &format!("after the append that follows a full refresh (primary_key={primary_key})"),
+        )
+        .await?;
+        assert_eq!(
+            rows.len(),
+            111,
+            "the fully refreshed rows are not read again"
+        );
+        rt.shutdown().await;
+    }
     Ok(())
 }
 
@@ -567,7 +857,9 @@ async fn a_delete_or_overwrite_snapshot_falls_back_to_the_time_window() -> anyho
 /// and without a primary key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_cursor_behind_the_written_rows_is_absorbed() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     for primary_key in [true, false] {
         let lab = Lab::start(TimeKind::Timestamp).await?;
         let c1 = lab.append(&keys("k", 1..=100, 0, "v1")).await?;
@@ -577,11 +869,21 @@ async fn a_cursor_behind_the_written_rows_is_absorbed() -> anyhow::Result<()> {
         };
         let (rt, datasets) = start_spice(&lab, &accel).await?;
         let c2 = lab
-            .append(&[keys("k", 101..=110, 1800, "v1"), vec![Row::at("k301", 300, "late")]].concat())
+            .append(
+                &[
+                    keys("k", 101..=110, 1800, "v1"),
+                    vec![Row::at("k301", 300, "late")],
+                ]
+                .concat(),
+            )
             .await?;
         let lab_uuid = lab.table_uuid().await?;
         refresh(&rt).await?;
-        assert_eq!(accelerated_count(&rt).await?, 111, "primary_key={primary_key}");
+        assert_eq!(
+            accelerated_count(&rt).await?,
+            111,
+            "primary_key={primary_key}"
+        );
 
         // The rows of the last refresh are stored, but its cursor save is lost: the
         // store still says the previous commit is written and this one is in flight.
@@ -590,11 +892,13 @@ async fn a_cursor_behind_the_written_rows_is_absorbed() -> anyhow::Result<()> {
             .find(|d| d.name.to_string() == ACCELERATED)
             .ok_or_else(|| anyhow::anyhow!("the accelerated dataset is registered"))?;
         let store = runtime::dataaccelerator::spice_sys::append_cursor_store(dataset).await;
-        let cursor = |snapshot_id| AppendCursor {
-            table_uuid: lab_uuid.clone(),
-            snapshot_id,
-        }
-        .to_json();
+        let cursor = |snapshot_id| {
+            AppendCursor {
+                table_uuid: lab_uuid.clone(),
+                snapshot_id,
+            }
+            .to_json()
+        };
         store.save_committed(&cursor(c1)).await?;
         store.save_pending(&cursor(c2)).await?;
 
@@ -615,7 +919,9 @@ async fn a_cursor_behind_the_written_rows_is_absorbed() -> anyhow::Result<()> {
 /// twice: the rows a commit added are new rows, so nothing is compared with them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_unkeyed_dataset_keeps_a_legitimate_duplicate() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=10, 0, "v1")).await?;
     let accel = Accel {
@@ -640,14 +946,20 @@ async fn an_unkeyed_dataset_keeps_a_legitimate_duplicate() -> anyhow::Result<()>
     );
 
     refresh(&rt).await?;
-    assert_eq!(accelerated_count(&rt).await?, 11, "a repeated refresh adds nothing");
+    assert_eq!(
+        accelerated_count(&rt).await?,
+        11,
+        "a repeated refresh adds nothing"
+    );
     Ok(())
 }
 
 /// A refresh that finds the table at the snapshot it last loaded scans no data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_unchanged_table_scans_no_data() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
@@ -656,8 +968,16 @@ async fn an_unchanged_table_scans_no_data() -> anyhow::Result<()> {
     let skipped_before = counter(FETCHES_SKIPPED);
     refresh(&rt).await?;
     refresh(&rt).await?;
-    assert_eq!(counter(ROWS_PROCESSED) - processed_before, 0.0, "no row was read");
-    assert_eq!(counter(FETCHES_SKIPPED) - skipped_before, 2.0, "both refreshes skipped the fetch");
+    assert_count(
+        counter(ROWS_PROCESSED) - processed_before,
+        0,
+        "no row was read",
+    );
+    assert_count(
+        counter(FETCHES_SKIPPED) - skipped_before,
+        2,
+        "both refreshes skipped the fetch",
+    );
     assert_eq!(accelerated_count(&rt).await?, 100);
     Ok(())
 }
@@ -667,7 +987,9 @@ async fn an_unchanged_table_scans_no_data() -> anyhow::Result<()> {
 /// table's snapshots are followed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_recreated_table_is_read_by_time_once() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     let (rt, _) = start_spice(&lab, &Accel::default()).await?;
@@ -698,7 +1020,9 @@ async fn a_recreated_table_is_read_by_time_once() -> anyhow::Result<()> {
 /// A memory-mode acceleration keeps its cursor for the process: late rows load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_memory_mode_acceleration_follows_snapshots_too() -> anyhow::Result<()> {
-    let _tracing = crate::init_tracing(Some("integration=debug,data_components=debug,runtime_table=debug,info"));
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
     let lab = Lab::start(TimeKind::Timestamp).await?;
     lab.append(&keys("k", 1..=100, 0, "v1")).await?;
     lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
@@ -708,8 +1032,11 @@ async fn a_memory_mode_acceleration_follows_snapshots_too() -> anyhow::Result<()
     };
     let (rt, _) = start_spice(&lab, &accel).await?;
 
-    lab.append(&[Row::at("k301", 300, "late_out"), Row::at("k2", 480, "v2_out")])
-        .await?;
+    lab.append(&[
+        Row::at("k301", 300, "late_out"),
+        Row::at("k2", 480, "v2_out"),
+    ])
+    .await?;
     refresh(&rt).await?;
     let rows = assert_matches_source(&rt, TimeKind::Timestamp, "after the late append").await?;
     assert_eq!(rows.len(), 111);

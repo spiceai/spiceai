@@ -27,14 +27,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use iceberg::arrow::FieldMatchMode;
 use iceberg::io::StorageFactory;
 use iceberg::spec::{
-    DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestListWriter, ManifestStatus,
-    ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Snapshot, SnapshotReference,
-    SnapshotRetention, Summary, Type,
+    DataContentType, DataFile, FormatVersion, MAIN_BRANCH, ManifestEntry, ManifestListWriter,
+    ManifestStatus, ManifestWriterBuilder, NestedField, Operation, PrimitiveType, Snapshot,
+    SnapshotReference, SnapshotRetention, Summary, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -182,7 +182,10 @@ impl Lab {
             .publish_port(8181)
             .add_env_var("CATALOG_WAREHOUSE", &format!("s3://{S3_BUCKET}/warehouse/"))
             .add_env_var("CATALOG_IO__IMPL", "org.apache.iceberg.aws.s3.S3FileIO")
-            .add_env_var("CATALOG_S3_ENDPOINT", &format!("http://{store_bridge}:9000"))
+            .add_env_var(
+                "CATALOG_S3_ENDPOINT",
+                &format!("http://{store_bridge}:9000"),
+            )
             .add_env_var("CATALOG_S3_PATH__STYLE__ACCESS", "true")
             .add_env_var("AWS_ACCESS_KEY_ID", S3_ACCESS_KEY)
             .add_env_var("AWS_SECRET_ACCESS_KEY", S3_SECRET_KEY)
@@ -365,7 +368,7 @@ impl Lab {
         let metadata = table.metadata();
         let parquet = ParquetWriterBuilder::from_table_properties(
             &metadata.table_properties(),
-            metadata.current_schema().clone(),
+            Arc::clone(metadata.current_schema()),
         )?
         .with_match_mode(FieldMatchMode::Name);
         let rolling = RollingFileWriterBuilder::new_with_default_file_size(
@@ -381,7 +384,11 @@ impl Lab {
         let mut writer = DataFileWriterBuilder::new(rolling).build(None).await?;
         writer.write(self.batch(rows)?).await?;
         let mut files = writer.close().await?;
-        anyhow::ensure!(files.len() == 1, "one data file per write, got {}", files.len());
+        anyhow::ensure!(
+            files.len() == 1,
+            "one data file per write, got {}",
+            files.len()
+        );
         Ok(files.remove(0))
     }
 
@@ -396,6 +403,97 @@ impl Lab {
             .metadata()
             .current_snapshot_id()
             .ok_or_else(|| anyhow::anyhow!("the append produced no snapshot"))
+    }
+
+    /// Commits `rows` as one data file together with a position delete file that deletes
+    /// the rows at `positions` of that same file, in one `overwrite` snapshot:
+    /// what a streaming upsert writer commits when a key changes twice between two of
+    /// its commits. Returns the new snapshot's id.
+    pub async fn append_with_own_deletes(
+        &self,
+        rows: &[Row],
+        positions: &[i64],
+    ) -> anyhow::Result<i64> {
+        let table = self.load_table().await?;
+        let data = self.write_data_file(&table, rows).await?;
+        let deletes = self
+            .write_position_deletes(&table, data.file_path(), positions)
+            .await?;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .row_delta()
+            .add_data_files(vec![data])
+            .add_delete_files(vec![deletes])
+            .apply(tx)?;
+        let table = tx.commit(self.catalog.as_ref()).await?;
+        table
+            .metadata()
+            .current_snapshot_id()
+            .ok_or_else(|| anyhow::anyhow!("the commit produced no snapshot"))
+    }
+
+    /// Writes a position delete file deleting `positions` of the data file at
+    /// `data_path`.
+    async fn write_position_deletes(
+        &self,
+        table: &Table,
+        data_path: &str,
+        positions: &[i64],
+    ) -> anyhow::Result<DataFile> {
+        let metadata = table.metadata();
+        // The field ids the Iceberg spec reserves for a position delete file's columns.
+        let schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        2_147_483_546,
+                        "file_path",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                    NestedField::required(
+                        2_147_483_545,
+                        "pos",
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()?,
+        );
+        let parquet =
+            ParquetWriterBuilder::from_table_properties(&metadata.table_properties(), schema)?
+                .with_match_mode(FieldMatchMode::Name);
+        let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet,
+            table.file_io().clone(),
+            DefaultLocationGenerator::new(metadata)?,
+            DefaultFileNameGenerator::new(
+                uuid::Uuid::now_v7().to_string(),
+                Some("deletes".to_string()),
+                iceberg::spec::DataFileFormat::Parquet,
+            ),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("file_path", DataType::Utf8, false),
+                Field::new("pos", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![data_path; positions.len()])),
+                Arc::new(Int64Array::from(positions.to_vec())),
+            ],
+        )?;
+        let mut writer = rolling.build();
+        writer.write(&None, &batch).await?;
+        let mut files = writer.close().await?;
+        anyhow::ensure!(
+            files.len() == 1,
+            "one delete file per write, got {}",
+            files.len()
+        );
+        let mut file = files.remove(0);
+        file.content(DataContentType::PositionDeletes);
+        Ok(file.build()?)
     }
 
     /// The paths of the data files `snapshot_id` added.
@@ -579,7 +677,7 @@ impl RewriteFiles {
         let mut writer = ManifestWriterBuilder::new(
             output,
             Some(snapshot_id),
-            metadata.current_schema().clone(),
+            Arc::clone(metadata.current_schema()),
             metadata.default_partition_spec().as_ref().clone(),
         )
         .build_v2_data();

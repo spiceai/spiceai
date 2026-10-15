@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use self::append_cursor::AppendCursorStore;
 use super::refresh::Refresh;
 use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
@@ -36,13 +37,12 @@ use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningP
 use arrow_tools::type_rewrite::rewrite_data_type;
 use async_stream::stream;
 use data_components::cdc::AccelerationContents;
-use data_components::poly::PolyTableProvider;
 use data_components::incremental_append::{
-    AppendPlan, SeedMark, IncrementalAppendSource, TimeColumn, incremental_append_source,
+    AppendPlan, Fallback, IncrementalAppendSource, PinnedRead, RewrittenRows, SeedMark, TimeColumn,
+    incremental_append_source,
 };
+use data_components::poly::PolyTableProvider;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
-use self::append_cursor::AppendCursorStore;
-use util::timestamp_filter::data_type_to_timestamp_format;
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -107,6 +107,7 @@ use tokio::{
 };
 use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::timestamp_filter::data_type_to_timestamp_format;
 use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
@@ -452,7 +453,10 @@ impl RefreshTaskBuilder {
 
     /// Where an append refresh keeps the source snapshot it last loaded.
     #[must_use]
-    pub fn with_append_cursor_store(mut self, store: Option<AppendCursorStore>) -> RefreshTaskBuilder {
+    pub fn with_append_cursor_store(
+        mut self,
+        store: Option<AppendCursorStore>,
+    ) -> RefreshTaskBuilder {
         self.append_cursor_store = store;
         self
     }
@@ -538,6 +542,7 @@ impl RefreshTaskBuilder {
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
             append_cursor_store: self.append_cursor_store,
+            last_append_fallback: parking_lot::Mutex::new(None),
             session_state,
         }
     }
@@ -627,6 +632,9 @@ pub struct RefreshTask {
     in_flight_revalidations: super::caching::InFlightRevalidations,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
+    /// The reason the last append refresh read by time instead of following its
+    /// source's commits, so the warning repeats only when the reason changes.
+    last_append_fallback: parking_lot::Mutex<Option<&'static str>>,
     /// Built once instead of a fresh `SessionContext` per stale entry.
     session_state: Arc<SessionState>,
 }
@@ -944,18 +952,26 @@ impl RefreshTask {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
-            RefreshMode::Full => {
-                match self
-                    .get_full_or_incremental_append_update(refresh, None)
-                    .await
-                {
-                    Ok(update) if refresh.versions_by_time.is_some() => {
-                        self.select_latest_by_time(refresh, update, StoredRowsFrom::None)
-                            .await
+            // A full refresh of a dataset whose append refresh follows its source's
+            // commits reads the source pinned to its current commit and saves it, so the
+            // next append refresh reads only what lands after it.
+            RefreshMode::Full => match self.pin_full_refresh(refresh).await {
+                Ok(pinned) => {
+                    let source = pinned.as_ref().map(|read| Arc::clone(&read.provider));
+                    append_cursor_to_save = pinned.map(|read| read.cursor);
+                    match self
+                        .get_full_or_incremental_append_update_from(refresh, None, source)
+                        .await
+                    {
+                        Ok(update) if refresh.versions_by_time.is_some() => {
+                            self.select_latest_by_time(refresh, update, StoredRowsFrom::None)
+                                .await
+                        }
+                        other => other,
                     }
-                    other => other,
                 }
-            }
+                Err(e) => Err(e),
+            },
             RefreshMode::Append => match self.get_incremental_append_update(refresh).await {
                 // The source holds nothing the acceleration lacks, decided from its
                 // metadata alone: no data was scanned.
@@ -1481,11 +1497,17 @@ impl RefreshTask {
             name: name.clone(),
             format: self.stored_time_format(name, refresh),
         });
+        let rewritten_rows = if self.keeps_newest(refresh) {
+            RewrittenRows::KeepNewest
+        } else {
+            RewrittenRows::ReadByTime
+        };
         let plan = source
             .plan_append(
                 &self.dataset_name.to_string(),
                 saved.committed.as_deref(),
                 time_column.as_ref(),
+                rewritten_rows,
             )
             .await
             .map_err(|source| {
@@ -1493,18 +1515,19 @@ impl RefreshTask {
             })?;
 
         match plan {
-            AppendPlan::Unchanged => Ok(AppendRead::UpToDate),
-            AppendPlan::TimeFiltered {
-                cursor,
-                source,
-                fallback,
-            } => {
-                if let Some(reason) = fallback {
-                    tracing::warn!(
-                        "Dataset '{}' reads new rows by time for this append refresh instead of following its source commits: {reason}. Run a full refresh to rebuild the acceleration from the source.",
-                        self.dataset_name
-                    );
+            AppendPlan::Unchanged => {
+                *self.last_append_fallback.lock() = None;
+                Ok(AppendRead::UpToDate)
+            }
+            AppendPlan::TimeFiltered { pinned, fallback } => {
+                match &fallback {
+                    Some(fallback) => self.report_append_fallback(fallback).await,
+                    None => *self.last_append_fallback.lock() = None,
                 }
+                let (cursor, source) = match pinned {
+                    Some(PinnedRead { cursor, provider }) => (Some(cursor), Some(provider)),
+                    None => (None, None),
+                };
                 if let Some(cursor) = &cursor {
                     let _ = self.save_pending_cursor(store, cursor).await;
                 }
@@ -1512,6 +1535,7 @@ impl RefreshTask {
                 Ok(AppendRead::Update { update, cursor })
             }
             AppendPlan::AddedRows(read) => {
+                *self.last_append_fallback.lock() = None;
                 if read.is_empty {
                     // The commits added no row: nothing to read, and nothing a replay
                     // could lose, so the cursor moves now.
@@ -1527,12 +1551,13 @@ impl RefreshTask {
                 let update = self
                     .get_data_update(vec![], refresh, UpdateType::Append, read.provider)
                     .await?;
-                let from = read.seed.map_or(StoredRowsFrom::All, StoredRowsFrom::from_seed);
-                let update = if refresh.versions_by_time.is_some()
-                    && self.version_ordering(refresh).is_some()
-                {
+                let from = read
+                    .seed
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::from_seed);
+                let update = if self.keeps_newest(refresh) {
                     // Keep-newest compares every incoming row with its key's stored
-                    // version, which also drops a replayed row as a re-read.
+                    // version, which drops a replayed row or an overwrite's copy of a
+                    // stored row as a re-read.
                     self.select_latest_by_time(refresh, update, from).await?
                 } else if replaying {
                     self.except_existing_records_from(refresh, update, from)
@@ -1579,6 +1604,69 @@ impl RefreshTask {
                 self.dataset_name
             );
         })
+    }
+
+    /// Whether the refresh keeps the newest version of each key, comparing every incoming
+    /// row with its key's stored version.
+    fn keeps_newest(&self, refresh: &Refresh) -> bool {
+        refresh.versions_by_time.is_some() && self.version_ordering(refresh).is_some()
+    }
+
+    /// Warns that this append refresh reads by time instead of following the source's
+    /// commits, once for each change of reason, and counts it under its reason.
+    async fn report_append_fallback(&self, fallback: &Fallback) {
+        let repeated =
+            self.last_append_fallback.lock().replace(fallback.reason) == Some(fallback.reason);
+        let message = format!(
+            "Dataset '{}' reads new rows by time for this append refresh instead of following its source commits: {}. Rows that arrive late by more than refresh_append_overlap are not loaded by this refresh; run a full refresh to reload them.",
+            self.dataset_name, fallback.detail
+        );
+        if repeated {
+            tracing::debug!("{message}");
+        } else {
+            tracing::warn!("{message}");
+        }
+        for mut label_set in self.get_dataset_label_sets(&RefreshMode::Append).await {
+            label_set.push(KeyValue::new("reason", fallback.reason));
+            metrics::REFRESH_FALLBACKS.add(1, &label_set);
+        }
+    }
+
+    /// The source a full refresh reads, pinned to its current commit, when the
+    /// dataset's append refresh follows the source's commits; the commit is marked as
+    /// in flight. `None` reads the dataset's own provider.
+    async fn pin_full_refresh(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<Option<PinnedRead>, RetryError<super::Error>> {
+        let Some(store) = &self.append_cursor_store else {
+            return Ok(None);
+        };
+        if refresh.time_column.is_none() || refresh.override_sql_raw.is_some() {
+            return Ok(None);
+        }
+        let federated_provider = self.federated.table_provider().await;
+        let Some(source) = incremental_append_source(federated_provider.as_ref()) else {
+            return Ok(None);
+        };
+        let pinned = source.pin_current().await.map_err(|source| {
+            RetryError::transient(super::Error::FailedToRefreshDataset { source })
+        })?;
+        match &pinned {
+            Some(read) => {
+                let _ = self.save_pending_cursor(store, &read.cursor).await;
+            }
+            // Nothing to pin: the next append refresh starts without a cursor.
+            None => {
+                if let Err(e) = store.clear().await {
+                    tracing::debug!(
+                        "Dataset '{}' could not clear its append cursor: {e}",
+                        self.dataset_name
+                    );
+                }
+            }
+        }
+        Ok(pinned)
     }
 
     /// Saves the commit an append refresh just loaded. A save that fails only costs

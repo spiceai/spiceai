@@ -66,6 +66,36 @@ impl std::fmt::Display for SeedMark {
     }
 }
 
+/// How the refresh can take in a commit that rewrote stored rows (an Iceberg
+/// `overwrite`): its new files hold copies of rows the acceleration already has, beside
+/// new and changed rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewrittenRows {
+    /// Keep-newest compares every incoming row with its key's stored version, so a copy
+    /// changes nothing and the commit's files are read like any other.
+    KeepNewest,
+    /// Nothing tells a copy from a new row, so a refresh that meets such a commit reads
+    /// by time.
+    ReadByTime,
+}
+
+/// The source pinned to one commit, and the cursor naming that commit.
+#[derive(Debug, Clone)]
+pub struct PinnedRead {
+    pub cursor: String,
+    pub provider: Arc<dyn TableProvider>,
+}
+
+/// Why a refresh with a cursor reads by time instead of following the source's commits.
+#[derive(Debug, Clone)]
+pub struct Fallback {
+    /// A short stable code: the `reason` label of the fallback metric, and what decides
+    /// whether the warning repeats.
+    pub reason: &'static str,
+    /// What the source found, for the log.
+    pub detail: String,
+}
+
 /// The read of the rows the source's commits added since the saved cursor.
 #[derive(Debug, Clone)]
 pub struct AddedRowsRead {
@@ -94,18 +124,18 @@ pub struct AddedRowsRead {
 pub enum AppendPlan {
     /// The source is at the saved cursor: nothing to read.
     Unchanged,
-    /// Read the source as the append refresh does by time, then save `cursor`. `cursor`
-    /// and `source` are `None` when the source has no commit to pin or save.
+    /// Read the source as the append refresh does by time, then save the pinned
+    /// cursor. `pinned` is `None` when the source has no commit to pin or save.
     ///
     /// `fallback` is `None` on the first refresh, which has no cursor to follow. It
-    /// names the reason when the source has a cursor it cannot follow: a commit that
-    /// removed rows, an expired or rolled-back cursor, a replaced table. That read is
-    /// the refresh the dataset would have run without the cursor, so it misses what
-    /// the time window misses, and the reason is reported to the user.
+    /// names the reason when the source has a cursor it cannot follow: an expired or
+    /// rolled-back cursor, a replaced table, a commit that rewrote rows of a dataset
+    /// without a primary key. That read is the refresh the dataset would have run
+    /// without the cursor, so it misses what the time window misses, and the reason is
+    /// reported to the user.
     TimeFiltered {
-        cursor: Option<String>,
-        source: Option<Arc<dyn TableProvider>>,
-        fallback: Option<String>,
+        pinned: Option<PinnedRead>,
+        fallback: Option<Fallback>,
     },
     /// Read the rows the commits since the cursor added.
     AddedRows(AddedRowsRead),
@@ -115,9 +145,9 @@ pub enum AppendPlan {
 #[async_trait]
 pub trait IncrementalAppendSource: Send + Sync {
     /// Decides what the append refresh of `dataset` reads, given the cursor the refresh
-    /// last saved (`None` on the first refresh, or after the acceleration was rebuilt)
-    /// and the dataset's time column. A cursor this source cannot read is treated as
-    /// none.
+    /// last saved (`None` on the first refresh, or after the acceleration was rebuilt),
+    /// the dataset's time column, and how the refresh can take in rewritten rows. A
+    /// cursor this source cannot read is treated as none.
     ///
     /// Reads the source's metadata only; the plan's providers read the data.
     async fn plan_append(
@@ -125,7 +155,12 @@ pub trait IncrementalAppendSource: Send + Sync {
         dataset: &str,
         saved_cursor: Option<&str>,
         time_column: Option<&TimeColumn>,
+        rewritten_rows: RewrittenRows,
     ) -> DFResult<AppendPlan>;
+
+    /// The source pinned to its current commit, for a refresh that reads all of it;
+    /// `None` when the source has no commit.
+    async fn pin_current(&self) -> DFResult<Option<PinnedRead>>;
 }
 
 /// The [`IncrementalAppendSource`] beneath `provider`, through any layer the runtime stacked
@@ -135,7 +170,9 @@ pub trait IncrementalAppendSource: Send + Sync {
 /// Each source that implements the contract is named here, as the refresh-skip check
 /// names its providers: a `dyn TableProvider` cannot be upcast to another trait object.
 #[must_use]
-pub fn incremental_append_source(provider: &dyn TableProvider) -> Option<&dyn IncrementalAppendSource> {
+pub fn incremental_append_source(
+    provider: &dyn TableProvider,
+) -> Option<&dyn IncrementalAppendSource> {
     if let Some(iceberg) =
         find_concrete::<iceberg_datafusion::IcebergTableProvider>(provider, LayerWalk::Read)
     {

@@ -66,6 +66,7 @@ pub mod flight;
 pub mod flightsql;
 pub mod function_support;
 pub mod iceberg;
+pub mod incremental_append;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
@@ -82,7 +83,6 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_replication;
 pub mod refresh_skip;
-pub mod incremental_append;
 pub mod resilient_http;
 pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]

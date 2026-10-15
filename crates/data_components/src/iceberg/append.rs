@@ -43,11 +43,11 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::future::try_join_all;
-use iceberg::scan::FileScanTask;
+use iceberg::scan::{FileScanTask, FileScanTaskDeleteFile};
 use iceberg::spec::{
     DataContentType, Datum, ManifestContentType, ManifestEntryRef, ManifestFile, ManifestStatus,
-    NameMapping, Operation, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, Schema,
-    SnapshotRef, TableMetadata,
+    NameMapping, Operation, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, Schema, SnapshotRef,
+    TableMetadata,
 };
 use iceberg::table::Table;
 use iceberg_datafusion::IcebergTableProvider;
@@ -58,7 +58,8 @@ use snafu::{ResultExt, Snafu};
 use util::timestamp_filter::TimestampFormat;
 
 use crate::incremental_append::{
-    AddedRowsRead, AppendPlan, SeedMark, IncrementalAppendSource, TimeColumn,
+    AddedRowsRead, AppendPlan, Fallback, IncrementalAppendSource, PinnedRead, RewrittenRows,
+    SeedMark, TimeColumn,
 };
 
 #[derive(Debug, Snafu)]
@@ -66,7 +67,8 @@ pub enum Error {
     #[snafu(display("Failed to load Iceberg table '{table}': {source}"))]
     LoadTable {
         table: String,
-        source: iceberg::Error,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
     },
 
     #[snafu(display(
@@ -75,7 +77,8 @@ pub enum Error {
     ManifestList {
         table: String,
         snapshot_id: i64,
-        source: iceberg::Error,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
     },
 
     #[snafu(display(
@@ -85,7 +88,8 @@ pub enum Error {
         table: String,
         snapshot_id: i64,
         path: String,
-        source: iceberg::Error,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
     },
 
     #[snafu(display("The saved Iceberg append cursor cannot be read: {source}"))]
@@ -164,14 +168,38 @@ impl AppendCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FallbackReason {
     /// The table was dropped and recreated under the same name.
-    TableReplaced { saved_uuid: String, current_uuid: String },
-    /// The saved snapshot is no longer an ancestor of the current one: it expired,
-    /// the table was rolled back, or the branch changed.
+    TableReplaced {
+        saved_uuid: String,
+        current_uuid: String,
+    },
+    /// The saved snapshot is no longer an ancestor of the current one: a snapshot
+    /// between them expired, the table was rolled back, or the branch changed.
     SnapshotNotAncestor { saved: i64, current: i64 },
     /// The table has no snapshot at all any more.
     TableHasNoSnapshot { saved: i64 },
-    /// A snapshot since the saved one deleted or overwrote rows.
-    RowsRemoved { saved: i64, walked: WalkedSnapshots },
+    /// A snapshot since the saved one rewrote rows, and the dataset has no primary key
+    /// to tell a rewritten copy from a new row.
+    RowsRewritten { saved: i64, walked: WalkedSnapshots },
+}
+
+impl FallbackReason {
+    /// The `reason` label of the fallback metric.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::TableReplaced { .. } => "table_replaced",
+            Self::SnapshotNotAncestor { .. } => "snapshot_not_ancestor",
+            Self::TableHasNoSnapshot { .. } => "table_has_no_snapshot",
+            Self::RowsRewritten { .. } => "rows_rewritten_without_primary_key",
+        }
+    }
+
+    fn into_fallback(self) -> Fallback {
+        Fallback {
+            reason: self.code(),
+            detail: self.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for FallbackReason {
@@ -186,15 +214,15 @@ impl std::fmt::Display for FallbackReason {
             ),
             Self::SnapshotNotAncestor { saved, current } => write!(
                 f,
-                "the last loaded Iceberg snapshot {saved} is no longer an ancestor of the current snapshot {current} (expired, rolled back, or on another branch), so rows removed at the source stay in the acceleration"
+                "the last loaded Iceberg snapshot {saved} is no longer an ancestor of the current snapshot {current} (a snapshot between them expired, the table was rolled back, or it is on another branch), so rows removed at the source stay in the acceleration"
             ),
             Self::TableHasNoSnapshot { saved } => write!(
                 f,
                 "the Iceberg table has no snapshot any more (the last loaded one was {saved}), so its rows stay in the acceleration"
             ),
-            Self::RowsRemoved { saved, walked } => write!(
+            Self::RowsRewritten { saved, walked } => write!(
                 f,
-                "{walked} since the last loaded Iceberg snapshot {saved}, and a snapshot deleted or overwrote rows, which an append refresh does not remove"
+                "{walked} since the last loaded Iceberg snapshot {saved}, and an overwrite rewrote rows, which a dataset without a primary key cannot tell from new rows"
             ),
         }
     }
@@ -214,20 +242,13 @@ impl WalkedSnapshots {
     pub fn total(self) -> usize {
         self.append + self.replace + self.delete + self.overwrite
     }
-
-    /// Whether any snapshot removed rows, which the snapshot-following read cannot
-    /// represent.
-    #[must_use]
-    pub fn has_mutation(self) -> bool {
-        self.delete + self.overwrite > 0
-    }
 }
 
 impl std::fmt::Display for WalkedSnapshots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} snapshot(s): {} append, {} replace, {} delete, {} overwrite",
+            "{} new Iceberg snapshot(s) ({} append, {} replace, {} delete, {} overwrite)",
             self.total(),
             self.append,
             self.replace,
@@ -237,12 +258,16 @@ impl std::fmt::Display for WalkedSnapshots {
     }
 }
 
-/// A data file an `append` snapshot in the interval added, with the partition spec its
-/// manifest was written under.
+/// A data file a snapshot in the interval added, with the partition spec its manifest
+/// was written under and the position deletes that same snapshot added.
 #[derive(Debug, Clone)]
 pub struct AddedFile {
     pub entry: ManifestEntryRef,
     pub partition_spec: PartitionSpecRef,
+    /// Empty for a file an `append` added. For a file an overwrite added, the position
+    /// deletes (and deletion vectors) of that commit: a row it wrote and deleted in one
+    /// commit was never in the table. The reader applies each to the file it names.
+    pub deletes: Arc<Vec<FileScanTaskDeleteFile>>,
 }
 
 fn pinned(provider: &IcebergTableProvider, snapshot_id: i64) -> Arc<dyn TableProvider> {
@@ -256,6 +281,7 @@ impl IncrementalAppendSource for IcebergTableProvider {
         dataset: &str,
         saved_cursor: Option<&str>,
         time_column: Option<&TimeColumn>,
+        rewritten_rows: RewrittenRows,
     ) -> DFResult<AppendPlan> {
         let cursor = saved_cursor.and_then(|json| match AppendCursor::from_json(json) {
             Ok(cursor) => Some(cursor),
@@ -266,20 +292,56 @@ impl IncrementalAppendSource for IcebergTableProvider {
                 None
             }
         });
-        plan_append(dataset, self, cursor.as_ref(), time_column)
+        plan_append(dataset, self, cursor.as_ref(), time_column, rewritten_rows)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
+
+    async fn pin_current(&self) -> DFResult<Option<PinnedRead>> {
+        let table = load_table(self)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(pinned_read(
+            self,
+            &table,
+            table.metadata().current_snapshot_id(),
+        ))
+    }
+}
+
+async fn load_table(provider: &IcebergTableProvider) -> Result<Table> {
+    let ident = provider.table_ident();
+    provider
+        .catalog()
+        .load_table(ident)
+        .await
+        .with_context(|_| LoadTableSnafu {
+            table: ident.to_string(),
+        })
+}
+
+/// `provider` pinned to `snapshot_id` of `table`, and the cursor naming it.
+fn pinned_read(
+    provider: &IcebergTableProvider,
+    table: &Table,
+    snapshot_id: Option<i64>,
+) -> Option<PinnedRead> {
+    let snapshot_id = snapshot_id?;
+    Some(PinnedRead {
+        cursor: AppendCursor {
+            table_uuid: table.metadata().uuid().to_string(),
+            snapshot_id,
+        }
+        .to_json(),
+        provider: pinned(provider, snapshot_id),
+    })
 }
 
 /// Decides what the append refresh of `dataset` reads.
 ///
 /// Loads the table from its catalog once (no data is read), finds the snapshots
 /// between the saved cursor and the current snapshot by walking parent pointers, and
-/// classifies each from the manifests it added: a snapshot whose summary says
-/// `replace` is skipped (a compaction changes no row); one that added delete files
-/// or `DELETED` entries removed rows, whatever its summary says; the rest added the
-/// `ADDED` data entries of their manifests.
+/// classifies each from the manifests it added (see [`classify_interval`]).
 ///
 /// # Errors
 ///
@@ -289,36 +351,19 @@ pub async fn plan_append(
     provider: &IcebergTableProvider,
     cursor: Option<&AppendCursor>,
     time_column: Option<&TimeColumn>,
+    rewritten_rows: RewrittenRows,
 ) -> Result<AppendPlan> {
-    let ident = provider.table_ident();
-    let table = provider
-        .catalog()
-        .load_table(ident)
-        .await
-        .with_context(|_| LoadTableSnafu {
-            table: ident.to_string(),
-        })?;
+    let table = load_table(provider).await?;
     let metadata = table.metadata();
     let table_uuid = metadata.uuid().to_string();
     let current = metadata.current_snapshot_id();
-    let cursor_at = |snapshot_id: Option<i64>| {
-        snapshot_id.map(|snapshot_id| {
-            AppendCursor {
-                table_uuid: table_uuid.clone(),
-                snapshot_id,
-            }
-            .to_json()
-        })
-    };
-    let source_at = |snapshot_id: Option<i64>| snapshot_id.map(|id| pinned(provider, id));
 
     let Some(saved) = cursor else {
         tracing::debug!(
             "Dataset '{dataset}' has no Iceberg append cursor; its append refresh reads the table by time as of snapshot {current:?} and saves it"
         );
         return Ok(AppendPlan::TimeFiltered {
-            cursor: cursor_at(current),
-            source: source_at(current),
+            pinned: pinned_read(provider, &table, current),
             fallback: None,
         });
     };
@@ -326,9 +371,8 @@ pub async fn plan_append(
     // A cursor the planner cannot follow: the refresh reads by time once, as it would
     // without a cursor, and follows snapshots again from the current one.
     let fall_back = |reason: FallbackReason| AppendPlan::TimeFiltered {
-        cursor: cursor_at(current),
-        source: source_at(current),
-        fallback: Some(reason.to_string()),
+        pinned: pinned_read(provider, &table, current),
+        fallback: Some(reason.into_fallback()),
     };
 
     if saved.table_uuid != table_uuid {
@@ -358,26 +402,27 @@ pub async fn plan_append(
         }));
     };
 
+    let (walked, added) = match classify_interval(&table, &interval, rewritten_rows).await? {
+        Interval::Added { walked, files } => (walked, files),
+        Interval::Rewritten { walked } => {
+            return Ok(fall_back(FallbackReason::RowsRewritten {
+                saved: saved.snapshot_id,
+                walked,
+            }));
+        }
+    };
+
     let cursor = AppendCursor {
         table_uuid: table_uuid.clone(),
         snapshot_id: current,
     }
     .to_json();
-    let (walked, added) = classify_interval(&table, &interval).await?;
-
-    if walked.has_mutation() {
-        return Ok(fall_back(FallbackReason::RowsRemoved {
-            saved: saved.snapshot_id,
-            walked,
-        }));
-    }
-
     let seed = time_column.map(|time| seed_mark(&added, time, metadata.current_schema()));
     let name_mapping = metadata
         .table_properties()
         .default_name_mapping()
         .with_context(|_| LoadTableSnafu {
-            table: ident.to_string(),
+            table: provider.table_ident().to_string(),
         })?
         .map(Arc::new);
     let reader = AddedFilesProvider {
@@ -387,11 +432,14 @@ pub async fn plan_append(
         files: added,
         name_mapping,
     };
-    tracing::debug!(
-        "Dataset '{dataset}' has {walked} since Iceberg snapshot {}; its append refresh reads the {} data file(s) ({} row(s)) they added, pinned to snapshot {current}, comparing stored rows from {}",
+    tracing::info!(
+        "Dataset '{dataset}' follows {walked} since snapshot {}: reading {} data file(s) ({} row(s))",
         saved.snapshot_id,
         reader.files.len(),
         reader.record_count(),
+    );
+    tracing::debug!(
+        "Dataset '{dataset}' reads the added files pinned to Iceberg snapshot {current}, comparing stored rows from {}",
         seed.map_or_else(|| "no time column".to_string(), |seed| seed.to_string())
     );
     Ok(AppendPlan::AddedRows(AddedRowsRead {
@@ -438,136 +486,209 @@ pub fn snapshots_between(
     None
 }
 
-/// Classifies every snapshot of `interval` and collects the data files the `append`
-/// snapshots added.
+/// What [`classify_interval`] found.
+enum Interval {
+    /// The data files to read.
+    Added {
+        walked: WalkedSnapshots,
+        files: Vec<AddedFile>,
+    },
+    /// A snapshot rewrote rows that the refresh cannot tell from new ones.
+    Rewritten { walked: WalkedSnapshots },
+}
+
+/// What one snapshot's manifests show.
+#[derive(Default)]
+struct SnapshotFiles {
+    added: Vec<AddedFile>,
+    /// It removed a data file or added a delete file.
+    removed_rows: bool,
+    position_deletes: Vec<FileScanTaskDeleteFile>,
+}
+
+/// Classifies every snapshot of `interval` from the manifests it added, and collects
+/// the data files the refresh reads. Each snapshot is decided on its own, so a commit
+/// that cannot be read as added rows does not hide the appends around it:
 ///
-/// Two passes, so an interval that falls back costs only its manifest lists: the lists
-/// alone show a delete manifest or a manifest that removed files, and only a pure-append
-/// interval has its data manifests read. Each pass reads concurrently.
+/// - `replace` (by its summary) is skipped: a compaction or manifest rewrite changes no
+///   row.
+/// - A snapshot that added no data file only deleted rows, which an append refresh does
+///   not apply: skipped.
+/// - A snapshot that added data files and removed none is an append: its files are read.
+/// - A snapshot that added data files and also removed files or added delete files
+///   rewrote rows (an overwrite). Its files hold copies of stored rows beside new ones.
+///   With [`RewrittenRows::KeepNewest`] they are read with that commit's own position
+///   deletes, and keep-newest drops the copies; otherwise the interval is read by time.
+///
+/// The manifest lists are read first, and the manifests only where the lists leave the
+/// outcome open; each pass reads concurrently.
 async fn classify_interval(
     table: &Table,
     interval: &[SnapshotRef],
-) -> Result<(WalkedSnapshots, Vec<AddedFile>)> {
+    rewritten_rows: RewrittenRows,
+) -> Result<Interval> {
     let table_name = table.identifier().to_string();
     let table_name = &table_name;
     let mut walked = WalkedSnapshots::default();
 
-    let lists = try_join_all(interval.iter().map(|snapshot| async move {
-        let snapshot_id = snapshot.snapshot_id();
-        let summary_operation = snapshot.summary().operation.clone();
-        // A compaction or manifest rewrite changes no row, and reading its manifests
-        // would only show the files it moved; the summary is trusted for this one case.
-        if summary_operation == Operation::Replace {
-            return Ok((snapshot_id, summary_operation, Vec::new()));
-        }
-        let list = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .with_context(|_| ManifestListSnafu {
-                table: table_name.clone(),
-                snapshot_id,
-            })?;
-        let added: Vec<ManifestFile> = list
-            .entries()
+    let lists = try_join_all(
+        interval
             .iter()
-            .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
-            .cloned()
-            .collect();
-        Ok((snapshot_id, summary_operation, added))
-    }))
+            // A compaction or manifest rewrite changes no row, and reading its manifests
+            // would only show the files it moved; the summary is trusted for this one case.
+            .filter(|snapshot| snapshot.summary().operation != Operation::Replace)
+            .map(|snapshot| async move {
+                let snapshot_id = snapshot.snapshot_id();
+                let list = table
+                    .manifest_list_reader(snapshot)
+                    .load()
+                    .await
+                    .with_context(|_| ManifestListSnafu {
+                        table: table_name.clone(),
+                        snapshot_id,
+                    })?;
+                let added: Vec<ManifestFile> = list
+                    .entries()
+                    .iter()
+                    .filter(|manifest| manifest.added_snapshot_id == snapshot_id)
+                    .cloned()
+                    .collect();
+                Ok((snapshot_id, added))
+            }),
+    )
     .await?;
+    walked.replace = interval.len() - lists.len();
 
     let mut to_read = Vec::new();
-    for (snapshot_id, summary_operation, manifests) in lists {
-        if summary_operation == Operation::Replace {
-            walked.replace += 1;
-            continue;
-        }
-        let removed_rows = manifests.iter().any(|manifest| {
-            manifest.content == ManifestContentType::Deletes
-                || manifest.deleted_files_count.is_some_and(|count| count > 0)
+    for (snapshot_id, manifests) in lists {
+        // A manifest list without file counts (an old writer) leaves both open until
+        // the manifests are read.
+        let adds_no_data = manifests
+            .iter()
+            .filter(|m| m.content == ManifestContentType::Data)
+            .all(|m| m.added_files_count == Some(0));
+        let removes = manifests.iter().any(|m| {
+            m.content == ManifestContentType::Deletes
+                || m.deleted_files_count.is_some_and(|count| count > 0)
         });
-        if removed_rows {
-            count_mutation(&mut walked, &summary_operation);
-            continue;
+        let adds_data = manifests.iter().any(|m| {
+            m.content == ManifestContentType::Data
+                && m.added_files_count.is_some_and(|count| count > 0)
+        });
+        if adds_no_data {
+            walked.delete += 1;
+        } else if adds_data && removes && rewritten_rows == RewrittenRows::ReadByTime {
+            walked.overwrite += 1;
+            return Ok(Interval::Rewritten { walked });
+        } else {
+            to_read.push((snapshot_id, manifests));
         }
-        to_read.push((snapshot_id, summary_operation, manifests));
-    }
-    if walked.has_mutation() {
-        // The outcome is decided; the counts of the rest are still reported.
-        for (_, summary_operation, _) in to_read {
-            if summary_operation == Operation::Replace {
-                walked.replace += 1;
-            } else {
-                walked.append += 1;
-            }
-        }
-        return Ok((walked, Vec::new()));
     }
 
-    let manifests = try_join_all(to_read.iter().flat_map(|(snapshot_id, _, manifests)| {
-        manifests.iter().map(move |manifest_file| async move {
-            table
-                .manifest_reader()
-                .read(manifest_file)
-                .await
-                .map(|manifest| (*snapshot_id, manifest))
-                .with_context(|_| ManifestSnafu {
-                    table: table_name.clone(),
-                    snapshot_id: *snapshot_id,
-                    path: manifest_file.manifest_path.clone(),
-                })
-        })
-    }))
-    .await?;
+    let reads = to_read.iter().flat_map(|(snapshot_id, manifests)| {
+        manifests
+            .iter()
+            .filter(|m| {
+                // Delete manifests matter only for the position deletes an overwrite's
+                // own files are read with.
+                m.content == ManifestContentType::Data
+                    || rewritten_rows == RewrittenRows::KeepNewest
+            })
+            .map(move |manifest_file| async move {
+                table
+                    .manifest_reader()
+                    .read(manifest_file)
+                    .await
+                    .map(|manifest| (*snapshot_id, manifest_file, manifest))
+                    .with_context(|_| ManifestSnafu {
+                        table: table_name.clone(),
+                        snapshot_id: *snapshot_id,
+                        path: manifest_file.manifest_path.clone(),
+                    })
+            })
+    });
+    let manifests = try_join_all(reads).await?;
 
-    let mut mutated: HashSet<i64> = HashSet::new();
-    let mut added = Vec::new();
-    for (snapshot_id, manifest) in &manifests {
-        let partition_spec: PartitionSpecRef = Arc::new(manifest.metadata().partition_spec().clone());
+    let mut by_snapshot: std::collections::HashMap<i64, SnapshotFiles> =
+        std::collections::HashMap::new();
+    for (snapshot_id, manifest_file, manifest) in &manifests {
+        let files = by_snapshot.entry(*snapshot_id).or_default();
+        if manifest_file.content == ManifestContentType::Deletes {
+            files.removed_rows = true;
+        }
+        let partition_spec: PartitionSpecRef =
+            Arc::new(manifest.metadata().partition_spec().clone());
         for entry in manifest.entries() {
-            match entry.status() {
-                // A manifest list without file counts (an old writer) shows a removed
-                // file only here.
-                ManifestStatus::Deleted => {
-                    mutated.insert(*snapshot_id);
-                }
-                ManifestStatus::Added
-                    if entry.content_type() == DataContentType::Data
-                        && entry.record_count() > 0 =>
-                {
-                    added.push(AddedFile {
+            match (entry.status(), entry.content_type()) {
+                // A manifest list without file counts shows a removed file only here.
+                (ManifestStatus::Deleted, _) => files.removed_rows = true,
+                (ManifestStatus::Added, DataContentType::Data) if entry.record_count() > 0 => {
+                    files.added.push(AddedFile {
                         entry: Arc::clone(entry),
                         partition_spec: Arc::clone(&partition_spec),
+                        deletes: Arc::default(),
                     });
+                }
+                (ManifestStatus::Added, DataContentType::PositionDeletes) => {
+                    files.removed_rows = true;
+                    files
+                        .position_deletes
+                        .push(delete_file(entry, manifest_file.partition_spec_id));
+                }
+                (ManifestStatus::Added, DataContentType::EqualityDeletes) => {
+                    // An equality delete applies only to data files of a lower sequence
+                    // number, so never to the files its own commit added.
+                    files.removed_rows = true;
                 }
                 // An existing entry was carried over from an older manifest, and an
                 // empty file holds nothing to read.
-                ManifestStatus::Added | ManifestStatus::Existing => {}
+                (ManifestStatus::Added | ManifestStatus::Existing, _) => {}
             }
         }
     }
-    for (snapshot_id, summary_operation, _) in &to_read {
-        if mutated.contains(snapshot_id) {
-            count_mutation(&mut walked, summary_operation);
+
+    let mut added = Vec::new();
+    for (snapshot_id, _) in &to_read {
+        let files = by_snapshot.remove(snapshot_id).unwrap_or_default();
+        if files.added.is_empty() {
+            walked.delete += 1;
+        } else if files.removed_rows {
+            walked.overwrite += 1;
+            if rewritten_rows == RewrittenRows::ReadByTime {
+                return Ok(Interval::Rewritten { walked });
+            }
+            let deletes = Arc::new(files.position_deletes);
+            added.extend(files.added.into_iter().map(|file| AddedFile {
+                deletes: Arc::clone(&deletes),
+                ..file
+            }));
         } else {
             walked.append += 1;
+            added.extend(files.added);
         }
     }
-    if walked.has_mutation() {
-        return Ok((walked, Vec::new()));
-    }
-    Ok((walked, added))
+    Ok(Interval::Added {
+        walked,
+        files: added,
+    })
 }
 
-/// Counts a snapshot that removed rows as its own summary says when that is `delete`,
-/// else as `overwrite`, since its manifests show rows removed and added.
-fn count_mutation(walked: &mut WalkedSnapshots, summary: &Operation) {
-    match summary {
-        Operation::Delete => walked.delete += 1,
-        Operation::Overwrite | Operation::Append | Operation::Replace => walked.overwrite += 1,
-    }
+/// The scan-task form of the position delete file (or deletion vector) `entry`.
+fn delete_file(entry: &ManifestEntryRef, partition_spec_id: i32) -> FileScanTaskDeleteFile {
+    let data_file = entry.data_file();
+    FileScanTaskDeleteFile::builder()
+        .with_file_path(entry.file_path().to_string())
+        .with_file_size_in_bytes(entry.file_size_in_bytes())
+        .with_file_type(entry.content_type())
+        .with_file_format(entry.file_format())
+        .with_partition_spec_id(partition_spec_id)
+        .with_equality_ids(data_file.equality_ids())
+        .with_referenced_data_file(data_file.referenced_data_file())
+        .with_content_offset(data_file.content_offset())
+        .with_content_size_in_bytes(data_file.content_size_in_bytes())
+        .with_record_count(Some(entry.record_count()))
+        .with_key_metadata(data_file.key_metadata().map(Box::from))
+        .build()
 }
 
 /// Where keep-newest or the exact-row dedupe starts reading stored rows for `files`.
@@ -634,24 +755,28 @@ fn bound_nanos(bound: &Datum, format: &TimestampFormat) -> Option<u128> {
         (PrimitiveType::Date, PrimitiveLiteral::Int(days), _) => {
             scaled(i64::from(*days), 86_400_000_000_000)
         }
-        (PrimitiveType::Long, PrimitiveLiteral::Long(value), TimestampFormat::UnixTimestamp { scale }) => {
-            scaled(*value, *scale)
-        }
-        (PrimitiveType::Int, PrimitiveLiteral::Int(value), TimestampFormat::UnixTimestamp { scale }) => {
-            scaled(i64::from(*value), *scale)
-        }
+        (
+            PrimitiveType::Long,
+            PrimitiveLiteral::Long(value),
+            TimestampFormat::UnixTimestamp { scale },
+        ) => scaled(*value, *scale),
+        (
+            PrimitiveType::Int,
+            PrimitiveLiteral::Int(value),
+            TimestampFormat::UnixTimestamp { scale },
+        ) => scaled(i64::from(*value), *scale),
         _ => None,
     }
 }
 
-/// Reads the data files the interval's `append` snapshots added, each as of the
-/// snapshot that added it.
+/// Reads the data files the interval's snapshots added, each as of the snapshot that
+/// added it.
 ///
 /// The scan tasks are built from the manifest entries the planner already read, so a
 /// later `replace` (compaction) that removed those files from the current snapshot does
 /// not hide them: the files themselves stay on storage until the snapshot that added
-/// them expires. No delete file is attached, since append refresh does not apply
-/// deletes and a pure-append interval adds none.
+/// them expires. A later commit's deletes are not applied, since append refresh does
+/// not remove rows; only an overwrite's own position deletes are (see [`AddedFile`]).
 #[derive(Debug)]
 pub struct AddedFilesProvider {
     table: Table,
@@ -718,6 +843,7 @@ impl AddedFilesProvider {
                     .with_name_mapping(self.name_mapping.clone())
                     .with_case_sensitive(true)
                     .with_key_metadata(data_file.key_metadata().map(Box::from))
+                    .with_deletes(file.deletes.as_ref().clone())
                     .build()
                     .map_err(to_datafusion_error)
             })
@@ -837,9 +963,15 @@ mod tests {
         cursor: Option<&AppendCursor>,
         time_column: Option<&TimeColumn>,
     ) -> AppendPlan {
-        plan_append(dataset, provider, cursor, time_column)
-            .await
-            .expect("plans")
+        plan_append(
+            dataset,
+            provider,
+            cursor,
+            time_column,
+            RewrittenRows::KeepNewest,
+        )
+        .await
+        .expect("plans")
     }
 
     fn cursor_of(json: &str) -> AppendCursor {
@@ -953,8 +1085,7 @@ mod tests {
             matches!(
                 plan,
                 AppendPlan::TimeFiltered {
-                    cursor: None,
-                    source: None,
+                    pinned: None,
                     fallback: None
                 }
             ),
@@ -964,14 +1095,13 @@ mod tests {
         let first = append(&catalog, &ident, &[(1, 0)]).await;
         let plan = plan_for("events", &provider, None, Some(&temporal("ts"))).await;
         let AppendPlan::TimeFiltered {
-            cursor: Some(cursor),
-            source: Some(_),
+            pinned: Some(pinned),
             fallback: None,
         } = plan
         else {
             panic!("no cursor reads the table as today and saves the current snapshot: {plan:?}");
         };
-        let cursor = cursor_of(&cursor);
+        let cursor = cursor_of(&pinned.cursor);
         assert_eq!(cursor.snapshot_id, first);
         assert_eq!(cursor.table_uuid, table_uuid(&catalog, &ident).await);
     }
@@ -1018,9 +1148,15 @@ mod tests {
         assert!(!read.is_empty);
         let table = catalog.load_table(&ident).await.expect("table loads");
         let interval = snapshots_between(table.metadata(), first, third).expect("an interval");
-        let (walked, added) = classify_interval(&table, &interval)
+        let Interval::Added {
+            walked,
+            files: added,
+        } = classify_interval(&table, &interval, RewrittenRows::KeepNewest)
             .await
-            .expect("the interval classifies");
+            .expect("the interval classifies")
+        else {
+            panic!("a pure-append interval is read from its files");
+        };
         assert_eq!(
             walked,
             WalkedSnapshots {
@@ -1111,17 +1247,20 @@ mod tests {
         };
         let plan = plan_for("events", &provider, Some(&replaced), Some(&temporal("ts"))).await;
         let AppendPlan::TimeFiltered {
-            cursor,
-            source: Some(_),
+            pinned: Some(pinned),
             fallback: Some(reason),
         } = plan
         else {
             panic!("a UUID the table does not have means it was recreated: {plan:?}");
         };
-        let cursor = cursor_of(&cursor.expect("the current snapshot is the cursor"));
-        assert_eq!((cursor.snapshot_id, cursor.table_uuid), (first, uuid.clone()));
+        let cursor = cursor_of(&pinned.cursor);
         assert_eq!(
-            reason,
+            (cursor.snapshot_id, cursor.table_uuid),
+            (first, uuid.clone())
+        );
+        assert_eq!(reason.reason, "table_replaced");
+        assert_eq!(
+            reason.detail,
             format!(
                 "the Iceberg table was replaced (its UUID changed from 00000000-0000-0000-0000-000000000000 to {uuid}), so rows of the old table stay in the acceleration"
             )
@@ -1139,10 +1278,11 @@ mod tests {
         else {
             panic!("a saved snapshot the walk from the current one never meets: {plan:?}");
         };
+        assert_eq!(reason.reason, "snapshot_not_ancestor");
         assert_eq!(
-            reason,
+            reason.detail,
             format!(
-                "the last loaded Iceberg snapshot {} is no longer an ancestor of the current snapshot {first} (expired, rolled back, or on another branch), so rows removed at the source stay in the acceleration",
+                "the last loaded Iceberg snapshot {} is no longer an ancestor of the current snapshot {first} (a snapshot between them expired, the table was rolled back, or it is on another branch), so rows removed at the source stay in the acceleration",
                 first + 1
             )
         );
@@ -1259,8 +1399,8 @@ mod tests {
             "The saved append cursor was written for source 'delta' version 1, not for an Iceberg table"
         );
         let newer = r#"{"version":2,"source":"iceberg","table_uuid":"x","snapshot_id":1}"#;
-        assert!(AppendCursor::from_json(newer).is_err());
-        assert!(AppendCursor::from_json("not json").is_err());
+        AppendCursor::from_json(newer).expect_err("a newer layout");
+        AppendCursor::from_json("not json").expect_err("not a cursor");
     }
 
     #[test]
@@ -1273,8 +1413,7 @@ mod tests {
         };
         assert_eq!(
             walked.to_string(),
-            "5 snapshot(s): 3 append, 1 replace, 0 delete, 1 overwrite"
+            "5 new Iceberg snapshot(s) (3 append, 1 replace, 0 delete, 1 overwrite)"
         );
-        assert!(walked.has_mutation());
     }
 }
