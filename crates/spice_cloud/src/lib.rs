@@ -404,6 +404,7 @@ pub async fn create_synced_internal_accelerated_table(
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
+    builder.node_local();
 
     let accelerated_table = builder
         .build()
