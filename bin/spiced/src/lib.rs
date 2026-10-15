@@ -1085,9 +1085,6 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         if let Some(h) = df.cpu_runtime() {
             tokio_handles.push(("cpu", h.clone()));
         }
-        if let Some(h) = df.interactive_runtime() {
-            tokio_handles.push(("interactive", h.clone()));
-        }
         if let Some(h) = df.refresh_runtime() {
             tokio_handles.push(("refresh", h.clone()));
         }
