@@ -803,6 +803,7 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
+        .with_query_error_logging(query.log_errors)
         .with_output_preview(output_preview)
         .with_caching(caching)
         .with_results_cache_warmup_enabled(results_cache_warmup_enabled)

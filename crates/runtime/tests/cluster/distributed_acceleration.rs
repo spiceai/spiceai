@@ -384,6 +384,92 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
         .await
 }
 
+/// The only executor may hold one partition, so the scheduler leaves the others unassigned.
+/// A query on the table must fail: the scheduler holds none of the data, and an answer from
+/// the assigned partition alone would be wrong.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn query_fails_when_a_partition_has_no_ready_executor() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=info,warn"))
+        .with_ansi(true)
+        .try_init();
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+    let state_tempdir = tempfile::tempdir().expect("state tempdir");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let app = AppBuilder::new("partition_without_executor")
+                .with_dataset(make_memory_accelerated_dataset(
+                    format!("file://{}", csv_path.display()),
+                    "test_data",
+                    3,
+                    "id",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(SchedulerConfig {
+                        state_location: Some(format!(
+                            "file://{}",
+                            state_tempdir.path().display()
+                        )),
+                        params: None,
+                        partition_assignment_interval: "1s".to_string(),
+                        max_partition_assignments_per_interval:
+                            spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+                        max_partitions_per_executor: 1,
+                        partition_discovery_timeout:
+                            spicepod::component::runtime::default_partition_discovery_timeout(),
+                    }),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            let start = std::time::Instant::now();
+            while harness
+                .partition_owner_counts("test_data")
+                .values()
+                .sum::<usize>()
+                == 0
+            {
+                if start.elapsed() > Duration::from_mins(1) {
+                    anyhow::bail!("the scheduler assigned no partition of test_data");
+                }
+                sleep(Duration::from_millis(200)).await;
+            }
+
+            let result = harness
+                .query("SELECT COUNT(*) AS cnt FROM test_data")
+                .await;
+            harness.shutdown().await;
+
+            match result {
+                Ok(batches) => anyhow::bail!(
+                    "the query should fail while partitions of test_data have no executor, but returned:\n{}",
+                    arrow::util::pretty::pretty_format_batches(&batches)?
+                ),
+                Err(error) => assert!(
+                    error.to_string().contains("no ready executor serves"),
+                    "unexpected error: {error}"
+                ),
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// Test that 2 executors with `bucket(4, id)` partitioning produce correct query results.
 ///
 /// Verifies:
