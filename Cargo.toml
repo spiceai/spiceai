@@ -355,11 +355,13 @@ opendal = { version = "0.58", default-features = false, features = ["services-s3
 # Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
 orc-rust = { version = "0.9.0", default-features = false, features = ["async"] }
 opentelemetry = { version = "0.32", default-features = false, features = [
+    "logs",
     "metrics",
     "trace",
 ] }
 opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "logs",
     "metrics",
     "grpc-tonic",
     "http-proto",
@@ -370,9 +372,11 @@ opentelemetry-zipkin = { version = "0.32", default-features = false, features = 
     "reqwest-client",
 ] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+    "logs",
     "metrics",
     "rt-tokio",
     "trace",
+    "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
     "experimental_metrics_periodicreader_with_async_runtime",
     "experimental_metrics_custom_reader",
