@@ -46,7 +46,8 @@ pub use cluster_state::{
 };
 pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::{
-    ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,
+    ExecutorRegistration, ExecutorRegistry, FederatedPartitionProvider, Registered,
+    RegisteredHandles, TablePartitions,
 };
 pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,

@@ -176,7 +176,8 @@ impl MetadataFileCatalog {
 }
 
 /// Finds a table's current metadata file, in the directory of the version hint
-/// `hint` (a full URL the `file_io` can read): the file the hint names, or, when
+/// `hint` (a full URL the `file_io` can read): the file the hint names (for a
+/// version number, the newest consecutive version from it), or, when
 /// `listing` is given and the hint does not exist, the listed file with the highest
 /// version number (`v<N>.metadata.json` or `<N>-<uuid>.metadata.json`). Files that
 /// share the highest version, as a failed commit can leave behind, are told apart
@@ -208,6 +209,11 @@ pub async fn find_current_metadata(
 /// The metadata file the version hint names. The hint holds a version (`3`, for
 /// `v3.metadata.json`) or a file name stem (`00003-8f2c`, for
 /// `00003-8f2c.metadata.json`).
+///
+/// A version is where the search starts: a Hadoop table commits version `N+1` by
+/// creating its metadata file and only then updates the hint, best-effort, so the
+/// hint can name an older version than the current one. As in Iceberg's Hadoop
+/// tables, the newest of the consecutive versions from the hinted one is read.
 async fn metadata_named_by(file_io: &FileIO, hint: &str, directory: &str) -> Result<String> {
     let content = file_io.new_input(hint)?.read().await?;
     let version = std::str::from_utf8(&content)
@@ -225,32 +231,67 @@ async fn metadata_named_by(file_io: &FileIO, hint: &str, directory: &str) -> Res
         ));
     }
 
-    let stems = if version.bytes().all(|b| b.is_ascii_digit()) {
+    let numbered = version.bytes().all(|b| b.is_ascii_digit());
+    let stems = if numbered {
         vec![format!("v{version}"), version.to_string()]
     } else {
         vec![version.to_string()]
     };
-    let candidates: Vec<String> = stems
-        .iter()
-        .flat_map(|stem| {
-            METADATA_SUFFIXES
-                .iter()
-                .map(move |suffix| format!("{stem}{suffix}"))
-        })
-        .collect();
-    for name in &candidates {
-        let location = format!("{directory}/{name}");
-        if file_io.exists(&location).await? {
-            return Ok(location);
+    let Some((matched, mut location)) = existing_metadata_file(file_io, directory, &stems).await?
+    else {
+        let candidates: Vec<String> = stems
+            .iter()
+            .flat_map(|stem| {
+                METADATA_SUFFIXES
+                    .iter()
+                    .map(move |suffix| format!("{stem}{suffix}"))
+            })
+            .collect();
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "The version hint '{hint}' names version '{version}', but none of {} exists in '{directory}/'",
+                candidates.join(", ")
+            ),
+        ));
+    };
+    if !numbered {
+        return Ok(location);
+    }
+    let Ok(mut version) = version.parse::<u64>() else {
+        return Ok(location);
+    };
+
+    // Later versions are named the way the hinted one is: `v<N>` or `<N>`.
+    let prefix = if matched == 0 { "v" } else { "" };
+    while let Some(next) = version.checked_add(1) {
+        let stems = [format!("{prefix}{next}")];
+        let Some((_, next_location)) = existing_metadata_file(file_io, directory, &stems).await?
+        else {
+            break;
+        };
+        location = next_location;
+        version = next;
+    }
+    Ok(location)
+}
+
+/// The first of `stems`, with any metadata file suffix, that exists in `directory`:
+/// its index in `stems` and its location.
+async fn existing_metadata_file(
+    file_io: &FileIO,
+    directory: &str,
+    stems: &[String],
+) -> Result<Option<(usize, String)>> {
+    for (index, stem) in stems.iter().enumerate() {
+        for suffix in METADATA_SUFFIXES {
+            let location = format!("{directory}/{stem}{suffix}");
+            if file_io.exists(&location).await? {
+                return Ok(Some((index, location)));
+            }
         }
     }
-    Err(Error::new(
-        ErrorKind::DataInvalid,
-        format!(
-            "The version hint '{hint}' names version '{version}', but none of {} exists in '{directory}/'",
-            candidates.join(", ")
-        ),
-    ))
+    Ok(None)
 }
 
 async fn newest_metadata_file(
@@ -311,11 +352,15 @@ const METADATA_SUFFIXES: [&str; 3] = [".gz.metadata.json", ".metadata.json.gz", 
 /// The version number of a metadata file named `v<N>.metadata.json` or
 /// `<N>-<uuid>.metadata.json`, plain or gzip-compressed (`.gz.metadata.json`, or
 /// the older `.metadata.json.gz`). Leading zeros are padding. Any other file name
-/// has no version.
+/// has no version, `<uuid>.metadata.json` included: a Hadoop writer writes metadata
+/// under that name before it commits it as `v<N>.metadata.json`.
 fn metadata_version(file_name: &str) -> Option<u64> {
     let stem = METADATA_SUFFIXES
         .into_iter()
         .find_map(|suffix| file_name.strip_suffix(suffix))?;
+    if uuid::Uuid::try_parse(stem).is_ok() {
+        return None;
+    }
     let stem = stem.strip_prefix('v').unwrap_or(stem);
     let digits_end = stem
         .find(|c: char| !c.is_ascii_digit())
@@ -927,12 +972,29 @@ mod tests {
             ("v.metadata.json", None),
             ("3a.metadata.json", None),
             ("metadata.json", None),
+            // A Hadoop writer's uncommitted metadata, whose UUID starts with digits.
+            ("12345678-abcd-4abc-8abc-123456789abc.metadata.json", None),
+            (
+                "12345678-abcd-4abc-8abc-123456789abc.gz.metadata.json",
+                None,
+            ),
+            (
+                "00012-12345678-abcd-4abc-8abc-123456789abc.metadata.json",
+                Some(12),
+            ),
         ] {
             assert_eq!(metadata_version(name), version, "{name}");
         }
         assert_eq!(
             newest_metadata_names(["v9.metadata.json", "v10.metadata.json", "v2.metadata.json"]),
             Some(vec!["v10.metadata.json"])
+        );
+        assert_eq!(
+            newest_metadata_names([
+                "v3.metadata.json",
+                "12345678-abcd-4abc-8abc-123456789abc.metadata.json"
+            ]),
+            Some(vec!["v3.metadata.json"])
         );
         assert_eq!(newest_metadata_names(["version-hint.text"]), None);
     }
@@ -1010,10 +1072,42 @@ mod tests {
         assert_eq!(ids_of(&Arc::new(provider)).await, ALL_IDS);
     }
 
-    /// A version hint decides the current metadata file even when newer files
-    /// exist, and is read again on every load, through both the table root and a
-    /// pin on the hint file itself. The hint may hold a version (Java's Hadoop
-    /// tables) or a file name stem (`DuckDB`).
+    /// A Hadoop writer writes a new version as `<uuid>.metadata.json` and commits it
+    /// by renaming it to `v<N>.metadata.json`. With no version hint, an uncommitted
+    /// file whose UUID starts with digits is not read as the newest version.
+    #[tokio::test]
+    async fn a_hadoop_writers_uncommitted_metadata_is_not_read_without_a_hint() {
+        let warehouse = tempfile::tempdir().expect("temp warehouse is created");
+        let table_root = write_table(warehouse.path(), &APPENDS).await;
+        let files = rename_to_hadoop_names(&table_root);
+        std::fs::rename(
+            &files[11],
+            table_root
+                .join("metadata")
+                .join("12345678-abcd-4abc-8abc-123456789abc.metadata.json"),
+        )
+        .expect("the newest version is left uncommitted");
+
+        let catalog = table_root_catalog(&table_root);
+        assert_eq!(
+            ids_through(catalog.clone()).await,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+        assert_eq!(
+            catalog
+                .current_metadata()
+                .await
+                .expect("current metadata is found")
+                .location,
+            format!("file://{}", files[10].display())
+        );
+    }
+
+    /// A version hint is read again on every load, through both the table root and
+    /// a pin on the hint file itself. A file name stem (`DuckDB`) names the metadata
+    /// file even when newer files exist. A version (Java's Hadoop tables) is where
+    /// the search starts: a Hadoop writer creates `v<N+1>.metadata.json` before it
+    /// updates the hint, and only best-effort, so a hint can lag the current version.
     #[tokio::test]
     async fn a_version_hint_names_the_current_metadata_file_and_is_reread_on_every_load() {
         let warehouse = tempfile::tempdir().expect("temp warehouse is created");
@@ -1045,30 +1139,32 @@ mod tests {
 
         rename_to_hadoop_names(&table_root);
         for provider in [&root, &pinned] {
-            write_hint(&table_root, "3");
-            assert_eq!(ids_of(provider).await, [0, 1, 2], "hint names v3");
-            write_hint(&table_root, "10");
-            assert_eq!(
-                ids_of(provider).await,
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-                "hint names v10"
-            );
+            for version in ["3", "10", "11"] {
+                write_hint(&table_root, version);
+                assert_eq!(ids_of(provider).await, ALL_IDS, "hint names v{version}");
+            }
         }
 
-        // The older gzip spelling, `v<N>.metadata.json.gz`.
-        let v3 = table_root.join("metadata").join("v3.metadata.json");
+        // The older gzip spelling, `v<N>.metadata.json.gz`, after the hinted version.
+        let v4 = table_root.join("metadata").join("v4.metadata.json");
         let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut gzip, &std::fs::read(&v3).expect("v3 is read"))
-            .expect("v3 is compressed");
+        std::io::Write::write_all(&mut gzip, &std::fs::read(&v4).expect("v4 is read"))
+            .expect("v4 is compressed");
         std::fs::write(
-            v3.with_file_name("v3.metadata.json.gz"),
+            v4.with_file_name("v4.metadata.json.gz"),
             gzip.finish().expect("gzip finishes"),
         )
-        .expect("gzip v3 is written");
-        std::fs::remove_file(&v3).expect("plain v3 is removed");
+        .expect("gzip v4 is written");
+        std::fs::remove_file(&v4).expect("plain v4 is removed");
         for provider in [&root, &pinned] {
-            write_hint(&table_root, "3");
-            assert_eq!(ids_of(provider).await, [0, 1, 2], "hint names gzip v3");
+            for version in ["3", "4"] {
+                write_hint(&table_root, version);
+                assert_eq!(
+                    ids_of(provider).await,
+                    ALL_IDS,
+                    "hint names v{version}, v4 is gzip"
+                );
+            }
         }
 
         write_hint(&table_root, "12");

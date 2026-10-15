@@ -424,16 +424,15 @@ pub fn validate_replication_slot_name(name: &str) -> Result<(), String> {
 /// long dataset names that happen to share the same truncated sanitized prefix
 /// still produce distinct default slot names.
 ///
-/// `instance_suffix` is an 8-char blake3-ish hash (actually `twox-hash` xxh3
-/// for zero-dep reuse) of `SPICE_INSTANCE_ID` falling back to the machine
-/// hostname, so each replica gets a distinct, deterministic slot across
-/// restarts.
+/// `instance_suffix` is an 8-char `twox-hash` xxh3 hash of the instance
+/// identity ([`util::instance_id::instance_id`]), so each replica gets a
+/// distinct, deterministic slot across restarts.
 ///
 /// The sanitized dataset portion is truncated to keep the final identifier
 /// within Postgres' 63-byte limit.
 #[must_use]
 pub fn default_slot_name(dataset_name: &str) -> String {
-    slot_name_for(dataset_name, &resolve_instance_id())
+    slot_name_for(dataset_name, util::instance_id::instance_id())
 }
 
 /// Build the slot name for `dataset_name` scoped to `instance_id` (the value
@@ -474,17 +473,6 @@ pub fn publication_name_for_slot(slot_name: &str) -> String {
     let base = sanitize(slot_name);
     let base = truncate_to_bytes(&base, PG_IDENTIFIER_MAX_BYTES - 4);
     format!("{base}_pub")
-}
-
-/// The identity distinguishing this spiced instance from another sharing the
-/// same source database: `SPICE_INSTANCE_ID` if set, else the machine hostname,
-/// else `"unknown"`. Stable across restarts of the same instance, which is what
-/// keeps [`slot_name_for`] resuming the same replication slot on restart.
-fn resolve_instance_id() -> String {
-    std::env::var("SPICE_INSTANCE_ID")
-        .ok()
-        .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Default publication is shared across replicas:
@@ -583,23 +571,6 @@ fn xxh3_short_hash(s: &str) -> String {
 
 fn xxh3_short_hash_prefix(s: &str, len: usize) -> String {
     xxh3_short_hash(s).chars().take(len).collect()
-}
-
-// Environment-based hostname discovery only. We intentionally avoid reading
-// `/etc/hostname` because that's blocking I/O, and this function is called on
-// a Tokio runtime thread during connector initialization. Any Kubernetes or
-// Docker deployment already sets `HOSTNAME`, and fallback callers see
-// `"unknown"` in the unlikely case neither env var is set.
-mod hostname {
-    pub fn get() -> std::io::Result<std::ffi::OsString> {
-        if let Ok(h) = std::env::var("HOSTNAME") {
-            return Ok(h.into());
-        }
-        if let Ok(h) = std::env::var("COMPUTERNAME") {
-            return Ok(h.into());
-        }
-        Err(std::io::Error::other("hostname unavailable"))
-    }
 }
 
 impl ReplicationParams {
@@ -1057,6 +1028,72 @@ TXTE85+Or9IUwDI9543jsyCvuQ8=
         let a2 = default_slot_name("users");
         assert_eq!(a1, a2);
         assert!(a1.starts_with("spice_users_"));
+    }
+
+    /// The default slot name of dataset `users` for each identity input. The
+    /// expected names are the ones the previous release created for the same
+    /// input, read back from `pg_replication_slots`.
+    fn default_slot_name_with(vars: &[(&str, &str)], host_name: &str) -> String {
+        let identity = util::instance_id::resolve(
+            |name| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| (*value).to_string())
+            },
+            || host_name.to_string(),
+        );
+        slot_name_for("users", &identity)
+    }
+
+    /// An instance that names itself with `SPICE_INSTANCE_ID`, `HOSTNAME` or
+    /// `COMPUTERNAME` keeps the slot it already has.
+    #[test]
+    fn slot_names_from_identity_variables_are_unchanged() {
+        assert_eq!(
+            default_slot_name_with(
+                &[("SPICE_INSTANCE_ID", "spice-0"), ("HOSTNAME", "pod-1")],
+                "os-host"
+            ),
+            "spice_users_f7c836_5d13f841"
+        );
+        assert_eq!(
+            default_slot_name_with(
+                &[("HOSTNAME", "pod-1"), ("COMPUTERNAME", "WIN-1")],
+                "os-host"
+            ),
+            "spice_users_f7c836_e7d4207d"
+        );
+        assert_eq!(
+            default_slot_name_with(&[("COMPUTERNAME", "WIN-1")], "os-host"),
+            "spice_users_f7c836_090d9561"
+        );
+    }
+
+    /// With none of the identity variables set, the slot name comes from the host
+    /// name: the name a `HOSTNAME` with the same value gives, not the name the
+    /// previous release used for such an instance.
+    #[test]
+    fn slot_name_without_identity_variables_comes_from_the_host_name() {
+        let slot = default_slot_name_with(&[], "pod-1");
+        assert_eq!(slot, "spice_users_f7c836_e7d4207d");
+        assert_ne!(
+            slot, "spice_users_f7c836_3f484bfe",
+            "the previous release hashed \"unknown\" for this instance"
+        );
+    }
+
+    /// An empty `SPICE_INSTANCE_ID` counts as unset.
+    #[test]
+    fn slot_name_with_an_empty_spice_instance_id_uses_the_next_source() {
+        let slot = default_slot_name_with(
+            &[("SPICE_INSTANCE_ID", ""), ("HOSTNAME", "pod-1")],
+            "os-host",
+        );
+        assert_eq!(slot, "spice_users_f7c836_e7d4207d");
+        assert_ne!(
+            slot, "spice_users_f7c836_38d394c2",
+            "the previous release hashed the empty value"
+        );
     }
 
     #[test]

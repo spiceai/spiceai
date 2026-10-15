@@ -327,11 +327,16 @@ mod tests {
         assert!(ready <= connected);
         for i in 0..connected {
             let (tx, _rx) = mpsc::channel(1);
-            registry.register(format!("e{i}"), tx).await;
+            registry.register(format!("e{i}"), "", tx).await;
         }
         for i in 0..ready {
             registry
-                .insert_flight_sql_client(format!("e{i}"), dummy_flight_sql_client())
+                .insert_flight_sql_client(
+                    format!("e{i}"),
+                    format!("127.0.0.1:{}", 50_100 + i),
+                    "",
+                    dummy_flight_sql_client(),
+                )
                 .await;
         }
     }

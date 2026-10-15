@@ -322,7 +322,8 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     .with_runtime_config(executor1_config.clone())
                     .with_resolved_cluster_config(
                         ResolvedClusterConfig::try_new(executor1_config.cluster.clone())
-                            .expect("should resolve cluster config"),
+                            .expect("should resolve cluster config")
+                            .with_instance_id("executor1"),
                     )
                     .with_app(executor1_app)
                     .build()
@@ -381,7 +382,8 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                     .with_runtime_config(executor2_config.clone())
                     .with_resolved_cluster_config(
                         ResolvedClusterConfig::try_new(executor2_config.cluster.clone())
-                            .expect("should resolve cluster config"),
+                            .expect("should resolve cluster config")
+                            .with_instance_id("executor2"),
                     )
                     .with_app(executor2_app)
                     .build()

@@ -124,7 +124,7 @@ message GetMetricsResponse {
 
 // Message sent from executor to scheduler on the control stream.
 message ExecutorControlMessage {
-    // Executor's advertise address (used as identifier).
+    // Executor's instance identity.
     string executor_id = 1;
     oneof message {
         ExecutorHeartbeat heartbeat = 2;
@@ -135,6 +135,9 @@ message ExecutorControlMessage {
         PartitionsLoaded partitions_loaded = 6;
         ExecutorStatistics executor_statistics = 7;
     }
+    // Per-process id of the executor, set on the first message of a stream. A
+    // new value under the same executor_id means the executor restarted.
+    string process_id = 8;
 }
 
 // Periodic per-table statistics report from an executor, decoupled from the
@@ -196,8 +199,13 @@ message UpdatePartitions {
 
 // Request message for AllocateInitialPartitions RPC.
 message AllocateInitialPartitionsRequest {
-  // Executor's advertise address (used as identifier).
+  // Executor's advertise URL, used to reach it.
   string executor_url = 1;
+  // Executor's instance identity. Empty from executors that use their advertise
+  // address as their identity.
+  string executor_id = 2;
+  // Per-process id of the executor, the one its control stream sends.
+  string process_id = 3;
 }
 
 message BytesArray {
