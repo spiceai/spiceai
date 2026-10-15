@@ -38,10 +38,11 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArr
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use cayenne::metadata::{CompressionStrategy, CreateTableOptions, DeltaEncoding, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
-use common::{BackendType, TestFixture, insert_batch};
+use common::{BackendType, TestFixture, insert_batch, write_batches};
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::dml::InsertOp;
 
 /// Enough rows to exceed the inline-memtable admission cap (default 1024),
 /// forcing the staged file-write path the encoding level applies to.
@@ -230,12 +231,10 @@ async fn delta_encoding_levels_are_correct_and_actually_engage() {
     );
 }
 
-/// Rows per insert in the custom-strategy regression test.
+/// Rows per write in the custom-strategy regression test.
 const STRATEGY_ROWS: i64 = 20_000;
 
-/// The shape of the #15175 reproduction: a sequential key, a timestamp that
-/// advances one second per row, and a short string derived from the key.
-fn sequential_schema() -> SchemaRef {
+fn monotone_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
@@ -243,31 +242,40 @@ fn sequential_schema() -> SchemaRef {
     ]))
 }
 
-fn sequential_batch(start: i64, rows: i64) -> RecordBatch {
+/// Rows `start..start + rows`. `id` increases by irregular steps, so its
+/// best encoding in the default `BtrBlocks` search is `fastlanes.delta`; `ts`
+/// advances one second per row and `name` is derived from the row number, as
+/// in the #15175 reproduction.
+fn monotone_batch(start: i64, rows: i64) -> RecordBatch {
     // 2026-01-01T00:00:00Z
     const EPOCH_MICROS: i64 = 1_767_225_600_000_000;
-    let ids: Vec<i64> = (start..start + rows).collect();
-    let timestamps: Vec<i64> = ids
-        .iter()
-        .map(|id| EPOCH_MICROS + id * 1_000_000)
+    let row_numbers = start..start + rows;
+    let ids: Vec<i64> = row_numbers
+        .clone()
+        .map(|row| row * 64 + (row * 2_654_435_761).rem_euclid(61))
         .collect();
-    let names: Vec<String> = ids.iter().map(|id| format!("k{id}")).collect();
+    let timestamps: Vec<i64> = row_numbers
+        .clone()
+        .map(|row| EPOCH_MICROS + row * 1_000_000)
+        .collect();
+    let names: Vec<String> = row_numbers.map(|row| format!("k{row}")).collect();
     RecordBatch::try_new(
-        sequential_schema(),
+        monotone_schema(),
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(TimestampMicrosecondArray::from(timestamps)),
             Arc::new(StringArray::from(names)),
         ],
     )
-    .expect("build sequential batch")
+    .expect("build monotone batch")
 }
 
 /// Regression test for #15175: a write strategy built from the default
-/// `BtrBlocks` scheme set, which `cayenne_compression_strategy: zstd` and
-/// `cayenne_delta_encoding` levels 4 to 6 use, failed every write with
-/// "Serialized array ID fastlanes.delta not permitted by ctx". The second
-/// insert lands in a table that already holds rows, so it is a delta write.
+/// `BtrBlocks` scheme set failed the write with "Serialized array ID
+/// fastlanes.delta not permitted by ctx". `cayenne_compression_strategy: zstd`
+/// uses one for maintenance writes, such as an overwrite, and
+/// `cayenne_delta_encoding` levels 4 to 6 use one for delta writes, such as an
+/// append. Each case writes twice and reads every row back.
 #[tokio::test]
 async fn default_scheme_set_strategies_write_and_read_back() {
     let fixture = TestFixture::new(BackendType::Sqlite)
@@ -285,45 +293,44 @@ async fn default_scheme_set_strategies_write_and_read_back() {
                 compression_strategy: CompressionStrategy::Zstd,
                 ..VortexConfig::default()
             },
+            InsertOp::Overwrite,
         ),
-        ("delta_level4", delta_level(4)),
-        ("delta_level5", delta_level(5)),
-        ("delta_level6", delta_level(6)),
+        ("delta_level4", delta_level(4), InsertOp::Append),
+        ("delta_level5", delta_level(5), InsertOp::Append),
+        ("delta_level6", delta_level(6), InsertOp::Append),
     ];
 
-    let inserts = [
-        sequential_batch(0, STRATEGY_ROWS),
-        sequential_batch(STRATEGY_ROWS, STRATEGY_ROWS),
-    ];
-    let expected = arrow::compute::concat_batches(&sequential_schema(), &inserts)
+    let first = monotone_batch(0, STRATEGY_ROWS);
+    let second = monotone_batch(STRATEGY_ROWS, STRATEGY_ROWS);
+    let expected = arrow::compute::concat_batches(&monotone_schema(), [&first, &second])
         .expect("concat expected rows");
 
-    for (name, vortex_config) in cases {
-        let table = create_table(&fixture, name, sequential_schema(), vortex_config).await;
-        for (index, batch) in inserts.iter().enumerate() {
-            let written = insert_batch(&table, batch.clone())
+    for (name, vortex_config, first_op) in cases {
+        let table = create_table(&fixture, name, monotone_schema(), vortex_config).await;
+        for (op, batch) in [(first_op, &first), (InsertOp::Append, &second)] {
+            let written = write_batches(&table, vec![batch.clone()], op)
                 .await
-                .unwrap_or_else(|e| panic!("{name}: insert {index} failed: {e}"));
+                .unwrap_or_else(|e| panic!("{name}: {op} failed: {e}"));
             assert_eq!(
                 written,
                 u64::try_from(STRATEGY_ROWS).expect("row count fits u64"),
-                "{name}: insert {index} row count"
+                "{name}: {op} row count"
             );
         }
 
         let rows = scan_all_rows(&table, name).await;
-        let actual = arrow::compute::concat_batches(&sequential_schema(), &rows)
+        let actual = arrow::compute::concat_batches(&monotone_schema(), &rows)
             .unwrap_or_else(|e| panic!("{name}: concat scanned rows: {e}"));
         assert_eq!(
             actual.num_rows(),
             expected.num_rows(),
             "{name}: scanned row count"
         );
-        for (index, field) in sequential_schema().fields().iter().enumerate() {
+        for (index, field) in monotone_schema().fields().iter().enumerate() {
             assert_eq!(
                 actual.column(index).as_ref(),
                 expected.column(index).as_ref(),
-                "{name}: column `{}` must read back exactly as inserted",
+                "{name}: column `{}` must read back exactly as written",
                 field.name()
             );
         }
