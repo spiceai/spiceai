@@ -431,7 +431,7 @@ pub(crate) async fn forward_change_envelope(
                             .collect(),
                         data: data.clone(),
                         source_commit_ts_ms: batch.source_commit_ts_ms(),
-                        queued_at_ms: queue::now_ms(),
+                        queued_at_ms: runtime_drasi::queue::now_ms(),
                     })
                     .await;
             }
