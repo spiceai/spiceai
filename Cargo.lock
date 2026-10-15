@@ -4857,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "connector-huggingface"
-version = "2.4.0-unstable"
+version = "2.4.0-rc.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -18134,7 +18134,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-decide"
-version = "2.4.0-unstable"
+version = "2.4.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -18452,7 +18452,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-state-location"
-version = "2.4.0-unstable"
+version = "2.4.0-rc.2"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
