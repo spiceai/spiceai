@@ -806,6 +806,58 @@
         }
       }
     },
+    "/v1/metrics": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Ingest OTLP metrics over HTTP",
+        "description": "OpenTelemetry Protocol (OTLP/HTTP) metrics receiver. Accepts protobuf or JSON\n`ExportMetricsServiceRequest` bodies, optionally gzip-compressed, and stores them like the\ngRPC receiver on the Flight port.",
+        "operationId": "post_otlp_metrics",
+        "requestBody": {
+          "description": "OTLP ExportMetricsServiceRequest",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Export accepted, possibly with partial success"
+          },
+          "400": {
+            "description": "Invalid body, or every data point was rejected"
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          },
+          "403": {
+            "description": "Write access required"
+          },
+          "413": {
+            "description": "Body too large"
+          },
+          "415": {
+            "description": "Unsupported Content-Type or Content-Encoding"
+          },
+          "503": {
+            "description": "Failed to write to the metrics store; retry the export"
+          }
+        }
+      }
+    },
     "/v1/models": {
       "get": {
         "tags": [
