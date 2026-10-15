@@ -718,7 +718,10 @@ mod tests {
         let empty = message(json!({
             "role": "assistant", "content": "D", "name": "", "tool_calls": [],
         }));
-        assert_eq!(anonymous_key(&[bare.clone()]), anonymous_key(&[nulls]));
+        assert_eq!(
+            anonymous_key(std::slice::from_ref(&bare)),
+            anonymous_key(&[nulls])
+        );
         assert_eq!(anonymous_key(&[bare]), anonymous_key(&[empty]));
 
         // A tool-call-only turn, echoed without content, with `null`, `""` or `[]`.
