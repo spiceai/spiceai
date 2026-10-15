@@ -218,16 +218,6 @@ impl Api {
     }
 }
 
-/// How [`assert_starts_with`] compares two requests.
-#[derive(Clone, Copy, Debug)]
-enum Compare {
-    /// As the provider's prompt cache reads them: each part as is.
-    Exact,
-    /// As the model reads them: without the `id` of each Responses `function_call`. Spice replays
-    /// a call of an earlier turn without its `id` (see `responses_tool_history::replayed`).
-    WithoutCallIds,
-}
-
 /// One request that Spice sent the provider, and the provider's usage for it.
 #[derive(Debug)]
 struct Round {
@@ -341,7 +331,7 @@ impl Conversation {
             );
         };
         if let Some(round_2) = turn_1.rounds.last() {
-            assert_starts_with(label, self.api, Compare::WithoutCallIds, round_2, round_3);
+            assert_starts_with(label, self.api, round_2, round_3);
         }
 
         assert!(
@@ -351,15 +341,14 @@ impl Conversation {
         );
     }
 
-    /// Asserts that each round starts with all of the round before it, exactly as the provider's
-    /// prompt cache reads it.
+    /// Asserts that each round starts with all of the round before it.
     fn assert_each_round_starts_with_the_last(&self) {
         // The conversation must include a tool round, or there is no round to compare.
         self.turn_1_query();
 
         let rounds = self.rounds().collect::<Vec<_>>();
         for (before, after) in rounds.iter().zip(rounds.iter().skip(1)) {
-            assert_starts_with(&self.label, self.api, Compare::Exact, before, after);
+            assert_starts_with(&self.label, self.api, before, after);
         }
     }
 
@@ -598,32 +587,23 @@ fn system_prompt() -> String {
 
 /// The parts of `request` that the provider reads as one prefix, in order: the tools, Responses'
 /// `instructions` (Spice's system prompt), and then each message or item of the conversation.
-fn prompt_parts(api: Api, compare: Compare, request: &Value) -> Vec<Value> {
+fn prompt_parts(api: Api, request: &Value) -> Vec<Value> {
     let items = match api {
         Api::ChatCompletions => &request["messages"],
         Api::Responses => &request["input"],
     };
-    let items = items.as_array().into_iter().flatten().map(|item| {
-        let mut item = item.clone();
-        if matches!((api, compare), (Api::Responses, Compare::WithoutCallIds))
-            && item["type"] == "function_call"
-            && let Some(item) = item.as_object_mut()
-        {
-            item.remove("id");
-        }
-        item
-    });
-    [request["tools"].clone(), request["instructions"].clone()]
+    [&request["tools"], &request["instructions"]]
         .into_iter()
-        .chain(items)
+        .chain(items.as_array().into_iter().flatten())
+        .cloned()
         .collect()
 }
 
 /// Asserts that the request of `after` starts with all of the request of `before`.
-fn assert_starts_with(label: &str, api: Api, compare: Compare, before: &Round, after: &Round) {
+fn assert_starts_with(label: &str, api: Api, before: &Round, after: &Round) {
     let (before, after) = (
-        prompt_parts(api, compare, &before.request),
-        prompt_parts(api, compare, &after.request),
+        prompt_parts(api, &before.request),
+        prompt_parts(api, &after.request),
     );
     let difference = before
         .iter()
@@ -720,10 +700,14 @@ async fn responses_send_earlier_tool_calls(
         .await
 }
 
+/// Not for `OpenAI`'s reasoning model: `OpenAI` leaves out the reasoning items of earlier turns, so
+/// a later turn can read the cache only up to the first of them, whatever Spice sends. Measured on
+/// 2026-10-15 with `gpt-5-mini`: turn 2 had fewer input tokens than the round before it (12,792 vs
+/// 12,820), and read 5,632 of them from the cache.
 #[rstest]
 #[tokio::test]
 async fn responses_reuse_the_prompt_cache(
-    #[values(Provider::OpenAi, Provider::OpenAiReasoning, Provider::Xai)] provider: Provider,
+    #[values(Provider::OpenAi, Provider::Xai)] provider: Provider,
     #[values(false, true)] stream: bool,
 ) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
