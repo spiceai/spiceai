@@ -62,7 +62,7 @@ use super::{
 /// The snapshot location parameter naming the SQS queue, as registered in the
 /// location's parameter spec. Users write it with the `s3_` prefix, as
 /// [`QUEUE_URL_KEY`].
-pub(super) const QUEUE_URL_PARAM: &str = "queue_url";
+pub(super) const QUEUE_URL_PARAM: &str = runtime_state_location::SNAPSHOT_QUEUE_URL_PARAM;
 const QUEUE_URL_KEY: &str = "s3_queue_url";
 
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(30);

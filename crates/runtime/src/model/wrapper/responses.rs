@@ -33,6 +33,7 @@ use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::model::metrics::{handle_metrics, handle_token_metrics, request_labels_responses};
+use crate::model::responses_tool_history::replay_spice_tool_calls;
 
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -79,7 +80,10 @@ impl ResponsesWrapper {
         }
     }
 
-    fn prepare_req(&self, req: CreateResponse) -> CreateResponse {
+    /// `req` as the provider receives it: with the Spicepod's system prompt and request defaults,
+    /// and with the Spice tool calls of earlier turns given back as the model saw them.
+    fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
+        req.input = replay_spice_tool_calls(req.input);
         self.with_model_defaults(self.with_system_prompt(req))
     }
 

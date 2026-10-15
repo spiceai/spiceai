@@ -486,6 +486,7 @@ async fn persist_remote_excluding(
 pub(crate) async fn build_results_cache_warmer(
     enabled: bool,
     runtime_state: Option<&RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> ResultsCacheWarmer {
@@ -493,15 +494,22 @@ pub(crate) async fn build_results_cache_warmer(
         return ResultsCacheWarmer::new(default_warmup_store_path(), enabled).await;
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         &state.into(),
-        crate::object_store_state::StateFeature::ResultsCacheWarmup,
+        runtime_state_location::StateFeature::ResultsCacheWarmup,
     )
     .await
     {
         Ok((store, prefix)) => {
+            let store = match state_location_check {
+                Some(check) => check.guard(
+                    runtime_state_location::StateFeature::ResultsCacheWarmup,
+                    store,
+                ),
+                None => store,
+            };
             tracing::info!(
                 "SQL results cache warmup will store query plans at '{}'",
                 state.location
@@ -2185,6 +2193,7 @@ mod tests {
         let warmer = build_results_cache_warmer(
             true,
             Some(&runtime_state),
+            None,
             Arc::clone(&secrets),
             Handle::current(),
         )
@@ -2226,9 +2235,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let reloaded =
-            build_results_cache_warmer(true, Some(&runtime_state), secrets, Handle::current())
-                .await;
+        let reloaded = build_results_cache_warmer(
+            true,
+            Some(&runtime_state),
+            None,
+            secrets,
+            Handle::current(),
+        )
+        .await;
         assert_eq!(
             reloaded.templates_snapshot().len(),
             1,

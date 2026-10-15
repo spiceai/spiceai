@@ -161,6 +161,19 @@ pub(crate) struct EncodePermits {
 static GLOBAL_ENCODE_BUDGET: LazyLock<RwLock<Option<EncodeBudget>>> =
     LazyLock::new(|| RwLock::new(None));
 
+/// Held by every test that installs the process-global encode budget or reads
+/// it as unset: under `cargo test` this crate's tests share one process.
+#[cfg(test)]
+pub(crate) static GLOBAL_ENCODE_BUDGET_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Remove the process-global encode budget, so a test that installed one leaves
+/// the process as it found it.
+#[cfg(test)]
+pub(crate) fn clear_global_encode_budget() {
+    *GLOBAL_ENCODE_BUDGET.write() = None;
+}
+
 /// Install the process-global encode-concurrency budget. Called once at startup
 /// with the host core budget (optionally minus a reserve for query threads).
 /// `permits` is clamped to at least 1. Later calls replace the previous budget.
@@ -655,10 +668,12 @@ mod tests {
     }
 
     /// With no global budget installed, acquisition is a no-op (`None`) and
-    /// writes proceed ungated. No test mutates the global, so it is always unset
-    /// here — keeping this free of cross-test interference.
+    /// writes proceed ungated. A test that installs the global holds
+    /// [`GLOBAL_ENCODE_BUDGET_TEST_LOCK`] until it removes it again, so the global
+    /// is unset while this one holds the lock.
     #[tokio::test]
     async fn acquire_encode_permits_is_noop_when_unset() {
+        let _serialized = GLOBAL_ENCODE_BUDGET_TEST_LOCK.lock().await;
         assert!(
             acquire_encode_permits(8, WriteClass::Delta, false)
                 .await

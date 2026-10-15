@@ -215,7 +215,7 @@ impl CayenneTableProvider {
             Arc::clone(observer) as Arc<dyn vortex_datafusion::VortexWriteObserver>
         });
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let file_stats = (!self.should_capture_positions())
+        let file_stats = (!self.hides_repeated_keys_with_position_deletes())
             .then(|| {
                 FileStatsObserver::new(self.table_name(), &schema, pk_observer.clone())
                     .map(Arc::new)

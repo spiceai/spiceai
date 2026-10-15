@@ -298,7 +298,7 @@ impl SnapshotFixture {
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.snapshots.clone())
+            .and_then(|app| app.effective_snapshots())
             .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
         let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
             runtime_snapshots,

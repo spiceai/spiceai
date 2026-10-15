@@ -123,7 +123,6 @@ pub mod jobs;
 mod management;
 mod metrics_server;
 pub mod model;
-mod object_store_state;
 pub mod opentelemetry;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
@@ -152,6 +151,7 @@ pub mod cluster;
 mod secrets_preflight;
 mod server_timing;
 pub mod spice_metrics;
+mod state_location;
 pub mod status;
 pub mod task_history;
 pub mod token_providers;
@@ -608,6 +608,9 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display("{reason}"))]
+    StateLocationRefused { reason: String },
+
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -754,6 +757,9 @@ pub struct Runtime {
     /// The engines found to have created the snapshots of datasets that read snapshots
     /// (`file_format: snapshot`), which building those datasets needs.
     snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    state_location_check: Option<Arc<runtime_state_location::StateLocationCheck>>,
 }
 
 impl Debug for Runtime {
@@ -897,6 +903,13 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    pub(crate) fn state_location_check(
+        &self,
+    ) -> Option<&Arc<runtime_state_location::StateLocationCheck>> {
+        self.state_location_check.as_ref()
     }
 
     /// The engines of the snapshot sources this runtime has resolved.
@@ -1702,6 +1715,7 @@ impl Runtime {
                 executor_future,
                 flight_future,
                 health_http_future,
+                self.state_location_refusal(),
             )
             .map(|_| ());
         }
@@ -1793,7 +1807,8 @@ impl Runtime {
                 pods_watcher_future,
                 cache_maintenance_future,
                 cluster_future,
-                shutdown_signal_future
+                shutdown_signal_future,
+                self.state_location_refusal()
             ) {
                 Err(err) => Err(err),
                 _ => Ok(()),
@@ -1806,10 +1821,27 @@ impl Runtime {
             metrics_future,
             pods_watcher_future,
             cache_maintenance_future,
-            shutdown_signal_future
+            shutdown_signal_future,
+            self.state_location_refusal()
         ) {
             Err(err) => Err(err),
             _ => Ok(()),
+        }
+    }
+
+    /// Fails when the startup check refuses `runtime.state.location`, which
+    /// stops startup. Otherwise resolves once the check passes, or at shutdown.
+    async fn state_location_refusal(&self) -> Result<()> {
+        let Some(check) = &self.state_location_check else {
+            return Ok(());
+        };
+        let shutdown = self.status.shutdown_token();
+        tokio::select! {
+            refused = check.finished() => match refused {
+                Some(reason) => StateLocationRefusedSnafu { reason: reason.to_string() }.fail(),
+                None => Ok(()),
+            },
+            () = shutdown.cancelled() => Ok(()),
         }
     }
 
