@@ -157,7 +157,7 @@ fn extract_query_relevance_from_batches(
 
 /// Converts raw search results into `query id → (corpus id → score)` for evaluation. The corpus row
 /// id comes from the dataset's declared `row_id`, whose column name differs per dataset (`_id` for
-/// MTEB, `chunk_id` for ConTEB), so this takes the single primary-key field of each result rather
+/// MTEB, `chunk_id` for `ConTEB`), so this takes the single primary-key field of each result rather
 /// than a fixed name. A corpus whose `row_id` names more than one column cannot be matched against
 /// the single `corpus-id` qrel column, so such a result is skipped.
 pub(crate) fn transform_search_results_for_eval(

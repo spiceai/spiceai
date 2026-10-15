@@ -130,7 +130,7 @@ impl<'a> CorpusSpec<'a> {
 /// `engine_mode`, `vector_search`, `model`, and `full_text_search`.
 ///
 /// The search columns are the columns with `embeddings` or `full_text_search` set, whatever their
-/// name (`text` for MTEB, `chunk` for ConTEB).
+/// name (`text` for MTEB, `chunk` for `ConTEB`).
 pub(crate) fn corpus_attributes(app: &App) -> Vec<KeyValue> {
     let Some(corpus) = CorpusSpec::find(app) else {
         return vec![];
