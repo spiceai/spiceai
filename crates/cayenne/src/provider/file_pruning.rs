@@ -211,7 +211,9 @@ pub(crate) fn statistics_from_record_batches(
                     continue;
                 }
                 let col = batch.column(col_idx);
-                let col_nulls = col.null_count();
+                // Logical nulls: a dictionary key that names a null value, or a `Null`
+                // column's rows, carry no null bit of their own.
+                let col_nulls = col.logical_null_count();
                 null_count += col_nulls;
                 if unbounded {
                     continue;
