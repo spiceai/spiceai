@@ -116,6 +116,7 @@ opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
+    "logs",
     "metrics",
 ] }
 opentelemetry_sdk.workspace = true

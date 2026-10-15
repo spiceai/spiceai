@@ -399,6 +399,23 @@ fn default_otel_push_interval() -> String {
     "60s".to_string()
 }
 
+/// A kind of telemetry the OTEL exporter sends, in OpenTelemetry's own terms.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum OtelSignal {
+    /// The runtime's metrics, pushed every `push_interval`.
+    Metrics,
+    /// The runtime's log records, as printed to stdout.
+    Logs,
+}
+
+/// Metrics only: what `otel_exporter` sent before it could send anything else,
+/// so an existing Spicepod keeps sending exactly that.
+fn default_otel_signals() -> Vec<OtelSignal> {
+    vec![OtelSignal::Metrics]
+}
+
 /// Aggregation temporality preference for the OTEL metrics push exporter.
 ///
 /// Controls how counter and histogram values are encoded on the wire:
@@ -430,11 +447,13 @@ pub enum OtelTemporality {
     LowMemory,
 }
 
-/// Configuration for pushing metrics to an OpenTelemetry collector.
+/// Configuration for pushing metrics and logs to an OpenTelemetry collector.
 ///
 /// The protocol is inferred from the endpoint:
 /// - **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`
 /// - **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)
+///
+/// `signals` chooses what is sent, and defaults to metrics only.
 ///
 /// # Examples
 ///
@@ -460,6 +479,13 @@ pub enum OtelTemporality {
 /// otel_exporter:
 ///   enabled: true
 ///   endpoint: "http://localhost:4318/v1/metrics"
+/// ```
+///
+/// Metrics and logs:
+/// ```yaml
+/// otel_exporter:
+///   endpoint: "otel-collector:4317"
+///   signals: [metrics, logs]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -500,6 +526,13 @@ pub struct OtelExporterConfig {
     /// details.
     #[serde(default)]
     pub temporality: OtelTemporality,
+
+    /// What the exporter sends to `endpoint`: `metrics`, `logs`, or both.
+    ///
+    /// Defaults to `[metrics]`. `endpoint` and `headers` apply to every signal;
+    /// `push_interval`, `temporality`, and `metrics` apply to metrics only.
+    #[serde(default = "default_otel_signals")]
+    pub signals: Vec<OtelSignal>,
 }
 
 impl OtelExporterConfig {
@@ -516,6 +549,46 @@ impl OtelExporterConfig {
         self.endpoint.starts_with("http://")
             || self.endpoint.starts_with("https://")
             || self.endpoint.contains("/v1/metrics")
+    }
+
+    /// Whether this exporter sends `signal`.
+    #[must_use]
+    pub fn exports(&self, signal: OtelSignal) -> bool {
+        self.signals.contains(&signal)
+    }
+
+    /// Rejects a configuration the exporter cannot act on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, worded for the Spicepod author, when `signals` is empty.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.signals.is_empty() {
+            return Err(format!(
+                "runtime.telemetry.otel_exporter.signals is empty, so the exporter has nothing to send. List 'metrics', 'logs', or both, or remove 'otel_exporter'. See: {OTEL_EXPORTER_DOCS_URL}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The OTLP/HTTP URL that log records are sent to.
+    ///
+    /// `endpoint` is treated as the base URL the OTLP exporter specification
+    /// describes, and `/v1/logs` is appended to it. A trailing `/v1/metrics` —
+    /// the form this exporter has always accepted for metrics — is removed
+    /// first, so one endpoint serves both signals. A query string is kept.
+    #[must_use]
+    pub fn logs_http_endpoint(&self) -> String {
+        let endpoint = self.endpoint.as_str();
+        let (base, query) = endpoint
+            .find(['?', '#'])
+            .map_or((endpoint, ""), |at| endpoint.split_at(at));
+        let base = base.trim_end_matches('/');
+        let base = base
+            .strip_suffix("/v1/metrics")
+            .unwrap_or(base)
+            .trim_end_matches('/');
+        format!("{base}/v1/logs{query}")
     }
 
     /// Returns the endpoint formatted for gRPC use.
@@ -567,7 +640,8 @@ pub struct TelemetryConfig {
     /// `MeterProvider`, so they appear as dimensions on every metric exported
     /// via the Prometheus scrape endpoint, the cluster on-demand OTLP reader,
     /// and the `otel_exporter` push exporter, and as labels on anonymous
-    /// usage telemetry. Currently does not affect tracing spans or logs.
+    /// usage telemetry. The log records `otel_exporter` sends carry the same
+    /// resource. Does not affect tracing spans.
     /// Example: `{ environment: prod, region: us-west-2, team: data-platform }`.
     #[serde(default)]
     pub properties: HashMap<String, String>,
@@ -629,6 +703,10 @@ impl Default for TelemetryConfig {
 
 /// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
 pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
+
+/// Docs section for `runtime.telemetry.otel_exporter`, linked from its errors.
+pub const OTEL_EXPORTER_DOCS_URL: &str =
+    "https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetryotel_exporter";
 
 /// The runtime-wide targets the adaptive controller steers toward, under `runtime.params`.
 /// They steer the closed loop and never turn it on.
@@ -1550,6 +1628,39 @@ pub struct Query {
     /// ```
     #[serde(default, skip_serializing_if = "is_default")]
     pub cte_materialization: CteMaterialization,
+
+    /// Which failed queries are logged, to stdout and — when
+    /// `runtime.telemetry.otel_exporter.signals` includes `logs` — to the OTLP
+    /// endpoint. Default `none` logs nothing beyond a query refused for memory,
+    /// because failed queries can be frequent.
+    ///
+    /// ```yaml
+    /// runtime:
+    ///   query:
+    ///     log_errors: execution   # none (default) | execution | all
+    /// ```
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub log_errors: QueryErrorLogging,
+}
+
+/// Which failed queries `spiced` logs.
+///
+/// A failure is either a query rejected before it ran — a syntax error, or a
+/// planning error such as an unknown table or column — which is the client's to
+/// fix, or a valid query that failed while running — a source or object-store
+/// error, a timeout, an internal error — which may need the operator.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryErrorLogging {
+    /// Log a query refused for want of memory as a warning, and every other
+    /// failure at debug level only.
+    #[default]
+    None,
+    /// Also log queries that failed while running, as warnings.
+    Execution,
+    /// Also log queries rejected before running, at info level.
+    All,
 }
 
 /// How the Cayenne query path treats multi-reference `WITH` clauses.
@@ -1873,6 +1984,10 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
 
         if let Some(prefix) = &deserializer.telemetry.metric_prefix {
             validate_metric_prefix(prefix)?;
+        }
+
+        if let Some(otel_exporter) = &deserializer.telemetry.otel_exporter {
+            otel_exporter.validate()?;
         }
 
         if let Some(sql_results) = &caching.sql_results {
@@ -2352,6 +2467,47 @@ mod tests {
         assert!(
             err.to_string().contains("runtime.query.timeout"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_query_log_errors_parses() {
+        let empty: Runtime = yaml::from_str("{}").expect("parses");
+        assert_eq!(
+            empty.query.unwrap_or_default().log_errors,
+            QueryErrorLogging::None,
+            "failed queries are not logged unless asked for"
+        );
+
+        for (raw, expected) in [
+            ("none", QueryErrorLogging::None),
+            ("execution", QueryErrorLogging::Execution),
+            ("all", QueryErrorLogging::All),
+        ] {
+            let runtime: Runtime = yaml::from_str(&format!(
+                "
+            query:
+                log_errors: {raw}
+        "
+            ))
+            .unwrap_or_else(|e| panic!("log_errors {raw} must parse: {e}"));
+            assert_eq!(
+                runtime.query.unwrap_or_default().log_errors,
+                expected,
+                "log_errors={raw}"
+            );
+        }
+
+        let err = yaml::from_str::<Runtime>(
+            r"
+            query:
+                log_errors: errors
+        ",
+        )
+        .expect_err("an unknown value must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "unknown variant `errors`, expected one of `none`, `execution`, `all`"
         );
     }
 
@@ -3183,6 +3339,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config
             .push_interval_duration()
@@ -3196,6 +3353,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config_minutes
             .push_interval_duration()
@@ -3209,6 +3367,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config_hours
             .push_interval_duration()
@@ -3223,6 +3382,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let duration = config_ms
             .push_interval_duration()
@@ -3239,6 +3399,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let result = config.push_interval_duration();
         assert!(result.is_err());
@@ -3257,6 +3418,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         let err = config
             .push_interval_duration()
@@ -3291,6 +3453,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(!grpc_bare.is_http());
 
@@ -3302,6 +3465,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(!grpc_port.is_http());
 
@@ -3313,6 +3477,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(http_scheme.is_http());
 
@@ -3324,6 +3489,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(https_config.is_http());
 
@@ -3335,6 +3501,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert!(http_path.is_http());
     }
@@ -3349,6 +3516,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert_eq!(bare.grpc_endpoint(), "http://otel-collector:4317");
 
@@ -3360,6 +3528,7 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert_eq!(with_port.grpc_endpoint(), "http://otel-collector:9090");
 
@@ -3371,8 +3540,140 @@ datasets:
             metrics: vec![],
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
+            signals: default_otel_signals(),
         };
         assert_eq!(localhost.grpc_endpoint(), "http://localhost:4317");
+    }
+
+    fn otel_exporter_from(yaml: &str) -> Result<OtelExporterConfig, String> {
+        yaml::from_str::<Runtime>(yaml)
+            .map_err(|e| e.to_string())
+            .map(|runtime| {
+                runtime
+                    .telemetry
+                    .otel_exporter
+                    .expect("otel_exporter should be present")
+            })
+    }
+
+    /// A Spicepod written before `signals` existed must keep sending metrics
+    /// and nothing else.
+    #[test]
+    fn test_otel_exporter_signals_default_to_metrics_only() {
+        let config = otel_exporter_from(
+            r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ",
+        )
+        .expect("an exporter without signals must parse");
+        assert_eq!(config.signals, vec![OtelSignal::Metrics]);
+        assert!(config.exports(OtelSignal::Metrics));
+        assert!(!config.exports(OtelSignal::Logs));
+    }
+
+    #[test]
+    fn test_otel_exporter_signals_parsing() {
+        for (raw, metrics, logs) in [
+            ("[metrics, logs]", true, true),
+            ("[logs]", false, true),
+            ("[metrics]", true, false),
+        ] {
+            let config = otel_exporter_from(&format!(
+                "
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    signals: {raw}
+        "
+            ))
+            .unwrap_or_else(|e| panic!("signals {raw} must parse: {e}"));
+            assert_eq!(
+                config.exports(OtelSignal::Metrics),
+                metrics,
+                "signals={raw}"
+            );
+            assert_eq!(config.exports(OtelSignal::Logs), logs, "signals={raw}");
+        }
+    }
+
+    #[test]
+    fn test_otel_exporter_empty_signals_rejected() {
+        let err = otel_exporter_from(
+            r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    signals: []
+        ",
+        )
+        .expect_err("an exporter with nothing to send must be rejected");
+        assert_eq!(
+            err,
+            "runtime.telemetry.otel_exporter.signals is empty, so the exporter has nothing to send. List 'metrics', 'logs', or both, or remove 'otel_exporter'. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimetelemetryotel_exporter"
+        );
+    }
+
+    #[test]
+    fn test_otel_exporter_unknown_signal_rejected() {
+        let err = otel_exporter_from(
+            r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    signals: [metrics, traces]
+        ",
+        )
+        .expect_err("a signal the exporter cannot send must be rejected");
+        assert_eq!(
+            err,
+            "unknown variant `traces`, expected `metrics` or `logs`"
+        );
+    }
+
+    /// The logs URL follows the OTLP exporter specification's base-URL rule,
+    /// and also accepts the `/v1/metrics` URL this exporter documents for
+    /// metrics, so one endpoint serves both signals.
+    #[test]
+    fn test_otel_exporter_logs_http_endpoint() {
+        for (endpoint, expected) in [
+            (
+                "http://otel-collector:4318",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "http://otel-collector:4318/",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "http://otel-collector:4318/v1/metrics",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "http://otel-collector:4318/v1/metrics/",
+                "http://otel-collector:4318/v1/logs",
+            ),
+            (
+                "https://otlp.example.com/otlp",
+                "https://otlp.example.com/otlp/v1/logs",
+            ),
+            (
+                "https://otlp.example.com/otlp/v1/metrics?tenant=a",
+                "https://otlp.example.com/otlp/v1/logs?tenant=a",
+            ),
+        ] {
+            let config = OtelExporterConfig {
+                enabled: true,
+                endpoint: endpoint.to_string(),
+                push_interval: "60s".to_string(),
+                metrics: vec![],
+                headers: HashMap::new(),
+                temporality: OtelTemporality::default(),
+                signals: vec![OtelSignal::Logs],
+            };
+            assert_eq!(config.logs_http_endpoint(), expected, "endpoint={endpoint}");
+        }
     }
 
     #[test]
