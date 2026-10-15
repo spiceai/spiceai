@@ -60,11 +60,11 @@ pub fn describe(age: Duration) -> String {
     const HOUR: u64 = 60 * MINUTE;
     const DAY: u64 = 24 * HOUR;
     let secs = age.as_secs();
-    if secs >= 2 * DAY && secs % DAY == 0 {
+    if secs >= 2 * DAY && secs.is_multiple_of(DAY) {
         format!("{}d", secs / DAY)
-    } else if secs >= HOUR && secs % HOUR == 0 {
+    } else if secs >= HOUR && secs.is_multiple_of(HOUR) {
         format!("{}h", secs / HOUR)
-    } else if secs >= MINUTE && secs % MINUTE == 0 {
+    } else if secs >= MINUTE && secs.is_multiple_of(MINUTE) {
         format!("{}m", secs / MINUTE)
     } else {
         format!("{secs}s")

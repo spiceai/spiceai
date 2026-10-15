@@ -44,11 +44,11 @@ use crate::cluster::cluster_state::{
     self, ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerEntry,
     TableEntryChanges, UNREGISTERED_TABLE_RETENTION,
 };
+use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
+use crate::cluster::reaper::Reaper;
 use crate::datafusion::DataFusion;
 use datafusion::common::TableReference;
 use object_store_occ::cleanup;
-use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
-use crate::cluster::reaper::Reaper;
 use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
@@ -270,7 +270,11 @@ impl CleanupPass {
     fn log(&self) {
         tracing::debug!(
             jobs_deleted = self.jobs.as_ref().ok(),
-            tables_removed = self.tables.as_ref().ok().map(|changes| changes.removed.len()),
+            tables_removed = self
+                .tables
+                .as_ref()
+                .ok()
+                .map(|changes| changes.removed.len()),
             "State cleanup pass finished"
         );
         match &self.jobs {

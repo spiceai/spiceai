@@ -818,7 +818,10 @@ mod tests {
             ("spice.public.newly_unregistered", None),
             ("spice.public.just_under_a_day", Some(now - day_ms + 1)),
             ("spice.public.exactly_a_day", Some(now - day_ms)),
-            ("spice.public.unknown_to_this_scheduler", Some(now - 2 * day_ms)),
+            (
+                "spice.public.unknown_to_this_scheduler",
+                Some(now - 2 * day_ms),
+            ),
         ] {
             state
                 .accelerations
@@ -840,11 +843,7 @@ mod tests {
         .map(|(table, registered)| (table.to_string(), registered))
         .collect();
 
-        let changes = state.reconcile_table_entries(
-            &registered,
-            now,
-            UNREGISTERED_TABLE_RETENTION,
-        );
+        let changes = state.reconcile_table_entries(&registered, now, UNREGISTERED_TABLE_RETENTION);
 
         assert_eq!(
             changes,
@@ -860,7 +859,10 @@ mod tests {
         assert_eq!(
             entries(&state.accelerations),
             vec![
-                ("spice.public.just_under_a_day".to_string(), Some(now - day_ms + 1)),
+                (
+                    "spice.public.just_under_a_day".to_string(),
+                    Some(now - day_ms + 1)
+                ),
                 ("spice.public.newly_unregistered".to_string(), Some(now)),
                 ("spice.public.registered".to_string(), None),
                 ("spice.public.reregistered".to_string(), None),
@@ -915,7 +917,10 @@ mod tests {
         first_pass.expect("the first scheduler's pass succeeds");
         second_pass.expect("the second scheduler's pass succeeds");
 
-        let state = ClusterStateStore::new(store, "").read().await.expect("read");
+        let state = ClusterStateStore::new(store, "")
+            .read()
+            .await
+            .expect("read");
         assert_eq!(
             state.accelerations.keys().collect::<Vec<_>>(),
             vec!["spice.public.shared"],

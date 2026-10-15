@@ -2130,8 +2130,8 @@ impl SnapshotManager {
                 if entry.timestamp_ms > lost_by_ms {
                     continue;
                 }
-                let Ok(path) =
-                    self.snapshot_uri_to_object_path(&entry.snapshot, Some(&handle.metadata.location))
+                let Ok(path) = self
+                    .snapshot_uri_to_object_path(&entry.snapshot, Some(&handle.metadata.location))
                 else {
                     continue;
                 };
@@ -2150,7 +2150,9 @@ impl SnapshotManager {
             match self.object_store.head(path).await {
                 Ok(_) => Ok(false),
                 Err(object_store::Error::NotFound { .. }) => Ok(true),
-                Err(err) if is_retriable_object_store_error(&err) => Err(RetryError::transient(err)),
+                Err(err) if is_retriable_object_store_error(&err) => {
+                    Err(RetryError::transient(err))
+                }
                 Err(err) => Err(RetryError::permanent(err)),
             }
         })
@@ -4159,11 +4161,17 @@ impl SnapshotManager {
 
         // A snapshot whose file is gone cannot be restored, so it is never made current.
         if let Some(handle) = self.load_metadata().await?
-            && let Some(entry) = handle
-                .metadata
-                .datasets
-                .get(&self.dataset_name)
-                .and_then(|dataset| dataset.snapshots.iter().find(|e| e.snapshot_id == snapshot_id))
+            && let Some(entry) =
+                handle
+                    .metadata
+                    .datasets
+                    .get(&self.dataset_name)
+                    .and_then(|dataset| {
+                        dataset
+                            .snapshots
+                            .iter()
+                            .find(|e| e.snapshot_id == snapshot_id)
+                    })
             && let Ok(path) =
                 self.snapshot_uri_to_object_path(&entry.snapshot, Some(&handle.metadata.location))
             && self.file_is_gone(&path).await
@@ -10555,8 +10563,13 @@ mod tests {
         );
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         for publish_number in 0..3 {
-            publish_contents(&writer, &local_path, &format!("publish {publish_number}"), &schema)
-                .await;
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
         }
         let old_entries = dataset_entries(store.as_ref(), &metadata_path).await;
         assert_eq!(entry_ids(&old_entries), vec![0, 1, 2]);
@@ -10605,7 +10618,10 @@ mod tests {
             vec![3]
         );
         for path in &old_paths {
-            assert!(object_exists(store.as_ref(), path).await, "{path} stays for a day");
+            assert!(
+                object_exists(store.as_ref(), path).await,
+                "{path} stays for a day"
+            );
         }
         let restored = download_first()
             .await
@@ -10618,7 +10634,10 @@ mod tests {
         let entries = dataset_entries(store.as_ref(), &metadata_path).await;
         assert_eq!(entry_ids(&entries), vec![4]);
         for path in &old_paths {
-            assert!(!object_exists(store.as_ref(), path).await, "{path} is deleted");
+            assert!(
+                !object_exists(store.as_ref(), path).await,
+                "{path} is deleted"
+            );
         }
         for entry in [&third, &entries[0]] {
             let path = writer
@@ -10681,12 +10700,18 @@ mod tests {
 
         writer.cleanup_clock = CleanupClock::ahead_by(DAY - std::time::Duration::from_mins(1));
         publish_contents(&writer, &local_path, "publish 0", &schema).await;
-        assert!(object_exists(store.as_ref(), &orphan).await, "a younger file stays");
+        assert!(
+            object_exists(store.as_ref(), &orphan).await,
+            "a younger file stays"
+        );
 
         *writer.next_sweep.lock() = None;
         writer.cleanup_clock = CleanupClock::ahead_by(DAY + std::time::Duration::from_mins(1));
         publish_contents(&writer, &local_path, "publish 1", &schema).await;
-        assert!(!object_exists(store.as_ref(), &orphan).await, "the orphan is deleted");
+        assert!(
+            !object_exists(store.as_ref(), &orphan).await,
+            "the orphan is deleted"
+        );
         for path in &kept {
             assert!(object_exists(store.as_ref(), path).await, "{path} stays");
         }
@@ -10716,14 +10741,22 @@ mod tests {
         );
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         for publish_number in 0..3 {
-            publish_contents(&writer, &local_path, &format!("publish {publish_number}"), &schema)
-                .await;
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
         }
         for entry in &dataset_entries(store.as_ref(), &metadata_path).await[..2] {
             let path = writer
                 .snapshot_uri_to_object_path(&entry.snapshot, None)
                 .expect("snapshot path");
-            store.delete(&path).await.expect("delete as a lifecycle rule would");
+            store
+                .delete(&path)
+                .await
+                .expect("delete as a lifecycle rule would");
         }
 
         *writer.next_sweep.lock() = None;
@@ -10794,14 +10827,22 @@ mod tests {
         );
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         for publish_number in 0..3 {
-            publish_contents(&writer, &local_path, &format!("publish {publish_number}"), &schema)
-                .await;
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
         }
         let entries = dataset_entries(store.as_ref(), &metadata_path).await;
         let gone = writer
             .snapshot_uri_to_object_path(&entries[0].snapshot, None)
             .expect("snapshot path");
-        store.delete(&gone).await.expect("delete as a lifecycle rule would");
+        store
+            .delete(&gone)
+            .await
+            .expect("delete as a lifecycle rule would");
 
         let err = writer
             .set_current_snapshot(0)

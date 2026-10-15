@@ -45,9 +45,7 @@ pub async fn delete_unused_state(
     now: SystemTime,
 ) -> object_store::Result<usize> {
     let retention_ms = millis(cleanup::age(UNUSED_ORIGIN_RETENTION));
-    let now_ms = now
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since_epoch| millis(since_epoch));
+    let now_ms = now.duration_since(UNIX_EPOCH).map_or(0, millis);
     let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {
         return Ok(0);
@@ -144,7 +142,11 @@ mod tests {
         let paths: Vec<String> = (0..50)
             .map(|origin| format!("rate-control/app/origin-{origin}.json"))
             .collect();
-        seed(&store, &paths.iter().map(String::as_str).collect::<Vec<_>>()).await;
+        seed(
+            &store,
+            &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await;
         let later = SystemTime::now() + UNUSED_ORIGIN_RETENTION + Duration::from_secs(1);
 
         let (first, second) = tokio::join!(

@@ -99,7 +99,11 @@ pub(super) fn apply(
     grace: Duration,
 ) -> Retention {
     let current = dataset.current_snapshot_id;
-    let newest = dataset.snapshots.iter().map(|entry| entry.snapshot_id).max();
+    let newest = dataset
+        .snapshots
+        .iter()
+        .map(|entry| entry.snapshot_id)
+        .max();
     let oldest_kept_ms = now_ms.saturating_sub(millis(retention));
 
     let mut result = Retention::default();

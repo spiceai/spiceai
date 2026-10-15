@@ -1150,7 +1150,11 @@ mod tests {
 
         let mut deleted = Vec::new();
         let mut kept = Vec::new();
-        for status in [JobStatus::Failed, JobStatus::Cancelled, JobStatus::Succeeded] {
+        for status in [
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+            JobStatus::Succeeded,
+        ] {
             deleted.push(finished_job(&job_store, status, twelve_hours + minute).await);
             kept.push(finished_job(&job_store, status, twelve_hours - minute).await);
         }
