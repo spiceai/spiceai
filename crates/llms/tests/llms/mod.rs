@@ -39,6 +39,7 @@ use tokio::sync::oneshot;
 use crate::{TEST_ARGS, init_tracing};
 
 mod create;
+mod responses;
 mod streaming_tests;
 
 /// Async function that creates a model instance
@@ -128,6 +129,12 @@ static DOTENV: LazyLock<()> = LazyLock::new(|| {
 /// share, which is what their [`TestModel::fetch_repo`] serialization keys on.
 const PHI3_REPO: &str = "microsoft/Phi-3-mini-4k-instruct";
 
+/// The `OpenAI` model the chat and Responses tests run against.
+const OPENAI_MODEL: &str = "gpt-4o-mini";
+
+/// The xAI model the chat and Responses tests run against.
+const XAI_MODEL: &str = "grok-4.3";
+
 static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
     vec![
         TestModel {
@@ -165,15 +172,16 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
         TestModel {
             name: "openai",
             fetch_repo: None,
-            create: Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
+            create: Box::new(|| Box::pin(async { Ok(create::create_openai(OPENAI_MODEL)) })),
         },
         TestModel {
             name: "xai",
             fetch_repo: None,
             create: Box::new(|| {
                 Box::pin(async {
-                    create::create_xai("grok-4.3")
-                        .map_err(|e| anyhow::anyhow!("failed to create 'grok-4.3' from xAI: {e}"))
+                    create::create_xai(XAI_MODEL).map_err(|e| {
+                        anyhow::anyhow!("failed to create '{XAI_MODEL}' from xAI: {e}")
+                    })
                 })
             }),
         },
