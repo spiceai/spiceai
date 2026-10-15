@@ -66,7 +66,7 @@ impl SpiceAiModelLister {
             .with_api_key(api_key.map(ExposeSecret::expose_secret));
 
         Self {
-            client: Client::with_config(config),
+            client: crate::provider::client_without_retry(config),
         }
     }
 

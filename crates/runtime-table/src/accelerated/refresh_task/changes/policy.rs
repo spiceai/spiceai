@@ -33,6 +33,22 @@ use super::{
     schema_evolution_first_warn,
 };
 
+/// The warning for a widening the dataset's `on_schema_change` policy does not
+/// apply: values are cast to the current schema, and a change it cannot hold
+/// exactly is refused.
+fn blocked_by_policy_warning(dataset: &str, change: &str, policy: OnSchemaChange) -> String {
+    format!(
+        "Dataset '{dataset}' received a widening schema change on its CDC stream ({change}), but `on_schema_change: {policy}` only evolves added columns, so values are cast to the current schema and a change with a value that schema cannot hold exactly is refused. Set `on_schema_change: sync_all_columns` to evolve types. See: https://spiceai.org/docs/features/data-acceleration"
+    )
+}
+
+/// The warning for a widening the acceleration engine applies only at restart.
+fn restart_required_warning(dataset: &str, change: &str) -> String {
+    format!(
+        "Dataset '{dataset}' received a widening schema change on its CDC stream ({change}), but its acceleration engine cannot evolve mid-stream, so until Spice restarts values are cast to the current schema (new columns are dropped) and a change with a value that schema cannot hold exactly is refused. Restart Spice to apply the evolution. See: https://spiceai.org/docs/features/data-acceleration"
+    )
+}
+
 /// Immutable source policy. No refresh task, sink, or source committer is captured.
 pub(super) struct RefreshCdcPolicy {
     pub dataset: TableReference,
@@ -89,7 +105,7 @@ impl CdcPolicy for RefreshCdcPolicy {
                         &schema_evolution_labels(&dataset, kind, "blocked_by_policy"),
                     );
                     if schema_evolution_first_warn(format!("{dataset}|policy|{change}")) {
-                        tracing::warn!(dataset = %dataset, "widening schema change detected on the CDC stream ({change}) but `on_schema_change: {}` only evolves added columns; values continue to be cast to the current schema. Set `on_schema_change: sync_all_columns` to evolve types", settings.policy);
+                        tracing::warn!(dataset = %dataset, "{}", blocked_by_policy_warning(&dataset, &change, settings.policy));
                         emit_schema_evolution_event(&dataset, "blocked_by_policy", &change, true);
                     }
                     return Ok(SchemaDecision::Proceed);
@@ -116,7 +132,7 @@ impl CdcPolicy for RefreshCdcPolicy {
                             &schema_evolution_labels(&dataset, kind, "restart_required"),
                         );
                         if schema_evolution_first_warn(format!("{dataset}|restart|{change}")) {
-                            tracing::warn!(dataset = %dataset, "widening schema change detected on the CDC stream ({change}) but this acceleration engine cannot evolve mid-stream; incoming values are cast to the current schema (new columns dropped) until restart. Restart Spice to apply the evolution");
+                            tracing::warn!(dataset = %dataset, "{}", restart_required_warning(&dataset, &change));
                             emit_schema_evolution_event(
                                 &dataset,
                                 "restart_required",
@@ -169,5 +185,26 @@ impl CdcPolicy for RefreshCdcPolicy {
         self.settings
             .as_ref()
             .is_some_and(|settings| settings.policy != OnSchemaChange::Block)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_change_warnings_name_the_dataset_the_consequence_and_the_fix() {
+        assert_eq!(
+            blocked_by_policy_warning(
+                "r1",
+                "1 widened (k: Int32 -> Float64)",
+                OnSchemaChange::AppendNewColumns
+            ),
+            "Dataset 'r1' received a widening schema change on its CDC stream (1 widened (k: Int32 -> Float64)), but `on_schema_change: append_new_columns` only evolves added columns, so values are cast to the current schema and a change with a value that schema cannot hold exactly is refused. Set `on_schema_change: sync_all_columns` to evolve types. See: https://spiceai.org/docs/features/data-acceleration"
+        );
+        assert_eq!(
+            restart_required_warning("r1", "1 widened (k: Int32 -> Float64)"),
+            "Dataset 'r1' received a widening schema change on its CDC stream (1 widened (k: Int32 -> Float64)), but its acceleration engine cannot evolve mid-stream, so until Spice restarts values are cast to the current schema (new columns are dropped) and a change with a value that schema cannot hold exactly is refused. Restart Spice to apply the evolution. See: https://spiceai.org/docs/features/data-acceleration"
+        );
     }
 }

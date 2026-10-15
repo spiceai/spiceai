@@ -49,6 +49,68 @@ mod flight_prepared_statements {
             .await
     }
 
+    /// The schema `GetFlightInfo` advertises for a prepared statement with
+    /// bound parameters must match the `DoGet` stream, including for output
+    /// columns derived from a parameter (ADBC and arrow-go reject a mismatch
+    /// with "endpoint 0 returned inconsistent schema").
+    #[tokio::test]
+    async fn test_bound_param_flight_info_schema_matches_stream() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+
+        test_request_context()
+            .scope(async {
+                let (channel, _df) = start_spice_test_app(None, None, None).await?;
+                let mut client = FlightSqlServiceClient::new(channel);
+
+                let int_param = || {
+                    create_param_batch(
+                        vec![("$1", arrow::datatypes::DataType::Int64, true)],
+                        vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+                    )
+                };
+                let cases = [
+                    ("SELECT $1 AS x", int_param()?),
+                    ("SELECT CAST($1 AS VARCHAR) AS x", int_param()?),
+                    (
+                        "SELECT $1 || 'x' AS x",
+                        create_param_batch(
+                            vec![("$1", arrow::datatypes::DataType::Utf8, true)],
+                            vec![Arc::new(StringArray::from(vec!["a"])) as ArrayRef],
+                        )?,
+                    ),
+                    ("SELECT 1 + $1 AS x", int_param()?),
+                ];
+
+                for (sql, params) in cases {
+                    let mut stmt = get_prepared_statement(&mut client, sql).await?;
+                    stmt.set_parameters(params)?;
+                    let flight_info = stmt.execute().await?;
+                    let advertised = flight_info.clone().try_decode_schema()?;
+
+                    let ticket = flight_info
+                        .endpoint
+                        .first()
+                        .and_then(|e| e.ticket.clone())
+                        .ok_or_else(|| anyhow::anyhow!("No ticket for {sql}"))?;
+                    let batches: Vec<RecordBatch> =
+                        client.do_get(ticket).await?.try_collect().await?;
+                    let streamed = batches
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("No batch for {sql}"))?
+                        .schema();
+
+                    assert_eq!(advertised.fields().len(), streamed.fields().len(), "{sql}");
+                    for (a, s) in advertised.fields().iter().zip(streamed.fields()) {
+                        assert_eq!(a.data_type(), s.data_type(), "data type for {sql}");
+                        assert_eq!(a.is_nullable(), s.is_nullable(), "nullability for {sql}");
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn test_question_mark_placeholder() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(Some("integration=debug,info"));

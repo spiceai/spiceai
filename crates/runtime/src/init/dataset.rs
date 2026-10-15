@@ -26,6 +26,7 @@ use std::{
 
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::cluster::partition::get_partition_filter_exprs;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
     ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
@@ -289,22 +290,32 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        if let Some(snapshots) = app.snapshots.as_deref() {
-            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
-                ds.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.enabled
-                        && acceleration
-                            .refresh_mode
-                            .is_some_and(|mode| mode.is_snapshot_only())
-                })
-            });
+        // An executor runs the scheduler's spicepod, whose own startup logs these warnings.
+        if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor) {
             if let Some(warning) =
-                runtime_acceleration::snapshot::notifications::unread_queue_warning(
-                    snapshots,
-                    any_snapshot_mode_dataset,
+                runtime_state_location::scheduler_deprecation::scheduler_deprecation_warning(
+                    &app.runtime,
                 )
             {
                 tracing::warn!("{warning}");
+            }
+            if let Some(section) = app.snapshots.as_deref() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::section_deprecation::section_deprecation_warning(
+                        section,
+                        app.runtime.state.as_ref(),
+                    )
+                );
+            }
+        }
+        // A scheduler loads no accelerations, so it reads no queue whatever its datasets.
+        if self.df.snapshot_notifications().is_some() {
+            for setting in app.unread_snapshot_queues() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::notifications::unread_queue_warning(&setting)
+                );
             }
         }
 
@@ -380,12 +391,7 @@ impl Runtime {
             let resolved = resolve_table_reference(ds.name.clone());
             let future = if pending {
                 background_roots.insert(resolved.clone());
-                self.track_snapshot_bootstrap(
-                    &ds.name,
-                    future,
-                    Some(self.initial_load.cancel.clone()),
-                )
-                .await
+                self.track_snapshot_bootstrap(&ds.name, future).await
             } else {
                 future
             };
@@ -429,13 +435,7 @@ impl Runtime {
                         parent_done.cancelled().await;
                         chain.await;
                     });
-                    let chain = self
-                        .track_snapshot_bootstrap(
-                            &name,
-                            chain,
-                            Some(self.initial_load.cancel.clone()),
-                        )
-                        .await;
+                    let chain = self.track_snapshot_bootstrap(&name, chain).await;
                     background_chains.push((name, chain));
                 } else {
                     chains.push(chain);
@@ -1072,7 +1072,6 @@ impl Runtime {
         self: &Arc<Self>,
         name: &TableReference,
         load: Pin<Box<dyn Future<Output = ()> + Send>>,
-        initial_load_cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let cancel = self.status.shutdown_token().child_token();
         let task_cancel = cancel.clone();
@@ -1081,16 +1080,9 @@ impl Runtime {
                 &Self::snapshot_bootstrap_task_name(name),
                 Some(cancel),
                 async move {
-                    let initial_load_cancel = async move {
-                        match initial_load_cancel {
-                            Some(token) => token.cancelled().await,
-                            None => std::future::pending().await,
-                        }
-                    };
                     tokio::select! {
                         biased;
                         () = task_cancel.cancelled() => {},
-                        () = initial_load_cancel => {},
                         () = load => {},
                     }
                     Ok(())
@@ -1915,7 +1907,7 @@ impl Runtime {
         self.df.clear_cached_plans().await;
 
         // A reload can change what the dataset reads, so results read from its
-        // previous contents must stop being served as fresh, and a query that
+        // previous contents must stop being served, and a query that
         // planned against the previous registration must not store its result.
         // Both of those read the table-change clock this marks. The replacement
         // below marks it again: this mark cannot reject a result whose read
@@ -1940,8 +1932,8 @@ impl Runtime {
                     {
                         Ok(()) => {
                             // Mark again now the swap has happened. The mark above
-                            // stops results read before the reload from being served
-                            // as fresh, but a query that started after it and read the
+                            // stops results read before the reload from being served,
+                            // but a query that started after it and read the
                             // previous registration finishes with a `read_started_at`
                             // the clock would accept, so its result must be rejected by
                             // a mark at the replacement itself.
@@ -2031,7 +2023,7 @@ impl Runtime {
     }
 
     /// Marks the results-cache table clock for `dataset`, so results read from
-    /// what it held before this point stop being served as fresh and a result
+    /// what it held before this point stop being served and a result
     /// read before it cannot be stored as fresh afterwards.
     ///
     /// Degrade and continue, as the write paths that mark the same clock do: a
@@ -2054,14 +2046,8 @@ impl Runtime {
         cause: CacheInvalidation,
     ) {
         let caching = self.df.caching();
-        // An unload takes the evicting path, which a `cache_key_type: sql` hit needs
-        // because such a hit is answered before planning and the plan cache therefore
-        // never reaches it. See [`cache::QueryResultsCacheProvider::evict_for_table`]
-        // for why the stale-serving window must not absorb an unload.
-        let outcome = match cause {
-            CacheInvalidation::Reload => caching.invalidate_for_table(dataset.clone()).await,
-            CacheInvalidation::Unload => caching.evict_for_table(dataset.clone()).await,
-        };
+        // Reload and unload hard-evict results, including raw SQL hits served before planning.
+        let outcome = caching.invalidate_for_table(dataset.clone()).await;
 
         if let Err(e) = outcome {
             tracing::warn!("{}", cache_invalidation_warning(dataset, cause, &e));
@@ -2853,8 +2839,7 @@ impl Runtime {
                     .await;
             });
             let load_future = if pending {
-                self.track_snapshot_bootstrap(&ds.name, load_future, None)
-                    .await
+                self.track_snapshot_bootstrap(&ds.name, load_future).await
             } else {
                 load_future
             };
@@ -6256,11 +6241,11 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     /// A reload marks the results-cache table clock for the dataset it reloads.
     ///
     /// The reload replaces what the dataset reads, so a result read from its previous
-    /// contents must stop being served as fresh, and a query that planned against the
+    /// contents must stop being served, and a query that planned against the
     /// previous registration must not store the result it reads. Both of those are
-    /// decided by that mark: `entry_validity` reads it on every hit, and
+    /// decided by that mark: `tables_changed_since` reads it on every hit, and
     /// `tables_changed_since` reads it before a result is stored. Clearing the cached
-    /// plans, which is all the reload used to do, changes neither.
+    /// plans alone does not prevent reuse of cached results.
     #[tokio::test]
     async fn updating_a_dataset_invalidates_the_results_cached_from_it() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);

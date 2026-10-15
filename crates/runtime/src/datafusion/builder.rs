@@ -104,7 +104,9 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use spicepod::component::runtime::{CteMaterialization, SpillCompression as SpiceSpillCompression};
+use spicepod::component::runtime::{
+    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
+};
 use spicepod::metric::Metrics;
 use tokio::{
     runtime::Handle,
@@ -357,11 +359,13 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
     caching: Option<Arc<Caching>>,
     results_cache_warmup_store: Option<std::path::PathBuf>,
     results_cache_warmup_enabled: bool,
     results_cache_warmer: Option<super::query::ResultsCacheWarmer>,
+    runtime_state_location: Option<String>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
@@ -488,11 +492,13 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
             task_history_enabled: true,
+            query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
             caching: None,
             results_cache_warmup_store: None,
             results_cache_warmup_enabled: false,
             results_cache_warmer: None,
+            runtime_state_location: None,
             spill_compression: None,
             cluster_config: None,
             metrics: None,
@@ -521,6 +527,13 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    #[must_use]
+    pub fn with_query_error_logging(mut self, query_error_logging: QueryErrorLogging) -> Self {
+        self.query_error_logging = query_error_logging;
+        self
+    }
+
     /// Whether queries build the output preview; see
     /// `DataFusion::task_history_captured_output`.
     #[must_use]
@@ -544,6 +557,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_results_cache_warmup_enabled(mut self, enabled: bool) -> Self {
         self.results_cache_warmup_enabled = enabled;
+        self
+    }
+
+    /// The spicepod's `runtime.state.location`, which snapshot notifications
+    /// route by.
+    #[must_use]
+    pub fn with_runtime_state_location(mut self, location: Option<String>) -> Self {
+        self.runtime_state_location = location;
         self
     }
 
@@ -1172,7 +1193,7 @@ impl DataFusionBuilder {
             if let Some(registry) = &self.executor_registry {
                 let reg = Arc::clone(registry);
                 let addresses: ExecutorAddressProvider =
-                    Arc::new(move || reg.ready_executor_ids_sync());
+                    Arc::new(move || reg.ready_executor_addresses_sync());
                 // The primary gate is the scale-invariant cost test
                 // (dim_rows × executors < fact_rows); this is the absolute cap
                 // on the broadcast dimension's row count to bound per-executor
@@ -1445,13 +1466,16 @@ impl DataFusionBuilder {
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             snapshot_notifications: Arc::new(
-                runtime_acceleration::snapshot::notifications::SnapshotNotifications::default(),
+                runtime_acceleration::snapshot::notifications::SnapshotNotifications::new(
+                    self.runtime_state_location,
+                ),
             ),
             dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
+            query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),

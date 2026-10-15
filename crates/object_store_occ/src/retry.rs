@@ -28,6 +28,9 @@ use std::future::Future;
 use std::time::Duration;
 
 /// How a compare-and-swap loop backs off while other writers keep winning.
+///
+/// Every writer of shared state retries with [`ConflictRetry::default`], so
+/// one change here applies to all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictRetry {
     /// Attempts before giving up, counting the first. At least 1.

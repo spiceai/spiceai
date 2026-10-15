@@ -1179,6 +1179,333 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
     Ok(())
 }
 
+/// The `k` column of an envelope's change batch, which must carry exactly one row.
+fn single_change_value(envelope: &ChangeEnvelope) -> (i64, arrow::array::ArrayRef) {
+    let batch = envelope.change_batch().expect("built change batch");
+    assert_eq!(batch.record.num_rows(), 1, "expected one change");
+    let data = batch
+        .record
+        .column_by_name("data")
+        .expect("data column")
+        .as_struct();
+    let id = data
+        .column_by_name("id")
+        .expect("id column")
+        .as_primitive::<arrow::datatypes::Int64Type>()
+        .value(0);
+    (id, Arc::clone(data.column_by_name("k").expect("k column")))
+}
+
+/// Start a stream over a fresh `public.<table> (id bigint primary key, k integer)`
+/// holding three rows, and drive it to Ready.
+async fn start_alter_type_stream(
+    port: u16,
+    table: &str,
+    policy: SchemaEvolutionPolicy,
+) -> Result<(tokio_postgres::Client, ChangesStream), anyhow::Error> {
+    let source = common::connect(port).await?;
+    source
+        .simple_query(&format!(
+            "CREATE TABLE public.{table} (id bigint PRIMARY KEY, k integer); \
+             INSERT INTO public.{table} VALUES (1, 10), (2, 20), (3, 30);"
+        ))
+        .await?;
+    let input = ReplicationStreamInput {
+        dataset_name: table.into(),
+        params: params_for(port, &format!("{table}_slot"), &format!("{table}_pub")),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int32, true),
+        ])),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.into(),
+        metrics: ReplicationMetricsCollector::new(),
+        policy,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
+    };
+    let mut stream = start_replication_stream(input);
+    let boot = next_envelope(&mut stream, "bootstrap").await?;
+    assert_eq!(num_rows(&boot), 3, "bootstrap delivers the three seed rows");
+    boot.commit().await?;
+    wait_for_ready(&mut stream, "readiness")
+        .await?
+        .commit()
+        .await?;
+    Ok((source, stream))
+}
+
+/// Regression test for #14718: the first change after a source column's type
+/// changed is decoded with the new type.
+///
+/// Postgres sends a table's `Relation` message only before the first change on
+/// it in a session, so when that change follows an `ALTER COLUMN ... TYPE`, the
+/// first `Relation` the stream sees already carries the new type. The stream
+/// must still see that the type differs from the one the dataset registered.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_change_after_column_type_change_decodes_with_the_new_type()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+
+    // `sync_all_columns` widens `k` to `Float64` live and carries 1.5 exactly.
+    let (source, mut stream) = start_alter_type_stream(
+        port,
+        "alter_type_sync",
+        SchemaEvolutionPolicy::SyncAllColumns,
+    )
+    .await?;
+    source
+        .simple_query(
+            "ALTER TABLE public.alter_type_sync ALTER COLUMN k TYPE double precision; \
+             INSERT INTO public.alter_type_sync VALUES (4, 1.5);",
+        )
+        .await?;
+    let envelope = next_change_envelope(&mut stream, "insert after widening").await?;
+    let (id, k) = single_change_value(&envelope);
+    assert_eq!(id, 4);
+    assert_eq!(k.data_type(), &DataType::Float64, "k is widened to Float64");
+    assert_eq!(
+        k.as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0)
+            .to_bits(),
+        1.5f64.to_bits()
+    );
+    envelope.commit().await?;
+    drop(stream);
+
+    // `block` keeps the registered `Int32`: a value the new type holds that
+    // `Int32` represents exactly is applied, and one it cannot is an error that
+    // names the column, never a truncated row.
+    let (source, mut stream) =
+        start_alter_type_stream(port, "alter_type_block", SchemaEvolutionPolicy::Block).await?;
+    source
+        .simple_query(
+            "ALTER TABLE public.alter_type_block ALTER COLUMN k TYPE double precision; \
+             INSERT INTO public.alter_type_block VALUES (4, 2.0);",
+        )
+        .await?;
+    let envelope = next_change_envelope(&mut stream, "exact insert under block").await?;
+    let (id, k) = single_change_value(&envelope);
+    assert_eq!(id, 4);
+    assert_eq!(
+        k.data_type(),
+        &DataType::Int32,
+        "block keeps the registered type"
+    );
+    assert_eq!(k.as_primitive::<arrow::datatypes::Int32Type>().value(0), 2);
+    envelope.commit().await?;
+
+    source
+        .simple_query("INSERT INTO public.alter_type_block VALUES (5, 2.5)")
+        .await?;
+    let envelope = next_envelope(&mut stream, "lossy insert under block").await?;
+    let error = envelope
+        .change_batch()
+        .expect_err("2.5 cannot be stored in an Int32 column")
+        .to_string();
+    assert!(
+        error.contains(
+            "column 'k': postgres_replication: the float8 value 2.5 (type oid 701) cannot be \
+             stored in the dataset's `Int32` column without loss"
+        ),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+/// A stream that resumes with WAL from both sides of a column type change still
+/// unconsumed keeps applying it. The dataset is registered from the source as it
+/// is now (`k` already `double precision`), so the first `Relation` the resumed
+/// stream receives describes an older, narrower type than the registered one;
+/// its values are widened into the registered type rather than refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_across_a_column_type_change_applies_wal_from_both_sides()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+    let table = "alter_type_resume";
+    let (source, stream) =
+        start_alter_type_stream(port, table, SchemaEvolutionPolicy::SyncAllColumns).await?;
+    drop(stream);
+    // Model a restart: the changes below are written while no stream holds the
+    // slot, so the resumed stream reads them in a new replication session.
+    let slot = format!("{table}_slot");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let active: bool = source
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await?
+            .get(0);
+        if !active {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "slot {slot} stayed active after its stream was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // One transaction each: a multi-statement `simple_query` would run as one.
+    for statement in [
+        format!("INSERT INTO public.{table} VALUES (4, 7)"),
+        format!("ALTER TABLE public.{table} ALTER COLUMN k TYPE double precision"),
+        format!("INSERT INTO public.{table} VALUES (5, 1.5)"),
+    ] {
+        source.simple_query(&statement).await?;
+    }
+
+    let input = ReplicationStreamInput {
+        dataset_name: table.into(),
+        params: params_for(port, &format!("{table}_slot"), &format!("{table}_pub")),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Float64, true),
+        ])),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.into(),
+        metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::SyncAllColumns,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
+    };
+    let mut stream = start_replication_stream(input);
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let envelope = next_change_envelope(&mut stream, "replayed inserts").await?;
+        let (id, k) = single_change_value(&envelope);
+        assert_eq!(
+            k.data_type(),
+            &DataType::Float64,
+            "k stays the registered Float64"
+        );
+        seen.push((
+            id,
+            k.as_primitive::<arrow::datatypes::Float64Type>()
+                .value(0)
+                .to_bits(),
+        ));
+        envelope.commit().await?;
+    }
+    assert_eq!(seen, vec![(4, 7.0f64.to_bits()), (5, 1.5f64.to_bits())]);
+    Ok(())
+}
+
+/// The dataset's schema is inferred before the stream reads the source catalog,
+/// so on a restart a type change can land between the two: the registered
+/// schema still says `Int32` while the catalog, and the first `Relation`,
+/// already say `double precision`. The resumed stream must still widen it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_change_between_registration_and_join_is_still_adopted() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+    let table = "alter_type_before_join";
+    let (source, stream) =
+        start_alter_type_stream(port, table, SchemaEvolutionPolicy::SyncAllColumns).await?;
+    drop(stream);
+    let slot = format!("{table}_slot");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let active: bool = source
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await?
+            .get(0);
+        if !active {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "slot {slot} stayed active after its stream was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    source
+        .simple_query(&format!(
+            "ALTER TABLE public.{table} ALTER COLUMN k TYPE double precision"
+        ))
+        .await?;
+
+    // Resumed with the schema registered before the `ALTER`.
+    let input = ReplicationStreamInput {
+        dataset_name: table.into(),
+        params: params_for(port, &slot, &format!("{table}_pub")),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int32, true),
+        ])),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.into(),
+        metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::SyncAllColumns,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
+    };
+    let mut stream = start_replication_stream(input);
+    source
+        .simple_query(&format!("INSERT INTO public.{table} VALUES (4, 1.5)"))
+        .await?;
+    let envelope = next_change_envelope(&mut stream, "insert after the earlier change").await?;
+    let (id, k) = single_change_value(&envelope);
+    assert_eq!(id, 4);
+    assert_eq!(k.data_type(), &DataType::Float64, "k is widened to Float64");
+    assert_eq!(
+        k.as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0)
+            .to_bits(),
+        1.5f64.to_bits()
+    );
+    envelope.commit().await?;
+    Ok(())
+}
+
+/// Under `block`, an `integer` column changed to `oid` keeps the registered
+/// `Int32` type, and an `oid` value that type holds is applied as it.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_applies_an_oid_value_into_the_registered_integer_column() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+    let table = "alter_type_oid_block";
+    let (source, mut stream) =
+        start_alter_type_stream(port, table, SchemaEvolutionPolicy::Block).await?;
+    source
+        .simple_query(&format!(
+            "ALTER TABLE public.{table} ALTER COLUMN k TYPE oid USING k::oid; \
+             INSERT INTO public.{table} VALUES (4, 42);"
+        ))
+        .await?;
+    let envelope = next_change_envelope(&mut stream, "oid insert under block").await?;
+    let (id, k) = single_change_value(&envelope);
+    assert_eq!(id, 4);
+    assert_eq!(
+        k.data_type(),
+        &DataType::Int32,
+        "block keeps the registered type"
+    );
+    assert_eq!(k.as_primitive::<arrow::datatypes::Int32Type>().value(0), 42);
+    envelope.commit().await?;
+    Ok(())
+}
+
 pub(super) async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,

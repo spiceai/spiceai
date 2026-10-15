@@ -1891,6 +1891,14 @@ impl RefreshTask {
             ));
         }
         state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
+        // Only now: the replaced provider is no longer served.
+        state
+            .accelerator
+            .maintain_after_snapshot_restore(
+                state.source.as_ref(),
+                &state.swappable_provider.current(),
+            )
+            .await;
         if let Some(updated_at) = info.last_updated_at {
             self.last_updated_at
                 .store(updated_at, std::sync::atomic::Ordering::Release);
@@ -2881,6 +2889,47 @@ impl RefreshTask {
     fn update_last_updated_at(&self) {
         super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
     }
+}
+
+/// Reads the first batch a full refresh of `dataset_name` reads, planned in the context a
+/// refresh plans in: through `refresh_sql` when the dataset has one, every column of
+/// `federated_provider` otherwise. `accelerator` is registered beside it, as the dataset's
+/// acceleration is for a refresh.
+///
+/// A settings rebuild drops an acceleration only once this read succeeds, so its reload
+/// is known to be able to read what a refresh reads.
+///
+/// # Errors
+///
+/// Returns the error that planning or executing the read fails with.
+pub async fn read_first_refresh_batch(
+    federated_provider: Arc<dyn TableProvider>,
+    dataset_name: &TableReference,
+    accelerator: &Arc<dyn TableProvider>,
+    refresh_sql: Option<String>,
+    disable_federation: bool,
+    io_runtime: Handle,
+) -> Result<(), DataFusionError> {
+    let mut ctx = RefreshTask::create_refresh_df_context(
+        Arc::clone(&federated_provider),
+        dataset_name,
+        accelerator,
+        disable_federation,
+        io_runtime,
+    )
+    .await;
+    let mut data = get_data(
+        &mut ctx,
+        dataset_name.clone(),
+        federated_provider,
+        refresh_sql,
+        Vec::new(),
+    )
+    .await?;
+    if let Some(batch) = data.next().await {
+        batch?;
+    }
+    Ok(())
 }
 
 /// Returns true when `candidate` is structurally compatible with `expected`

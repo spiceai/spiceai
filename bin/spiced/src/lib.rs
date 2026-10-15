@@ -27,8 +27,8 @@ use std::time::Duration;
 use tokio::sync::SetOnce;
 
 use app::spicepod::component::runtime::{
-    ClientAuthMode as SpicepodClientAuthMode, Runtime as SpicepodRuntime, TelemetryConfig,
-    validate_metric_prefix,
+    ClientAuthMode as SpicepodClientAuthMode, OtelExporterConfig, OtelSignal,
+    Runtime as SpicepodRuntime, TelemetryConfig, validate_metric_prefix,
 };
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -152,6 +152,7 @@ mod runtime_lock;
 pub use runtime_lock::{InstanceClaim, claim_instance_directory};
 #[path = "tracing.rs"]
 mod spiced_tracing;
+pub use spiced_tracing::otel_logs;
 mod tls;
 
 /// Registers the connector *aliases* — secondary names that reuse an existing connector's
@@ -194,6 +195,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
     UnableToStartServers { source: Box<runtime::Error> },
+
+    #[snafu(display("{source}"))]
+    StateLocationRefused { source: Box<runtime::Error> },
 
     #[snafu(display("Failed to load dataset: {source}"))]
     UnableToLoadDataset { source: Box<runtime::Error> },
@@ -852,6 +856,14 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     // accelerator memory budget, invalid `runtime.query.*` values — are dropped.
     let rt = in_tracing_context_async(builder.build()).await;
 
+    // `logs` in `runtime.telemetry.otel_exporter.signals` also sends the log to
+    // the exporter's endpoint. An executor learns that setting from the
+    // scheduler, after the subscriber is installed, so it installs the layer
+    // unarmed and arms it once the setting arrives (below).
+    let otel_logs_config = telemetry_config.get().and_then(otel_logs_exporter).cloned();
+    let otel_logs_sink =
+        (is_executor || otel_logs_config.is_some()).then(otel_logs::LogsSink::default);
+
     spiced_tracing::init_tracing(
         app.as_ref(),
         tracing_config.as_ref(),
@@ -864,9 +876,20 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         ),
         cloud_connect_configured,
         args.service_log_dir.as_deref(),
+        otel_logs_sink.clone(),
     )
     .await
     .context(UnableToInitializeTracingSnafu)?;
+
+    if let (Some(sink), Some(exporter)) = (&otel_logs_sink, &otel_logs_config) {
+        start_otel_logs(
+            rt.secrets(),
+            sink,
+            exporter,
+            telemetry_config.get().map(|c| &c.properties),
+        )
+        .await;
+    }
 
     if args.open_telemetry_deprecated {
         tracing::warn!(
@@ -987,7 +1010,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     let otel_config = telemetry_config
         .get()
         .and_then(|c| c.otel_exporter.as_ref())
-        .filter(|c| c.enabled);
+        .filter(|c| c.enabled && c.exports(OtelSignal::Metrics));
 
     // Cloud Connect counts: its reader only produces data once it is attached to
     // the meter provider built below, and an enrolled instance alone sets none
@@ -1000,11 +1023,7 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
         let resolved_otel_headers = if let Some(config) = otel_config {
-            runtime_secrets::get_params_with_secrets(rt.secrets(), &config.headers)
-                .await
-                .into_iter()
-                .map(|(key, value)| (key, value.expose_secret().to_string()))
-                .collect()
+            resolve_otel_headers(rt.secrets(), config).await
         } else {
             std::collections::HashMap::new()
         };
@@ -1017,15 +1036,8 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
         // on-demand reader and inherit attribution from the scheduler-side
         // pipeline, so the empty-resource case here is consistent with the
         // surrounding executor config flow.
-        let resource_attributes: Vec<KeyValue> = telemetry_config
-            .get()
-            .map(|c| {
-                c.properties
-                    .iter()
-                    .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let resource_attributes =
+            telemetry_properties(telemetry_config.get().map(|c| &c.properties));
         let metric_prefix = telemetry_config.get().and_then(|c| c.metric_prefix.clone());
 
         init_metrics(
@@ -1136,6 +1148,19 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     });
 
     let rt = Arc::new(rt);
+
+    if is_executor && let Some(sink) = otel_logs_sink {
+        let telemetry_config = Arc::clone(&telemetry_config);
+        let secrets = rt.secrets();
+        tokio::spawn(async move {
+            // Set once the executor has joined the cluster and bound the
+            // scheduler's secrets, which header templates resolve through.
+            let config = telemetry_config.wait().await;
+            if let Some(exporter) = otel_logs_exporter(config) {
+                start_otel_logs(secrets, &sink, exporter, Some(&config.properties)).await;
+            }
+        });
+    }
 
     if needs_metrics {
         rt.init_cache_metrics();
@@ -1283,6 +1308,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     let result = match server_thread.await {
         // Don't treat force terminated as an error
         Ok(Err(runtime::Error::ForceTerminated)) => Ok(()),
+        Ok(Err(e @ runtime::Error::StateLocationRefused { .. })) => {
+            Err(Error::StateLocationRefused {
+                source: Box::new(e),
+            })
+        }
         Ok(ok) => ok.map_err(|e| Error::UnableToStartServers {
             source: Box::new(e),
         }),
@@ -1649,6 +1679,77 @@ pub async fn build_app(args: &Args) -> Result<AppBundle> {
     })
 }
 
+/// The exporter configuration that sends logs, if `config` has one enabled.
+fn otel_logs_exporter(config: &TelemetryConfig) -> Option<&OtelExporterConfig> {
+    config
+        .otel_exporter
+        .as_ref()
+        .filter(|exporter| exporter.enabled && exporter.exports(OtelSignal::Logs))
+}
+
+/// `config.headers` with their secret templates resolved, ready to send.
+async fn resolve_otel_headers(
+    secrets: Arc<tokio::sync::RwLock<runtime_secrets::Secrets>>,
+    config: &OtelExporterConfig,
+) -> HashMap<String, String> {
+    runtime_secrets::get_params_with_secrets(secrets, &config.headers)
+        .await
+        .into_iter()
+        .map(|(key, value)| (key, value.expose_secret().to_string()))
+        .collect()
+}
+
+/// `runtime.telemetry.properties` as resource attributes.
+fn telemetry_properties(properties: Option<&HashMap<String, String>>) -> Vec<KeyValue> {
+    properties
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The resource every exported signal describes this process with.
+///
+/// `runtime.telemetry.properties` are applied over what `Resource::builder()`
+/// reads from the environment (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`),
+/// so an explicit property wins over an environment attribute of the same key.
+/// Metrics and logs share it, so a backend can join one to the other.
+fn exporter_resource(attributes: Vec<KeyValue>) -> Resource {
+    let mut builder = Resource::builder();
+    if !attributes.is_empty() {
+        builder = builder.with_attributes(attributes);
+    }
+    builder.build()
+}
+
+/// Starts exporting logs to `exporter.endpoint` and reports the outcome.
+///
+/// A failure is logged and leaves logging on stdout only: the runtime starts
+/// either way, as it does when the metrics exporter cannot start.
+async fn start_otel_logs(
+    secrets: Arc<tokio::sync::RwLock<runtime_secrets::Secrets>>,
+    sink: &otel_logs::LogsSink,
+    exporter: &OtelExporterConfig,
+    properties: Option<&HashMap<String, String>>,
+) {
+    let headers = resolve_otel_headers(secrets, exporter).await;
+    let resource = exporter_resource(telemetry_properties(properties));
+    match otel_logs::start(sink, exporter, headers, resource) {
+        Ok(()) => {
+            let protocol = if exporter.is_http() { "http" } else { "grpc" };
+            tracing::info!(
+                endpoint = %exporter.endpoint,
+                protocol = protocol,
+                "OTEL logs exporter enabled"
+            );
+        }
+        Err(e) => tracing::error!("Failed to initialize OTEL logs exporter: {e}"),
+    }
+}
+
 /// Initializes the global [`SdkMeterProvider`] with whichever metric sinks the
 /// caller has configured. Each reader is attached independently; any
 /// combination is valid as long as at least one source is present.
@@ -1709,13 +1810,8 @@ fn init_metrics(
     // `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are still merged in
     // by `Resource::builder()`; explicit attributes here take precedence over
     // env-derived ones with the same key.
-    let mut resource_builder = Resource::builder();
-    if !resource_attributes.is_empty() {
-        resource_builder = resource_builder.with_attributes(resource_attributes);
-    }
-    let resource = resource_builder.build();
-
-    let mut provider_builder = SdkMeterProvider::builder().with_resource(resource);
+    let mut provider_builder =
+        SdkMeterProvider::builder().with_resource(exporter_resource(resource_attributes));
 
     // Optional metric name prefix (e.g. "spiceai.") configured under
     // `runtime.telemetry.metric_prefix`. Applied via an OTel View on the
@@ -1850,6 +1946,7 @@ async fn start_anonymous_telemetry(
         telemetry::anonymous::start(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
+            cpu_budget::cpu_budget().configured_cores(),
         )
         .await;
     }

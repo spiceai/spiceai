@@ -3821,6 +3821,95 @@ mod tests {
         }
     }
 
+    /// MySQL's bare `DATETIME` keeps no fractional seconds and rounds a literal with
+    /// more than six, so a fractional-second filter must reach it as `DATETIME(6)`
+    /// with the literal cut to six digits, or it compares a different instant.
+    #[test]
+    fn a_fractional_second_filter_unparsed_for_mysql_keeps_its_precision() {
+        let at = |nanos: i64| lit(ScalarValue::TimestampNanosecond(Some(nanos), None));
+        // 1994-06-15 12:30:00.5 and 12:30:00.123456789 as nanoseconds since the Unix epoch.
+        let (half_second, nine_digits) = (771_683_400_500_000_000, 771_683_400_123_456_789);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            None,
+        )
+        .expect("scan events")
+        .filter(
+            col("ts")
+                .eq(at(half_second))
+                .or(col("ts").eq(at(nine_digits))),
+        )
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("mysql", &MySqlDialect {}, &plan);
+        for literal in [
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))",
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))",
+        ] {
+            assert!(
+                sql.contains(literal),
+                "MySQL must compare at microsecond precision, or the filter selects the wrong \
+                 rows: expected {literal} in {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14941: `INTERSECT` and `EXCEPT` are planned as semi
+    /// and anti joins whose keys match NULLs, because a set operation treats two
+    /// NULLs as the same value. `=` is never true on NULL, so the federated
+    /// statement must compare those keys with `IS NOT DISTINCT FROM` (`<=>` on
+    /// MySQL), or the remote engine drops every row with a NULL in a compared
+    /// column from an `INTERSECT` and keeps it in an `EXCEPT`.
+    #[test]
+    fn intersect_and_except_unparse_keys_that_match_nulls() {
+        let scan = |name: &str| {
+            LogicalPlanBuilder::scan(
+                name,
+                table_source(vec![Field::new("k", DataType::Utf8, true)]),
+                None,
+            )
+            .and_then(|scan| scan.project(vec![col("k")]))
+            .and_then(LogicalPlanBuilder::build)
+            .unwrap_or_else(|error| panic!("scan {name}: {error}"))
+        };
+        // (dialect, identifier quote, how it spells a key comparison that matches NULLs)
+        let dialects: [(&str, &dyn Dialect, char, &str); 3] = [
+            ("duckdb", &DuckDBDialect::new(), '"', "IS NOT DISTINCT FROM"),
+            (
+                "postgres",
+                &PostgreSqlDialect {},
+                '"',
+                "IS NOT DISTINCT FROM",
+            ),
+            ("mysql", &MySqlDialect {}, '`', "<=>"),
+        ];
+        for (operation, exists) in [("INTERSECT", "EXISTS"), ("EXCEPT", "NOT EXISTS")] {
+            let plan = if operation == "INTERSECT" {
+                LogicalPlanBuilder::intersect(scan("a"), scan("b"), false)
+            } else {
+                LogicalPlanBuilder::except(scan("a"), scan("b"), false)
+            }
+            .unwrap_or_else(|error| panic!("{operation}: {error}"));
+            for (dialect_name, dialect, q, matches) in dialects {
+                assert_eq!(
+                    unparse_with(dialect_name, dialect, &plan),
+                    format!(
+                        "SELECT DISTINCT {q}a{q}.{q}k{q} FROM {q}a{q} WHERE {exists} \
+                         (SELECT 1 FROM {q}b{q} WHERE ({q}a{q}.{q}k{q} {matches} {q}b{q}.{q}k{q}))"
+                    ),
+                    "{dialect_name}: {operation} must compare its keys so that NULLs match"
+                );
+            }
+        }
+    }
+
     /// Regression test for the unparser's `rescope_projection_over_projection`,
     /// carried by the `spiceai/datafusion` fork (upstream's
     /// apache/datafusion#22961): common subexpression elimination leaves a
@@ -4231,5 +4320,47 @@ mod tests {
                 "a column the cast keeps still does"
             );
         }
+    }
+
+    /// MySQL's bare `DATETIME` keeps no fractional seconds, so a timestamp
+    /// pushed down as `CAST('… .5' AS DATETIME)` compares against the whole
+    /// second and a filter on a fractional-second value selects the wrong rows
+    /// (#14929). The cast names the precision of the literal's unit, at most the
+    /// six digits MySQL holds, and longer literals are cut to six, not rounded.
+    #[test]
+    fn a_mysql_timestamp_literal_keeps_its_fractional_seconds() {
+        let unparser = Unparser::new(&MySqlDialect {});
+        let render = |value: ScalarValue| {
+            unparser
+                .expr_to_sql(&lit(value))
+                .expect("unparse timestamp literal")
+                .to_string()
+        };
+        // 1994-06-15 12:30:00 UTC plus a fraction, in each unit.
+        assert_eq!(
+            render(ScalarValue::TimestampNanosecond(
+                Some(771_683_400_500_000_000),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampNanosecond(
+                Some(771_683_400_123_456_789),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampMillisecond(
+                Some(771_683_400_500),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(3))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampSecond(Some(771_683_400), None)),
+            "CAST('1994-06-15 12:30:00' AS DATETIME(0))"
+        );
     }
 }

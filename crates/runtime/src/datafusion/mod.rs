@@ -39,7 +39,7 @@ use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
-use crate::dataaccelerator::{self, BootstrapStatus};
+use crate::dataaccelerator::{self, AccelerationSource, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
@@ -66,7 +66,9 @@ use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use data_connector_api::federated::FederatedTableProvider;
-use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
+use runtime_acceleration::acceleration::{
+    DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL, SettingsRebuild,
+};
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
@@ -130,6 +132,7 @@ use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
+use spicepod::component::runtime::QueryErrorLogging;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -254,6 +257,17 @@ pub enum Error {
 
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
     UnableToCreateDataAccelerator { source: dataaccelerator::Error },
+
+    /// A rebuild for changed settings could not clear the dataset checkpoint, which it
+    /// must do before dropping the acceleration: a checkpoint that outlived the dropped
+    /// table would mark its empty replacement loaded. Nothing is dropped. Retriable.
+    #[snafu(display(
+        "Failed to rebuild the acceleration of dataset '{dataset_name}' for its changed settings, so the dataset does not load until a retry succeeds: its load checkpoint could not be cleared. Cause: {source}"
+    ))]
+    AccelerationRebuildCheckpoint {
+        dataset_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
@@ -626,7 +640,7 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
-                // An invalid `snapshots.params.s3_queue_url`.
+                // An invalid snapshot `s3_queue_url`.
                 | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
@@ -634,6 +648,150 @@ impl Error {
                 | Self::SnapshotCreationBatchesShouldBePositive
         )
     }
+}
+
+/// How long a dataset whose acceleration needs a rebuild waits for its source to answer a
+/// read, reaching it first if it has not been reached yet, before keeping the settings its
+/// acceleration was built with.
+const REBUILD_SOURCE_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether a rebuilt acceleration could reload from `source_table_provider`: its source
+/// answers the read the reload makes, on the schema the dataset registered with. A source
+/// whose schema change `on_schema_change` holds back cannot. Any other source is read as a
+/// refresh reads it ([`read_refresh_batch`]), after waiting for it to be reached if it has
+/// not been yet, all within [`REBUILD_SOURCE_WAIT`].
+///
+/// A built table alone shows nothing about reads: a connector can build one without
+/// reading its source (from a lazily connecting pool, say) while every read fails. Nor does
+/// a read of the bare table show that the dataset's `refresh_sql` runs over what it reads.
+/// Dropping the acceleration on less would leave the dataset with no rows until the reload
+/// can run.
+async fn source_readable_for_rebuild(
+    dataset: &Dataset,
+    acceleration_schema: &SchemaRef,
+    disable_federation: bool,
+    source_table_provider: &FederatedTable,
+    io_runtime: Handle,
+) -> bool {
+    if source_table_provider.holds_schema_change() {
+        return false;
+    }
+    let read = async {
+        let Ok(table_provider) = source_table_provider.try_wait_table_provider().await else {
+            return false;
+        };
+        match read_refresh_batch(
+            dataset,
+            acceleration_schema,
+            disable_federation,
+            table_provider,
+            io_runtime,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                let error = error.to_string();
+                let cause = util::single_line(&error);
+                tracing::debug!(
+                    "Dataset '{}' keeps its acceleration for now: reading its source before a rebuild failed: {cause}",
+                    dataset.name
+                );
+                false
+            }
+        }
+    };
+    tokio::time::timeout(REBUILD_SOURCE_WAIT, read)
+        .await
+        .unwrap_or(false)
+}
+
+/// Reads the first batch `dataset`'s refresh reads from `table_provider`, planned as a
+/// refresh plans it: through the dataset's `refresh_sql` when it has one, every column
+/// otherwise. The acceleration is not open while this decides whether to drop it, so an
+/// empty table of its schema stands in for it beside the source.
+async fn read_refresh_batch(
+    dataset: &Dataset,
+    acceleration_schema: &SchemaRef,
+    disable_federation: bool,
+    table_provider: Arc<dyn TableProvider>,
+    io_runtime: Handle,
+) -> datafusion::error::Result<()> {
+    let sql = dataset
+        .refresh_sql()
+        .map(|sql| {
+            refresh_sql::parse_refresh_sql(dataset.name.clone(), &sql, table_provider.schema())
+                .map(|(parsed, _schema)| parsed.to_sql())
+                .map_err(|error| DataFusionError::Plan(error.to_string()))
+        })
+        .transpose()?;
+    let acceleration_stand_in: Arc<dyn TableProvider> = Arc::new(
+        datafusion::datasource::empty::EmptyTable::new(Arc::clone(acceleration_schema)),
+    );
+    runtime_table::accelerated::refresh_task::read_first_refresh_batch(
+        table_provider,
+        &dataset.name,
+        &acceleration_stand_in,
+        sql,
+        disable_federation,
+        io_runtime,
+    )
+    .await
+}
+
+/// Whether a rebuilt view acceleration could reload: a row of the view's query can be read
+/// through `view_table` within [`REBUILD_SOURCE_WAIT`]. Planning the view reads none of the
+/// sources its query reads, so only a read shows that they answer.
+async fn view_readable_for_rebuild(
+    ctx: &SessionContext,
+    view_name: &TableReference,
+    view_table: &Arc<dyn TableProvider>,
+) -> bool {
+    match tokio::time::timeout(
+        REBUILD_SOURCE_WAIT,
+        read_one_row(ctx, Arc::clone(view_table)),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            let error = error.to_string();
+            let cause = util::single_line(&error);
+            tracing::debug!(
+                "View '{view_name}' keeps its acceleration for now: reading its query before a rebuild failed: {cause}"
+            );
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Reads at most one row through `table_provider`, so an empty source answers too.
+async fn read_one_row(
+    ctx: &SessionContext,
+    table_provider: Arc<dyn TableProvider>,
+) -> datafusion::error::Result<()> {
+    let mut rows = ctx
+        .read_table(table_provider)?
+        .limit(0, Some(1))?
+        .execute_stream()
+        .await?;
+    while let Some(batch) = rows.next().await {
+        batch?;
+    }
+    Ok(())
+}
+
+/// The line an operator reads when an acceleration is rebuilt for changed settings.
+/// `cause` is the engine's account of the settings its stored table cannot adopt, worded
+/// as a clause.
+fn acceleration_rebuilt_message(cause: &str) -> String {
+    let mut chars = cause.chars();
+    let cause: String = chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default();
+    format!("{cause}, so it is dropped and reloaded from the source with the new settings.")
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -1336,6 +1494,8 @@ pub struct DataFusion {
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    pub(crate) query_error_logging: QueryErrorLogging,
     /// Whether a query's output preview is recorded: task history is enabled and the
     /// `captured_output` column of `runtime.task_history` is not `none`. When nothing
     /// records it, queries do not build it.
@@ -3864,18 +4024,15 @@ impl DataFusion {
         };
 
         let accelerated_table_provider = self
-            .accelerator_engine_registry
-            .create_accelerator_table(
-                dataset.name.clone(),
+            .create_dataset_accelerator_table(
+                dataset,
+                &source_table_provider,
                 Arc::clone(&storage_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
                 Arc::clone(&secrets),
-                Some(dataset),
-                Arc::clone(&self.ctx),
             )
-            .await
-            .context(UnableToCreateDataAcceleratorSnafu)?;
+            .await?;
 
         // For RefreshMode::Snapshot, wrap the accelerator in a SwappableTableProvider
         // so the underlying provider can be replaced atomically when a newer snapshot
@@ -4553,9 +4710,9 @@ impl DataFusion {
     }
 
     /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
-    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
-    /// SQS queue that receives them. `None` when no queue is configured, and on
-    /// a scheduler, which loads no accelerations itself.
+    /// S3 event notifications, when the `s3_queue_url` in the dataset's snapshot
+    /// params names the SQS queue that receives them. `None` when no queue is
+    /// configured, and on a scheduler, which loads no accelerations itself.
     async fn subscribe_to_snapshot_notifications(
         &self,
         dataset: &Dataset,
@@ -4571,6 +4728,13 @@ impl DataFusion {
             .context(SnapshotNotificationsConfigSnafu {
                 dataset_name: dataset.name.to_string(),
             })
+    }
+
+    /// Sets the `runtime.state.location` that snapshot queue subscriptions
+    /// resolve against.
+    pub(crate) fn set_runtime_state_location(&self, location: Option<String>) {
+        self.snapshot_notifications
+            .set_runtime_state_location(location);
     }
 
     /// The queue consumers shared by local snapshot bootstrap and refresh.
@@ -4926,27 +5090,10 @@ impl DataFusion {
                 .await;
             }
 
-            // Drop the existing table from the acceleration engine so it can be recreated
-            // with the updated schema
-            let accelerator = self
-                .accelerator_engine_registry
-                .get_accelerator_engine(acceleration_settings.engine)
-                .await
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset_name.clone(),
-                })?;
-            accelerator
-                .drop_table(&dataset_name, dataset)
-                .await
-                .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
-                .context(UnableToCreateDataAcceleratorSnafu)?;
-
-            // Clear the checkpoint so the refresh treats this as a fresh table
-            let _ = cp.delete().await;
-
-            // The table is recreated with a new schema; cached logical plans reference the
-            // old schema and must be dropped (mirrors the in-place evolution path above).
-            self.clear_cached_plans().await;
+            // Drop the existing table from the acceleration engine so it is recreated with
+            // the updated schema; cached logical plans reference the old schema.
+            self.drop_acceleration_for_recreate(dataset, acceleration_settings, Some(&cp))
+                .await?;
 
             SCHEMA_EVOLUTION_APPLIED.add(
                 1,
@@ -4958,6 +5105,228 @@ impl DataFusion {
         }
 
         Ok(None)
+    }
+
+    /// Creates `view`'s accelerator table, rebuilding the acceleration once when the
+    /// engine reports that its stored table was built with settings it cannot adopt in
+    /// place ([`dataaccelerator::Error::RebuildRequired`]).
+    ///
+    /// An engine reports that only for a view whose settings let it be rebuilt
+    /// (`acceleration_source::rebuilds_on_settings_change`), so the rebuild loses no row a
+    /// reload does not bring back. The reload runs the view's query, which reads sources
+    /// that can fail, so the acceleration is dropped only once a row of the query can be
+    /// read through `view_table` ([`view_readable_for_rebuild`]). Until then, the engine
+    /// keeps the settings the acceleration was built with
+    /// ([`SettingsRebuild::HeldUntilSourceReadable`]) and the view keeps serving it.
+    async fn create_view_accelerator_table(
+        &self,
+        view: &View,
+        view_table: &Arc<dyn TableProvider>,
+        schema: SchemaRef,
+        acceleration_settings: &Acceleration,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        match self
+            .create_accelerator_table_for(view, &schema, None, acceleration_settings, &secrets)
+            .await
+        {
+            Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
+                if view_readable_for_rebuild(&self.ctx, &view.name, view_table).await {
+                    self.rebuild_acceleration(view, acceleration_settings, &cause.to_string())
+                        .await?;
+                    return self
+                        .create_accelerator_table_for(
+                            view,
+                            &schema,
+                            None,
+                            acceleration_settings,
+                            &secrets,
+                        )
+                        .await
+                        .context(UnableToCreateDataAcceleratorSnafu);
+                }
+                let mut held_view = view.clone();
+                if let Some(acceleration) = held_view.spec.acceleration.as_mut() {
+                    acceleration.settings_rebuild = SettingsRebuild::HeldUntilSourceReadable;
+                }
+                let mut held_settings = acceleration_settings.clone();
+                held_settings.settings_rebuild = SettingsRebuild::HeldUntilSourceReadable;
+                self.create_accelerator_table_for(
+                    &held_view,
+                    &schema,
+                    None,
+                    &held_settings,
+                    &secrets,
+                )
+                .await
+                .context(UnableToCreateDataAcceleratorSnafu)
+            }
+            result => result.context(UnableToCreateDataAcceleratorSnafu),
+        }
+    }
+
+    /// [`Self::create_view_accelerator_table`] for a dataset, whose rebuilt
+    /// acceleration reloads from its source: the acceleration is dropped only once the
+    /// source answers a read on the schema the dataset registered with
+    /// ([`source_readable_for_rebuild`]). While it does not — it is unreachable, a read of
+    /// it fails, or `on_schema_change` holds back its schema change — a rebuilt table could
+    /// not reload,
+    /// so the engine keeps the settings the acceleration was built with
+    /// ([`SettingsRebuild::HeldUntilSourceReadable`]) and the dataset keeps serving it.
+    async fn create_dataset_accelerator_table(
+        &self,
+        dataset: &Dataset,
+        source_table_provider: &FederatedTable,
+        schema: SchemaRef,
+        constraints: Option<&Constraints>,
+        acceleration_settings: &Acceleration,
+        secrets: Arc<TokioRwLock<Secrets>>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        match self
+            .create_accelerator_table_for(
+                dataset,
+                &schema,
+                constraints,
+                acceleration_settings,
+                &secrets,
+            )
+            .await
+        {
+            Err(dataaccelerator::Error::RebuildRequired { source: cause }) => {
+                if source_readable_for_rebuild(
+                    dataset,
+                    &schema,
+                    acceleration_settings.disable_federation,
+                    source_table_provider,
+                    self.io_runtime.clone(),
+                )
+                .await
+                {
+                    self.rebuild_acceleration(dataset, acceleration_settings, &cause.to_string())
+                        .await?;
+                    return self
+                        .create_accelerator_table_for(
+                            dataset,
+                            &schema,
+                            constraints,
+                            acceleration_settings,
+                            &secrets,
+                        )
+                        .await
+                        .context(UnableToCreateDataAcceleratorSnafu);
+                }
+                let mut held_dataset = dataset.clone();
+                if let Some(acceleration) = held_dataset.acceleration.as_mut() {
+                    acceleration.settings_rebuild = SettingsRebuild::HeldUntilSourceReadable;
+                }
+                let mut held_settings = acceleration_settings.clone();
+                held_settings.settings_rebuild = SettingsRebuild::HeldUntilSourceReadable;
+                self.create_accelerator_table_for(
+                    &held_dataset,
+                    &schema,
+                    constraints,
+                    &held_settings,
+                    &secrets,
+                )
+                .await
+                .context(UnableToCreateDataAcceleratorSnafu)
+            }
+            result => result.context(UnableToCreateDataAcceleratorSnafu),
+        }
+    }
+
+    /// Creates `source`'s accelerator table through the engine registry.
+    async fn create_accelerator_table_for(
+        &self,
+        source: &dyn AccelerationSource,
+        schema: &SchemaRef,
+        constraints: Option<&Constraints>,
+        acceleration_settings: &Acceleration,
+        secrets: &Arc<TokioRwLock<Secrets>>,
+    ) -> std::result::Result<Arc<dyn TableProvider>, dataaccelerator::Error> {
+        self.accelerator_engine_registry
+            .create_accelerator_table(
+                source.name().clone(),
+                Arc::clone(schema),
+                constraints,
+                acceleration_settings,
+                Arc::clone(secrets),
+                Some(source),
+                Arc::clone(&self.ctx),
+            )
+            .await
+    }
+
+    /// Rebuilds `source`'s acceleration for changed settings: clears the dataset
+    /// checkpoint, drops the table, and logs why, so the next create builds the table
+    /// again, empty, from the current settings, to be loaded as on a first start.
+    ///
+    /// The checkpoint goes before the table, and must go. One that outlived the table it
+    /// describes would mark the recreated, empty table loaded, and with no refresh due it
+    /// would serve no rows. Without it, a restart that finds the old table still in place
+    /// detects the change again and rebuilds.
+    async fn rebuild_acceleration(
+        &self,
+        source: &dyn AccelerationSource,
+        acceleration_settings: &Acceleration,
+        cause: &str,
+    ) -> Result<()> {
+        let dataset_name = source.name().to_string();
+        let checkpoint = dataset_checkpointer(
+            source,
+            self.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .context(AccelerationRebuildCheckpointSnafu {
+            dataset_name: dataset_name.clone(),
+        })?;
+        checkpoint
+            .delete()
+            .await
+            .context(AccelerationRebuildCheckpointSnafu { dataset_name })?;
+
+        self.drop_acceleration_for_recreate(source, acceleration_settings, None)
+            .await?;
+        tracing::info!("{}", acceleration_rebuilt_message(cause));
+        Ok(())
+    }
+
+    /// Drops `source`'s accelerated table so the next create builds it again, empty,
+    /// from the current settings, then clears the cached plans that reference it.
+    ///
+    /// `checkpoint`, when given, is cleared after the drop, the order a schema-change
+    /// recreate needs: its checkpoint records the old schema, which is how a restart
+    /// after a failed drop detects the change again. A settings rebuild clears its
+    /// checkpoint itself, before the drop (see [`Self::rebuild_acceleration`]).
+    async fn drop_acceleration_for_recreate(
+        &self,
+        source: &dyn AccelerationSource,
+        acceleration_settings: &Acceleration,
+        checkpoint: Option<&Arc<dyn DatasetCheckpointer>>,
+    ) -> Result<()> {
+        let name = source.name().to_string();
+        let accelerator = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+            .ok_or_else(|| Error::ExpectedAccelerationSettings { name: name.clone() })?;
+        accelerator
+            .drop_table(&name, source)
+            .await
+            .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
+            .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        // Clear the checkpoint so the refresh treats this as a fresh table.
+        if let Some(checkpoint) = checkpoint {
+            let _ = checkpoint.delete().await;
+        }
+
+        // Cached logical plans reference the dropped table.
+        self.clear_cached_plans().await;
+        Ok(())
     }
 
     /// Applies a widening plan to the dataset's acceleration engine table and persists
@@ -6118,19 +6487,15 @@ impl DataFusion {
         )?;
 
         let accelerated_table_provider = self
-            .accelerator_engine_registry()
-            .create_accelerator_table(
-                table.clone(),
-                schema,
-                None,
-                acceleration,
-                secrets,
-                Some(view),
-                Arc::clone(&self.ctx),
-            )
+            .create_view_accelerator_table(view, &view_table, schema, acceleration, secrets)
             .await
             .map_err(|e| Error::UnableToCreateView {
-                reason: format!("Failed to create view acceleration: {e}"),
+                reason: match e {
+                    Error::UnableToCreateDataAccelerator { source } => {
+                        format!("Failed to create view acceleration: {source}")
+                    }
+                    e => format!("Failed to create view acceleration: {e}"),
+                },
             })?;
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
@@ -7252,11 +7617,17 @@ async fn build_snapshot_refresh_state(
 
     let swappable_provider = SwappableTableProvider::new(initial_provider);
     let current_snapshot_id = std::sync::Arc::new(std::sync::Mutex::new(bootstrap_loaded_id));
+    let source: Arc<dyn crate::dataaccelerator::AccelerationSource> = Arc::new(dataset.clone());
+    // The initial provider serves the restored snapshot; the engine may reclaim
+    // what an earlier process left that this snapshot no longer references.
+    accelerator
+        .maintain_after_snapshot_restore(source.as_ref(), &swappable_provider.current())
+        .await;
 
     Ok(SnapshotRefreshState {
         manager,
         accelerator,
-        source: Arc::new(dataset.clone()),
+        source,
         swappable_provider,
         provider_factory,
         current_snapshot_id,
@@ -7278,6 +7649,24 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    #[test]
+    fn settings_rebuild_messages_name_the_dataset_the_change_and_the_outcome() {
+        let cause = "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])";
+        assert_eq!(
+            acceleration_rebuilt_message(cause),
+            "The existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id']), so it is dropped and reloaded from the source with the new settings."
+        );
+        let checkpoint = Error::AccelerationRebuildCheckpoint {
+            dataset_name: "trips".to_string(),
+            source: "database is locked".into(),
+        };
+        assert_eq!(
+            checkpoint.to_string(),
+            "Failed to rebuild the acceleration of dataset 'trips' for its changed settings, so the dataset does not load until a retry succeeds: its load checkpoint could not be cleared. Cause: database is locked"
+        );
+        assert!(checkpoint.is_retriable());
+    }
 
     #[test]
     fn retention_use_source_untranslatable_names_the_combination() {

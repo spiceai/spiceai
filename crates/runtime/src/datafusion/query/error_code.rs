@@ -68,7 +68,17 @@ impl From<&DataFusionError> for ErrorCode {
             | DataFusionError::External(..)
             | DataFusionError::Execution(..) => ErrorCode::QueryExecutionError,
             DataFusionError::ResourcesExhausted(..) => ErrorCode::ResourcesExhausted,
-            DataFusionError::Context(_, err) => ErrorCode::from(err.as_ref()),
+            // The SQL planner attaches a diagnostic to the errors it reports
+            // against the query text — an unknown column, a bad cast — and the
+            // wrapped error says what kind of failure it is.
+            DataFusionError::Context(_, err) | DataFusionError::Diagnostic(_, err) => {
+                ErrorCode::from(err.as_ref())
+            }
+            // Several errors from one query: the first decides, as for the
+            // status a Flight client is sent.
+            DataFusionError::Collection(errors) => errors
+                .first()
+                .map_or(ErrorCode::InternalError, ErrorCode::from),
             // A join wraps its build-side failure in `Shared` before handing it
             // to each probe partition (datafusion physical-plan joins/utils.rs).
             // Without this arm a join's memory refusal is `InternalError`.
@@ -175,6 +185,41 @@ mod tests {
         assert_eq!(i8::from(&ErrorCode::QueryExecutionError), -30);
         assert_eq!(i8::from(&ErrorCode::ResourcesExhausted), -40);
         assert_eq!(i8::from(&ErrorCode::InternalError), -120);
+    }
+
+    /// The planner reports an unknown column as a `SchemaError` wrapped in a
+    /// `Diagnostic`. That is the client's query to fix, not a runtime bug: as
+    /// `InternalError` it would be logged as a warning under
+    /// `runtime.query.log_errors: execution`, which exists to leave those out.
+    #[tokio::test]
+    async fn a_planner_error_with_a_diagnostic_is_a_planning_error() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.sql("CREATE TABLE trips (id INT, city VARCHAR)")
+            .await
+            .expect("create the table");
+        let err = ctx
+            .sql("SELECT nope FROM trips")
+            .await
+            .expect_err("an unknown column fails to plan");
+
+        assert!(
+            matches!(err, DataFusionError::Diagnostic(..)),
+            "the planner wraps the error in a diagnostic: {err:?}"
+        );
+        assert_eq!(ErrorCode::from(&err), ErrorCode::QueryPlanningError);
+    }
+
+    #[test]
+    fn a_collection_of_errors_is_classified_by_its_first() {
+        let err = DataFusionError::Collection(vec![
+            DataFusionError::Plan("bad plan".to_string()),
+            DataFusionError::Internal("bug".to_string()),
+        ]);
+        assert_eq!(ErrorCode::from(&err), ErrorCode::QueryPlanningError);
+        assert_eq!(
+            ErrorCode::from(&DataFusionError::Collection(vec![])),
+            ErrorCode::InternalError
+        );
     }
 
     /// The variants the new arm sits between must keep their classification.

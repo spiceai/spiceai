@@ -189,5 +189,6 @@ rules ignores a row-count miss or a value that is not the engine's rendering
 of the golden.
 
 Do not treat these counts as a merge gate. CI (every merge-queue entry,
-pushes, and nightly; SF 1 on `spiceai-macos`) is report-only on pass rate
-until a threshold is set from this baseline (and preferably from Mode B).
+pushes, and nightly; SF 1 on `spiceai-macos-large` in the merge queue and
+`spiceai-macos` otherwise) is report-only on pass rate until a threshold is
+set from this baseline (and preferably from Mode B).

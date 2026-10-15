@@ -33,7 +33,7 @@ use super::{
     CompoundReadMode, Error, compound_delete_by_keys, compound_delete_by_predicate,
     compound_delete_group_remainder, compound_group_pruning, compound_on_write_complete,
     compound_on_write_start, compound_required_columns, compound_resolve_delete_keys,
-    compound_write, fallback::fallback_on_empty_plan, validate_compatibility,
+    compound_truncate, compound_write, fallback::fallback_on_empty_plan, validate_compatibility,
 };
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::prelude::Expr;
@@ -187,6 +187,10 @@ impl Index for CompoundVectorIndex {
 
     async fn on_write_complete(&self) -> Result<(), DataFusionError> {
         compound_on_write_complete(self.primary.as_ref(), self.secondary.as_ref()).await
+    }
+
+    async fn truncate(&self) -> DataFusionResult<()> {
+        compound_truncate(self.primary.as_ref(), self.secondary.as_ref()).await
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> DataFusionResult<()> {

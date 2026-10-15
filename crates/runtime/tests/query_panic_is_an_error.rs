@@ -26,8 +26,8 @@ limitations under the License.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/13876>.
 //!
-//! This lives in its own test binary because it registers a deliberately panicking
-//! UDF on the session context, which must not be visible to any other test.
+//! The deliberately panicking UDF is registered on this test's own runtime's session
+//! context, so no other test can see it.
 
 use std::sync::Arc;
 

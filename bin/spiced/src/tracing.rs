@@ -44,6 +44,8 @@ use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, regis
 
 #[path = "tracing/dependency_log.rs"]
 mod dependency_log;
+#[path = "tracing/otel_logs.rs"]
+pub mod otel_logs;
 
 #[derive(PartialEq, Debug)]
 pub enum LogVerbosity {
@@ -101,7 +103,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry=warn,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn,text_embeddings_backend_candle=error";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn,text_embeddings_backend_candle=error,rmcp::service=error";
 
 fn specific_env_filter(filter: &str) -> String {
     format!("{OFF_FILTERS},{filter}")
@@ -331,6 +333,7 @@ pub(crate) async fn init_tracing(
     verbosity: LogVerbosity,
     cloud_connect_configured: bool,
     service_log_dir: Option<&std::path::Path>,
+    otel_logs: Option<otel_logs::LogsSink>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
@@ -367,7 +370,8 @@ pub(crate) async fn init_tracing(
                     .display()
             )
         })?)
-        .with(cloud_connect_log_capture_layer(cloud_connect_configured));
+        .with(cloud_connect_log_capture_layer(cloud_connect_configured))
+        .with(otel_logs.map(otel_logs::layer));
 
     tracing::subscriber::set_global_default(subscriber)?;
     // Routes `log` records — which most of the dependency graph, DataFusion

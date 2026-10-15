@@ -32,6 +32,8 @@ use crate::http::v1::{
 };
 use runtime_request_context::{Protocol, RequestContext};
 
+#[cfg(feature = "mcp")]
+use super::mcp_transport::{McpOriginPolicy, McpResponse, McpTransport};
 use app::App;
 use axum::{extract::State, routing::patch};
 use http::{
@@ -103,6 +105,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::cdc::post,
+        v1::otlp::post,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -420,6 +423,8 @@ pub(crate) fn routes(
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
+        // OTLP/HTTP metrics receiver; same handler as the gRPC receiver on the Flight port.
+        .route(v1::otlp::PATH, post(v1::otlp::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -477,7 +482,7 @@ pub(crate) fn routes(
         // relying on each tool to enforce its own safety posture. Configure
         // `runtime.auth.api_key` (or any future provider) to re-enable this surface.
         let tools_auth_required = auth_layer.is_some();
-        let tools_auth_message = "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
+        let tools_auth_message = "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/spicepod/runtime#runtimeauth) and retry with credentials.";
         let tools_router = Router::new()
             .route("/v1/tools", get(v1::tools::list))
             .route("/v1/tools/search", get(v1::tools::search))
@@ -510,7 +515,7 @@ pub(crate) fn routes(
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
             .layer(Extension(rt.evaluate_models()))
-            .layer(Extension(rt.responses_api_support()))
+            .layer(Extension(rt.model_capabilities()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
@@ -542,6 +547,10 @@ pub(crate) fn routes(
         .route("/v1/queries/{query_id}/cancel", post(v1::queries::cancel));
 
     authenticated_router = authenticated_router.merge(queries_router);
+
+    // `/v1/mcp` Origin policy. It also decides the CORS headers on `/v1/mcp`.
+    #[cfg(feature = "mcp")]
+    let mcp_origins = McpOriginPolicy::new(mcp_origin_cors(config.as_ref(), cors_config));
 
     #[cfg(feature = "mcp")]
     {
@@ -576,16 +585,21 @@ pub(crate) fn routes(
                 )
             }
         };
-        let mcp_service = EpochReloadingMcpService::new(&schema_snapshot, rebuild);
+        let mcp_service = EpochReloadingMcpService::new(
+            &schema_snapshot,
+            rebuild,
+            McpTransport::new(sessions, mcp_origins.clone()),
+        );
 
         tracing::debug!(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );
         let mcp_auth_required = auth_layer.is_some();
-        let mcp_auth_message = "MCP endpoint (/v1/mcp) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
+        let mcp_auth_message = "MCP endpoint (/v1/mcp) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/spicepod/runtime#runtimeauth) and retry with credentials.";
         let mcp_router = Router::new()
             .nest_service("/v1/mcp", mcp_service)
+            .route_layer(middleware::from_fn(reject_repeated_mcp_routing_headers))
             .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT))
             .route_layer(middleware::from_fn(move |req, next| {
                 require_auth_configured(mcp_auth_required, mcp_auth_message, req, next)
@@ -593,7 +607,12 @@ pub(crate) fn routes(
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
+    let otlp_metrics_service = Arc::new(crate::opentelemetry::build_metrics_service(
+        rt.datafusion(),
+        Some(Arc::downgrade(rt)),
+    ));
     authenticated_router = authenticated_router
+        .layer(Extension(otlp_metrics_service))
         .layer(Extension(Arc::clone(rt)))
         // Handlers that report a model's load state take the status on its own, so they can be
         // exercised without building a `Runtime`.
@@ -622,6 +641,11 @@ pub(crate) fn routes(
     authenticated_router = authenticated_router
         .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
 
+    // OTLP/HTTP needs every `/v1/metrics` error as a `google.rpc.Status` in the request's
+    // encoding, including the auth, mTLS, and body-limit rejections above, so this wraps them.
+    authenticated_router =
+        authenticated_router.route_layer(middleware::from_fn(v1::otlp::encode_layer_errors));
+
     // The executor registry only exists when the runtime is in scheduler role; it is `None`
     // otherwise. `/v1/ready`'s executor gating reads it through this layer.
     let executor_registry: Option<Arc<ExecutorRegistry>> = rt.df.executor_registry().cloned();
@@ -641,19 +665,25 @@ pub(crate) fn routes(
             Arc::clone(&rt.df),
             track_metrics,
         ))
-        .layer(Extension(Arc::clone(&rt.app)))
-        .layer(cors_layer(cors_config));
+        .layer(Extension(Arc::clone(&rt.app)));
+
+    #[cfg(feature = "mcp")]
+    let router = router.layer(middleware::from_fn_with_state(
+        RouteCors {
+            app: cors_layer(cors_config),
+            mcp: mcp_cors_layer(mcp_origins),
+        },
+        route_cors,
+    ));
+    #[cfg(not(feature = "mcp"))]
+    let router = router.layer(cors_layer(cors_config));
 
     // tower-http 0.6 has no prefix `AllowHeaders` predicate. `cors_layer`
     // mirrors `Access-Control-Request-Headers` so a preflight that asks for
     // `Mcp-Param-*` is not answered with a closed list that omits them. This
     // rewrite then replaces `Access-Control-Allow-Headers` with the closed
     // MCP set plus requested `Mcp-Param-*` names — not every requested header.
-    if cors_config.enabled {
-        router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
-    } else {
-        router
-    }
+    router.layer(middleware::from_fn(allow_mcp_param_cors_headers))
 }
 
 async fn track_metrics(
@@ -810,8 +840,9 @@ fn mcp_origin_cors<'a>(config: &'a config::Config, app_cors: &'a CorsConfig) -> 
 /// `runtime.cors`.
 ///
 /// Host (`Host` header):
-/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, rmcp defaults
-///   apply (`localhost`, `127.0.0.1`, `::1`).
+/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None` or empty, rmcp
+///   defaults apply (`localhost`, `127.0.0.1`, `::1`). rmcp treats an empty list as
+///   "allow all", so an empty list must not reach it.
 /// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely.
 /// - Otherwise the provided list replaces the defaults entirely.
 ///
@@ -819,7 +850,9 @@ fn mcp_origin_cors<'a>(config: &'a config::Config, app_cors: &'a CorsConfig) -> 
 /// - `"*"` or an empty CORS list expands to localhost defaults so the
 ///   rmcp allow-list is never empty (empty accepts every `Origin`).
 /// - A concrete list is the 2026-07-28 Streamable HTTP origin policy:
-///   a mismatched `Origin` is 403; a missing `Origin` still passes.
+///   a mismatched `Origin` is 403; a missing `Origin` still passes. rmcp
+///   matches a portless entry on any port, so [`McpTransport`] also checks
+///   the port of a concrete entry.
 ///
 /// `legacy_session_mode` stays on so `initialize` clients still get
 /// `Mcp-Session-Id` sessions. `2026-07-28` requests are always served
@@ -832,8 +865,10 @@ fn mcp_server_config(
     let config = StreamableHttpServerConfig::default().with_legacy_session_mode(true);
     let config = match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
         Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
-        Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
-        None => config,
+        Some(hosts) if !hosts.is_empty() => {
+            config.with_allowed_hosts(hosts.iter().map(String::as_str))
+        }
+        Some(_) | None => config,
     };
 
     config.with_allowed_origins(cors_config.mcp_allowed_origins())
@@ -933,6 +968,7 @@ impl<T: Clone> EpochReloading<T> {
 #[derive(Clone)]
 struct EpochReloadingMcpService {
     state: Arc<EpochReloading<StreamableHttpService<RuntimeServer, LocalSessionManager>>>,
+    transport: McpTransport,
 }
 
 #[cfg(feature = "mcp")]
@@ -943,6 +979,7 @@ impl EpochReloadingMcpService {
         + Send
         + Sync
         + 'static,
+        transport: McpTransport,
     ) -> Self {
         let epoch_schemas = Arc::clone(schemas);
         Self {
@@ -951,6 +988,7 @@ impl EpochReloadingMcpService {
                 move || epoch_schemas.epoch(),
                 rebuild,
             )),
+            transport,
         }
     }
 
@@ -966,9 +1004,7 @@ where
     B::Data: Send + 'static,
     B::Error: std::fmt::Display,
 {
-    type Response = <StreamableHttpService<RuntimeServer, LocalSessionManager> as tower::Service<
-        http::Request<B>,
-    >>::Response;
+    type Response = McpResponse;
     type Error = std::convert::Infallible;
     type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -981,8 +1017,42 @@ where
 
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
         let service = self.current();
-        Box::pin(async move { Ok(service.handle(req).await) })
+        let transport = self.transport.clone();
+        Box::pin(
+            async move { Ok(name_rejected_setting(transport.handle(&service, req).await).await) },
+        )
     }
+}
+
+/// rmcp's DNS-rebinding 403s do not name the setting to change; rewrite them to.
+#[cfg(feature = "mcp")]
+async fn name_rejected_setting(response: McpResponse) -> McpResponse {
+    use http_body_util::BodyExt;
+
+    if response.status() != http::StatusCode::FORBIDDEN {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(never) => match never {},
+    };
+    let message = match &bytes[..] {
+        b"Forbidden: Host header is not allowed" => {
+            "Forbidden: Host header is not allowed. Add the host to `runtime.mcp.allowed_hosts`."
+        }
+        b"Forbidden: Origin header is not allowed" => {
+            "Forbidden: Origin header is not allowed. Add the origin to `runtime.cors.allowed_origins`."
+        }
+        _ => {
+            return http::Response::from_parts(parts, http_body_util::Full::new(bytes).boxed());
+        }
+    };
+    parts.headers.remove(http::header::CONTENT_LENGTH);
+    http::Response::from_parts(
+        parts,
+        http_body_util::Full::new(bytes::Bytes::from(message)).boxed(),
+    )
 }
 
 fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
@@ -1010,6 +1080,11 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
+    cors_rules(cors).allow_origin(allowed_origins)
+}
+
+/// Methods and headers shared by every CORS policy.
+fn cors_rules(cors: CorsLayer) -> CorsLayer {
     cors.allow_methods([
         Method::GET,
         Method::POST,
@@ -1025,7 +1100,43 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         HeaderName::from_static("mcp-protocol-version"),
         SERVER_TIMING,
     ])
-    .allow_origin(allowed_origins)
+}
+
+/// CORS for `/v1/mcp`: allow exactly the origins the MCP `Origin` check
+/// accepts, whether or not `runtime.cors.enabled` is set. Otherwise a browser
+/// client passes the check but cannot read the response.
+#[cfg(feature = "mcp")]
+fn mcp_cors_layer(origins: McpOriginPolicy) -> CorsLayer {
+    cors_rules(CorsLayer::new()).allow_origin(AllowOrigin::predicate(move |origin, _| {
+        origins.allows(origin)
+    }))
+}
+
+/// One CORS policy per request: `/v1/mcp` uses the MCP policy and all other
+/// routes use `runtime.cors`.
+#[cfg(feature = "mcp")]
+#[derive(Clone)]
+struct RouteCors {
+    app: CorsLayer,
+    mcp: CorsLayer,
+}
+
+#[cfg(feature = "mcp")]
+async fn route_cors(
+    State(cors): State<RouteCors>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let layer = if path == "/v1/mcp" || path.starts_with("/v1/mcp/") {
+        &cors.mcp
+    } else {
+        &cors.app
+    };
+    match tower::ServiceExt::oneshot(tower::Layer::layer(layer, next), req).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    }
 }
 
 /// Closed CORS request-header set, plus any `Mcp-Param-*` name.
@@ -1079,7 +1190,12 @@ fn cors_allow_headers_value(requested: Option<&str>) -> HeaderValue {
 async fn allow_mcp_param_cors_headers(req: Request<Body>, next: Next) -> axum::response::Response {
     let requested = req.headers().get(ACCESS_CONTROL_REQUEST_HEADERS).cloned();
     let mut response = next.run(req).await;
-    if let Some(requested) = requested {
+    // Only rewrite a CORS answer; a route without CORS stays without it.
+    if let Some(requested) = requested
+        && response
+            .headers()
+            .contains_key(ACCESS_CONTROL_ALLOW_HEADERS)
+    {
         let value = cors_allow_headers_value(requested.to_str().ok());
         response
             .headers_mut()
@@ -1148,6 +1264,52 @@ async fn check_shutdown(
 /// Used to gate routes whose behavior is unsafe anonymously (`/v1/tools/*`: the raw
 /// request body is handed to `tool.call`, which for built-ins like `sql` and
 /// `websearch` is equivalent to arbitrary query / outbound fetch).
+/// Streamable HTTP headers that rmcp checks against the JSON-RPC body.
+#[cfg(feature = "mcp")]
+const MCP_ROUTING_HEADERS: [&str; 3] = ["mcp-method", "mcp-name", "mcp-protocol-version"];
+#[cfg(feature = "mcp")]
+const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
+
+#[cfg(feature = "mcp")]
+fn repeated_mcp_routing_header(headers: &http::HeaderMap) -> Option<&http::HeaderName> {
+    headers.keys().find(|name| {
+        (MCP_ROUTING_HEADERS.contains(&name.as_str())
+            || name.as_str().starts_with(MCP_PARAM_HEADER_PREFIX))
+            && headers.get_all(*name).iter().nth(1).is_some()
+    })
+}
+
+/// rmcp checks only the first copy of a repeated routing header, so a proxy
+/// that routes on a later copy could see a different method or tool from the
+/// one Spice runs. Reject repeats as a header mismatch (HTTP 400, `-32020`).
+#[cfg(feature = "mcp")]
+async fn reject_repeated_mcp_routing_headers(
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    #[derive(serde::Deserialize)]
+    struct RequestIdOnly {
+        id: Option<rmcp::model::RequestId>,
+    }
+
+    let Some(name) = repeated_mcp_routing_header(req.headers()).cloned() else {
+        return next.run(req).await;
+    };
+    let id = axum::body::to_bytes(req.into_body(), MCP_REQUEST_BODY_LIMIT)
+        .await
+        .ok()
+        .and_then(|body| serde_json::from_slice::<RequestIdOnly>(&body).ok())
+        .and_then(|request| request.id);
+    let error = rmcp::model::JsonRpcError::new(
+        id,
+        rmcp::model::ErrorData::header_mismatch(
+            format!("{name} header must not be repeated"),
+            None,
+        ),
+    );
+    (http::StatusCode::BAD_REQUEST, axum::Json(error)).into_response()
+}
+
 async fn require_auth_configured(
     auth_configured: bool,
     message: &'static str,

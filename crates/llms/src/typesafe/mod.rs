@@ -192,7 +192,7 @@ impl Evaluate for TypeSafe {
 
         match status {
             StatusCode::OK => {
-                let parsed = serde_json::from_str::<EvaluateResponse>(&body).map_err(|e| {
+                let mut parsed = serde_json::from_str::<EvaluateResponse>(&body).map_err(|e| {
                     evaluate_api::Error::UnparseableResponse {
                         model: self.name.clone(),
                         response: format!("{e}; body={body}"),
@@ -201,6 +201,8 @@ impl Evaluate for TypeSafe {
                 // A 200 that drops, re-types, or answers outside its own options is a
                 // wrong result, not a success.
                 evaluate_api::check_answers(&self.name, &asked, &parsed)?;
+                // Responses name the model the caller asked for, as chat completions do.
+                parsed.model.clone_from(&self.name);
                 Ok(parsed)
             }
             StatusCode::UNAUTHORIZED => AuthenticationFailedSnafu {
@@ -240,11 +242,6 @@ impl Evaluate for TypeSafe {
                 source: format!("HTTP {status}: {body}").into(),
             }),
         }
-    }
-
-    /// Jev is a System One model: a decision model, not a chat model.
-    fn is_decision_model(&self) -> bool {
-        true
     }
 
     async fn health(&self) -> Result<()> {
@@ -366,7 +363,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = TypeSafe::try_new("jev", Some("jev"), "test-key")
+        let client = TypeSafe::try_new("triage", Some("jev"), "test-key")
             .expect("client")
             .with_base_url(server.uri());
 
@@ -399,7 +396,7 @@ mod tests {
 
         let resp = client
             .evaluate(EvaluateRequest {
-                model: "jev".into(), // spicepod name; provider replaces with jev-latest
+                model: "triage".into(), // spicepod name; provider replaces with jev-latest
                 state: EvaluateState::from("Help! My payouts have been failing for 3 days."),
                 questions,
                 safety_identifier: None,
@@ -409,7 +406,8 @@ mod tests {
             .await
             .expect("evaluate succeeds");
 
-        assert_eq!(resp.model, "jev-1.13.0");
+        // The Spicepod name, not the `jev-1.13.0` the provider answered with.
+        assert_eq!(resp.model, "triage");
         assert!(matches!(
             resp.answers.get("is_urgent"),
             Some(Answer::Noul { noul }) if (*noul - 0.92).abs() < f64::EPSILON
