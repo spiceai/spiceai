@@ -32,7 +32,8 @@ use runtime_state_location::{
     CheckError, StateFeature, StateLocationCheck, build_object_store, check_location,
 };
 use spicepod::acceleration::SnapshotBehavior;
-use spicepod::component::runtime::RuntimeState;
+use spicepod::component::runtime::{RuntimeState, runtime_state_folder, same_folder};
+use spicepod::component::snapshot::SNAPSHOTS_STATE_FOLDER;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
@@ -79,17 +80,24 @@ pub(crate) fn spawn_check(rt: &Runtime, state: RuntimeState, check: Arc<StateLoc
 }
 
 /// Whether `app`'s datasets keep their snapshots in `runtime.state`: snapshots are
-/// enabled for one of them and `snapshots.location` does not move them elsewhere.
+/// enabled for one of them and its snapshot location is the `snapshots/` folder of
+/// `runtime.state.location`.
 pub(crate) fn snapshots_use_runtime_state(app: &App) -> bool {
-    app.runtime.state.is_some()
-        && runtime_acceleration::snapshot::snapshots_enabled()
-        && app
-            .snapshots
-            .as_deref()
-            .is_none_or(|snapshots| snapshots.enabled && snapshots.location.is_none())
+    let Some(state) = app.runtime.state.as_ref() else {
+        return false;
+    };
+    let folder = runtime_state_folder(&state.location, SNAPSHOTS_STATE_FOLDER);
+    runtime_acceleration::snapshot::snapshots_enabled()
         && app.datasets.iter().any(|dataset| {
             dataset.acceleration.as_ref().is_some_and(|acceleration| {
-                acceleration.enabled && acceleration.snapshots != SnapshotBehavior::Disabled
+                let snapshots = app.dataset_snapshots(acceleration);
+                acceleration.enabled
+                    && acceleration.snapshots != SnapshotBehavior::Disabled
+                    && snapshots.enabled
+                    && snapshots
+                        .location
+                        .as_deref()
+                        .is_some_and(|location| same_folder(location, &folder))
             })
         })
 }
@@ -349,6 +357,41 @@ mod tests {
             passed_message(&check),
             "Shared state location 's3://my-bucket/spice/' enforces conditional writes and holds state for the cluster scheduler, source rate control and SQL results cache warmup."
         );
+    }
+
+    #[cfg(feature = "snapshots")]
+    #[test]
+    fn snapshots_use_runtime_state_when_a_dataset_resolves_to_its_folder() {
+        use spicepod::acceleration::Acceleration;
+        use spicepod::component::dataset::Dataset;
+        use spicepod::component::runtime::Runtime as SpicepodRuntime;
+
+        let app = |snapshots_location: Option<&str>| {
+            let mut dataset = Dataset::new("s3://data-bucket/events/", "events");
+            dataset.acceleration = Some(Acceleration {
+                enabled: true,
+                snapshots: SnapshotBehavior::Enabled,
+                snapshots_location: snapshots_location.map(ToString::to_string),
+                ..Default::default()
+            });
+            app::AppBuilder::new("state")
+                .with_runtime(SpicepodRuntime {
+                    state: Some(RuntimeState {
+                        location: LOCATION.to_string(),
+                        params: None,
+                    }),
+                    ..Default::default()
+                })
+                .with_dataset(dataset)
+                .build()
+        };
+        assert!(snapshots_use_runtime_state(&app(None)));
+        assert!(snapshots_use_runtime_state(&app(Some(
+            "s3://my-bucket/spice/snapshots"
+        ))));
+        assert!(!snapshots_use_runtime_state(&app(Some(
+            "s3://archive-bucket/snapshots/"
+        ))));
     }
 
     #[tokio::test]

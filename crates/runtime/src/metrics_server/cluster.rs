@@ -184,12 +184,7 @@ impl ClusterMetricsCollector {
     async fn collect_from_schedulers(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let peers = self.scheduler_peers.read().await;
 
-        // Filter out self from peers
-        let peer_addresses: Vec<String> = peers
-            .values()
-            .filter(|record| record.advertise_address != self.node_id)
-            .map(|record| record.advertise_address.clone())
-            .collect();
+        let peer_addresses = crate::cluster::remote_scheduler_addresses(&peers, &self.node_id);
 
         drop(peers);
 

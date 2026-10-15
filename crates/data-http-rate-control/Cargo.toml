@@ -23,7 +23,11 @@ runtime-rate-control = { path = "../runtime-rate-control" }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+util = { path = "../util" }
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
