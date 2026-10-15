@@ -582,7 +582,7 @@ async fn runtime_state_location_holds_snapshots_without_a_snapshots_section() {
     state_root.sort();
     assert_eq!(
         state_root,
-        ["snapshots"],
+        ["_spice", "snapshots"],
         "snapshots are kept in their own folder of the state location"
     );
 

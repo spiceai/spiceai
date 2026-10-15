@@ -139,6 +139,22 @@ pub fn absolute_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
     absolute_dir(path, PathSpelling::Uri).map(Some)
 }
 
+/// A configured Cayenne *data* directory where a recursive delete would walk it: made
+/// absolute ([`absolute_data_dir`]), then resolved component by component in filesystem
+/// order, so a symlink or `..` leads where the filesystem leads it. A component that
+/// does not exist yet resolves to itself. `Ok(None)` for an object-store location.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be placed against the working directory, or
+/// when a component exists but cannot be resolved.
+pub async fn resolved_data_dir(path: &str) -> std::io::Result<Option<PathBuf>> {
+    let Some(absolute) = absolute_data_dir(path)? else {
+        return Ok(None);
+    };
+    resolve_in_filesystem_order(&absolute).await.map(Some)
+}
+
 /// Resolve `absolute` component by component, in the order the filesystem would.
 ///
 /// The order is the whole point: `..` names the parent of the directory the preceding

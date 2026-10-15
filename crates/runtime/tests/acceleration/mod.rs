@@ -85,6 +85,8 @@ mod reload_file_accelerated;
 mod retention_arrow;
 #[cfg(not(target_os = "windows"))]
 mod retention_cayenne;
+#[cfg(not(target_os = "windows"))]
+mod settings_change_cayenne;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
