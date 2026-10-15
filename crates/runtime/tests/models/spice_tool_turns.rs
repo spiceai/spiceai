@@ -276,7 +276,7 @@ impl Conversation {
         let (answer, answer_items) = api
             .send(
                 &spice.client,
-                &[question.clone()],
+                std::slice::from_ref(&question),
                 &prompt_cache_key,
                 stream,
             )
