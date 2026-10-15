@@ -1,0 +1,444 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Scan planning latency right after a full refresh.
+//!
+//! A full refresh publishes a new snapshot with an `INSERT OVERWRITE`. Every scan
+//! of the table then plans against that snapshot, and a primary-key lookup has
+//! to list the snapshot's files with their statistics before it can prune to
+//! the one file that holds its key. This bench measures what the scans that
+//! reach a new snapshot together pay for that.
+//!
+//! Each round refreshes a file-backed table (many small files, so the listing
+//! has real work to do) the way an accelerated dataset's full refresh does: an
+//! overwrite, then `prepare_scan_view_for_reads`, which the refresh calls before
+//! it reports completion. It then immediately plans `CONCURRENT_SCANS` concurrent
+//! `WHERE id = ?` scans and records each one's latency (`post_refresh_scan`).
+//! Then it plans the same number of sequential scans against the settled
+//! snapshot (`steady_scan`), and records how long the refresh took to complete,
+//! preparation included (`refresh`). Every round checks that a lookup returns the round's
+//! rows, so a fast answer from the wrong snapshot fails the run.
+//!
+//! Reports P50, P99, P99.9 and max per series.
+//!
+//! `cargo bench -p cayenne --bench listing_after_overwrite`
+//! (`LISTING_BENCH_ROUNDS` overrides the round count).
+//! `LISTING_BENCH_PARTITIONS=N` partitions the same rows by `bucket = id % N`
+//! (`N > 0`, at most `ROWS`); unset keeps the unpartitioned table. Partitioned
+//! runs require `--features partition-table-provider`.
+//! `LISTING_BENCH_PREPARE=1` (default) prepares the table, or each partition
+//! sequentially, after the overwrite. `LISTING_BENCH_PREPARE=0` skips preparation
+//! for the control arm in the same binary. Refresh timing includes preparation
+//! when enabled.
+
+#![expect(clippy::expect_used)]
+
+use std::hint::black_box;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arrow::array::{ArrayRef, BinaryArray, Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema};
+use cayenne::metadata::{CreateTableOptions, VortexConfig};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use datafusion::datasource::TableProvider;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_expr::dml::InsertOp;
+use datafusion_expr::{col, lit};
+use datafusion_physical_plan::collect;
+
+#[cfg(feature = "partition-table-provider")]
+use cayenne::CayennePartitionCreator;
+#[cfg(feature = "partition-table-provider")]
+use datafusion_table_providers::UnsupportedTypeAction;
+#[cfg(feature = "partition-table-provider")]
+use runtime_table_partition::{expression::PartitionedBy, provider::PartitionTableProvider};
+
+const TABLE_NAME: &str = "listing_after_overwrite";
+/// Rows per overwrite. With `PAYLOAD_LEN` and a 1 MiB file target this writes
+/// on the order of fifty files per snapshot.
+const ROWS: i64 = 200_000;
+const PAYLOAD_LEN: usize = 256;
+const TARGET_FILE_SIZE_MB: usize = 1;
+const CONCURRENT_SCANS: usize = 64;
+const DEFAULT_ROUNDS: usize = 30;
+
+fn schema(partitions: Option<i64>) -> Arc<Schema> {
+    let mut fields = vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("payload", DataType::Binary, false),
+    ];
+    if partitions.is_some() {
+        fields.push(Field::new("bucket", DataType::Int64, false));
+    }
+    Arc::new(Schema::new(fields))
+}
+
+/// Rows `0..ROWS` with `value = id * 1000 + round`, so a lookup tells which
+/// round's snapshot answered it.
+fn round_batch(round: i64, partitions: Option<i64>) -> RecordBatch {
+    let ids: Vec<i64> = (0..ROWS).collect();
+    let values: Vec<i64> = ids.iter().map(|id| id * 1000 + round).collect();
+    let mut payload = Vec::with_capacity(ids.len() * PAYLOAD_LEN);
+    for id in &ids {
+        let mut x = id.unsigned_abs().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ round.unsigned_abs();
+        for _ in 0..PAYLOAD_LEN {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            payload.push(x.to_le_bytes()[7]);
+        }
+    }
+    let buckets =
+        partitions.map(|count| Int64Array::from_iter_values(ids.iter().map(|id| id % count)));
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(ids)),
+        Arc::new(Int64Array::from(values)),
+        Arc::new(BinaryArray::from_iter_values(
+            payload.as_chunks::<PAYLOAD_LEN>().0,
+        )),
+    ];
+    if let Some(buckets) = buckets {
+        columns.push(Arc::new(buckets));
+    }
+    RecordBatch::try_new(schema(partitions), columns).expect("batch")
+}
+
+async fn overwrite(
+    table: &dyn TableProvider,
+    ctx: &SessionContext,
+    round: i64,
+    partitions: Option<i64>,
+) {
+    let batch = round_batch(round, partitions);
+    let plan = table
+        .insert_into(
+            &ctx.state(),
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                .expect("memory exec"),
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("overwrite plan");
+    collect(plan, ctx.task_ctx()).await.expect("overwrite");
+}
+
+async fn plan_lookup(table: &dyn TableProvider, ctx: &SessionContext, id: i64) -> Duration {
+    let start = Instant::now();
+    let plan = table
+        .scan(&ctx.state(), Some(&vec![1]), &[col("id").eq(lit(id))], None)
+        .await
+        .expect("scan");
+    let elapsed = start.elapsed();
+    black_box(plan);
+    elapsed
+}
+
+async fn lookup_value(table: Arc<dyn TableProvider>, ctx: &SessionContext, id: i64) -> Vec<i64> {
+    let batches = ctx
+        .read_table(table)
+        .expect("read table")
+        .filter(col("id").eq(lit(id)))
+        .expect("filter")
+        .select_columns(&["value"])
+        .expect("project")
+        .collect()
+        .await
+        .expect("lookup");
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 value")
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Nearest-rank percentile of `sorted`, in microseconds.
+fn percentile_us(sorted: &[Duration], p: f64) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "a rank within a bench sample count"
+    )]
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1].as_micros()
+}
+
+fn report(name: &str, samples: &mut [Duration]) {
+    samples.sort_unstable();
+    println!(
+        "{name:<18} n={:<6} p50={:>9}us p99={:>9}us p99.9={:>9}us max={:>9}us",
+        samples.len(),
+        percentile_us(samples, 50.0),
+        percentile_us(samples, 99.0),
+        percentile_us(samples, 99.9),
+        samples.last().map_or(0, Duration::as_micros),
+    );
+}
+
+/// Files in the directory named `snapshot_id` anywhere under `root`.
+fn snapshot_file_count(root: &std::path::Path, snapshot_id: &str) -> usize {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if entry.file_name().to_string_lossy() == snapshot_id {
+                    return std::fs::read_dir(entry.path()).map_or(0, Iterator::count);
+                }
+                stack.push(entry.path());
+            }
+        }
+    }
+    0
+}
+
+#[cfg(feature = "partition-table-provider")]
+async fn create_partitioned_table(
+    catalog: Arc<CayenneCatalog>,
+    runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    options: CreateTableOptions,
+) -> Arc<dyn TableProvider> {
+    let partition_by = vec![PartitionedBy {
+        name: "bucket".to_string(),
+        expression: col("bucket"),
+    }];
+    let table_id = catalog
+        .create_table(options.clone())
+        .await
+        .expect("create partitioned table");
+    let creator = Arc::new(CayennePartitionCreator::new(
+        TABLE_NAME.to_string(),
+        options.base_path.into(),
+        partition_by.clone(),
+        Arc::clone(&options.schema),
+        catalog as Arc<dyn MetadataCatalog>,
+        table_id,
+        UnsupportedTypeAction::Error,
+        vec![],
+        None,
+        options.vortex_config,
+        None,
+        vec![],
+        None,
+        runtime_env,
+    ));
+    Arc::new(
+        PartitionTableProvider::new(creator, partition_by, options.schema)
+            .await
+            .expect("partitioned provider"),
+    )
+}
+
+#[cfg(not(feature = "partition-table-provider"))]
+#[expect(
+    clippy::unused_async,
+    reason = "matches the partitioned build's signature"
+)]
+async fn create_partitioned_table(
+    _catalog: Arc<CayenneCatalog>,
+    _runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    _options: CreateTableOptions,
+) -> Arc<dyn TableProvider> {
+    panic!("LISTING_BENCH_PARTITIONS requires --features partition-table-provider")
+}
+
+#[cfg_attr(
+    not(feature = "partition-table-provider"),
+    expect(
+        unused_variables,
+        clippy::unused_async,
+        reason = "only a partitioned table has partitions"
+    )
+)]
+async fn cayenne_tables(table: &dyn TableProvider) -> Vec<Arc<dyn TableProvider>> {
+    #[cfg(feature = "partition-table-provider")]
+    if let Some(partitioned) = table.downcast_ref::<PartitionTableProvider>() {
+        return partitioned.partition_table_providers().await;
+    }
+    vec![]
+}
+
+async fn prepare_reads(table: &dyn TableProvider) {
+    if let Some(table) = table.downcast_ref::<CayenneTableProvider>() {
+        table.prepare_scan_view_for_reads().await;
+    } else {
+        for partition in cayenne_tables(table).await {
+            partition
+                .downcast_ref::<CayenneTableProvider>()
+                .expect("Cayenne partition")
+                .prepare_scan_view_for_reads()
+                .await;
+        }
+    }
+}
+
+async fn file_count(table: &dyn TableProvider, root: &std::path::Path) -> usize {
+    if let Some(table) = table.downcast_ref::<CayenneTableProvider>() {
+        snapshot_file_count(root, &table.current_snapshot_id())
+    } else {
+        let mut files = 0;
+        for partition in cayenne_tables(table).await {
+            let partition = partition
+                .downcast_ref::<CayenneTableProvider>()
+                .expect("Cayenne partition");
+            files += snapshot_file_count(root, &partition.current_snapshot_id());
+        }
+        files
+    }
+}
+
+async fn run(rounds: usize, partitions: Option<i64>, prepare: bool) {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let data_path = temp_dir.path().join("data");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("data dir");
+    let catalog = Arc::new(
+        CayenneCatalog::new(format!(
+            "sqlite://{}",
+            temp_dir.path().join("catalog.db").display()
+        ))
+        .expect("catalog"),
+    );
+    catalog.init().await.expect("catalog init");
+    let runtime_env = Arc::new(RuntimeEnvBuilder::new().build().expect("runtime env"));
+    let options = CreateTableOptions {
+        table_name: TABLE_NAME.to_string(),
+        schema: schema(partitions),
+        primary_key: vec![],
+        on_conflict: None,
+        base_path: data_path.to_string_lossy().to_string(),
+        partition_column: partitions.map(|_| "bucket".to_string()),
+        vortex_config: VortexConfig {
+            inline_max_rows: 0,
+            target_vortex_file_size_mb: TARGET_FILE_SIZE_MB,
+            compaction_background_interval_ms: 0,
+            compaction_trigger_files: usize::MAX,
+            compaction_trigger_protected_snapshots: usize::MAX,
+            compaction_trigger_snapshot_age_ms: u64::MAX,
+            ..VortexConfig::default()
+        },
+    };
+    let table: Arc<dyn TableProvider> = if partitions.is_some() {
+        create_partitioned_table(Arc::clone(&catalog), Arc::clone(&runtime_env), options).await
+    } else {
+        let table = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            Arc::clone(&runtime_env),
+        )
+        .create(options)
+        .await
+        .expect("create table");
+        let table = Arc::new(table);
+        table.init_scan_view_cache();
+        table
+    };
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), Arc::clone(&runtime_env));
+    ctx.register_table(TABLE_NAME, Arc::clone(&table))
+        .expect("register table");
+
+    // Settle one snapshot first so the first timed round is not the table's
+    // first-ever listing.
+    overwrite(table.as_ref(), &ctx, 0, partitions).await;
+    let _ = lookup_value(Arc::clone(&table), &ctx, 1).await;
+
+    let mut refresh = Vec::with_capacity(rounds);
+    let mut post_refresh = Vec::with_capacity(rounds * CONCURRENT_SCANS);
+    let mut steady = Vec::with_capacity(rounds * CONCURRENT_SCANS);
+    for round in 1..=rounds {
+        let round = i64::try_from(round).expect("round fits i64");
+        let start = Instant::now();
+        overwrite(table.as_ref(), &ctx, round, partitions).await;
+        if prepare {
+            prepare_reads(table.as_ref()).await;
+        }
+        refresh.push(start.elapsed());
+
+        let scans: Vec<_> = (0..CONCURRENT_SCANS)
+            .map(|scan| {
+                let table = Arc::clone(&table);
+                let ctx = ctx.clone();
+                let id = i64::try_from(scan).expect("scan fits i64") * 997 % ROWS;
+                tokio::spawn(async move { plan_lookup(table.as_ref(), &ctx, id).await })
+            })
+            .collect();
+        for scan in scans {
+            post_refresh.push(scan.await.expect("scan task"));
+        }
+        for scan in 0..CONCURRENT_SCANS {
+            let id = i64::try_from(scan).expect("scan fits i64") * 1_013 % ROWS;
+            steady.push(plan_lookup(table.as_ref(), &ctx, id).await);
+        }
+
+        let id = 4_242;
+        assert_eq!(
+            lookup_value(Arc::clone(&table), &ctx, id).await,
+            vec![id * 1000 + round],
+            "round {round}: a lookup must read the round's snapshot"
+        );
+    }
+
+    let files = file_count(table.as_ref(), &data_path).await;
+    println!(
+        "listing_after_overwrite: rounds={rounds} rows={ROWS} files_per_snapshot={files} concurrent_scans={CONCURRENT_SCANS} partitions={} prepare={}",
+        partitions.unwrap_or(0),
+        u8::from(prepare)
+    );
+    report("refresh", &mut refresh);
+    report("post_refresh_scan", &mut post_refresh);
+    report("steady_scan", &mut steady);
+}
+
+fn main() {
+    let rounds = std::env::var("LISTING_BENCH_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_ROUNDS);
+    let partitions = std::env::var("LISTING_BENCH_PARTITIONS").ok().map(|value| {
+        let count = value
+            .parse::<i64>()
+            .expect("LISTING_BENCH_PARTITIONS must be an integer");
+        assert!(
+            (1..=ROWS).contains(&count),
+            "LISTING_BENCH_PARTITIONS must be between 1 and ROWS"
+        );
+        count
+    });
+    let prepare = match std::env::var("LISTING_BENCH_PREPARE").as_deref() {
+        Ok("0") => false,
+        Ok("1") | Err(std::env::VarError::NotPresent) => true,
+        _ => panic!("LISTING_BENCH_PREPARE must be 0 or 1"),
+    };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(run(rounds, partitions, prepare));
+}

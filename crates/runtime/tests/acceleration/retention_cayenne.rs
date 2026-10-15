@@ -36,7 +36,7 @@ use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
-    component::dataset::Dataset,
+    component::{caching::SQLResultsCacheConfig, dataset::Dataset},
     param::Params,
 };
 
@@ -220,8 +220,13 @@ async fn cayenne_full_refresh_applies_retention_sql_on_every_refresh() -> Result
             let mut rows = INITIAL_ROWS.to_vec();
             write_source(&source, &rows)?;
 
+            // Refresh leaves cached SQL results in place; reads after one must skip the cache.
             let app = AppBuilder::new("test_cayenne_retention_sql")
                 .with_dataset(make_dataset(&source, &data_path))
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -287,6 +292,10 @@ async fn cayenne_memory_mode_applies_retention_sql() -> Result<(), anyhow::Error
 
             let app = AppBuilder::new("test_cayenne_retention_sql_memory")
                 .with_dataset(make_memory_dataset(&source, MEM_TABLE))
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -396,6 +405,10 @@ async fn cayenne_memory_mode_retention_sql_keeps_a_null_the_predicate_cannot_eva
 
             let app = AppBuilder::new("test_cayenne_retention_sql_memory_null")
                 .with_dataset(make_memory_dataset(&source, MEM_NULL_TABLE))
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
@@ -489,6 +502,10 @@ async fn cayenne_memory_mode_retention_sql_matching_every_row_empties_the_tier()
                     MEM_ALL_TABLE,
                     "true",
                 ))
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);

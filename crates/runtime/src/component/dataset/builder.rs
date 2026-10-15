@@ -326,7 +326,7 @@ impl DatasetBuilder {
             }
         } else if let Some(acceleration) = self.acceleration.as_mut() {
             acceleration.snapshot_behavior = SnapshotBehavior::from(
-                app.snapshots.clone(),
+                app.effective_snapshots(),
                 self.acceleration_snapshot_behavior,
                 runtime.secrets_weak(),
                 runtime.tokio_io_runtime(),

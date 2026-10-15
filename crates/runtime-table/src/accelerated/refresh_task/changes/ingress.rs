@@ -591,12 +591,12 @@ impl RefreshTask {
         if group.changed
             && let Some(cache) = context.caching.and_then(Weak::upgrade)
             && let Err(error) = cache
-                .invalidate_for_table(context.dataset_name.clone())
+                .invalidate_for_refresh(context.dataset_name.clone())
                 .await
             && !self.runtime_status.is_shutdown()
         {
             tracing::error!(
-                "Failed to invalidate cached results for dataset {}: {error}",
+                "Failed to invalidate cached query plans and search results for dataset {} after a refresh, so they may reflect the previous data until they expire: {error}",
                 context.dataset_name
             );
         }

@@ -7,6 +7,7 @@ name = "runtime"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
@@ -167,6 +168,7 @@ runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-state-location = { path = "../runtime-state-location" }
 runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
@@ -203,7 +205,7 @@ tokio-util.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tools = { path = "../tools" }
-tower.workspace = true
+tower = { workspace = true, features = ["util"] }
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
@@ -469,12 +471,12 @@ name = "cdc_delete_burst"
 [lints]
 workspace = true
 
-# Spice accelerators vs out-of-Spice standalone DuckDB/SQLite — exact SQL results.
-# Separate binary so we do not rebuild the full integration suite.
+# Integration tests are modules of the `integration` binary
+# (`tests/integration.rs`). The targets below need a process, a workflow step, or
+# a feature set of their own; each says which.
 [[test]]
-name = "result_correctness"
-path = "tests/result_correctness.rs"
-required-features = ["duckdb", "sqlite"]
+name = "integration"
+path = "tests/integration.rs"
 
 # A binary of its own so `make nextest` can run it without loading `integration`,
 # which on macOS is too large for dyld to map the shared cache beside it.
@@ -482,3 +484,38 @@ required-features = ["duckdb", "sqlite"]
 name = "rate_control"
 path = "tests/rate_control.rs"
 required-features = ["rate-control"]
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "metrics"
+path = "tests/metrics.rs"
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "cayenne_runtime_tuning"
+path = "tests/cayenne_runtime_tuning.rs"
+
+# Installs a counting `#[global_allocator]` to compare the results cache's
+# reported size with the heap it holds.
+[[test]]
+name = "results_cache_growth"
+path = "tests/results_cache_growth.rs"
+
+# Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
+[[test]]
+name = "retention_oom"
+path = "tests/retention_oom.rs"
+
+# Each runs as its own step in `integration.yml`, with credentials of its own.
+[[test]]
+name = "integration_aws_sdk"
+path = "tests/integration_aws_sdk.rs"
+
+[[test]]
+name = "integration_snapshot_refresh"
+path = "tests/integration_snapshot_refresh.rs"
+
+# Built with the `models` feature set by `integration_models.yml`.
+[[test]]
+name = "integration_models"
+path = "tests/integration_models.rs"

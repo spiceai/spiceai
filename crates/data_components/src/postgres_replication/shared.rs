@@ -479,6 +479,10 @@ struct MemberHandle {
     /// pgoutput `Relation` messages by Postgres design; tolerated during
     /// schema validation and applied as NULL.
     generated_columns: Vec<String>,
+    /// The source table's column type OIDs read when the member joined
+    /// ([`slot::SharedMemberSetup::column_type_oids`]): the baseline the
+    /// member's [`RelationSchemaTracker`] diffs the first `Relation` against.
+    column_type_oids: HashMap<String, u32>,
     /// The dataset's `on_schema_change` policy. Drives the per-member
     /// [`RelationSchemaTracker`] in [`handle_relation`]: under a non-`Block`
     /// policy a mid-stream source column add / lossless type widening is adopted
@@ -2612,6 +2616,7 @@ async fn attach_member(
             schema: Arc::clone(&schema),
             primary_keys: primary_keys.clone(),
             generated_columns: setup.generated_columns.clone(),
+            column_type_oids: setup.column_type_oids.clone(),
             policy,
             sender,
             metrics: Arc::clone(&metrics),
@@ -4201,6 +4206,7 @@ async fn handle_relation(
                 member.dataset_name.clone(),
                 member.primary_keys.clone(),
             )
+            .with_column_type_oids(member.column_type_oids.clone())
         });
         match tracker.observe_relation(&rel) {
             Ok(observation) => {
@@ -4799,6 +4805,7 @@ mod tests {
             },
             table_added: false,
             generated_columns: vec![],
+            column_type_oids: HashMap::new(),
             publication_tables: tables.iter().map(|t| key(t)).collect(),
         }
     }
@@ -5015,6 +5022,7 @@ mod tests {
                     schema: Arc::clone(&schema),
                     primary_keys: vec![],
                     generated_columns: vec![],
+                    column_type_oids: HashMap::new(),
                     policy: SchemaEvolutionPolicy::Block,
                     sender,
                     metrics: Arc::clone(&metrics),
@@ -5055,6 +5063,7 @@ mod tests {
                 schema,
                 primary_keys: vec!["id".into()],
                 generated_columns: vec![],
+                column_type_oids: HashMap::new(),
                 policy: SchemaEvolutionPolicy::AppendNewColumns,
                 sender,
                 metrics: ReplicationMetricsCollector::new(),
@@ -5176,6 +5185,7 @@ mod tests {
                     schema,
                     primary_keys: vec!["id".into()],
                     generated_columns: vec![],
+                    column_type_oids: HashMap::new(),
                     policy: SchemaEvolutionPolicy::AppendNewColumns,
                     sender,
                     metrics: ReplicationMetricsCollector::new(),
@@ -7236,6 +7246,7 @@ mod tests {
                     schema: Arc::clone(&schema),
                     primary_keys: vec!["id".into()],
                     generated_columns: vec![],
+                    column_type_oids: HashMap::new(),
                     policy: SchemaEvolutionPolicy::Block,
                     sender,
                     metrics: ReplicationMetricsCollector::new(),
@@ -7874,6 +7885,7 @@ mod tests {
                 schema: tiny_schema(),
                 primary_keys: vec![],
                 generated_columns: vec![],
+                column_type_oids: HashMap::new(),
                 policy: SchemaEvolutionPolicy::Block,
                 sender,
                 metrics: ReplicationMetricsCollector::new(),

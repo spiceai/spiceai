@@ -179,10 +179,16 @@ pub fn accelerated_tables(app: &Arc<App>) -> HashMap<TableReference, Vec<Partiti
 pub async fn executor_request_initial_partitions(
     mut client: ClusterServiceClient<Channel>,
     executor_url: String,
+    executor_id: String,
+    process_id: String,
     task_ctx: &TaskContext,
 ) -> Result<HashMap<ResolvedTableReference, Vec<Expr>>> {
     let response = client
-        .allocate_initial_partitions(AllocateInitialPartitionsRequest { executor_url })
+        .allocate_initial_partitions(AllocateInitialPartitionsRequest {
+            executor_url,
+            executor_id,
+            process_id,
+        })
         .await
         .context(PartitionAllocationRequestSnafu)?
         .into_inner();

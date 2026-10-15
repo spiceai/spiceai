@@ -41,12 +41,12 @@ class CodeQlWorkflowTest(unittest.TestCase):
         import yaml
 
         doc = yaml.safe_load(WORKFLOW.read_text())
-        # Extraction and query evaluation share one job. The spiceai-macos
+        # Extraction and query evaluation share one job. The spiceai-macos-large
         # runners are persistent and all run merge-queue extractions, so a
         # second job on that pool would add no isolation.
         self.assertEqual(set(doc["jobs"]), {"analyze"})
         analyze = doc["jobs"]["analyze"]
-        self.assertEqual(analyze["runs-on"], "spiceai-macos")
+        self.assertEqual(analyze["runs-on"], "spiceai-macos-large")
         self.assertEqual(
             analyze["env"]["HAS_SPICEIO_SECRET"],
             "${{ secrets.UNAS_SMB_PASS != '' }}",

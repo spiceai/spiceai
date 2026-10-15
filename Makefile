@@ -151,10 +151,14 @@ endif
 # the nightly gate, so select the other two binaries by name rather than every
 # integration test in the `spice` package.
 #
-# `spiced`'s `dependency_logging` uses a loopback S3 endpoint to exercise
-# Iceberg retries through the runtime's dependency logger without credentials.
-# Select it explicitly so the gate checks the diagnostic emitted by the pinned
-# storage dependency as well as the formatter's unit tests.
+# `spiced`'s integration tests are modules of its `integration` binary.
+# `dependency_logging` uses a loopback S3 endpoint to exercise Iceberg retries
+# through the runtime's dependency logger without credentials, so the gate
+# checks the diagnostic emitted by the pinned storage dependency as well as the
+# formatter's unit tests; `build_logging` and `cpu_budget` start `spiced` or
+# build its runtime with no external service. `cloud_connect_bootstrap` is left
+# out: spiced's enrollment client does not trust the test's HTTPS mock, on Linux
+# or macOS, because nothing gives it the test's certificate authority.
 #
 # `llms`'s `anthropic_stream_errors` and `list_models_errors` modules are
 # selected for the same reason: each stands a local one-shot HTTP server up on an
@@ -214,7 +218,7 @@ print-rust-gate-features:
 # `kind(=lib)` cannot reach, and they ran nowhere before being named here:
 # `json_semantics` holds the three `datafusion-functions-json` guards,
 # `adbc_cancellation` the one guard shared by the `arrow-adbc` fork PR #4 and #65
-# rows, and `cpu_budget` the guard for vortex's `set_available_parallelism` —
+# rows, and `spiced`'s `cpu_budget` module the guard for vortex's `set_available_parallelism` —
 # six ledger rows across the three. Each is self-contained — a fake
 # in-process ADBC driver, a spicepod written to a temp dir, arrow built in
 # memory — needing no credentials and no service, and `--all --tests` compiles
@@ -231,7 +235,7 @@ print-rust-gate-features:
 # `runtime`'s `integration` binary on purpose: selecting any test there makes
 # nextest execute that binary to list it, and its debug build on macOS is too
 # large to load (dyld aborts before `main`, failing the whole run).
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (binary_id(=data_components::integration) & test(=every_test_file_is_compiled)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget)) + (binary_id(=llms::integration) & (test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/) | test(=every_test_file_is_compiled)))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/)) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/)) + (package(=runtime) & binary(=results_cache_growth))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -292,11 +296,11 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture -E 'not test(spiceai_integration_test)'
 
 .PHONY: test-integration-models
 test-integration-models:

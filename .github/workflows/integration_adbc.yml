@@ -117,6 +117,10 @@ jobs:
         with:
           drivers: 'sqlite'
 
+      - name: Set up Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: ./.github/actions/setup-nextest
+
       - name: Run ADBC integration tests
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
@@ -125,7 +129,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          cargo test -p runtime --features adbc --test integration -- adbc::
+          cargo nextest run -p runtime --features adbc --test integration -E 'test(/^adbc::/)'
 
       # Not from the merge queue: a cache saved there is scoped to the queue
       # entry's temporary `gh-readonly-queue/...` ref, which later entries and

@@ -20,6 +20,7 @@ limitations under the License.
 //! PUBLICATION` is not allowed on replication connections and the slot state
 //! queries live in normal catalog tables.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use snafu::ResultExt;
@@ -182,6 +183,11 @@ pub struct SharedMemberSetup {
     /// `GENERATED` columns of this member's table — see
     /// [`SlotInfo::generated_columns`].
     pub generated_columns: Vec<String>,
+    /// Each column's Postgres type OID as the catalog reports it now, the type
+    /// the dataset's registered schema was inferred from. It is the baseline a
+    /// pgoutput `Relation` message is diffed against: the first `Relation` the
+    /// stream sends can already describe a type changed since registration.
+    pub column_type_oids: HashMap<String, u32>,
     /// Every table in the shared publication as `(schema, table)`, read after
     /// this member was added. On a resuming slot this is the set of tables
     /// whose changes the slot is still accumulating, whether or not a dataset
@@ -242,8 +248,10 @@ pub async fn setup_shared_member(
             let (client, conn_task) = connect_setup(params).await?;
             let outcome = async {
                 validate_replica_identity(&client, schema_name, table_name).await?;
-                let generated_columns =
-                    fetch_generated_columns(&client, schema_name, table_name).await?;
+                let SourceColumns {
+                    generated_columns,
+                    column_type_oids,
+                } = fetch_source_columns(&client, schema_name, table_name).await?;
                 let table_added =
                     ensure_publication(&client, &params.publication_name, schema_name, table_name)
                         .await?;
@@ -269,6 +277,7 @@ pub async fn setup_shared_member(
                     slot,
                     table_added,
                     generated_columns,
+                    column_type_oids,
                     publication_tables,
                     slot_restart_lsn,
                     current_wal_lsn,
@@ -348,35 +357,54 @@ async fn do_setup(
     history: &HistoryLatch,
 ) -> Result<SlotInfo> {
     validate_replica_identity(client, schema_name, table_name).await?;
-    let generated_columns = fetch_generated_columns(client, schema_name, table_name).await?;
+    let generated_columns = fetch_source_columns(client, schema_name, table_name)
+        .await?
+        .generated_columns;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
     let mut slot = ensure_slot(client, params, history).await?;
     slot.generated_columns = generated_columns;
     Ok(slot)
 }
 
-/// List the table's `GENERATED` columns (`pg_attribute.attgenerated`).
-/// Postgres omits these from pgoutput `Relation` messages, so the WAL path
-/// needs to know which dataset columns to expect to be absent.
-async fn fetch_generated_columns(
+/// What the source catalog (`pg_attribute`) says about the table's columns.
+struct SourceColumns {
+    /// The `GENERATED` columns. Postgres omits these from pgoutput `Relation`
+    /// messages, so the WAL path needs to know which dataset columns to expect
+    /// to be absent.
+    generated_columns: Vec<String>,
+    /// Each column's type OID.
+    column_type_oids: HashMap<String, u32>,
+}
+
+async fn fetch_source_columns(
     client: &tokio_postgres::Client,
     schema_name: &str,
     table_name: &str,
-) -> Result<Vec<String>> {
+) -> Result<SourceColumns> {
     let rows = client
         .query(
-            "SELECT a.attname \
+            "SELECT a.attname, a.atttypid, a.attgenerated::text <> '' \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relname = $2 \
-               AND a.attnum > 0 AND NOT a.attisdropped \
-               AND a.attgenerated::text <> ''",
+               AND a.attnum > 0 AND NOT a.attisdropped",
             &[&schema_name, &table_name],
         )
         .await
         .context(SetupExecSnafu)?;
-    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    let mut columns = SourceColumns {
+        generated_columns: Vec::new(),
+        column_type_oids: HashMap::with_capacity(rows.len()),
+    };
+    for row in &rows {
+        let name: String = row.get(0);
+        if row.get::<_, bool>(2) {
+            columns.generated_columns.push(name.clone());
+        }
+        columns.column_type_oids.insert(name, row.get(1));
+    }
+    Ok(columns)
 }
 
 /// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]
