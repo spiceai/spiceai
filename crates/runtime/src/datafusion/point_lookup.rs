@@ -44,7 +44,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{split_binary, split_conjunction};
-use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, TableScan};
+use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, Projection, TableScan};
 use datafusion::optimizer::{AnalyzerRule, ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::{PhysicalOptimizerContext, PhysicalOptimizerRule};
@@ -262,7 +262,13 @@ pub(crate) fn is_bounded_key_lookup(plan: &LogicalPlan) -> bool {
     loop {
         match node {
             LogicalPlan::Projection(projection) => {
-                if projection.expr.iter().any(reads_beyond_its_row) {
+                // The predicates gathered above name this projection's outputs, so they
+                // bound the scan only through columns it passes through unchanged.
+                if projection.expr.iter().any(reads_beyond_its_row)
+                    || !predicates
+                        .iter()
+                        .all(|predicate| passes_through(projection, predicate))
+                {
                     return false;
                 }
                 node = projection.input.as_ref();
@@ -276,20 +282,25 @@ pub(crate) fn is_bounded_key_lookup(plan: &LogicalPlan) -> bool {
                 node = filter.input.as_ref();
             }
             LogicalPlan::Sort(sort) => {
+                // A sort that keeps only its first rows picks them from its whole input,
+                // so a predicate above it bounds nothing the scan reads.
                 if sort
                     .expr
                     .iter()
                     .any(|sort| reads_beyond_its_row(&sort.expr))
+                    || (sort.fetch.is_some() && !predicates.is_empty())
                 {
                     return false;
                 }
                 node = sort.input.as_ref();
             }
             LogicalPlan::Limit(limit) => {
+                // Likewise a limit: a predicate above it filters the rows the limit kept.
                 if [&limit.skip, &limit.fetch]
                     .into_iter()
                     .flatten()
                     .any(|expr| reads_beyond_its_row(expr))
+                    || !predicates.is_empty()
                 {
                     return false;
                 }
@@ -299,6 +310,21 @@ pub(crate) fn is_bounded_key_lookup(plan: &LogicalPlan) -> bool {
             _ => return false,
         }
     }
+}
+
+/// Whether every column `predicate` reads leaves `projection` as the input column of the same
+/// name, unrenamed and uncomputed, so the predicate means the same thing below the projection.
+fn passes_through(projection: &Projection, predicate: &Expr) -> bool {
+    predicate.column_refs().iter().all(|column| {
+        projection.expr.iter().any(|expr| match expr {
+            Expr::Column(input) => input.name == column.name,
+            Expr::Alias(alias) => {
+                alias.name == column.name
+                    && matches!(alias.expr.as_ref(), Expr::Column(input) if input.name == column.name)
+            }
+            _ => false,
+        })
+    })
 }
 
 /// Whether `expr` needs more than the row it is evaluated on: a subquery, an outer reference, an
@@ -747,6 +773,9 @@ mod tests {
             "SELECT * FROM composite WHERE (region = 1 AND id = 5) OR (region = 2 AND id = 6)",
             "SELECT * FROM composite WHERE region IN (1, 2) AND id IN (5, 6)",
             "SELECT * FROM composite WHERE region = 1 AND (id = 5 OR id = 6)",
+            // A subquery that passes the key through under its own name.
+            "SELECT * FROM (SELECT id, name FROM keyed) q WHERE id = 5",
+            "SELECT * FROM (SELECT k.id AS id FROM keyed k) q WHERE id = 5",
         ] {
             assert!(
                 is_bounded_key_lookup(&unoptimized(&ctx, sql).await),
@@ -766,6 +795,14 @@ mod tests {
             "SELECT * FROM keyed WHERE id IN (SELECT id FROM keyed)",
             "SELECT * FROM keyed WHERE id = (SELECT max(id) FROM keyed)",
             "SELECT a.id FROM keyed a JOIN keyed b ON a.id = b.id WHERE a.id = 5",
+            // An outer `id` that is another column renamed, or a value computed from the
+            // key, does not pin the key.
+            "SELECT * FROM (SELECT region AS id FROM keyed) q WHERE id = 1",
+            "SELECT * FROM (SELECT id + 1 AS id FROM keyed) q WHERE id = 5",
+            "SELECT id FROM (SELECT id % 2 AS id FROM keyed) t WHERE id = 1",
+            // A predicate above a limit filters the rows the limit kept from the whole table.
+            "SELECT * FROM (SELECT * FROM keyed ORDER BY region, id LIMIT 10) q WHERE id = 4",
+            "SELECT * FROM (SELECT * FROM keyed LIMIT 10) q WHERE id = 4",
         ] {
             assert!(
                 !is_bounded_key_lookup(&unoptimized(&ctx, sql).await),
