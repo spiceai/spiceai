@@ -68,10 +68,12 @@ pub fn section_deprecation_warning(section: &Snapshots, state: Option<&RuntimeSt
         "The top-level `snapshots` section is deprecated and will be removed in a future release. Snapshots are stored in the `snapshots/` folder of `runtime.state.location`.",
     );
     match remedy {
-        // The section's `params`, even empty ones, replace `runtime.state.params`
-        // for the snapshots, so they move to the datasets.
+        // The section's `params`, even empty or absent beside its own location,
+        // replace `runtime.state.params` for the snapshots, so they move to the
+        // datasets.
         Remedy::AlreadyThere
-            if section.params.is_some() && state.is_some_and(|state| state.params.is_some()) =>
+            if (section.params.is_some() || section.location.is_some())
+                && state.is_some_and(|state| state.params.is_some()) =>
         {
             warning.push_str(" Your snapshots are already there: delete the section.");
             if keys.is_empty() {
@@ -255,8 +257,9 @@ mod tests {
         );
     }
 
-    /// The section's `params`, even empty ones, replace `runtime.state.params` for
-    /// the snapshots, so deleting the section must not leave them to apply.
+    /// The section's `params`, even empty or absent beside its own location,
+    /// replace `runtime.state.params` for the snapshots, so deleting the section
+    /// must not leave them to apply.
     #[test]
     fn section_params_beside_runtime_state_params_move_to_each_dataset() {
         let state = RuntimeState {
@@ -286,6 +289,16 @@ mod tests {
             "{empty}"
         );
         assert!(!empty.contains("https://state.example"), "{empty}");
+
+        let location_alone = section_deprecation_warning(
+            &section(Some("s3://my-bucket/spice/snapshots/"), None),
+            Some(&state),
+        );
+        assert_safe(&location_alone);
+        assert!(
+            location_alone.contains(" Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and does not set it, so `runtime.state.params` do not apply to its snapshots. See:"),
+            "{location_alone}"
+        );
     }
 
     #[test]

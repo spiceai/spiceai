@@ -66,6 +66,10 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
     keys.sort_unstable();
     let keys = keys.join(", ");
     let state = runtime.state.as_ref();
+    // `runtime.state.params` serve every `runtime.state` feature: the scheduler
+    // takes them as they are, since adding its keys would change them for the others.
+    let state_params = state.is_some_and(|state| state.params.is_some());
+    let mut already_there = false;
 
     let mut warning = format!(
         "{settings} deprecated and will be removed in a future release. The scheduler keeps its state in the `cluster/` folder of `runtime.state.location`."
@@ -90,6 +94,7 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
             None => runtime_state_location_holding(location, SCHEDULER_STATE_FOLDER)
                 .map_or(Remedy::StartEmpty, Remedy::RuntimeState),
         };
+        already_there = matches!(remedy, Remedy::AlreadyThere);
         match remedy {
             Remedy::AlreadyThere => warning.push_str(
                 " Its state is already there: remove `runtime.scheduler.state_location`.",
@@ -127,7 +132,17 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
             }
         }
     }
-    if params.is_some() {
+    if params.is_some() && state_params {
+        let named = if keys.is_empty() {
+            String::new()
+        } else {
+            format!(" ({keys})")
+        };
+        let _ = write!(
+            warning,
+            " Remove `runtime.scheduler.params`{named}: the scheduler then uses `runtime.state.params`, so check that they give it access to its state."
+        );
+    } else if params.is_some() {
         if keys.is_empty() {
             warning.push_str(" Remove `runtime.scheduler.params`.");
         } else {
@@ -136,6 +151,10 @@ pub fn scheduler_deprecation_warning(runtime: &Runtime) -> Option<String> {
                 " Move {keys} from `runtime.scheduler.params` into `runtime.state.params`."
             );
         }
+    } else if already_there && state_params {
+        warning.push_str(
+            " The scheduler then uses `runtime.state.params`, so check that they give it access to its state.",
+        );
     }
     let _ = write!(warning, " See: {SCHEDULER_DOCS}");
     Some(warning)
@@ -313,6 +332,71 @@ mod tests {
                 "{warning}"
             );
         }
+    }
+
+    /// `runtime.state.params` serve every `runtime.state` feature, so the warning
+    /// never merges the scheduler's keys into them.
+    #[test]
+    fn runtime_state_params_replace_the_schedulers_own() {
+        let with_state_params = |mut runtime: Runtime| {
+            if let Some(state) = runtime.state.as_mut() {
+                state.params = Some(Params::from_string_map(
+                    [(
+                        "s3_endpoint".to_string(),
+                        "https://state.example".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ));
+            }
+            runtime
+        };
+        let adopts = " the scheduler then uses `runtime.state.params`, so check that they give it access to its state.";
+
+        let warning = checked_warning(&with_state_params(runtime(
+            Some("s3://b/spice/cluster/"),
+            Some(params()),
+            Some("s3://b/spice/"),
+        )));
+        assert!(
+            warning.contains(&format!(
+                " Its state is already there: remove `runtime.scheduler.state_location`. Remove `runtime.scheduler.params` (s3_key, s3_region):{adopts} See:"
+            )),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("into `runtime.state.params`"),
+            "{warning}"
+        );
+
+        let empty = checked_warning(&with_state_params(runtime(
+            None,
+            Some(Params::default()),
+            Some("s3://b/spice/"),
+        )));
+        assert!(
+            empty.contains(&format!(" Remove `runtime.scheduler.params`:{adopts} See:")),
+            "{empty}"
+        );
+
+        let location_alone = checked_warning(&with_state_params(runtime(
+            Some("s3://b/spice/cluster/"),
+            None,
+            Some("s3://b/spice/"),
+        )));
+        assert!(
+            location_alone.contains(" remove `runtime.scheduler.state_location`. The scheduler then uses `runtime.state.params`, so check that they give it access to its state. See:"),
+            "{location_alone}"
+        );
+        assert!(
+            !checked_warning(&runtime(
+                Some("s3://b/spice/cluster/"),
+                None,
+                Some("s3://b/spice/"),
+            ))
+            .contains("runtime.state.params"),
+            "no `runtime.state.params` to adopt"
+        );
     }
 
     #[test]
