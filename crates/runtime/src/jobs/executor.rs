@@ -32,8 +32,30 @@ use crate::http::v1::queries::SubmitQueryRequest;
 use crate::jobs::state::JobErrorCode;
 
 use super::Result;
+use super::error::Error;
 use super::state::{JobState, JobStatus};
 use super::store::JobStore;
+
+/// How a job comes to be driven by this scheduler.
+enum Start {
+    /// It was submitted here: start it.
+    Submitted,
+    /// It was taken over from a scheduler that stopped: this is the state the
+    /// takeover wrote.
+    TakenOver(JobState),
+}
+
+/// Logs how a job's background task ended. A driver that another scheduler
+/// took the job from stops at its next write; that is not a failure.
+fn report_job_end(job_id: &str, result: Result<()>, what: &str) {
+    match result {
+        Ok(()) => {}
+        Err(Error::JobTakenOver { .. }) => {
+            tracing::debug!(job_id, "Stopped driving the job: another scheduler took it over");
+        }
+        Err(e) => tracing::error!(job_id = %job_id, error = %e, "{what}"),
+    }
+}
 
 /// Tracks an active job's cancellation token and query handle (once submitted).
 struct ActiveJobInfo {
@@ -117,7 +139,7 @@ impl JobExecutor {
                     &job_id_clone,
                     &active_jobs,
                     cancel_token,
-                    false,
+                    Start::Submitted,
                 )
                 .await;
 
@@ -127,9 +149,7 @@ impl JobExecutor {
                     active.remove(&job_id_clone);
                 }
 
-                if let Err(e) = result {
-                    tracing::error!(job_id = %job_id_clone, error = %e, "Job execution failed");
-                }
+                report_job_end(&job_id_clone, result, "Job execution failed");
             }
             .instrument(tracing::info_span!("job_execution", job_id = %job_id)),
         );
@@ -141,6 +161,11 @@ impl JobExecutor {
     /// distributed execution on this scheduler. No-op if this scheduler is
     /// already driving the job locally.
     ///
+    /// `job` is the state in which the recovery sweep found the job orphaned.
+    /// The takeover lands only while the job is still in that state, so of the
+    /// schedulers that recover the same job only one drives it, and the driver
+    /// it was taken from is refused at its next write.
+    ///
     /// Resuming re-plans the job's SQL on this scheduler, and planning is where a
     /// principal's table access and masking apply. The job records only its
     /// submitter's opaque storage id, not an identity a plan can be authorized
@@ -148,28 +173,6 @@ impl JobExecutor {
     /// request to resubmit rather than re-planned without that principal.
     pub async fn resume(&self, job: &JobState) {
         let job_id = job.job_id.as_str();
-        if !job.is_owned_by(super::PUBLIC_JOB_OWNER) {
-            tracing::warn!(
-                job_id,
-                "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
-            );
-            if let Err(e) = self
-                .job_store
-                .fail_job(
-                    job_id,
-                    JobErrorCode::SchedulerUnavailable,
-                    "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
-                )
-                .await
-            {
-                tracing::warn!(
-                    job_id,
-                    "Failed to mark async query job '{job_id}' failed after its scheduler stopped: {e}"
-                );
-            }
-            return;
-        }
-
         let cancel_token = CancellationToken::new();
         {
             let mut active = self.active_jobs.write().await;
@@ -185,6 +188,55 @@ impl JobExecutor {
             );
         }
 
+        let taken = match self.job_store.take_over_job(job).await {
+            Ok(Some(taken)) => Some(taken),
+            Ok(None) => {
+                tracing::debug!(
+                    job_id,
+                    "Not recovering the job: another scheduler took it over first, or it finished"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to take over async query job '{job_id}': {e}");
+                None
+            }
+        };
+        let Some(taken) = taken else {
+            self.active_jobs.write().await.remove(job_id);
+            return;
+        };
+
+        if !taken.is_owned_by(super::PUBLIC_JOB_OWNER) {
+            self.active_jobs.write().await.remove(job_id);
+            tracing::warn!(
+                job_id,
+                "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
+            );
+            let failed = match taken.driver() {
+                Some(driver) => {
+                    self.job_store
+                        .fail_job(
+                            job_id,
+                            &driver,
+                            JobErrorCode::SchedulerUnavailable,
+                            "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
+                        )
+                        .await
+                }
+                None => Err(Error::JobTakenOver {
+                    job_id: job_id.to_string(),
+                }),
+            };
+            if let Err(e) = failed {
+                tracing::warn!(
+                    job_id,
+                    "Failed to mark async query job '{job_id}' failed after its scheduler stopped: {e}"
+                );
+            }
+            return;
+        }
+
         let job_store = Arc::clone(&self.job_store);
         let df = Arc::clone(&self.df);
         let active_jobs = Arc::clone(&self.active_jobs);
@@ -198,7 +250,7 @@ impl JobExecutor {
                     &job_id_owned,
                     &active_jobs,
                     cancel_token,
-                    true,
+                    Start::TakenOver(taken),
                 )
                 .await;
 
@@ -207,9 +259,7 @@ impl JobExecutor {
                     active.remove(&job_id_owned);
                 }
 
-                if let Err(e) = result {
-                    tracing::error!(job_id = %job_id_owned, error = %e, "Job recovery failed");
-                }
+                report_job_end(&job_id_owned, result, "Job recovery failed");
             }
             .instrument(tracing::info_span!("job_recovery", job_id = %job_id)),
         );
@@ -333,17 +383,23 @@ impl JobExecutor {
         job_id: &str,
         active_jobs: &RwLock<std::collections::HashMap<String, ActiveJobInfo>>,
         cancel: CancellationToken,
-        resume: bool,
+        start: Start,
     ) -> Result<()> {
-        // Get job and mark as running. During recovery another scheduler may have
-        // already claimed this job; treat that race as a no-op.
-        let state = match job_store.set_job_running(job_id).await {
-            Ok(state) => state,
-            Err(super::error::Error::ConcurrentModification { .. }) if resume => return Ok(()),
-            // Cancelled (or otherwise finished) before this task started it.
-            Err(super::error::Error::JobAlreadyFinished { .. }) => return Ok(()),
-            Err(e) => return Err(e),
+        let resume = matches!(start, Start::TakenOver(_));
+        let state = match start {
+            Start::Submitted => match job_store.set_job_running(job_id).await {
+                Ok(state) => state,
+                // Cancelled (or otherwise finished) before this task started it.
+                Err(Error::JobAlreadyFinished { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            },
+            Start::TakenOver(state) => state,
         };
+        // Every write this task makes for the job is refused once another
+        // scheduler takes the job over.
+        let driver = state.driver().ok_or_else(|| Error::JobTakenOver {
+            job_id: job_id.to_string(),
+        })?;
 
         // Check for early cancellation
         if cancel.is_cancelled() {
@@ -364,7 +420,12 @@ impl JobExecutor {
                 }
                 Err(e) => {
                     job_store
-                        .fail_job(job_id, JobErrorCode::ParameterBindingFailed, e.to_string())
+                        .fail_job(
+                            job_id,
+                            &driver,
+                            JobErrorCode::ParameterBindingFailed,
+                            e.to_string(),
+                        )
                         .await?;
                     return Ok(());
                 }
@@ -383,7 +444,7 @@ impl JobExecutor {
             Err(e) => {
                 let error_code = Self::query_error_to_code(&e);
                 job_store
-                    .fail_job(job_id, error_code, e.to_string())
+                    .fail_job(job_id, &driver, error_code, e.to_string())
                     .await?;
                 return Ok(());
             }
@@ -428,7 +489,7 @@ impl JobExecutor {
                 if let Err(e) = query_handle.cancel().await {
                     tracing::error!("Failed to cancel the timed-out query '{job_id}': {e}");
                 }
-                job_store.fail_job(job_id, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
+                job_store.fail_job(job_id, &driver, JobErrorCode::Timeout, "Job execution timed out".to_string()).await?;
                 Ok(())
             }
             result_stream = query_handle.into_stream() => {
@@ -437,27 +498,28 @@ impl JobExecutor {
                     Ok(stream) => stream,
                     Err(e) => {
                         let (error_code, error_msg) = Self::handle_error_to_code_and_msg(&e);
-                        job_store.fail_job(job_id, error_code, error_msg).await?;
+                        job_store.fail_job(job_id, &driver, error_code, error_msg).await?;
                         return Ok(());
                     }
                 };
 
                 // Write result chunks as batches arrive from the stream
                 let job_result = match job_store
-                    .write_result_chunks_from_stream(job_id, result_stream)
+                    .write_result_chunks_from_stream(job_id, &driver, result_stream)
                     .await
                 {
                     Ok(result) => result,
+                    Err(e @ Error::JobTakenOver { .. }) => return Err(e),
                     Err(e) => {
                         job_store
-                            .fail_job(job_id, JobErrorCode::FetchingResultsFailed, e.to_string())
+                            .fail_job(job_id, &driver, JobErrorCode::FetchingResultsFailed, e.to_string())
                             .await?;
                         return Ok(());
                     }
                 };
 
                 // Mark job as succeeded
-                job_store.complete_job(job_id, job_result).await?;
+                job_store.complete_job(job_id, &driver, job_result).await?;
 
                 Ok(())
             }

@@ -16,6 +16,11 @@ limitations under the License.
 
 //! Reaper that evicts dead schedulers from `cluster.json`.
 //!
+//! A scheduler is dead once its heartbeat has lapsed in this process's
+//! observation (see [`crate::cluster::heartbeat`]), or, when it has no
+//! heartbeat object, once this process has seen it without one for its TTL. A
+//! reaper that has just started therefore evicts nothing for its first TTL.
+//!
 //! Heartbeat files are deliberately *not* deleted by the reaper. Object
 //! stores have no conditional-delete primitive, so deleting after a
 //! takeover would race the new process's freshly written heartbeat.
@@ -25,6 +30,7 @@ limitations under the License.
 //! so leaving them in place is harmless.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use snafu::Snafu;
 use uuid::Uuid;
@@ -32,7 +38,7 @@ use uuid::Uuid;
 use crate::cluster::cluster_state::{
     ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerId,
 };
-use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
+use crate::cluster::heartbeat::{self, SchedulerHeartbeatStore};
 
 /// Errors that can be raised during a single reaper tick.
 #[derive(Debug, Snafu)]
@@ -74,7 +80,7 @@ impl Reaper {
     /// Run a single reap pass. Returns the set of scheduler ids that
     /// were evicted from `cluster.json` and any candidates that were
     /// skipped because of an `instance_id` mismatch (likely takeover).
-    pub async fn tick(&self, now_ms: u64) -> Result<ReaperOutcome> {
+    pub async fn tick(&self) -> Result<ReaperOutcome> {
         let snapshot = self
             .cluster
             .read()
@@ -90,8 +96,8 @@ impl Reaper {
         let mut stale: Vec<(SchedulerId, Uuid)> = Vec::new();
         for (id, entry) in &snapshot.schedulers {
             match heartbeats.get(id) {
-                Some(beat) if beat.instance_id == entry.instance_id => {
-                    if beat.is_stale(now_ms) {
+                Some(observed) if observed.beat.instance_id == entry.instance_id => {
+                    if observed.lapsed() {
                         stale.push((id.clone(), entry.instance_id));
                     }
                 }
@@ -100,10 +106,9 @@ impl Reaper {
                     // mid-takeover). Don't reap.
                 }
                 None => {
-                    // No heartbeat at all. Only reap if the entry has
-                    // had time to publish its first heartbeat.
-                    let grace = entry.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-                    if now_ms.saturating_sub(entry.started_at_ms) > grace {
+                    // No heartbeat at all. Only reap once the entry has had
+                    // its TTL, in this process's observation, to publish one.
+                    if self.heartbeats.observe(id, None) >= Duration::from_millis(entry.ttl_ms) {
                         stale.push((id.clone(), entry.instance_id));
                     }
                 }
@@ -183,40 +188,87 @@ mod tests {
         .expect("mutate");
     }
 
-    #[tokio::test]
-    async fn reaps_scheduler_with_stale_heartbeat() {
+    const TTL: Duration = Duration::from_secs(30);
+
+    fn wall_clock_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("fits")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaps_scheduler_whose_heartbeat_stays_unchanged_for_its_ttl() {
         let (cs, hb) = setup().await;
         let id = Uuid::new_v4();
         add_entry(&cs, entry("a", id, 0, 30_000)).await;
         hb.heartbeat("a", id, 1_000, 30_000).await.expect("hb");
 
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let out = r.tick(1_000_000).await.expect("tick");
+        // A reaper that has just started has seen no version yet.
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(TTL - Duration::from_secs(1)).await;
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let out = r.tick().await.expect("tick");
         assert_eq!(out.evicted, vec!["a".to_string()]);
         let snap = cs.read().await.expect("read");
         assert!(!snap.schedulers.contains_key("a"));
     }
 
-    #[tokio::test]
-    async fn reaps_scheduler_with_missing_heartbeat_after_grace_period() {
+    #[tokio::test(start_paused = true)]
+    async fn reaps_scheduler_seen_without_a_heartbeat_for_its_ttl() {
         let (cs, hb) = setup().await;
         let id = Uuid::new_v4();
         add_entry(&cs, entry("a", id, 0, 30_000)).await;
         // No heartbeat written.
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let out = r.tick(1_000_000).await.expect("tick");
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(TTL).await;
+        let out = r.tick().await.expect("tick");
         assert_eq!(out.evicted, vec!["a".to_string()]);
     }
 
-    #[tokio::test]
-    async fn does_not_reap_scheduler_with_fresh_heartbeat() {
+    #[tokio::test(start_paused = true)]
+    async fn does_not_reap_scheduler_whose_heartbeat_keeps_changing() {
         let (cs, hb) = setup().await;
         let id = Uuid::new_v4();
         add_entry(&cs, entry("a", id, 0, 30_000)).await;
-        hb.heartbeat("a", id, 999_000, 30_000).await.expect("hb");
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let out = r.tick(1_000_000).await.expect("tick");
-        assert!(out.evicted.is_empty());
+        for beat in 0..10 {
+            hb.heartbeat("a", id, 1_000 + beat * 10_000, 30_000)
+                .await
+                .expect("hb");
+            assert!(r.tick().await.expect("tick").evicted.is_empty());
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+    }
+
+    /// Clock skew between schedulers cannot get a live one reaped: its
+    /// heartbeat timestamps a minute behind or ahead of the reaper's clock are
+    /// never compared with that clock.
+    #[tokio::test(start_paused = true)]
+    async fn does_not_reap_a_live_scheduler_whose_clock_is_a_minute_off() {
+        for skew_ms in [-60_000_i64, 60_000] {
+            let (cs, hb) = setup().await;
+            let id = Uuid::new_v4();
+            add_entry(&cs, entry("a", id, 0, 30_000)).await;
+            let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
+            for beat in 0..10_u64 {
+                let written = wall_clock_ms()
+                    .saturating_add_signed(skew_ms)
+                    .saturating_add(beat * 10_000);
+                hb.heartbeat("a", id, written, 30_000).await.expect("hb");
+                assert!(
+                    r.tick().await.expect("tick").evicted.is_empty(),
+                    "a scheduler with a clock {skew_ms}ms off was reaped while live"
+                );
+                tokio::time::advance(Duration::from_secs(10)).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -225,11 +277,11 @@ mod tests {
         let id = Uuid::new_v4();
         add_entry(&cs, entry("a", id, 990_000, 30_000)).await;
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let out = r.tick(1_000_000).await.expect("tick");
+        let out = r.tick().await.expect("tick");
         assert!(out.evicted.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaper_skips_when_instance_id_does_not_match() {
         let (cs, hb) = setup().await;
         let old = Uuid::new_v4();
@@ -240,13 +292,15 @@ mod tests {
         // about to be overwritten by the new process).
         hb.heartbeat("a", old, 1_000, 30_000).await.expect("hb");
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let out = r.tick(1_000_000).await.expect("tick");
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(TTL * 2).await;
+        let out = r.tick().await.expect("tick");
         assert!(out.evicted.is_empty());
         let snap = cs.read().await.expect("read");
         assert!(snap.schedulers.contains_key("a"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_reapers_idempotent() {
         let (cs, hb) = setup().await;
         let id = Uuid::new_v4();
@@ -254,7 +308,9 @@ mod tests {
         hb.heartbeat("a", id, 1_000, 30_000).await.expect("hb");
         let r1 = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
         let r2 = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let (o1, o2) = tokio::join!(r1.tick(1_000_000), r2.tick(1_000_000));
+        r1.tick().await.expect("first observation");
+        tokio::time::advance(TTL).await;
+        let (o1, o2) = tokio::join!(r1.tick(), r2.tick());
         let o1 = o1.expect("o1");
         let o2 = o2.expect("o2");
         let total: Vec<_> = o1
@@ -272,14 +328,16 @@ mod tests {
         assert!(o1.skipped.len() + o2.skipped.len() <= 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reaper_does_not_delete_heartbeat_files() {
         let (cs, hb) = setup().await;
         let id = Uuid::new_v4();
         add_entry(&cs, entry("a", id, 0, 30_000)).await;
         hb.heartbeat("a", id, 1_000, 30_000).await.expect("hb");
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        let out = r.tick(1_000_000).await.expect("tick");
+        r.tick().await.expect("first observation");
+        tokio::time::advance(TTL).await;
+        let out = r.tick().await.expect("tick");
         // The reaper ran and evicted the stale scheduler...
         assert_eq!(out.evicted, vec!["a".to_string()]);
         // ...but its heartbeat file is still present and unchanged (an orphan

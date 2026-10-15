@@ -612,7 +612,7 @@ use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
 pub use control_stream_client::ControlStreamManager;
-pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
+pub use heartbeat::{SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ExecutorOutboundBroadcaster;

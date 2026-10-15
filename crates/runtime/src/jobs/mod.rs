@@ -33,7 +33,7 @@ pub use error::{Error, Result};
 pub use executor::JobExecutor;
 pub use state::JobErrorCode;
 pub use state::{
-    DEFAULT_CHUNK_SIZE, JobResult, JobResultManifest, JobSchema, JobState, JobStatus,
+    DEFAULT_CHUNK_SIZE, JobDriver, JobResult, JobResultManifest, JobSchema, JobState, JobStatus,
     PUBLIC_JOB_OWNER,
 };
 pub use store::JobStore;
