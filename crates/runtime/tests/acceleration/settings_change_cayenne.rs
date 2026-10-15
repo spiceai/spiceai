@@ -1135,7 +1135,11 @@ async fn an_accelerated_view_is_held_while_every_read_of_its_source_fails()
             .await
             .clone()
             .ok_or_else(|| anyhow::anyhow!("the runtime has no app"))?;
-        let view = View::new(ViewBuilder::try_from(view)?.build(), Arc::clone(&rt), app);
+        let view = runtime::component::view::View::new(
+            ViewBuilder::try_from(view)?.build(),
+            Arc::clone(&rt),
+            app,
+        );
         let checkpoint = dataset_checkpointer(
             &view,
             rt.accelerator_engine_registry(),
