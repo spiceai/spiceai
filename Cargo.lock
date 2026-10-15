@@ -41,7 +41,7 @@ dependencies = [
  "linkme",
  "object_store 0.13.2",
  "object_store_spawn",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "parking_lot",
  "paste",
  "runtime-acceleration",
@@ -3466,7 +3466,7 @@ dependencies = [
  "fundu",
  "futures",
  "moka",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "parking_lot",
  "pingora-lru",
  "rand 0.10.1",
@@ -3783,8 +3783,8 @@ dependencies = [
  "libc",
  "loom",
  "object_store 0.13.2",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "parking_lot",
  "paste",
  "roaring",
@@ -4502,7 +4502,7 @@ dependencies = [
  "datafusion-table-providers",
  "futures",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime",
  "runtime-api-types",
  "runtime-component",
@@ -4527,7 +4527,7 @@ dependencies = [
  "datafusion",
  "futures",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "paste",
  "runtime",
  "runtime-api-types",
@@ -4652,7 +4652,7 @@ dependencies = [
  "futures",
  "humantime",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
@@ -4752,7 +4752,7 @@ dependencies = [
  "git2",
  "globset",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "regex",
  "reqwest 0.13.4",
  "runtime",
@@ -4928,7 +4928,7 @@ dependencies = [
  "fundu",
  "futures",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
@@ -5010,7 +5010,7 @@ dependencies = [
  "futures",
  "linkme",
  "mysql_async",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "paste",
  "runtime",
  "runtime-api-types",
@@ -5104,7 +5104,7 @@ dependencies = [
  "fundu",
  "futures",
  "linkme",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime",
  "runtime-api-types",
  "runtime-checkpoint-api",
@@ -5295,6 +5295,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-hex"
+version = "1.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e59eef12462b0f9b0a3620219be5d639afd79fe39dff0a42c3997061f9298b4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "proptest",
+ "serde_core",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5408,6 +5420,12 @@ dependencies = [
  "core-foundation 0.9.4",
  "libc",
 ]
+
+[[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "core_maths"
@@ -6401,7 +6419,7 @@ dependencies = [
  "fundu",
  "governor",
  "object_store 0.13.2",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime-api-types",
  "runtime-metrics",
  "runtime-parameters",
@@ -14528,6 +14546,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c1f1a6ac9c875a4941e4c7c085b61e8f4daa326de03b4701768c3491a6ad9ee"
+dependencies = [
+ "js-sys",
+]
+
+[[package]]
 name = "opentelemetry-http"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14536,7 +14563,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "http 1.4.1",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "reqwest 0.13.4",
 ]
 
@@ -14547,10 +14574,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
  "http 1.4.1",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-http",
- "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry-proto 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "prost 0.14.3",
  "reqwest 0.13.4",
  "thiserror 2.0.18",
@@ -14566,8 +14593,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c0359983e7f79cf33c9abd89e5d7ddf67c46c419d0148598022d70e70c01aba"
 dependencies = [
  "once_cell",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "prometheus",
 ]
 
@@ -14577,11 +14604,25 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "prost 0.14.3",
  "tonic",
  "tonic-prost",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
+dependencies = [
+ "base64 0.22.1",
+ "const-hex",
+ "opentelemetry 0.33.1",
+ "opentelemetry_sdk 0.33.1",
+ "prost 0.14.3",
+ "serde",
 ]
 
 [[package]]
@@ -14592,9 +14633,9 @@ checksum = "bb4ac40cc1bc732d0f45b6ab4f72b029470f0e0fcce298048a3db05c18e54fa6"
 dependencies = [
  "http 1.4.1",
  "once_cell",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-http",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -14611,13 +14652,27 @@ dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372a912db2974d1990207006fd0e3aa0ef3fd4ad3be43c65cfaadf2206866061"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry 0.33.1",
+ "portable-atomic",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -14735,8 +14790,8 @@ dependencies = [
  "arrow-buffer",
  "async-trait",
  "blake3",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "tracing",
 ]
 
@@ -14745,7 +14800,7 @@ name = "otelpublisher"
 version = "2.4.0-unstable"
 dependencies = [
  "clap",
- "opentelemetry-proto",
+ "opentelemetry-proto 0.32.0",
  "tokio",
  "tonic",
 ]
@@ -15889,6 +15944,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
+dependencies = [
+ "bitflags 2.13.0",
+ "chacha20",
+ "core_detect",
+ "num-traits",
+ "rand 0.10.1",
+ "rand_xorshift",
+ "regex-syntax",
+ "unarray",
+]
+
+[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16530,6 +16601,15 @@ name = "rand_pcg"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -17578,6 +17658,7 @@ dependencies = [
  "evaluate-api",
  "evaluate-chat",
  "event_stream",
+ "flate2",
  "flight_client",
  "fundu",
  "futures",
@@ -17614,11 +17695,12 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opendal",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
- "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry-proto 0.32.0",
+ "opentelemetry-proto 0.33.1",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "package",
  "parking_lot",
@@ -17756,7 +17838,7 @@ dependencies = [
  "libc",
  "object_store 0.13.2",
  "object_store_occ",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "parking_lot",
  "runtime-checkpoint-api",
  "runtime-datafusion",
@@ -17970,8 +18052,8 @@ dependencies = [
  "futures",
  "object_store 0.13.2",
  "object_store_occ",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "parking_lot",
  "prost 0.14.3",
  "runtime-datafusion",
@@ -18007,7 +18089,7 @@ dependencies = [
  "globset",
  "key-index",
  "logos",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime-acceleration",
  "serde",
  "snafu",
@@ -18045,7 +18127,7 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "object_store 0.13.2",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "parking_lot",
  "regex",
  "regex-syntax",
@@ -18111,7 +18193,7 @@ dependencies = [
  "insta",
  "linkme",
  "llms",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "reqwest 0.13.4",
  "runtime-auth",
  "runtime-rate-control",
@@ -18195,8 +18277,8 @@ dependencies = [
 name = "runtime-metrics"
 version = "2.4.0-unstable"
 dependencies = [
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "runtime-api-types",
  "snafu",
  "telemetry",
@@ -18337,7 +18419,7 @@ dependencies = [
  "futures",
  "headers",
  "http 1.4.1",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "percent-encoding",
  "regex",
  "runtime-auth",
@@ -18482,7 +18564,7 @@ name = "runtime-status"
 version = "2.4.0-unstable"
 dependencies = [
  "datafusion-common",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "runtime-api-types",
  "runtime-metrics",
  "tokio",
@@ -18516,9 +18598,9 @@ dependencies = [
  "fundu",
  "futures",
  "insta",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-prometheus",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "parking_lot",
  "prometheus",
  "rand 0.10.1",
@@ -18584,7 +18666,7 @@ dependencies = [
  "arc-swap",
  "futures",
  "notify",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "rustls",
  "sha2 0.10.9",
  "snafu",
@@ -20221,7 +20303,7 @@ dependencies = [
  "insta",
  "keyring",
  "nix 0.29.0",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "pem",
  "predicates",
  "rand 0.10.1",
@@ -20413,11 +20495,11 @@ dependencies = [
  "iceberg-storage-opendal",
  "libc",
  "mimalloc",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-http",
  "opentelemetry-prometheus",
  "opentelemetry-zipkin",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "parking_lot",
  "podswatcher",
@@ -21453,9 +21535,9 @@ dependencies = [
  "flight_client",
  "futures",
  "hostname 0.4.2",
- "opentelemetry",
- "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry 0.32.0",
+ "opentelemetry-proto 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "pin-project",
  "prost 0.14.3",
@@ -21582,9 +21664,9 @@ dependencies = [
  "nix 0.30.1",
  "object_store 0.13.2",
  "octocrab",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-otlp",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "otel-arrow",
  "rand 0.10.1",
  "rcgen",
@@ -22655,7 +22737,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
 dependencies = [
  "js-sys",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "smallvec 1.15.1",
  "tracing",
  "tracing-core",
@@ -23227,6 +23309,12 @@ dependencies = [
  "thiserror 1.0.69",
  "ug",
 ]
+
+[[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "uncased"
@@ -23954,9 +24042,9 @@ dependencies = [
  "itertools 0.14.0",
  "moka",
  "object_store 0.13.2",
- "opentelemetry",
+ "opentelemetry 0.32.0",
  "opentelemetry-prometheus",
- "opentelemetry_sdk",
+ "opentelemetry_sdk 0.32.1",
  "parking_lot",
  "prometheus",
  "rstest 0.26.1",

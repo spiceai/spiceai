@@ -1741,9 +1741,17 @@ impl LeasedBucket {
                 },
             )
             .await;
-        // Every attempt after the first followed a write that lost the race.
+        // A change call's write lost the race unless that call ended the modify.
+        // Running out of retries and a failed read both end it after a lost race.
         let conflicts = match &leased {
-            Err(ModifyError::Contention { .. }) => attempts,
+            Err(
+                ModifyError::Contention { .. }
+                | ModifyError::State(
+                    object_store_occ::Error::ObjectStore { .. }
+                    | object_store_occ::Error::Deserialization { .. }
+                    | object_store_occ::Error::Unversioned { .. },
+                ),
+            ) => attempts,
             _ => attempts.saturating_sub(1),
         };
         self.metrics
@@ -4510,21 +4518,31 @@ mod tests {
     }
 
     /// Runs `race` once, when the second request reaches the store: after this
-    /// replica read the shared state, before whatever it does next.
+    /// replica read the shared state, before whatever it does next. The request
+    /// numbered `fail_call` (from 0), if any, fails.
     struct RaceAfterFirstRead {
         inner: Arc<dyn ObjectStore>,
         calls: std::sync::atomic::AtomicUsize,
         race: tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+        fail_call: Option<usize>,
     }
 
     impl RaceAfterFirstRead {
-        async fn before_call(&self) {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+        async fn before_call(&self) -> object_store::Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
                 let race = self.race.lock().await.take();
                 if let Some(race) = race {
                     race.await;
                 }
             }
+            if self.fail_call == Some(call) {
+                return Err(object_store::Error::Generic {
+                    store: "RaceAfterFirstRead",
+                    source: "injected failure".into(),
+                });
+            }
+            Ok(())
         }
     }
 
@@ -4548,7 +4566,7 @@ mod tests {
             payload: object_store::PutPayload,
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            self.before_call().await;
+            self.before_call().await?;
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
@@ -4563,7 +4581,7 @@ mod tests {
             location: &object_store::path::Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            self.before_call().await;
+            self.before_call().await?;
             self.inner.get_opts(location, options).await
         }
         fn list(
@@ -4613,6 +4631,7 @@ mod tests {
             race: tokio::sync::Mutex::new(Some(Box::pin(async move {
                 refresh_with_demand(&other).await;
             }))),
+            fail_call: None,
         });
         let mut config = per_second_config(&store, "a", 10, window);
         config.store = Arc::clone(&racing) as Arc<dyn ObjectStore>;
@@ -4630,6 +4649,37 @@ mod tests {
             "the other replica's grant must be kept"
         );
         assert!(granted_to(&bucket, window_id, "a").await > 0);
+        assert_eq!(bucket.metrics().lease_acquire_conflicts_total(), 1);
+    }
+
+    /// A write that loses the race is counted as a conflict even when the read
+    /// that retries it fails.
+    #[tokio::test]
+    async fn a_conflict_before_a_failed_read_is_counted() {
+        let store = Arc::new(InMemory::new());
+        let window = Duration::from_mins(10);
+        let other = per_second_bucket(&store, "b", 10, window);
+        // Request 0 reads, request 1 writes after the other replica leased,
+        // request 2 is the read that retries the lost write.
+        let racing = Arc::new(RaceAfterFirstRead {
+            inner: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            race: tokio::sync::Mutex::new(Some(Box::pin(async move {
+                refresh_with_demand(&other).await;
+            }))),
+            fail_call: Some(2),
+        });
+        let mut config = per_second_config(&store, "a", 10, window);
+        config.store = Arc::clone(&racing) as Arc<dyn ObjectStore>;
+        let bucket = LeasedBucket::new(config);
+        bucket.inner.lock().await.attempted_this_window = 50;
+
+        let refreshed = bucket.refresh_lease().await;
+
+        assert!(
+            matches!(refreshed, Err(Error::Read { .. })),
+            "the retried read fails: {refreshed:?}"
+        );
         assert_eq!(bucket.metrics().lease_acquire_conflicts_total(), 1);
     }
 }
