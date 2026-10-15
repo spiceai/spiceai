@@ -72,7 +72,7 @@ pub enum Error {
     #[snafu(display("Failed to write the object for key {key}: {source}"))]
     ConditionalWrite {
         key: String,
-        source: ConditionalWriteError,
+        source: Box<ConditionalWriteError>,
     },
 
     #[snafu(display(

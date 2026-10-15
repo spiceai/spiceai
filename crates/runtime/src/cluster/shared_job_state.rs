@@ -425,12 +425,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
             queued_at,
         );
         meta.session_id = graph.session_id().to_string();
-        if let InsertResult::AlreadyExists = self
+        let inserted = self
             .meta
             .insert(job_id.as_str(), &meta)
             .await
-            .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?
-        {
+            .map_err(|e| BallistaError::Internal(format!("failed to persist job meta: {e}")))?;
+        if inserted == InsertResult::AlreadyExists {
             return Err(BallistaError::Internal(format!(
                 "failed to submit job {job_id}, meta already owned"
             )));
@@ -1329,16 +1329,16 @@ mod tests {
         new_owner: &Arc<TestState>,
         job: &JobId,
     ) -> futures::future::BoxFuture<'static, ()> {
-        let (taker, taken) = (Arc::clone(new_owner), job.clone());
+        let (new_owner, job) = (Arc::clone(new_owner), job.clone());
         Box::pin(async move {
-            taker
-                .try_acquire_job(&taken)
+            new_owner
+                .try_acquire_job(&job)
                 .await
                 .expect("acquire")
                 .expect("the new owner takes the job over");
-            let graph = running_graph(&taker, "new");
-            taker
-                .save_job(&taken, &graph)
+            let graph = running_graph(&new_owner, "new");
+            new_owner
+                .save_job(&job, &graph)
                 .await
                 .expect("the new owner saves");
         })
@@ -1394,11 +1394,11 @@ mod tests {
         *racing.before_write.lock().await = Some(take_over_and_save(&new_owner, &job));
 
         submitter.accept_job(&job, "test", 0).expect("accept");
-        let submitted = submitter
+        let outcome = submitter
             .submit_job(job.clone(), &running_graph(&submitter, "submitted"), None)
             .await;
 
-        assert!(submitted.is_err(), "the submitter does not own the job");
+        assert!(outcome.is_err(), "the submitter does not own the job");
         let meta = new_owner
             .meta
             .get("j")

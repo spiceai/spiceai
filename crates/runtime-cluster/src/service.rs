@@ -32,7 +32,7 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use app::App;
 use datafusion::common::TableReference;
@@ -51,7 +51,7 @@ use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
 use crate::metrics;
 use crate::scheduler_task_config::PartitionAssignmentConfig;
-use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
+use crate::{PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -86,9 +86,6 @@ pub enum Error {
 
     #[snafu(display("Partition discovery timed out for table {table}"))]
     DiscoveryTimeout { table: String },
-
-    #[snafu(display("Failed to read current system time: {source}"))]
-    SystemTime { source: std::time::SystemTimeError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1246,18 +1243,12 @@ async fn notify_executor_of_assignments(
     Ok(())
 }
 
-fn now_ms() -> Result<u128> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .context(SystemTimeSnafu)
-}
-
 #[cfg(test)]
 mod tests {
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
 
+    use crate::PartitionMetadata;
     use crate::cluster_state::ClusterStateStore;
 
     use super::*;
