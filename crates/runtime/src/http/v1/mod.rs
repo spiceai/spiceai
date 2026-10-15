@@ -27,6 +27,7 @@ pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
+pub mod otlp;
 pub mod packages;
 pub mod queries;
 pub mod query;

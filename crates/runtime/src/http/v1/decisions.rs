@@ -38,6 +38,9 @@ use tracing_futures::Instrument;
 
 use crate::model::EvaluateModelStore;
 use crate::status::RuntimeStatus;
+use model_capabilities::{
+    Capability, CapabilityStore, DecisionsBackend, ModelCapabilities, require,
+};
 
 /// Where to read about the models that answer decisions.
 const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
@@ -70,6 +73,7 @@ const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
 ))]
 pub(crate) async fn post(
     Extension(models): Extension<Arc<RwLock<EvaluateModelStore>>>,
+    Extension(capabilities): Extension<Arc<RwLock<CapabilityStore>>>,
     Extension(status): Extension<Arc<RuntimeStatus>>,
     body: Bytes,
 ) -> Response {
@@ -124,9 +128,23 @@ pub(crate) async fn post(
             }
         };
 
-        let Some(model) = models.read().await.get(&request.model).cloned() else {
-            // A model that failed to load, or is still loading, is absent from the store
-            // too; its status says which, as on `/v1/chat/completions`.
+        let (model, native) = {
+            let capabilities = capabilities.read().await;
+            let model = require(
+                &capabilities,
+                &*models.read().await,
+                &request.model,
+                Capability::Decisions,
+            );
+            let native = capabilities
+                .get(&request.model)
+                .and_then(ModelCapabilities::decisions)
+                == Some(DecisionsBackend::Native);
+            (model, native)
+        };
+        let Ok(model) = model else {
+            // A model that failed to load, or is still loading, has no capabilities
+            // registered either; its status says which, as on `/v1/chat/completions`.
             let unavailable = status.unavailable_model_reason(&request.model);
             // The load error can carry the provider's text, so task history gets only
             // which of the two it is.
@@ -155,7 +173,7 @@ pub(crate) async fn post(
 
         // A decision model has no reasoning effort to set; answering anyway would hide
         // that the level the caller asked for was never applied.
-        if request.reasoning_effort.is_some() && model.is_decision_model() {
+        if request.reasoning_effort.is_some() && native {
             tracing::error!(
                 target: "task_history",
                 "Evaluation of model '{}' failed: unsupported parameter `reasoning_effort`",
@@ -333,26 +351,25 @@ mod tests {
         async fn health(&self) -> evaluate_api::Result<()> {
             Ok(())
         }
-
-        fn is_decision_model(&self) -> bool {
-            true
-        }
     }
 
-    async fn call(
-        store: EvaluateModelStore,
-        body: serde_json::Value,
-    ) -> (StatusCode, serde_json::Value) {
-        call_with_status(store, RuntimeStatus::new(), body).await
+    /// Evaluators and their capabilities, as the runtime registers them.
+    #[derive(Default)]
+    struct Models(EvaluateModelStore, CapabilityStore);
+
+    async fn call(models: Models, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        call_with_status(models, RuntimeStatus::new(), body).await
     }
 
     async fn call_with_status(
-        store: EvaluateModelStore,
+        models: Models,
         status: Arc<RuntimeStatus>,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        let Models(store, capabilities) = models;
         let response = post(
             Extension(Arc::new(RwLock::new(store))),
+            Extension(Arc::new(RwLock::new(capabilities))),
             Extension(status),
             Bytes::from(body.to_string()),
         )
@@ -367,17 +384,23 @@ mod tests {
         (status, serde_json::from_slice(&bytes).expect("json body"))
     }
 
-    fn store_with(name: &str, model: Arc<dyn Evaluate>) -> EvaluateModelStore {
-        let mut store = EvaluateModelStore::new();
-        store.insert(name.into(), model);
-        store
+    /// `model` registered as `name`, with the capabilities of a model `from` a provider.
+    fn store_with(name: &str, from: &str, model: Arc<dyn Evaluate>) -> Models {
+        let capabilities = model_capabilities::ModelCapabilities::of(
+            &spicepod::component::model::Model::new(from, name),
+        )
+        .expect("a known provider");
+        Models(
+            EvaluateModelStore::from([(name.to_string(), model)]),
+            CapabilityStore::from([(name.to_string(), capabilities)]),
+        )
     }
 
     #[tokio::test]
     async fn answers_come_back_in_question_order_with_names() {
         let model = Arc::new(DummyEvaluate::default());
         let (status, body) = call(
-            store_with("jev", Arc::clone(&model) as Arc<dyn Evaluate>),
+            store_with("jev", "typesafe:jev", Arc::clone(&model) as Arc<dyn Evaluate>),
             json!({
                 "model": "jev",
                 "input": "The package arrived with a broken screen.",
@@ -458,7 +481,7 @@ mod tests {
     /// ERROR events it recorded in task history. An ERROR event is what the exporter turns
     /// into the row's `error_message`; a row without one is recorded as a success.
     async fn call_recording_task_history(
-        store: EvaluateModelStore,
+        store: Models,
         status: Arc<RuntimeStatus>,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value, Vec<String>) {
@@ -483,10 +506,10 @@ mod tests {
     // regression test for #14893: a refused request was recorded as a successful task.
     #[tokio::test]
     async fn every_refused_decision_is_recorded_as_failed_in_task_history() {
-        let jev = || store_with("jev", Arc::new(DummyEvaluate::default()));
+        let jev = || store_with("jev", "typesafe:jev", Arc::new(DummyEvaluate::default()));
         let cases = [
             (
-                EvaluateModelStore::new(),
+                Models::default(),
                 json!({"model": "nope", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
                 StatusCode::NOT_FOUND,
                 "Evaluation of model 'nope' failed: model not found",
@@ -532,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_model_is_a_404_naming_it() {
         let (status, body) = call(
-            EvaluateModelStore::new(),
+            Models::default(),
             json!({"model": "missing", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
         )
         .await;
@@ -569,8 +592,7 @@ mod tests {
             let status = RuntimeStatus::new();
             status.update_model("deepseek", model_status);
             recorded.push(
-                call_recording_task_history(EvaluateModelStore::new(), status, request.clone())
-                    .await,
+                call_recording_task_history(Models::default(), status, request.clone()).await,
             );
             expected.push((
                 StatusCode::NOT_FOUND,
@@ -583,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_requests_are_400_in_the_openai_envelope() {
-        let store = || store_with("jev", Arc::new(DummyEvaluate::default()));
+        let store = || store_with("jev", "typesafe:jev", Arc::new(DummyEvaluate::default()));
         let cases = [
             (
                 json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}], "stream": true}),
@@ -625,16 +647,12 @@ mod tests {
         async fn health(&self) -> evaluate_api::Result<()> {
             Ok(())
         }
-
-        fn is_decision_model(&self) -> bool {
-            true
-        }
     }
 
     #[tokio::test]
     async fn an_unavailable_provider_is_a_503() {
         let (status, body) = call(
-            store_with("jev", Arc::new(UnavailableEvaluate)),
+            store_with("jev", "typesafe:jev", Arc::new(UnavailableEvaluate)),
             json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
         )
         .await;
@@ -697,6 +715,7 @@ mod tests {
         let (status, body) = call(
             store_with(
                 "judge",
+                "openai:gpt-4o-mini",
                 Arc::new(evaluate_chat::ChatEvaluator::new(
                     "judge",
                     Arc::new(AnsweringChat::default()),
@@ -738,6 +757,7 @@ mod tests {
         let (status, body) = call(
             store_with(
                 "judge",
+                "openai:gpt-4o-mini",
                 Arc::new(evaluate_chat::ChatEvaluator::new(
                     "judge",
                     Arc::clone(&chat) as Arc<dyn llms::chat::Chat>,
@@ -765,7 +785,11 @@ mod tests {
     async fn reasoning_effort_for_a_decision_model_is_a_400() {
         let model = Arc::new(DummyEvaluate::default());
         let (status, body) = call(
-            store_with("jev", Arc::clone(&model) as Arc<dyn Evaluate>),
+            store_with(
+                "jev",
+                "typesafe:jev",
+                Arc::clone(&model) as Arc<dyn Evaluate>,
+            ),
             json!({
                 "model": "jev",
                 "input": "x",

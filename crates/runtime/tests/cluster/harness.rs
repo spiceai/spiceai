@@ -236,6 +236,21 @@ impl ClusterHarness {
         }
     }
 
+    /// The executors the scheduler's Ballista state holds, as `(id, host:port)`
+    /// sorted by id.
+    pub async fn registered_executors(&self) -> Result<Vec<(String, String)>, anyhow::Error> {
+        let mut executors: Vec<(String, String)> = self
+            .executor_manager
+            .get_executors_state()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .into_iter()
+            .map(|(metadata, _, _)| (metadata.id, format!("{}:{}", metadata.host, metadata.port)))
+            .collect();
+        executors.sort();
+        Ok(executors)
+    }
+
     /// Run a SQL query through the scheduler and collect all result batches.
     pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
         QueryBuilder::new(sql, self.scheduler.datafusion())
@@ -403,7 +418,8 @@ impl ClusterHarnessBuilder {
                 .with_runtime_config(scheduler_config.clone())
                 .with_resolved_cluster_config(
                     ResolvedClusterConfig::try_new(scheduler_config.cluster.clone())
-                        .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                        .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                        .with_instance_id("scheduler"),
                 )
                 .with_app(scheduler_app)
                 .build()
@@ -525,7 +541,8 @@ async fn start_executor(
             .with_runtime_config(executor_config.clone())
             .with_resolved_cluster_config(
                 ResolvedClusterConfig::try_new(executor_config.cluster.clone())
-                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                    .with_instance_id(label),
             )
             .with_app(app)
             .build()

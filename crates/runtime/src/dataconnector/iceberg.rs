@@ -76,7 +76,7 @@ pub(crate) const HADOOP_PARAMETERS: [ParameterSpec; HADOOP_PARAM_LEN] = [
     // unprefixed `metadata_path` shares its unprefixed name, and the two must
     // resolve to distinct keys for both spellings to be accepted.
     ParameterSpec::runtime(METADATA_PATH_PARAM)
-        .description("The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead, and names the metadata file to read."),
+        .description("The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead: it names the metadata file to read, or a version number from which the newest consecutive `v<N>.metadata.json` is read."),
     ParameterSpec::runtime(LEGACY_METADATA_PATH_PARAM)
         .deprecated("Use `iceberg_metadata_path`, which accepts the same full URL and also a path relative to `from`, such as `/metadata/v1.metadata.json`."),
 ];
@@ -342,8 +342,8 @@ impl IcebergDataConnector {
     }
 
     /// Loads the table rooted at `from`, with no catalog. Each query reads the
-    /// metadata file `metadata/version-hint.text` names, or else the one with the
-    /// highest version number in `metadata/`, so new commits are read as they land.
+    /// metadata file found from `metadata/version-hint.text`, or else the one with
+    /// the highest version number in `metadata/`, so new commits are read as they land.
     async fn load_table_root(
         props: &HashMap<String, String>,
         storage_factory: Option<Arc<dyn StorageFactory>>,

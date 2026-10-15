@@ -71,6 +71,7 @@ pub mod directory_archive;
 pub mod engine;
 pub mod metrics;
 pub mod notifications;
+pub mod section_deprecation;
 mod writer_lease;
 pub use crate::layout::AccelerationLayout;
 pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled};
@@ -1354,7 +1355,7 @@ impl SnapshotManager {
         tracing::debug!(dataset = %dataset_name, "Snapshots enabled");
 
         let Some(snapshot_location) = &snapshot_config.location else {
-            tracing::warn!(dataset = %dataset_name, "Snapshots enabled but no location configured");
+            tracing::warn!(dataset = %dataset_name, "{}", no_location_warning(&dataset_name));
             return None;
         };
         let snapshot_location_uri = snapshot_location.clone();
@@ -1442,7 +1443,7 @@ impl SnapshotManager {
         };
 
         let Some(snapshot_location) = &snapshot_config.location else {
-            tracing::warn!(dataset = %dataset_name, "Snapshots enabled but no location configured");
+            tracing::warn!(dataset = %dataset_name, "{}", no_location_warning(&dataset_name));
             return None;
         };
         let snapshot_location_uri = snapshot_location.clone();
@@ -3970,6 +3971,13 @@ fn encode_hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+/// The warning for a dataset that enables snapshots without a snapshot location.
+fn no_location_warning(dataset_name: &str) -> String {
+    format!(
+        "Snapshots are enabled for dataset '{dataset_name}', but no snapshot location is configured. Set `runtime.state.location`, or `acceleration.snapshots_location` on the dataset. See: {SNAPSHOTS_DOCS}"
+    )
+}
+
 /// The object path of an `s3://` snapshot location inside its bucket. The
 /// notification consumer matches S3 event keys against the same path, so both
 /// derive it here.
@@ -4023,7 +4031,7 @@ fn log_snapshot_store_error(
             tracing::error!(
                 dataset = %dataset_name,
                 location = %snapshots_location_url,
-                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because 'snapshots.params' is invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because its S3 params are invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
             );
         }
         Error::GcsParameterValidation { source, .. } => {
@@ -4124,12 +4132,17 @@ async fn build_s3_parameters(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<&HashMap<String, String>>,
 ) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
-    runtime_state_location::build_s3_parameters(secrets, params, StateFeature::Snapshots)
-        .await
-        .map_err(|error| match error {
-            runtime_state_location::Error::S3ParameterValidation { source, .. } => source,
-            other => Box::new(other),
-        })
+    runtime_state_location::build_s3_parameters(
+        secrets,
+        params,
+        StateFeature::Snapshots,
+        StateSource::FeatureSetting,
+    )
+    .await
+    .map_err(|error| match error {
+        runtime_state_location::Error::S3ParameterValidation { source, .. } => source,
+        other => Box::new(other),
+    })
 }
 
 #[cfg(test)]
