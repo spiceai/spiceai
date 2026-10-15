@@ -78,11 +78,11 @@ pub fn section_deprecation_warning(section: &Snapshots, state: Option<&RuntimeSt
             warning.push_str(" Your snapshots are already there: delete the section.");
             if keys.is_empty() {
                 warning.push_str(
-                    " Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and does not set it, so `runtime.state.params` do not apply to its snapshots.",
+                    " Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and sets neither `snapshots_location` nor `snapshots_params`, so `runtime.state.params` do not apply to its snapshots.",
                 );
             } else {
                 warning.push_str(&move_keys(
-                    "`acceleration.snapshots_params` on each dataset that enables snapshots and does not set it",
+                    "`acceleration.snapshots_params` on each dataset that enables snapshots and sets neither `snapshots_location` nor `snapshots_params`",
                 ));
             }
         }
@@ -104,17 +104,17 @@ pub fn section_deprecation_warning(section: &Snapshots, state: Option<&RuntimeSt
         Remedy::Datasets(location) => {
             let _ = write!(
                 warning,
-                " To keep your snapshots where they are, delete the section and set `acceleration.snapshots_location: {location}` on each dataset that enables snapshots."
+                " To keep your snapshots where they are, delete the section and set `acceleration.snapshots_location: {location}` on each dataset that enables snapshots and does not set it."
             );
             warning.push_str(&move_keys(
-                "`acceleration.snapshots_params` on each of those datasets",
+                "`acceleration.snapshots_params` on each of those datasets that does not set it",
             ));
         }
     }
     if section.bootstrap_on_failure_behavior != BootstrapOnFailureBehavior::default() {
         let _ = write!(
             warning,
-            " Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: {}` on each dataset that enables snapshots.",
+            " Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: {}` on each dataset that enables snapshots and does not set it.",
             behavior_name(section.bootstrap_on_failure_behavior)
         );
     }
@@ -277,7 +277,7 @@ mod tests {
         let warning = section_deprecation_warning(&section(None, Some(params())), Some(&state));
         assert_safe(&warning);
         assert!(
-            warning.contains(" Your snapshots are already there: delete the section. Move s3_auth, s3_key, s3_region from `snapshots.params` into `acceleration.snapshots_params` on each dataset that enables snapshots and does not set it. See:"),
+            warning.contains(" Your snapshots are already there: delete the section. Move s3_auth, s3_key, s3_region from `snapshots.params` into `acceleration.snapshots_params` on each dataset that enables snapshots and sets neither `snapshots_location` nor `snapshots_params`. See:"),
             "{warning}"
         );
 
@@ -285,7 +285,7 @@ mod tests {
             section_deprecation_warning(&section(None, Some(Params::default())), Some(&state));
         assert_safe(&empty);
         assert!(
-            empty.contains(" Your snapshots are already there: delete the section. Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and does not set it, so `runtime.state.params` do not apply to its snapshots. See:"),
+            empty.contains(" Your snapshots are already there: delete the section. Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and sets neither `snapshots_location` nor `snapshots_params`, so `runtime.state.params` do not apply to its snapshots. See:"),
             "{empty}"
         );
         assert!(!empty.contains("https://state.example"), "{empty}");
@@ -296,7 +296,7 @@ mod tests {
         );
         assert_safe(&location_alone);
         assert!(
-            location_alone.contains(" Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and does not set it, so `runtime.state.params` do not apply to its snapshots. See:"),
+            location_alone.contains(" Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and sets neither `snapshots_location` nor `snapshots_params`, so `runtime.state.params` do not apply to its snapshots. See:"),
             "{location_alone}"
         );
     }
@@ -316,7 +316,7 @@ mod tests {
             );
             assert_safe(&warning);
             assert!(
-                warning.contains(&format!(" To keep your snapshots where they are, delete the section and set `acceleration.snapshots_location: {location}` on each dataset that enables snapshots. Move s3_auth, s3_key, s3_region from `snapshots.params` into `acceleration.snapshots_params` on each of those datasets. See:")),
+                warning.contains(&format!(" To keep your snapshots where they are, delete the section and set `acceleration.snapshots_location: {location}` on each dataset that enables snapshots and does not set it. Move s3_auth, s3_key, s3_region from `snapshots.params` into `acceleration.snapshots_params` on each of those datasets that does not set it. See:")),
                 "{warning}"
             );
         }
@@ -326,7 +326,7 @@ mod tests {
         assert_safe(&without_params);
         assert!(
             without_params.contains(
-                "`acceleration.snapshots_location: s3://archive-bucket/snaps/` on each dataset that enables snapshots. See:"
+                "`acceleration.snapshots_location: s3://archive-bucket/snaps/` on each dataset that enables snapshots and does not set it. See:"
             ),
             "no params to move: {without_params}"
         );
@@ -342,7 +342,7 @@ mod tests {
         assert_safe(&warning);
         assert!(
             warning.contains(
-                " on each dataset that enables snapshots. Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: fallback` on each dataset that enables snapshots. See:"
+                " on each dataset that enables snapshots and does not set it. Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: fallback` on each dataset that enables snapshots and does not set it. See:"
             ),
             "{warning}"
         );
@@ -355,7 +355,7 @@ mod tests {
         let warning = section_deprecation_warning(&retry, Some(&state("s3://my-bucket/spice/")));
         assert_safe(&warning);
         assert!(
-            warning.contains(" Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: retry` on each dataset that enables snapshots. `snapshots.enabled: false` has no replacement: set `snapshots: disabled`, the default, on each dataset instead. See:"),
+            warning.contains(" Replace `snapshots.bootstrap_on_failure_behavior` with `acceleration.snapshots_bootstrap_on_failure_behavior: retry` on each dataset that enables snapshots and does not set it. `snapshots.enabled: false` has no replacement: set `snapshots: disabled`, the default, on each dataset instead. See:"),
             "{warning}"
         );
     }
