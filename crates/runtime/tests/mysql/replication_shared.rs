@@ -767,6 +767,72 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
     Ok(())
 }
 
+/// The shared pump reads the binlog for every member of its group, so it must not depend on
+/// the runtime that subscribed the first member. Here that runtime has a single worker,
+/// which is blocked once the member is ready; a change committed afterwards must still reach
+/// the member, read on the test's own runtime. A pump spawned onto the subscribing runtime
+/// never runs again, and the change never arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_pump_reads_while_the_subscribing_runtime_is_blocked() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "blocked", &[(1, "b1")]).await?;
+
+    // Subscribe, bootstrap and reach readiness on a one-worker runtime of its own, then
+    // hand the stream over and block that worker until the test releases it.
+    let (stream_tx, stream_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let subscriber = std::thread::spawn(move || -> Result<(), anyhow::Error> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        let stream = runtime.block_on(async {
+            let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+            let mut stream =
+                start_replication_stream(stream_input(port, 210_601, "blocked", store));
+            drain_bootstrap(&mut stream, "blocked member", &[1]).await?;
+            wait_for_ready(&mut stream, "blocked member readiness").await?;
+            Ok::<_, anyhow::Error>(stream)
+        })?;
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn(async move {
+            let _ = blocked_tx.send(());
+            // Holds the runtime's only worker: nothing else on this runtime runs until
+            // the test is done.
+            let _ = release_rx.recv();
+        });
+        blocked_rx.recv()?;
+        if stream_tx.send(stream).is_err() {
+            anyhow::bail!("the test stopped waiting for the stream");
+        }
+        Ok(())
+    });
+
+    let mut stream = stream_rx.await?;
+    exec(&pool, "INSERT INTO blocked VALUES (2, 'b2')").await?;
+    let delivered = expect_single_change(
+        &mut stream,
+        "insert while the subscriber is blocked",
+        "c",
+        2,
+    )
+    .await;
+
+    release_tx.send(())?;
+    subscriber
+        .join()
+        .map_err(|_| anyhow::anyhow!("the subscribing thread panicked"))??;
+    delivered?;
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
+
 /// A change carries its source transaction's commit time to the millisecond. `MySQL`
 /// writes the commit time in microseconds into each transaction's GTID event; an event
 /// header has whole seconds only, which read up to a second old, and the replication-lag
