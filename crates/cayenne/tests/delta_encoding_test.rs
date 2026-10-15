@@ -237,7 +237,11 @@ const STRATEGY_ROWS: i64 = 20_000;
 fn monotone_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
         Field::new("name", DataType::Utf8, false),
     ]))
 }
