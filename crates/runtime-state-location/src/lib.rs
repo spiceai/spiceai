@@ -40,6 +40,12 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use url::Url;
 
+mod check;
+
+pub use check::{
+    CheckError, FORMAT_FILE, FORMAT_VERSION, RUNTIME_STATE_DOCS, StateLocationCheck, check_location,
+};
+
 fn s3_parameters() -> Vec<ParameterSpec> {
     vec![
         ParameterSpec::component("region").secret(),
@@ -169,12 +175,15 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A runtime feature that keeps shared state in a state location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateFeature {
     Scheduler,
     RateControl,
     ResultsCacheWarmup,
     Snapshots,
+    /// The startup check of a `runtime.state` location, which keeps
+    /// `format.json` and its probe object in the location's `_spice/` folder.
+    StartupCheck,
 }
 
 impl StateFeature {
@@ -185,6 +194,7 @@ impl StateFeature {
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
+            Self::StartupCheck => "_spice",
         }
     }
 
@@ -194,13 +204,28 @@ impl StateFeature {
             Self::RateControl => "rate-control state",
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
+            Self::StartupCheck => "shared state location check",
+        }
+    }
+
+    /// The feature's name in log messages.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Scheduler => "the cluster scheduler",
+            Self::RateControl => "source rate control",
+            Self::ResultsCacheWarmup => "SQL results cache warmup",
+            Self::Snapshots => "acceleration snapshots",
+            Self::StartupCheck => "the startup check",
         }
     }
 
     /// The S3 parameters the feature's `params` are validated against.
     fn s3_parameters(self) -> &'static [ParameterSpec] {
         match self {
-            Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup => &S3_PARAMETERS,
+            Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck => {
+                &S3_PARAMETERS
+            }
             Self::Snapshots => &SNAPSHOT_S3_PARAMETERS,
         }
     }
