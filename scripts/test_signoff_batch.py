@@ -28,6 +28,7 @@ STUB_SIGNOFF = """#!/usr/bin/env bash
 # signoff-batch accepts a scripts/signoff that defines cmd_verify.
 case "$1" in
   verify)
+    if [[ -n "${STUB_VERIFY_HOOK:-}" ]]; then bash "$STUB_VERIFY_HOOK" >&2; fi
     if [[ -e FAIL ]]; then echo 'error: could not compile `probe` (lib)'; exit 1; fi
     echo "✓ Verified $(git rev-parse --short=12 HEAD) — lint+test passed in 1s (no status posted)" ;;
   -f) printf '%s %s\\n' "$(git rev-parse HEAD)" "$4" >> "$STUB_ATTEST_LOG" ;;
@@ -43,10 +44,43 @@ cat "$STUB_GH_DIR/pr-$3.json"
 
 class PureFunctionTest(unittest.TestCase):
     def test_parse_pr_arg(self):
-        for arg in ("15040", "#15040", "https://github.com/spiceai/spiceai/pull/15040", "x/pull/15040/"):
+        for arg in ("15040", "#15040", " 15040 "):
             self.assertEqual(batch.parse_pr_arg(arg), 15040, arg)
+        for arg in ("trunk", "x/pull/15040/", "https://example.com/a/b/c/pull/15040"):
+            with self.assertRaises(batch.BatchError, msg=arg):
+                batch.parse_pr_arg(arg, "spiceai/spiceai")
+        # A URL is only accepted for the repository the batch pushes to.
+        for repo in ("spiceai/spiceai", "SpiceAI/SpiceAI"):
+            for arg in ("https://github.com/spiceai/spiceai/pull/15040", "spiceai/spiceai/pull/15040/"):
+                self.assertEqual(batch.parse_pr_arg(arg, repo), 15040, arg)
+        for arg in ("https://github.com/other/project/pull/15040", "other/project/pull/15040"):
+            with self.assertRaises(batch.BatchError, msg=arg):
+                batch.parse_pr_arg(arg, "spiceai/spiceai")
         with self.assertRaises(batch.BatchError):
-            batch.parse_pr_arg("trunk")
+            batch.parse_pr_arg("https://github.com/spiceai/spiceai/pull/15040", None)
+        self.assertEqual(batch.parse_pr_arg("15040", None), 15040)
+
+    def test_repo_slug_from_remote_url(self):
+        for url in ("https://github.com/spiceai/spiceai.git", "git@github.com:spiceai/spiceai.git",
+                    "https://github.com/spiceai/spiceai", "ssh://git@github.com/spiceai/spiceai.git"):
+            self.assertEqual(batch.slug_from_remote_url(url), "spiceai/spiceai", url)
+        self.assertIsNone(batch.slug_from_remote_url("/tmp/origin.git"))
+
+    def test_remote_repo_slug_refuses_a_split_remote(self):
+        with tempfile.TemporaryDirectory(prefix="signoff-batch-remote-") as tmp:
+            repo = Path(tmp)
+            env = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+            def git(*args):
+                subprocess.run(["git", *args], cwd=repo, env=os.environ | env, check=True, capture_output=True)
+
+            git("init", "-q")
+            self.assertIsNone(batch.remote_repo_slug(repo))  # no remote: not a GitHub repository
+            git("remote", "add", "origin", "https://github.com/spiceai/spiceai.git")
+            self.assertEqual(batch.remote_repo_slug(repo), "spiceai/spiceai")
+            git("remote", "set-url", "--push", "origin", "git@github.com:other/project.git")
+            with self.assertRaises(batch.BatchError):
+                batch.remote_repo_slug(repo)
 
     def test_failing_crates_from_clippy_and_nextest(self):
         log = "\n".join([
@@ -148,10 +182,10 @@ class EndToEndTest(unittest.TestCase):
     def origin_tip(self, branch):
         return self.git(self.origin, "rev-parse", f"refs/heads/{branch}")
 
-    def run_batch(self, *args):
+    def run_batch(self, *args, env=None):
         return subprocess.run(
             [str(SUBJECT), "--yes", "--worktree", str(self.worktree), *args],
-            cwd=self.dev, env=self.env, text=True, capture_output=True, timeout=60,
+            cwd=self.dev, env=self.env | (env or {}), text=True, capture_output=True, timeout=60,
         )
 
     def test_pass_pushes_trunk_merges_and_attests_each_head(self):
@@ -171,6 +205,37 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(attested[tip], f"lint+test passed in batch with {other}")
         # The attestation worktrees are gone again.
         self.assertNotIn("signoff-batch-attest", self.git(self.dev, "worktree", "list"))
+
+    def test_branch_that_moves_during_the_checks_is_not_attested(self):
+        # The PR already has trunk, so the batch has no merge of its own to push.
+        self.open_pr(1, "pr-one", {"a.txt": "a from pr one\n"})
+        checked = self.origin_tip("pr-one")
+        other = self.root / "other"
+        self.git(self.root, "clone", "-q", "-b", "pr-one", str(self.origin), str(other))
+        hook = self.root / "move-branch.sh"
+        hook.write_text(
+            f"cd {other} && echo moved > a.txt && git commit -qam 'moved during checks'"
+            " && git push -q origin HEAD:refs/heads/pr-one\n"
+        )
+        result = self.run_batch("1", env={"STUB_VERIFY_HOOK": str(hook)})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("#1: push rejected, not attested", result.stderr)
+        self.assertNotEqual(self.origin_tip("pr-one"), checked)
+        attested = self.attest_log.read_text() if self.attest_log.exists() else ""
+        self.assertNotIn(checked, attested)
+
+    def test_branch_deleted_during_the_checks_is_not_recreated(self):
+        # A PR merged mid-run deletes its branch; the batch must not push it back.
+        self.open_pr(1, "pr-one", {"a.txt": "a from pr one\n"})
+        checked = self.origin_tip("pr-one")
+        hook = self.root / "delete-branch.sh"
+        hook.write_text(f"git --git-dir={self.origin} update-ref -d refs/heads/pr-one\n")
+        result = self.run_batch("1", env={"STUB_VERIFY_HOOK": str(hook)})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("#1: push rejected, not attested", result.stderr)
+        self.assertEqual(self.git(self.origin, "branch", "--list", "pr-one"), "")
+        attested = self.attest_log.read_text() if self.attest_log.exists() else ""
+        self.assertNotIn(checked, attested)
 
     def test_failure_pushes_and_attests_nothing(self):
         self.open_pr(1, "pr-one", {"a.txt": "a from pr one\n"})

@@ -7,8 +7,8 @@
 #   2. Merge those heads onto T, in the order given: the batch commit.
 #   3. Run `scripts/signoff verify` on the batch, in a worktree that is reused
 #      across runs so its build cache stays warm.
-#   4. Pass: push each updated head (a plain push, never a force push), then
-#      attest it with `scripts/signoff -f --no-verify --note "..."`.
+#   4. Pass: push each head, leased on the head that was checked (it never
+#      rewrites history), then attest it with `scripts/signoff -f --no-verify --note "..."`.
 #      Fail: push nothing. Name the PRs that touch the crates that failed.
 #
 #   trunk T ──┬── #a + T ──┐
@@ -153,11 +153,45 @@ def changed_files(repo: Path, base: str, head: str) -> set[str]:
     return set(out.splitlines()) if out else set()
 
 
-def parse_pr_arg(arg: str) -> int:
-    match = re.fullmatch(r"#?(\d+)|.*/pull/(\d+)/?", arg.strip())
+def slug_from_remote_url(url: str) -> str | None:
+    """`owner/name` for a GitHub remote URL, or None when it is not one."""
+    match = re.fullmatch(r"(?:https://|ssh://git@|git@)github\.com[/:]([^/]+)/([^/]+?)(?:\.git)?/?", url.strip())
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def remote_repo_slug(repo: Path) -> str | None:
+    """`owner/name` of the GitHub repository REMOTE fetches from and pushes to, or
+    None when it is not a GitHub repository. A remote that fetches from one
+    repository and pushes to another is refused: the batch would check one and
+    attest the other."""
+    fetch_url = run(["git", "remote", "get-url", REMOTE], repo, check=False).stdout
+    push_url = run(["git", "remote", "get-url", "--push", REMOTE], repo, check=False).stdout
+    fetch_slug, push_slug = slug_from_remote_url(fetch_url), slug_from_remote_url(push_url)
+    if (fetch_slug or "").lower() != (push_slug or "").lower():
+        raise BatchError(
+            f"remote {REMOTE!r} fetches from {fetch_url.strip()} but pushes to {push_url.strip()}; "
+            "point both at the same repository"
+        )
+    return fetch_slug
+
+
+def parse_pr_arg(arg: str, repo_slug: str | None = None) -> int:
+    """The PR number from a number, #number, or URL. A URL naming a repository must
+    name `repo_slug`: the batch looks PRs up and pushes to that repository only."""
+    text = arg.strip()
+    match = re.fullmatch(r"#?(\d+)", text)
+    if match:
+        return int(match.group(1))
+    match = re.fullmatch(r"(?:https?://github\.com/)?([^/:]+)/([^/]+)/pull/(\d+)/?", text)
     if not match:
         raise BatchError(f"not a PR number or URL: {arg!r}")
-    return int(match.group(1) or match.group(2))
+    named = f"{match.group(1)}/{match.group(2)}"
+    if repo_slug is None or named.lower() != repo_slug.lower():
+        raise BatchError(
+            f"{arg!r} is a PR in {named}, but this batch pushes to {repo_slug or f'remote {REMOTE!r}'}; "
+            "pass a PR number from this repository"
+        )
+    return int(match.group(3))
 
 
 def lookup_pr(repo: Path, number: int) -> tuple[str, str, str]:
@@ -431,7 +465,14 @@ def main(argv: Sequence[str]) -> int:
 
     try:
         repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
-        numbers = list(dict.fromkeys(parse_pr_arg(a) for a in args.prs))
+        repo_slug = remote_repo_slug(repo)
+        if repo_slug:
+            # gh picks its repository on its own (GH_REPO, a `gh repo set-default`
+            # choice), which can differ from REMOTE. Pin the PR lookups and the
+            # attestation to the repository the batch fetches from and pushes to.
+            os.environ["GH_HOST"] = "github.com"
+            os.environ["GH_REPO"] = f"github.com/{repo_slug}"
+        numbers = list(dict.fromkeys(parse_pr_arg(a, repo_slug) for a in args.prs))
         worktree = (args.worktree or default_worktree(repo)).resolve()
 
         trunk, prs = fetch(repo, numbers)
@@ -459,12 +500,20 @@ def main(argv: Sequence[str]) -> int:
 
         failed = []
         for h in batch.heads:
-            if h.needs_push:
-                push = run(["git", "push", "--quiet", REMOTE, f"{h.sha}:refs/heads/{h.pr.branch}"], repo, check=False)
-                if push.returncode != 0:
-                    # Usually the branch moved during the run: its new head was not checked.
-                    failed.append(f"#{h.pr.number}: push rejected, not attested\n{push.stderr.strip()}")
-                    continue
+            # Push even a head that already had trunk: the push is the stale-head guard.
+            # The lease makes it a compare-and-swap on the head the batch checked, so a
+            # branch that moved or was deleted during the checks rejects it. It never
+            # rewrites history: h.sha is that head or a merge on top of it.
+            push = run(
+                ["git", "push", "--quiet", f"--force-with-lease=refs/heads/{h.pr.branch}:{h.pr.head}",
+                 REMOTE, f"{h.sha}:refs/heads/{h.pr.branch}"],
+                repo,
+                check=False,
+            )
+            if push.returncode != 0:
+                # Usually the branch moved during the run: its new head was not checked.
+                failed.append(f"#{h.pr.number}: push rejected, not attested\n{push.stderr.strip()}")
+                continue
             result = attest(repo, signoff, h.sha, compose_note(summary, h.pr, batch))
             if result.returncode != 0:
                 failed.append(f"#{h.pr.number}: attestation failed\n{(result.stdout + result.stderr).strip()}")

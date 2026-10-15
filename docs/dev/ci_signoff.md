@@ -316,9 +316,10 @@ scripts/signoff-batch --plan 15040 15041     # build and check out the batch, th
    `<checkout>-signoff-batch`; set `--worktree` or `SIGNOFF_BATCH_WORKTREE` to
    change it. The log goes to `.git/signoff-batch/<batch>.log`.
 4. If the checks pass, the script asks for confirmation (skip it with `--yes`).
-   Then it pushes each updated head and attests it. The description names the
-   other PRs in the batch. If a push is rejected because the branch moved during the
-   run, the script does not attest that PR.
+   Then it pushes each head and attests it. The description names the other PRs
+   in the batch. A head that already had `trunk` is pushed too. Each push is
+   leased on the head the batch checked, so it is rejected if the branch moved
+   or was deleted during the run, and the script does not attest that PR.
 
 If the checks fail, the script pushes and attests nothing. It reads the log for
 crates that did not compile or had failing tests, and lists the PRs that change
