@@ -14732,6 +14732,7 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "async-trait",
+ "blake3",
  "opentelemetry",
  "opentelemetry_sdk",
  "tracing",
