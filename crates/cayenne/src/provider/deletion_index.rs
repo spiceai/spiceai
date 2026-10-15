@@ -1030,9 +1030,14 @@ where
             let m = merged_entry(tail.get(key).copied(), entry.delete_seq, entry.insert_seq);
             tail.insert(*key, m.entry);
         }
+        // Each side at or below the cutoff is cleared, as `prune_deletes_at_or_below`
+        // clears it.
         tail.retain(|_, entry| {
             if entry.delete_seq != SEQUENCE_ABSENT && entry.delete_seq <= prefix.cutoff {
                 entry.delete_seq = SEQUENCE_ABSENT;
+            }
+            if entry.insert_seq != SEQUENCE_ABSENT && entry.insert_seq <= prefix.cutoff {
+                entry.insert_seq = SEQUENCE_ABSENT;
             }
             entry.delete_seq != SEQUENCE_ABSENT || entry.insert_seq != SEQUENCE_ABSENT
         });
@@ -2181,10 +2186,14 @@ mod tests {
             }) {
                 internal_trials += 1;
             }
-            // One prune of the whole final index at the cutoff.
-            for (delete, _) in model.values_mut() {
+            // One prune of the whole final index at the cutoff: each side at or below
+            // it is cleared.
+            for (delete, insert) in model.values_mut() {
                 if *delete != SEQUENCE_ABSENT && *delete <= cutoff {
                     *delete = SEQUENCE_ABSENT;
+                }
+                if *insert != SEQUENCE_ABSENT && *insert <= cutoff {
+                    *insert = SEQUENCE_ABSENT;
                 }
             }
             model.retain(|_, (d, i)| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT);
