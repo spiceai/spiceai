@@ -1471,14 +1471,27 @@ async fn prop_auto_crossing_observes_position_then_key_switch_impl(
     );
 
     // Growth + flush may already have requested/run the switch; if not, the
-    // reclaim pass under compaction_lock does it (same path as production).
+    // reclaim pass under compaction_lock does it (same path as production). A pass
+    // declines without running while another pass holds the compaction lock or a
+    // staged append is in flight, so poll until one runs, within a deadline.
     if table.should_capture_positions() {
-        assert!(
-            table
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut attempts = 0_u32;
+        let mut ran = false;
+        while table.should_capture_positions() && std::time::Instant::now() < deadline {
+            attempts += 1;
+            ran = table
                 .compact_current_snapshot_small_files()
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
-            "AutoCrossing non-vacuity: reclaim pass must run after growth past the bound"
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            if ran {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            ran || !table.should_capture_positions(),
+            "AutoCrossing non-vacuity: reclaim pass must run after growth past the bound ({attempts} attempts)"
         );
     }
     assert!(

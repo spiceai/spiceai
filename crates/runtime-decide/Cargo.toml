@@ -17,6 +17,7 @@ datafusion.workspace = true
 evaluate-api = { path = "../evaluate-api" }
 futures.workspace = true
 linkme.workspace = true
+model-capabilities = { path = "../model-capabilities" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-status = { path = "../runtime-status" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
@@ -29,6 +30,7 @@ tracing.workspace = true
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 insta.workspace = true
+spicepod = { path = "../spicepod", default-features = false }
 
 [[bench]]
 name = "planning"

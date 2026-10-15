@@ -851,7 +851,19 @@ struct SnapshotSweepPins {
 /// Keeps maintenance from deleting the table's files until dropped.
 /// See [`CayenneTableProvider::hold_file_deletions`].
 pub struct FileDeletionHold {
-    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    table: CayenneTableProvider,
+}
+
+impl Drop for FileDeletionHold {
+    /// Releases the hold, then runs the snapshot-directory sweeps, which skip
+    /// their pass while it is held. A table that snapshots after every commit
+    /// would otherwise skip every sweep and keep every directory it supersedes.
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.table.schedule_old_snapshot_cleanup();
+        self.table.sweep_retired_snapshot_dirs();
+    }
 }
 
 /// Keeps the table's persisted secondary index runs as they were written until
@@ -2987,6 +2999,7 @@ pub struct CayenneTableProviderBuilder {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -3141,6 +3154,14 @@ struct CayenneTableProviderOpenOptions {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    /// The conflict detection recorded for the partitioned table this table is a
+    /// partition of, if it is one. A partition follows that table turning the check
+    /// off, with the conflict action it records cleared to match, as the table's own is:
+    /// the change is applied in place to the table's metastore row, not to the rows of
+    /// the partitions it already has, which would otherwise keep checking and keep
+    /// resolving a key repeated within one write. A partition is never given the check
+    /// this way, since one written without it may hold more than one row per key.
+    partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// What a sweep consults before deleting a snapshot directory: in-flight scan
@@ -3185,7 +3206,20 @@ impl CayenneTableProviderBuilder {
             index_word_bits: None,
             dataset_name: None,
             snapshot_dir_pins: None,
+            partitioned_table_conflict_detection: None,
         }
+    }
+
+    /// Open or create a partition of a partitioned table whose metastore row records
+    /// `detection`. A partition follows that table turning conflict detection off; see
+    /// [`CayenneTableProviderOpenOptions::partitioned_table_conflict_detection`].
+    #[must_use]
+    pub(crate) fn with_partitioned_table_conflict_detection(
+        mut self,
+        detection: PkConflictDetection,
+    ) -> Self {
+        self.partitioned_table_conflict_detection = Some(detection);
+        self
     }
 
     /// Open the table over the pins of the instance this one replaces, so this
@@ -3336,6 +3370,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3372,6 +3407,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -3384,7 +3420,7 @@ impl CayenneTableProviderBuilder {
 /// created with `DoNothing` by an earlier release included — it upserts on that key.
 /// A table without one, or with no `on_conflict` (`pk_conflict_detection: none`),
 /// is left as recorded.
-fn upsert_on_primary_key(
+pub(crate) fn upsert_on_primary_key(
     primary_key: &[String],
     on_conflict: Option<OnConflict>,
 ) -> Option<OnConflict> {
@@ -9605,11 +9641,16 @@ impl CayenneTableProvider {
             index_word_bits,
             dataset_name,
             snapshot_dir_pins,
+            partitioned_table_conflict_detection,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
         table_metadata.on_conflict =
             upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
+        if partitioned_table_conflict_detection == Some(PkConflictDetection::None) {
+            table_metadata.vortex_config.pk_conflict_detection = PkConflictDetection::None;
+            table_metadata.on_conflict = None;
+        }
 
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
@@ -10415,6 +10456,15 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn metadata(&self) -> &TableMetadata {
         &self.table_metadata
+    }
+
+    /// The primary-key conflict detection this table's writes run with: the mode its
+    /// metastore row records. That is the requested mode unless the table kept its
+    /// settings through a change it cannot adopt in place, or holds them until its source
+    /// can be read. Such a table keeps its key handling with them, so its writes do not
+    /// follow the requested mode the shared context was built from.
+    fn pk_conflict_detection(&self) -> PkConflictDetection {
+        self.table_metadata.vortex_config.pk_conflict_detection
     }
 
     /// The configured CDC durability mode for this table.
@@ -15705,7 +15755,7 @@ impl CayenneTableProvider {
             return Ok(PreparedInsertStream::immediate(stream));
         };
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+        if self.pk_conflict_detection() == PkConflictDetection::None {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for append"
@@ -15921,7 +15971,7 @@ impl CayenneTableProvider {
             .clone()
             .unwrap_or(OnConflict::DoNothingAll);
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+        if self.pk_conflict_detection() == PkConflictDetection::None {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for sharded append"
@@ -21381,10 +21431,12 @@ impl CayenneTableProvider {
     /// Hold off maintenance deleting the table's files until the returned guard
     /// drops, for a reader that copies them, such as an acceleration snapshot. Take
     /// it before exporting the metastore slice and hold it until the archive is
-    /// written. Waits for an in-flight deletion to finish.
+    /// written. Waits for an in-flight deletion to finish. Dropping it runs the
+    /// snapshot-directory sweeps.
     pub async fn hold_file_deletions(&self) -> FileDeletionHold {
         FileDeletionHold {
-            _guard: Arc::clone(&self.file_deletion_fence).read_owned().await,
+            guard: Some(Arc::clone(&self.file_deletion_fence).read_owned().await),
+            table: self.clone_for_write(),
         }
     }
 
@@ -21414,7 +21466,7 @@ impl CayenneTableProvider {
 
     /// Claim file deletion for a snapshot-directory sweep, held until its
     /// deletion finishes. `None` while file deletions are held: the sweep skips its
-    /// pass and the next commit retries it.
+    /// pass, and releasing the hold runs it again.
     fn claim_file_deletions(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         Arc::clone(&self.file_deletion_fence).try_write_owned().ok()
     }
@@ -42949,6 +43001,73 @@ mod tests {
         wait_until_removed(&dir).await;
     }
 
+    /// An overwrite committed while an acceleration snapshot holds file
+    /// deletions supersedes a snapshot directory that its own sweep cannot
+    /// delete. Releasing the hold must delete it: a `refresh_mode: full`
+    /// writer that snapshots after every refresh otherwise keeps every
+    /// directory it supersedes.
+    #[tokio::test]
+    async fn releasing_a_file_deletion_hold_deletes_the_directory_an_overwrite_superseded() {
+        async fn overwrite(ctx: &SessionContext, table: &CayenneTableProvider, value: i64) {
+            let schema = table.table_schema();
+            let source = MemorySourceConfig::try_new_exec(
+                &[vec![id_value_batch(Arc::clone(&schema), &[1], &[value])]],
+                schema,
+                None,
+            )
+            .expect("overwrite source");
+            let plan = table
+                .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(plan, ctx.task_ctx()).await.expect("overwrite");
+        }
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "deletion_hold_overwrite",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        overwrite(&ctx, &provider, 10).await;
+        let superseded = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+
+        let hold = provider.hold_file_deletions().await;
+        overwrite(&ctx, &provider, 11).await;
+        let current = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+        assert_ne!(
+            superseded, current,
+            "the overwrite publishes a new snapshot"
+        );
+        // Let the overwrite's sweep run, and skip, under the hold.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while provider.snapshot_cleanup_scheduled.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the overwrite's sweep finishes");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(superseded.exists(), "the sweep keeps the dir while held");
+        // Lapse every other pin, so that only the hold keeps the dir: the
+        // overwrite's cached scan view, the listing grace and the dir's own grace.
+        provider.evict_stale_scan_view(Instant::now() + Duration::from_hours(1));
+        let past = Instant::now()
+            .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
+            .expect("the clock has run longer than two graces");
+        for at in provider.snapshot_last_listed.lock().values_mut() {
+            *at = past;
+        }
+        tokio::time::sleep(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE).await;
+        assert_eq!(provider.snapshot_cleanup_pins().1, HashSet::new());
+
+        drop(hold);
+        wait_until_removed(&superseded).await;
+        assert!(current.exists(), "the current snapshot stays");
+    }
+
     /// A hold taken while the retired-snapshot sweep is deleting waits for the
     /// deletion to finish, so an archive never sees a directory disappear.
     #[tokio::test]
@@ -57477,8 +57596,9 @@ mod tests {
     /// Sequential p50 tests do not catch a lock that serializes the warm hit.
     /// This drives 8 workers against many on-disk files after the listing cache
     /// and `ScanView` are warm, and requires: every row is the seeded
-    /// `value = id * 10`, zero metastore queries, and concurrent elapsed at
-    /// least 2× faster than a one-worker baseline on the same fixture.
+    /// `value = id * 10`, zero metastore queries, no per-file statistics
+    /// collected, and concurrent elapsed at least 2× faster than a one-worker
+    /// baseline on the same fixture.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn pk_point_lookup_warm_concurrent_throughput_reuses_listing_and_scan_view() {
         const FILES: i64 = 32;
@@ -57566,6 +57686,14 @@ mod tests {
             .expect("batch");
             insert_batch_with_context(&ctx, &provider, batch).await;
         }
+        // The inserts leave a post-write maintenance pass behind them, which
+        // persists table statistics and rebuilds the snapshot manifest through
+        // the metastore. Finish it before the warmup, so it cannot run inside
+        // the measured window.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("flush post-write maintenance");
         let ctx = Arc::new(ctx);
         let total_rows = files * rows_per_file;
         // One PK from each quartile so workers prune different files.
@@ -57613,6 +57741,7 @@ mod tests {
         }
         let baseline = baseline_t0.elapsed();
         let queries_before = catalog.metastore_query_count();
+        let statistics_before = provider.scan_file_statistics_counters();
 
         let errors = Arc::new(AtomicU64::new(0));
         let t0 = Instant::now();
@@ -57645,6 +57774,7 @@ mod tests {
             .expect("lookup count fits u64");
         let error_count = errors.load(Ordering::Relaxed);
         let queries_after = catalog.metastore_query_count();
+        let statistics_after = provider.scan_file_statistics_counters();
         let elapsed_ms = u64::try_from(elapsed.as_millis())
             .expect("elapsed ms fits u64")
             .max(1);
@@ -57660,6 +57790,10 @@ mod tests {
         assert_eq!(
             queries_before, queries_after,
             "{mode}: warm concurrent PK lookups queried the metastore ({queries_before} -> {queries_after})"
+        );
+        assert_eq!(
+            statistics_before, statistics_after,
+            "{mode}: warm concurrent PK lookups collected per-file statistics"
         );
         assert!(
             elapsed.saturating_mul(2) < serialized,

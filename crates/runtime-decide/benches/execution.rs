@@ -38,6 +38,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::optimizer::Optimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use evaluate_api::{Answer, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState};
+use model_capabilities::{CapabilityStore, ModelCapabilities};
 use runtime_decide::{DecisionFunctions, guard_async_calls};
 use runtime_status::RuntimeStatus;
 use tokio::sync::RwLock;
@@ -76,10 +77,6 @@ impl Evaluate for SlowModel {
     async fn health(&self) -> evaluate_api::Result<()> {
         Ok(())
     }
-
-    fn is_decision_model(&self) -> bool {
-        true
-    }
 }
 
 /// 5 ms plus an exponential tail with a 15 ms mean, fixed per input text.
@@ -109,7 +106,20 @@ fn session(rows: usize, model: &Arc<SlowModel>) -> SessionContext {
     let ctx = SessionContext::new_with_state(state);
     let store: HashMap<String, Arc<dyn Evaluate>> =
         HashMap::from([("jev".to_string(), Arc::clone(model) as Arc<dyn Evaluate>)]);
-    DecisionFunctions::new(Arc::new(RwLock::new(store)), RuntimeStatus::new()).register(&ctx);
+    let capabilities = CapabilityStore::from([(
+        "jev".to_string(),
+        ModelCapabilities::of(&spicepod::component::model::Model::new(
+            "typesafe:jev",
+            "jev",
+        ))
+        .expect("a known provider"),
+    )]);
+    DecisionFunctions::new(
+        Arc::new(RwLock::new(store)),
+        Arc::new(RwLock::new(capabilities)),
+        RuntimeStatus::new(),
+    )
+    .register(&ctx);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
