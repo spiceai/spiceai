@@ -38,7 +38,7 @@ pub mod write_through;
 
 pub use cluster_state::{
     ClusterState, ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
-    SchedulerEntry, SchedulerId,
+    SchedulerEntry, SchedulerId, TableEntryChanges, UNREGISTERED_TABLE_RETENTION,
 };
 pub use executor_registry::{
     ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,

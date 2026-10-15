@@ -456,6 +456,13 @@ fn snapshot_api_error_to_response(error: &SnapshotApiError) -> Response {
             }),
         )
             .into_response(),
+        SnapshotApiError::SnapshotFileMissing { .. } => (
+            StatusCode::CONFLICT,
+            Json(MessageResponse {
+                message: error.to_string(),
+            }),
+        )
+            .into_response(),
         SnapshotApiError::ReadMetadata { .. }
         | SnapshotApiError::ParseMetadata { .. }
         | SnapshotApiError::UnsupportedVersion { .. }

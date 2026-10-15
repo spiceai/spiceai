@@ -139,6 +139,29 @@ impl std::fmt::Debug for HttpRateControlPersistedState {
     }
 }
 
+/// Deletes the shared rate-control state of origins no instance has used for
+/// [`UNUSED_ORIGIN_RETENTION`](runtime_rate_control::cleanup::UNUSED_ORIGIN_RETENTION).
+async fn delete_unused_rate_control_state(store: &dyn ObjectStore, prefix: &str) {
+    let retention = object_store_occ::cleanup::describe(object_store_occ::cleanup::age(
+        runtime_rate_control::cleanup::UNUSED_ORIGIN_RETENTION,
+    ));
+    match runtime_rate_control::cleanup::delete_unused_state(
+        store,
+        prefix,
+        std::time::SystemTime::now(),
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => tracing::info!(
+            "State cleanup deleted the shared rate-control state of {deleted} origins that no instance has sent requests to for {retention}."
+        ),
+        Err(error) => tracing::warn!(
+            "Failed to delete the shared rate-control state of origins unused for {retention}, so it stays in the rate-control state location until the next attempt: {error}"
+        ),
+    }
+}
+
 #[must_use]
 pub fn global_registry() -> Arc<HttpRateControlRegistry> {
     Arc::clone(&GLOBAL_HTTP_RATE_CONTROL_REGISTRY)
@@ -1207,6 +1230,20 @@ impl HttpRateControlRegistry {
             }
         });
         drop(persistence_task);
+
+        let store = Arc::clone(&persisted_state.store);
+        let prefix = persisted_state.base_prefix.clone();
+        let weak_registry = Arc::downgrade(self);
+        let cleanup_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(object_store_occ::cleanup::next_pass_delay()).await;
+                if weak_registry.strong_count() == 0 {
+                    break;
+                }
+                delete_unused_rate_control_state(store.as_ref(), &prefix).await;
+            }
+        });
+        drop(cleanup_task);
     }
 
     async fn persisted_rate_controllers(&self) -> Vec<(String, Arc<RateController>)> {

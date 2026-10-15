@@ -15,6 +15,7 @@ data_components = { path = "../data_components" }
 fundu = { workspace = true }
 governor.workspace = true
 object_store = { workspace = true }
+object_store_occ = { path = "../object_store_occ" }
 opentelemetry.workspace = true
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-metrics = { path = "../runtime-metrics" }
