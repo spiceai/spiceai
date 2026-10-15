@@ -20,8 +20,9 @@ limitations under the License.
 //! control streams between schedulers and executors. Schedulers use this
 //! registry to request metrics from executors on-demand.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
@@ -159,6 +160,98 @@ pub struct RegisteredHandles {
     pub pending_acks: CorrelatedResponses<Ack>,
 }
 
+/// How a control-stream registration relates to the earlier ones under the same
+/// executor id. Executors name themselves by their instance identity, which is
+/// stable across restarts, and send a per-process id with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorRegistration {
+    /// No earlier process is known under this id.
+    New,
+    /// The process that registered last connected again.
+    Reconnected,
+    /// Another process registered under this id: the earlier run is gone, and
+    /// nothing it held — running tasks, shuffle output, loaded partitions — can
+    /// be counted on. Partition assignments follow the id and stay.
+    Restarted,
+    /// A process older than the one registered last connected, so two running
+    /// processes share the id. The connection is not registered.
+    Duplicate,
+}
+
+/// What [`ExecutorRegistry::register`] returns: the handles for the connection
+/// and how it relates to earlier registrations.
+#[derive(Debug, Clone)]
+pub struct Registered {
+    pub handles: RegisteredHandles,
+    pub registration: ExecutorRegistration,
+    /// Identifies this connection to [`ExecutorRegistry::is_current`] and
+    /// [`ExecutorRegistry::unregister`].
+    pub connection: u64,
+}
+
+/// Replaced processes remembered per executor id, so a replaced process that is
+/// still running is recognized when it connects again.
+const REPLACED_PROCESSES_KEPT: usize = 8;
+
+/// The processes seen under one executor id.
+#[derive(Debug, Default)]
+struct ExecutorProcesses {
+    /// The connection registered last, if it is still registered.
+    connection: Option<u64>,
+    /// The process that registered last. Executors that send no process id
+    /// leave this unset.
+    current: Option<String>,
+    /// Processes a later registration replaced, oldest first.
+    replaced: VecDeque<String>,
+}
+
+/// An executor's `FlightSQL` endpoint.
+#[derive(Debug, Clone)]
+struct FlightEndpoint {
+    /// `host:port`, without a scheme.
+    address: String,
+    /// The process that registered the endpoint; empty for executors that send
+    /// no process id.
+    process_id: String,
+}
+
+/// Classifies a registration by the process it comes from and updates `seen`.
+/// `was_connected` says whether a connection is registered under the id.
+fn classify_registration(
+    seen: &mut ExecutorProcesses,
+    process_id: &str,
+    was_connected: bool,
+) -> ExecutorRegistration {
+    if process_id.is_empty() {
+        return if was_connected {
+            ExecutorRegistration::Reconnected
+        } else {
+            ExecutorRegistration::New
+        };
+    }
+    // Process ids sort by creation time, so a process older than the one
+    // registered last is still running alongside it, whatever order they connect in.
+    if seen.replaced.iter().any(|replaced| replaced == process_id)
+        || seen
+            .current
+            .as_deref()
+            .is_some_and(|current| process_id < current)
+    {
+        return ExecutorRegistration::Duplicate;
+    }
+    match seen.current.replace(process_id.to_string()) {
+        None => ExecutorRegistration::New,
+        Some(previous) if previous == process_id => ExecutorRegistration::Reconnected,
+        Some(previous) => {
+            if seen.replaced.len() == REPLACED_PROCESSES_KEPT {
+                seen.replaced.pop_front();
+            }
+            seen.replaced.push_back(previous);
+            ExecutorRegistration::Restarted
+        }
+    }
+}
+
 /// Append-only log of DDL SQL statements applied to the cluster.
 ///
 /// Used to replay DDL on executors that join after the statements were originally executed.
@@ -262,10 +355,22 @@ pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
 
+    /// Map of `executor_id` -> the processes seen under it. Locked only while
+    /// `connections` is write-locked, or on its own for reads.
+    processes: Arc<parking_lot::Mutex<HashMap<String, ExecutorProcesses>>>,
+
+    /// Source of the ids in [`Registered::connection`].
+    next_connection: Arc<AtomicU64>,
+
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
     /// An executor with a `FlightSqlClient` is considered "ready" — the scheduler can route queries to it.
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
+
+    /// Map of `executor_id` -> where its `FlightSqlClient` connects and which
+    /// process registered it. Changed only while `flight_sql_clients` is
+    /// write-locked.
+    flight_sql_endpoints: Arc<parking_lot::RwLock<HashMap<String, FlightEndpoint>>>,
 
     /// Map of `executor_id` -> table partitions for that executor
     partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
@@ -331,7 +436,10 @@ impl ExecutorRegistry {
     ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            processes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            next_connection: Arc::new(AtomicU64::new(1)),
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
+            flight_sql_endpoints: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_store,
             federated_partition_store,
@@ -437,23 +545,42 @@ impl ExecutorRegistry {
             .to_vec()
     }
 
-    /// Registers an executor connection.
+    /// Registers the control-stream connection of the executor `executor_id`
+    /// whose process sent `process_id` (empty for executors that send none).
     ///
-    /// If an executor with the same ID is already registered, the old connection
-    /// is replaced (the executor reconnected).
+    /// The connection replaces any earlier one under the same id, except for a
+    /// [`ExecutorRegistration::Duplicate`], which is not registered.
     pub async fn register(
         &self,
         executor_id: String,
+        process_id: &str,
         request_tx: mpsc::Sender<SchedulerControlMessage>,
-    ) -> RegisteredHandles {
+    ) -> Registered {
         let connection = ExecutorConnection::new(request_tx);
         let handles = RegisteredHandles {
             pending_metrics: connection.pending_metrics(),
             pending_acks: connection.pending_acks(),
         };
+        let connection_id = self.next_connection.fetch_add(1, Ordering::Relaxed);
 
         let mut connections = self.connections.write().await;
         let is_reconnect = connections.contains_key(&executor_id);
+        let registration = {
+            let mut processes = self.processes.lock();
+            let seen = processes.entry(executor_id.clone()).or_default();
+            let registration = classify_registration(seen, process_id, is_reconnect);
+            if registration != ExecutorRegistration::Duplicate {
+                seen.connection = Some(connection_id);
+            }
+            registration
+        };
+        if registration == ExecutorRegistration::Duplicate {
+            return Registered {
+                handles,
+                registration,
+                connection: connection_id,
+            };
+        }
         if is_reconnect {
             tracing::debug!("Executor {executor_id} reconnected, replacing existing connection");
         } else {
@@ -469,15 +596,82 @@ impl ExecutorRegistry {
             }
         }
 
-        handles
+        // The earlier run's endpoint may be gone, and the new process has not
+        // loaded its partitions yet, so it is not ready until it registers its
+        // own endpoint.
+        if registration == ExecutorRegistration::Restarted {
+            let mut clients = self.flight_sql_clients.write().await;
+            let mut endpoints = self.flight_sql_endpoints.write();
+            if endpoints
+                .get(&executor_id)
+                .is_some_and(|endpoint| endpoint.process_id.as_str() < process_id)
+            {
+                clients.remove(&executor_id);
+                endpoints.remove(&executor_id);
+            }
+        }
+
+        Registered {
+            handles,
+            registration,
+            connection: connection_id,
+        }
     }
 
-    /// Unregisters an executor and removes it from all three tracking maps.
-    pub async fn unregister(&self, executor_id: &str) {
-        if self.connections.write().await.remove(executor_id).is_some() {
+    /// Whether `connection` is the registered connection of `executor_id`. A
+    /// connection stops being current when a later one under the same id
+    /// replaces it.
+    #[must_use]
+    pub fn is_current(&self, executor_id: &str, connection: u64) -> bool {
+        self.processes
+            .lock()
+            .get(executor_id)
+            .is_some_and(|seen| seen.connection == Some(connection))
+    }
+
+    /// Unregisters `executor_id` and removes it from all three tracking maps,
+    /// if `connection` is still its registered connection. Returns whether it
+    /// was: a connection that a later one replaced leaves the executor alone.
+    ///
+    /// A later process under the same id may already have registered its Flight
+    /// endpoint before its control stream connects; that endpoint, and the
+    /// executor's other state, are then left for the later process.
+    pub async fn unregister(&self, executor_id: &str, connection: u64) -> bool {
+        let mut connections = self.connections.write().await;
+        let process_id = {
+            let mut processes = self.processes.lock();
+            match processes.get_mut(executor_id) {
+                Some(seen) if seen.connection == Some(connection) => {
+                    seen.connection = None;
+                    seen.current.clone().unwrap_or_default()
+                }
+                _ => return false,
+            }
+        };
+        if connections.remove(executor_id).is_some() {
             tracing::debug!("Executor {executor_id} disconnected");
         }
-        self.flight_sql_clients.write().await.remove(executor_id);
+        // Held while `connections` is, so no endpoint registers between the
+        // check above and its removal below.
+        let successor_registered = {
+            let mut clients = self.flight_sql_clients.write().await;
+            let mut endpoints = self.flight_sql_endpoints.write();
+            let successor_registered = endpoints
+                .get(executor_id)
+                .is_some_and(|endpoint| endpoint.process_id > process_id);
+            if !successor_registered {
+                clients.remove(executor_id);
+                endpoints.remove(executor_id);
+            }
+            successor_registered
+        };
+        drop(connections);
+        if let Some(node_id) = self.node_id.as_deref() {
+            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
+        }
+        if successor_registered {
+            return true;
+        }
         self.partitions.write().await.remove(executor_id);
 
         // Drop the disconnected executor's reported statistics across all tables
@@ -489,10 +683,7 @@ impl ExecutorRegistry {
             }
             stats.retain(|_, table_stats| !table_stats.is_empty());
         }
-
-        if let Some(node_id) = self.node_id.as_deref() {
-            metrics::set_scheduler_executor_active_connection(node_id, executor_id, false);
-        }
+        true
     }
 
     /// Returns `true` if at least one executor has an active `FlightSqlClient`.
@@ -505,12 +696,45 @@ impl ExecutorRegistry {
         self.flight_sql_clients.read().await.clone()
     }
 
-    /// Inserts or replaces the `FlightSqlClient` for `executor_id`.
-    pub async fn insert_flight_sql_client(&self, executor_id: String, client: FlightSqlClient) {
-        self.flight_sql_clients
-            .write()
-            .await
-            .insert(executor_id, client);
+    /// Inserts or replaces the `FlightSqlClient` for `executor_id`, which
+    /// connects to `address` (`host:port`) and was registered by the executor
+    /// process `process_id` (empty for executors that send none). Returns
+    /// `false`, inserting nothing, when a later process under the same id
+    /// is newer than `process_id`, by its control stream or its endpoint: an
+    /// earlier process's endpoint must not displace its successor's, whichever
+    /// arrives first. Process ids sort by creation time.
+    pub async fn insert_flight_sql_client(
+        &self,
+        executor_id: String,
+        address: String,
+        process_id: &str,
+        client: FlightSqlClient,
+    ) -> bool {
+        let mut clients = self.flight_sql_clients.write().await;
+        // Older than the process registered last (a replaced run or a refused
+        // duplicate), or older than the process whose endpoint is registered.
+        let superseded = !process_id.is_empty()
+            && (self.processes.lock().get(&executor_id).is_some_and(|seen| {
+                seen.current
+                    .as_deref()
+                    .is_some_and(|current| process_id < current)
+            }) || self
+                .flight_sql_endpoints
+                .read()
+                .get(&executor_id)
+                .is_some_and(|endpoint| endpoint.process_id.as_str() > process_id));
+        if superseded {
+            return false;
+        }
+        self.flight_sql_endpoints.write().insert(
+            executor_id.clone(),
+            FlightEndpoint {
+                address,
+                process_id: process_id.to_string(),
+            },
+        );
+        clients.insert(executor_id, client);
+        true
     }
 
     /// Replaces the cached `TablePartitions` for `executor_id`.
@@ -558,16 +782,19 @@ impl ExecutorRegistry {
         connections.keys().cloned().collect()
     }
 
-    /// Best-effort SYNCHRONOUS snapshot of ready executor IDs (`host:port`, no
-    /// scheme — the same form `executor_table` expects after prepending a
-    /// scheme). Returns empty if the lock is momentarily contended. Used by the
-    /// broadcast-join physical optimizer rule, which runs in a sync planning
-    /// context and cannot await.
+    /// Best-effort SYNCHRONOUS snapshot of ready executors' addresses
+    /// (`host:port`, no scheme — the same form `executor_table` expects after
+    /// prepending a scheme). Returns empty if the lock is momentarily contended.
+    /// Used by the broadcast-join physical optimizer rule, which runs in a sync
+    /// planning context and cannot await.
     #[must_use]
-    pub fn ready_executor_ids_sync(&self) -> Vec<String> {
-        match self.flight_sql_clients.try_read() {
-            Ok(clients) => clients.keys().cloned().collect(),
-            Err(_) => Vec::new(),
+    pub fn ready_executor_addresses_sync(&self) -> Vec<String> {
+        match self.flight_sql_endpoints.try_read() {
+            Some(endpoints) => endpoints
+                .values()
+                .map(|endpoint| endpoint.address.clone())
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -1047,12 +1274,16 @@ mod tests {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx).await;
+        let registered = registry.register("executor-1".to_string(), "", tx).await;
 
         let executors = registry.connected_executors().await;
         assert_eq!(executors, vec!["executor-1"]);
 
-        registry.unregister("executor-1").await;
+        assert!(
+            registry
+                .unregister("executor-1", registered.connection)
+                .await
+        );
 
         let executors = registry.connected_executors().await;
         assert!(executors.is_empty());
@@ -1064,11 +1295,232 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx1).await;
-        registry.register("executor-1".to_string(), tx2).await;
+        registry.register("executor-1".to_string(), "", tx1).await;
+        registry.register("executor-1".to_string(), "", tx2).await;
 
         let executors = registry.connected_executors().await;
         assert_eq!(executors.len(), 1);
+    }
+
+    /// An executor that restarts under the same id sends a new process id. The
+    /// new process is a restart of the old one, and the old process's connection
+    /// closing late leaves the new one registered.
+    #[tokio::test]
+    async fn a_new_process_under_an_executor_id_is_a_restart() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        let first = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        assert_eq!(first.registration, ExecutorRegistration::New);
+        let restarted = registry.register("exec-a".to_string(), "run-2", tx2).await;
+        assert_eq!(restarted.registration, ExecutorRegistration::Restarted);
+        assert!(!registry.is_current("exec-a", first.connection));
+        assert!(registry.is_current("exec-a", restarted.connection));
+
+        assert!(
+            !registry.unregister("exec-a", first.connection).await,
+            "the replaced connection closing must not unregister its successor"
+        );
+        assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
+
+        let reconnected = registry.register("exec-a".to_string(), "run-2", tx3).await;
+        assert_eq!(reconnected.registration, ExecutorRegistration::Reconnected);
+        assert!(registry.unregister("exec-a", reconnected.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+    }
+
+    /// A restart drops the endpoint the earlier run registered, so the executor
+    /// is not ready until the new process registers its own. An endpoint the new
+    /// process registered before its control stream connected is kept. Broadcast
+    /// joins reach executors at these endpoints, not at their identity.
+    #[tokio::test]
+    async fn a_restart_drops_the_endpoint_of_the_earlier_run() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50101".to_string(),
+                "run-1",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50101"]
+        );
+
+        registry.register("exec-a".to_string(), "run-2", tx2).await;
+        assert_eq!(registry.flight_sql_clients_count().await, 0);
+        assert!(registry.ready_executor_addresses_sync().is_empty());
+
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "run-3",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        registry.register("exec-a".to_string(), "run-3", tx3).await;
+        assert_eq!(registry.flight_sql_clients_count().await, 1);
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        // A replaced process registering its endpoint late is ignored.
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+
+        // The next run registers its endpoint, the run it replaces registers
+        // its endpoint late, and only then does the next run's control stream
+        // connect: the next run's endpoint stays.
+        let (tx4, _rx4) = mpsc::channel(1);
+        assert!(
+            registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50103".to_string(),
+                    "run-4",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50102".to_string(),
+                    "run-3",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        registry.register("exec-a".to_string(), "run-4", tx4).await;
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50103"]
+        );
+    }
+
+    /// The earlier run's connection closing after the next run registered its
+    /// endpoint, but before the next run's control stream connected, leaves
+    /// that endpoint in place.
+    #[tokio::test]
+    async fn an_earlier_connection_closing_keeps_its_successors_endpoint() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+
+        let earlier = registry.register("exec-a".to_string(), "run-1", tx1).await;
+        registry
+            .insert_flight_sql_client(
+                "exec-a".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "run-2",
+                dummy_flight_sql_client(),
+            )
+            .await;
+        assert!(registry.unregister("exec-a", earlier.connection).await);
+        assert!(registry.connected_executors().await.is_empty());
+        assert_eq!(
+            registry.ready_executor_addresses_sync(),
+            ["127.0.0.1:50102"]
+        );
+    }
+
+    /// A replaced process that connects again is still running, so two processes
+    /// share the id. It is refused and the later process stays registered.
+    #[tokio::test]
+    async fn a_replaced_process_that_connects_again_is_a_duplicate() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (tx3, _rx3) = mpsc::channel(1);
+
+        registry.register("exec-a".to_string(), "run-1", tx1).await;
+        let later = registry.register("exec-a".to_string(), "run-2", tx2).await;
+        let returning = registry.register("exec-a".to_string(), "run-1", tx3).await;
+
+        assert_eq!(returning.registration, ExecutorRegistration::Duplicate);
+        assert!(registry.is_current("exec-a", later.connection));
+        assert!(!registry.is_current("exec-a", returning.connection));
+        assert_eq!(registry.connected_executors().await, vec!["exec-a"]);
+    }
+
+    /// An older process that connects after a newer one, for example to a
+    /// scheduler that started after both, is a duplicate, not a restart.
+    #[tokio::test]
+    async fn an_older_process_connecting_later_is_a_duplicate() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let newer = registry.register("exec-a".to_string(), "run-2", tx1).await;
+        let older = registry.register("exec-a".to_string(), "run-1", tx2).await;
+
+        assert_eq!(newer.registration, ExecutorRegistration::New);
+        assert_eq!(older.registration, ExecutorRegistration::Duplicate);
+        assert!(registry.is_current("exec-a", newer.connection));
+
+        // Its endpoint is refused too, even before the newer process registers one.
+        assert!(
+            !registry
+                .insert_flight_sql_client(
+                    "exec-a".to_string(),
+                    "127.0.0.1:50101".to_string(),
+                    "run-1",
+                    dummy_flight_sql_client(),
+                )
+                .await
+        );
+        assert!(registry.ready_executor_addresses_sync().is_empty());
+    }
+
+    /// An executor that sends no process id is registered as before: a second
+    /// connection under its id is a reconnect, never a restart.
+    #[tokio::test]
+    async fn an_executor_without_a_process_id_reconnects() {
+        let registry = make_registry().await;
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let first = registry
+            .register("127.0.0.1:50062".to_string(), "", tx1)
+            .await;
+        let second = registry
+            .register("127.0.0.1:50062".to_string(), "", tx2)
+            .await;
+        assert_eq!(first.registration, ExecutorRegistration::New);
+        assert_eq!(second.registration, ExecutorRegistration::Reconnected);
+        assert!(
+            !registry
+                .unregister("127.0.0.1:50062", first.connection)
+                .await
+        );
+        assert!(
+            registry
+                .unregister("127.0.0.1:50062", second.connection)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1086,9 +1538,9 @@ mod tests {
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx1).await;
-        registry.register("executor-2".to_string(), tx2).await;
-        registry.register("executor-3".to_string(), tx3).await;
+        registry.register("executor-1".to_string(), "", tx1).await;
+        let executor_2 = registry.register("executor-2".to_string(), "", tx2).await;
+        registry.register("executor-3".to_string(), "", tx3).await;
 
         let mut executors = registry.connected_executors().await;
         executors.sort();
@@ -1097,7 +1549,9 @@ mod tests {
         assert_eq!(executors, vec!["executor-1", "executor-2", "executor-3"]);
 
         // Unregister one
-        registry.unregister("executor-2").await;
+        registry
+            .unregister("executor-2", executor_2.connection)
+            .await;
 
         let mut executors = registry.connected_executors().await;
         executors.sort();
@@ -1248,29 +1702,39 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
         let (tx3, _rx3) = mpsc::channel(1);
-        registry.register("e1".to_string(), tx1).await;
-        registry.register("e2".to_string(), tx2).await;
-        registry.register("e3".to_string(), tx3).await;
+        registry.register("e1".to_string(), "", tx1).await;
+        let e2 = registry.register("e2".to_string(), "", tx2).await;
+        let e3 = registry.register("e3".to_string(), "", tx3).await;
         assert_eq!(registry.connected_executor_count().await, 3);
         assert_eq!(registry.flight_sql_clients_count().await, 0);
 
         // Two of them complete the handshake (AllocateInitialPartitions) → ready.
         registry
-            .insert_flight_sql_client("e1".to_string(), dummy_flight_sql_client())
+            .insert_flight_sql_client(
+                "e1".to_string(),
+                "127.0.0.1:50101".to_string(),
+                "",
+                dummy_flight_sql_client(),
+            )
             .await;
         registry
-            .insert_flight_sql_client("e2".to_string(), dummy_flight_sql_client())
+            .insert_flight_sql_client(
+                "e2".to_string(),
+                "127.0.0.1:50102".to_string(),
+                "",
+                dummy_flight_sql_client(),
+            )
             .await;
         assert_eq!(registry.connected_executor_count().await, 3);
         assert_eq!(registry.flight_sql_clients_count().await, 2);
 
         // Unregister one ready executor — both counts drop.
-        registry.unregister("e2").await;
+        registry.unregister("e2", e2.connection).await;
         assert_eq!(registry.connected_executor_count().await, 2);
         assert_eq!(registry.flight_sql_clients_count().await, 1);
 
         // Unregister the not-yet-ready executor — connected drops, ready unchanged.
-        registry.unregister("e3").await;
+        registry.unregister("e3", e3.connection).await;
         assert_eq!(registry.connected_executor_count().await, 1);
         assert_eq!(registry.flight_sql_clients_count().await, 1);
     }
@@ -1280,10 +1744,14 @@ mod tests {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(1);
 
-        registry.register("executor-1".to_string(), tx).await;
+        let registered = registry.register("executor-1".to_string(), "", tx).await;
 
         // Unregistering a non-existent executor should not panic
-        registry.unregister("executor-nonexistent").await;
+        assert!(
+            !registry
+                .unregister("executor-nonexistent", registered.connection)
+                .await
+        );
 
         // Original executor should still be registered
         let executors = registry.connected_executors().await;
@@ -1445,7 +1913,7 @@ mod tests {
     async fn send_command_with_ack_success() {
         let registry = make_registry().await;
         let (tx, rx) = mpsc::channel(8);
-        let handles = registry.register("e1".to_string(), tx).await;
+        let handles = registry.register("e1".to_string(), "", tx).await.handles;
         spawn_fake_executor_ack(rx, handles.pending_acks.clone(), None);
 
         let result = registry
@@ -1463,7 +1931,7 @@ mod tests {
     async fn send_command_with_ack_propagates_application_error() {
         let registry = make_registry().await;
         let (tx, rx) = mpsc::channel(8);
-        let handles = registry.register("e1".to_string(), tx).await;
+        let handles = registry.register("e1".to_string(), "", tx).await.handles;
         spawn_fake_executor_ack(
             rx,
             handles.pending_acks.clone(),
@@ -1492,7 +1960,7 @@ mod tests {
     async fn send_command_with_ack_times_out_when_no_response() {
         let registry = make_registry().await;
         let (tx, _rx) = mpsc::channel(8); // _rx kept alive but never read
-        let _handles = registry.register("e1".to_string(), tx).await;
+        let _handles = registry.register("e1".to_string(), "", tx).await;
 
         let err = registry
             .send_command_with_ack(
