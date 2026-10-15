@@ -28,6 +28,7 @@ mod build_logging;
 mod cloud_connect_bootstrap;
 mod cpu_budget;
 mod dependency_logging;
+mod otel_logs;
 
 /// Fails the calling test unless it runs in a process of its own.
 ///
