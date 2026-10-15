@@ -23,9 +23,9 @@ limitations under the License.
 //!
 //! `series_hash` identifies a series (metric name, resource attributes, scope, and point
 //! attributes), so `(time_unix_nano, series_hash)` is a complete key and a retried export
-//! writes rows that a primary key deduplicates.
+//! writes rows that a primary key deduplicates. It hashes a typed encoding of the attributes
+//! rather than their JSON, which renders some distinct values alike.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
@@ -101,8 +101,9 @@ pub static METRICS_STORE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// JSON form of an OTLP attribute value. Integers, doubles, booleans and strings keep their
 /// JSON type; arrays and key-value lists nest. Bytes become `{"bytes": "<base64>"}` and NaN or
-/// an infinity becomes `{"double": "NaN"}`, so neither can collide with a string attribute
-/// carrying the same text (the JSON also feeds `series_hash`).
+/// an infinity becomes `{"double": "NaN"}`, so neither reads as a string attribute carrying
+/// the same text. A key-value list can still render the same JSON, so `series_hash` hashes
+/// [`encode_attributes`] instead.
 fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
     let Some(value) = value.and_then(|v| v.value.as_ref()) else {
         return JsonValue::Null;
@@ -135,45 +136,164 @@ fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
 /// Attributes as a JSON object with keys in sorted order, so equal attribute sets always
 /// serialize, and hash, the same way. A repeated key keeps its last value.
 fn attributes_to_json(attributes: &[KeyValue]) -> JsonValue {
-    let sorted: BTreeMap<&str, JsonValue> = attributes
-        .iter()
-        .map(|kv| (kv.key.as_str(), any_value_to_json(kv.value.as_ref())))
-        .collect();
+    sorted_attributes_to_json(&sorted_attributes(attributes))
+}
+
+fn sorted_attributes_to_json(sorted: &[(&str, Option<&AnyValue>)]) -> JsonValue {
     let mut map = serde_json::Map::with_capacity(sorted.len());
     for (key, value) in sorted {
-        map.insert(key.to_string(), value);
+        map.insert((*key).to_string(), any_value_to_json(*value));
     }
     JsonValue::Object(map)
 }
 
+/// Attributes sorted by key, a repeated key keeping its last value.
+fn sorted_attributes(attributes: &[KeyValue]) -> Vec<(&str, Option<&AnyValue>)> {
+    let mut sorted: Vec<_> = attributes
+        .iter()
+        .map(|kv| (kv.key.as_str(), kv.value.as_ref()))
+        .collect();
+    // A stable sort keeps a repeated key's values in order, so the last of a run is the last
+    // one given; `dedup_by` passes the later entry first and drops it after copying it over.
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            *earlier = *later;
+            true
+        } else {
+            false
+        }
+    });
+    sorted
+}
+
+/// Attributes as their stored JSON string, appending their [`encode_attributes`] bytes to
+/// `encoded`. Both come from one sort of the keys.
+fn serialize_attributes(attributes: &[KeyValue], encoded: &mut Vec<u8>) -> String {
+    let sorted = sorted_attributes(attributes);
+    encode_sorted_attributes(&sorted, encoded);
+    sorted_attributes_to_json(&sorted).to_string()
+}
+
+#[cfg(test)]
 fn attributes_to_json_string(attributes: &[KeyValue]) -> String {
     attributes_to_json(attributes).to_string()
 }
 
+/// Attributes as the stored JSON and as the [`encode_attributes`] bytes `series_hash` hashes.
+struct SerializedAttributes {
+    json: String,
+    encoded: Vec<u8>,
+}
+
+impl SerializedAttributes {
+    fn new(attributes: &[KeyValue]) -> Self {
+        let mut encoded = Vec::new();
+        let json = serialize_attributes(attributes, &mut encoded);
+        Self { json, encoded }
+    }
+}
+
+fn encode_len(len: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(len as u64).to_le_bytes());
+}
+
+fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    encode_len(bytes.len(), out);
+    out.extend_from_slice(bytes);
+}
+
+/// Appends an unambiguous encoding of `attributes` to `out`: every value is tagged with its
+/// `AnyValue` kind and every string, byte string and collection is length-prefixed, so two
+/// encodings are equal only for equal attributes. Keys are sorted and a repeated key keeps its
+/// last value, as in [`attributes_to_json`].
+fn encode_attributes(attributes: &[KeyValue], out: &mut Vec<u8>) {
+    encode_sorted_attributes(&sorted_attributes(attributes), out);
+}
+
+fn encode_sorted_attributes(sorted: &[(&str, Option<&AnyValue>)], out: &mut Vec<u8>) {
+    encode_len(sorted.len(), out);
+    for (key, value) in sorted {
+        encode_bytes(key.as_bytes(), out);
+        encode_any_value(*value, out);
+    }
+}
+
+fn encode_any_value(value: Option<&AnyValue>, out: &mut Vec<u8>) {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        out.push(0);
+        return;
+    };
+    match value {
+        any_value::Value::StringValue(s) => {
+            out.push(1);
+            encode_bytes(s.as_bytes(), out);
+        }
+        any_value::Value::BoolValue(b) => {
+            out.push(2);
+            out.push(u8::from(*b));
+        }
+        any_value::Value::IntValue(i) => {
+            out.push(3);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        any_value::Value::DoubleValue(d) => {
+            out.push(4);
+            // Every NaN is one value, as in the JSON.
+            let bits = if d.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                d.to_bits()
+            };
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        any_value::Value::BytesValue(b) => {
+            out.push(5);
+            encode_bytes(b, out);
+        }
+        any_value::Value::ArrayValue(a) => {
+            out.push(6);
+            encode_len(a.values.len(), out);
+            for v in &a.values {
+                encode_any_value(Some(v), out);
+            }
+        }
+        any_value::Value::KvlistValue(kv) => {
+            out.push(7);
+            encode_attributes(&kv.values, out);
+        }
+        any_value::Value::StringValueStrindex(i) => {
+            out.push(8);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+    }
+}
+
 /// Identity of a series: metric name, resource attributes, scope name, version and
-/// attributes, and point attributes. Each part is length-prefixed so no two different series encode the same bytes.
-/// The algorithm (`XxHash3_64`, seed 0) is part of the stored data and must not change.
+/// attributes, and point attributes, each set of attributes as [`encode_attributes`] bytes.
+/// Each part is length-prefixed so no two different series encode the same bytes. The
+/// encoding and the algorithm (`XxHash3_64`, seed 0) are part of the stored data and must not
+/// change.
 #[must_use]
 pub fn series_hash(
     metric_name: &str,
-    resource_attributes_json: &str,
+    resource_attributes: &[u8],
     scope_name: &str,
     scope_version: &str,
-    scope_attributes_json: &str,
-    attributes_json: &str,
+    scope_attributes: &[u8],
+    attributes: &[u8],
 ) -> u64 {
     let parts = [
-        metric_name,
-        resource_attributes_json,
-        scope_name,
-        scope_version,
-        scope_attributes_json,
-        attributes_json,
+        metric_name.as_bytes(),
+        resource_attributes,
+        scope_name.as_bytes(),
+        scope_version.as_bytes(),
+        scope_attributes,
+        attributes,
     ];
     let mut bytes = Vec::with_capacity(parts.iter().map(|p| p.len() + 8).sum());
     for part in parts {
-        bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(part.as_bytes());
+        encode_bytes(part, &mut bytes);
     }
     twox_hash::XxHash3_64::oneshot(&bytes)
 }
@@ -221,6 +341,8 @@ struct StoreBuilders {
     negative_bucket_counts: ListBuilder<UInt64Builder>,
     quantiles: ListBuilder<Float64Builder>,
     quantile_values: ListBuilder<Float64Builder>,
+    /// Scratch for a point's [`encode_attributes`] bytes, reused across points.
+    encoded_attributes: Vec<u8>,
 }
 
 /// Columns shared by every row of one metric of one scope.
@@ -231,10 +353,10 @@ struct MetricContext<'a> {
     unit: &'a str,
     temporality: Option<&'static str>,
     is_monotonic: Option<bool>,
-    resource_attributes: &'a str,
+    resource_attributes: &'a SerializedAttributes,
     scope_name: &'a str,
     scope_version: &'a str,
-    scope_attributes: &'a str,
+    scope_attributes: &'a SerializedAttributes,
 }
 
 fn non_empty(s: &str) -> Option<&str> {
@@ -290,7 +412,9 @@ impl StoreBuilders {
         flags: u32,
         values: PointValues<'_>,
     ) {
-        let attributes_json = attributes_to_json_string(attributes);
+        let mut encoded = std::mem::take(&mut self.encoded_attributes);
+        encoded.clear();
+        let attributes_json = serialize_attributes(attributes, &mut encoded);
         self.metric_name.append_value(ctx.name);
         self.metric_type.append_value(ctx.metric_type);
         self.description.append_option(non_empty(ctx.description));
@@ -303,20 +427,21 @@ impl StoreBuilders {
             .append_option((start_time_unix_nano != 0).then_some(start_time_unix_nano));
         self.series_hash.append_value(series_hash(
             ctx.name,
-            ctx.resource_attributes,
+            &ctx.resource_attributes.encoded,
             ctx.scope_name,
             ctx.scope_version,
-            ctx.scope_attributes,
-            &attributes_json,
+            &ctx.scope_attributes.encoded,
+            &encoded,
         ));
+        self.encoded_attributes = encoded;
         self.attributes.append_value(&attributes_json);
         self.resource_attributes
-            .append_value(ctx.resource_attributes);
+            .append_value(&ctx.resource_attributes.json);
         self.scope_name.append_option(non_empty(ctx.scope_name));
         self.scope_version
             .append_option(non_empty(ctx.scope_version));
         self.scope_attributes
-            .append_option(non_empty(ctx.scope_attributes));
+            .append_option(non_empty(&ctx.scope_attributes.json));
         self.value_double.append_option(values.value_double);
         self.value_int.append_option(values.value_int);
         self.count.append_option(values.count);
@@ -419,8 +544,8 @@ struct OwnedContext<'a> {
 /// Every data point of an export, in order, ready to build metrics store batches of bounded
 /// size. Attributes shared across points are serialized once.
 pub struct StoreExport<'a> {
-    resources: Vec<String>,
-    scopes: Vec<String>,
+    resources: Vec<SerializedAttributes>,
+    scopes: Vec<SerializedAttributes>,
     contexts: Vec<OwnedContext<'a>>,
     points: Vec<(usize, PointRef<'a>)>,
 }
@@ -437,7 +562,7 @@ impl<'a> StoreExport<'a> {
         };
         for resource_metric in &request.resource_metrics {
             let resource = export.resources.len();
-            export.resources.push(attributes_to_json_string(
+            export.resources.push(SerializedAttributes::new(
                 resource_metric
                     .resource
                     .as_ref()
@@ -446,7 +571,7 @@ impl<'a> StoreExport<'a> {
             for scope_metric in &resource_metric.scope_metrics {
                 let scope = scope_metric.scope.as_ref();
                 let scope_attributes = export.scopes.len();
-                export.scopes.push(attributes_to_json_string(
+                export.scopes.push(SerializedAttributes::new(
                     scope.map_or(&[][..], |s| s.attributes.as_slice()),
                 ));
                 let (scope_name, scope_version) =
@@ -659,7 +784,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
-    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::metrics::v1::{
         ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
         Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
@@ -985,24 +1110,97 @@ mod tests {
 
     #[test]
     fn series_hash_distinguishes_every_identity_part() {
-        let base = series_hash("m", "{}", "s", "1", "{}", r#"{"a":"1"}"#);
-        assert_ne!(base, series_hash("n", "{}", "s", "1", "{}", r#"{"a":"1"}"#));
+        let base = series_hash("m", b"{}", "s", "1", b"{}", br#"{"a":"1"}"#);
         assert_ne!(
             base,
-            series_hash("m", r#"{"x":1}"#, "s", "1", "{}", r#"{"a":"1"}"#)
+            series_hash("n", b"{}", "s", "1", b"{}", br#"{"a":"1"}"#)
         );
-        assert_ne!(base, series_hash("m", "{}", "t", "1", "{}", r#"{"a":"1"}"#));
-        assert_ne!(base, series_hash("m", "{}", "s", "2", "{}", r#"{"a":"1"}"#));
         assert_ne!(
             base,
-            series_hash("m", "{}", "s", "1", r#"{"sa":"1"}"#, r#"{"a":"1"}"#)
+            series_hash("m", br#"{"x":1}"#, "s", "1", b"{}", br#"{"a":"1"}"#)
         );
-        assert_ne!(base, series_hash("m", "{}", "s", "1", "{}", r#"{"a":"2"}"#));
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "t", "1", b"{}", br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "s", "2", b"{}", br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "s", "1", br#"{"sa":"1"}"#, br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "s", "1", b"{}", br#"{"a":"2"}"#)
+        );
         // Length prefixes keep part boundaries from shifting into each other.
         assert_ne!(
-            series_hash("ab", "", "", "", "", ""),
-            series_hash("a", "b", "", "", "", "")
+            series_hash("ab", b"", "", "", b"", b""),
+            series_hash("a", b"b", "", "", b"", b"")
         );
+    }
+
+    #[test]
+    fn series_hash_distinguishes_attribute_types_whose_json_matches() {
+        let kvlist = |key: &str, value: &str| {
+            any_value::Value::KvlistValue(KeyValueList {
+                values: vec![s(key, value)],
+            })
+        };
+        // Each pair serializes to the same `attributes` JSON but is two series, so it must not
+        // share a `(time_unix_nano, series_hash)` key.
+        let pairs = [
+            (
+                any_value::Value::BytesValue(vec![1, 2]),
+                kvlist("bytes", "AQI="),
+            ),
+            (
+                any_value::Value::DoubleValue(f64::NAN),
+                kvlist("double", "NaN"),
+            ),
+            (
+                any_value::Value::DoubleValue(f64::INFINITY),
+                kvlist("double", "inf"),
+            ),
+        ];
+        for (a, b) in pairs {
+            let req = request(vec![metric(
+                "m",
+                "",
+                Data::Gauge(Gauge {
+                    data_points: vec![
+                        number_point(1, Value::AsInt(1), vec![kv("k", a.clone())]),
+                        number_point(1, Value::AsInt(2), vec![kv("k", b.clone())]),
+                    ],
+                }),
+            )]);
+            let batch = export_to_store_batch(&req).expect("batch").expect("rows");
+            let attributes = batch
+                .column_by_name("attributes")
+                .expect("col")
+                .as_string::<i32>();
+            assert_eq!(attributes.value(0), attributes.value(1), "{a:?} vs {b:?}");
+            let hash = batch
+                .column_by_name("series_hash")
+                .expect("col")
+                .as_primitive::<UInt64Type>();
+            assert_ne!(hash.value(0), hash.value(1), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_attribute_key_keeps_its_last_value() {
+        let repeated = [s("a", "1"), s("b", "x"), s("a", "2"), s("a", "3")];
+        let mut encoded = Vec::new();
+        assert_eq!(
+            serialize_attributes(&repeated, &mut encoded),
+            r#"{"a":"3","b":"x"}"#
+        );
+        let mut expected = Vec::new();
+        encode_attributes(&[s("b", "x"), s("a", "3")], &mut expected);
+        assert_eq!(encoded, expected);
     }
 
     #[test]
