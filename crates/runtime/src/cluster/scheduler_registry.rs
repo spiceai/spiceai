@@ -32,6 +32,7 @@ use app::spicepod::component::runtime::{StateLocation, StateSource};
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
 use object_store::ObjectStore;
+use object_store_occ::lease::LapseClock;
 use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use tokio::runtime::Handle;
@@ -437,6 +438,13 @@ impl SchedulerRegistryRunner {
         let entry = self.entry.clone();
         let scheduler_id = self.scheduler_id.clone();
         let instance_id = self.instance_id;
+        // How long this process has seen the id's heartbeat object, or its
+        // absence, unchanged while one process held the registration, keyed by
+        // that process. A process that has just started has seen nothing yet,
+        // so it cannot judge the registered entry gone until it has watched the
+        // heartbeat for a TTL; neither can it judge an entry registered since
+        // it started watching, such as another restart's.
+        let registration_lapse = LapseClock::default();
 
         let observed_version = loop {
             let observed = self
@@ -446,18 +454,13 @@ impl SchedulerRegistryRunner {
                 .context(HeartbeatSnafu)?;
             let observed_version = observed.as_ref().map(|(_, version)| version.clone());
             let observed_beat = observed.and_then(|(beat, _)| beat);
-            // How long this process has seen the id's heartbeat object, or its
-            // absence, unchanged. A process that has just started has seen
-            // nothing yet, so it cannot judge the registered entry gone until it
-            // has watched the heartbeat for a TTL.
-            let unchanged_for = self
-                .heartbeats
-                .observe(&self.scheduler_id, observed_version.as_ref());
 
             let res = self
                 .cluster
                 .mutate(|state| {
                     if let Some(existing) = state.schedulers.get(&scheduler_id) {
+                        let unchanged_for = registration_lapse
+                            .observe(&existing.instance_id.to_string(), observed_version.as_ref());
                         // Judge the registered entry by *its own* heartbeat. The
                         // key is shared, so a beat left by another incarnation says
                         // nothing about this entry: if a successor commits its
@@ -2901,6 +2904,121 @@ mod tests {
             .map(|entry| entry.instance_id);
         assert_ne!(registered, Some(holder));
         assert_eq!(registered, Some(second.instance_id));
+    }
+
+    /// Object store whose heartbeat writes land a second after they are sent.
+    #[derive(Debug)]
+    struct SlowHeartbeatWrites {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for SlowHeartbeatWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowHeartbeatWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SlowHeartbeatWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().starts_with("heartbeats") {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Two processes that restart under one identity after a crash both wait
+    /// out the crashed holder's heartbeat. One registers; the other, whose
+    /// membership write then conflicts while the first beat is still in
+    /// flight, is refused as a duplicate instead of replacing it.
+    #[tokio::test(start_paused = true)]
+    async fn two_restarts_under_one_identity_register_once() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (heartbeats, _holder, _, _) = second_process_under_one_identity(&store).await;
+        let slow: Arc<dyn ObjectStore> = Arc::new(SlowHeartbeatWrites {
+            inner: Arc::clone(&store),
+        });
+        let restart = || {
+            let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&slow), ""));
+            let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&slow), ""));
+            runner_over(&cluster, &heartbeats, &slow, Uuid::new_v4())
+        };
+        let (first, second) = (restart(), restart());
+
+        let results = tokio::join!(first.register_self(), second.register_self());
+
+        let registered = match results {
+            (Ok(()), Err(Error::SchedulerIdConflict { .. })) => first.instance_id,
+            (Err(Error::SchedulerIdConflict { .. }), Ok(())) => second.instance_id,
+            other => panic!("one restart registers and the other is a duplicate: {other:?}"),
+        };
+        let snap = ClusterStateStore::new(Arc::clone(&store), "")
+            .read()
+            .await
+            .expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(registered)
+        );
+        let beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read")
+            .expect("heartbeat");
+        assert_eq!(beat.instance_id, registered);
     }
 
     /// A scheduler that restarts under its name while another scheduler's
