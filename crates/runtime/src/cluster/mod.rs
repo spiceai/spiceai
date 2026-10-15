@@ -1852,6 +1852,15 @@ pub async fn initialize_cluster_executor(
             rt.datafusion().cluster_config.node_advertise_url(),
             initial_partitions.clone()
         );
+
+        // The scheduler that allocated the partitions now holds this executor's
+        // Flight endpoint. Every other scheduler, and each scheduler again after
+        // its control stream reconnects, gets it over the control stream.
+        if let Some(broadcaster) = rt.executor_outbound_broadcaster() {
+            broadcaster
+                .announce_flight_endpoint(rt.datafusion().cluster_config.node_advertise_url())
+                .await;
+        }
         rt.set_partition_assignments(initial_partitions).await;
 
         // Replay DDL statements from the scheduler to create tables/schemas

@@ -720,6 +720,16 @@ impl ClusterService for ClusterServiceImpl {
                                                 );
                                             }
                                         }
+                                        ExecutorMessage::FlightEndpoint(endpoint) => {
+                                            register_executor_flight_endpoint(
+                                                &executor_registry,
+                                                &datafusion,
+                                                &executor_id,
+                                                &endpoint.executor_url,
+                                                &process_id,
+                                            )
+                                            .await;
+                                        }
                                         _ => {
                                             handle_executor_message(
                                                 &executor_id,
@@ -839,30 +849,14 @@ impl ClusterService for ClusterServiceImpl {
             ));
         }
 
-        let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
-        match create_executor_flight_client(&executor_url, tls_config_opt) {
-            Ok(client) => {
-                if !self
-                    .executor_registry
-                    .insert_flight_sql_client(
-                        executor_id.to_string(),
-                        executor_address.to_string(),
-                        &process_id,
-                        client,
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        "Ignoring the Flight endpoint of a replaced process of executor {executor_id}"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create Flight SQL client for executor {executor_id}: {e}"
-                );
-            }
-        }
+        register_executor_flight_endpoint(
+            &self.executor_registry,
+            &self.datafusion,
+            executor_id,
+            &executor_url,
+            &process_id,
+        )
+        .await;
 
         // Partitions assigned while this executor was identified by its advertise
         // address follow it to its instance identity.
@@ -1000,6 +994,42 @@ impl ClusterService for ClusterServiceImpl {
     }
 }
 
+/// Creates the Flight SQL client the scheduler sends executor-bound scans
+/// through, from the executor's advertise URL, and registers it for
+/// `executor_id` as the endpoint of executor process `process_id`.
+async fn register_executor_flight_endpoint(
+    executor_registry: &ExecutorRegistry,
+    datafusion: &DataFusion,
+    executor_id: &str,
+    executor_url: &str,
+    process_id: &str,
+) {
+    let executor_address = executor_url
+        .split_once("://")
+        .map_or(executor_url, |(_, address)| address);
+    let tls_config_opt = datafusion.cluster_config.client_tls_config();
+    match create_executor_flight_client(executor_url, tls_config_opt) {
+        Ok(client) => {
+            if !executor_registry
+                .insert_flight_sql_client(
+                    executor_id.to_string(),
+                    executor_address.to_string(),
+                    process_id,
+                    client,
+                )
+                .await
+            {
+                tracing::debug!(
+                    "Ignoring the Flight endpoint of a replaced process of executor {executor_id}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create Flight SQL client for executor {executor_id}: {e}");
+        }
+    }
+}
+
 fn create_executor_flight_client(
     endpoint: &str,
     client_tls_config: Option<ClientTlsConfig>,
@@ -1050,6 +1080,13 @@ async fn handle_executor_message(
             // Acks are handled separately in the stream handler via pending_acks.
             // This shouldn't be reached, but log if it is.
             tracing::warn!("Unexpected ack in handle_executor_message for {executor_id}");
+        }
+        ExecutorMessage::FlightEndpoint(_) => {
+            // Handled in the stream handler once the executor is registered. A
+            // stream's first message is its heartbeat, so this is not reached.
+            tracing::warn!(
+                "Unexpected Flight endpoint in handle_executor_message for {executor_id}"
+            );
         }
         ExecutorMessage::PartitionsLoaded(loaded) => {
             handle_partitions_loaded(executor_id, loaded, datafusion).await;
