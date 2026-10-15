@@ -54,7 +54,7 @@ use crate::suite::load_tpch_suite;
 pub const SUITE_REF: &str = "spiceai/substrait-compliance@43d31411c69ef7594887c7d759037bcf8244eeed";
 
 /// spiceai/datafusion git rev from the workspace `[patch.crates-io]`.
-pub const DATAFUSION_FORK_REV: &str = "63df51067f7f85ed017770511e09b72cc4d55957";
+pub const DATAFUSION_FORK_REV: &str = "72cdbc610f9b99b485783543dfe69c41657cbbfa";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Mode {

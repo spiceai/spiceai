@@ -5855,6 +5855,47 @@ mod placeholder_type_inference {
         Ok(types)
     }
 
+    /// The shortest time a disjunction of `branches` composite-key equalities takes
+    /// to plan, from SQL text to logical plan, over three tries.
+    async fn disjunction_planning_time(branches: usize) -> std::time::Duration {
+        let ctx = session();
+        let state = ctx.state();
+        let sql = format!(
+            "SELECT id FROM t WHERE {}",
+            (0..branches)
+                .map(|i| format!("(id = {i} AND name = 'n{i}' AND tagged = 't{i}')"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            state
+                .create_logical_plan(&sql)
+                .await
+                .expect("plan the disjunction");
+            fastest = fastest.min(started.elapsed());
+        }
+        fastest
+    }
+
+    /// Planning a wide disjunction that holds no placeholder grows linearly with
+    /// its width. Placeholder inference runs on every planned expression, and the
+    /// fork's version used to look up an operand's field at every node of the
+    /// chain, rendering the operand's whole subtree each time: a lookup of 100
+    /// composite keys spent ~150 ms in planning. Four times the branches must cost
+    /// well under eight times the time; that walk costs sixteen times or more.
+    #[tokio::test]
+    async fn a_wide_disjunction_plans_in_time_linear_in_its_width() {
+        let narrow = disjunction_planning_time(100).await;
+        let wide = disjunction_planning_time(400).await;
+        assert!(
+            wide < narrow * 8,
+            "planning 400 branches took {wide:?} against {narrow:?} for 100, more than \
+             linear in the width"
+        );
+    }
+
     /// Every shape one of the fork patches added inference for. A missing patch
     /// leaves the placeholder untyped, which reaches the client as the `UInt64`
     /// fallback rather than the column's own type.
