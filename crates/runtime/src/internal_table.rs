@@ -158,6 +158,7 @@ pub async fn create_internal_accelerated_table(
     );
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
     builder.write_to_accelerator_only();
+    builder.node_local();
 
     builder.retention(retention);
 

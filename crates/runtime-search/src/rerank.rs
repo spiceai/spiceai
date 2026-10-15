@@ -69,6 +69,7 @@ use futures::TryStreamExt;
 use llms::chat::Chat;
 use llms::evaluate::{Evaluate, EvaluateModelStore};
 use llms::rerank::{EvaluateRerank, LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
+use model_capabilities::{Capability, CapabilityStore, require};
 use runtime_query_engine::query_engine::QueryEngine;
 use tokio::sync::RwLock;
 use tracing::Instrument;
@@ -420,6 +421,7 @@ pub struct RerankModelStores {
     pub rerankers: Arc<RwLock<RerankerModelStore>>,
     pub chat_models: Arc<RwLock<ChatModelStore>>,
     pub evaluate_models: Arc<RwLock<EvaluateModelStore>>,
+    pub capabilities: Arc<RwLock<CapabilityStore>>,
 }
 
 impl RerankModelStores {
@@ -432,14 +434,22 @@ impl RerankModelStores {
         names
     }
 
-    /// Native reranker, else a chat model wrapped in [`LlmRerank`], else an
-    /// evaluation model wrapped in [`EvaluateRerank`].
+    /// Native reranker, else a model with chat wrapped in [`LlmRerank`], else a model
+    /// that answers decisions wrapped in [`EvaluateRerank`]. A model with both, such as
+    /// `gpt-6-luna`, reranks through chat.
     async fn resolve(&self, name: &str, args: &RerankTableFuncArgs) -> Option<Arc<dyn Rerank>> {
         if let Some(rr) = self.rerankers.read().await.get(name) {
             return Some(Arc::clone(rr));
         }
-        if let Some(chat) = self.chat_models.read().await.get(name) {
-            let mut adapter = LlmRerank::new(name, Arc::clone(chat));
+        let capabilities = self.capabilities.read().await;
+        let chat = require(
+            &capabilities,
+            &*self.chat_models.read().await,
+            name,
+            Capability::Chat,
+        );
+        if let Ok(chat) = chat {
+            let mut adapter = LlmRerank::new(name, chat);
             if let Some(strategy) = args.strategy {
                 adapter = adapter.with_strategy(strategy);
             }
@@ -448,7 +458,13 @@ impl RerankModelStores {
             }
             return Some(Arc::new(adapter));
         }
-        let evaluator: Arc<dyn Evaluate> = Arc::clone(self.evaluate_models.read().await.get(name)?);
+        let evaluator: Arc<dyn Evaluate> = require(
+            &capabilities,
+            &*self.evaluate_models.read().await,
+            name,
+            Capability::Decisions,
+        )
+        .ok()?;
         let mut adapter = EvaluateRerank::new(name, evaluator);
         if let Some(strategy) = args.strategy {
             adapter = adapter.with_strategy(strategy);
@@ -1814,6 +1830,7 @@ mod tests {
             rerankers: Arc::new(RwLock::new(HashMap::new())),
             chat_models: Arc::new(RwLock::new(HashMap::new())),
             evaluate_models: Arc::new(RwLock::new(HashMap::new())),
+            capabilities: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Register rerank UDTF. Use our TestQueryEngine which supports both sync and async
@@ -1978,10 +1995,6 @@ mod tests {
 
         async fn health(&self) -> llms::evaluate::Result<()> {
             Ok(())
-        }
-
-        fn is_decision_model(&self) -> bool {
-            true
         }
     }
 

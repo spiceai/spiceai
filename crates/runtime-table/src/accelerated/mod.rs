@@ -357,6 +357,8 @@ pub struct AcceleratedTable {
     /// Inverse of configured retention predicates, applied to
     /// `on_zero_results: use_source` fallback scans.
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
+    /// See [`Builder::node_local`].
+    node_local: bool,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -503,6 +505,7 @@ pub struct Builder {
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
+    node_local: bool,
 }
 
 impl Builder {
@@ -562,6 +565,7 @@ impl Builder {
             user_facing_schema: None,
             cdc_param_overrides: None,
             fallback_retention_keep: None,
+            node_local: false,
         }
     }
 
@@ -658,6 +662,13 @@ impl Builder {
     /// This is used for a source that discards writes (`sink`).
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
+        self
+    }
+
+    /// Marks the table as holding only this node's own data, such as its task history.
+    /// A cluster scheduler reads such a table itself; executors do not have its rows.
+    pub fn node_local(&mut self) -> &mut Self {
+        self.node_local = true;
         self
     }
 
@@ -1467,6 +1478,7 @@ impl Builder {
             cluster_role: self.cluster_role,
             user_facing_schema: self.user_facing_schema,
             fallback_retention_keep,
+            node_local: self.node_local,
         };
         if let Some(prepared_child) = prepared_child {
             let rows = prepared_child.publish().map_err(|source| {
@@ -1498,6 +1510,12 @@ impl AcceleratedTable {
     #[must_use]
     pub fn change_sink(&self) -> Option<&runtime_acceleration::change_sink::ChangeSink> {
         self.change_sink.as_ref()
+    }
+
+    /// Whether the table holds only this node's own data. See [`Builder::node_local`].
+    #[must_use]
+    pub fn is_node_local(&self) -> bool {
+        self.node_local
     }
 
     /// Fence new cache work, stop producers, and drain accepted work before

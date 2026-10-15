@@ -273,6 +273,8 @@ runtime-checkpoint-api = "foundation"
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
 evaluate-api = "foundation"
+# What each model can serve and the gate every serving path asks; its closure is `spicepod`.
+model-capabilities = "foundation"
 embed-api = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"

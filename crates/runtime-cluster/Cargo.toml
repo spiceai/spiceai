@@ -64,7 +64,11 @@ x509-certificate.workspace = true
 # instruments actually export.
 opentelemetry-prometheus.workspace = true
 opentelemetry_sdk = { workspace = true }
+<<<<<<< HEAD
 prometheus.workspace = true
+=======
+tempfile.workspace = true
+>>>>>>> origin/trunk
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

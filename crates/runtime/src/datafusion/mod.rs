@@ -132,6 +132,7 @@ use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
+use spicepod::component::runtime::QueryErrorLogging;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -640,7 +641,7 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
-                // An invalid `snapshots.params.s3_queue_url`.
+                // An invalid snapshot `s3_queue_url`.
                 | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
@@ -1494,6 +1495,8 @@ pub struct DataFusion {
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    pub(crate) query_error_logging: QueryErrorLogging,
     /// Whether a query's output preview is recorded: task history is enabled and the
     /// `captured_output` column of `runtime.task_history` is not `none`. When nothing
     /// records it, queries do not build it.
@@ -4708,9 +4711,9 @@ impl DataFusion {
     }
 
     /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
-    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
-    /// SQS queue that receives them. `None` when no queue is configured, and on
-    /// a scheduler, which loads no accelerations itself.
+    /// S3 event notifications, when the `s3_queue_url` in the dataset's snapshot
+    /// params names the SQS queue that receives them. `None` when no queue is
+    /// configured, and on a scheduler, which loads no accelerations itself.
     async fn subscribe_to_snapshot_notifications(
         &self,
         dataset: &Dataset,
@@ -4726,6 +4729,13 @@ impl DataFusion {
             .context(SnapshotNotificationsConfigSnafu {
                 dataset_name: dataset.name.to_string(),
             })
+    }
+
+    /// Sets the `runtime.state.location` that snapshot queue subscriptions
+    /// resolve against.
+    pub(crate) fn set_runtime_state_location(&self, location: Option<String>) {
+        self.snapshot_notifications
+            .set_runtime_state_location(location);
     }
 
     /// The queue consumers shared by local snapshot bootstrap and refresh.

@@ -37,7 +37,8 @@ use datafusion::logical_expr::{col, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    SendableRecordBatchStream, coalesce_partitions::CoalescePartitionsExec,
     stream::RecordBatchStreamAdapter,
 };
 use datafusion::physical_plan::{Distribution, Partitioning, PlanProperties};
@@ -3299,7 +3300,17 @@ impl CachingAccelerationScanExec {
         batch_write_tx: CacheWriteSender,
     ) -> Self {
         let max_age = Some(effective_max_age(max_age));
-        let input = input.into();
+        let input = match input.into() {
+            // `execute` reads one input partition, and a primary-key point lookup
+            // is planned without `EnsureRequirements`, so merge the partitions of a
+            // multi-snapshot or multi-file scan here.
+            CachingScanInput::Planned(input)
+                if input.output_partitioning().partition_count() > 1 =>
+            {
+                CachingScanInput::Planned(Arc::new(CoalescePartitionsExec::new(input)))
+            }
+            input => input,
+        };
 
         let plan_properties = Arc::new(match &input {
             CachingScanInput::Planned(input) => input

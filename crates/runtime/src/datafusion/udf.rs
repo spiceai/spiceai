@@ -118,6 +118,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         rerankers: runtime.rerankers(),
         chat_models: runtime.completion_llms(),
         evaluate_models: runtime.evaluate_models(),
+        capabilities: runtime.model_capabilities(),
     };
     ctx.register_udf(
         RerankTableFunc::new(std::sync::Weak::clone(&weak_df), rerank_models.clone()).into(),
@@ -155,6 +156,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         ctx.register_udf(
             Ai::new(
                 runtime.completion_llms(),
+                runtime.model_capabilities(),
                 runtime.model_rate_controllers(),
                 runtime.status(),
             )
@@ -167,8 +169,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // the decision and chat models in the evaluation store, with the planner rules that
     // place their model calls. Registered once per runtime, so the rules are appended
     // once.
-    runtime_decide::DecisionFunctions::new(runtime.evaluate_models(), runtime.status())
-        .register(ctx);
+    runtime_decide::DecisionFunctions::new(
+        runtime.evaluate_models(),
+        runtime.model_capabilities(),
+        runtime.status(),
+    )
+    .register(ctx);
 
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }

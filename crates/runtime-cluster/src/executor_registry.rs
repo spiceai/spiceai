@@ -30,10 +30,11 @@ use datafusion::{
     catalog::TableProvider,
     common::TableReference,
     common::{Statistics, stats::Precision},
+    error::{DataFusionError, Result as DataFusionResult},
 };
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
-use runtime_datafusion::analyzer_rule::TablePartitionProvider;
+use runtime_datafusion::analyzer_rule::{PartitionProviders, TablePartitionProvider};
 use runtime_proto::{Ack, MetricsRequest, MetricsResponse, SchedulerControlMessage};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
@@ -951,19 +952,20 @@ impl ExecutorRegistry {
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// See [`get_partitions_from_store`].
     pub fn resolve_accelerated_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
+    ) -> DataFusionResult<PartitionProviders> {
+        let (Ok(connections), Ok(flight_sql_clients)) = (
+            self.connections.try_read(),
+            self.flight_sql_clients.try_read(),
+        ) else {
+            return Err(executors_changing(table));
         };
         let executors = ready_executors(&connections, &flight_sql_clients);
         let executor_statistics = self.executor_statistics_snapshot(table);
@@ -976,6 +978,14 @@ impl ExecutorRegistry {
             self.node_id.as_deref(),
         )
     }
+}
+
+/// The error for a query planned while an executor connects or disconnects. Planning cannot
+/// wait for the registry's locks, and a partial executor list would drop rows.
+fn executors_changing(table: &TableReference) -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "Cannot query {table}: the scheduler's executors are changing; retry the query"
+    ))
 }
 
 /// Returns executors that have both an active connection and a `FlightSQL` client.
@@ -1045,6 +1055,11 @@ fn stamp_executor_statistics(
     statistics
 }
 
+/// Returns an empty list only when the table's partition metadata lists no partitions.
+///
+/// # Errors
+///
+/// Returns an error when no ready executor serves the table, or one of its partitions.
 pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
@@ -1052,7 +1067,7 @@ pub(crate) fn get_partitions_from_store(
     schema: &SchemaRef,
     executor_statistics: &HashMap<String, ExecutorTableStatistics>,
     node_id: Option<&str>,
-) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
+) -> DataFusionResult<PartitionProviders> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
         // No partition metadata — route to a single live executor to avoid duplicate results.
         let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.as_str())
@@ -1066,7 +1081,9 @@ pub(crate) fn get_partitions_from_store(
                     metrics::PlanningFailure::NoExecutors,
                 );
             }
-            return Vec::new();
+            return Err(DataFusionError::Plan(format!(
+                "Cannot query {table}: no ready executor serves it"
+            )));
         };
 
         if let Some(node_id) = node_id {
@@ -1076,7 +1093,7 @@ pub(crate) fn get_partitions_from_store(
         // so the coordinator can size joins even on this no-partition-metadata
         // fallback path (previously this passed `None`, silently degrading plans).
         let statistics = stamp_executor_statistics(executor_statistics, executor_id, table, schema);
-        return vec![(
+        return Ok(vec![(
             flight_sql_table_provider(
                 executor_id,
                 (*client).clone(),
@@ -1085,7 +1102,7 @@ pub(crate) fn get_partitions_from_store(
                 statistics,
             ),
             Vec::new(),
-        )];
+        )]);
     };
 
     // All required partitions (future: filter by query predicates)
@@ -1097,7 +1114,7 @@ pub(crate) fn get_partitions_from_store(
 
     if required_partitions.is_empty() {
         tracing::debug!("No partitions required for table {table}");
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Build executor -> partitions map, excluding dead executors. Per-executor
@@ -1140,7 +1157,11 @@ pub(crate) fn get_partitions_from_store(
                     metrics::PlanningFailure::MissingPartitions,
                 );
             }
-            return Vec::new();
+            return Err(DataFusionError::Plan(format!(
+                "Cannot query {table}: no ready executor serves {} of its {} partitions",
+                missing.len(),
+                required_partitions.len()
+            )));
         }
     };
 
@@ -1156,7 +1177,7 @@ pub(crate) fn get_partitions_from_store(
         required_partitions.len()
     );
 
-    selected_executors
+    Ok(selected_executors
         .into_iter()
         .filter_map(|executor_id| {
             let (_, client) = executors.get(&executor_id)?;
@@ -1176,7 +1197,7 @@ pub(crate) fn get_partitions_from_store(
             );
             Some((provider, partition_values))
         })
-        .collect()
+        .collect())
 }
 
 /// Partition provider for federated (non-accelerated) tables such as Cayenne tables.
@@ -1218,14 +1239,12 @@ impl TablePartitionProvider for FederatedPartitionProvider {
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
+    ) -> DataFusionResult<PartitionProviders> {
+        let (Ok(connections), Ok(flight_sql_clients)) = (
+            self.connections.try_read(),
+            self.flight_sql_clients.try_read(),
+        ) else {
+            return Err(executors_changing(table));
         };
 
         let executors = ready_executors(&connections, &flight_sql_clients);
@@ -1236,17 +1255,17 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             .cloned()
             .unwrap_or_default();
 
-        get_partitions_from_store(
+        Ok(get_partitions_from_store(
             &self.partition_store,
             &executors,
             table,
             schema,
             &executor_statistics,
             self.node_id.as_deref(),
-        )
+        )?
         .into_iter()
         .map(|(provider, _)| (provider, vec![]))
-        .collect()
+        .collect())
     }
 }
 
@@ -1813,6 +1832,77 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert!(ready.contains_key("exec-2"));
         assert!(!ready.contains_key("exec-1"));
+    }
+
+    fn id_schema() -> SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn a_table_without_a_ready_executor_does_not_resolve() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("t");
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema())
+            .expect_err("no executor is ready");
+        assert!(
+            error.to_string().contains("no ready executor serves it"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partitions_without_a_ready_executor_do_not_resolve() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("t");
+        let store = registry.accelerations_partition_store();
+        let partitions: Vec<PartitionValue> = (0..2)
+            .map(|bucket| HashMap::from([("bucket(2, id)".to_string(), Some(bucket.to_string()))]))
+            .collect();
+        store
+            .set_unassigned_partitions(
+                &table,
+                partitions.clone(),
+                vec!["bucket(2, id)".to_string()],
+            )
+            .await
+            .expect("seed partitions");
+        store
+            .assign_partition(&table, &partitions[0], "executor-1")
+            .await
+            .expect("assign partition");
+        // Connected, but without a FlightSQL client, so not ready.
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register("executor-1".to_string(), "", tx).await;
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema())
+            .expect_err("no partition has a ready executor");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 2 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_with_no_partitions_resolves_to_no_scans() {
+        let registry = make_registry().await;
+        let table = TableReference::bare("t");
+        registry
+            .accelerations_partition_store()
+            .set_unassigned_partitions(&table, Vec::new(), vec!["bucket(2, id)".to_string()])
+            .await
+            .expect("seed partitions");
+
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema())
+            .expect("a table with no partitions resolves");
+        assert!(partitions.is_empty());
     }
 
     #[tokio::test]
