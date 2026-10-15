@@ -1465,14 +1465,22 @@ impl RefreshTask {
         }
 
         // A source that records which rows each commit added has its append refresh
-        // follow its commits instead of a time window. A one-off override `refresh_sql`
-        // reads a subset of the source and keeps today's path, which saves no cursor.
-        if refresh.override_sql_raw.is_none()
-            && let Some(store) = &self.append_cursor_store
-        {
+        // follow its commits instead of a time window.
+        if let Some(store) = &self.append_cursor_store {
             let federated_provider = self.federated.table_provider().await;
             if let Some(source) = incremental_append_source(federated_provider.as_ref()) {
-                return self.incremental_append(refresh, source, store).await;
+                if refresh.override_sql_raw.is_none() {
+                    return self.incremental_append(refresh, source, store).await;
+                }
+                // A one-off override `refresh_sql` reads by time a part of what the
+                // commits up to the current one added. Its write is marked as in flight
+                // and never saved as loaded, so the next append refresh compares the rows
+                // it reads again with the stored ones.
+                let pinned = self.pin_in_flight(store, source).await?;
+                return self
+                    .time_filtered_append(refresh, pinned.map(|read| read.provider))
+                    .await
+                    .map(AppendRead::without_cursor);
             }
         }
 
@@ -1635,6 +1643,9 @@ impl RefreshTask {
     /// The source a full refresh reads, pinned to its current commit, when the
     /// dataset's append refresh follows the source's commits; the commit is marked as
     /// in flight. `None` reads the dataset's own provider.
+    ///
+    /// A one-off override `refresh_sql` is pinned too: the acceleration then holds what
+    /// that SQL read at the commit, and the next append refresh reads what lands after.
     async fn pin_full_refresh(
         &self,
         refresh: &Refresh,
@@ -1642,29 +1653,38 @@ impl RefreshTask {
         let Some(store) = &self.append_cursor_store else {
             return Ok(None);
         };
-        if refresh.time_column.is_none() || refresh.override_sql_raw.is_some() {
+        if refresh.time_column.is_none() {
             return Ok(None);
         }
         let federated_provider = self.federated.table_provider().await;
         let Some(source) = incremental_append_source(federated_provider.as_ref()) else {
             return Ok(None);
         };
+        let pinned = self.pin_in_flight(store, source).await?;
+        if pinned.is_none() {
+            // Nothing to pin: the next append refresh starts without a cursor.
+            if let Err(e) = store.clear().await {
+                tracing::debug!(
+                    "Dataset '{}' could not clear its append cursor: {e}",
+                    self.dataset_name
+                );
+            }
+        }
+        Ok(pinned)
+    }
+
+    /// `source` pinned to its current commit, which is marked as in flight; `None` when
+    /// the source has no commit.
+    async fn pin_in_flight(
+        &self,
+        store: &AppendCursorStore,
+        source: &dyn IncrementalAppendSource,
+    ) -> Result<Option<PinnedRead>, RetryError<super::Error>> {
         let pinned = source.pin_current().await.map_err(|source| {
             RetryError::transient(super::Error::FailedToRefreshDataset { source })
         })?;
-        match &pinned {
-            Some(read) => {
-                let _ = self.save_pending_cursor(store, &read.cursor).await;
-            }
-            // Nothing to pin: the next append refresh starts without a cursor.
-            None => {
-                if let Err(e) = store.clear().await {
-                    tracing::debug!(
-                        "Dataset '{}' could not clear its append cursor: {e}",
-                        self.dataset_name
-                    );
-                }
-            }
+        if let Some(read) = &pinned {
+            let _ = self.save_pending_cursor(store, &read.cursor).await;
         }
         Ok(pinned)
     }

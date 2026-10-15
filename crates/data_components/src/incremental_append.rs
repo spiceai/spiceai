@@ -163,9 +163,13 @@ pub trait IncrementalAppendSource: Send + Sync {
     async fn pin_current(&self) -> DFResult<Option<PinnedRead>>;
 }
 
-/// The [`IncrementalAppendSource`] beneath `provider`, through any layer the runtime stacked
-/// on it (metadata enrichment, federation, deletion, cluster routing), or `None` when the
-/// dataset's source does not record its commits.
+/// The [`IncrementalAppendSource`] beneath `provider`, through any layer whose scan returns
+/// the source's rows unchanged (metadata enrichment, federation, deletion, cluster routing),
+/// or `None` when the dataset's source does not record its commits.
+///
+/// The refresh reads the source's own providers in the dataset's place, so a layer that
+/// changes what a scan returns, such as one computing embedding columns, hides the source
+/// and the dataset reads by time through that layer.
 ///
 /// Each source that implements the contract is named here, as the refresh-skip check
 /// names its providers: a `dyn TableProvider` cannot be upcast to another trait object.
@@ -174,7 +178,7 @@ pub fn incremental_append_source(
     provider: &dyn TableProvider,
 ) -> Option<&dyn IncrementalAppendSource> {
     if let Some(iceberg) =
-        find_concrete::<iceberg_datafusion::IcebergTableProvider>(provider, LayerWalk::Read)
+        find_concrete::<iceberg_datafusion::IcebergTableProvider>(provider, LayerWalk::Passthrough)
     {
         return Some(iceberg);
     }

@@ -1416,4 +1416,32 @@ mod tests {
             "5 new Iceberg snapshot(s) (3 append, 1 replace, 0 delete, 1 overwrite)"
         );
     }
+
+    /// The refresh reads the source in the dataset's place, so it finds the source only
+    /// through layers whose scan returns the source's rows unchanged.
+    #[tokio::test]
+    async fn the_source_is_found_only_through_layers_that_leave_reads_unchanged() {
+        /// A layer that does not say its reads are unchanged, as one computing a column.
+        #[derive(Debug)]
+        struct ComputesAColumn;
+        impl spice_table::TableLayer for ComputesAColumn {}
+
+        let (catalog, ident) = catalog_with_table().await;
+        let source: Arc<dyn TableProvider> = Arc::new(provider_for(&catalog, &ident).await);
+        let described = crate::metadata_enriched_table_provider(
+            Arc::clone(&source),
+            HashMap::from([("description".to_string(), "events".to_string())]),
+            crate::FieldMetadata::new(),
+        );
+        assert!(
+            crate::incremental_append::incremental_append_source(described.as_ref()).is_some(),
+            "a table description leaves reads unchanged"
+        );
+        let computed: Arc<dyn TableProvider> =
+            spice_table::SpiceTable::over(Arc::new(ComputesAColumn), source);
+        assert!(
+            crate::incremental_append::incremental_append_source(computed.as_ref()).is_none(),
+            "a layer that changes what a scan returns hides the source"
+        );
+    }
 }

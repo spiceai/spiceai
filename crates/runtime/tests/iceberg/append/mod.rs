@@ -96,13 +96,23 @@ async fn refresh(rt: &Arc<Runtime>) -> anyhow::Result<()> {
 
 /// Runs one full refresh to completion, as a user repairing the dataset does.
 async fn full_refresh(rt: &Arc<Runtime>) -> anyhow::Result<()> {
+    one_off_refresh(rt, RefreshMode::Full, None).await
+}
+
+/// Runs one refresh in `mode` to completion, reading `sql` in place of the dataset's
+/// `refresh_sql` when given, as a user calling the refresh API does.
+async fn one_off_refresh(
+    rt: &Arc<Runtime>,
+    mode: RefreshMode,
+    sql: Option<String>,
+) -> anyhow::Result<()> {
     let waiter = rt
         .datafusion()
         .refresh_table(
             &TableReference::from(ACCELERATED),
             Some(RefreshOverrides {
-                sql: None,
-                mode: Some(RefreshMode::Full),
+                sql,
+                mode: Some(mode),
                 max_jitter: None,
             }),
         )
@@ -111,7 +121,7 @@ async fn full_refresh(rt: &Arc<Runtime>) -> anyhow::Result<()> {
     let outcome = tokio::time::timeout(Duration::from_mins(3), waiter.wait()).await?;
     anyhow::ensure!(
         outcome.is_answered(),
-        "the full refresh did not complete: {outcome:?}"
+        "the one-off refresh did not complete: {outcome:?}"
     );
     Ok(())
 }
@@ -846,6 +856,49 @@ async fn a_full_refresh_moves_the_cursor() -> anyhow::Result<()> {
             rows.len(),
             111,
             "the fully refreshed rows are not read again"
+        );
+        rt.shutdown().await;
+    }
+    Ok(())
+}
+
+/// A one-off refresh with its own `refresh_sql` can write the rows of commits after the
+/// cursor. The next append refresh does not store them again, which it would without a
+/// primary key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_one_off_refresh_sql_adds_no_duplicate() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
+    for mode in [RefreshMode::Full, RefreshMode::Append] {
+        let lab = Lab::start(TimeKind::Timestamp).await?;
+        lab.append(&keys("k", 1..=100, 0, "v1")).await?;
+        let accel = Accel {
+            primary_key: false,
+            ..Accel::default()
+        };
+        let (rt, _) = start_spice(&lab, &accel).await?;
+
+        lab.append(&keys("k", 101..=110, 1800, "v1")).await?;
+        one_off_refresh(&rt, mode, Some(format!("SELECT * FROM {ACCELERATED}"))).await?;
+        assert_eq!(
+            accelerated_count(&rt).await?,
+            110,
+            "after the one-off {mode:?} refresh"
+        );
+
+        lab.append(&[Row::at("k301", 300, "late")]).await?;
+        refresh(&rt).await?;
+        let rows = assert_matches_source(
+            &rt,
+            TimeKind::Timestamp,
+            &format!("after the append that follows a one-off {mode:?} refresh"),
+        )
+        .await?;
+        assert_eq!(
+            rows.len(),
+            111,
+            "the rows the one-off refresh wrote are not stored again"
         );
         rt.shutdown().await;
     }
