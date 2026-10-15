@@ -23,6 +23,11 @@
 #   scripts/signoff                 Run checks, then sign off on HEAD  (or: make signoff)
 #   scripts/signoff -f              Sign off even with a dirty/unpushed tree
 #   scripts/signoff --no-verify     Sign off without running the checks (honor system)
+#   scripts/signoff --note TEXT     Add TEXT to the status description (e.g. where
+#                                   the checks ran, for a --no-verify sign-off)
+#   scripts/signoff verify          Run the checks on HEAD but post no status
+#                                   (for trees that are not a pushed PR head, such
+#                                   as the combined branch of scripts/signoff-batch)
 #   scripts/signoff status          Show the sign-off status of HEAD
 #   scripts/signoff mine            Show attestation status for all your open PRs
 #   scripts/signoff clear-pending   Restate a left-behind pending status as incomplete
@@ -2212,11 +2217,14 @@ post_failure_status() {
 }
 
 cmd_signoff() {
-  local force=false verify=true
+  local force=false verify=true note=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -f|--force)     force=true;  shift ;;
       --no-verify)    verify=false; shift ;;
+      --note)
+        [[ $# -ge 2 ]] || fail "--note needs a value"
+        note="$2"; shift 2 ;;
       # The two targeted phases are one decision in practice — they are the
       # fail-fast pass, and skipping one while keeping the other rarely makes
       # sense. Setting both is also the only combination that means what it
@@ -2307,6 +2315,10 @@ cmd_signoff() {
     fi
     elapsed=$(( $(date +%s) - start ))
     description="Signed off by ${user}${via} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s"
+    [[ -n "$note" ]] && description+=" — ${note}"
+  elif [[ -n "$note" ]]; then
+    # The note says where the checks ran instead, e.g. scripts/signoff-batch.
+    description="Signed off by ${user}${via} — ${note}"
   else
     description="Signed off by ${user}${via} (checks not verified locally)"
   fi
@@ -2318,6 +2330,40 @@ cmd_signoff() {
 
   echo "${OK} Signed off on ${sha:0:12} — ${description}"
   refresh_attestation_check "$sha" "$repo"
+}
+
+# Run the sign-off checks on HEAD and report the verdict, but post no status.
+# HEAD need not be pushed: scripts/signoff-batch runs this on a local merge of
+# several PRs, and then attests each PR head itself.
+cmd_verify() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skip-targeted)
+        export SIGNOFF_SKIP_TARGETED_LINT=1 SIGNOFF_SKIP_TARGETED_TESTS=1
+        shift ;;
+      -h|--help)      cmd_help; exit 0 ;;
+      *)              fail "unknown option: $1 (see: scripts/signoff --help)" ;;
+    esac
+  done
+  is_remote_run && fail "verify posts no status, so it has no place in a remote sign-off run"
+
+  detect_vcs
+  local revision sha start elapsed check_status=0
+  revision=$(current_revision true)
+  sha=$(revision_sha "$revision") || fail "could not resolve ${revision}"
+  SIGNOFF_CHECK_SUMMARY="lint+test passed"
+  start=$(date +%s)
+  # Same status capture as cmd_signoff: no `if`/`||`, so set -e stays on inside.
+  set +e
+  run_checks "$revision"
+  check_status=$?
+  set -e
+  elapsed=$(( $(date +%s) - start ))
+  if [[ "$check_status" -ne 0 || -n "$SIGNOFF_SIGNALLED" ]]; then
+    describe_check_failure "$check_status" "$elapsed" "$(local_user_name || true)"
+    fail "${SIGNOFF_FAILURE_MESSAGE} (no status posted)"
+  fi
+  echo "${OK} Verified ${sha:0:12} — ${SIGNOFF_CHECK_SUMMARY} in ${elapsed}s (no status posted)"
 }
 
 # Pick the current STATUS_CONTEXT state out of a combined-status payload. The
@@ -2976,6 +3022,12 @@ Developers:
   scripts/signoff remote       Same as make signoff-remote (Git + JJ)
   scripts/signoff -f           Sign off even with a dirty/unpushed tree
   scripts/signoff --no-verify  Sign off without running checks (honor system)
+  scripts/signoff --note TEXT  Add TEXT to the sign-off description; with
+                               --no-verify it replaces "(checks not verified
+                               locally)", so say where the checks ran
+  scripts/signoff verify [--skip-targeted]
+                               Run the checks on HEAD, post no status. HEAD need
+                               not be pushed (see scripts/signoff-batch)
   scripts/signoff --skip-targeted
                                Skip the branch-scoped pre-lint and unit tests
                                (steps 1-2); the full gate still runs
@@ -3047,7 +3099,8 @@ EOF
 main() {
   case "${1:-}" in
     ""|signoff) shift || true; cmd_signoff "$@" ;;
-    -f|--force|--no-verify|--skip-targeted) cmd_signoff "$@" ;;
+    -f|--force|--no-verify|--skip-targeted|--note) cmd_signoff "$@" ;;
+    verify)   shift; cmd_verify "$@" ;;
     remote)   shift; cmd_remote "$@" ;;
     status)   shift; cmd_status "$@" ;;
     mine)     shift; cmd_mine "$@" ;;
