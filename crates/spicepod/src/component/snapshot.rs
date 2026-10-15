@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::runtime::RuntimeState;
 use super::{default_true, is_default};
 use crate::param::Params;
 #[cfg(feature = "schemars")]
@@ -50,7 +49,8 @@ pub struct Snapshots {
     /// i.e. `s3://my-bucket/spice/snapshots/`
     ///
     /// When not set, snapshots go to the `snapshots/` folder of
-    /// `runtime.state.location`.
+    /// `runtime.state.location`. A dataset's `acceleration.snapshots_location`
+    /// wins over it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
 
@@ -65,52 +65,19 @@ pub struct Snapshots {
     /// Auth params for accessing the object store location.
     /// For S3, this is the same as the S3 dataset connector params
     /// with the notable exception that `s3_auth` is set to `iam_role` by default.
-    /// When set, they replace `runtime.state.params` for a location taken from
-    /// `runtime.state`.
+    /// They apply to this section's `location`, and replace `runtime.state.params`
+    /// for the `runtime.state` location. A dataset's `acceleration.snapshots_params`
+    /// win over them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 }
 
-/// The folder of `runtime.state.location` that holds acceleration snapshots when
-/// `snapshots.location` is not set.
+/// The folder of `runtime.state.location` that holds acceleration snapshots.
 pub const SNAPSHOTS_STATE_FOLDER: &str = "snapshots";
 
-impl Snapshots {
-    /// The snapshot configuration for a spicepod that sets `runtime.state` and no
-    /// `snapshots.location`: snapshots go to the `snapshots` folder of
-    /// `runtime.state.location`. As with `runtime.scheduler.params`,
-    /// `snapshots.params`, when set, replace `runtime.state.params`. Every other
-    /// field comes from `snapshots`, or its default when the section is absent.
-    #[must_use]
-    pub fn in_runtime_state(snapshots: Option<&Snapshots>, state: &RuntimeState) -> Snapshots {
-        let snapshots = snapshots.cloned().unwrap_or_default();
-        let params = snapshots.params.or_else(|| state.params.clone());
-        Snapshots {
-            location: Some(runtime_state_folder(&state.location)),
-            params,
-            ..snapshots
-        }
-    }
-}
-
-/// `<location>/snapshots/`. A location that is not a URL is joined as text, so the
-/// snapshot store still reports it as invalid.
-fn runtime_state_folder(location: &str) -> String {
-    let folder = format!("{SNAPSHOTS_STATE_FOLDER}/");
-    match url::Url::parse(location) {
-        Ok(mut url) => {
-            if !url.path().ends_with('/') {
-                let path = format!("{}/", url.path());
-                url.set_path(&path);
-            }
-            url.join(&folder).map_or_else(
-                |_| format!("{}/{folder}", location.trim_end_matches('/')),
-                String::from,
-            )
-        }
-        Err(_) => format!("{}/{folder}", location.trim_end_matches('/')),
-    }
-}
+/// The snapshot `params` key that names the SQS queue receiving a snapshot
+/// location's S3 event notifications.
+pub const SNAPSHOTS_QUEUE_URL_PARAM: &str = "s3_queue_url";
 
 impl Default for Snapshots {
     fn default() -> Self {
@@ -137,86 +104,5 @@ mod tests {
         );
         assert!(snapshots.location.is_none());
         assert!(snapshots.params.is_none());
-    }
-
-    fn runtime_state(location: &str, params: Option<&[(&str, &str)]>) -> RuntimeState {
-        RuntimeState {
-            location: location.to_string(),
-            params: params.map(|params| {
-                Params::from_string_map(
-                    params
-                        .iter()
-                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                        .collect(),
-                )
-            }),
-        }
-    }
-
-    #[test]
-    fn runtime_state_snapshots_go_to_the_snapshots_folder() {
-        for (location, expected) in [
-            ("s3://my-bucket/spice/", "s3://my-bucket/spice/snapshots/"),
-            ("s3://my-bucket/spice", "s3://my-bucket/spice/snapshots/"),
-            ("s3://my-bucket", "s3://my-bucket/snapshots/"),
-            ("s3://my-bucket/", "s3://my-bucket/snapshots/"),
-            ("file:///", "file:///snapshots/"),
-            (
-                "file:///var/spice/state",
-                "file:///var/spice/state/snapshots/",
-            ),
-            (
-                "abfss://container@account.dfs.core.windows.net/spice/",
-                "abfss://container@account.dfs.core.windows.net/spice/snapshots/",
-            ),
-            ("abfs://container", "abfs://container/snapshots/"),
-            ("gs://bucket/a%20b/", "gs://bucket/a%20b/snapshots/"),
-            ("not a url", "not a url/snapshots/"),
-        ] {
-            let snapshots = Snapshots::in_runtime_state(None, &runtime_state(location, None));
-            assert_eq!(snapshots.location.as_deref(), Some(expected), "{location}");
-        }
-    }
-
-    /// `snapshots.params` replace `runtime.state.params` as a whole, as
-    /// `runtime.scheduler.params` do; the other fields keep their values.
-    #[test]
-    fn runtime_state_snapshots_take_snapshot_params_else_state_params() {
-        let state = runtime_state(
-            "s3://my-bucket/spice/",
-            Some(&[("s3_region", "us-east-1"), ("s3_auth", "iam_role")]),
-        );
-
-        let defaults = Snapshots::in_runtime_state(None, &state);
-        assert_eq!(
-            defaults,
-            Snapshots {
-                enabled: true,
-                location: Some("s3://my-bucket/spice/snapshots/".to_string()),
-                bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Warn,
-                params: state.params.clone(),
-            }
-        );
-
-        let section = Snapshots {
-            enabled: false,
-            location: None,
-            bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Fallback,
-            params: Some(Params::from_string_map(
-                [(
-                    "s3_queue_url".to_string(),
-                    "https://sqs.us-east-1.amazonaws.com/1/q".to_string(),
-                )]
-                .into_iter()
-                .collect(),
-            )),
-        };
-        assert_eq!(
-            Snapshots::in_runtime_state(Some(&section), &state),
-            Snapshots {
-                location: Some("s3://my-bucket/spice/snapshots/".to_string()),
-                ..section
-            }
-        );
     }
 }

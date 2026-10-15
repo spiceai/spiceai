@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Decision model loader (`TypeSafe` Jev, `OpenAI` decision models). Chat models get their
-//! evaluator from [`super::LoadedChatModel::evaluator`].
+//! Native decision model loader (`TypeSafe` Jev, `OpenAI` decision models). Models without
+//! a native Decisions API get their evaluator from [`super::LoadedChatModel::evaluator`].
 
 #![expect(clippy::implicit_hasher)]
 
@@ -46,7 +46,8 @@ pub use llms::evaluate::EvaluateModelStore;
 /// Construct an [`Evaluate`] model from a Spicepod model component.
 ///
 /// Supports decision models: [`ModelSource::TypeSafe`] Jev and `OpenAI` decision models
-/// such as `gpt-6-luna`. Chat models answer decisions through their own evaluator.
+/// such as `gpt-6-luna`, including models that also support chat. Other chat models
+/// answer decisions through their own evaluator.
 ///
 /// Returns the evaluation model and the rate controller that should also be
 /// registered in the runtime's model rate-controller map.
@@ -194,15 +195,8 @@ impl Evaluate for Metered {
     }
 }
 
-/// Whether this Spicepod model is a decision model, which answers decisions and not
-/// chat: `TypeSafe` Jev, or an `OpenAI` decision model such as `gpt-6-luna`.
+/// Whether this Spicepod model supports evaluation only, without chat.
 #[must_use]
 pub fn is_evaluate_only(component: &Model) -> bool {
-    match component.get_source() {
-        Some(ModelSource::TypeSafe) => true,
-        Some(ModelSource::OpenAi) => component
-            .get_model_id()
-            .is_some_and(|id| llms::openai::decisions::is_decision_model_id(&id)),
-        _ => false,
-    }
+    matches!(component.get_source(), Some(ModelSource::TypeSafe))
 }
