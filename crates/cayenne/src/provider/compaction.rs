@@ -86,6 +86,51 @@ static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| R
 static COMPACTION_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(compaction_budget_permits())));
 
+/// Process-wide budget bounding how many `deletion_mode: auto` tables rewrite
+/// themselves whole at once to reclaim deletes
+/// (`CpuBudget::cayenne_whole_table_reclaim_permits`). Each table paces its own
+/// reclaims, but tables written alike reach their triggers together, and with
+/// nothing bounding them across tables 20 rewrote at once on eight cores and
+/// stalled queries. Separate from [`COMPACTION_BUDGET`], which a background pass
+/// already holds when it reaches a reclaim, and from the encode budget, which
+/// writers draw on.
+static WHOLE_TABLE_RECLAIM_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    Arc::new(Semaphore::new(
+        cpu_budget::cpu_budget().cayenne_whole_table_reclaim_permits(),
+    ))
+});
+
+/// The process-wide budget an `auto` table's whole-table reclaim draws on. See
+/// [`WHOLE_TABLE_RECLAIM_BUDGET`].
+#[must_use]
+pub(crate) fn whole_table_reclaim_budget() -> Arc<Semaphore> {
+    Arc::clone(&WHOLE_TABLE_RECLAIM_BUDGET)
+}
+
+tokio::task_local! {
+    /// Set while a background compaction pass holds a permit from its compaction
+    /// budget ([`BackgroundCompactor`]). A whole-table reclaim in such a pass that
+    /// finds no reclaim permit free declines rather than wait: waiting, it would hold
+    /// a compaction permit that other tables' background compaction needs.
+    static BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT: ();
+}
+
+/// Run `pass` as a background compaction pass that holds a compaction permit
+/// (see [`BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT`]).
+pub(crate) async fn run_holding_compaction_permit<F: Future>(pass: F) -> F::Output {
+    BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT
+        .scope((), pass)
+        .await
+}
+
+/// Whether the running pass is a background compaction pass holding a compaction
+/// permit (see [`BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT`]).
+pub(crate) fn holds_compaction_permit() -> bool {
+    BACKGROUND_PASS_HOLDS_COMPACTION_PERMIT
+        .try_with(|()| ())
+        .is_ok()
+}
+
 static COMPACTION_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static IN_FLIGHT_COMPACTION_PASSES: LazyLock<CompactionPassTracker> =
     LazyLock::new(CompactionPassTracker::default);
@@ -635,7 +680,7 @@ impl BackgroundCompactor {
                         )],
                     );
 
-                    match runner.run_compaction_trigger().await {
+                    match run_holding_compaction_permit(runner.run_compaction_trigger()).await {
                         Ok(true) => {
                             tracing::debug!(
                                 target: "cayenne::compaction",

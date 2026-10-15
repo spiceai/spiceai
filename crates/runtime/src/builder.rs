@@ -634,12 +634,28 @@ impl RuntimeBuilder {
             Some(ClusterRole::Executor)
         );
 
+        // Every instance with `runtime.state` checks its location at startup. The
+        // features that keep state there write only once the check has passed.
+        let state_location_check = spicepod_rt
+            .state
+            .as_ref()
+            .map(|state| runtime_state_location::StateLocationCheck::new(&state.location));
+        if let Some(check) = &state_location_check
+            && self
+                .app
+                .as_deref()
+                .is_some_and(crate::state_location::snapshots_use_runtime_state)
+        {
+            check.record_feature(runtime_state_location::StateFeature::Snapshots);
+        }
+
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
         let http_rate_control_registry = build_http_rate_control_registry(
             spicepod_rt.source_rate_control.as_ref(),
             spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -648,6 +664,7 @@ impl RuntimeBuilder {
         let results_cache_warmer = crate::datafusion::query::build_results_cache_warmer(
             results_cache_warmup_enabled,
             spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -675,6 +692,7 @@ impl RuntimeBuilder {
                         Arc::clone(&secrets),
                         io_runtime.clone(),
                         &scheduler_state,
+                        state_location_check.as_ref(),
                     )
                     .await
                     {
@@ -882,7 +900,12 @@ impl RuntimeBuilder {
             view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),
+            state_location_check: state_location_check.clone(),
         };
+
+        if let (Some(state), Some(check)) = (spicepod_rt.state.clone(), state_location_check) {
+            crate::state_location::spawn_check(&rt, state, check);
+        }
 
         // Executors: register cluster status before any concurrent
         // `load_components` / `start_servers` race so readiness cannot pass on
@@ -952,10 +975,16 @@ impl Default for RuntimeBuilder {
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (source_rate_control, &secrets, &io_runtime);
+    let _ = (
+        source_rate_control,
+        state_location_check,
+        &secrets,
+        &io_runtime,
+    );
     // `runtime.state` also serves the scheduler and results-cache warmup, so
     // setting it is not a request for cluster rate control: no warning.
     if runtime_state.is_some() {
@@ -973,6 +1002,7 @@ async fn build_http_rate_control_registry(
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
@@ -984,15 +1014,21 @@ async fn build_http_rate_control_registry(
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         &state.into(),
-        crate::object_store_state::StateFeature::RateControl,
+        runtime_state_location::StateFeature::RateControl,
     )
     .await
     {
         Ok((store, base_prefix)) => {
+            let store = match state_location_check {
+                Some(check) => {
+                    check.guard(runtime_state_location::StateFeature::RateControl, store)
+                }
+                None => store,
+            };
             tracing::info!(
                 "Initialized persisted HTTP governor rate-control state with location: {}",
                 state.location

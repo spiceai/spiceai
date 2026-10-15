@@ -37,8 +37,8 @@ use parking_lot::RwLock;
 use snafu::prelude::*;
 
 use crate::catalog::CatalogError;
-use crate::metadata::{CompressionStrategy, PkConflictDetection, VortexConfig};
-use crate::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+use crate::metadata::{CompressionStrategy, DeletionMode, PkConflictDetection, VortexConfig};
+use crate::{CayenneCatalog, CayenneContext, CayenneTableProviderBuilder, MetadataCatalog};
 
 /// Configuration for constructing a [`CayenneCatalogProvider`].
 #[derive(Debug, Clone)]
@@ -747,9 +747,13 @@ impl CayenneSchemaProvider {
     ) -> Result<Option<Arc<dyn TableProvider>>> {
         // Check if the table exists in the catalog
         match catalog.get_table(table_name).await {
-            Ok(_metadata) => {
-                let builder =
-                    CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env));
+            Ok(metadata) => {
+                let builder = catalog_table_builder(
+                    catalog,
+                    runtime_env,
+                    table_name,
+                    &metadata.vortex_config,
+                );
 
                 match builder.open(table_name).await {
                     Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
@@ -823,6 +827,28 @@ impl SchemaProvider for CayenneSchemaProvider {
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         Ok(self.tables.write().remove(name))
     }
+}
+
+/// A builder that opens a table of a Cayenne catalog with its stored
+/// configuration, and with `deletion_mode: auto` set up for this runtime as the
+/// accelerator sets it up for a dataset. On a runtime where `auto` may not keep a
+/// small table compacted whole alongside its writes, with fewer than 8 physical CPU
+/// cores or not on Linux ([`crate::auto_keeps_small_tables_compacted`]), an `auto` table
+/// keeps key deletes from the start ([`VortexConfig::auto_keeps_key_deletes`]). The
+/// setting is not stored, so the table chooses again wherever it next opens.
+pub(crate) fn catalog_table_builder(
+    catalog: &Arc<dyn MetadataCatalog>,
+    runtime_env: &Arc<RuntimeEnv>,
+    table_name: &str,
+    stored: &VortexConfig,
+) -> CayenneTableProviderBuilder {
+    let mut config = stored.clone();
+    if config.deletion_mode == DeletionMode::Auto && !crate::auto_keeps_small_tables_compacted() {
+        config.auto_keeps_key_deletes = true;
+    }
+    CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env)).with_context(
+        CayenneContext::new(&config, Arc::clone(runtime_env), table_name),
+    )
 }
 
 #[cfg(test)]
@@ -1095,6 +1121,170 @@ mod tests {
         assert!(
             matches!(error, Error::MetastoreInsideDataDir { .. }),
             "expected a metastore-overlap refusal, got: {error}"
+        );
+    }
+
+    /// A Cayenne catalog on `base`, and a two-column `id`/`v` schema.
+    async fn small_host_catalog(
+        base: &std::path::Path,
+        runtime_env: &std::sync::Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> CayenneCatalogProvider {
+        CayenneCatalogProvider::try_new(
+            config(&base.to_string_lossy()),
+            std::sync::Arc::clone(runtime_env),
+            data_components::catalog_filter::TableSelector::select_all(),
+        )
+        .await
+        .expect("open the catalog")
+    }
+
+    fn id_value_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]))
+    }
+
+    /// Whether an opened table records position deletes, and whether it is `auto`.
+    fn deletion_mode_of(
+        table: &std::sync::Arc<dyn datafusion::catalog::TableProvider>,
+    ) -> (bool, bool) {
+        let table = table
+            .downcast_ref::<crate::CayenneTableProvider>()
+            .expect("a Cayenne table");
+        (
+            table.pk_deletion_mode.uses_positions(),
+            table.pk_deletion_mode.auto().is_some(),
+        )
+    }
+
+    /// On a runtime with fewer than 8 CPU cores, a primary-key table that a Cayenne
+    /// catalog loads opens as `auto` on key deletes, as the accelerator opens a
+    /// dataset, so it keeps `auto`'s reclaim of rows the bake cannot reach. Its stored
+    /// configuration is unchanged, so it chooses again wherever it next opens. Runs
+    /// under an installed budget of two or three cores.
+    #[tokio::test]
+    async fn a_catalog_table_loads_on_key_deletes_on_a_small_host() {
+        use std::sync::Arc;
+
+        use datafusion::execution::runtime_env::RuntimeEnv;
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+
+        use super::CayenneSchemaProvider;
+        use crate::metadata::{CreateTableOptions, DeletionMode};
+
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "catalog_provider::tests::a_catalog_table_loads_on_key_deletes_on_a_small_host",
+        )
+        .expect("an isolated run with an installed CPU budget") else {
+            return;
+        };
+        assert!(
+            !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted(),
+            "premise: a {cores}-core budget is a small host"
+        );
+        let base = tempfile::tempdir().expect("temp dir");
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let provider = small_host_catalog(base.path(), &runtime_env).await;
+        provider
+            .metadata_catalog()
+            .create_table(CreateTableOptions {
+                table_name: "public/t".to_string(),
+                schema: id_value_schema(),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                    "id".to_string(),
+                ]))),
+                base_path: provider.data_base_path().to_string(),
+                partition_column: None,
+                vortex_config: provider.vortex_config().clone(),
+            })
+            .await
+            .expect("create a primary-key table");
+
+        let loaded = CayenneSchemaProvider::load_table(
+            provider.metadata_catalog(),
+            "public/t",
+            &runtime_env,
+        )
+        .await
+        .expect("load the table")
+        .expect("the table exists");
+        assert_eq!(
+            deletion_mode_of(&loaded),
+            (false, true),
+            "the catalog loads it as `auto` on key deletes: (records position deletes, is auto)"
+        );
+        let stored = provider
+            .metadata_catalog()
+            .get_table("public/t")
+            .await
+            .expect("the stored table");
+        assert_eq!(
+            stored.vortex_config.deletion_mode,
+            DeletionMode::Auto,
+            "the resolution is not stored"
+        );
+    }
+
+    /// On a runtime with fewer than 8 CPU cores, a primary-key table that `CREATE
+    /// TABLE` makes in a Cayenne catalog opens as `auto` on key deletes. Runs under
+    /// an installed budget of two or three cores.
+    #[cfg(feature = "partition-table-provider")]
+    #[tokio::test]
+    async fn a_table_created_in_a_catalog_opens_on_key_deletes_on_a_small_host() {
+        use std::sync::Arc;
+
+        use datafusion::catalog::CatalogProvider;
+        use datafusion::execution::runtime_env::RuntimeEnv;
+
+        use crate::ddl::operations::{CreateTableParams, create_table};
+
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "catalog_provider::tests::a_table_created_in_a_catalog_opens_on_key_deletes_on_a_small_host",
+        )
+        .expect("an isolated run with an installed CPU budget") else {
+            return;
+        };
+        assert!(
+            !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted(),
+            "premise: a {cores}-core budget is a small host"
+        );
+        let base = tempfile::tempdir().expect("temp dir");
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let provider = small_host_catalog(base.path(), &runtime_env).await;
+        create_table(
+            CreateTableParams {
+                table_name: "t".to_string(),
+                schema_name: "public".to_string(),
+                catalog_name: "cayenne".to_string(),
+                arrow_schema: id_value_schema(),
+                primary_key: vec!["id".to_string()],
+                partition_expr_sql: None,
+                cluster_by: vec![],
+                if_not_exists: false,
+                like_source_table: None,
+                ctx: None,
+            },
+            &provider,
+            Arc::clone(&runtime_env),
+        )
+        .await
+        .expect("create a primary-key table");
+
+        let created = provider
+            .schema("public")
+            .expect("the schema CREATE TABLE made")
+            .table("t")
+            .await
+            .expect("look up the created table")
+            .expect("the created table");
+        assert_eq!(
+            deletion_mode_of(&created),
+            (false, true),
+            "CREATE TABLE opens it as `auto` on key deletes: (records position deletes, is auto)"
         );
     }
 }

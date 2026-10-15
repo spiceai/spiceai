@@ -62,6 +62,7 @@ use super::on_conflict::{
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
+use super::pk_deletion_mode::{AutoDeletionMode, AutoKeyTableKind, PkDeletionMode, TableStorage};
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
@@ -154,6 +155,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::OnceCell;
 use tokio::task;
 use vortex_datafusion::VortexFormat;
 use vortex_datafusion::VortexSource;
@@ -800,6 +802,38 @@ struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
+    /// These files with their statistics, built once for every scan that shares
+    /// this capture — every scan of one [`ScanView`] — instead of once per scan.
+    /// See [`CayenneTableProvider::snapshot_files_with_stats`].
+    with_statistics: Arc<OnceCell<SnapshotFilesWithStatistics>>,
+}
+
+impl CapturedSnapshotFiles {
+    fn new(dir_generation: u64, listing_epoch: u64, files: Arc<Vec<PartitionedFile>>) -> Self {
+        Self {
+            dir_generation,
+            listing_epoch,
+            files,
+            with_statistics: Arc::default(),
+        }
+    }
+}
+
+/// A captured file set with each file's statistics, computed against
+/// `statistics_schema`.
+struct SnapshotFilesWithStatistics {
+    statistics_schema: SchemaRef,
+    files: Arc<Vec<PartitionedFile>>,
+}
+
+/// Why a shared statistics listing was not stored in its capture's cell.
+enum SharedListingError {
+    /// The build failed. Nothing is stored, so a later scan builds it again.
+    Failed(datafusion_common::DataFusionError),
+    /// The table's file set or statistics were invalidated while the listing was
+    /// built. The listing still answers the scan that built it, as a build that
+    /// was never shared does, but it is not stored for scans that start later.
+    Invalidated(Arc<Vec<PartitionedFile>>),
 }
 
 /// The live state one sweep reads, owned so it can cross into `spawn_blocking`.
@@ -1768,6 +1802,40 @@ impl ScanViewCache {
     }
 }
 
+/// What [`CayenneTableProvider::deletion_index_reclaim_decision`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimDecision {
+    /// A whole-table reclaim should run now.
+    Due(SnapshotMaintenanceTrigger),
+    /// The deletion index is past its trigger, but the pace holds an `auto`
+    /// table's whole-table reclaim back.
+    Paced,
+    /// The deletion index is past its trigger, but the CDC apply is at or over
+    /// capacity.
+    Backpressure,
+    /// Nothing for the whole-table reclaim to do yet, or a table it does not serve.
+    NotDue,
+}
+
+impl ReclaimDecision {
+    /// The trigger to run the reclaim with, when it is due.
+    fn trigger(self) -> Option<SnapshotMaintenanceTrigger> {
+        match self {
+            Self::Due(trigger) => Some(trigger),
+            Self::Paced | Self::Backpressure | Self::NotDue => None,
+        }
+    }
+
+    /// The outcome a pass records when this decision leaves it nothing to do.
+    fn declined_outcome(self) -> CompactionOutcome {
+        match self {
+            Self::Paced => CompactionOutcome::DeclinedPaced,
+            Self::Backpressure => CompactionOutcome::DeclinedApplyBackpressure,
+            Self::Due(_) | Self::NotDue => CompactionOutcome::DeclinedBelowTrigger,
+        }
+    }
+}
+
 /// Test-only mid-pass hook: an async callback fired at a fixed point of a
 /// compaction or rewrite pass. See `CayenneTableProvider::test_pre_publish_hook`
 /// and `CayenneTableProvider::test_post_catalog_commit_hook`.
@@ -1784,6 +1852,29 @@ type TestSchemaStatisticsLockProbe = (
 /// `CayenneTableProvider::test_post_capture_hook`.
 #[cfg(test)]
 type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// Test-only probe of the writer-concurrent full rewrite's capture: the first
+/// sender fires once the rewrite holds `write_lock` to capture, the second once it
+/// has taken its cutoff. See `CayenneTableProvider::test_rewrite_capture_probe`.
+#[cfg(test)]
+type TestRewriteCaptureProbe = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+);
+
+/// Test-only counters and fault injection for the statistics listing.
+#[cfg(test)]
+#[derive(Default)]
+struct TestListingSeams {
+    /// Listings built with statistics rather than served from a cache, so a
+    /// test can tell a shared or carried-forward listing from a rebuild.
+    builds: AtomicU64,
+    /// Scans that asked a capture's shared listing for their files, so a test
+    /// can release a held build once every scan has joined it.
+    shared_requests: AtomicU64,
+    /// Fail the next listing build. Consumed on first use.
+    fail_next: AtomicBool,
+}
 
 /// Test-only synchronous hook fired at the start of the checkpoint's fold-and-union
 /// task, on the blocking pool. See `CayenneTableProvider::test_checkpoint_union_hook`.
@@ -1919,6 +2010,10 @@ pub struct CayenneTableProvider {
     /// Strategy for primary key-based deletion filtering.
     /// Contains the deletion caches specific to each strategy variant.
     pub(crate) pk_deletion_strategy: PkDeletionStrategyWithCache,
+    /// Whether a primary-key table records position deletes or key deletes, as
+    /// configured or as `deletion_mode: auto` chooses it. Shared by every
+    /// `clone_for_write` copy, so a switch `auto` makes is seen by all of them.
+    pub(crate) pk_deletion_mode: PkDeletionMode,
     /// `RowConverter` for converting primary key columns to byte representation.
     ///
     /// `None` is load-bearing for the single-`Int64` strategy: deletion-vector
@@ -2052,6 +2147,9 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only counters and fault injection for the statistics listing.
+    #[cfg(test)]
+    test_listing: Arc<TestListingSeams>,
     /// Test-only seam fired by `load_existing_pk_index` after its fenced capture
     /// and before its scans, so a test can run a checkpoint in the window a keyset
     /// rebuild reads the table after that capture. Consumed on first fire.
@@ -2074,6 +2172,15 @@ pub struct CayenneTableProvider {
     /// Consumed on first fire.
     #[cfg(test)]
     test_pre_rewrite_commit_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only probe of the writer-concurrent full rewrite's capture, so a test
+    /// can order a staged write's publish against it. Consumed on first fire.
+    #[cfg(test)]
+    pub(crate) test_rewrite_capture_probe: Arc<ParkingMutex<Option<TestRewriteCaptureProbe>>>,
+    /// Test-only hook run by the writer-concurrent full rewrite after it releases
+    /// `write_lock`, before it builds its plan from the captured view. Consumed on
+    /// first fire.
+    #[cfg(test)]
+    pub(crate) test_rewrite_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -2880,6 +2987,7 @@ pub struct CayenneTableProviderBuilder {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -3034,6 +3142,14 @@ struct CayenneTableProviderOpenOptions {
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
     snapshot_dir_pins: Option<SnapshotDirPins>,
+    /// The conflict detection recorded for the partitioned table this table is a
+    /// partition of, if it is one. A partition follows that table turning the check
+    /// off, with the conflict action it records cleared to match, as the table's own is:
+    /// the change is applied in place to the table's metastore row, not to the rows of
+    /// the partitions it already has, which would otherwise keep checking and keep
+    /// resolving a key repeated within one write. A partition is never given the check
+    /// this way, since one written without it may hold more than one row per key.
+    partitioned_table_conflict_detection: Option<PkConflictDetection>,
 }
 
 /// What a sweep consults before deleting a snapshot directory: in-flight scan
@@ -3078,7 +3194,20 @@ impl CayenneTableProviderBuilder {
             index_word_bits: None,
             dataset_name: None,
             snapshot_dir_pins: None,
+            partitioned_table_conflict_detection: None,
         }
+    }
+
+    /// Open or create a partition of a partitioned table whose metastore row records
+    /// `detection`. A partition follows that table turning conflict detection off; see
+    /// [`CayenneTableProviderOpenOptions::partitioned_table_conflict_detection`].
+    #[must_use]
+    pub(crate) fn with_partitioned_table_conflict_detection(
+        mut self,
+        detection: PkConflictDetection,
+    ) -> Self {
+        self.partitioned_table_conflict_detection = Some(detection);
+        self
     }
 
     /// Open the table over the pins of the instance this one replaces, so this
@@ -3229,6 +3358,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3265,6 +3395,7 @@ impl CayenneTableProviderBuilder {
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
             snapshot_dir_pins: self.snapshot_dir_pins,
+            partitioned_table_conflict_detection: self.partitioned_table_conflict_detection,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -3277,7 +3408,7 @@ impl CayenneTableProviderBuilder {
 /// created with `DoNothing` by an earlier release included — it upserts on that key.
 /// A table without one, or with no `on_conflict` (`pk_conflict_detection: none`),
 /// is left as recorded.
-fn upsert_on_primary_key(
+pub(crate) fn upsert_on_primary_key(
     primary_key: &[String],
     on_conflict: Option<OnConflict>,
 ) -> Option<OnConflict> {
@@ -4276,6 +4407,11 @@ pub(crate) enum EncodeFanOut {
     /// Size the fan-out from the configured write concurrency and the byte
     /// estimate. The overwhelming majority of writes.
     Sized,
+    /// One encoder for one of many writes the caller runs side by side, as the
+    /// per-file fold does. The parallelism lives in the caller, so the write
+    /// is not recorded as the table's write shape: a fan-out of one here says
+    /// nothing about how the table's own writes are sharded.
+    PerCaller,
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
@@ -9493,11 +9629,16 @@ impl CayenneTableProvider {
             index_word_bits,
             dataset_name,
             snapshot_dir_pins,
+            partitioned_table_conflict_detection,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
         table_metadata.on_conflict =
             upsert_on_primary_key(&table_metadata.primary_key, table_metadata.on_conflict);
+        if partitioned_table_conflict_detection == Some(PkConflictDetection::None) {
+            table_metadata.vortex_config.pk_conflict_detection = PkConflictDetection::None;
+            table_metadata.on_conflict = None;
+        }
 
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
@@ -9584,6 +9725,7 @@ impl CayenneTableProvider {
             table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await?;
+        let pk_deletion_mode = Self::resolve_pk_deletion_mode(&table_metadata, &context);
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -9770,6 +9912,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_listing: Arc::default(),
+            #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
@@ -9777,6 +9921,10 @@ impl CayenneTableProvider {
             test_checkpoint_union_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -9807,6 +9955,7 @@ impl CayenneTableProvider {
             time_retention_filter_builder,
             context,
             pk_deletion_strategy,
+            pk_deletion_mode,
             pk_row_converter,
             pk_column_indices,
             durable_write_back,
@@ -9995,6 +10144,29 @@ impl CayenneTableProvider {
         // compaction. Best-effort: it leaves the manifest empty on failure and
         // the scan falls back to directory listing.
         provider.backfill_snapshot_manifest_if_empty().await;
+
+        // Size an `auto` table for its starting mode, before anything writes to
+        // it: past the bound, or unsized, it starts on key deletes. One that keeps
+        // key deletes from the start has nothing to size.
+        if let Some(auto) = provider.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let table_bytes = match provider.warm_listed_bytes().await {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        "{}",
+                        auto_unsized_at_open_message(
+                            provider.table_metadata.table_name.as_str(),
+                            &error,
+                        )
+                    );
+                    None
+                }
+            };
+            auto.size_at_open(table_bytes);
+        }
 
         // Startup replay for the orphaned-DV sweep. A publication that raises the
         // surviving-sequence floor and the in-memory signal that follows it cannot
@@ -10272,6 +10444,15 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn metadata(&self) -> &TableMetadata {
         &self.table_metadata
+    }
+
+    /// The primary-key conflict detection this table's writes run with: the mode its
+    /// metastore row records. That is the requested mode unless the table kept its
+    /// settings through a change it cannot adopt in place, or holds them until its source
+    /// can be read. Such a table keeps its key handling with them, so its writes do not
+    /// follow the requested mode the shared context was built from.
+    fn pk_conflict_detection(&self) -> PkConflictDetection {
+        self.table_metadata.vortex_config.pk_conflict_detection
     }
 
     /// The configured CDC durability mode for this table.
@@ -10570,7 +10751,15 @@ impl CayenneTableProvider {
         let super::delta_encoding::WritePolicy {
             class: write_class,
             fan_out,
+            encode_budget,
+            routing,
         } = policy;
+        // A range plan routes on its key column, whatever the policy asked for.
+        let routing = if range.is_some() {
+            super::delta_encoding::ShardRouting::Key
+        } else {
+            routing
+        };
 
         // Materialize the snapshot directory before the write, unconditionally.
         // The Vortex sink creates it lazily when it writes its first file, so a
@@ -10627,12 +10816,17 @@ impl CayenneTableProvider {
         // deadlocks the demux against the permit holders (see `write_budget`
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits = super::write_budget::acquire_encode_permits(
-            shard_count,
-            write_class,
-            self.context.is_coupled_writer(),
-        )
-        .await;
+        let _encode_permits = match encode_budget {
+            super::delta_encoding::EncodeBudgetUse::Shared => {
+                super::write_budget::acquire_encode_permits(
+                    shard_count,
+                    write_class,
+                    self.context.is_coupled_writer(),
+                )
+                .await
+            }
+            super::delta_encoding::EncodeBudgetUse::Exempt => None,
+        };
         record_cayenne_write_phase(
             self.table_name(),
             "encode_permit_wait",
@@ -10648,9 +10842,10 @@ impl CayenneTableProvider {
 
         // Build the write-path Vortex format for this snapshot. Unsorted writes
         // are sharded across `target_partitions` concurrent encoders (PK-hashed
-        // for keyed tables, round-robin otherwise) so the encode saturates all
-        // cores; sorted rewrites and single-writer configs fall back to one
-        // serial writer. Scans are unaffected — they never read the write-shard
+        // for keyed tables, round-robin otherwise, and whole batches in turn
+        // when `routing` asks for them and the table requested no layout) so
+        // the encode saturates all cores; sorted rewrites and single-writer
+        // configs fall back to one serial writer. Scans are unaffected — they never read the write-shard
         // config (only `create_writer_physical_plan` does). The shard count is
         // size-aware: a write smaller than one target file stays a single shard
         // regardless of `target_partitions` (see `snapshot_shard_count`).
@@ -10669,6 +10864,7 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
+                routing,
                 range.as_ref().map(|range| range.bounds),
             )
             .map(|mut config| {
@@ -11123,6 +11319,11 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
     ) -> usize {
+        // The caller runs many such writes side by side, so each takes one
+        // encoder and records no write shape.
+        if matches!(fan_out, EncodeFanOut::PerCaller) {
+            return 1;
+        }
         // The caller requires a single sequence of output files. Checked before
         // the configured concurrency, which must not be able to override it.
         if matches!(fan_out, EncodeFanOut::Serial) {
@@ -11513,6 +11714,19 @@ impl CayenneTableProvider {
             }
         };
 
+        // Size an `auto` table against its position-delete bound on the same
+        // cadence, so a table that grew past it moves to key deletes even when no
+        // reclaim is due yet. From its snapshot directories, not the figures
+        // above: those still count a protected snapshot a merge replaced until its
+        // registration is swept, and read about twice the table during a load.
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+            && let Ok(table_bytes) = self.warm_listed_bytes().await
+            && !auto.fits(table_bytes)
+        {
+            self.request_auto_switch_to_key(table_bytes);
+        }
+
         let to_gauge = |value: i64| u64::try_from(value).unwrap_or(0);
         telemetry::cayenne::track_table_storage(
             &telemetry::cayenne::CayenneTableStorage {
@@ -11811,6 +12025,7 @@ impl CayenneTableProvider {
             target_size_bytes,
             estimated_bytes,
             fan_out,
+            super::delta_encoding::ShardRouting::Key,
             range_bounds,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
@@ -11861,6 +12076,19 @@ impl CayenneTableProvider {
             .then_some(bounds)
     }
 
+    /// Whether a write routed by `routing` hands whole batches to its shards
+    /// instead of splitting them on the shard key. Only when the table requested
+    /// no layout: no shard key and no [`CayenneContext::has_requested_layout`].
+    /// This changes which file a row lands in, never which rows are written.
+    fn routes_whole_batches(&self, routing: super::delta_encoding::ShardRouting) -> bool {
+        match routing {
+            super::delta_encoding::ShardRouting::Key => false,
+            super::delta_encoding::ShardRouting::WholeBatch => {
+                self.context.shard_key_columns().is_empty() && !self.context.has_requested_layout()
+            }
+        }
+    }
+
     /// The intra-write shard configuration this write earns, or `None` for a
     /// single serial writer. Shared by [`Self::write_shard_format`] (default
     /// encoding) and the delta-encoding strategy-override path
@@ -11872,20 +12100,17 @@ impl CayenneTableProvider {
     /// source's declared shard key) and every column resolves against the
     /// schema. That is an explicit request for key-clustered files, so it wins.
     ///
-    /// Otherwise the shards are filled with CONTIGUOUS runs of the arrival
-    /// stream. This is the default because hashing destroys the arrival order,
-    /// and the arrival order is what a CDC table's zone maps are built on: with
-    /// a hash (or round-robin) split, every output file spans the whole range of
-    /// a monotonic column, so a point lookup can prune nothing and must open all
-    /// of them. A serial write never had that problem — it wrote one file per
-    /// range — and preserving contiguity is what keeps the parallel encode from
-    /// giving that pruning away.
+    /// Otherwise a keyed table hashes on its primary key and an unkeyed table
+    /// hands whole batches to the shards in turn. A keyed table's write does the
+    /// same when `routing` asks for whole batches and the table requested no
+    /// layout (see [`Self::routes_whole_batches`]).
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        routing: super::delta_encoding::ShardRouting,
         range_bounds: Option<&[ScalarValue]>,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
@@ -11900,8 +12125,13 @@ impl CayenneTableProvider {
         // Bounds describe one column — the first `shard_key_columns` entry after
         // the caller leads with `range.column`. The rest of the key is kept so
         // an estimated-bounds hash fallback can still rebalance a composite key;
-        // a single-column key hashes that same column.
-        let shard_key_columns = self.resolved_shard_key_columns();
+        // a single-column key hashes that same column. An empty key is the
+        // sink's whole-batch round-robin.
+        let shard_key_columns = if self.routes_whole_batches(routing) {
+            Vec::new()
+        } else {
+            self.resolved_shard_key_columns()
+        };
         let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
         Some(WriteShardConfig {
             write_concurrency: shard_count,
@@ -11987,7 +12217,7 @@ impl CayenneTableProvider {
     /// config, encode permits — equal to the shards actually written. Split
     /// points computed for more shards would be cut down to their first few,
     /// leaving the last shard nearly all of the rows.
-    fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
+    pub(super) fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
         let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         self.context
@@ -12032,6 +12262,7 @@ impl CayenneTableProvider {
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
+            pk_deletion_mode: self.pk_deletion_mode.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
@@ -12075,6 +12306,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             #[cfg(test)]
+            test_listing: Arc::clone(&self.test_listing),
+            #[cfg(test)]
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::clone(
@@ -12084,6 +12317,10 @@ impl CayenneTableProvider {
             test_checkpoint_union_hook: Arc::clone(&self.test_checkpoint_union_hook),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
+            #[cfg(test)]
+            test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
+            #[cfg(test)]
+            test_rewrite_post_capture_hook: Arc::clone(&self.test_rewrite_post_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -12613,7 +12850,7 @@ impl CayenneTableProvider {
 
     /// Effective byte budget for the table-wide PK keyset cache
     /// (`pk_keyset_cache`).
-    fn effective_single_keyset_budget(&self) -> usize {
+    pub(crate) fn effective_single_keyset_budget(&self) -> usize {
         self.effective_pk_keyset_budget(self.pk_keyset_bytes_single.load(Ordering::Relaxed))
     }
 
@@ -12751,6 +12988,13 @@ impl CayenneTableProvider {
         ]);
     }
 
+    /// Cache the filter a first load built of the keys it wrote, as the
+    /// table-wide index (see `first_load_pk`).
+    pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkBloom) {
+        let (_, checkout) = self.take_cached_pk_index();
+        self.store_cached_pk_index(CachedPkIndex::Bloom(bloom), checkout);
+    }
+
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
         let max_bytes = self.effective_single_keyset_budget();
         // Held from closing the checkout window through the store, so no writer can
@@ -12839,6 +13083,17 @@ impl CayenneTableProvider {
             self.pk_keyset_occ_degraded.store(false, Ordering::Release);
             self.publish_single_keyset_bytes(0);
             return;
+        }
+
+        // A table `deletion_mode: auto` moved to key deletes while this keyset was
+        // checked out: forget the positions it captured, as the switch did for a
+        // cached keyset. A keyset that never captured a position has no captured
+        // files, so this costs a key table nothing.
+        if let CachedPkIndex::Exact(keyset) = &mut index
+            && !keyset.captured_files.is_empty()
+            && !self.should_capture_positions()
+        {
+            keyset.forget_positions();
         }
 
         let to_store = match index {
@@ -13560,12 +13815,184 @@ impl CayenneTableProvider {
     }
 
     /// Whether this table should capture file-local row positions for upsert
-    /// deletes: a PK table (`Int64Pk`/`RowConverterBased`) whose resolved
-    /// [`DeletionMode`] is `Position`. PK-less tables use the `PositionBased`
-    /// strategy directly and never reach this read-back.
-    pub(crate) fn should_capture_positions(&self) -> bool {
+    /// deletes: a PK table (`Int64Pk`/`RowConverterBased`) whose deletion mode
+    /// — configured, or chosen by `auto` — is position. PK-less tables use the
+    /// `PositionBased` strategy directly and never reach this read-back.
+    ///
+    /// Exposed so tests can observe which deletes an `auto` table records.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn should_capture_positions(&self) -> bool {
+        !self.pk_deletion_strategy.is_position_based() && self.pk_deletion_mode.uses_positions()
+    }
+
+    /// Whether this table's position-delete rewrites — the whole-table reclaim and
+    /// the protected-snapshot merges — hold writers off while they run: a PK
+    /// table configured with `deletion_mode: position`.
+    ///
+    /// Such a table can carry position deletes with nothing else hiding their row
+    /// — a key repeated within one write is hidden by a position delete alone —
+    /// so a rewrite that let a writer in could drop one with the file it targets.
+    /// A table `auto` put on position deletes records none of those: it folds a
+    /// repeated key out of the files as key mode does, and every position delete
+    /// it records for an upsert carries a key tombstone for the same row (see
+    /// `apply_on_conflict_to_batch`). That twin is sequence-tagged, so the
+    /// writer-concurrent rewrite keeps it whenever it lands after the rewrite's
+    /// cutoff and it goes on hiding the row in the rewritten file, exactly as on a
+    /// key-mode table. PK-less tables answer `false` here and take their own
+    /// writer-exclusive path in the rewrite.
+    pub(crate) fn position_rewrites_exclude_writers(&self) -> bool {
+        self.hides_repeated_keys_with_position_deletes()
+    }
+
+    /// Whether a key repeated within one write is hidden by a position delete on
+    /// the superseded copy rather than folded out of the files: a PK table
+    /// configured with `deletion_mode: position`.
+    ///
+    /// Folding rewrites only the files of the write that holds the copies and
+    /// keeps per-file statistics exact, so a statistics-answered aggregate stays
+    /// one; a position delete is cheaper to write but leaves the statistics
+    /// counting the hidden copy. `auto` folds, as key mode does.
+    pub(crate) fn hides_repeated_keys_with_position_deletes(&self) -> bool {
         !self.pk_deletion_strategy.is_position_based()
-            && self.context.deletion_mode().resolved(true).is_position()
+            && matches!(self.pk_deletion_mode, PkDeletionMode::Position)
+    }
+
+    /// Resolve how this table records primary-key deletes when it opens.
+    ///
+    /// `auto` sizes the table from the manifest (the current and protected
+    /// snapshots' data files) to decide whether it starts on position deletes.
+    /// It does not adapt a table whose rows live in RAM, a partitioned table, or a
+    /// table with a datalake tier: those keep key deletes, as before.
+    fn resolve_pk_deletion_mode(
+        table_metadata: &TableMetadata,
+        context: &CayenneContext,
+    ) -> PkDeletionMode {
+        let has_primary_key = !table_metadata.primary_key.is_empty();
+        // `auto` rewrites a table whole only where that was measured to pay (see
+        // `AutoKeyTableKind`); the accelerator prints the same kinds in its
+        // auto-tuned config line.
+        let storage = if table_metadata.vortex_config.memory_mode {
+            TableStorage::Memory
+        } else if table_metadata.path.starts_with("s3://") {
+            TableStorage::ObjectStorage
+        } else {
+            TableStorage::LocalDisk
+        };
+        let adapts = AutoKeyTableKind::of(
+            storage,
+            table_metadata.partition_column.is_some() || context.is_coupled_writer(),
+            table_metadata.vortex_config.cold_tier_enabled(),
+        )
+        .is_none();
+        PkDeletionMode::for_table(
+            context.deletion_mode(),
+            has_primary_key,
+            adapts,
+            context.auto_keeps_key_deletes(),
+            context.target_file_size_bytes(),
+        )
+    }
+
+    /// The on-disk bytes `auto` sizes a table by: the data files of its current
+    /// and protected snapshots, which is what a whole-table rewrite reads, listed
+    /// from their directories. The metastore's storage figures are not used: they
+    /// still count a protected snapshot that a merge replaced until its
+    /// registration is swept, and read about twice the table during a load.
+    ///
+    /// Exposed so tests can size a table against `auto`'s bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a snapshot directory of the table cannot be listed.
+    #[doc(hidden)]
+    pub async fn warm_listed_bytes(&self) -> Result<u64> {
+        let files = self
+            .list_compaction_candidate_files_with_sizes(&self.get_current_snapshot_id())
+            .await?;
+        Ok(files
+            .iter()
+            .fold(0_u64, |total, (_, size)| total.saturating_add(*size)))
+    }
+
+    /// Ask the next compaction trigger to move an `auto` table that outgrew its
+    /// position-delete bound to key deletes, and schedule one. A no-op for a table
+    /// that is not `auto`, or already moved.
+    fn request_auto_switch_to_key(&self, table_bytes: u64) {
+        let Some(auto) = self.pk_deletion_mode.auto() else {
+            return;
+        };
+        if auto.request_switch_to_key() {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                table_bytes,
+                max_position_bytes = auto.max_position_bytes(),
+                "deletion_mode auto: table outgrew position deletes; switching to key deletes on the next compaction trigger"
+            );
+            self.schedule_post_write_compaction();
+        }
+    }
+
+    /// Move an `auto` table to key deletes now. The caller holds
+    /// `compaction_lock` exclusively, so no compaction pass is running under the
+    /// position-mode rules while the table changes mode; the passes that follow
+    /// read the new mode. Returns `true` when the table switched.
+    ///
+    /// A writer that read a row's position before the switch may still record a
+    /// position delete after it. That is safe for the reason
+    /// [`Self::position_rewrites_exclude_writers`] gives: the delete carries a key
+    /// tombstone that the key-mode passes now running keep until a rewrite
+    /// applies it.
+    fn switch_auto_to_key_deletes(&self) -> bool {
+        let Some(auto) = self.switch_auto_to_key_deletes_unlogged() else {
+            return false;
+        };
+        // The user sees this change only for a table that was kept fully
+        // compacted since it loaded: a table that passes the bound during its first
+        // load was never rewritten whole, so its reads do not change.
+        if auto.was_kept_compacted() {
+            tracing::info!(
+                target: "cayenne::compaction",
+                "{}",
+                auto_switched_to_key_deletes_message(
+                    self.table_metadata.table_name.as_str(),
+                    auto.max_position_bytes(),
+                )
+            );
+        } else {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                max_position_bytes = auto.max_position_bytes(),
+                "deletion_mode auto: the table outgrew position deletes before it was rewritten whole; it uses key deletes"
+            );
+        }
+        true
+    }
+
+    /// Move an `auto` table to key deletes and forget the positions it captured.
+    /// Returns the table's `auto` state when this call switched it.
+    fn switch_auto_to_key_deletes_unlogged(&self) -> Option<&Arc<AutoDeletionMode>> {
+        let auto = self.pk_deletion_mode.auto()?;
+        if !auto.switch_to_key() {
+            return None;
+        }
+        // Forget the positions the read-back captured, so no later upsert records
+        // a position delete: from here on every delete is a key delete.
+        let keyset_bytes = {
+            let mut guard = self.pk_keyset_cache.lock();
+            match guard.as_mut() {
+                Some(CachedPkIndex::Exact(keyset)) => {
+                    keyset.forget_positions();
+                    keyset.approx_bytes
+                }
+                Some(other) => other.approx_bytes(),
+                None => 0,
+            }
+        };
+        self.publish_single_keyset_bytes(keyset_bytes);
+        Some(auto)
     }
 
     /// Force a synchronous position-capture pass now, if this table is in
@@ -13594,6 +14021,17 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn deletion_index_len(&self) -> usize {
         self.pk_deletion_snapshot().delete_len()
+    }
+
+    /// Clear `deletion_mode: auto`'s whole-table reclaim pace so the next reclaim
+    /// is due at once. Integration tests that already observed a paced shrink use
+    /// this before waiting for the index to return under its bound, rather than
+    /// waiting nine times a CI-slow rewrite.
+    #[doc(hidden)]
+    pub fn forget_auto_reclaim_pace(&self) {
+        if let Some(auto) = self.pk_deletion_mode.auto() {
+            auto.forget_reclaim_pace();
+        }
     }
 
     /// Bytes this table currently reserves against the query memory pool for its
@@ -13741,6 +14179,21 @@ impl CayenneTableProvider {
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to list snapshot files: {err}"),
             })?;
+        // An `auto` table reads its rows back only while it is within its
+        // position-delete bound: past it, the read-back would scan a table that is
+        // about to move to key deletes, which never use a captured position.
+        if let Some(auto) = self.pk_deletion_mode.auto() {
+            let listed_bytes: u64 = listed
+                .file_groups
+                .iter()
+                .flat_map(FileGroup::iter)
+                .map(|file| file.object_meta.size)
+                .sum();
+            if !auto.fits(listed_bytes) {
+                self.request_auto_switch_to_key(listed_bytes);
+                return Ok(());
+            }
+        }
         let object_store = state
             .runtime_env()
             .object_store(&table_url)
@@ -13820,8 +14273,13 @@ impl CayenneTableProvider {
                 // (no byte-budget change — `RowLocation` is a fixed-size enum).
                 // Entries should already exist (recorded as `FileUnlocated` by
                 // `record_file_pk_keys`); a missing one is skipped defensively.
+                // Read the mode again under the lock: a table `deletion_mode: auto`
+                // moved to key deletes since this pass began has forgotten its
+                // positions, and the switch takes this lock after it moves.
                 let mut guard = self.pk_keyset_cache.lock();
-                if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
+                if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut()
+                    && self.should_capture_positions()
+                {
                     for (key, position) in entries {
                         if let Some(location) = keyset.location_mut(&key) {
                             *location = RowLocation::FilePositioned {
@@ -14098,7 +14556,7 @@ impl CayenneTableProvider {
     }
 
     /// Build a `RowConverter` for the primary key columns.
-    fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
+    pub(crate) fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
         let table_schema = self.table_schema();
         let mut sort_fields = Vec::with_capacity(pk_indices.len());
         for idx in pk_indices {
@@ -15285,7 +15743,7 @@ impl CayenneTableProvider {
             return Ok(PreparedInsertStream::immediate(stream));
         };
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+        if self.pk_conflict_detection() == PkConflictDetection::None {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for append"
@@ -15501,7 +15959,7 @@ impl CayenneTableProvider {
             .clone()
             .unwrap_or(OnConflict::DoNothingAll);
 
-        if self.context.pk_conflict_detection() == PkConflictDetection::None {
+        if self.pk_conflict_detection() == PkConflictDetection::None {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Skipping Cayenne primary-key conflict detection for sharded append"
@@ -15691,6 +16149,10 @@ impl CayenneTableProvider {
             };
 
         let deduplicate_batch = !ctx.upsert_options.is_default();
+        // Read once per batch: a table `deletion_mode: auto` moved to key deletes
+        // records no further position delete, even for a row whose captured
+        // position a keyset checked out before the switch still carries.
+        let record_positions = self.should_capture_positions();
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
         let mut kept_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
@@ -15932,10 +16394,11 @@ impl CayenneTableProvider {
                                 // the same row twice is idempotent for
                                 // visibility; `total_superseded` counts
                                 // dual-encoded rows exactly once.
-                                if let RowLocation::FilePositioned {
-                                    file_path,
-                                    position,
-                                } = existing
+                                if record_positions
+                                    && let RowLocation::FilePositioned {
+                                        file_path,
+                                        position,
+                                    } = existing
                                 {
                                     delete_specs
                                         .entry(Arc::clone(file_path))
@@ -19105,7 +19568,7 @@ impl CayenneTableProvider {
         // for any shard count a write uses.
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if self.context.has_requested_layout() {
             return OverwriteRouting::Hash;
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
@@ -19220,7 +19683,7 @@ impl CayenneTableProvider {
         // for any shard count a write uses (as `overwrite_range_plan`).
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if self.context.has_requested_layout() {
             return Ok((data, None));
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
@@ -19961,21 +20424,42 @@ impl CayenneTableProvider {
     /// of the process, over-committing the query pool with a reservation that can
     /// never be dropped.
     ///
-    /// Cheap on the common path: `should_capture_positions()` short-circuits for
-    /// every key-delete and primary-key-less table before any index is read.
-    fn deletion_index_reclaim_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
-        // Excludes both tables that do not need this: a primary-key-less table
-        // records no key tombstones at all, and a key-delete table has the bake,
-        // which is cheaper (it rewrites the settled protected prefix, not the whole
-        // current snapshot).
-        if !self.should_capture_positions() {
-            return None;
+    /// A `deletion_mode: auto` table on key deletes needs it too where the bake
+    /// cannot reach its rows: the bake folds only protected snapshots, so a key
+    /// delete of a row in the current snapshot — where every whole-table rewrite
+    /// leaves the table's rows — stays in the index until the current snapshot is
+    /// rewritten, and while the current snapshot holds such rows the bake's
+    /// clean-prefix check keeps it from pruning anything. Such a table fires here
+    /// too; the pass that takes the trigger confirms the current snapshot holds
+    /// rows before it rewrites, and leaves a table whose rows are all protected to
+    /// the bake. An explicit `deletion_mode: key` table keeps the bake alone.
+    ///
+    /// An `auto` table's whole-table reclaims, on position or key deletes, are paced
+    /// to a small share of the time ([`AutoDeletionMode::reclaim_due`]): on key
+    /// deletes the table can be any size, and on position deletes a high write rate
+    /// can call for a reclaim often enough for the rewrites to crowd out writes.
+    /// Until the next one is due, the index grows past the trigger. Over the memory
+    /// ceiling, nothing waits. An explicit `deletion_mode: position` table is not
+    /// paced.
+    ///
+    /// Cheap on the common path: an explicit key-delete or primary-key-less table
+    /// returns before any index is read.
+    fn deletion_index_reclaim_decision(&self) -> ReclaimDecision {
+        // Excludes the tables that do not need this: a primary-key-less table
+        // records no key tombstones at all, and an explicit key-delete table has
+        // the bake, which is cheaper (it rewrites the settled protected prefix, not
+        // the whole current snapshot).
+        let auto = self.pk_deletion_mode.auto();
+        let key_reclaim = !self.pk_deletion_strategy.is_position_based()
+            && auto.is_some_and(|auto| !auto.uses_positions());
+        if !self.should_capture_positions() && !key_reclaim {
+            return ReclaimDecision::NotDue;
         }
         let deletion_index_len = self.pk_deletion_snapshot().delete_len();
         // An empty index has nothing to reclaim — whatever the trigger, even a
         // configured 0 — and this path is a whole-snapshot rewrite.
         if deletion_index_len == 0 {
-            return None;
+            return ReclaimDecision::NotDue;
         }
         // The CONFIGURED trigger, not the adaptive one: the controller lowers that
         // to bake more often, a trade priced against the incremental bake's write
@@ -19984,37 +20468,57 @@ impl CayenneTableProvider {
         let trigger_len = self.context.configured_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
         if deletion_index_len < trigger_len && !over_memory_ceiling {
-            return None;
+            return ReclaimDecision::NotDue;
+        }
+        if !over_memory_ceiling
+            && let Some(auto) = auto
+            && !auto.reclaim_due(Instant::now())
+        {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deletion_index_len,
+                "Deferring the whole-table reclaim: the previous one ended too recently",
+            );
+            return ReclaimDecision::Paced;
         }
         // Apply-back-pressure gate, mirroring the seq-prefix bake's. The rewrite
         // competes with the CDC apply for the same write path, and it competes
-        // harder than the bake: it re-encodes the whole current snapshot and holds
-        // `write_lock` for the duration, so firing it at a table that is already
-        // replication-lag-bound starves the apply that would let the lag close —
-        // measured at SF-1000, where `order_line` bootstrapped and then never caught
-        // up. Defer; the next tick re-evaluates.
+        // harder than the bake: it re-encodes the whole current snapshot (and on an
+        // explicit position-delete table holds `write_lock` for the duration), so
+        // firing it at a table that is already replication-lag-bound starves the
+        // apply that would let the lag close — measured at SF-1000, where
+        // `order_line` bootstrapped and then never caught up. Defer; the next tick
+        // re-evaluates.
         //
         // EXCEPT over the memory ceiling, where the rewrite is the OOM guard: the
         // index is undroppable and over-commits the pool, so deferring it trades a
         // survival constraint for a throughput one.
         //
-        // This is the gate's only caller for a position table — the bake's call sits
-        // behind `key_mode`, and no table is both — so the sample counter it
-        // consumes is not shared.
-        if !over_memory_ceiling && self.context.bake_should_defer_for_apply() {
+        // The gate reads the apply sample through its own cursor: an `auto` table on
+        // key deletes runs the bake's gate first in the same pass, and on a shared
+        // cursor that sample would read as stale here, letting the costlier rewrite
+        // through while the bake yields.
+        if !over_memory_ceiling && self.context.whole_table_reclaim_should_defer_for_apply() {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 deletion_index_len,
-                "Deferring position-mode deletion-index rewrite: CDC apply at/over capacity (back-pressure)",
+                "Deferring whole-table deletion-index rewrite: CDC apply at/over capacity (back-pressure)",
             );
-            return None;
+            return ReclaimDecision::Backpressure;
         }
-        Some(SnapshotMaintenanceTrigger::DeletionIndexSize {
+        ReclaimDecision::Due(SnapshotMaintenanceTrigger::DeletionIndexSize {
             deletion_index_len,
             trigger_len,
             over_memory_ceiling,
         })
+    }
+
+    /// [`Self::deletion_index_reclaim_decision`], as the trigger to run with.
+    #[cfg(test)]
+    fn deletion_index_reclaim_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
+        self.deletion_index_reclaim_decision().trigger()
     }
 
     /// Compact current snapshot files into a new snapshot dir, with atomic,
@@ -20063,12 +20567,13 @@ impl CayenneTableProvider {
         // other, and is the only one a `deletion_mode: position` primary-key table
         // can ever raise — see `deletion_index_reclaim_trigger`.
         let small_files = self.new_current_files_above_compaction_threshold();
-        let deletion_index_trigger = self.deletion_index_reclaim_trigger();
+        let reclaim = self.deletion_index_reclaim_decision();
+        let deletion_index_trigger = reclaim.trigger();
         if !small_files && deletion_index_trigger.is_none() {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
-                CompactionOutcome::DeclinedBelowTrigger,
+                reclaim.declined_outcome(),
             );
             return Ok(false);
         }
@@ -20090,6 +20595,29 @@ impl CayenneTableProvider {
             },
         );
 
+        // An `auto` table's whole-table reclaim takes its permit from the
+        // process-wide reclaim budget before this pass takes the table's
+        // `compaction_lock`, so a pass that waits for one holds nothing another
+        // pass needs, least of all the lock a reclaim over the memory ceiling
+        // takes without a permit. Held for the rewrite, and taken before it is
+        // timed: a wait is not reclaim time, and does not count toward the pace.
+        let _reclaim_permit = match deletion_index_trigger {
+            Some(trigger) => match self.whole_table_reclaim_permit(trigger).await {
+                Ok(permit) => permit,
+                Err(declined) => {
+                    if let Some(declined) = declined {
+                        maintenance_metrics::track_compaction(
+                            table_name,
+                            CompactionKind::SubsetCurrent,
+                            declined,
+                        );
+                    }
+                    return Ok(false);
+                }
+            },
+            None => None,
+        };
+
         let Ok(_guard) = self.compaction_lock.try_write() else {
             maintenance_metrics::track_compaction(
                 table_name,
@@ -20107,13 +20635,98 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
+        // An `auto` table rewrites itself whole — the only rewrite this pass runs on
+        // a position-delete table, whichever trigger fired — only while it is within
+        // its position-delete bound. Past it, this pass moves the table to key
+        // deletes instead, and the seq-prefix bake reclaims the index from the next
+        // trigger on. The size is read here, under `compaction_lock`, because this
+        // pass is the one about to pay for the rewrite.
+        // The trigger was read before this pass took the lock, and before any wait
+        // for a reclaim permit: another pass may have reclaimed the index since,
+        // or the table may have crossed its memory ceiling. Read it again.
+        let mut deletion_index_trigger = if deletion_index_trigger.is_some() {
+            let reclaim = self.deletion_index_reclaim_decision();
+            if reclaim.trigger().is_none() && !small_files {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::SubsetCurrent,
+                    reclaim.declined_outcome(),
+                );
+                return Ok(false);
+            }
+            reclaim.trigger()
+        } else {
+            None
+        };
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let outgrew = if auto.switch_requested() {
+                true
+            } else {
+                match self.warm_listed_bytes().await {
+                    Ok(table_bytes) => !auto.fits(table_bytes),
+                    // Unsized, the rewrite is not known to be cheap, and an I/O
+                    // error says nothing about the table's size: skip this pass
+                    // and size it again on the next.
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            %error,
+                            "Skipping current-snapshot compaction: could not size the table for `deletion_mode: auto`; will retry on the next trigger",
+                        );
+                        maintenance_metrics::track_compaction(
+                            table_name,
+                            CompactionKind::SubsetCurrent,
+                            CompactionOutcome::DeclinedSizingFailed,
+                        );
+                        return Ok(false);
+                    }
+                }
+            };
+            if outgrew {
+                self.switch_auto_to_key_deletes();
+            }
+        }
+        // A deletion-index trigger computed before this pass took `compaction_lock`
+        // is stale if the table has moved to key deletes since — here, or in a pass
+        // that held the lock meanwhile: on key deletes the bake reclaims what it
+        // can reach, and the whole-table reclaim fires on the key-delete rule. Read
+        // it again under that rule.
+        if deletion_index_trigger.is_some() && !self.should_capture_positions() {
+            let reclaim = self.deletion_index_reclaim_decision();
+            deletion_index_trigger = reclaim.trigger();
+            let mut declined = reclaim.declined_outcome();
+            // On key deletes the whole-table reclaim is for rows the bake cannot
+            // reach, which are rows in the current snapshot: with none there, every
+            // row is in a protected snapshot and the bake reclaims the index.
+            if deletion_index_trigger.is_some()
+                && !self
+                    .list_snapshot_files_with_sizes(&self.get_current_snapshot_id())
+                    .await
+                    .is_ok_and(|files| !files.is_empty())
+            {
+                deletion_index_trigger = None;
+                declined = CompactionOutcome::DeclinedBelowTrigger;
+            }
+            if deletion_index_trigger.is_none() && !small_files {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::SubsetCurrent,
+                    declined,
+                );
+                return Ok(false);
+            }
+        }
+
         // Position-delete-mode tables: serialize against writers + visibility
         // flips for the whole pass, identical to the protected-snapshot subset
         // path. Their position tombstones are file-path scoped and the
         // append-counter guard does not observe deletes, so a full re-encode must
         // run without a concurrent writer. The full rewrite below reuses these
         // guards rather than acquiring its own (see
-        // `rewrite_current_snapshot_for_compaction_holding`): `write_lock` is not
+        // `rewrite_current_snapshot_holding_bounded`): `write_lock` is not
         // reentrant.
         //
         // BLOCKING acquire, as the rewrite's own acquire is, and for the same
@@ -20122,7 +20735,10 @@ impl CayenneTableProvider {
         // deletion index only this pass can clear. Taken AFTER `compaction_lock`,
         // the documented order (cold promotion takes the two the same way), so a
         // pass that loses the compaction lock never stalls a writer.
-        let position_guards = if self.should_capture_positions() {
+        //
+        // A table `auto` put on position deletes takes no guards: its rewrite runs
+        // alongside writers (see `position_rewrites_exclude_writers`).
+        let position_guards = if self.position_rewrites_exclude_writers() {
             Some(PositionRewriteGuards {
                 _write: self.write_lock_arc().lock_owned().await,
                 _visibility: self.visibility_lock_arc().lock_owned().await,
@@ -20139,7 +20755,7 @@ impl CayenneTableProvider {
         if let Some(trigger) = deletion_index_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
             let committed = self
-                .rewrite_current_snapshot_for_compaction_tracked(position_guards)
+                .rewrite_current_snapshot_for_reclaim_tracked(position_guards)
                 .await?;
             if committed {
                 self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
@@ -20740,6 +21356,11 @@ impl CayenneTableProvider {
         let cfg = self.context.compaction_picker_config();
         self.new_files_since_last_compaction.load(Ordering::Relaxed) >= cfg.trigger_files
             || self.protected_snapshot_maintenance_trigger().is_some()
+            // A pending `auto` switch to key deletes is performed by the trigger.
+            || self
+                .pk_deletion_mode
+                .auto()
+                .is_some_and(|auto| auto.switch_requested())
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
@@ -22448,6 +23069,20 @@ impl CayenneTableProvider {
             // so an index this large is a `runtime.query.memory_limit` violation in
             // progress. Say so, and name the mode that would let the cheaper
             // seq-prefix bake keep the index small instead of an O(table) rewrite.
+            // `auto` reached here on position deletes only while it is within its
+            // bound, so the rewrite is small and runs alongside writers; the
+            // remedy the warning below names does not apply to it.
+            SnapshotMaintenanceTrigger::DeletionIndexSize {
+                deletion_index_len,
+                trigger_len,
+                over_memory_ceiling: true,
+            } if self.pk_deletion_mode.auto().is_some() => tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deletion_index_len,
+                trigger_len,
+                "Running current-snapshot compaction because the deletion index is over its memory ceiling"
+            ),
             SnapshotMaintenanceTrigger::DeletionIndexSize {
                 deletion_index_len,
                 trigger_len,
@@ -23333,15 +23968,110 @@ impl CayenneTableProvider {
     /// background and post-write compaction triggers call.
     ///
     /// `held_position_guards` is passed through to
-    /// [`Self::rewrite_current_snapshot_for_compaction_holding`].
+    /// [`Self::rewrite_current_snapshot_holding_bounded`].
     async fn rewrite_current_snapshot_for_compaction_tracked(
         &self,
         held_position_guards: Option<PositionRewriteGuards>,
     ) -> Result<bool> {
+        self.rewrite_current_snapshot_tracked(held_position_guards, false)
+            .await
+    }
+
+    /// [`Self::rewrite_current_snapshot_for_compaction_tracked`] for the rewrite a
+    /// position-delete table reclaims its deletion index with. On a table
+    /// `deletion_mode: auto` put on position deletes, that rewrite is bounded: it
+    /// sizes what it captured and moves the table to key deletes instead of
+    /// rewriting past the bound.
+    async fn rewrite_current_snapshot_for_reclaim_tracked(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+    ) -> Result<bool> {
+        self.rewrite_current_snapshot_tracked(held_position_guards, true)
+            .await
+    }
+
+    /// The permit a whole-table reclaim fired by `trigger` holds while it rewrites:
+    /// an `auto` table's comes from the process-wide reclaim budget
+    /// (`compaction::whole_table_reclaim_budget`), so tables written alike do not
+    /// all rewrite at once. `None` for a reclaim that takes none: one on a table not
+    /// on `deletion_mode: auto`, and one over the deletion index's memory ceiling,
+    /// where the rewrite is the OOM guard and nothing may hold it back.
+    ///
+    /// A background pass already holds a compaction permit, so when no reclaim
+    /// permit is free it declines as `declined_reclaim_budget_busy` and a later
+    /// tick tries again: waiting, it would hold the compaction permit other
+    /// tables' background compaction needs. Any other pass waits for one, before
+    /// it takes the table's `compaction_lock`, and re-checks the table every
+    /// [`RECLAIM_PERMIT_CEILING_RECHECK`] while it waits: a table that crosses its
+    /// memory ceiling meanwhile reclaims without a permit, and one whose
+    /// maintenance [`Self::quiesce`] has closed stops waiting. The runtime quiesces
+    /// a table before it reloads or removes its dataset, and waits for this pass
+    /// to finish; nothing has started, so nothing is lost.
+    ///
+    /// `Err(Some(outcome))` declines the reclaim and counts `outcome`; `Err(None)`
+    /// stops it and counts nothing, as a pass that finds its maintenance closed
+    /// under `compaction_lock` does.
+    async fn whole_table_reclaim_permit(
+        &self,
+        trigger: SnapshotMaintenanceTrigger,
+    ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, Option<CompactionOutcome>>
+    {
+        if self.pk_deletion_mode.auto().is_none()
+            || matches!(
+                trigger,
+                SnapshotMaintenanceTrigger::DeletionIndexSize {
+                    over_memory_ceiling: true,
+                    ..
+                }
+            )
+        {
+            return Ok(None);
+        }
+        let budget = super::compaction::whole_table_reclaim_budget();
+        if super::compaction::holds_compaction_permit() {
+            return budget
+                .try_acquire_owned()
+                .map(Some)
+                .map_err(|_| Some(CompactionOutcome::DeclinedReclaimBudgetBusy));
+        }
+        // One acquisition for the whole wait, so the pass keeps its place in the
+        // queue across the re-checks.
+        let acquire = budget.acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit.ok()),
+                () = tokio::time::sleep(RECLAIM_PERMIT_CEILING_RECHECK) => {
+                    if self.is_maintenance_closed() {
+                        return Err(None);
+                    }
+                    if self.deletion_index_over_memory_ceiling() {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn rewrite_current_snapshot_tracked(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+        reclaim: bool,
+    ) -> Result<bool> {
         let pass_start = Instant::now();
         let result = self
-            .rewrite_current_snapshot_for_compaction_holding(held_position_guards)
+            .rewrite_current_snapshot_holding_bounded(held_position_guards, reclaim)
             .await;
+        // Paces an `auto` table's whole-table reclaims (`AutoDeletionMode::reclaim_due`).
+        // Every pass counts, committed or not: the time was spent either way, and a
+        // pass that gave up waiting for staged writes to drain held new writes off
+        // under `write_lock` for as long as it waited.
+        if reclaim && let Some(auto) = self.pk_deletion_mode.auto() {
+            auto.record_reclaim(pass_start.elapsed(), Instant::now());
+            if matches!(result, Ok(true)) && auto.uses_positions() {
+                auto.record_kept_compacted();
+            }
+        }
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
             "completed"
@@ -23395,11 +24125,22 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// The full rewrite, never bounded as a reclaim (see
+    /// [`Self::rewrite_current_snapshot_holding_bounded`]).
+    #[cfg(test)]
+    async fn rewrite_current_snapshot_for_compaction_holding(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+    ) -> Result<bool> {
+        self.rewrite_current_snapshot_holding_bounded(held_position_guards, false)
+            .await
+    }
+
     /// Consolidate the full visible row set into a single new current snapshot
     /// dir and atomically flip the current-snapshot pointer to it.
     ///
     /// Returns `Ok(true)` if a new snapshot was committed, `Ok(false)` if the
-    /// pass was a no-op — the source had no live rows, a **concurrent append
+    /// pass was a no-op — a non-reclaim source had no live rows, a **concurrent append
     /// landed during the off-fence re-encode** (append fence) and the commit
     /// aborted to avoid losing it, or the **protected-snapshot set changed during
     /// the scan** (delete fence) so the folded set could no longer be determined.
@@ -23410,9 +24151,14 @@ impl CayenneTableProvider {
     /// locks for the whole pass. `held_position_guards` is those two locks when
     /// the caller already holds them, and they are reused instead of acquired.
     /// Pass `None` unless this task holds both: `write_lock` is not reentrant.
-    async fn rewrite_current_snapshot_for_compaction_holding(
+    ///
+    /// `reclaim` marks the deletion-index reclaim of a position-delete table,
+    /// which an `auto` table bounds by size (see
+    /// [`Self::rewrite_current_snapshot_for_reclaim_tracked`]).
+    async fn rewrite_current_snapshot_holding_bounded(
         &self,
         held_position_guards: Option<PositionRewriteGuards>,
+        reclaim: bool,
     ) -> Result<bool> {
         // Committed/failed belong to the tracked wrapper; every non-committed
         // exit below reports itself, so the two together account for each pass
@@ -23448,8 +24194,8 @@ impl CayenneTableProvider {
         // the snapshot but before the drop is wiped while its row is already in
         // the new file — resurrecting it. `compaction_lock` (held here) and
         // `write_lock` (held by writers) are distinct, so writes DO interleave.
-        let uses_position_deletes =
-            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based();
+        let uses_position_deletes = self.position_rewrites_exclude_writers()
+            || self.pk_deletion_strategy.is_position_based();
 
         // Position-delete tables: tombstones are file-scoped (a row position in a
         // named data file), not sequence-tagged, so they cannot be carried
@@ -23457,6 +24203,9 @@ impl CayenneTableProvider {
         // safe option is to exclude writers for the whole rewrite (mirrors
         // `compact_protected_snapshots_subset`), via a BLOCKING `write_lock`
         // acquire so the full-snapshot rewrite always makes progress (see below).
+        // A table `deletion_mode: auto` put on position deletes is the exception
+        // and takes the fenced scope below: each of its position deletes carries a
+        // sequence-tagged key tombstone (`position_rewrites_exclude_writers`).
         let _position_guards = match held_position_guards {
             Some(held) => Some(held),
             // Blocking acquire (not try_lock): the full-snapshot rewrite must
@@ -23668,48 +24417,171 @@ impl CayenneTableProvider {
                 snapshot_id_before,
             )
         } else {
-            let _capture_guard = self.write_lock_arc().lock_owned().await;
-            // Defense-in-depth for table replacement while this pass encodes.
-            // Promotion is serialized by `compaction_lock`; overwrite/reopened
-            // providers may still flip `current_snapshot_id` without moving the
-            // current-dir generation, so revalidate before catalog publish.
-            let snapshot_id_before = self.get_current_snapshot_id();
-            self.drain_mem_tier_before_rewrite_scan().await?;
-            if self.cached_inlined_row_count() > 0 {
-                self.checkpoint_inlined_data().await?;
+            let (scan_view, scope, generation_before, snapshot_id_before) = {
+                let _capture_guard = self.write_lock_arc().lock_owned().await;
+                #[cfg(test)]
+                let capture_probe = self.test_rewrite_capture_probe.lock().take().map(
+                    |(write_lock_held, captured)| {
+                        let _ = write_lock_held.send(());
+                        captured
+                    },
+                );
+                // A pipelined staged write reserves its sequences under `write_lock`
+                // (stage A) and publishes its rows and tombstones later without it
+                // (stage B). One that reserved before the cutoff below and published
+                // after it would land tombstones at or below that cutoff, which the
+                // commit then prunes, while the rows they hide sit in this rewrite's
+                // output. Holding `write_lock` blocks new stage A commits and stage B
+                // needs only the visibility lock and listing fence, so draining here
+                // leaves no write straddling the cutoff.
+                if !self
+                    .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+                    .await
+                {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Aborting full rewrite: in-flight staged writes did not drain; will retry on a later trigger",
+                    );
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::Full,
+                        CompactionOutcome::AbortedConcurrentChange,
+                    );
+                    return Ok(false);
+                }
+                // Defense-in-depth for table replacement while this pass encodes.
+                // Promotion is serialized by `compaction_lock`; overwrite/reopened
+                // providers may still flip `current_snapshot_id` without moving the
+                // current-dir generation, so revalidate before catalog publish.
+                let snapshot_id_before = self.get_current_snapshot_id();
+                self.drain_mem_tier_before_rewrite_scan().await?;
+                if self.cached_inlined_row_count() > 0 {
+                    self.checkpoint_inlined_data().await?;
+                }
+                let folded_before = self.protected_snapshot_ids();
+                // Only the capture holds `write_lock`. The view pins the files,
+                // deletions and tiers this rewrite reads, as of the cutoff below; its
+                // plan is built after the lock is released, from the view alone, as a
+                // query's plan is, so writers wait for the capture but not for the plan
+                // build, which under load took most of the time this held the lock.
+                let (scan_view, generation_before) = self.rewrite_scan_view(&ctx).await?;
+                let cutoff = self.sequence_high_water().await;
+                #[cfg(test)]
+                if let Some(captured) = capture_probe {
+                    let _ = captured.send(());
+                }
+                let folded_after = self.protected_snapshot_ids();
+                if folded_before != folded_after {
+                    // A concurrent finalize published a protected snapshot during the
+                    // scan; we can no longer tell which snapshots the scan folded.
+                    // Abort before any new snapshot dir is created; retry next trigger.
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Aborting full rewrite: protected-snapshot set changed during scan \
+                         (concurrent finalize); will retry on the next trigger",
+                    );
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::Full,
+                        CompactionOutcome::AbortedConcurrentChange,
+                    );
+                    return Ok(false);
+                }
+                (
+                    scan_view,
+                    RewriteScope::Fenced {
+                        cutoff,
+                        folded: folded_before,
+                    },
+                    generation_before,
+                    snapshot_id_before,
+                )
+            };
+            #[cfg(test)]
+            {
+                let hook = self.test_rewrite_post_capture_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
             }
-            let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) =
-                self.visible_file_stream_for_rewrite(&ctx, &order).await?;
-            let cutoff = self.sequence_high_water().await;
-            let folded_after = self.protected_snapshot_ids();
-            if folded_before != folded_after {
-                // A concurrent finalize published a protected snapshot during the
-                // scan; we can no longer tell which snapshots the scan folded.
-                // Abort before any new snapshot dir is created; retry next trigger.
+            let stream = self
+                .rewrite_stream_from_view(&ctx, &order, scan_view)
+                .await?;
+            (stream, scope, generation_before, snapshot_id_before)
+        };
+
+        // The whole-table reclaim of an `auto` table on position deletes sizes what
+        // it captured, the current snapshot and every protected snapshot it folds,
+        // before encoding any of it, and runs only within the bound: the pass that
+        // scheduled it sized the table from the manifest, which can trail a
+        // just-published write.
+        let captured_bytes = if reclaim
+            && self
+                .pk_deletion_mode
+                .auto()
+                .is_some_and(|auto| auto.uses_positions())
+        {
+            let folded = match &scope {
+                RewriteScope::Fenced { folded, .. }
+                | RewriteScope::AllTombstonesFoldedSnapshots { folded } => Some(folded),
+                RewriteScope::All => None,
+            };
+            let mut captured_bytes = 0_u64;
+            let mut sizing_error = None;
+            for snapshot_id in
+                std::iter::once(&snapshot_id_before).chain(folded.into_iter().flatten())
+            {
+                let files = match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                    Ok(files) => files,
+                    Err(error) => {
+                        sizing_error = Some(error.to_string());
+                        break;
+                    }
+                };
+                captured_bytes = files.iter().fold(captured_bytes, |total, (_, size)| {
+                    total.saturating_add(*size)
+                });
+            }
+            Some(sizing_error.map_or(Ok(captured_bytes), Err))
+        } else {
+            None
+        };
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+            && let Some(sized) = &captured_bytes
+        {
+            if let Err(error) = sized {
+                // An I/O error says nothing about the table's size: decline this
+                // rewrite, keep the mode, and size it again on the next trigger.
+                drop(stream);
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: protected-snapshot set changed during scan \
-                     (concurrent finalize); will retry on the next trigger",
+                    %error,
+                    "Skipping whole-table reclaim: could not size what it captured; will retry on the next trigger",
                 );
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
+                    CompactionOutcome::DeclinedSizingFailed,
                 );
                 return Ok(false);
             }
-            (
-                stream,
-                RewriteScope::Fenced {
-                    cutoff,
-                    folded: folded_before,
-                },
-                generation_before,
-                snapshot_id_before,
-            )
-        };
+            if sized.as_ref().is_ok_and(|bytes| !auto.fits(*bytes)) {
+                drop(stream);
+                // The caller holds `compaction_lock`, as every caller of this
+                // rewrite does.
+                self.switch_auto_to_key_deletes();
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::DeclinedOverPositionBound,
+                );
+                return Ok(false);
+            }
+        }
 
         // Compaction is the file-count reduction path. Ordinary appends shard
         // across the session's target partitions for encode throughput, but a
@@ -23725,6 +24597,25 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
+        // The whole-table reclaim of an `auto` table takes no permit from the
+        // global encode budget, on either kind of delete and at any size. It encodes
+        // one file sequence (`target_partitions` above), so a permit buys it no
+        // parallelism, while holding one made every write that asked for the
+        // budget's whole width wait out its encode, for as long as the table takes
+        // to rewrite. Within the bound, on four CPUs with a two-permit budget, a
+        // writer upserting 2,000 keys every 250 ms reached a 96 ms P99 write on
+        // position deletes, against 37–40 ms on key deletes. Past it, on eight
+        // cores, 20 tables of 200K rows wrote at a 379–416 ms P99 beside one
+        // overwrite-seeded table of 5M rows rewriting itself on key deletes, against
+        // 135–136 ms with that table on explicit key deletes. The reclaim budget
+        // (`compaction::whole_table_reclaim_budget`) bounds how many such encodes run
+        // at once across tables, and in `spiced` they run on the low-priority
+        // compaction runtime.
+        let write_policy = if reclaim && self.pk_deletion_mode.auto().is_some() {
+            rewrite_write_policy(rewrite_is_sorted).without_encode_budget()
+        } else {
+            rewrite_write_policy(rewrite_is_sorted)
+        };
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_result = self
             .write_to_snapshot(
@@ -23735,7 +24626,7 @@ impl CayenneTableProvider {
                 // Compaction consolidates into a single output file, so it needs
                 // no size estimate.
                 None,
-                rewrite_write_policy(rewrite_is_sorted),
+                write_policy,
             )
             .await;
 
@@ -23748,10 +24639,10 @@ impl CayenneTableProvider {
             }
         };
 
-        if total_rows == 0 {
-            // No live rows in the source — clean up the empty new snapshot
-            // dir and skip the catalog commit. Subsequent triggers will keep
-            // returning the same empty state and pick None, so this is rare.
+        if total_rows == 0 && !reclaim {
+            // An ordinary compaction need not publish empty output. A deletion-index
+            // reclaim must commit an empty snapshot before pruning the tombstones
+            // it folded, under the same fences that preserve concurrent writes.
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             maintenance_metrics::track_compaction(
@@ -23902,6 +24793,23 @@ impl CayenneTableProvider {
         // the `match &fence` below). Holding the fence across the catalog write
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
+        // Checkpoint the PK existence index for the new snapshot (best-effort)
+        // BEFORE the commit makes it current. The commit drops the in-memory keyset
+        // (its row locations name the files this rewrite replaces), and the next
+        // write that needs one loads this checkpoint and folds in only what landed
+        // since — the protected snapshots, inline rows and RAM tier the load reads
+        // under the listing fence. Persisted after the commit instead, a write
+        // between the two found no checkpoint for the current snapshot and rebuilt
+        // the keyset by scanning every key: 36–52 ms of write latency per rewrite
+        // on a 500K-row table. A checkpoint for a snapshot that never becomes
+        // current (the commit aborts) is ignored on load, which checks the tag.
+        // Nothing can retire the new snapshot's files while this scans them: they
+        // are not current yet, and this pass holds `compaction_lock`.
+        if self.upsert_bloom_eligible() {
+            self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
+                .await;
+        }
+
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
         #[cfg(test)]
@@ -24044,6 +24952,12 @@ impl CayenneTableProvider {
                     let cold_cap = self.cold_tombstone_prune_cap().await;
                     let prune_cutoff = cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap));
                     self.prune_deletion_caches_after_full_rewrite(prune_cutoff, folded);
+                    // The rewritten files are gone, and the rows any position delete
+                    // on them hid were left out of the new file; a scan planned
+                    // before this flip carries its own copy of each bitmap.
+                    self.retire_position_deletions_of(
+                        std::iter::once(&snapshot_id_before).chain(folded.iter()),
+                    );
                 }
             }
 
@@ -24106,34 +25020,6 @@ impl CayenneTableProvider {
                 .await;
         }
 
-        // Checkpoint the PK existence index for fast restart (best-effort). The
-        // new current snapshot now holds all live rows, and protected snapshots /
-        // inline entries were just cleared, so a bloom of this snapshot's keys is a
-        // complete checkpoint tagged with `new_snapshot_id`.
-        //
-        // The checkpoint build scans `new_snapshot_id`'s Vortex files, so pin it
-        // against the retired-dir sweep first. A key-delete table compacts
-        // concurrently with its writers, so a writer can supersede this snapshot
-        // and the sweep unlink its files while the scan reads them. A NotFound here
-        // is only swallowed (the checkpoint is lost, not the data), but the pin
-        // avoids the wasted scan and keeps this read consistent with the rebuild
-        // reads. Pin-then-verify rather than the read fence, because this runs under
-        // `compaction_lock` and an `.await` under the fence would extend that hold
-        // (as in `pin_current_snapshot_for_compaction`). If the verify fails the
-        // snapshot is already superseded, so the checkpoint would be tagged a stale
-        // id and rejected on load — skip persisting it.
-        if self.upsert_bloom_eligible() {
-            let pin = SnapshotScanRef::new(
-                Arc::clone(&self.snapshot_scan_refs),
-                vec![new_snapshot_id.clone()],
-            );
-            if self.get_current_snapshot_id() == new_snapshot_id {
-                self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
-                    .await;
-            }
-            drop(pin);
-        }
-
         // The fence guarantees no NEW plan-build sees the old listing table, and
         // the sweep skips any dir with an in-flight scan, so a plan that captured
         // the old paths keeps its files until it finishes executing.
@@ -24182,6 +25068,44 @@ impl CayenneTableProvider {
     /// deliberately tracks ONLY current-dir publishes — not the rewrite's own
     /// output write or background mem-tier checkpoints — so the fence does not
     /// abort on changes that leave the current dir untouched.
+    /// The scan view a full rewrite reads, captured fresh, and the current-dir
+    /// generation sampled before it. Flushes the inline memtable first, so the view
+    /// covers every visible row.
+    ///
+    /// Fresh whatever view reuse the table allows its queries: a read-only
+    /// `refresh_mode: changes` dataset lets a query serve a view up to a second
+    /// old, and a rewrite reading such a view would fold, and drop, a protected
+    /// snapshot published after it without that snapshot's rows in its output.
+    async fn rewrite_scan_view(&self, ctx: &SessionContext) -> Result<(Arc<ScanView>, u64)> {
+        if self.cached_inlined_row_count() > 0 {
+            self.checkpoint_inlined_data().await?;
+        }
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
+        let state = ctx.state();
+        self.prepare_scan(&state, &[]).await?;
+        let scan_view = self
+            .scan_view_at_current_input(ScanViewReuse::WithinLag(Duration::ZERO))
+            .await?;
+        Ok((scan_view, generation_before))
+    }
+
+    /// The rewrite's stream over `scan_view` (see [`Self::rewrite_scan_view`]), in
+    /// `order`.
+    async fn rewrite_stream_from_view(
+        &self,
+        ctx: &SessionContext,
+        order: &RewriteOrder,
+        scan_view: Arc<ScanView>,
+    ) -> Result<SendableRecordBatchStream> {
+        let state = ctx.state();
+        let plan = self
+            .plan_scan_from_view(&state, None, &[], None, scan_view)
+            .await?;
+        let task_ctx = ctx.task_ctx();
+        let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
+        Ok(datafusion_physical_plan::execute_stream(ordered, task_ctx)?)
+    }
+
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
@@ -24204,13 +25128,10 @@ impl CayenneTableProvider {
         &self,
         ctx: &SessionContext,
     ) -> Result<(Arc<dyn ExecutionPlan>, u64)> {
-        if self.cached_inlined_row_count() > 0 {
-            self.checkpoint_inlined_data().await?;
-        }
-
-        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
-
-        let plan = TableProvider::scan(self, &ctx.state(), None, &[], None).await?;
+        let (scan_view, generation_before) = self.rewrite_scan_view(ctx).await?;
+        let plan = self
+            .plan_scan_from_view(&ctx.state(), None, &[], None, scan_view)
+            .await?;
         Ok((plan, generation_before))
     }
 
@@ -24521,7 +25442,14 @@ impl CayenneTableProvider {
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
         // Cold promotion streams its rows, so it has no key range to split on.
-        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out, None);
+        let shard = self.write_shard_config(
+            1,
+            target_size_bytes,
+            None,
+            fan_out,
+            super::delta_encoding::ShardRouting::Key,
+            None,
+        );
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -25519,8 +26447,10 @@ impl CayenneTableProvider {
         // physically applied to the merged output. Serialize those rewrites with
         // writers and staged visibility flips. Key-delete tables remain safe to
         // compact without the writer gate because post-fence deletes are carried
-        // by sequence number and still apply to the merged snapshot.
-        let serialize_position_deletes = self.should_capture_positions();
+        // by sequence number and still apply to the merged snapshot. So does a
+        // table `deletion_mode: auto` put on position deletes: each of its position
+        // deletes carries such a key tombstone (`position_rewrites_exclude_writers`).
+        let serialize_position_deletes = self.position_rewrites_exclude_writers();
         let _position_write_guard = if serialize_position_deletes {
             if let Ok(guard) = self.write_lock_arc().try_lock_owned() {
                 self.position_compaction_skip_streak.lock().reset();
@@ -25552,8 +26482,7 @@ impl CayenneTableProvider {
                          write lock across every recent attempt on this position-delete table. \
                          File count will grow unboundedly until writes pause; consider \
                          `cayenne_deletion_mode: key` for delete-heavy tables (key-delete \
-                         compaction runs concurrently with writers; `auto` already resolves \
-                         to key for tables with a primary key).",
+                         compaction runs concurrently with writers).",
                     );
                 } else {
                     tracing::trace!(
@@ -28545,6 +29474,26 @@ impl CayenneTableProvider {
         );
     }
 
+    /// Drop the position deletes that target files of `snapshot_ids` — snapshots
+    /// a committed rewrite replaced, whose files no scan planned after it reads.
+    /// Left in place they would hide no row, but they would still mark the table's
+    /// file statistics inexact.
+    fn retire_position_deletions_of<'a>(&self, snapshot_ids: impl Iterator<Item = &'a String>) {
+        let cache = self.pk_deletion_strategy.position_cache();
+        if cache.load().is_empty() {
+            return;
+        }
+        let dirs: Vec<String> = snapshot_ids
+            .map(|snapshot_id| format!("/{}/{snapshot_id}/", self.table_metadata.table_id))
+            .collect();
+        cache.rcu(|current| {
+            let mut next = PositionBitmap::clone(current);
+            next.retain(|path, _| !dirs.iter().any(|dir| path.contains(dir.as_str())));
+            next
+        });
+        self.refresh_deletion_memory_accounting();
+    }
+
     /// Highest commit sequence covered by the datalake (cold) manifest, when
     /// the tier holds files. Warm-only rewrites (the seq-prefix bake, the
     /// full-rewrite prune) must retain every tombstone ABOVE this cap: they
@@ -28582,7 +29531,9 @@ impl CayenneTableProvider {
 
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
     /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
-    /// `delete_seq > cutoff` and all upsert re-insertion records.
+    /// `delete_seq > cutoff` and upsert re-insertion records with
+    /// `insert_seq > cutoff`. A re-insertion at or below the cutoff decides no
+    /// probe, because every surviving delete of its key is newer.
     ///
     /// COLD-TIER CONTRACT: callers whose rewrite did not touch the cold tier
     /// must cap `cutoff` at [`Self::cold_tombstone_prune_cap`] — tombstones
@@ -31234,11 +32185,11 @@ impl CayenneTableProvider {
                     .await?,
             )
         };
-        Ok(CapturedSnapshotFiles {
+        Ok(CapturedSnapshotFiles::new(
             dir_generation,
             listing_epoch,
             files,
-        })
+        ))
     }
 
     /// Resolve the cold-tier manifest that belongs to `snapshot_id`, for a caller
@@ -31672,6 +32623,68 @@ impl CayenneTableProvider {
                 }
             };
         }
+    }
+
+    /// Build the scan view of the table as it is now, with its files' statistics,
+    /// so the scans that follow a refresh find both ready instead of building
+    /// them. A refresh calls this once its write has finished, index maintenance
+    /// included, and before it reports completion: the queries a completed
+    /// refresh lets through then plan against a ready view.
+    ///
+    /// Best-effort, and safe to cancel. The write is already committed and
+    /// visible, and a scan that arrives first builds the same view and listing
+    /// itself, so a failure here costs only that scan's latency.
+    ///
+    /// A table that lists its files from the manifest (`scan_from_manifest`) is
+    /// skipped: an append's files reach the manifest only with the post-write
+    /// maintenance pass, so a listing built now could miss them.
+    pub async fn prepare_scan_view_for_reads(&self) {
+        if self.context.scan_from_manifest() {
+            return;
+        }
+        if let Err(error) = self.build_current_scan_view_with_statistics().await {
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                %error,
+                "Did not prepare the scan view after a write; the next scan builds it"
+            );
+        }
+    }
+
+    /// Whether the table's newest scan view is of its current snapshot and its
+    /// files' statistics are already listed, so the next scan builds neither.
+    /// Exposed so the refresh path's tests can assert it prepared the table.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scan_view_is_prepared(&self) -> bool {
+        self.scan_view_cache
+            .latest_complete
+            .load_full()
+            .is_some_and(|completed| {
+                completed.view.raw.current_snapshot_id == self.get_current_snapshot_id()
+                    && completed.order == self.scan_input_version.load(Ordering::Acquire)
+                    && completed
+                        .view
+                        .raw
+                        .warm_files
+                        .with_statistics
+                        .get()
+                        .is_some()
+            })
+    }
+
+    /// Plan a full scan of the table as it is now: the scan builds the scan view
+    /// and its files' statistics exactly as a query's would. `CurrentScanView`
+    /// makes it capture the table as it is now, whatever its reuse mode, since a
+    /// lag-tolerant table would otherwise be handed a view from before this
+    /// write and publishing that as the newest would hide the write.
+    async fn build_current_scan_view_with_statistics(&self) -> datafusion_common::Result<()> {
+        let mut config =
+            util::session_state::session_config().with_extension(Arc::new(CurrentScanView));
+        config.options_mut().execution.collect_statistics = true;
+        let ctx =
+            SessionContext::new_with_config_rt(config, Arc::clone(self.context.runtime_env()));
+        self.scan(&ctx.state(), None, &[], None).await.map(|_| ())
     }
 
     fn mem_tier_deletion_maps(
@@ -37120,17 +38133,79 @@ impl CayenneTableProvider {
         .await
     }
 
-    /// Return the snapshot's files with statistics, using
-    /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
-    /// generation, and listing-cache epoch still match. A complete listing
-    /// (not truncated by LIMIT) is stored so later point lookups prune in
-    /// memory instead of re-LISTing.
+    /// Return the snapshot's files with statistics. Scans that share a captured
+    /// file set — every scan of one [`ScanView`] — share one build of it, used
+    /// only while the capture's directory generation and listing-cache epoch are
+    /// still the table's; see [`SharedListingError`] for what is not stored.
     async fn snapshot_files_with_stats(
         &self,
         request: &SnapshotScanListingRequest<'_>,
         collect_stats: bool,
         dir_generation: u64,
     ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        if collect_stats
+            && let Some(captured) = request.captured_files
+            && self.captured_files_are_current(captured)
+        {
+            #[cfg(test)]
+            self.test_listing
+                .shared_requests
+                .fetch_add(1, Ordering::Relaxed);
+            let shared = captured
+                .with_statistics
+                .get_or_try_init(|| async {
+                    let (files, stored) = self
+                        .build_snapshot_files_with_stats(request, true, dir_generation)
+                        .await
+                        .map_err(SharedListingError::Failed)?;
+                    if stored {
+                        Ok(SnapshotFilesWithStatistics {
+                            statistics_schema: Arc::clone(&request.file_statistics_schema),
+                            files,
+                        })
+                    } else {
+                        Err(SharedListingError::Invalidated(files))
+                    }
+                })
+                .await;
+            match shared {
+                Ok(shared) if shared.statistics_schema == request.file_statistics_schema => {
+                    return Ok(Arc::clone(&shared.files));
+                }
+                // Statistics for another schema; build this scan's own below.
+                Ok(_) => {}
+                Err(SharedListingError::Invalidated(files)) => return Ok(files),
+                Err(SharedListingError::Failed(error)) => return Err(error),
+            }
+        }
+        self.build_snapshot_files_with_stats(request, collect_stats, dir_generation)
+            .await
+            .map(|(files, _)| files)
+    }
+
+    /// Whether `captured` still has the table's directory generation and
+    /// listing-cache epoch, so a listing built for it is the one a capture taken
+    /// now would get.
+    fn captured_files_are_current(&self, captured: &CapturedSnapshotFiles) -> bool {
+        captured.dir_generation == self.current_dir_generation.load(Ordering::Acquire)
+            && captured.listing_epoch == self.listing_cache_epoch.load(Ordering::Acquire)
+    }
+
+    /// Build the snapshot's files with statistics, using
+    /// [`Self::cached_snapshot_listing`] when the snapshot id, directory
+    /// generation, and listing-cache epoch still match. A complete listing
+    /// (not truncated by LIMIT) is stored so later point lookups prune in
+    /// memory instead of re-LISTing, and so a new view of the same snapshot —
+    /// which CDC writes mint without changing its files — starts from it.
+    ///
+    /// Also returns whether the listing is the slot's: a hit, or a build that
+    /// was stored because no generation or epoch change overtook it.
+    async fn build_snapshot_files_with_stats(
+        &self,
+        request: &SnapshotScanListingRequest<'_>,
+        collect_stats: bool,
+        dir_generation: u64,
+    ) -> datafusion_common::Result<(Arc<Vec<PartitionedFile>>, bool)> {
         let listing_epoch = request.captured_files.map_or_else(
             || self.listing_cache_epoch.load(Ordering::Acquire),
             |files| files.listing_epoch,
@@ -37149,7 +38224,14 @@ impl CayenneTableProvider {
                         .is_some_and(|source| Arc::ptr_eq(&captured.files, source))
             })
         {
-            return Ok(Arc::clone(&cached.files));
+            return Ok((Arc::clone(&cached.files), true));
+        }
+
+        #[cfg(test)]
+        if collect_stats && self.test_listing.fail_next.swap(false, Ordering::AcqRel) {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "injected snapshot listing failure".to_string(),
+            ));
         }
 
         let store = request
@@ -37195,7 +38277,12 @@ impl CayenneTableProvider {
             Self::collect_scan_files_with_limit(files, None, collect_stats).await?;
         let files = Arc::new(file_group.into_inner());
         #[cfg(test)]
+        if collect_stats {
+            self.test_listing.builds.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
+        let mut stored = false;
         if collect_stats && !truncated {
             let gen_after = self.current_dir_generation.load(Ordering::Acquire);
             let epoch_after = self.listing_cache_epoch.load(Ordering::Acquire);
@@ -37211,9 +38298,10 @@ impl CayenneTableProvider {
                             .captured_files
                             .map(|captured| Arc::clone(&captured.files)),
                     })));
+                stored = true;
             }
         }
-        Ok(files)
+        Ok((files, stored))
     }
 
     fn file_group_with_limit(
@@ -38871,32 +39959,14 @@ fn i64_eq_literal_on_schema(schema: &SchemaRef, filters: &[Expr]) -> Option<(usi
     None
 }
 
-#[async_trait]
-impl TableProvider for CayenneTableProvider {
-    fn schema(&self) -> SchemaRef {
-        // Advertise the view-typed read schema (string/binary -> view) so
-        // DataFusion plans the whole query — joins, aggregates, sorts — on view
-        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
-        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
-        // for writes/CDC/stats; scan() decodes the matching view types.
-        self.read_schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.pk_constraints.as_ref()
-    }
-
-    async fn scan(
+impl CayenneTableProvider {
+    /// What a scan does before it captures its view (see [`Self::plan_scan_from_view`]),
+    /// and how that capture may reuse a cached view.
+    async fn prepare_scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+    ) -> datafusion_common::Result<ScanViewReuse> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
         // Cheap (mutex + HashMap bump); empty filters are a no-op.
@@ -38908,7 +39978,7 @@ impl TableProvider for CayenneTableProvider {
         // collected. Gating this on `has_sort_columns()` instead is what made the
         // adaptive layout inert on every catalog-visible CDC deployment, since
         // inference fills `cayenne_sort_columns` on all of them.
-        if !self.context.has_cluster_by() && !self.context.sort_columns_are_authoritative() {
+        if !self.context.has_requested_layout() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -38945,31 +40015,27 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Obtain the scan-view bundle from the demand cache. See
-        // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
-        // segments are computed OFF the query path (in `spawn_blocking`) and
-        // deduplicated across concurrent scans on the same state, so the scan no
-        // longer recomputes them per-scan (the retired memos' job).
-        // Everything below descends from that ONE capture, so it is internally
-        // consistent (the merged deletions hide the old copies of the exact rows this
-        // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
-        // for the full scan lifetime, so plan-build runs WITHOUT the listing fence.
-        //
-        // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
-        // so downstream plan-build owns them exactly as when it captured inline.
-        let reuse = if state.config().get_extension::<CurrentScanView>().is_some() {
-            ScanViewReuse::UntilInvalidated
-        } else {
-            self.scan_view_reuse
-        };
-        let scan_view = self.scan_view_at_current_input(reuse).await?;
-        #[cfg(test)]
-        {
-            let hook = self.test_post_scan_view_selection_hook.lock().take();
-            if let Some(hook) = hook {
-                hook().await;
-            }
-        }
+        Ok(
+            if state.config().get_extension::<CurrentScanView>().is_some() {
+                ScanViewReuse::UntilInvalidated
+            } else {
+                self.scan_view_reuse
+            },
+        )
+    }
+
+    /// A scan's plan over `scan_view`. Everything the plan reads descends from that
+    /// one capture, and its `scan_guard` pins the captured snapshot dirs, so the plan
+    /// can be built after any lock the capture was taken under is released: it reads
+    /// exactly the captured state whatever lands meanwhile.
+    async fn plan_scan_from_view(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        scan_view: Arc<ScanView>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
@@ -39474,6 +40540,58 @@ impl TableProvider for CayenneTableProvider {
             maintained_aggregate_epoch,
             lookup_index_explain,
         ))
+    }
+}
+
+#[async_trait]
+impl TableProvider for CayenneTableProvider {
+    fn schema(&self) -> SchemaRef {
+        // Advertise the view-typed read schema (string/binary -> view) so
+        // DataFusion plans the whole query — joins, aggregates, sorts — on view
+        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
+        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
+        // for writes/CDC/stats; scan() decodes the matching view types.
+        self.read_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.pk_constraints.as_ref()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let reuse = self.prepare_scan(state, filters).await?;
+        // Obtain the scan-view bundle from the demand cache. See
+        // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
+        // segments are computed OFF the query path (in `spawn_blocking`) and
+        // deduplicated across concurrent scans on the same state, so the scan no
+        // longer recomputes them per-scan (the retired memos' job).
+        // Everything below descends from that ONE capture, so it is internally
+        // consistent (the merged deletions hide the old copies of the exact rows this
+        // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
+        // for the full scan lifetime, so plan-build runs WITHOUT the listing fence.
+        //
+        // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
+        // so downstream plan-build owns them exactly as when it captured inline.
+        let scan_view = self.scan_view_at_current_input(reuse).await?;
+        #[cfg(test)]
+        {
+            let hook = self.test_post_scan_view_selection_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        self.plan_scan_from_view(state, projection, filters, limit, scan_view)
+            .await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
@@ -40332,6 +41450,35 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
     }
 }
 
+/// The line a table logs, once, when `deletion_mode: auto` moves it from position
+/// to key deletes because it grew past the size it keeps fully compacted, after
+/// it had been kept so.
+fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    let bound = if max_position_bytes >= MIB && max_position_bytes.is_multiple_of(MIB) {
+        format!("{} MiB", max_position_bytes / MIB)
+    } else {
+        format!("{} KiB", max_position_bytes.div_ceil(1024))
+    };
+    format!(
+        "Dataset '{dataset}' grew past {bound} on disk, the largest size `cayenne_deletion_mode: auto` keeps on position deletes, so it now uses key deletes: queries still see every write, applying recent updates and deletes as they read until compaction merges them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    )
+}
+
+/// How often a pass waiting for a whole-table reclaim permit re-checks its
+/// table's deletion index against the memory ceiling: over it, the reclaim is the
+/// OOM guard and runs without a permit. The same re-check ends the wait of a pass
+/// whose table [`CayenneTableProvider::quiesce`] has closed.
+const RECLAIM_PERMIT_CEILING_RECHECK: Duration = Duration::from_secs(1);
+
+/// The line a table logs when `deletion_mode: auto` cannot size it as it loads,
+/// and so starts it on key deletes until it next loads.
+fn auto_unsized_at_open_message(dataset: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Failed to read the size on disk of dataset '{dataset}' when it loaded, so `cayenne_deletion_mode: auto` uses key deletes for it until it next loads. Cause: {error}. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    )
+}
+
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
@@ -40348,6 +41495,16 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let Some(_pass) = super::compaction::try_track_compaction_pass() else {
             return Ok(false);
         };
+        // A switch to key deletes that an `auto` table requested where it could not
+        // take `compaction_lock` happens here, before any pass below reads the
+        // mode. A busy lock leaves the request pending for the next trigger.
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.switch_requested()
+            && let Ok(_guard) = self.compaction_lock.try_write()
+            && self.maintenance_still_admitted()
+        {
+            self.switch_auto_to_key_deletes();
+        }
         // One trigger runs up to three passes, in this order:
         //
         // 1. Seq-prefix bake — shrinks the merge-on-read deletion index by
@@ -52017,6 +53174,76 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::no_layout(0, true)]
+    #[case::shard_key(1, false)]
+    #[case::cluster_by(2, false)]
+    #[case::user_sort(3, false)]
+    #[case::inferred_sort(4, true)]
+    #[tokio::test]
+    async fn test_bulk_load_shard_routing_respects_requested_layout(
+        #[case] layout: usize,
+        #[case] whole_batch: bool,
+    ) {
+        use crate::metadata::SortColumnsOrigin;
+        use crate::provider::delta_encoding::ShardRouting;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let configs = [
+            VortexConfig::default(),
+            VortexConfig {
+                shard_key_columns: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                cluster_by: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::User,
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::Inferred,
+                ..Default::default()
+            },
+        ];
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "bulk_routing",
+            Arc::clone(&schema),
+            configs[layout].clone(),
+            vec!["id".into()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let shard = provider
+            .write_shard_config(
+                4,
+                provider.context.target_file_size_bytes(),
+                None,
+                EncodeFanOut::Sized,
+                ShardRouting::WholeBatch,
+                None,
+            )
+            .expect("bulk load enables sharding");
+        let expected_key = if whole_batch {
+            vec![]
+        } else {
+            vec!["id".to_string()]
+        };
+        assert_eq!(
+            (
+                provider.routes_whole_batches(ShardRouting::WholeBatch),
+                provider.routes_whole_batches(ShardRouting::Key),
+                shard.shard_key_columns,
+            ),
+            (whole_batch, false, expected_key),
+        );
+    }
+
     #[tokio::test]
     async fn test_write_shard_format_keyed_hashes_by_primary_key() {
         let schema = Arc::new(Schema::new(vec![
@@ -55294,6 +56521,592 @@ mod tests {
         );
     }
 
+    /// A file-backed table with no primary key and no background compaction, for
+    /// the shared-listing tests. `inline_max_rows` decides whether small appends
+    /// land in the inline tier, leaving the snapshot's files unchanged.
+    async fn shared_listing_table(
+        name: &str,
+        inline_max_rows: usize,
+    ) -> (Arc<CayenneTableProvider>, SessionContext, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, temp_dir) = create_cayenne_table_with_config(
+            name,
+            schema,
+            VortexConfig {
+                inline_max_rows,
+                compaction_background_interval_ms: 0,
+                compaction_trigger_files: usize::MAX,
+                compaction_trigger_protected_snapshots: usize::MAX,
+                compaction_trigger_snapshot_age_ms: u64::MAX,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        (provider, ctx, temp_dir)
+    }
+
+    /// [`shared_listing_table`] holding ids `0..100` (`value = id * 10 + 1`), at a
+    /// listing-cache epoch no publish or scan has listed yet, which a new scan
+    /// view keys to.
+    async fn unlisted_shared_listing_table(
+        name: &str,
+    ) -> (Arc<CayenneTableProvider>, SessionContext, tempfile::TempDir) {
+        let (provider, ctx, dir) = shared_listing_table(name, 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.drop_cached_snapshot_listing();
+        provider.notify_scan_input_change();
+        (provider, ctx, dir)
+    }
+
+    /// Replace the table's rows with ids `0..rows`, each with value `id * 10 + tag`,
+    /// through the `INSERT OVERWRITE` path a full refresh takes.
+    async fn overwrite_ids(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        rows: i64,
+        tag: i64,
+    ) {
+        let ids: Vec<i64> = (0..rows).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 10 + tag).collect();
+        let batch = id_value_batch(provider.table_schema(), &ids, &values);
+        let plan = provider
+            .insert_into(
+                &ctx.state(),
+                MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                    .expect("overwrite source"),
+                InsertOp::Overwrite,
+            )
+            .await
+            .expect("overwrite plan");
+        collect(plan, ctx.task_ctx())
+            .await
+            .expect("overwrite completes");
+    }
+
+    /// `SELECT value WHERE id = ?`.
+    async fn lookup_value(
+        provider: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        id: i64,
+    ) -> Vec<i64> {
+        query_pk_i64(
+            Arc::clone(provider) as Arc<dyn TableProvider>,
+            ctx,
+            id,
+            "value",
+        )
+        .await
+    }
+
+    fn snapshot_listing_builds(provider: &CayenneTableProvider) -> u64 {
+        provider.test_listing.builds.load(Ordering::Relaxed)
+    }
+
+    fn shared_listing_requests(provider: &CayenneTableProvider) -> u64 {
+        provider
+            .test_listing
+            .shared_requests
+            .load(Ordering::Relaxed)
+    }
+
+    fn latest_scan_view(provider: &CayenneTableProvider) -> Arc<ScanView> {
+        Arc::clone(
+            &provider
+                .scan_view_cache
+                .latest_complete
+                .load_full()
+                .expect("a completed scan view")
+                .view,
+        )
+    }
+
+    /// The listing with statistics `view`'s scans share, if one was built.
+    fn shared_listing(view: &ScanView) -> Option<&Arc<Vec<PartitionedFile>>> {
+        view.raw
+            .warm_files
+            .with_statistics
+            .get()
+            .map(|listing| &listing.files)
+    }
+
+    /// Every file a listing returned lies in `snapshot_id`'s directory.
+    fn assert_listing_in_snapshot(files: &[PartitionedFile], snapshot_id: &str) {
+        assert!(!files.is_empty(), "the snapshot has files");
+        for file in files {
+            assert!(
+                file.object_meta.location.as_ref().contains(snapshot_id),
+                "{} is not a file of snapshot {snapshot_id}",
+                file.object_meta.location
+            );
+        }
+    }
+
+    /// Preparing the table after an overwrite (a full refresh) builds the new
+    /// snapshot's scan view and statistics listing: the scans that the refresh
+    /// lets through build neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_overwrite_needs_no_listing_build() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_overwrite", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        overwrite_ids(&ctx, &provider, 100, 2).await;
+        assert!(!provider.scan_view_is_prepared());
+        provider.prepare_scan_view_for_reads().await;
+        assert!(provider.scan_view_is_prepared());
+        let snapshot_id = provider.get_current_snapshot_id();
+
+        let view = latest_scan_view(&provider);
+        assert_eq!(view.raw.current_snapshot_id, snapshot_id);
+        let prepared = shared_listing(&view).expect("preparation built the new snapshot's listing");
+        assert_listing_in_snapshot(prepared, &snapshot_id);
+        let builds = snapshot_listing_builds(&provider);
+
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![72],
+            "the first lookup after the overwrite reads the new rows"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "the first scan after an overwrite must not build a listing"
+        );
+        assert!(
+            Arc::ptr_eq(&latest_scan_view(&provider), &view),
+            "the first scan after preparation must use the prepared view"
+        );
+    }
+
+    /// Preparing the table after an append (an `append` refresh) builds the
+    /// listing of the files it published, so the next scan builds none and still
+    /// sees the appended rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_append_needs_no_listing_build() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_append", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.prepare_scan_view_for_reads().await;
+        let before = latest_scan_view(&provider);
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(provider.table_schema(), &[5_000], &[42]),
+        )
+        .await;
+        provider.prepare_scan_view_for_reads().await;
+        let view = latest_scan_view(&provider);
+        assert!(
+            !Arc::ptr_eq(&view, &before),
+            "preparation built a scan view of the files the append published"
+        );
+        let prepared =
+            shared_listing(&view).expect("preparation built the listing of the appended files");
+        assert_eq!(prepared.len(), before.raw.warm_files.files.len() + 1);
+        let builds = snapshot_listing_builds(&provider);
+
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "the appended row"
+        );
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "and the rows before it"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "the first scan after an append must not build a listing"
+        );
+    }
+
+    /// A table that reuses scan views within a lag (read-only `changes`) is
+    /// prepared as it is now: preparing after an append must not publish the
+    /// pre-append view as the newest, which would hide the append from the
+    /// scans that follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preparing_a_lag_tolerant_table_does_not_hide_a_write() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (mut provider, _dir) = create_cayenne_table_with_config(
+            "shared_listing_lag",
+            Arc::clone(&schema),
+            VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        provider.scan_view_reuse = ScanViewReuse::WithinLag(Duration::from_secs(3_600));
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.prepare_scan_view_for_reads().await;
+
+        insert_batch_with_context(&ctx, &provider, id_value_batch(schema, &[5_000], &[42])).await;
+        provider.prepare_scan_view_for_reads().await;
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "a scan after preparation must see the append"
+        );
+    }
+
+    /// Listings that do not share a scan view — a protected snapshot's, an
+    /// internal read's, two views over the same files — still share each file's
+    /// statistics collection: concurrent cold listings read each footer once and
+    /// persist each file's statistics once, and later ones wait on the collection
+    /// already in flight rather than starting their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn listings_outside_a_scan_view_share_each_files_statistics() {
+        const LISTINGS: usize = 4;
+        const FILES: usize = 3;
+        let (provider, ctx, _dir) = shared_listing_table("per_file_statistics_sharing", 0).await;
+        for file in 0..FILES {
+            let start = i64::try_from(file).expect("file index") * 100;
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                id_value_batch_for_range(provider.table_schema(), start, 100),
+            )
+            .await;
+        }
+        // Cold: no persisted statistics and nothing cached, so every file goes
+        // to its footer.
+        provider
+            .catalog
+            .clear_snapshot_file_statistics(provider.table_id())
+            .await
+            .expect("clear persisted statistics");
+        provider.clear_scan_file_statistics_cache();
+        let before = provider.scan_file_statistics_counters();
+
+        // Hold the first footer collection until another listing has joined it.
+        let (entered, on_entered) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_file_statistics_publish_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered.send(());
+                let _ = released.await;
+            })
+        }));
+        let snapshot_id = provider.get_current_snapshot_id();
+        let listings: Vec<_> = (0..LISTINGS)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let state = ctx.state();
+                let snapshot_id = snapshot_id.clone();
+                tokio::spawn(async move {
+                    let url = ListingTableUrl::parse(CayenneTableProvider::snapshot_dir_url(
+                        &provider.table_metadata.path,
+                        &provider.table_metadata.table_id,
+                        &snapshot_id,
+                    ))
+                    .expect("snapshot URL");
+                    let options = CayenneTableProvider::create_listing_options(
+                        provider.context.file_format(),
+                        &provider.pk_deletion_strategy,
+                        state.config(),
+                    )
+                    .with_collect_stat(true);
+                    let schema = provider.table_schema();
+                    let listed = provider
+                        .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                            state: &state,
+                            table_url: &url,
+                            options: &options,
+                            partition_filters: &[],
+                            data_filters: &[],
+                            snapshot_id: &snapshot_id,
+                            limit: None,
+                            scan_schema: CayenneTableProvider::snapshot_scan_schema(
+                                &schema, &options,
+                            ),
+                            file_statistics_schema: schema,
+                            captured_files: None,
+                        })
+                        .await
+                        .expect("listing");
+                    let mut paths: Vec<String> = file_group_paths(&listed.file_groups)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    paths.sort();
+                    paths
+                })
+            })
+            .collect();
+        on_entered.await.expect("a footer collection started");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while provider.scan_file_statistics_counters().joined_in_flight
+                == before.joined_in_flight
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("another listing must join the held collection");
+        release.send(()).expect("the held collection is waiting");
+
+        let mut listed = Vec::new();
+        for listing in listings {
+            listed.push(listing.await.expect("listing task"));
+        }
+        assert_eq!(listed[0].len(), FILES, "every listing sees every file");
+        assert!(
+            listed.iter().all(|paths| paths == &listed[0]),
+            "every listing sees the same files"
+        );
+        let after = provider.scan_file_statistics_counters();
+        assert_eq!(
+            after.footer_reads - before.footer_reads,
+            u64::try_from(FILES).expect("file count"),
+            "{LISTINGS} concurrent cold listings must read each footer once: {after:?}"
+        );
+        assert_eq!(
+            after.persisted_upserts - before.persisted_upserts,
+            u64::try_from(FILES).expect("file count"),
+            "{LISTINGS} concurrent cold listings must persist each file's statistics once: {after:?}"
+        );
+        assert!(after.joined_in_flight > before.joined_in_flight);
+    }
+
+    /// Scans that reach a snapshot state nothing has listed yet wait on one shared
+    /// listing build instead of each building their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_scans_share_one_listing_build() {
+        const SCANS: u64 = 8;
+        let (provider, ctx, _dir) =
+            unlisted_shared_listing_table("shared_listing_concurrent").await;
+        let builds = snapshot_listing_builds(&provider);
+        let requests = shared_listing_requests(&provider);
+
+        // Hold the first build until every scan has asked for the listing.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_post_snapshot_list_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = released.await;
+            })
+        }));
+        let scans: Vec<_> = (0..SCANS)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let ctx = ctx.clone();
+                tokio::spawn(async move { lookup_value(&provider, &ctx, 7).await })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while shared_listing_requests(&provider) - requests < SCANS {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "every scan must ask the shared listing for its files; {} of {SCANS} did",
+                shared_listing_requests(&provider) - requests
+            )
+        });
+        release.send(()).expect("the held build is waiting");
+        for scan in scans {
+            assert_eq!(scan.await.expect("scan task"), vec![71]);
+        }
+        assert_eq!(
+            snapshot_listing_builds(&provider) - builds,
+            1,
+            "{SCANS} concurrent scans of one view must build its listing once"
+        );
+    }
+
+    /// A failed listing build is not stored: the scan that hit it fails, and the
+    /// next scan of the same view builds the listing again and succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_listing_build_is_rebuilt_by_the_next_scan() {
+        let (provider, ctx, _dir) = unlisted_shared_listing_table("shared_listing_failure").await;
+        let builds = snapshot_listing_builds(&provider);
+
+        provider
+            .test_listing
+            .fail_next
+            .store(true, Ordering::Release);
+        let error = provider
+            .scan(&ctx.state(), None, &[col("id").eq(lit_i64(7))], None)
+            .await
+            .expect_err("the injected listing failure fails the scan");
+        assert!(
+            error
+                .to_string()
+                .contains("injected snapshot listing failure"),
+            "unexpected error: {error}"
+        );
+        let view = latest_scan_view(&provider);
+        assert!(
+            shared_listing(&view).is_none(),
+            "a failed listing must not be stored in the view"
+        );
+        assert!(provider.cached_snapshot_listing.load_full().is_none());
+
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
+        assert!(
+            Arc::ptr_eq(&latest_scan_view(&provider), &view),
+            "the retry scans the same view"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider) - builds,
+            1,
+            "the scan after a failure builds the listing once"
+        );
+        assert!(shared_listing(&view).is_some());
+    }
+
+    /// A listing whose build a listing-cache invalidation overtook still answers
+    /// the scan that built it, but is not stored for the view's later scans.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listing_overtaken_by_an_invalidation_is_not_stored() {
+        let (provider, ctx, _dir) = unlisted_shared_listing_table("shared_listing_overtaken").await;
+        let builds = snapshot_listing_builds(&provider);
+
+        let invalidating = Arc::clone(&provider);
+        *provider.test_post_snapshot_list_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                invalidating.drop_cached_snapshot_listing();
+            })
+        }));
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "the overtaken listing still answers its own scan"
+        );
+        assert_eq!(snapshot_listing_builds(&provider) - builds, 1);
+        assert!(
+            shared_listing(&latest_scan_view(&provider)).is_none(),
+            "a listing an invalidation overtook must not be stored in the view"
+        );
+        assert!(provider.cached_snapshot_listing.load_full().is_none());
+    }
+
+    /// A write that changes what a scan sees without changing the snapshot's files
+    /// — here an append into the inline tier, as a CDC write does — mints a new
+    /// scan view, which starts from the snapshot's existing listing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_view_of_unchanged_files_reuses_their_listing() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_carry", 50).await;
+        overwrite_ids(&ctx, &provider, 1_000, 1).await;
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
+        let before = latest_scan_view(&provider);
+        let listed = Arc::clone(shared_listing(&before).expect("the snapshot was listed"));
+        let builds = snapshot_listing_builds(&provider);
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(provider.table_schema(), &[5_000], &[42]),
+        )
+        .await;
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "the inline row"
+        );
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "and the snapshot's rows"
+        );
+        let after = latest_scan_view(&provider);
+        assert!(
+            !Arc::ptr_eq(&after, &before),
+            "the append must mint a new scan view"
+        );
+        assert_eq!(
+            after.raw.current_snapshot_id,
+            before.raw.current_snapshot_id
+        );
+        let reused = shared_listing(&after).expect("the new view's scans listed its files");
+        assert!(
+            Arc::ptr_eq(reused, &listed),
+            "the new view must reuse the snapshot's listing"
+        );
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "a new view of unchanged files must not rebuild their listing"
+        );
+    }
+
+    /// A listing shared by a view, or built by an overwrite, never answers for a
+    /// different snapshot, directory generation, or listing-cache epoch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_listing_never_serves_another_snapshot_generation_or_epoch() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_identity", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
+        let first = latest_scan_view(&provider);
+        let first_snapshot = provider.get_current_snapshot_id();
+
+        // A new snapshot gets its own listing.
+        overwrite_ids(&ctx, &provider, 100, 2).await;
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![72]);
+        let second = latest_scan_view(&provider);
+        let second_snapshot = provider.get_current_snapshot_id();
+        assert_ne!(first_snapshot, second_snapshot);
+        assert_listing_in_snapshot(
+            shared_listing(&first).expect("first snapshot listed"),
+            &first_snapshot,
+        );
+        assert_listing_in_snapshot(
+            shared_listing(&second).expect("second snapshot listed"),
+            &second_snapshot,
+        );
+
+        // Invalidate the listing cache without anything else changing, so scans
+        // keep being served the same view. Its listing belongs to the previous
+        // epoch and must not answer them; each scan builds its own instead.
+        provider.drop_cached_snapshot_listing();
+        assert_scans_bypass_view_listing(&provider, &ctx, &second, "listing-cache epoch").await;
+        provider
+            .current_dir_generation
+            .fetch_add(1, Ordering::AcqRel);
+        assert_scans_bypass_view_listing(&provider, &ctx, &second, "directory generation").await;
+    }
+
+    /// Two scans each served `view`, whose `what` has moved since it was built,
+    /// read the right rows and each build their own listing rather than using
+    /// the view's.
+    async fn assert_scans_bypass_view_listing(
+        provider: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        view: &Arc<ScanView>,
+        what: &str,
+    ) {
+        for scan in 1..=2 {
+            let builds = snapshot_listing_builds(provider);
+            assert_eq!(lookup_value(provider, ctx, 7).await, vec![72]);
+            assert!(
+                Arc::ptr_eq(&latest_scan_view(provider), view),
+                "the scan is served the view whose {what} moved"
+            );
+            assert_eq!(
+                snapshot_listing_builds(provider) - builds,
+                1,
+                "scan {scan} after the {what} moved must not use the view's listing"
+            );
+        }
+    }
+
     /// `refresh_listing_table` can add files to the current snapshot without
     /// bumping `current_dir_generation` (position-based checkpoint, schema
     /// evolution). The snapshot listing cache must drop so the next PK lookup
@@ -55448,9 +57261,11 @@ mod tests {
             "warmup scan must populate the snapshot listing cache"
         );
         let generation_before = provider.current_dir_generation.load(Ordering::Relaxed);
-        // Force a LIST without bumping `listing_cache_epoch`, matching an
-        // in-flight listing that sampled the epoch before refresh.
-        provider.cached_snapshot_listing.store(None);
+        // Force a LIST: a new listing-cache epoch keys a new scan view with no
+        // listing yet. The refresh in the hook below moves the epoch again while
+        // that LIST is in flight, as a refresh does to a listing that sampled the
+        // epoch before it.
+        provider.drop_cached_snapshot_listing();
 
         let extra = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -57945,10 +59760,11 @@ mod tests {
         );
     }
 
-    /// Primary-key tables with default `deletion_mode: Auto` resolve to `Key` mode,
-    /// so the seq-prefix bake pass executes and folds older protected snapshots.
+    /// A primary-key table on the default `deletion_mode: Auto` declines the
+    /// seq-prefix bake while it is on position deletes (a small table reclaims by
+    /// rewriting itself whole), and bakes once `auto` has moved it to key deletes.
     #[tokio::test]
-    async fn seq_prefix_bake_runs_on_auto_mode_pk_table() {
+    async fn seq_prefix_bake_runs_on_auto_mode_pk_table_once_on_key_deletes() {
         use arrow::datatypes::{DataType, Field, Schema};
         let ctx = SessionContext::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -57978,7 +59794,6 @@ mod tests {
             partition_column: None,
             vortex_config: VortexConfig {
                 inline_max_rows: 0,
-                // Default deletion_mode is Auto -> resolves to Key for PK tables.
                 deletion_mode: crate::metadata::DeletionMode::Auto,
                 compaction_background_interval_ms: 3_600_000,
                 ..VortexConfig::default()
@@ -57989,8 +59804,8 @@ mod tests {
             .await
             .expect("table created");
         assert!(
-            !provider.should_capture_positions(),
-            "auto mode on a PK table must resolve to key mode"
+            provider.should_capture_positions(),
+            "a small auto-mode PK table starts on position deletes"
         );
 
         for id in 0..6_i64 {
@@ -58006,13 +59821,28 @@ mod tests {
         }
         let before = provider.protected_snapshots.load_full().len();
 
+        assert!(
+            !provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("a declined bake is a no-op"),
+            "the bake declines a table on position deletes"
+        );
+        assert_eq!(provider.protected_snapshots.load_full().len(), before);
+
+        {
+            let _guard = provider.compaction_lock.write().await;
+            assert!(provider.switch_auto_to_key_deletes());
+        }
+        assert!(!provider.should_capture_positions());
+
         let baked = provider
             .bake_seq_prefix_protected_snapshots()
             .await
             .expect("bake should not error");
         assert!(
             baked,
-            "the seq-prefix bake must succeed on an auto-mode PK table"
+            "the seq-prefix bake must succeed on an auto-mode PK table on key deletes"
         );
         assert!(
             provider.protected_snapshots.load_full().len() < before,
@@ -58144,17 +59974,18 @@ mod tests {
         }
     }
 
-    /// Reopen a seeded table with `deletion_mode: Auto`, which resolves to KEY
-    /// mode for a primary-key table. The context carries the config in production
-    /// (the accelerator builds one from the spicepod params), so build it the same
-    /// way here — the stored `vortex_config_json` still says `position`.
+    /// Reopen a seeded table in KEY mode — `deletion_mode: key`, the mode `auto`
+    /// also moves a table to once it outgrows position deletes. The context
+    /// carries the config in production (the accelerator builds one from the
+    /// spicepod params), so build it the same way here — the stored
+    /// `vortex_config_json` still says `position`.
     async fn reopen_in_key_mode(
         seeded: &PositionedUpsertTable,
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
     ) -> CayenneTableProvider {
         let key_config = VortexConfig {
-            deletion_mode: crate::metadata::DeletionMode::Auto,
+            deletion_mode: crate::metadata::DeletionMode::Key,
             inline_max_rows: 0,
             inline_max_bytes: 0,
             inline_max_buffer_bytes: 0,
@@ -58185,15 +60016,15 @@ mod tests {
                 .expect("reopen the table in key mode");
         assert!(
             !reopened.should_capture_positions(),
-            "premise: `auto` on a PK table must resolve to key mode after reopen"
+            "premise: the table must reopen in key mode"
         );
         reopened
     }
 
-    /// MIGRATION SAFETY for resolving `auto` to `key` on primary-key tables: a
-    /// table that recorded per-file POSITION deletion vectors while configured
-    /// `deletion_mode: position` is reopened in key mode (what `auto` now
-    /// resolves to) and must still apply them. If the reopen dropped them, every
+    /// MIGRATION SAFETY for a primary-key table moving from position to key
+    /// deletes: a table that recorded per-file POSITION deletion vectors while on
+    /// position deletes is reopened in key mode (an explicit `key`, or `auto` once
+    /// the table outgrows position deletes) and must still apply them. If the reopen dropped them, every
     /// row those vectors mask would come back — a silent resurrection on upgrade
     /// for any table that had run under position mode.
     ///
@@ -58206,9 +60037,9 @@ mod tests {
     /// dual-encoded — the key twin masks the same prior version by sequence, so an
     /// ordinary visibility check stays green even with every position vector
     /// dropped (verified by mutating the loader). So this test also PRUNES the key
-    /// tombstones (`prune_deletes_at_or_below` keeps `insert_seq` and leaves
-    /// position deletions untouched by contract) and re-queries, which leaves the
-    /// reloaded position vectors as the only thing that can mask a prior version.
+    /// tombstones (`prune_deletes_at_or_below` leaves position deletions untouched
+    /// by contract) and re-queries, which leaves the reloaded position vectors as
+    /// the only thing that can mask a prior version.
     #[tokio::test]
     async fn position_deletion_vectors_still_apply_after_reopening_in_key_mode() {
         let ctx = SessionContext::new();
@@ -74813,6 +76644,10 @@ mod tests {
              discard its keyset, which rebuilds the whole keyset on every write"
         );
     }
+
+    mod auto_deletion_mode;
+
+    mod first_load_pk_filter;
 
     /// A snapshot reader reclaims the directories a reload leaves unreferenced
     /// without touching one a query still reads (spiceai/spiceai#14981). The

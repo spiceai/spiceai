@@ -48,6 +48,8 @@ pub mod replication_shared;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod replication_tpch;
 #[cfg(all(feature = "postgres", feature = "duckdb"))]
+pub mod replication_type_change;
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod schema_inference;
 #[cfg(all(feature = "postgres", feature = "sqlite", not(windows)))]
 pub mod write_back;

@@ -168,13 +168,31 @@ impl From<String> for EntryType {
 ///
 /// Used for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s
 /// non-empty `list[str | object | array]` criteria shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(untagged)]
 pub enum NonNullEntry {
     String(String),
     Array(Vec<Value>),
     Object(Map<String, Value>),
+}
+
+/// Written by hand so a level of the wrong kind is refused by saying which kinds a level
+/// may be, rather than that no variant of an untagged enum matched.
+impl<'de> Deserialize<'de> for NonNullEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = match Value::deserialize(deserializer)? {
+            Value::String(text) => return Ok(Self::String(text)),
+            Value::Array(items) => return Ok(Self::Array(items)),
+            Value::Object(fields) => return Ok(Self::Object(fields)),
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+        };
+        Err(serde::de::Error::custom(format!(
+            "a score level must be a string, an object, or an array, not {kind}"
+        )))
+    }
 }
 
 impl From<&str> for NonNullEntry {
@@ -302,6 +320,27 @@ pub enum Question {
     },
 }
 
+impl Question {
+    /// The answer to a question that needs no model: a choice with a single option,
+    /// which is that option with all the probability. Every model answers it this way
+    /// rather than asking. `None` for any other question.
+    #[must_use]
+    pub fn foregone_answer(&self) -> Option<Answer> {
+        let Self::Choice { criteria, .. } = self else {
+            return None;
+        };
+        if criteria.len() != 1 {
+            return None;
+        }
+        let option = criteria.keys().next()?;
+        Some(Answer::Choice {
+            choice: option.clone(),
+            probabilities: BTreeMap::from([(option.clone(), 1.0)]),
+            confidence: 1.0,
+        })
+    }
+}
+
 /// Optional yes/no rubric for a noul question.
 ///
 /// `true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when
@@ -323,41 +362,77 @@ pub struct NoulCriteria {
     pub false_meaning: NullableEntry,
 }
 
-/// Choice criteria, refusing an option listed twice: a JSON object keeps only the last
-/// value of a repeated key, which would silently merge two options into one.
-fn deserialize_choice_criteria<'de, D>(
+/// A JSON object as a map, refusing a repeated key: `serde` keeps only the last value
+/// of a repeated key, which would let one entry silently replace another.
+fn deserialize_unique_map<'de, D, V>(
     deserializer: D,
-) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+    entry: &'static str,
+) -> std::result::Result<BTreeMap<String, V>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
 {
-    struct CriteriaVisitor;
+    struct UniqueKeys<V> {
+        entry: &'static str,
+        value: std::marker::PhantomData<V>,
+    }
 
-    impl<'de> serde::de::Visitor<'de> for CriteriaVisitor {
-        type Value = BTreeMap<String, EntryType>;
+    impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for UniqueKeys<V> {
+        type Value = BTreeMap<String, V>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an object of option to description")
+            f.write_str("a JSON object")
         }
 
         fn visit_map<A: serde::de::MapAccess<'de>>(
             self,
             mut entries: A,
         ) -> std::result::Result<Self::Value, A::Error> {
-            let mut criteria = BTreeMap::new();
-            while let Some((option, description)) = entries.next_entry::<String, EntryType>()? {
-                if criteria.contains_key(&option) {
+            let mut map = BTreeMap::new();
+            while let Some((key, value)) = entries.next_entry::<String, V>()? {
+                if map.contains_key(&key) {
                     return Err(serde::de::Error::custom(format!(
-                        "choice option '{option}' is listed more than once"
+                        "{} '{key}' is listed more than once",
+                        self.entry
                     )));
                 }
-                criteria.insert(option, description);
+                map.insert(key, value);
             }
-            Ok(criteria)
+            Ok(map)
         }
     }
 
-    deserializer.deserialize_map(CriteriaVisitor)
+    deserializer.deserialize_map(UniqueKeys {
+        entry,
+        value: std::marker::PhantomData,
+    })
+}
+
+fn deserialize_choice_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unique_map(deserializer, "choice option")
+}
+
+fn deserialize_probabilities<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unique_map(deserializer, "probability for option")
+}
+
+fn deserialize_legend<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_unique_map(deserializer, "legend level")
 }
 
 fn deserialize_score_criteria<'de, D>(
@@ -375,15 +450,15 @@ where
     Ok(criteria)
 }
 
-/// A successful evaluation answers something; an empty `answers` map is a malformed
-/// provider response, not a 200.
+/// A successful evaluation answers something; an empty `answers` map, or one that
+/// answers a question twice, is a malformed provider response, not a 200.
 fn deserialize_nonempty_answers<'de, D>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<String, Answer>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let answers = BTreeMap::<String, Answer>::deserialize(deserializer)?;
+    let answers = deserialize_unique_map::<_, Answer>(deserializer, "answer")?;
     if answers.is_empty() {
         return Err(serde::de::Error::custom(
             "answers must contain at least one answer",
@@ -516,12 +591,15 @@ pub enum Answer {
     },
     Choice {
         choice: String,
+        #[serde(deserialize_with = "deserialize_probabilities")]
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
     Score {
         score: f64,
+        #[serde(deserialize_with = "deserialize_legend")]
         legend: BTreeMap<String, EntryType>,
+        #[serde(deserialize_with = "deserialize_probabilities")]
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
@@ -534,7 +612,7 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateResponse {
-    /// Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it.
+    /// The Spicepod model name the request named, as `/v1/chat/completions` reports it.
     pub model: String,
     #[serde(deserialize_with = "deserialize_nonempty_answers")]
     #[schemars(extend("minProperties" = 1))]
@@ -550,7 +628,8 @@ pub trait Evaluate: Send + Sync + Debug {
     /// Run an evaluation against `state` and `questions`.
     ///
     /// The runtime sets `request.model` to the Spicepod model *name*; providers
-    /// should substitute their upstream model id before calling the remote API.
+    /// should substitute their upstream model id before calling the remote API, and
+    /// report the Spicepod name back in [`EvaluateResponse::model`].
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
     /// Checks the model can answer, e.g. by listing the provider's models.
@@ -598,6 +677,23 @@ mod tests {
             err.to_string().contains(secret),
             "Display still has the body"
         );
+    }
+
+    #[test]
+    fn a_response_with_a_repeated_key_is_refused() {
+        for (body, error) in [
+            (
+                r#"{"model":"m","answers":{"q":{"type":"noul","noul":0.1},"q":{"type":"noul","noul":0.9}}}"#,
+                "answer 'q' is listed more than once",
+            ),
+            (
+                r#"{"model":"m","answers":{"q":{"type":"choice","choice":"a","probabilities":{"a":0.6,"a":0.4},"confidence":1.0}}}"#,
+                "probability for option 'a' is listed more than once",
+            ),
+        ] {
+            let err = serde_json::from_str::<EvaluateResponse>(body).expect_err(body);
+            assert!(err.to_string().contains(error), "{err}");
+        }
     }
 
     #[test]
@@ -727,6 +823,38 @@ mod tests {
         } else {
             panic!("expected Score");
         }
+    }
+
+    #[test]
+    fn score_levels_must_be_strings_objects_or_arrays() {
+        for (level, kind) in [(json!(null), "null"), (json!(3), "a number")] {
+            let error = serde_json::from_value::<Question>(json!({
+                "type": "score",
+                "criteria": ["low", level]
+            }))
+            .expect_err("a level that is not a string, object, or array must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("a score level must be a string, an object, or an array, not {kind}")
+            );
+        }
+
+        let ok: Question = serde_json::from_value(json!({
+            "type": "score",
+            "criteria": ["low", {"label": "mid"}, ["high"]]
+        }))
+        .expect("string, object, and array levels");
+        let Question::Score { criteria, .. } = ok else {
+            panic!("expected a score question, got {ok:?}");
+        };
+        assert_eq!(
+            criteria,
+            vec![
+                NonNullEntry::String("low".to_string()),
+                NonNullEntry::Object(Map::from_iter([("label".to_string(), json!("mid"))])),
+                NonNullEntry::Array(vec![json!("high")]),
+            ]
+        );
     }
 
     #[test]

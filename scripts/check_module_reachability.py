@@ -9,12 +9,17 @@
 # nothing. Three such files had accumulated in this workspace, together holding
 # 808 lines and 26 tests that had never run (#12735, #12737).
 #
-# This walks every workspace crate's module tree from its own target roots and
-# reports any `.rs` file under `src/` the walk never reaches.
+# This walks every workspace crate's module tree from every one of its target
+# roots — library, binaries, tests, benches and examples, as `cargo metadata`
+# lists them — and reports any `.rs` file under `src/`, `tests/`, `benches/` or
+# `examples/` the walk never reaches.
 #
-# Only `src/` is in scope. Cargo auto-discovers `benches/`, `tests/` and
-# `examples/` files as their own targets, so they are reachable with no `mod`
-# declaration anywhere and including them reports ~200 files that are all fine.
+# The test directories matter as much as `src/`. A crate that sets
+# `autotests = false` compiles only the `[[test]]` targets it declares, so a new
+# file dropped beside them is silently ignored, and a file in a subdirectory of
+# `tests/` is never a target of its own, so it compiles only if a `mod` reaches
+# it. Both look like tests and run nothing. See
+# docs/dev/integration_test_layout.md.
 #
 # Usage:
 #   scripts/check_module_reachability.py          # validate (exit 1 on violation)
@@ -252,8 +257,20 @@ def resolve_child(mod_dir: Path, name: str, override: str | None) -> Path | None
 MOD_RS_NAMES = {"mod.rs", "lib.rs", "main.rs"}
 
 
-def walk_from_root(root: Path, reached: set[Path]) -> None:
+def walk_from_root(
+    root: Path, reached: set[Path], walked: set[tuple[Path, bool]] | None = None
+) -> None:
     """Mark `root` and everything its module tree reaches.
+
+    `root` is a crate root — a target's `src_path` — and owns the directory it
+    sits in whatever it is named: `mod common;` in `tests/integration.rs` finds
+    `tests/common/mod.rs`, not `tests/integration/common/mod.rs`.
+
+    A file can be compiled in two contexts — as a target root, and as a module
+    of another target — and its `mod` declarations resolve differently in each.
+    `walked` therefore records (file, owns-its-directory) pairs rather than
+    files, so reaching a file in one context never skips walking it in the
+    other. Pass the same set for every root of a package to share that work.
 
     Two different directories are in play, and conflating them is what makes a
     naive version report live files:
@@ -268,16 +285,19 @@ def walk_from_root(root: Path, reached: set[Path]) -> None:
 
     Inside an inline `mod a { … }`, both forms descend through the inline names.
     """
-    stack = [root.resolve()]
+    if walked is None:
+        walked = set()
+    stack = [(root.resolve(), True)]
 
     while stack:
-        current = stack.pop()
-        if current in reached or not current.is_file():
+        current, owns_dir = stack.pop()
+        if (current, owns_dir) in walked or not current.is_file():
             continue
+        walked.add((current, owns_dir))
         reached.add(current)
 
         file_dir = current.parent
-        module_dir = file_dir if current.name in MOD_RS_NAMES else file_dir / current.stem
+        module_dir = file_dir if owns_dir else file_dir / current.stem
 
         for name, _, overrides, inline in parse_mods(current):
             if overrides:
@@ -290,22 +310,55 @@ def walk_from_root(root: Path, reached: set[Path]) -> None:
             for override in overrides or (None,):
                 child = resolve_child(base, name, override)
                 if child is not None:
-                    stack.append(child)
+                    # rustc treats a file loaded through `#[path]` as a mod-rs
+                    # file whatever its name: its own `mod` declarations
+                    # resolve beside it, not in a directory named after it.
+                    owns = override is not None or child.name in MOD_RS_NAMES
+                    stack.append((child, owns))
+
+
+# The directories whose `.rs` files must each be compiled by some target. Cargo
+# discovers targets only in these, so a `.rs` file anywhere else in a crate is
+# not source this check can judge (a fixture, a build input).
+SOURCE_DIRS = ("src", "tests", "benches", "examples")
 
 
 def collect_sources(src_dir: Path) -> set[Path]:
     return {p.resolve() for p in src_dir.rglob("*.rs") if p.is_file()}
 
 
+def package_sources(package: dict) -> list[tuple[Path, bool]]:
+    """Every source file of one `cargo metadata` package, and whether it is reached.
+
+    Roots come from cargo's own target list, so `autotests = false`, a
+    `[[test]]`/`[[bench]]` `path = "…"` override and auto-discovered targets are
+    all honoured without this script parsing the manifest.
+    """
+    crate_dir = Path(package["manifest_path"]).parent
+    reached: set[Path] = set()
+    walked: set[tuple[Path, bool]] = set()
+    for target in package.get("targets", []):
+        walk_from_root(Path(target["src_path"]), reached, walked)
+
+    # No name is exempt: every genuine root is already seeded above from cargo's
+    # own target list, and exempting `mod.rs` by name would hide a whole dead
+    # directory.
+    sources: set[Path] = set()
+    for sub in SOURCE_DIRS:
+        if (crate_dir / sub).is_dir():
+            sources |= collect_sources(crate_dir / sub)
+    return [(source, source in reached) for source in sorted(sources)]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fail when a file under a workspace crate's src/ is unreachable "
-        "from that crate's roots."
+        description="Fail when a source file of a workspace crate is unreachable "
+        "from every one of that crate's target roots."
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="print every src/ file and whether it is reachable",
+        help="print every source file and whether it is reachable",
     )
     args = parser.parse_args()
 
@@ -319,30 +372,7 @@ def main() -> int:
         if package.get("id") not in workspace_ids:
             continue
         name = package["name"]
-        crate_dir = Path(package["manifest_path"]).parent
-        src_dir = crate_dir / "src"
-        if not src_dir.is_dir():
-            continue
-
-        # Roots come from cargo's own target list, so a `path = "…"` override in
-        # Cargo.toml is honoured without this script parsing the manifest.
-        reached: set[Path] = set()
-        for target in package.get("targets", []):
-            src_path = Path(target["src_path"]).resolve()
-            try:
-                src_path.relative_to(src_dir.resolve())
-            except ValueError:
-                # A bench/test/example target outside src/ — not in scope, and
-                # its own module tree cannot make an src/ file reachable that
-                # the library does not already reach.
-                continue
-            walk_from_root(src_path, reached)
-
-        # No name is exempt: every genuine root — `lib.rs`, `main.rs`, each
-        # `src/bin/*.rs` — is already seeded above from cargo's own target list,
-        # and exempting `mod.rs` by name would hide a whole dead directory.
-        for source in sorted(collect_sources(src_dir)):
-            ok = source in reached
+        for source, ok in package_sources(package):
             listed.append((name, source, ok))
             if not ok:
                 violations.append((name, source))
@@ -354,21 +384,23 @@ def main() -> int:
 
     if violations:
         print(
-            f"error: {len(violations)} source file(s) under src/ are not reachable "
-            "from their crate's root, so nothing compiles them:\n",
+            f"error: {len(violations)} source file(s) are not reachable from any of "
+            "their crate's targets, so nothing compiles them:\n",
             file=sys.stderr,
         )
         for crate, source in violations:
             print(f"  {crate}: {source.relative_to(REPO)}", file=sys.stderr)
         print(
             "\nEither declare each one with a `mod` declaration from its parent "
-            "module, or delete it if the live code moved elsewhere.",
+            "module (a test file goes in its crate's `tests/integration.rs`, see "
+            "docs/dev/integration_test_layout.md), or delete it if the live code "
+            "moved elsewhere.",
             file=sys.stderr,
         )
         return 1
 
     if not args.list:
-        print(f"module reachability: {len(listed)} src/ file(s) all reachable")
+        print(f"module reachability: {len(listed)} source file(s) all reachable")
     return 0
 
 

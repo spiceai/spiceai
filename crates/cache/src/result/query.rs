@@ -124,16 +124,17 @@ pub struct CachedQueryResult {
     /// Input tables referenced by the query. [`Interned`] for the same reason
     /// as [`Self::schema`].
     pub input_tables: Interned<HashSet<TableReference>>,
-    /// Timestamp when the result was cached.
+    /// Instant the result was stored. Together with `read_started_at`, this
+    /// identifies a stored generation for [`Self::is_same_generation`].
     cached_at: Instant,
-    /// When the query that produced this result began reading.
+    /// When the query that produced this result started: taken before the
+    /// results-cache lookup and before any wait for a query worker, so it is no
+    /// later than the moment the query read its tables.
     ///
-    /// Serving this entry *as fresh* is only sound while none of
-    /// [`Self::input_tables`] has been invalidated since this instant, which is
-    /// what [`crate::QueryResultsCacheProvider::entry_validity`] rules on for
-    /// every hit. It is deliberately *not* [`Self::cached_at`]: an invalidation
-    /// landing between the read and the store must also disqualify the entry,
-    /// and `cached_at` is after both.
+    /// Freshness and expiry are measured from this instant, so queueing time
+    /// counts toward `item_ttl`. The table-change clock also compares against
+    /// it, so a client write, reload or unload after the query started
+    /// disqualifies the cached result.
     pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
@@ -397,10 +398,10 @@ impl CachedQueryResult {
         }
     }
 
-    /// Check if the cached data is stale (older than the given TTL).
+    /// Whether the query started more than `ttl` before `now`.
     #[must_use]
     pub fn is_stale(&self, ttl: Duration, now: Instant) -> bool {
-        now.duration_since(self.cached_at) > ttl
+        now.saturating_duration_since(self.read_started_at) > ttl
     }
 
     #[must_use]
@@ -901,6 +902,24 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use std::pin::Pin;
+
+    /// Read-start TTL boundaries are inclusive even with a recent insertion.
+    #[test]
+    fn staleness_uses_read_start_and_inclusive_ttl_boundary() {
+        let read = Instant::now();
+        let ttl = Duration::from_secs(1);
+        let result = CachedQueryResult::new_raw(
+            Vec::new(),
+            Arc::new(Schema::empty()),
+            Arc::new(HashSet::new()),
+            read + ttl,
+            read,
+        );
+        assert!(!result.is_stale(ttl, read + ttl));
+        assert!(result.is_stale(ttl, read + ttl + Duration::from_nanos(1)));
+        assert!(!result.is_stale(ttl + ttl, read + ttl + ttl));
+        assert!(result.is_stale(ttl + ttl, read + ttl + ttl + Duration::from_nanos(1)));
+    }
 
     #[test]
     fn test_memory_size_raw_batches() {
