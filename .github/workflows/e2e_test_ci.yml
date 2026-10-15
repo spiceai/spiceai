@@ -442,6 +442,16 @@ jobs:
           cp ./test/models/spicepod_openai.yml ./spicepod.yaml
           cat ./spicepod.yaml
 
+      - name: Test Luna chat, NSQL and native decisions
+        run: python3 test/models/luna_nsql.py --output-dir "${RUNNER_TEMP}/luna-nsql"
+
+      - name: Upload Luna regression artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: luna-nsql-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
+          path: ${{ runner.temp }}/luna-nsql
+
       # This job runs on the self-hosted pool, where several runner instances
       # share one host and therefore one network namespace, so spiced's default
       # 8090/50051 cannot be assumed free (#12419).
