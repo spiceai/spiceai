@@ -29,7 +29,9 @@ use evaluate_api::{
     Question,
 };
 use futures::{StreamExt, TryStreamExt, stream};
-use model_capabilities::{Capability, CapabilityStore, DecisionsBackend, require};
+use model_capabilities::{
+    Capability, CapabilityStore, DecisionsBackend, ModelCapabilities, require,
+};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_status::RuntimeStatus;
 use serde_json::Value;
@@ -132,7 +134,7 @@ impl Decider {
                     .filter(|name| {
                         capabilities
                             .get(name.as_str())
-                            .and_then(|found| found.decisions())
+                            .and_then(ModelCapabilities::decisions)
                             == Some(DecisionsBackend::Native)
                     })
                     .collect();

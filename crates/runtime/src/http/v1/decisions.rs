@@ -37,7 +37,9 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing_futures::Instrument;
 
 use crate::model::EvaluateModelStore;
-use model_capabilities::{Capability, CapabilityStore, DecisionsBackend, require};
+use model_capabilities::{
+    Capability, CapabilityStore, DecisionsBackend, ModelCapabilities, require,
+};
 
 /// Where to read about the models that answer decisions.
 const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
@@ -134,7 +136,7 @@ pub(crate) async fn post(
             );
             let native = capabilities
                 .get(&request.model)
-                .and_then(|found| found.decisions())
+                .and_then(ModelCapabilities::decisions)
                 == Some(DecisionsBackend::Native);
             (model, native)
         };

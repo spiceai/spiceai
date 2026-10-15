@@ -56,7 +56,7 @@ pub struct ModelCapabilities {
 
 /// What a model-id rule adds to its provider's default. It has no way to remove a
 /// capability, so no model id can take away what its provider serves.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Additions {
     native_decisions: bool,
 }
