@@ -29,6 +29,7 @@ use crate::{
     },
 };
 use app::AppBuilder;
+use arrow::array::StringArray;
 use async_openai::Client as OpenAIClient;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
@@ -43,7 +44,7 @@ use async_openai::types::responses::{
 };
 use async_openai::types::responses::{OutputTextContent, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -52,7 +53,8 @@ use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
 use serde_json::Value;
 use serde_json::json;
 use spicepod::component::runtime::TaskHistoryCapturedContext;
-use spicepod::component::{embeddings::Embeddings, model::Model};
+use spicepod::component::{dataset::Dataset, embeddings::Embeddings, model::Model};
+use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -1131,6 +1133,354 @@ async fn openai_test_responses_api_with_tools_non_streaming() -> Result<(), anyh
                     "{model}: {text:?}"
                 );
                 assert_list_datasets_called(&rt, &trace_provider, start, model).await;
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// The `orders` dataset the tool-history test queries.
+const ORDERS_CSV: &str = "order_id,region,product,quantity,unit_price
+1,north,widget,3,9.50
+2,south,gadget,1,24.00
+3,north,gadget,2,24.00
+4,east,widget,10,9.50
+5,south,widget,4,9.50
+6,east,gizmo,1,120.00
+7,west,gizmo,2,120.00
+8,north,widget,5,9.50
+";
+
+/// Sends `request` to `/v1/responses` and returns the response, and, for a streamed request, the
+/// events the client received.
+async fn create_response(
+    client: &OpenAIClient<OpenAIConfig>,
+    request: Value,
+) -> Result<(OpenAIResponse, Option<Vec<Value>>), anyhow::Error> {
+    let request: CreateResponse = serde_json::from_value(request)?;
+    if request.stream != Some(true) {
+        return Ok((client.responses().create(request).await?, None));
+    }
+    let mut stream = client.responses().create_stream(request).await?;
+    let mut events = Vec::new();
+    while let Some(result) = stream.next().await {
+        let event = match result {
+            Ok(event) => event,
+            Err(e) => {
+                eprintln!("{e:#?}");
+                break;
+            }
+        };
+        events.push(serde_json::to_value(&event)?);
+        match event {
+            ResponseStreamEvent::ResponseCompleted(completed) => {
+                return Ok((completed.response, Some(events)));
+            }
+            ResponseStreamEvent::ResponseIncomplete(_) | ResponseStreamEvent::ResponseFailed(_) => {
+                break;
+            }
+            _ => {}
+        }
+    }
+    Err(anyhow::anyhow!(
+        "the stream ended without a completed response: {events:#?}"
+    ))
+}
+
+/// The `input` of each `responses` task that started at `since` or later, in order: the requests
+/// Spice sent the provider.
+async fn responses_task_inputs(
+    rt: &Arc<Runtime>,
+    since: &str,
+) -> Result<Vec<Value>, anyhow::Error> {
+    let batches = rt
+        .datafusion()
+        .query_builder(&format!(
+            "SELECT input FROM runtime.task_history \
+             WHERE task = 'responses' AND start_time >= '{since}' ORDER BY start_time"
+        ))
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .data
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut inputs = Vec::new();
+    for batch in &batches {
+        let column = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8)?;
+        let column = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("`input` is not a string column"))?;
+        for input in column.iter().flatten() {
+            inputs.push(serde_json::from_str(input)?);
+        }
+    }
+    Ok(inputs)
+}
+
+/// `sql` lowercased, with its whitespace collapsed, no trailing semicolon, and unescaped quotes, to
+/// find a query a model quotes in its own layout or as it appears in the call's JSON arguments.
+fn normalized_sql(sql: &str) -> String {
+    sql.replace("\\\"", "\"")
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_string()
+}
+
+/// Asserts that each Spice tool call in `events` streamed as one hosted MCP call, without
+/// interleaving with another item: `output_item.added`, `mcp_call.in_progress`, the arguments,
+/// `mcp_call.completed`, and `output_item.done`.
+fn assert_mcp_call_events(model: &str, events: &[Value]) {
+    let added = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event["type"] == "response.output_item.added" && event["item"]["type"] == "mcp_call"
+        })
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    assert!(!added.is_empty(), "{model}: no mcp_call streamed");
+    for start in added {
+        let index = &events[start]["output_index"];
+        let end = start
+            + events[start..]
+                .iter()
+                .position(|event| event["type"] == "response.output_item.done")
+                .unwrap_or_else(|| panic!("{model}: the mcp_call at {start} never finished"));
+        let types = events[start..=end]
+            .iter()
+            .inspect(|event| assert_eq!(&event["output_index"], index, "{model}: {event}"))
+            .map(|event| event["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types.first(),
+            Some(&"response.output_item.added"),
+            "{model}"
+        );
+        assert_eq!(
+            types.get(1),
+            Some(&"response.mcp_call.in_progress"),
+            "{model}"
+        );
+        assert!(
+            types[2..types.len() - 3]
+                .iter()
+                .all(|t| *t == "response.mcp_call_arguments.delta"),
+            "{model}: {types:?}"
+        );
+        assert_eq!(
+            types[types.len() - 3..],
+            [
+                "response.mcp_call_arguments.done",
+                "response.mcp_call.completed",
+                "response.output_item.done"
+            ],
+            "{model}: {types:?}"
+        );
+    }
+}
+
+/// A client that keeps its own history sends a response's `output` back as the next request's
+/// `input`. The Spice tool calls in that output must give the model, on the next turn, the calls
+/// and results it saw, so it answers from them instead of running its tools again.
+#[tokio::test]
+async fn openai_test_responses_api_tool_history_replay() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let data_dir = tempfile::tempdir()?;
+            let orders_path = data_dir.path().join("orders.csv");
+            std::fs::write(&orders_path, ORDERS_CSV)?;
+            let mut orders = Dataset::new(format!("file:{}", orders_path.display()), "orders");
+            orders.params = Some(Params::from_string_map(
+                [("file_format".to_string(), "csv".to_string())].into(),
+            ));
+
+            let mut app = AppBuilder::new("responses_api").with_dataset(orders);
+            for (model, name) in RESPONSES_TOOL_USE_MODELS {
+                let mut model = get_openai_model_with_spice_tools(model, name);
+                model
+                    .params
+                    .insert("tools".into(), Value::String("sql".into()));
+                app = app.with_model(model);
+            }
+            let app = app.build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            // The turn-2 request Spice sends to OpenAI is the input of a `responses` task.
+            let (_tracing, trace_provider) = init_tracing_with_task_history_captured_context(
+                DEFAULT_TRACING_MODELS,
+                &rt,
+                TaskHistoryCapturedContext::Full,
+            );
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_client = OpenAIClient::with_config(
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1")),
+            );
+            let question = json!({
+                "role": "user",
+                "content": "Using the `orders` table (columns: region, quantity, unit_price), \
+                    what is the total revenue, quantity * unit_price, of each region?",
+            });
+
+            for (_, model) in RESPONSES_TOOL_USE_MODELS {
+                for stream in [false, true] {
+                    let label = format!("{model} (stream: {stream})");
+
+                    // Turn 1 forces a `sql` call, so Spice runs at least one tool round.
+                    let (turn_1, events) = create_response(
+                        &openai_client,
+                        json!({
+                            "model": model,
+                            "input": [question],
+                            "tool_choice": { "type": "function", "name": "sql" },
+                            "stream": stream,
+                        }),
+                    )
+                    .await?;
+                    let output = serde_json::to_value(&turn_1.output)?;
+                    let calls = output
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| item["type"] == "mcp_call")
+                        .collect::<Vec<_>>();
+                    assert!(!calls.is_empty(), "{label}: {output:#}");
+                    for call in &calls {
+                        assert_eq!(call["server_label"], "spice", "{label}: {call:#}");
+                        assert_eq!(call["name"], "sql", "{label}: {call:#}");
+                        assert_eq!(call["status"], "completed", "{label}: {call:#}");
+                        // The result is the rows as JSON, not a JSON string holding them.
+                        assert!(
+                            call["output"]
+                                .as_str()
+                                .and_then(|output| serde_json::from_str::<Value>(output).ok())
+                                .is_some_and(|rows| rows.is_array()),
+                            "{label}: {call:#}"
+                        );
+                        assert!(
+                            call["id"]
+                                .as_str()
+                                .is_some_and(|id| id.starts_with("mcp_spice_")),
+                            "{label}: {call:#}"
+                        );
+                    }
+                    assert!(
+                        !turn_1
+                            .output
+                            .iter()
+                            .any(|item| matches!(item, OutputItem::FunctionCall(_))),
+                        "{label}: {output:#}"
+                    );
+                    if let Some(events) = &events {
+                        assert_one_response(&label, events);
+                        assert_mcp_call_events(&label, events);
+                    }
+
+                    // Turn 2 sends turn 1's output back, as is.
+                    let turn_2_start = std::time::SystemTime::now();
+                    let mut input = vec![question.clone()];
+                    input.extend(output.as_array().into_iter().flatten().cloned());
+                    input.push(json!({
+                        "role": "user",
+                        "content": "What exact SQL query did you run? Quote it verbatim.",
+                    }));
+                    let (turn_2, _) = create_response(
+                        &openai_client,
+                        json!({ "model": model, "input": input, "stream": stream }),
+                    )
+                    .await?;
+
+                    let _ = trace_provider.force_flush();
+                    let since = Into::<DateTime<Utc>>::into(turn_2_start).to_rfc3339();
+                    let upstream_requests = responses_task_inputs(&rt, &since).await?;
+                    // One round: the model answered from the history instead of running a tool.
+                    let [upstream_request] = upstream_requests.as_slice() else {
+                        panic!(
+                            "{label}: turn 2 made other than one request: {upstream_requests:#?}"
+                        );
+                    };
+                    let upstream_input = upstream_request["input"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    // Each call reaches OpenAI as the model saw it: a `function_call` followed by
+                    // its result, paired by `call_id`.
+                    assert!(
+                        !upstream_input.iter().any(|item| item["type"] == "mcp_call"),
+                        "{label}: {upstream_input:#?}"
+                    );
+                    for call in &calls {
+                        let call_id = call["id"]
+                            .as_str()
+                            .and_then(|id| id.strip_prefix("mcp_spice_"))
+                            .unwrap_or_default();
+                        let position = upstream_input
+                            .iter()
+                            .position(|item| {
+                                item["type"] == "function_call" && item["call_id"] == call_id
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("{label}: no function_call {call_id}: {upstream_input:#?}")
+                            });
+                        assert_eq!(upstream_input[position]["name"], "sql", "{label}");
+                        assert_eq!(
+                            upstream_input[position]["arguments"], call["arguments"],
+                            "{label}"
+                        );
+                        assert_eq!(
+                            upstream_input.get(position + 1),
+                            Some(&json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": call["output"],
+                            })),
+                            "{label}"
+                        );
+                    }
+
+                    // And the model quotes the query it ran in turn 1.
+                    let query = serde_json::from_str::<Value>(
+                        calls[0]["arguments"].as_str().unwrap_or_default(),
+                    )?["query"]
+                        .as_str()
+                        .map(normalized_sql)
+                        .unwrap_or_default();
+                    let text = extract_text(&turn_2).unwrap_or_default();
+                    assert!(
+                        normalized_sql(&text).contains(&query),
+                        "{label}: turn 2 did not quote {query:?}: {text}"
+                    );
+                }
             }
 
             Ok(())

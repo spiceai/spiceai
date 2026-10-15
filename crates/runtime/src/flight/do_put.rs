@@ -96,6 +96,13 @@ pub(crate) async fn handle(
                 .await;
             }
             Command::CommandStatementUpdate(cmd) => {
+                if let Some(rate_limit_check) = rate_limit_check_fn.as_ref()
+                    && let Err(status) = rate_limit_check()
+                {
+                    let _start =
+                        metrics::track_flight_request("do_put", Some("statement_update")).await;
+                    return Err(status);
+                }
                 return flightsql::statement_update::do_put(cmd).await;
             }
             Command::CommandStatementIngest(ingest_cmd) => {

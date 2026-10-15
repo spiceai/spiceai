@@ -16,8 +16,6 @@ limitations under the License.
 
 pub mod builder;
 pub mod registry;
-#[cfg(feature = "state")]
-pub mod state;
 pub mod store;
 
 pub use builder::{build_azure_object_store, build_gcs_object_store};

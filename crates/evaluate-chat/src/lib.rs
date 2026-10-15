@@ -51,7 +51,7 @@ use async_openai::types::chat::{
     ResponseFormat, ResponseFormatJsonSchema,
 };
 use async_trait::async_trait;
-use chat_api::Chat;
+use chat_api::{ApiErrorKind, Chat};
 use evaluate_api::{
     Answer, Error, Evaluate, EvaluateRequest, EvaluateResponse, Question, Result, Usage,
     check_answers,
@@ -376,38 +376,30 @@ impl Evaluate for ChatEvaluator {
 /// reached is unavailable (as a System One provider's transport failure is). Anything
 /// else is a failed call.
 ///
-/// Discriminators live in `code` (OpenAI-shaped) or `type` (Anthropic type-only
-/// `ApiError`s such as `authentication_error` / `permission_error` /
-/// `rate_limit_error`). Both are matched so `/v1/decisions` can return 401/403/429
-/// instead of 500.
+/// The kind is read by [`ApiErrorKind::of`], the same reading `/v1/chat/completions`
+/// takes of the same failure.
 fn chat_error(model: &str, error: OpenAIError) -> Error {
     let model = model.to_string();
     match error {
         OpenAIError::InvalidArgument(message) => Error::InvalidRequest { model, message },
-        OpenAIError::ApiError(api) => match (api.code.as_deref(), api.r#type.as_deref()) {
-            (Some("invalid_request_error"), _) | (_, Some("invalid_request_error")) => {
-                Error::InvalidRequest {
-                    model,
-                    message: api.message,
-                }
-            }
-            (Some("invalid_api_key"), _) | (_, Some("authentication_error")) => {
-                Error::AuthenticationFailed {
-                    model,
-                    message: api.message,
-                }
-            }
-            (_, Some("permission_error")) => Error::PermissionDenied {
+        OpenAIError::ApiError(api) => match ApiErrorKind::of(&api) {
+            Some(ApiErrorKind::InvalidRequest) => Error::InvalidRequest {
                 model,
                 message: api.message,
             },
-            (Some("rate_limit_exceeded"), _) | (_, Some("rate_limit_error")) => {
-                Error::RateLimited {
-                    model,
-                    message: api.message,
-                }
-            }
-            _ => Error::ModelCallFailed {
+            Some(ApiErrorKind::Authentication) => Error::AuthenticationFailed {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::PermissionDenied) => Error::PermissionDenied {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::RateLimited) => Error::RateLimited {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::InsufficientQuota) | None => Error::ModelCallFailed {
                 model,
                 source: Box::new(OpenAIError::ApiError(api)),
             },
@@ -883,7 +875,24 @@ mod tests {
                 code: None,
             }))
         };
+        // `OpenAI` puts `invalid_request_error` in `type` and the specific reason in `code`.
+        let openai = |kind: &str, code: &str| {
+            Err(OpenAIError::ApiError(ApiError {
+                message: format!("upstream {code}"),
+                r#type: Some(kind.to_string()),
+                param: None,
+                code: Some(code.to_string()),
+            }))
+        };
         for (failure, expected) in [
+            (
+                openai("invalid_request_error", "invalid_api_key"),
+                "AuthenticationFailed",
+            ),
+            (
+                openai("invalid_request_error", "missing_required_parameter"),
+                "InvalidRequest",
+            ),
             (api_error("rate_limit_exceeded"), "RateLimited"),
             (api_error("invalid_api_key"), "AuthenticationFailed"),
             (api_error("invalid_request_error"), "InvalidRequest"),

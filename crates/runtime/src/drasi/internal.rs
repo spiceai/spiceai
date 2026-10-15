@@ -85,7 +85,8 @@ impl InternalForwarders {
                 spec.params.as_ref(),
             )?;
 
-            let store = super::open_dead_letter_store(&name).await;
+            let store =
+                super::open_dead_letter_store(&name, super::transport_name(spec.transport)).await;
 
             by_table.insert(
                 table_ref,

@@ -31,9 +31,14 @@ limitations under the License.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{DrasiChangeRows, DrasiSink};
 use arrow::array::RecordBatch;
+use runtime_metrics::drasi::{
+    DrasiForwardMetrics, OUTCOME_DEAD_LETTERED, OUTCOME_DELIVERED, OUTCOME_DISCARDED,
+    OUTCOME_RETRIED,
+};
 use tokio::sync::mpsc;
 
 use crate::dead_letter::{DeadLetterStore, RETRY_INTERVAL};
@@ -55,11 +60,15 @@ pub struct QueuedBatch {
     pub primary_key_columns: Vec<Vec<String>>,
     pub data: RecordBatch,
     pub source_commit_ts_ms: Option<i64>,
+    /// When this batch was handed to the queue, milliseconds since the Unix
+    /// epoch. Delivery latency uses this when the batch has no source commit
+    /// time. Persisted with the dead-letter batch so a restart does not
+    /// restamp it.
+    pub queued_at_ms: i64,
 }
 
 impl QueuedBatch {
     /// Builds a batch whose rows all share one operation and one key.
-    #[must_use]
     pub fn uniform(
         op_code: &str,
         key: &[String],
@@ -72,7 +81,38 @@ impl QueuedBatch {
             primary_key_columns: vec![key.to_vec(); rows],
             data,
             source_commit_ts_ms,
+            queued_at_ms: now_ms(),
         }
+    }
+}
+
+/// Milliseconds since the Unix epoch.
+#[must_use]
+pub fn now_ms() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// Milliseconds from the change to `acked_at_ms`.
+///
+/// The change's time is its source commit time when the batch has one, and the
+/// time it was queued otherwise. Recorded only when Drasi acknowledges the
+/// batch.
+#[must_use]
+pub fn delivery_latency_ms(
+    source_commit_ts_ms: Option<i64>,
+    queued_at_ms: i64,
+    acked_at_ms: i64,
+) -> f64 {
+    let start = source_commit_ts_ms.unwrap_or(queued_at_ms);
+    // `saturating_sub` only stops at `i64::MIN`. A commit time ahead of the
+    // acknowledgement is clock skew, and a negative latency is not a duration.
+    let delta = acked_at_ms.saturating_sub(start).max(0);
+    #[expect(clippy::cast_precision_loss)]
+    {
+        delta as f64
     }
 }
 
@@ -83,9 +123,14 @@ pub struct DeliveryQueue {
     jobs: mpsc::Sender<QueuedBatch>,
     dead_lettered: Arc<AtomicU64>,
     component: String,
+    transport: &'static str,
     /// Also held here, not just by the tasks: overflow is retained by the
     /// producer, which is the only place that still has the batch.
     store: Option<Arc<DeadLetterStore>>,
+    metrics: DrasiForwardMetrics,
+    /// In-memory batches still waiting, including the one a delivery attempt
+    /// is holding. The gauge reads this atomic at scrape time.
+    depth: Arc<AtomicU64>,
 }
 
 impl DeliveryQueue {
@@ -100,26 +145,76 @@ impl DeliveryQueue {
         depth: usize,
         store: Option<Arc<DeadLetterStore>>,
     ) -> Self {
+        Self::spawn_measuring(
+            sink,
+            component,
+            depth,
+            store,
+            RETRY_INTERVAL,
+            DrasiForwardMetrics::global(),
+        )
+    }
+
+    /// [`Self::spawn`] with an explicit retry interval and meter.
+    ///
+    /// Production passes [`RETRY_INTERVAL`] and [`DrasiForwardMetrics::global`].
+    /// Tests pass a short interval and a meter they can collect, and drive the
+    /// same delivery and retry tasks.
+    #[must_use]
+    pub fn spawn_measuring(
+        sink: Arc<DrasiSink>,
+        component: String,
+        depth: usize,
+        store: Option<Arc<DeadLetterStore>>,
+        retry_every: std::time::Duration,
+        metrics: DrasiForwardMetrics,
+    ) -> Self {
         let (jobs, receiver) = mpsc::channel(depth);
         let dead_lettered = Arc::new(AtomicU64::new(0));
+        let transport = sink.transport_name();
+        let queue_depth = metrics.queue_depth_slot(&component);
+        // Publish every outcome series at zero so scrapes can tell "none yet"
+        // from a missing exporter series.
+        metrics.seed_batch_outcomes(&component, transport);
+        // A component with no store still publishes the dead-letter series at
+        // zero. A store publishes its own occupancy, including batches
+        // recovered at open, so resetting it here would hide them.
+        if store.is_none() {
+            metrics
+                .dead_letter_slot(&component)
+                .store(0, Ordering::Relaxed);
+        }
 
         tokio::spawn(deliver(
             receiver,
             Arc::clone(&sink),
             component.clone(),
+            transport,
             Arc::clone(&dead_lettered),
             store.clone(),
+            metrics.clone(),
+            Arc::clone(&queue_depth),
         ));
 
         if let Some(store) = store.clone() {
-            tokio::spawn(retry_pending(sink, component.clone(), store));
+            tokio::spawn(retry_pending(
+                sink,
+                component.clone(),
+                transport,
+                store,
+                retry_every,
+                metrics.clone(),
+            ));
         }
 
         Self {
             jobs,
             dead_lettered,
             component,
+            transport,
             store,
+            metrics,
+            depth: queue_depth,
         }
     }
 
@@ -135,11 +230,18 @@ impl DeliveryQueue {
     /// the sink ahead of it — redelivery is a full-state replace, so the
     /// stop-the-line ordering has to hold from the moment of overflow.
     pub async fn enqueue(&self, batch: QueuedBatch) {
-        let overflow = match self.jobs.try_send(batch) {
-            Ok(()) => return,
-            Err(
-                mpsc::error::TrySendError::Full(batch) | mpsc::error::TrySendError::Closed(batch),
-            ) => batch,
+        // Reserve capacity first, bump depth, then publish through the permit.
+        // `try_send` would make the batch visible before the increment; delivery
+        // could then decrement first and leave the gauge stuck at 1.
+        let overflow = match self.jobs.try_reserve() {
+            Ok(permit) => {
+                add_depth(&self.depth);
+                permit.send(batch);
+                return;
+            }
+            Err(mpsc::error::TrySendError::Full(()) | mpsc::error::TrySendError::Closed(())) => {
+                batch
+            }
         };
 
         let Some(store) = &self.store else {
@@ -153,12 +255,19 @@ impl DeliveryQueue {
             self.dead_letter(&format!(
                 "the delivery queue is full and the batch could not be retained: {e}"
             ));
+        } else {
+            // Retained without a delivery attempt. A later attempt records its
+            // own outcome.
+            self.metrics
+                .record_batch(&self.component, self.transport, OUTCOME_DEAD_LETTERED);
         }
     }
 
-    /// Records a batch that will not be delivered.
+    /// Records a batch that will not be delivered and could not be retained.
     pub fn dead_letter(&self, reason: &str) {
         record_dead_letter(&self.dead_lettered, &self.component, reason);
+        self.metrics
+            .record_batch(&self.component, self.transport, OUTCOME_DEAD_LETTERED);
     }
 
     /// How many batches were dropped without reaching the durable store — a
@@ -167,7 +276,7 @@ impl DeliveryQueue {
     /// Batches the store accepted are retried and are *not* counted here; see
     /// [`DeadLetterStore::discarded`](crate::dead_letter::DeadLetterStore::discarded)
     /// for the ones it gave up on.
-    #[must_use]
+    #[cfg(test)]
     pub fn dead_lettered(&self) -> u64 {
         self.dead_lettered.load(Ordering::Relaxed)
     }
@@ -232,13 +341,41 @@ fn classify(result: Result<(), crate::Error>) -> (Outcome, Option<String>) {
     }
 }
 
+fn add_depth(depth: &AtomicU64) {
+    depth.fetch_add(1, Ordering::Relaxed);
+}
+
+fn sub_depth(depth: &AtomicU64) {
+    let mut current = depth.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(1);
+        match depth.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn record_ack(metrics: &DrasiForwardMetrics, component: &str, transport: &str, job: &QueuedBatch) {
+    metrics.record_batch(component, transport, OUTCOME_DELIVERED);
+    metrics.record_latency_ms(
+        component,
+        transport,
+        delivery_latency_ms(job.source_commit_ts_ms, job.queued_at_ms, now_ms()),
+    );
+}
+
 /// Drains one component's queue, delivering each batch in order.
+#[expect(clippy::too_many_arguments)]
 async fn deliver(
     mut jobs: mpsc::Receiver<QueuedBatch>,
     sink: Arc<DrasiSink>,
     component: String,
+    transport: &'static str,
     dead_lettered: Arc<AtomicU64>,
     store: Option<Arc<DeadLetterStore>>,
+    metrics: DrasiForwardMetrics,
+    depth: Arc<AtomicU64>,
 ) {
     while let Some(job) = jobs.recv().await {
         // Anything already pending is older than this batch. Delivering now
@@ -249,6 +386,10 @@ async fn deliver(
             if let Err(e) = store.append(&job).await {
                 record_dead_letter(&dead_lettered, &component, &e.to_string());
             }
+            // Appended, or dropped because it could not be retained. Either way
+            // this was not a delivery attempt.
+            metrics.record_batch(&component, transport, OUTCOME_DEAD_LETTERED);
+            sub_depth(&depth);
             continue;
         }
 
@@ -256,32 +397,47 @@ async fn deliver(
         let message = message.unwrap_or_default();
 
         match (outcome, &store) {
-            (Outcome::Delivered, _) => {}
+            (Outcome::Delivered, _) => {
+                record_ack(&metrics, &component, transport, &job);
+            }
             (Outcome::Retain, Some(store)) => {
                 if let Err(e) = store.append(&job).await {
                     record_dead_letter(&dead_lettered, &component, &e.to_string());
+                    metrics.record_batch(&component, transport, OUTCOME_DEAD_LETTERED);
                 } else {
                     tracing::warn!(
                         "Retaining a Drasi change batch for {component} for redelivery: {message}"
                     );
+                    metrics.record_batch(&component, transport, OUTCOME_RETRIED);
                 }
             }
-            // Two different reasons, one outcome — the batch is gone and the
-            // count is what records the gap. `Discard` can never be delivered,
-            // and retaining it would park it at the head of a stop-the-line
-            // queue forever, blocking every later change behind something that
-            // cannot succeed. `Retain` with no store has nowhere to be kept.
-            (Outcome::Discard, _) | (Outcome::Retain, None) => {
+            // `Discard` can never be delivered, and retaining it would park it
+            // at the head of a stop-the-line queue forever. `Retain` with no
+            // store has nowhere to be kept, so it is counted as dead-lettered.
+            (Outcome::Discard, _) => {
                 record_dead_letter(&dead_lettered, &component, &message);
+                metrics.record_batch(&component, transport, OUTCOME_DISCARDED);
+            }
+            (Outcome::Retain, None) => {
+                record_dead_letter(&dead_lettered, &component, &message);
+                metrics.record_batch(&component, transport, OUTCOME_DEAD_LETTERED);
             }
         }
+        sub_depth(&depth);
     }
 }
 
 /// Retries whatever the store is holding, until it drains.
-async fn retry_pending(sink: Arc<DrasiSink>, component: String, store: Arc<DeadLetterStore>) {
+async fn retry_pending(
+    sink: Arc<DrasiSink>,
+    component: String,
+    transport: &'static str,
+    store: Arc<DeadLetterStore>,
+    retry_every: std::time::Duration,
+    metrics: DrasiForwardMetrics,
+) {
     loop {
-        tokio::time::sleep(RETRY_INTERVAL).await;
+        tokio::time::sleep(retry_every).await;
 
         if store.is_empty().await {
             continue;
@@ -293,22 +449,32 @@ async fn retry_pending(sink: Arc<DrasiSink>, component: String, store: Arc<DeadL
         );
 
         let sink = Arc::clone(&sink);
+        let metrics = metrics.clone();
         store
             .drain(|job| {
                 let sink = Arc::clone(&sink);
                 let component = component.clone();
+                let metrics = metrics.clone();
                 async move {
                     let (outcome, message) = classify(forward(&sink, &job).await);
-                    if outcome == Outcome::Retain {
-                        tracing::debug!(
-                            "Drasi redelivery for {component} still failing: {}",
-                            message.unwrap_or_default()
-                        );
-                    } else if outcome == Outcome::Discard {
-                        tracing::warn!(
-                            "Discarding a Drasi change batch for {component} that can never be delivered: {}",
-                            message.unwrap_or_default()
-                        );
+                    match outcome {
+                        Outcome::Delivered => {
+                            record_ack(&metrics, &component, transport, &job);
+                        }
+                        Outcome::Retain => {
+                            tracing::debug!(
+                                "Drasi redelivery for {component} still failing: {}",
+                                message.unwrap_or_default()
+                            );
+                            metrics.record_batch(&component, transport, OUTCOME_RETRIED);
+                        }
+                        Outcome::Discard => {
+                            tracing::warn!(
+                                "Discarding a Drasi change batch for {component} that can never be delivered: {}",
+                                message.unwrap_or_default()
+                            );
+                            metrics.record_batch(&component, transport, OUTCOME_DISCARDED);
+                        }
                     }
                     outcome
                 }
@@ -348,6 +514,22 @@ mod tests {
             })
             .expect("builds"),
         )
+    }
+
+    #[test]
+    #[expect(clippy::float_cmp)]
+    fn latency_uses_the_source_commit_time_when_the_batch_has_one() {
+        assert_eq!(delivery_latency_ms(Some(1_000), 5_000, 1_500), 500.0);
+        assert_eq!(
+            delivery_latency_ms(None, 5_000, 5_040),
+            40.0,
+            "without a source commit time, latency starts when the batch was queued"
+        );
+        assert_eq!(
+            delivery_latency_ms(Some(9_000), 1_000, 8_000),
+            0.0,
+            "a commit time ahead of the acknowledgement does not record a negative latency"
+        );
     }
 
     #[test]

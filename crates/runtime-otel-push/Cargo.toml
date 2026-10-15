@@ -19,7 +19,16 @@ tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+axum.workspace = true
+opentelemetry.workspace = true
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "gen-tonic",
+    "metrics",
+] }
+telemetry = { path = "../telemetry" }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream.workspace = true
 
 [lints]
 workspace = true

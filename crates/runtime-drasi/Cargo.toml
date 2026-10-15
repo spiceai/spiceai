@@ -34,6 +34,7 @@ redis = { version = "1.5.0", default-features = false, features = [
   "tokio-rustls-comp",
 ] }
 reqwest.workspace = true
+runtime-metrics = { path = "../runtime-metrics" }
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true

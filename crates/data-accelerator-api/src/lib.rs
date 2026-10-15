@@ -374,6 +374,15 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The engine's stored table was built with settings it cannot adopt in place, and
+    /// the dataset's settings let it be rebuilt from the source
+    /// ([`DataAccelerator::requires_rebuild`]): the caller drops the table and creates
+    /// it again. Displays as the engine's cause clause.
+    #[snafu(display("{source}"))]
+    RebuildRequired {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     // Worded as the cause clause it appears as: the messages that embed it supply the
     // impact and where to report it. Reaching this means a caller paired an engine's
     // registration with another engine's settings, which every path here chooses by engine.
@@ -585,7 +594,9 @@ impl AcceleratorEngineRegistry {
             )
             .await
             .map_err(|source| {
-                if accelerator.rejects_configuration(source.as_ref()) {
+                if accelerator.requires_rebuild(source.as_ref()) {
+                    Error::RebuildRequired { source }
+                } else if accelerator.rejects_configuration(source.as_ref()) {
                     Error::EngineRejectedConfiguration { source }
                 } else {
                     Error::AccelerationCreationFailed { source }
@@ -635,6 +646,21 @@ pub trait DataAccelerator: Send + Sync {
             error.downcast_ref::<Error>(),
             Some(Error::InvalidConfiguration { .. })
         )
+    }
+
+    /// Whether `error`, returned by [`Self::create_external_table`], reports that the
+    /// dataset's stored table was built with settings it cannot adopt in place — a
+    /// different primary key or partitioning, for example — for a dataset whose settings
+    /// let it be rebuilt from the source
+    /// ([`runtime_acceleration::acceleration_source::rebuilds_on_settings_change`]).
+    ///
+    /// The caller answers it by dropping the table with [`Self::drop_table`], clearing
+    /// the dataset checkpoint, and creating the table again, which then reloads from the
+    /// source as on a first start. An engine reports this only for a dataset that
+    /// predicate admits; for any other it opens the table with the settings it was
+    /// built with. The default reports nothing, for engines that never rebuild.
+    fn requires_rebuild(&self, _error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+        false
     }
 
     /// The name of the accelerator

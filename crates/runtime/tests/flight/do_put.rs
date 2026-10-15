@@ -27,6 +27,7 @@ use crate::{
 use arrow::array::RecordBatch;
 use arrow_flight::{
     FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
+    sql::client::FlightSqlServiceClient,
 };
 
 use futures::stream::{self, TryStreamExt};
@@ -239,6 +240,45 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
             let results_str =
                 arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
             insta::assert_snapshot!("rate_limit_table_content", results_str);
+
+            Ok(())
+        })
+        .await
+}
+
+/// A Flight SQL statement update is a write, so it draws on the same quota as ingestion.
+#[tokio::test]
+async fn test_flight_statement_update_rate_limit() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid:rw")]))
+                as Arc<dyn FlightBasicAuth + Send + Sync>;
+
+            let write_quota = Quota::with_period(Duration::from_mins(10))
+                .expect("to create quota")
+                .allow_burst(NonZeroU32::new(1).expect("1 is non-zero"));
+
+            let (channel, _df) = start_spice_test_app(
+                Some(auth),
+                Some(RateLimits::new().with_flight_write_limit(write_quota)),
+                None,
+            )
+            .await?;
+
+            let mut client = FlightSqlServiceClient::new(channel);
+            client.handshake("", "valid").await?;
+
+            client.execute_update("SELECT 1".to_string(), None).await?;
+            let limited = client
+                .execute_update("SELECT 1".to_string(), None)
+                .await
+                .expect_err("the second statement update exceeds the write quota");
+            assert!(
+                limited.to_string().contains("Too many requests"),
+                "expected the write rate-limit error, got: {limited}"
+            );
 
             Ok(())
         })
