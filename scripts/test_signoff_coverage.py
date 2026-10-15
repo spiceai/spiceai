@@ -255,6 +255,7 @@ inherits = "dev"
         self.write(".config/nextest.toml", "[profile.default]\nretries = 0\n")
         self.write("version.txt", "0.1.0\n")
         self.write("scripts/verify_cli_build.py", (REPO / "scripts/verify_cli_build.py").read_text())
+        self.write("scripts/nextest_build_targets.py", (REPO / "scripts/nextest_build_targets.py").read_text())
         self.run_ok("cargo", "generate-lockfile", "--offline")
         self.commit()
         for controls in (
