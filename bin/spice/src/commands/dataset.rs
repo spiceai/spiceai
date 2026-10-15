@@ -24,6 +24,7 @@ use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
+use spice_cloud_client::endpoints::{DEFAULT_REGION as DEFAULT_CLOUD_REGION, is_valid_region};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -36,6 +37,27 @@ mod data_source {
     pub const S3: &str = "s3";
     pub const FTP: &str = "ftp";
     pub const SFTP: &str = "sftp";
+    pub const SPICE_AI: &str = "spice.ai";
+    pub const SPICEAI: &str = "spiceai";
+}
+
+/// Returns true if `from` reads from a Spice Cloud app, which requires `spiceai_region`.
+///
+/// Self-hosted sources such as `spiceai:http://localhost:50051` carry their own endpoint
+/// and don't need a region.
+fn is_spice_cloud_source(from: &str) -> bool {
+    [data_source::SPICE_AI, data_source::SPICEAI]
+        .iter()
+        .any(|prefix| {
+            from.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('/').or_else(|| rest.strip_prefix(':')))
+                .is_some_and(|path| {
+                    !path.is_empty()
+                        && !["http://", "https://", "grpc://", "grpc+tls://"]
+                            .iter()
+                            .any(|scheme| path.starts_with(scheme))
+                })
+        })
 }
 
 /// Arguments for the dataset command.
@@ -213,6 +235,20 @@ fn configure_dataset() -> Result<()> {
         }
     }
 
+    // Handle region for Spice Cloud
+    if is_spice_cloud_source(&from) {
+        let region = prompt_with_default(&mut reader, "spiceai_region", DEFAULT_CLOUD_REGION)?;
+        if !is_valid_region(&region) {
+            return InvalidArgumentSnafu {
+                message: format!(
+                    "Invalid Spice Cloud region: {region}. To list available regions, run 'spice cloud regions'"
+                ),
+            }
+            .fail();
+        }
+        params.insert("spiceai_region".to_string(), region);
+    }
+
     // Ask about local acceleration
     let accelerate_str = prompt_with_default(&mut reader, "locally accelerate (y/n)?", "y")?;
     let accelerate = accelerate_str.is_empty() || accelerate_str.to_lowercase() == "y";
@@ -349,6 +385,30 @@ mod tests {
         assert!(!is_valid_dataset_name("my dataset")); // spaces
         assert!(!is_valid_dataset_name("my.dataset")); // dots
         assert!(!is_valid_dataset_name("my/dataset")); // slashes
+    }
+
+    #[test]
+    fn test_is_spice_cloud_source() {
+        assert!(is_spice_cloud_source(
+            "spice.ai/spiceai/quickstart/datasets/taxi_trips"
+        ));
+        assert!(is_spice_cloud_source("spice.ai:eth.recent_blocks"));
+        assert!(is_spice_cloud_source(
+            "spiceai:spiceai/quickstart/datasets/taxi_trips"
+        ));
+        assert!(is_spice_cloud_source("spiceai/eth.recent_blocks"));
+
+        assert!(!is_spice_cloud_source("spiceai:http://localhost:50051"));
+        assert!(!is_spice_cloud_source(
+            "spice.ai:https://remote.example.com:50051"
+        ));
+        assert!(!is_spice_cloud_source(
+            "spice.ai:grpc+tls://remote.example.com:50051"
+        ));
+        assert!(!is_spice_cloud_source("spice.ai/"));
+        assert!(!is_spice_cloud_source("spiceaix:foo"));
+        assert!(!is_spice_cloud_source("s3://bucket/spice.ai/data.parquet"));
+        assert!(!is_spice_cloud_source("postgres:public.users"));
     }
 
     #[test]
