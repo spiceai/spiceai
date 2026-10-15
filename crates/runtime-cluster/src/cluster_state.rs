@@ -407,16 +407,15 @@ impl ClusterStateStore {
             } else {
                 None
             };
-            let (mut state, mut version, mut used_cache) = match cached {
-                Some((state, version)) => (state, version, true),
-                None => {
-                    let (state, version) = self.fetch_and_cache().await?;
-                    (state, version, false)
-                }
+            let (mut state, mut version, mut used_cache) = if let Some((state, version)) = cached {
+                (state, version, true)
+            } else {
+                let (state, version) = self.fetch_and_cache().await?;
+                (state, version, false)
             };
             loop {
                 let mut draft = (*state).clone();
-                let outcome = (&mut *mutator.lock())(&mut draft);
+                let outcome = (*mutator.lock())(&mut draft);
                 match outcome {
                     MutationOutcome::Abort(err) => return Err(err),
                     MutationOutcome::NoChange if used_cache => {

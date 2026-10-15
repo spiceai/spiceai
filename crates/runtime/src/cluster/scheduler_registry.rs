@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use app::spicepod::component::runtime::StateLocation;
+use app::spicepod::component::runtime::{StateLocation, StateSource};
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
 use object_store::ObjectStore;
@@ -113,7 +113,12 @@ pub enum Error {
     #[snafu(display(
         "Scheduler registration record already exists for {scheduler_id} and is still active"
     ))]
-    SchedulerIdConflict { scheduler_id: String },
+    SchedulerIdConflict {
+        scheduler_id: String,
+        /// The process holding the id was seen heartbeating after this one
+        /// tried to register, so two running processes share the identity.
+        holder_running: bool,
+    },
 
     #[snafu(display("Missing scheduler advertise address for registration"))]
     MissingAdvertiseAddress,
@@ -128,6 +133,20 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type SchedulerPeers = HashMap<String, SchedulerEntry>;
+
+/// The advertise addresses of the peer schedulers other than `local`, each once.
+/// During a rolling upgrade one scheduler can be registered under both its
+/// previous `host:port` key and its instance identity until the older entry
+/// expires; both entries carry the same address.
+#[must_use]
+pub fn remote_scheduler_addresses(peers: &SchedulerPeers, local: &str) -> Vec<String> {
+    let addresses: std::collections::BTreeSet<&str> = peers
+        .values()
+        .map(|peer| peer.advertise_address.as_str())
+        .filter(|address| *address != local)
+        .collect();
+    addresses.into_iter().map(str::to_string).collect()
+}
 
 struct SchedulerRegistryRunner {
     cluster: Arc<ClusterStateStore>,
@@ -165,17 +184,17 @@ pub async fn start_scheduler_registry(
         .ok_or(Error::MissingAdvertiseAddress)?
         .to_string();
 
-    let scheduler_id = format!(
-        "{advertise_host}:{}",
-        rt.datafusion().cluster_config.node_bind_address().port()
-    );
+    let scheduler_id = datafusion.cluster_config.instance_id().to_string();
 
     let instance_id = Uuid::new_v4();
     let now = now_ms()?;
     let entry = SchedulerEntry {
         scheduler_id: scheduler_id.clone(),
         instance_id,
-        advertise_address: scheduler_id.clone(),
+        advertise_address: format!(
+            "{advertise_host}:{}",
+            datafusion.cluster_config.node_bind_address().port()
+        ),
         grpc_address: format!(
             "{advertise_host}:{}",
             rt.config().flight_bind_address.port()
@@ -227,7 +246,18 @@ pub async fn start_scheduler_registry(
         last_written_version: Arc::new(ArcSwapOption::empty()),
     };
 
-    runner.run(cancel).await
+    let result = runner.run(cancel).await;
+    if let Err(Error::SchedulerIdConflict {
+        scheduler_id,
+        holder_running: true,
+    }) = &result
+    {
+        tracing::error!(
+            "{}",
+            util::instance_id::duplicate_instance_message(scheduler_id, &state.location)
+        );
+    }
+    result
 }
 
 /// What one scheduler cleanup pass did.
@@ -503,8 +533,10 @@ impl SchedulerRegistryRunner {
         match res {
             Ok(_) => {}
             Err(MutateError::Conflict { .. }) => {
+                let holder_running = self.holder_keeps_beating(observed_beat.as_ref()).await;
                 return Err(Error::SchedulerIdConflict {
                     scheduler_id: self.scheduler_id.clone(),
+                    holder_running,
                 });
             }
             Err(other) => return Err(Error::ClusterState { source: other }),
@@ -593,6 +625,23 @@ impl SchedulerRegistryRunner {
         }
     }
 
+    /// Whether the process holding this scheduler's id is still running: its
+    /// heartbeat moves within one heartbeat interval. A process that crashed
+    /// leaves a heartbeat that stays fresh for a while but no longer moves, so a
+    /// fresh heartbeat alone does not tell the two apart.
+    async fn holder_keeps_beating(&self, observed: Option<&heartbeat::SchedulerHeartbeat>) -> bool {
+        let interval =
+            Duration::from_millis(self.entry.ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+        tokio::time::sleep(interval + interval / 2).await;
+        match self.heartbeats.read(&self.scheduler_id).await {
+            Ok(Some(beat)) => observed.is_none_or(|before| {
+                beat.instance_id != before.instance_id
+                    || beat.last_heartbeat_ms > before.last_heartbeat_ms
+            }),
+            Ok(None) | Err(_) => false,
+        }
+    }
+
     /// A registration heartbeat write, bounded like the loop's writes: an
     /// unbounded put here can outlast the grace period that lets another
     /// incarnation take the id over, which is worse than publishing late.
@@ -626,7 +675,7 @@ impl SchedulerRegistryRunner {
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
-        // `scheduler_id` is `{advertise_host}:{port}` and so is stable across
+        // `scheduler_id` is the instance identity and so is stable across
         // restarts, while `instance_id` is per-process. Two incarnations can
         // therefore share the heartbeat key, and registration deliberately
         // lets a new one take over once the old looks stale. An incarnation
@@ -900,7 +949,7 @@ impl SchedulerRegistryRunner {
             );
         }
         *peers = next;
-        cluster_metrics::set_scheduler_count(&self.scheduler_id, peers.len() as u64);
+        cluster_metrics::set_scheduler_count(&self.entry.advertise_address, peers.len() as u64);
         Ok(())
     }
 
@@ -951,16 +1000,20 @@ pub(super) async fn build_object_store(
         Arc::clone(&rt.secrets()),
         rt.tokio_io_runtime().clone(),
         state,
+        rt.state_location_check(),
     )
     .await
 }
 
+/// Builds the scheduler's store at `state`. A store in `runtime.state` writes
+/// only once `check` has passed.
 pub async fn build_object_store_internal(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,
+    check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
-    runtime_state_location::build_object_store(
+    let (store, prefix) = runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         state,
@@ -969,7 +1022,14 @@ pub async fn build_object_store_internal(
     .await
     .map_err(|source| Error::ObjectStoreState {
         source: Box::new(source),
-    })
+    })?;
+    let store = match check {
+        Some(check) if state.source == StateSource::RuntimeState => {
+            check.guard(runtime_state_location::StateFeature::Scheduler, store)
+        }
+        _ => store,
+    };
+    Ok((store, prefix))
 }
 
 fn now_ms() -> Result<u64> {
@@ -2780,6 +2840,141 @@ mod tests {
         assert!(
             !runner.superseded.load(Ordering::Relaxed),
             "a read failure is not evidence of supersession"
+        );
+    }
+
+    /// Registers a holder under the shared test id and returns a runner for a
+    /// second process with the same identity.
+    async fn second_process_under_one_identity(
+        store: &Arc<dyn ObjectStore>,
+    ) -> (
+        Arc<SchedulerHeartbeatStore>,
+        Uuid,
+        SchedulerRegistryRunner,
+        Arc<ClusterStateStore>,
+    ) {
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let holder = Uuid::new_v4();
+        runner_over(&cluster, &heartbeats, store, holder)
+            .register_self()
+            .await
+            .expect("the holder registers");
+        let second = runner_over(&cluster, &heartbeats, store, Uuid::new_v4());
+        (heartbeats, holder, second, cluster)
+    }
+
+    /// A second running process under one identity is refused, and is reported
+    /// as a duplicate because the holder keeps heartbeating.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_running_process_under_one_identity_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (heartbeats, holder, second, cluster) = second_process_under_one_identity(&store).await;
+        let first_beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("the holder's heartbeat")
+            .last_heartbeat_ms;
+        let beater = tokio::spawn({
+            let heartbeats = Arc::clone(&heartbeats);
+            async move {
+                for beat in 1..=10 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    heartbeats
+                        .heartbeat("test:50051", holder, first_beat + beat * 5_000, 30_000)
+                        .await
+                        .expect("the holder heartbeats");
+                }
+            }
+        });
+
+        let err = second
+            .register_self()
+            .await
+            .expect_err("a second running process must be refused");
+        beater.abort();
+
+        assert!(
+            matches!(
+                err,
+                Error::SchedulerIdConflict {
+                    holder_running: true,
+                    ..
+                }
+            ),
+            "the holder kept heartbeating, so this is a duplicate: {err:?}"
+        );
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(holder),
+            "the holder keeps its registration"
+        );
+    }
+
+    /// A process whose predecessor crashed moments ago is refused until the
+    /// predecessor's heartbeat goes stale, but it is not reported as a duplicate:
+    /// the predecessor's heartbeat no longer moves.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_after_a_crash_is_not_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (_heartbeats, holder, second, cluster) =
+            second_process_under_one_identity(&store).await;
+
+        let err = second
+            .register_self()
+            .await
+            .expect_err("the crashed predecessor's heartbeat is still fresh");
+
+        assert!(
+            matches!(
+                err,
+                Error::SchedulerIdConflict {
+                    holder_running: false,
+                    ..
+                }
+            ),
+            "the predecessor stopped heartbeating, so this is not a duplicate: {err:?}"
+        );
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(holder)
+        );
+    }
+
+    /// A scheduler registered under both its previous `host:port` key and its
+    /// instance identity is reached once, and this scheduler not at all.
+    #[test]
+    fn remote_scheduler_addresses_are_listed_once() {
+        let entry = |id: &str, address: &str| SchedulerEntry {
+            scheduler_id: id.to_string(),
+            instance_id: Uuid::new_v4(),
+            advertise_address: address.to_string(),
+            grpc_address: address.to_string(),
+            http_address: address.to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let peers = SchedulerPeers::from([
+            (
+                "10.0.0.2:50052".to_string(),
+                entry("10.0.0.2:50052", "10.0.0.2:50052"),
+            ),
+            ("sched-b".to_string(), entry("sched-b", "10.0.0.2:50052")),
+            ("sched-a".to_string(), entry("sched-a", "10.0.0.1:50052")),
+        ]);
+        assert_eq!(
+            remote_scheduler_addresses(&peers, "10.0.0.1:50052"),
+            ["10.0.0.2:50052"]
         );
     }
 }

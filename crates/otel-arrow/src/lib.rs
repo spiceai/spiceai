@@ -17,6 +17,9 @@ limitations under the License.
 mod schema;
 pub use schema::*;
 
+mod series_id;
+pub use series_id::series_ids;
+
 mod converter;
 pub use converter::*;
 pub mod error;

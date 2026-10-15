@@ -124,6 +124,10 @@ struct HttpRateControlPersistedState {
     store: Arc<dyn ObjectStore>,
     base_prefix: String,
     refresh_interval: Duration,
+    /// Names this process's leases in the shared state. A lease holds tokens this
+    /// process has taken, so the name pairs the instance identity with a
+    /// per-process id: a restarted instance must not inherit its earlier run's
+    /// grant, and two processes with one identity must not share a grant.
     instance_id: String,
     instance_ttl: Duration,
 }
@@ -1180,7 +1184,7 @@ impl HttpRateControlRegistry {
                 store,
                 base_prefix: base_prefix.into(),
                 refresh_interval,
-                instance_id: uuid::Uuid::new_v4().to_string(),
+                instance_id: lease_holder_id(util::instance_id::instance_id()),
                 instance_ttl: persisted_instance_ttl(refresh_interval),
             }),
             ..Self::default()
@@ -2032,6 +2036,11 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// The name of this process's leases: `<instance identity>/<per-process id>`.
+fn lease_holder_id(instance_id: &str) -> String {
+    format!("{instance_id}/{}", uuid::Uuid::new_v4())
+}
+
 fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
     refresh_interval
         .saturating_mul(3)
@@ -2117,6 +2126,70 @@ mod tests {
         assert_eq!(controller.admission_coefficient(), Some(1.0));
         assert_eq!(controller.metrics().adaptive_throttled_total(), 0);
         assert_eq!(controller.metrics().permits_acquired_total(), 20);
+    }
+
+    /// Two processes of one instance, such as a run and the run that replaced it,
+    /// hold separate leases, each named by the instance identity. A shared lease
+    /// would hand the restarted process the tokens its earlier run already took.
+    #[tokio::test]
+    async fn each_process_of_an_instance_holds_its_own_lease() {
+        use object_store::ObjectStoreExt;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let origin = "https://restart.example.com:443";
+        for _ in 0..2 {
+            let registry = HttpRateControlRegistry::with_persisted_governor_state(
+                Arc::clone(&store),
+                "",
+                Duration::from_secs(60),
+            );
+            let controller = build_shared_rate_controller(
+                origin,
+                "spicepod",
+                &rps_config(10),
+                registry.persisted_governor_state.as_ref(),
+            )
+            .controller
+            .expect("a limited origin has a controller");
+            controller
+                .refresh_and_persist_state_snapshot()
+                .await
+                .expect("lease the window");
+        }
+
+        let path = object_store::path::Path::from(format!(
+            "{}.json",
+            rate_control_state_object_key("spicepod", origin)
+        ));
+        let bytes = store
+            .get(&path)
+            .await
+            .expect("read the shared state")
+            .bytes()
+            .await
+            .expect("read the shared state bytes");
+        let state: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("the shared state is JSON");
+        let holders: std::collections::BTreeSet<String> = state["limiters"]
+            .as_object()
+            .expect("limiters")
+            .values()
+            .flat_map(|limiter| limiter["windows"].as_object().expect("windows").values())
+            .flat_map(|window| window["leases"].as_object().expect("leases").keys())
+            .cloned()
+            .collect();
+        let identity_prefix = format!("{}/", util::instance_id::instance_id());
+        assert_eq!(
+            holders.len(),
+            2,
+            "each process holds its own lease: {holders:?}"
+        );
+        assert!(
+            holders
+                .iter()
+                .all(|holder| holder.starts_with(&identity_prefix)),
+            "every lease is named by the instance identity: {holders:?}"
+        );
     }
 
     /// A persisted controller adapts through its leased cluster buckets: once a
