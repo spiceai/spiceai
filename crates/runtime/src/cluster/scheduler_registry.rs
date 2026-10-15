@@ -268,6 +268,11 @@ struct CleanupPass {
 
 impl CleanupPass {
     fn log(&self) {
+        tracing::debug!(
+            jobs_deleted = self.jobs.as_ref().ok(),
+            tables_removed = self.tables.as_ref().ok().map(|changes| changes.removed.len()),
+            "State cleanup pass finished"
+        );
         match &self.jobs {
             Ok(0) => {}
             Ok(deleted) => tracing::info!(

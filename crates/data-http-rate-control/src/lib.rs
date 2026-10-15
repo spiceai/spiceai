@@ -156,7 +156,7 @@ async fn delete_unused_rate_control_state(store: &dyn ObjectStore, prefix: &str)
     )
     .await
     {
-        Ok(0) => {}
+        Ok(0) => tracing::debug!("State cleanup pass finished: no rate-control state to delete"),
         Ok(deleted) => tracing::info!(
             "State cleanup deleted the shared rate-control state of {deleted} origins that no instance has sent requests to for {retention}."
         ),
