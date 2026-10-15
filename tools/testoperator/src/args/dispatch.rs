@@ -1243,7 +1243,7 @@ benchmark_dataset: fiqa_retrieval
         );
 
         let test_file = format!("tests:\n  search:\n{}", indent(args, "    "));
-        yaml::from_str::<DispatchTestFile>(&test_file).unwrap_err();
+        yaml::from_str::<DispatchTestFile>(&test_file).expect_err("file should be rejected");
     }
 
     fn indent(text: &str, prefix: &str) -> String {

@@ -208,7 +208,7 @@ mod tests {
     fn label_rejects_non_string_or_empty_values() {
         for value in [serde_json::json!(""), serde_json::json!(3)] {
             let metadata = HashMap::from([("benchmark_dataset".to_string(), value)]);
-            BenchmarkDataset::from_metadata(&metadata).unwrap_err();
+            BenchmarkDataset::from_metadata(&metadata).expect_err("label should be rejected");
         }
     }
 
