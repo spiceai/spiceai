@@ -18,8 +18,8 @@ pub mod catalogs;
 pub mod cdc;
 pub mod chat;
 pub mod datasets;
+pub mod decisions;
 pub mod embeddings;
-pub mod evaluate;
 pub mod functions;
 pub mod iceberg;
 pub mod responses;
@@ -27,6 +27,7 @@ pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
+pub mod otlp;
 pub mod packages;
 pub mod queries;
 pub mod query;
@@ -51,6 +52,7 @@ use crate::{
         },
     },
     egress::EgressAccount,
+    http::server_timing::ServerTiming,
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
@@ -341,7 +343,7 @@ async fn query_stream_to_http_response(
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
-    (StatusCode::OK, headers, body).into_response()
+    streamed_response(headers, body)
 }
 
 /// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
@@ -511,7 +513,15 @@ async fn query_raw_stream_to_http_response(
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_from_batches(first, data_stream, account));
-    (StatusCode::OK, headers, body).into_response()
+    streamed_response(headers, body)
+}
+
+/// A `200 OK` whose body streams, marked so its `Server-Timing` total is sent
+/// as a trailer: the total is not known until the body ends.
+fn streamed_response(headers: HeaderMap, body: Body) -> Response {
+    let mut response = (StatusCode::OK, headers, body).into_response();
+    response.extensions_mut().insert(ServerTiming::Trailer);
+    response
 }
 
 trait SqlJsonBatch: Send + 'static {
@@ -836,6 +846,16 @@ mod tests {
         dataaccelerator::AcceleratorEngineRegistry, datafusion::builder::DataFusionBuilder,
         status::RuntimeStatus,
     };
+
+    /// A query the results cache refuses (e.g. one calling `random()` or
+    /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
+    /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
+    #[test]
+    fn disabled_results_cache_emits_no_cache_status_headers() {
+        assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert!(CacheStatus::CacheDisabled.to_header_string().is_none());
+        assert_eq!(CacheStatus::CacheHit.to_header_string(), Some("HIT"));
+    }
 
     /// `/v1/sql` must let clients distinguish outcomes by status code: a
     /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a

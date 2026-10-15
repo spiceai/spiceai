@@ -18,9 +18,10 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
-    InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics, TableStorageStats,
+    ColdTierFile, CompressionStrategy, CreateTableOptions, DeleteFile, DeletionType,
+    IndexRunRecord, InlinedData, InlinedDataStats, InlinedDelete, PartitionMetadata,
+    PkConflictDetection, SettingsChangeAction, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+    TableStatistics, TableStorageStats, VortexConfig,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
@@ -411,7 +412,7 @@ impl CayenneCatalog {
         txn.commit().await?;
         tracing::debug!(
             table_id,
-            "Dropped persisted column statistics because a decimal column's scale changed"
+            "Dropped persisted statistics during a logical schema change"
         );
         Ok(())
     }
@@ -491,6 +492,27 @@ impl CayenneCatalog {
             })
             .await?;
         }
+        Ok(())
+    }
+
+    /// Delete a table's persisted exact statistics inside a caller-owned
+    /// transaction whose commit adds rows to the table without moving its
+    /// current snapshot. They no longer describe the visible rows, and
+    /// `DataFusion` may substitute an exact count directly into `COUNT(*)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement fails.
+    pub async fn clear_table_statistics_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+    ) -> CatalogResult<()> {
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id.to_string())],
+        })
+        .await?;
         Ok(())
     }
 
@@ -964,6 +986,36 @@ impl CayenneCatalog {
                 .map(|id| sql_text_literal(id))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // CAS guard, the counterpart of `swap_protected_snapshots_in_txn`'s:
+            // every protected snapshot this rewrite folded must still be
+            // registered. The rewrite's output already holds their rows, so if a
+            // concurrent writer swapped one for a merged snapshot (or removed it)
+            // after the rewrite captured its fence, the snapshot that replaced it
+            // would stay registered beside the output and its rows would be read
+            // twice. A second provider instance for the same table is one way that
+            // happens — its `compaction_lock` is its own, so nothing in memory
+            // serializes its protected-snapshot merge against this rewrite — and
+            // a retention delete that empties a protected snapshot is another.
+            let folded = protected_snapshot_ids_to_clear.len();
+            let count_values = txn
+                .query_row_values(QueryRowParams {
+                    sql: &format!(
+                        "SELECT COUNT(*) FROM cayenne_snapshot_sequence \
+                         WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list})"
+                    ),
+                    params: vec![],
+                })
+                .await?;
+            let registered =
+                usize::try_from(i64::from_value(metastore_value_at(&count_values, 0)?)?)
+                    .unwrap_or(0);
+            if registered != folded {
+                return Err(CatalogError::ProtectedSnapshotsReplaced {
+                    table_id: table_id.to_string(),
+                    folded,
+                    missing: folded.saturating_sub(registered),
+                });
+            }
             format!(
                 "DELETE FROM cayenne_snapshot_sequence \
                  WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); "
@@ -1136,7 +1188,7 @@ impl CayenneCatalog {
         // cold store. No inline payload: a graduation's content is the cold files
         // registered below, and the overwrite clear correctly drops the warm
         // tier's inline corpus along with everything else keyed on the old snapshot.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
             .await?;
         // One statement per file rather than `execute_many`: each row carries
         // a statistics blob and a primary-key bloom of up to
@@ -1178,6 +1230,7 @@ impl CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -1237,6 +1290,13 @@ impl CayenneCatalog {
                         .to_string(),
                     source: Box::new(e),
                 })?;
+        }
+
+        // The position deletes that hide the copies later copies superseded, after
+        // the batch above cleared the previous snapshot's.
+        for chunk in delete_files.chunks(32_000 / 10) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
         Ok(())
     }
@@ -1371,27 +1431,40 @@ impl CayenneCatalog {
         Ok(rows.into_iter().next().unwrap_or(0))
     }
 
-    /// Reconcile a reopened table's stored `VortexConfig` with the currently
-    /// configured options, for the fields that describe how the table is RUN
-    /// rather than whether existing files remain readable: clustering and
-    /// datalake settings plus scan concurrency.
+    /// Reconcile a reopened table's stored `VortexConfig` with the requested options for
+    /// every setting that can change without rewriting a stored row, and return the
+    /// changed settings an operator configures that this applied.
     ///
-    /// These are deliberately excluded from [`configuration_matches`] (changing
-    /// them never recreates the table), and the provider runs with the STORED
-    /// config — so a spicepod change must be persisted here to take effect on
-    /// reopen. Without that, `cayenne_scan_concurrency` would be inert on every
-    /// table that already exists, which is exactly when an operator reaches for
-    /// it: lowering it under memory pressure would silently keep the old value.
+    /// Two kinds of setting qualify:
     ///
-    /// One change is rejected instead of persisted: moving (or unsetting) the
-    /// cold location while cold files exist, because the cold manifest's
-    /// absolute file URLs point at the old location and the next promotion's
-    /// replace-all would strand them.
-    async fn reconcile_runtime_only_config(
+    /// - **Layout** — sort order, clustering, compression, delta encoding and the write
+    ///   shard key decide how rows are written, never how a stored row is read: every
+    ///   Vortex file is self-describing, pruning reads each file's own footer
+    ///   statistics, and a scan claims a sort order only for a snapshot this process
+    ///   has itself rewritten in that order. Rows already stored keep their layout until
+    ///   a refresh or compaction rewrites them.
+    /// - **Runtime** — scan concurrency and the datalake tier, which describe how the
+    ///   table is run.
+    ///
+    /// The provider writes with the requested layout settings either way — they reach
+    /// it through its `CayenneContext` — and the stored copy is what the datalake tier
+    /// and the next open compare against, so persisting them keeps the stored
+    /// configuration the one the table runs with rather than the one it was created
+    /// with.
+    ///
+    /// Callers apply this only once the settings that define the stored rows match
+    /// ([`identity_setting_changes`]): when those differ the table is either kept with
+    /// its stored settings wholesale or rebuilt, and persisting part of the new
+    /// settings would leave a mixed state.
+    ///
+    /// One change is rejected instead of persisted: moving (or unsetting) the cold
+    /// location while cold files exist, because the cold manifest's absolute file URLs
+    /// point at the old location and the next promotion's replace-all would strand them.
+    async fn reconcile_in_place_settings(
         &self,
         stored: &mut TableMetadata,
         options: &CreateTableOptions,
-    ) -> CatalogResult<()> {
+    ) -> CatalogResult<Vec<SettingChange>> {
         let normalize = |loc: &Option<String>| -> Option<String> {
             loc.as_deref()
                 .map(|l| l.trim().trim_end_matches('/').to_string())
@@ -1413,31 +1486,66 @@ impl CayenneCatalog {
             }
         }
 
+        let mut applied = layout_setting_changes(&stored.vortex_config, &options.vortex_config);
+        // Reached only once the identity comparison passed, so a conflict-detection
+        // change here turns the check off for a keyed table, or changes it on a table
+        // without a primary key, where it checks nothing. The recorded `on_conflict`
+        // follows it: a table without the check records none.
+        if disables_pk_conflict_detection(stored, options) {
+            applied.push(SettingChange::new(
+                "`cayenne_pk_conflict_detection`",
+                format!("'{}'", stored.vortex_config.pk_conflict_detection.as_str()),
+                format!("'{}'", options.vortex_config.pk_conflict_detection.as_str()),
+            ));
+        }
+        let on_conflict_differs = stored.on_conflict.as_ref().map(ToString::to_string)
+            != options.on_conflict.as_ref().map(ToString::to_string);
         let stored_vc = &stored.vortex_config;
         let new_vc = &options.vortex_config;
-        let runtime_fields_differ = stored_vc.scan_concurrency != new_vc.scan_concurrency
+        let fields_differ = !applied.is_empty()
+            || on_conflict_differs
+            || stored_vc.pk_conflict_detection != new_vc.pk_conflict_detection
+            || stored_vc.sort_columns_origin != new_vc.sort_columns_origin
+            || stored_vc.scan_concurrency != new_vc.scan_concurrency
             || stored_vc.cold_tier_location != new_vc.cold_tier_location
-            || stored_vc.cluster_by != new_vc.cluster_by
             || stored_vc.cold_target_file_size_mb != new_vc.cold_target_file_size_mb
             || stored_vc.cold_clustering_run_size_mb != new_vc.cold_clustering_run_size_mb
             || stored_vc.cold_tier_warm_max_bytes != new_vc.cold_tier_warm_max_bytes
             || stored_vc.cold_tier_warm_max_files != new_vc.cold_tier_warm_max_files
             || stored_vc.cold_tier_background_interval_ms
                 != new_vc.cold_tier_background_interval_ms;
-        if !runtime_fields_differ {
-            return Ok(());
+        if !fields_differ {
+            return Ok(applied);
         }
 
-        stored.vortex_config.scan_concurrency = new_vc.scan_concurrency;
-
+        // Layout.
         stored
             .vortex_config
-            .cold_tier_location
-            .clone_from(&new_vc.cold_tier_location);
+            .sort_columns
+            .clone_from(&new_vc.sort_columns);
+        stored.vortex_config.sort_columns_origin = new_vc.sort_columns_origin;
         stored
             .vortex_config
             .cluster_by
             .clone_from(&new_vc.cluster_by);
+        stored
+            .vortex_config
+            .compression_strategy
+            .clone_from(&new_vc.compression_strategy);
+        stored.vortex_config.delta_encoding = new_vc.delta_encoding;
+        stored
+            .vortex_config
+            .shard_key_columns
+            .clone_from(&new_vc.shard_key_columns);
+        stored.vortex_config.pk_conflict_detection = new_vc.pk_conflict_detection;
+        stored.on_conflict.clone_from(&options.on_conflict);
+
+        // Runtime.
+        stored.vortex_config.scan_concurrency = new_vc.scan_concurrency;
+        stored
+            .vortex_config
+            .cold_tier_location
+            .clone_from(&new_vc.cold_tier_location);
         stored.vortex_config.cold_target_file_size_mb = new_vc.cold_target_file_size_mb;
         stored.vortex_config.cold_clustering_run_size_mb = new_vc.cold_clustering_run_size_mb;
         stored.vortex_config.cold_tier_warm_max_bytes = new_vc.cold_tier_warm_max_bytes;
@@ -1454,11 +1562,13 @@ impl CayenneCatalog {
                 source: Box::new(e),
             }
         })?;
+        let on_conflict_json = stored.on_conflict.as_ref().map(ToString::to_string);
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "UPDATE cayenne_table SET vortex_config_json = ?1 WHERE table_id = ?2",
+                sql: "UPDATE cayenne_table SET vortex_config_json = ?1, on_conflict_json = ?2 WHERE table_id = ?3",
                 params: vec![
                     MetastoreValue::Text(vortex_config_json),
+                    on_conflict_json.map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Text(stored.table_id.clone()),
                 ],
             })
@@ -1472,9 +1582,9 @@ impl CayenneCatalog {
             })?;
         tracing::debug!(
             table = stored.table_name.as_str(),
-            "Reconciled runtime configuration from spicepod params on table reopen"
+            "Reconciled layout and runtime configuration from spicepod params on table reopen"
         );
-        Ok(())
+        Ok(applied)
     }
 
     async fn validate_existing_table_configuration(
@@ -1486,54 +1596,84 @@ impl CayenneCatalog {
             Ok(mut stored_metadata) => {
                 log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
 
-                // Datalake (cold tier) config is runtime-toggleable, not table
-                // identity: reconcile it here instead of comparing it in
-                // `configuration_matches`. Gated on the rest of the
-                // configuration matching (schema excluded — widening evolution
-                // is handled below): when identity config differs, the caller
-                // falls back to the stored config wholesale, and persisting
-                // PART of the new config (the cold fields) would leave a mixed
-                // state. Rejects a location change while cold files exist;
-                // persists any other cold-field change.
-                if configuration_matches_ignoring_schema(&stored_metadata, options) {
-                    self.reconcile_runtime_only_config(&mut stored_metadata, options)
-                        .await?;
+                // Settings that define the stored rows cannot be applied to them in
+                // place: the table is rebuilt when the caller can afford it, and kept
+                // with its stored settings wholesale otherwise.
+                let identity_changes = identity_setting_changes(&stored_metadata, options);
+                if !identity_changes.is_empty() {
+                    if options.vortex_config.settings_change == SettingsChangeAction::Rebuild {
+                        return Err(CatalogError::SettingsChangeRequiresRebuild {
+                            table_name: table_name.to_string(),
+                            changes: describe_setting_changes(&identity_changes),
+                        });
+                    }
+                    // Rows written with the check off may share a key, so they cannot
+                    // give the one row per key the spicepod asks for. Kept, the table
+                    // would also go on writing without the check, since the provider
+                    // follows the stored mode, so this change is refused rather than
+                    // kept.
+                    if enables_pk_conflict_detection(&stored_metadata, options) {
+                        if options.vortex_config.settings_change
+                            == SettingsChangeAction::HoldUntilSourceReadable
+                        {
+                            return Err(CatalogError::PkConflictDetectionChangeHeld {
+                                table_name: table_name.to_string(),
+                            });
+                        }
+                        return Err(CatalogError::PkConflictDetectionEnabledOnExistingTable {
+                            table_name: table_name.to_string(),
+                        });
+                    }
+                    let warning = if options.vortex_config.settings_change
+                        == SettingsChangeAction::HoldUntilSourceReadable
+                    {
+                        settings_held_warning(table_name, &identity_changes)
+                    } else {
+                        settings_kept_warning(
+                            table_name,
+                            &identity_changes,
+                            options.vortex_config.memory_mode,
+                        )
+                    };
+                    tracing::warn!("{warning}");
+                    return Err(CatalogError::ChangedConfiguration {
+                        table_name: table_name.to_string(),
+                    });
                 }
 
-                if configuration_matches(&stored_metadata, options) {
+                let applied = self
+                    .reconcile_in_place_settings(&mut stored_metadata, options)
+                    .await?;
+                if !applied.is_empty() {
+                    tracing::info!(
+                        "{}",
+                        settings_applied_in_place_message(table_name, &applied)
+                    );
+                }
+
+                if configuration_schemas_match(&stored_metadata.schema, &options.schema) {
                     return Ok(stored_metadata);
                 }
 
                 // Widening schema evolution (policy-gated by the runtime via
-                // `vortex_config.schema_evolution`): when the schema is the
-                // ONLY configuration difference and the requested schema is a
-                // lossless widening of the stored one within the policy's
-                // evolution set, commit the widened schema and proceed with
-                // the existing table_id/data. Any other difference (or a
-                // disabled policy) keeps the legacy pin-stored-schema path.
-                if !options.vortex_config.schema_evolution.is_disabled()
-                    && configuration_matches_ignoring_schema(&stored_metadata, options)
-                {
-                    match self
+                // `vortex_config.schema_evolution`): when the requested schema is a
+                // lossless widening of the stored one within the policy's evolution
+                // set, commit the widened schema and proceed with the existing
+                // table_id/data. Otherwise the stored schema stays canonical; the
+                // evolution attempt has already said why.
+                if !options.vortex_config.schema_evolution.is_disabled() {
+                    return match self
                         .try_widening_schema_evolution(table_name, stored_metadata, options)
                         .await?
                     {
-                        Ok(evolved_metadata) => return Ok(evolved_metadata),
-                        Err(stored_metadata_back) => {
-                            log_configuration_differences(
-                                table_name,
-                                &stored_metadata_back,
-                                options,
-                            );
-                            return Err(CatalogError::ChangedConfiguration {
-                                table_name: table_name.to_string(),
-                            });
-                        }
-                    }
+                        Ok(evolved_metadata) => Ok(evolved_metadata),
+                        Err(_stored_metadata) => Err(CatalogError::ChangedConfiguration {
+                            table_name: table_name.to_string(),
+                        }),
+                    };
                 }
 
-                log_configuration_differences(table_name, &stored_metadata, options);
-
+                tracing::warn!("{}", schema_kept_warning(table_name));
                 Err(CatalogError::ChangedConfiguration {
                     table_name: table_name.to_string(),
                 })
@@ -1551,8 +1691,8 @@ impl CayenneCatalog {
     /// lossless widening within the configured
     /// [`crate::metadata::SchemaEvolutionMode`]'s evolution set and the
     /// metastore UPDATE committed; `Ok(Err(stored_metadata))` when the change
-    /// is outside the evolution set (block-equivalent — the caller falls back
-    /// to the legacy `ChangedConfiguration` path); `Err(_)` only when the
+    /// is outside the evolution set (block-equivalent — the caller keeps the
+    /// stored schema, and this has already logged why); `Err(_)` only when the
     /// metastore UPDATE itself fails.
     async fn try_widening_schema_evolution(
         &self,
@@ -1609,7 +1749,8 @@ impl CayenneCatalog {
                 Ok(Err(stored_metadata))
             }
             // A reorder/nullability-tighten-only difference: the stored schema
-            // remains canonical; keep the legacy warn + pin path.
+            // remains canonical, and nothing the operator configured is lost by
+            // keeping it.
             SchemaEvolution::Identical => Ok(Err(stored_metadata)),
         }
     }
@@ -3673,6 +3814,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -3695,7 +3837,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -4351,6 +4493,67 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_index_run \
+                      (table_id, index_key, run_name, row_count, size_bytes) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
+                params: vec![
+                    MetastoreValue::Text(run.table_id.clone()),
+                    MetastoreValue::Text(run.index_key.clone()),
+                    MetastoreValue::Text(run.run_name.clone()),
+                    MetastoreValue::Integer(i64::try_from(run.row_count).unwrap_or(i64::MAX)),
+                    MetastoreValue::Integer(i64::try_from(run.size_bytes).unwrap_or(i64::MAX)),
+                ],
+            })
+            .await
+    }
+
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
+        let owner = table_id.to_string();
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT index_key, run_name, row_count, size_bytes
+                    FROM cayenne_index_run
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                move |row| {
+                    Ok(IndexRunRecord {
+                        table_id: owner.clone(),
+                        index_key: row.get_string(0)?,
+                        run_name: row.get_string(1)?,
+                        row_count: u64::try_from(row.get_i64(2)?).unwrap_or(0),
+                        size_bytes: u64::try_from(row.get_i64(3)?).unwrap_or(0),
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_index_run \
+                      WHERE table_id = ?1 AND index_key = ?2 AND run_name = ?3",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(index_key.to_string()),
+                    MetastoreValue::Text(run_name.to_string()),
+                ],
+            })
+            .await
+    }
+
     async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
         let table_id = data.table_id.clone();
         let sequence_number = data.sequence_number;
@@ -4598,7 +4801,8 @@ impl MetadataCatalog for CayenneCatalog {
                         (SELECT COUNT(*) FROM cayenne_snapshot_file_statistics WHERE table_id = ?1),
                         (SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?2),
                         idt.n, idt.row_total, idt.bytes,
-                        idl.n, idl.deletes
+                        idl.n, idl.deletes,
+                        (SELECT COUNT(*) FROM cayenne_index_run WHERE table_id = ?1)
                     FROM
                         (SELECT COUNT(*) AS n,
                                 COALESCE(SUM(file_size_bytes), 0) AS bytes,
@@ -4651,6 +4855,7 @@ impl MetadataCatalog for CayenneCatalog {
                         inlined_bytes: row.get_i64(19)?,
                         inlined_delete_entries: row.get_i64(20)?,
                         inlined_delete_rows: row.get_i64(21)?,
+                        index_run_rows: row.get_i64(22)?,
                     })
                 },
             )
@@ -5853,57 +6058,290 @@ fn configuration_schemas_match(left: &arrow_schema::Schema, right: &arrow_schema
             .all(|(key, value)| is_statistic(key) || left.metadata().get(key) == Some(value))
 }
 
-/// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
-///
-/// Returns `true` if the configuration matches (no recreation needed).
-/// Only compares data-affecting fields; runtime tuning parameters like cache sizes
-/// and write/upload concurrency are excluded since they don't affect data correctness.
-fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
-    if !configuration_schemas_match(&stored.schema, &options.schema) {
-        return false;
-    }
-
-    configuration_matches_ignoring_schema(stored, options)
+/// One setting whose stored value differs from the requested one, named the way an
+/// operator configures it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingChange {
+    /// The setting, as a backticked Spicepod key or, for a derived setting such as
+    /// the data location, a plain description.
+    setting: &'static str,
+    stored: String,
+    requested: String,
 }
 
-/// [`configuration_matches`] minus the schema comparison. Used by the widening
-/// schema-evolution path to establish that the schema is the ONLY configuration
-/// difference before consulting the classifier.
-fn configuration_matches_ignoring_schema(
+impl SettingChange {
+    /// A setting value can hold a control character, as a quoted column identifier
+    /// may, and must not break the single line the message that embeds it is logged on.
+    fn new(setting: &'static str, stored: String, requested: String) -> Self {
+        Self {
+            setting,
+            stored: single_line_value(stored),
+            requested: single_line_value(requested),
+        }
+    }
+}
+
+/// `value` with its control characters replaced ([`util::single_line`]), moved through
+/// unchanged when it has none.
+fn single_line_value(value: String) -> String {
+    let collapsed = match util::single_line(&value) {
+        std::borrow::Cow::Owned(collapsed) => Some(collapsed),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    collapsed.unwrap_or(value)
+}
+
+impl std::fmt::Display for SettingChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} -> {}", self.setting, self.stored, self.requested)
+    }
+}
+
+/// `changes` as the comma-separated list the operator-facing messages embed.
+fn describe_setting_changes(changes: &[SettingChange]) -> String {
+    changes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A column list as a setting value: `none` when empty, otherwise the quoted names.
+fn columns_setting_value(columns: &[String]) -> String {
+    if columns.is_empty() {
+        "none".to_string()
+    } else {
+        format!(
+            "[{}]",
+            columns
+                .iter()
+                .map(|column| format!("'{column}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// An optional scalar as a setting value: `none` when unset, otherwise quoted.
+fn optional_setting_value(value: Option<&str>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| format!("'{value}'"))
+}
+
+fn compression_strategy_setting_value(strategy: &CompressionStrategy) -> String {
+    match strategy {
+        CompressionStrategy::Btrblocks => "'btrblocks'".to_string(),
+        CompressionStrategy::Zstd => "'zstd'".to_string(),
+    }
+}
+
+/// The `on_conflict` a table acts on, in its stored string form. A table without
+/// primary-key conflict detection resolves no conflicts, whatever its row records; a
+/// table with it upserts on its primary key whatever its row records (see
+/// [`crate::provider::table::upsert_on_primary_key`]). So neither the `DoNothing` an
+/// earlier release recorded on keyed tables nor an action recorded beside
+/// `pk_conflict_detection: none` reads as a changed setting.
+fn effective_on_conflict(
+    primary_key: &[String],
+    on_conflict: Option<&OnConflict>,
+    pk_conflict_detection: PkConflictDetection,
+) -> Option<String> {
+    if pk_conflict_detection == PkConflictDetection::None {
+        return None;
+    }
+    crate::provider::table::upsert_on_primary_key(primary_key, on_conflict.cloned())
+        .map(|on_conflict| on_conflict.to_string())
+}
+
+/// Whether `options` turns primary-key conflict detection off for a keyed table that
+/// was written with it on. Its rows are unique per key, which a table without the check
+/// may be too, so the change applies in place.
+fn disables_pk_conflict_detection(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
+    !stored.primary_key.is_empty()
+        && stored.vortex_config.pk_conflict_detection == PkConflictDetection::Auto
+        && options.vortex_config.pk_conflict_detection == PkConflictDetection::None
+}
+
+/// Whether `options` turns primary-key conflict detection on for a keyed table whose
+/// rows were written with it off, and so may share a key.
+fn enables_pk_conflict_detection(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
+    !stored.primary_key.is_empty()
+        && stored.vortex_config.pk_conflict_detection == PkConflictDetection::None
+        && options.vortex_config.pk_conflict_detection == PkConflictDetection::Auto
+}
+
+/// The settings that define `stored`'s rows and differ in `options`. None of them can
+/// be applied to stored rows in place: the primary key decides the deletion strategy
+/// and the key encodings recorded for every write, the effective `on_conflict` and
+/// conflict detection decide whether the stored rows are unique per key, the
+/// partition column decides which table the rows live in, and the location is where
+/// they are.
+///
+/// The schema is compared separately, under the dataset's `on_schema_change` policy.
+fn identity_setting_changes(
     stored: &TableMetadata,
     options: &CreateTableOptions,
-) -> bool {
-    // Compare primary keys
-    if stored.primary_key != options.primary_key {
-        return false;
+) -> Vec<SettingChange> {
+    let mut changes = Vec::new();
+
+    if stored.primary_key == options.primary_key {
+        if enables_pk_conflict_detection(stored, options) {
+            changes.push(SettingChange::new(
+                "`cayenne_pk_conflict_detection`",
+                format!("'{}'", stored.vortex_config.pk_conflict_detection.as_str()),
+                format!("'{}'", options.vortex_config.pk_conflict_detection.as_str()),
+            ));
+        } else if !disables_pk_conflict_detection(stored, options) {
+            let stored_on_conflict = effective_on_conflict(
+                &stored.primary_key,
+                stored.on_conflict.as_ref(),
+                stored.vortex_config.pk_conflict_detection,
+            );
+            let requested_on_conflict = effective_on_conflict(
+                &options.primary_key,
+                options.on_conflict.as_ref(),
+                options.vortex_config.pk_conflict_detection,
+            );
+            if stored_on_conflict != requested_on_conflict {
+                changes.push(SettingChange::new(
+                    "`on_conflict`",
+                    optional_setting_value(stored_on_conflict.as_deref()),
+                    optional_setting_value(requested_on_conflict.as_deref()),
+                ));
+            }
+        }
+    } else {
+        changes.push(SettingChange::new(
+            "`primary_key`",
+            columns_setting_value(&stored.primary_key),
+            columns_setting_value(&options.primary_key),
+        ));
+        // A new key already changes what the rows mean, but changing the check with it is
+        // a change of its own, and the list names every setting that changed: a table
+        // that keeps its settings keeps both. The requested table is keyed, so the check
+        // it asks for applies to it, whatever an unkeyed stored table recorded.
+        if !options.primary_key.is_empty()
+            && stored.vortex_config.pk_conflict_detection
+                != options.vortex_config.pk_conflict_detection
+        {
+            changes.push(SettingChange::new(
+                "`cayenne_pk_conflict_detection`",
+                format!("'{}'", stored.vortex_config.pk_conflict_detection.as_str()),
+                format!("'{}'", options.vortex_config.pk_conflict_detection.as_str()),
+            ));
+        }
     }
 
-    // Compare on-conflict behavior via string representation
-    let stored_oc = stored.on_conflict.as_ref().map(ToString::to_string);
-    let new_oc = options.on_conflict.as_ref().map(ToString::to_string);
-    if stored_oc != new_oc {
-        return false;
-    }
-
-    // Compare partition column
     if stored.partition_column != options.partition_column {
-        return false;
+        changes.push(SettingChange::new(
+            "`partition_by`",
+            optional_setting_value(stored.partition_column.as_deref()),
+            optional_setting_value(options.partition_column.as_deref()),
+        ));
     }
 
-    // Compare data-affecting Vortex config fields
-    if stored.vortex_config.sort_columns != options.vortex_config.sort_columns {
-        return false;
-    }
-    if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
-        return false;
+    // A snapshot restore re-anchors the stored path at the reader's data directory
+    // (`metastore::snapshot::import_dataset`), and re-anchoring a table rooted at that
+    // directory itself appends a separator: the same location, which must not read as a
+    // move — under `refresh_mode: full` it would rebuild every restored table on its
+    // first open and discard the snapshot it was restored from.
+    if stored.path.trim_end_matches('/') != options.base_path.trim_end_matches('/') {
+        changes.push(SettingChange::new(
+            "data location",
+            format!("'{}'", stored.path),
+            format!("'{}'", options.base_path),
+        ));
     }
 
-    // Compare base path (path change means data is in a different location)
-    if stored.path != options.base_path {
-        return false;
-    }
+    changes
+}
 
-    true
+/// The layout settings an operator configures that differ between `stored` and
+/// `requested`. Each is applied to an existing table in place
+/// ([`CayenneCatalog::reconcile_in_place_settings`]).
+fn layout_setting_changes(stored: &VortexConfig, requested: &VortexConfig) -> Vec<SettingChange> {
+    let mut changes = Vec::new();
+    if stored.sort_columns != requested.sort_columns {
+        changes.push(SettingChange::new(
+            "`cayenne_sort_columns`",
+            columns_setting_value(&stored.sort_columns),
+            columns_setting_value(&requested.sort_columns),
+        ));
+    }
+    if stored.cluster_by != requested.cluster_by {
+        changes.push(SettingChange::new(
+            "`cayenne_cluster_by`",
+            columns_setting_value(&stored.cluster_by),
+            columns_setting_value(&requested.cluster_by),
+        ));
+    }
+    if stored.compression_strategy != requested.compression_strategy {
+        changes.push(SettingChange::new(
+            "`cayenne_compression_strategy`",
+            compression_strategy_setting_value(&stored.compression_strategy),
+            compression_strategy_setting_value(&requested.compression_strategy),
+        ));
+    }
+    if stored.delta_encoding != requested.delta_encoding {
+        changes.push(SettingChange::new(
+            "`cayenne_delta_encoding`",
+            format!("'{}'", stored.delta_encoding),
+            format!("'{}'", requested.delta_encoding),
+        ));
+    }
+    if stored.shard_key_columns != requested.shard_key_columns {
+        changes.push(SettingChange::new(
+            "`cayenne_shard_key_columns`",
+            columns_setting_value(&stored.shard_key_columns),
+            columns_setting_value(&requested.shard_key_columns),
+        ));
+    }
+    changes
+}
+
+/// The line an operator reads when changed layout settings were applied to an
+/// existing table in place.
+fn settings_applied_in_place_message(table_name: &str, changes: &[SettingChange]) -> String {
+    format!(
+        "Applied the changed acceleration settings of dataset '{table_name}' to its existing acceleration in place ({}). Rows already stored keep their current layout until a refresh or compaction rewrites them.",
+        describe_setting_changes(changes)
+    )
+}
+
+/// The warning an operator reads when settings that define a table's stored rows
+/// changed and the table keeps the settings it was built with.
+///
+/// A `mode: memory` table is reached here only by a reload within one process — its
+/// metastore lives as long as the process — and is rebuilt from the source by the next
+/// restart, so its fix is that restart.
+fn settings_kept_warning(table_name: &str, changes: &[SettingChange], memory_mode: bool) -> String {
+    if memory_mode {
+        return format!(
+            "Dataset '{table_name}' keeps the settings its in-memory acceleration was built with until Spice restarts, so the changed settings ({}) do not take effect yet: they cannot be applied to the rows it holds in place. Restart Spice to rebuild the acceleration with the new settings. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            describe_setting_changes(changes)
+        );
+    }
+    format!(
+        "Dataset '{table_name}' keeps the settings its existing acceleration was built with, so the changed settings ({}) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only when a reload brings back every row it holds (`refresh_mode: full` with `write_mode: write_through`, from a source other than `sink`). To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+        describe_setting_changes(changes)
+    )
+}
+
+/// The warning an operator reads when settings that define a table's stored rows
+/// changed while its source cannot be read on the table's schema, so the table keeps the
+/// settings it was built with until it can.
+fn settings_held_warning(table_name: &str, changes: &[SettingChange]) -> String {
+    format!(
+        "Dataset '{table_name}' keeps the settings its existing acceleration was built with while its source cannot be read on that acceleration's schema, so the changed settings ({}) do not take effect yet: they cannot be applied to stored rows in place, and a rebuilt acceleration could not reload until the source can be read. Restart once the source is reachable and any change to its schema is resolved (revert it, or set `on_schema_change` to adopt it) to rebuild with the new settings. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+        describe_setting_changes(changes)
+    )
+}
+
+/// The warning an operator reads when a table keeps its stored schema because the
+/// dataset's `on_schema_change` policy does not evolve it.
+fn schema_kept_warning(table_name: &str) -> String {
+    format!(
+        "Dataset '{table_name}' keeps the schema its existing acceleration was built with, so the changed schema does not take effect. Set `on_schema_change` to evolve the acceleration's schema in place, or `mode: file_update` to rebuild the acceleration with the new schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    )
 }
 
 fn validate_create_table_options(options: &CreateTableOptions) -> CatalogResult<()> {
@@ -5973,88 +6411,6 @@ fn log_runtime_footer_cache_drift(
             "Cayenne table was registered with a different runtime.params.cayenne_footer_cache_mb than the value stored in the metastore; using the current runtime value"
         );
     }
-}
-
-/// Logs a warning describing exactly which configuration fields differ between the
-/// stored table metadata and the newly requested [`CreateTableOptions`].
-///
-/// Called when [`validate_existing_table_configuration`] detects a mismatch so the
-/// user can see *what* changed and how to resolve it.
-fn log_configuration_differences(
-    table_name: &str,
-    stored: &TableMetadata,
-    options: &CreateTableOptions,
-) {
-    let mut differences = Vec::new();
-
-    if stored.primary_key != options.primary_key {
-        differences.push(format!(
-            "primary_key: {:?} -> {:?}",
-            stored.primary_key, options.primary_key
-        ));
-    }
-
-    let stored_oc = stored.on_conflict.as_ref().map(ToString::to_string);
-    let new_oc = options.on_conflict.as_ref().map(ToString::to_string);
-    if stored_oc != new_oc {
-        differences.push(format!(
-            "on_conflict: {} -> {}",
-            stored_oc.as_deref().unwrap_or("none"),
-            new_oc.as_deref().unwrap_or("none"),
-        ));
-    }
-
-    if stored.partition_column != options.partition_column {
-        differences.push(format!(
-            "partition_column: {:?} -> {:?}",
-            stored.partition_column, options.partition_column
-        ));
-    }
-
-    if !configuration_schemas_match(&stored.schema, &options.schema) {
-        differences.push("schema: <changed>".to_string());
-    }
-
-    if stored.vortex_config.sort_columns != options.vortex_config.sort_columns {
-        differences.push(format!(
-            "sort_columns: {:?} -> {:?}",
-            stored.vortex_config.sort_columns, options.vortex_config.sort_columns
-        ));
-    }
-
-    if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
-        differences.push(format!(
-            "compression_strategy: {:?} -> {:?}",
-            stored.vortex_config.compression_strategy, options.vortex_config.compression_strategy
-        ));
-    }
-
-    // Note: `delta_encoding` is deliberately NOT part of the data-compatibility
-    // gate (`is_data_compatible`): every level emits standard Vortex encodings
-    // readable by the same scan, so a level change applies to future writes
-    // only and must not force a table re-create. Surface it in the change log.
-    if stored.vortex_config.delta_encoding != options.vortex_config.delta_encoding {
-        differences.push(format!(
-            "delta_encoding: {} -> {} (write-time only; existing data unaffected)",
-            stored.vortex_config.delta_encoding, options.vortex_config.delta_encoding
-        ));
-    }
-
-    if stored.path != options.base_path {
-        differences.push(format!(
-            "base_path: {:?} -> {:?}",
-            stored.path, options.base_path
-        ));
-    }
-
-    tracing::warn!(
-        table = table_name,
-        "Configuration for table '{table_name}' has changed but the existing acceleration was not recreated. \
-         Changed fields: [{}]. \
-         The acceleration will continue using the previously stored configuration. \
-         To apply the new configuration, delete the existing acceleration and restart.",
-        differences.join(", ")
-    );
 }
 
 #[cfg(test)]
@@ -6138,12 +6494,6 @@ mod tests {
             "cayenne_catalog.rs pins these table roots under /tmp, which another account may \
              already own; call test_table_root() instead: {pinned:#?}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_catalog_creation() {
-        let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
-        // Tests will be added once implementation is complete
     }
 
     /// The upserts replaced `INSERT OR REPLACE`, which rewrote the whole row.
@@ -8939,7 +9289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_falls_back_on_sort_columns_change() {
+    async fn test_create_table_applies_sort_columns_change_in_place() {
         let (_table_root, base_path) = test_table_root();
         let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
@@ -8965,7 +9315,7 @@ mod tests {
             .await
             .expect("Failed to create table");
 
-        // Add sort columns — should fall back to stored config with a warning
+        // Add sort columns — a layout setting, applied to the same table in place
         let vortex_config = crate::metadata::VortexConfig {
             sort_columns: vec!["ts".to_string()],
             ..Default::default()
@@ -8982,10 +9332,20 @@ mod tests {
         let table_id_2 = catalog
             .create_table(options_sorted)
             .await
-            .expect("Sort column change should fall back gracefully");
+            .expect("A sort column change should be applied in place");
         assert_eq!(
             table_id_1, table_id_2,
             "Should return the original table_id when sort columns change"
+        );
+        assert_eq!(
+            catalog
+                .get_table("sorted_table")
+                .await
+                .expect("Failed to get table")
+                .vortex_config
+                .sort_columns,
+            vec!["ts".to_string()],
+            "The stored configuration should record the new sort columns"
         );
 
         // Cleanup
@@ -9385,7 +9745,7 @@ mod tests {
 
         let before = catalog.metastore_query_count();
         let result = catalog
-            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None)
+            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None, &[])
             .await;
         violations.extend(statement_conflict_violation(
             "commit_overwrite",
@@ -9810,7 +10170,7 @@ mod tests {
     /// the aggregate query joins through `cayenne_table`, and a join that yields
     /// no rows still has to produce one all-zero result row for the gauges.
     #[tokio::test]
-    async fn table_storage_stats_of_an_untouched_table_is_all_zero() {
+    async fn table_storage_stats_tracks_index_run_registration_and_removal() {
         let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_table_storage_stats_empty_{}.db",
@@ -9840,6 +10200,38 @@ mod tests {
             .await
             .expect("sample storage stats for an empty table");
         assert_eq!(stats, crate::metadata::TableStorageStats::default());
+
+        for run_name in ["first.run", "second.run", "third.run"] {
+            catalog
+                .register_index_run(&crate::metadata::IndexRunRecord {
+                    table_id: table_id.clone(),
+                    index_key: "key".to_string(),
+                    run_name: run_name.to_string(),
+                    row_count: 100,
+                    size_bytes: 20,
+                })
+                .await
+                .expect("register an index run");
+        }
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("count registered runs");
+        assert_eq!(stats.index_run_rows, 3);
+        let other_stats = catalog
+            .table_storage_stats(&uuid::Uuid::now_v7().to_string())
+            .await
+            .expect("sample another table");
+        assert_eq!(other_stats.index_run_rows, 0);
+        catalog
+            .remove_index_run(&table_id, "key", "second.run")
+            .await
+            .expect("unregister an index run");
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("count remaining runs");
+        assert_eq!(stats.index_run_rows, 2);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -11064,249 +11456,438 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_configuration_matches_identical() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+    /// A requested configuration that differs from `stored` only where `edit` says.
+    fn requested_like(
+        stored: &TableMetadata,
+        edit: impl FnOnce(&mut CreateTableOptions),
+    ) -> CreateTableOptions {
+        let mut options = CreateTableOptions {
+            table_name: stored.table_name.clone(),
+            schema: Arc::clone(&stored.schema),
+            primary_key: stored.primary_key.clone(),
+            on_conflict: stored.on_conflict.clone(),
+            base_path: stored.path.clone(),
+            partition_column: stored.partition_column.clone(),
+            vortex_config: stored.vortex_config.clone(),
+        };
+        edit(&mut options);
+        options
+    }
+
+    fn id_schema() -> arrow_schema::SchemaRef {
+        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
             "id",
             arrow_schema::DataType::Int64,
             false,
-        )]));
-        let stored = make_test_metadata(
-            vec!["id".to_string()],
-            None,
-            None,
-            "table-root",
-            crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
-        );
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec!["id".to_string()],
-            on_conflict: None,
-            base_path: "table-root".to_string(),
-            partition_column: None,
-            vortex_config: crate::metadata::VortexConfig::default(),
-        };
-        assert!(
-            configuration_matches(&stored, &options),
-            "Identical configurations should match"
-        );
+        )]))
+    }
+
+    fn upsert_on(columns: &[&str]) -> OnConflict {
+        OnConflict::Upsert(
+            datafusion_table_providers::util::column_reference::ColumnReference::new(
+                columns.iter().map(ToString::to_string).collect(),
+            ),
+        )
+    }
+
+    fn described(changes: &[SettingChange]) -> Vec<String> {
+        changes.iter().map(ToString::to_string).collect()
     }
 
     #[test]
-    fn test_configuration_matches_primary_key_differs() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
+    fn identical_settings_are_no_change() {
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            Some(upsert_on(&["id"])),
+            None,
+            "table-root",
+            crate::metadata::VortexConfig::default(),
+            id_schema(),
+        );
+        let requested = requested_like(&stored, |_| {});
+        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert!(layout_setting_changes(&stored.vortex_config, &requested.vortex_config).is_empty());
+    }
+
+    #[test]
+    fn a_primary_key_change_defines_different_rows() {
         let stored = make_test_metadata(
             vec![],
             None,
             None,
             "table-root",
             crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+            id_schema(),
         );
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec!["id".to_string()],
-            on_conflict: None,
-            base_path: "table-root".to_string(),
-            partition_column: None,
-            vortex_config: crate::metadata::VortexConfig::default(),
-        };
-        assert!(
-            !configuration_matches(&stored, &options),
-            "Different primary_key should not match"
+        let requested = requested_like(&stored, |options| {
+            options.primary_key = vec!["id".to_string()];
+            options.on_conflict = Some(upsert_on(&["id"]));
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &requested)),
+            vec!["`primary_key`: none -> ['id']"]
         );
     }
 
+    /// An earlier release recorded `DoNothing` on keyed tables, and a keyed table upserts
+    /// on its key whatever it recorded, so the recorded action alone must not read as a
+    /// changed setting — under `refresh_mode: full` it would rebuild every such table on
+    /// upgrade.
     #[test]
-    fn test_configuration_matches_on_conflict_differs() {
-        use datafusion_table_providers::util::on_conflict::OnConflict;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
+    fn a_keyed_action_an_earlier_release_recorded_is_no_change() {
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            Some(OnConflict::DoNothing(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            None,
+            "table-root",
+            crate::metadata::VortexConfig::default(),
+            id_schema(),
+        );
+        let requested = requested_like(&stored, |options| {
+            options.on_conflict = Some(upsert_on(&["id"]));
+        });
+        assert!(identity_setting_changes(&stored, &requested).is_empty());
+    }
+
+    fn with_detection(pk_conflict_detection: PkConflictDetection) -> crate::metadata::VortexConfig {
+        crate::metadata::VortexConfig {
+            pk_conflict_detection,
+            ..crate::metadata::VortexConfig::default()
+        }
+    }
+
+    /// Rows written with the check off may share a key, so turning it on changes what the
+    /// stored rows mean.
+    #[test]
+    fn turning_conflict_detection_on_for_a_keyed_table_defines_different_rows() {
         let stored = make_test_metadata(
             vec!["id".to_string()],
             None,
             None,
             "table-root",
-            crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+            with_detection(PkConflictDetection::None),
+            id_schema(),
         );
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "table-root".to_string(),
-            partition_column: None,
-            vortex_config: crate::metadata::VortexConfig::default(),
-        };
-        assert!(
-            !configuration_matches(&stored, &options),
-            "Different on_conflict should not match"
+        let requested = requested_like(&stored, |options| {
+            options.on_conflict = Some(upsert_on(&["id"]));
+            options.vortex_config = with_detection(PkConflictDetection::Auto);
+        });
+        assert!(enables_pk_conflict_detection(&stored, &requested));
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &requested)),
+            vec!["`cayenne_pk_conflict_detection`: 'none' -> 'auto'"]
         );
     }
 
+    /// A new key and the check turned on in the same restart are two changes, and the list
+    /// names both, though the new key alone already defines different rows.
     #[test]
-    fn test_configuration_matches_sort_columns_differ() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
+    fn a_new_key_with_conflict_detection_turned_on_lists_both_changes() {
         let stored = make_test_metadata(
-            vec![],
+            vec!["id".to_string()],
             None,
             None,
             "table-root",
-            crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+            with_detection(PkConflictDetection::None),
+            id_schema(),
         );
-        let changed_vortex = crate::metadata::VortexConfig {
-            sort_columns: vec!["id".to_string()],
-            ..Default::default()
-        };
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: "table-root".to_string(),
-            partition_column: None,
-            vortex_config: changed_vortex,
-        };
-        assert!(
-            !configuration_matches(&stored, &options),
-            "Different sort_columns should not match"
+        let rekeyed = requested_like(&stored, |options| {
+            options.primary_key = vec!["v".to_string()];
+            options.on_conflict = Some(upsert_on(&["v"]));
+            options.vortex_config = with_detection(PkConflictDetection::Auto);
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &rekeyed)),
+            vec![
+                "`primary_key`: ['id'] -> ['v']",
+                "`cayenne_pk_conflict_detection`: 'none' -> 'auto'",
+            ]
+        );
+
+        // Without a key there is nothing for the check to enforce, so only the key is listed.
+        let unkeyed = requested_like(&stored, |options| {
+            options.primary_key = vec![];
+            options.vortex_config = with_detection(PkConflictDetection::Auto);
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &unkeyed)),
+            vec!["`primary_key`: ['id'] -> none"]
         );
     }
 
+    /// A new key with the check turned off is two changes as well. A table that keeps its
+    /// settings keeps both, so a list naming only the key would read as if the check had
+    /// been turned off.
     #[test]
-    fn test_configuration_matches_base_path_differs() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
+    fn a_new_key_with_conflict_detection_turned_off_lists_both_changes() {
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            Some(upsert_on(&["id"])),
+            None,
+            "table-root",
+            with_detection(PkConflictDetection::Auto),
+            id_schema(),
+        );
+        let rekeyed = requested_like(&stored, |options| {
+            options.primary_key = vec!["v".to_string()];
+            options.on_conflict = None;
+            options.vortex_config = with_detection(PkConflictDetection::None);
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &rekeyed)),
+            vec![
+                "`primary_key`: ['id'] -> ['v']",
+                "`cayenne_pk_conflict_detection`: 'auto' -> 'none'",
+            ]
+        );
+
+        // Without a key there is nothing for the check to enforce, so only the key is listed.
+        let unkeyed = requested_like(&stored, |options| {
+            options.primary_key = vec![];
+            options.on_conflict = None;
+            options.vortex_config = with_detection(PkConflictDetection::None);
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &unkeyed)),
+            vec!["`primary_key`: ['id'] -> none"]
+        );
+    }
+
+    /// A key added to an unkeyed table with the check changed is two changes too: the
+    /// requested table is keyed, so the check it asks for applies to it, whatever the
+    /// unkeyed stored table recorded.
+    #[test]
+    fn a_key_added_with_conflict_detection_changed_lists_both_changes() {
+        for (stored_detection, requested_detection, described_change) in [
+            (
+                PkConflictDetection::Auto,
+                PkConflictDetection::None,
+                "`cayenne_pk_conflict_detection`: 'auto' -> 'none'",
+            ),
+            (
+                PkConflictDetection::None,
+                PkConflictDetection::Auto,
+                "`cayenne_pk_conflict_detection`: 'none' -> 'auto'",
+            ),
+        ] {
+            let stored = make_test_metadata(
+                vec![],
+                None,
+                None,
+                "table-root",
+                with_detection(stored_detection),
+                id_schema(),
+            );
+            let keyed = requested_like(&stored, |options| {
+                options.primary_key = vec!["id".to_string()];
+                options.on_conflict =
+                    (requested_detection == PkConflictDetection::Auto).then(|| upsert_on(&["id"]));
+                options.vortex_config = with_detection(requested_detection);
+            });
+            assert_eq!(
+                described(&identity_setting_changes(&stored, &keyed)),
+                vec!["`primary_key`: none -> ['id']", described_change]
+            );
+        }
+    }
+
+    /// Rows written with the check on are unique per key, which rows written without it
+    /// may be too, so turning it off is applied in place rather than rebuilt.
+    #[test]
+    fn turning_conflict_detection_off_for_a_keyed_table_is_applied_in_place() {
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            Some(upsert_on(&["id"])),
+            None,
+            "table-root",
+            with_detection(PkConflictDetection::Auto),
+            id_schema(),
+        );
+        let requested = requested_like(&stored, |options| {
+            options.on_conflict = None;
+            options.vortex_config = with_detection(PkConflictDetection::None);
+        });
+        assert!(disables_pk_conflict_detection(&stored, &requested));
+        assert!(identity_setting_changes(&stored, &requested).is_empty());
+    }
+
+    /// A table without conflict detection resolves no conflicts whatever its row records,
+    /// so the action an earlier release recorded beside `pk_conflict_detection: none` is
+    /// not a changed setting either.
+    #[test]
+    fn an_action_recorded_without_conflict_detection_is_no_change() {
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            Some(OnConflict::DoNothing(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            None,
+            "table-root",
+            with_detection(PkConflictDetection::None),
+            id_schema(),
+        );
+        let requested = requested_like(&stored, |options| {
+            options.on_conflict = None;
+        });
+        assert!(identity_setting_changes(&stored, &requested).is_empty());
+    }
+
+    #[test]
+    fn partitioning_and_location_changes_define_different_rows() {
         let stored = make_test_metadata(
             vec![],
             None,
             None,
             "table-root-old",
             crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+            id_schema(),
         );
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec![],
-            on_conflict: None,
-            base_path: "table-root-new".to_string(),
-            partition_column: None,
-            vortex_config: crate::metadata::VortexConfig::default(),
-        };
-        assert!(
-            !configuration_matches(&stored, &options),
-            "Different base_path should not match"
+        let requested = requested_like(&stored, |options| {
+            options.partition_column = Some("region".to_string());
+            options.base_path = "table-root-new".to_string();
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &requested)),
+            vec![
+                "`partition_by`: none -> 'region'",
+                "data location: 'table-root-old' -> 'table-root-new'",
+            ]
         );
     }
 
+    /// A table restored from a snapshot stores its location re-anchored with a trailing
+    /// separator; that is the location it was configured with, not a move.
     #[test]
-    fn test_log_configuration_differences_primary_key_change() {
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
+    fn a_restored_location_with_a_trailing_separator_is_no_change() {
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/data/trips/",
+            crate::metadata::VortexConfig::default(),
+            id_schema(),
+        );
+        let requested = requested_like(&stored, |options| {
+            options.base_path = "/data/trips".to_string();
+        });
+        assert!(identity_setting_changes(&stored, &requested).is_empty());
+    }
+
+    /// Layout settings change how rows are written, never what a stored row means, so
+    /// none of them may reach the identity comparison that rebuilds a table.
+    #[test]
+    fn layout_settings_are_applied_in_place() {
         let stored = make_test_metadata(
             vec![],
             None,
             None,
             "table-root",
             crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+            id_schema(),
         );
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec!["id".to_string()],
-            on_conflict: None,
-            base_path: "table-root".to_string(),
-            partition_column: None,
-            vortex_config: crate::metadata::VortexConfig::default(),
-        };
-        // Should not panic; exercises the logging path for primary_key change.
-        log_configuration_differences("test_table", &stored, &options);
+        let requested = requested_like(&stored, |options| {
+            options.vortex_config = crate::metadata::VortexConfig {
+                sort_columns: vec!["id".to_string()],
+                cluster_by: vec!["id".to_string(), "ts".to_string()],
+                compression_strategy: CompressionStrategy::Zstd,
+                delta_encoding: crate::metadata::DeltaEncoding::Level(7),
+                shard_key_columns: vec!["id".to_string()],
+                ..crate::metadata::VortexConfig::default()
+            };
+        });
+        assert!(identity_setting_changes(&stored, &requested).is_empty());
+        assert_eq!(
+            described(&layout_setting_changes(
+                &stored.vortex_config,
+                &requested.vortex_config
+            )),
+            vec![
+                "`cayenne_sort_columns`: none -> ['id']",
+                "`cayenne_cluster_by`: none -> ['id', 'ts']",
+                "`cayenne_compression_strategy`: 'btrblocks' -> 'zstd'",
+                "`cayenne_delta_encoding`: 'auto' -> '7'",
+                "`cayenne_shard_key_columns`: none -> ['id']",
+            ]
+        );
+    }
+
+    /// A setting value can hold a control character (a quoted column identifier may
+    /// contain a newline), and must not break the single line a message is logged on.
+    #[test]
+    fn a_setting_value_with_a_newline_stays_on_one_line() {
+        let change = SettingChange::new(
+            "`primary_key`",
+            columns_setting_value(&["id\nWARN forged".to_string()]),
+            "none".to_string(),
+        );
+        assert_eq!(
+            change.to_string(),
+            "`primary_key`: ['id WARN forged'] -> none"
+        );
+        assert!(!settings_kept_warning("trips", &[change], false).contains('\n'));
     }
 
     #[test]
-    fn test_log_configuration_differences_on_conflict_change() {
-        use datafusion_table_providers::util::on_conflict::OnConflict;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
-        let stored = make_test_metadata(
-            vec!["id".to_string()],
-            None,
-            None,
-            "table-root",
-            crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+    fn settings_change_messages_name_the_dataset_the_changes_and_the_fix() {
+        let changes = [SettingChange::new(
+            "`primary_key`",
+            "none".to_string(),
+            "['id']".to_string(),
+        )];
+        assert_eq!(
+            settings_kept_warning("trips", &changes, true),
+            "Dataset 'trips' keeps the settings its in-memory acceleration was built with until Spice restarts, so the changed settings (`primary_key`: none -> ['id']) do not take effect yet: they cannot be applied to the rows it holds in place. Restart Spice to rebuild the acceleration with the new settings. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "table-root".to_string(),
-            partition_column: None,
-            vortex_config: crate::metadata::VortexConfig::default(),
-        };
-        // Should not panic; exercises the logging path for on_conflict change.
-        log_configuration_differences("test_table", &stored, &options);
-    }
+        assert_eq!(
+            settings_kept_warning("trips", &changes, false),
+            "Dataset 'trips' keeps the settings its existing acceleration was built with, so the changed settings (`primary_key`: none -> ['id']) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only when a reload brings back every row it holds (`refresh_mode: full` with `write_mode: write_through`, from a source other than `sink`). To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
 
-    #[test]
-    fn test_log_configuration_differences_multiple_fields() {
-        use datafusion_table_providers::util::on_conflict::OnConflict;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            false,
-        )]));
-        let stored = make_test_metadata(
-            vec![],
-            None,
-            None,
-            "table-root-old",
-            crate::metadata::VortexConfig::default(),
-            Arc::clone(&schema),
+        let changes = [SettingChange::new(
+            "`cayenne_sort_columns`",
+            "none".to_string(),
+            "['pickup_time']".to_string(),
+        )];
+        assert_eq!(
+            settings_applied_in_place_message("trips", &changes),
+            "Applied the changed acceleration settings of dataset 'trips' to its existing acceleration in place (`cayenne_sort_columns`: none -> ['pickup_time']). Rows already stored keep their current layout until a refresh or compaction rewrites them."
         );
-        let changed_vortex = crate::metadata::VortexConfig {
-            sort_columns: vec!["id".to_string()],
-            ..Default::default()
-        };
-        let options = CreateTableOptions {
-            table_name: "test_table".to_string(),
-            schema,
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::DoNothingAll),
-            base_path: "table-root-new".to_string(),
-            partition_column: Some("region".to_string()),
-            vortex_config: changed_vortex,
-        };
-        // Should not panic; exercises the logging path when many fields change at once.
-        log_configuration_differences("test_table", &stored, &options);
+
+        assert_eq!(
+            CatalogError::SettingsChangeRequiresRebuild {
+                table_name: "trips".to_string(),
+                changes: describe_setting_changes(&[SettingChange::new(
+                    "`primary_key`",
+                    "none".to_string(),
+                    "['id']".to_string(),
+                )]),
+            }
+            .to_string(),
+            "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])"
+        );
+
+        assert_eq!(
+            settings_held_warning(
+                "trips",
+                &[SettingChange::new(
+                    "`primary_key`",
+                    "none".to_string(),
+                    "['id']".to_string(),
+                )]
+            ),
+            "Dataset 'trips' keeps the settings its existing acceleration was built with while its source cannot be read on that acceleration's schema, so the changed settings (`primary_key`: none -> ['id']) do not take effect yet: they cannot be applied to stored rows in place, and a rebuilt acceleration could not reload until the source can be read. Restart once the source is reachable and any change to its schema is resolved (revert it, or set `on_schema_change` to adopt it) to rebuild with the new settings. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+
+        assert_eq!(
+            schema_kept_warning("trips"),
+            "Dataset 'trips' keeps the schema its existing acceleration was built with, so the changed schema does not take effect. Set `on_schema_change` to evolve the acceleration's schema in place, or `mode: file_update` to rebuild the acceleration with the new schema. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
     }
 
     #[tokio::test]
@@ -11371,6 +11952,332 @@ mod tests {
         );
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression test for #14889: a table created with conflict detection off
+    /// may hold several rows per key, so reopening it with the check on must
+    /// fail rather than fall back to the stored configuration, which keeps the
+    /// check off.
+    #[tokio::test]
+    async fn reopening_a_none_table_with_auto_is_refused() {
+        use crate::metadata::{PkConflictDetection, VortexConfig};
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_pkd_reopen_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = |table: &str, key: &[&str], detection| CreateTableOptions {
+            table_name: table.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: key.iter().map(ToString::to_string).collect(),
+            on_conflict: (detection == PkConflictDetection::Auto && !key.is_empty())
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                pk_conflict_detection: detection,
+                ..VortexConfig::default()
+            },
+        };
+
+        let keyed = catalog
+            .create_table(options("keyed", &["id"], PkConflictDetection::None))
+            .await
+            .expect("create a keyed table with conflict detection off");
+        let refused = catalog
+            .create_table(options("keyed", &["id"], PkConflictDetection::Auto))
+            .await
+            .expect_err("reopening with conflict detection on must be refused");
+        assert_eq!(
+            refused.to_string(),
+            "Failed to load table 'keyed': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
+        );
+
+        // Reopening with the setting it was created with still works.
+        assert_eq!(
+            catalog
+                .create_table(options("keyed", &["id"], PkConflictDetection::None))
+                .await
+                .expect("reopen with the stored setting"),
+            keyed
+        );
+        // Without a primary key the setting has nothing to check.
+        let unkeyed = catalog
+            .create_table(options("unkeyed", &[], PkConflictDetection::None))
+            .await
+            .expect("create an unkeyed table with conflict detection off");
+        assert_eq!(
+            catalog
+                .create_table(options("unkeyed", &[], PkConflictDetection::Auto))
+                .await
+                .expect("an unkeyed table reopens with auto"),
+            unkeyed
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// The open path against a real metastore: changed layout settings are persisted
+    /// on the same table, a changed primary key is reported for a rebuild only when the
+    /// caller allows one, and a kept table persists none of the requested settings.
+    #[tokio::test]
+    async fn reopening_with_changed_settings_evolves_layout_and_rebuilds_or_keeps_identity() {
+        use crate::metadata::{SettingsChangeAction, VortexConfig};
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!(
+            "sqlite://./.test_settings_change_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let options = |primary_key: &[&str], vortex_config: VortexConfig| CreateTableOptions {
+            table_name: "trips".to_string(),
+            schema: id_schema(),
+            primary_key: primary_key.iter().map(ToString::to_string).collect(),
+            on_conflict: (!primary_key.is_empty()).then(|| upsert_on(primary_key)),
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config,
+        };
+        let table_id = catalog
+            .create_table(options(&[], VortexConfig::default()))
+            .await
+            .expect("create the table");
+
+        // Layout settings: applied in place, on the same table, whatever the caller
+        // allows.
+        let sorted = VortexConfig {
+            sort_columns: vec!["id".to_string()],
+            compression_strategy: CompressionStrategy::Zstd,
+            settings_change: SettingsChangeAction::Rebuild,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            catalog
+                .create_table(options(&[], sorted.clone()))
+                .await
+                .expect("reopen with sort columns"),
+            table_id
+        );
+        let stored = catalog.get_table("trips").await.expect("read the table");
+        assert_eq!(stored.vortex_config.sort_columns, vec!["id".to_string()]);
+        assert_eq!(
+            stored.vortex_config.compression_strategy,
+            CompressionStrategy::Zstd
+        );
+
+        // A changed primary key, with a rebuild allowed: reported, nothing persisted.
+        let refused = catalog
+            .create_table(options(&["id"], sorted.clone()))
+            .await
+            .expect_err("a changed primary key must be reported for a rebuild");
+        assert!(
+            matches!(refused, CatalogError::SettingsChangeRequiresRebuild { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "the existing acceleration of dataset 'trips' was built with settings it cannot adopt in place (`primary_key`: none -> ['id'])"
+        );
+        assert!(
+            catalog
+                .get_table("trips")
+                .await
+                .expect("read the table")
+                .primary_key
+                .is_empty()
+        );
+
+        // The same change while the source cannot be read on the table's schema: kept,
+        // like any table the caller does not rebuild.
+        let held = VortexConfig {
+            settings_change: SettingsChangeAction::HoldUntilSourceReadable,
+            ..sorted.clone()
+        };
+        assert_eq!(
+            catalog
+                .create_table(options(&["id"], held))
+                .await
+                .expect("reopen while the source cannot be read"),
+            table_id
+        );
+        assert!(
+            catalog
+                .get_table("trips")
+                .await
+                .expect("read the table")
+                .primary_key
+                .is_empty()
+        );
+
+        // The same change when the caller keeps stored tables: the stored settings win
+        // wholesale, so the unsorted layout requested with it is not persisted either.
+        let kept = VortexConfig {
+            settings_change: SettingsChangeAction::KeepStored,
+            ..VortexConfig::default()
+        };
+        assert_eq!(
+            catalog
+                .create_table(options(&["id"], kept))
+                .await
+                .expect("reopen keeping the stored settings"),
+            table_id
+        );
+        let stored = catalog.get_table("trips").await.expect("read the table");
+        assert!(stored.primary_key.is_empty());
+        assert_eq!(stored.vortex_config.sort_columns, vec!["id".to_string()]);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Turning conflict detection on for a keyed table written with it off is reported
+    /// for a rebuild when the caller allows one, and refused as before when it does not,
+    /// or holds the rebuild until the source can be read.
+    #[tokio::test]
+    async fn enabling_conflict_detection_is_rebuilt_when_allowed() {
+        use crate::metadata::{PkConflictDetection, SettingsChangeAction, VortexConfig};
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_pkd_rebuild_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let options = |detection, settings_change| CreateTableOptions {
+            table_name: "keyed".to_string(),
+            schema: id_schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: (detection == PkConflictDetection::Auto).then(|| upsert_on(&["id"])),
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                pk_conflict_detection: detection,
+                settings_change,
+                ..VortexConfig::default()
+            },
+        };
+        catalog
+            .create_table(options(
+                PkConflictDetection::None,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect("create a keyed table with conflict detection off");
+
+        let rebuild = catalog
+            .create_table(options(
+                PkConflictDetection::Auto,
+                SettingsChangeAction::Rebuild,
+            ))
+            .await
+            .expect_err("enabling conflict detection must be reported for a rebuild");
+        assert_eq!(
+            rebuild.to_string(),
+            "the existing acceleration of dataset 'keyed' was built with settings it cannot adopt in place (`cayenne_pk_conflict_detection`: 'none' -> 'auto')"
+        );
+
+        let refused = catalog
+            .create_table(options(
+                PkConflictDetection::Auto,
+                SettingsChangeAction::KeepStored,
+            ))
+            .await
+            .expect_err("without a rebuild, enabling conflict detection stays refused");
+        assert!(
+            matches!(
+                refused,
+                CatalogError::PkConflictDetectionEnabledOnExistingTable { .. }
+            ),
+            "{refused:?}"
+        );
+
+        // A rebuild held until the source can be read is refused too, since the stored
+        // rows cannot be served under the check meanwhile, with the fixes that apply.
+        let held = catalog
+            .create_table(options(
+                PkConflictDetection::Auto,
+                SettingsChangeAction::HoldUntilSourceReadable,
+            ))
+            .await
+            .expect_err("a held rebuild cannot serve the stored rows under the check");
+        assert_eq!(
+            held.to_string(),
+            "Failed to load table 'keyed': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. Applying 'auto' rebuilds the table from its source, which cannot be read on the table's schema yet. To keep using the existing data, set 'cayenne_pk_conflict_detection' back to 'none'. To apply 'auto', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        );
+        assert_eq!(
+            catalog
+                .get_table("keyed")
+                .await
+                .expect("read the table")
+                .vortex_config
+                .pk_conflict_detection,
+            PkConflictDetection::None,
+            "a refused change persists nothing"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Turning conflict detection off for a keyed table is applied to the same table,
+    /// even when a rebuild is allowed, and the recorded `on_conflict` follows it, so the
+    /// reopened table resolves no conflicts — what the provider's writes already do.
+    #[tokio::test]
+    async fn disabling_conflict_detection_is_applied_in_place() {
+        use crate::metadata::{PkConflictDetection, SettingsChangeAction, VortexConfig};
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_pkd_disable_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let options = |detection| CreateTableOptions {
+            table_name: "keyed".to_string(),
+            schema: id_schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: (detection == PkConflictDetection::Auto).then(|| upsert_on(&["id"])),
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                pk_conflict_detection: detection,
+                settings_change: SettingsChangeAction::Rebuild,
+                ..VortexConfig::default()
+            },
+        };
+        let table_id = catalog
+            .create_table(options(PkConflictDetection::Auto))
+            .await
+            .expect("create a keyed table with conflict detection on");
+        assert_eq!(
+            catalog
+                .create_table(options(PkConflictDetection::None))
+                .await
+                .expect("turning conflict detection off applies in place"),
+            table_id
+        );
+        let stored = catalog.get_table("keyed").await.expect("read the table");
+        assert_eq!(
+            stored.vortex_config.pk_conflict_detection,
+            PkConflictDetection::None
+        );
+        assert!(stored.on_conflict.is_none(), "{:?}", stored.on_conflict);
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

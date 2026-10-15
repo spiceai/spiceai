@@ -30,6 +30,7 @@ All criteria must be met for the connector to be considered Stable, with excepti
 | Glue                             | ✅              | @lukekim        |
 | GraphQL                          | ➖              |                 |
 | HTTP/HTTPS                       | ✅              | @lukekim        |
+| Hugging Face                     | ➖              |                 |
 | Iceberg                          | ✅              | @lukekim        |
 | IMAP                             | ➖              |                 |
 | Kafka                            | ➖              |                 |

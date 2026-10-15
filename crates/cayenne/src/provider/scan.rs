@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::maintained_aggregate::MaintainedAggregateRegistry;
+use crate::maintained_aggregate::{MaintainedAggregateRegistry, PredicateConjuncts};
 use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
@@ -408,14 +408,15 @@ impl CayenneAccelerationExec {
         plan_has_pushed_filter(&self.inner)
     }
 
-    /// Whether this scan produces every live row of the table: nothing in the
-    /// wrapped plan filters or limits rows. A maintained aggregate view describes
-    /// exactly that relation, so the maintained-aggregate rewrite may substitute the
-    /// view for this scan only when this returns `true`. See
-    /// [`plan_scans_whole_relation`].
+    /// The predicate every row this scan produces satisfied: no conjuncts when it
+    /// produces every live row of the table, or `None` when the wrapped plan does
+    /// something to its rows that a predicate cannot describe. A maintained
+    /// aggregate view describes the live rows its own filter selects, so the
+    /// maintained-aggregate rewrite may substitute the view for this scan only
+    /// when the two predicates are the same. See [`plan_relation_predicate`].
     #[must_use]
-    pub(crate) fn scans_whole_relation(&self) -> bool {
-        plan_scans_whole_relation(&self.inner)
+    pub(crate) fn relation_predicate(&self) -> Option<PredicateConjuncts> {
+        plan_relation_predicate(&self.inner)
     }
 
     /// Whether every column this scan outputs is the stored table column of the
@@ -608,8 +609,10 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .any(|config| config.file_source().filter().is_some())
 }
 
-/// Whether `plan` produces every live row of the table it scans: no node in the
-/// subtree filters or limits rows.
+/// The predicate `plan` applies to the live rows of the table it scans: no
+/// conjuncts when it produces every live row, the conjuncts of `P` when it
+/// produces exactly the live rows satisfying `P`, and `None` when it cannot be
+/// established.
 ///
 /// A query's `WHERE` or `LIMIT` does not have to stay above the scan. Physical
 /// `FilterPushdown` hands a predicate to a Vortex source that accepts it, and to
@@ -617,27 +620,63 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// branch that `scan()` already wraps in the query's filters absorbs it, and
 /// `UnionExec` wraps each rejecting branch in its own `FilterExec`. Either way the
 /// `FilterExec` above the scan is removed. A `LIMIT` in a subquery becomes a fetch
-/// inside the scan. So the scan's own subtree is the only place to look.
+/// inside the scan. So the scan's own subtree is the only place to read either.
 ///
-/// The walk fails closed: only nodes known to pass every row through (and every
-/// child of theirs) count, so an operator added later is treated as narrowing the
-/// scan until it is listed here. The deletion-filter execs are listed because they
-/// remove only rows that are no longer live, which is the relation a maintained
-/// view describes. Any fetch fails the check, and a file source fails it when it
-/// carries a predicate (static or dynamic). An in-memory source never carries one.
+/// Every path from `plan` to a source that produces rows must apply the same
+/// conjuncts, gathered from the `FilterExec`s on the path and the file source's
+/// pushed predicate. A path ending in an `EmptyExec` produces no rows, so it
+/// constrains nothing. The walk fails closed: only nodes known to pass every row
+/// through count, so an operator added later is treated as changing the scan's
+/// rows until it is listed here. The deletion-filter execs are listed because
+/// they remove only rows that are no longer live, which is the relation a
+/// maintained view describes. Any fetch, a volatile or dynamic predicate, paths
+/// that disagree, or a plan in which no path produces rows yield `None`.
+pub(crate) fn plan_relation_predicate(plan: &Arc<dyn ExecutionPlan>) -> Option<PredicateConjuncts> {
+    match relation_rows(plan, &PredicateConjuncts::default())? {
+        RelationRows::NoRows => None,
+        RelationRows::Matching(predicate) => Some(predicate),
+    }
+}
+
+/// The rows a path through a scan subtree produces, relative to the table's
+/// live rows. See [`plan_relation_predicate`].
+enum RelationRows {
+    /// None at all: every path ends in an `EmptyExec`.
+    NoRows,
+    /// Exactly the live rows that satisfy every conjunct.
+    Matching(PredicateConjuncts),
+}
+
+/// [`plan_relation_predicate`] for the subtree at `plan`, where `applied` holds
+/// the conjuncts the `FilterExec`s above it on the path apply.
 #[expect(deprecated)]
-pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn relation_rows(
+    plan: &Arc<dyn ExecutionPlan>,
+    applied: &PredicateConjuncts,
+) -> Option<RelationRows> {
     if plan.fetch().is_some() {
-        return false;
+        return None;
     }
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         let source = data_source_exec.data_source();
         if let Some(config) = source.downcast_ref::<FileScanConfig>() {
-            return config.file_source().filter().is_none();
+            let mut applied = applied.clone();
+            if let Some(predicate) = config.file_source().filter() {
+                applied.try_add_predicate(&predicate)?;
+            }
+            return Some(RelationRows::Matching(applied));
         }
         return source
             .downcast_ref::<datafusion::datasource::memory::MemorySourceConfig>()
-            .is_some();
+            .map(|_| RelationRows::Matching(applied.clone()));
+    }
+    if let Some(filter) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
+        let mut applied = applied.clone();
+        applied.try_add_predicate(filter.predicate())?;
+        return relation_rows(filter.input(), &applied);
+    }
+    if plan.is::<datafusion_physical_plan::empty::EmptyExec>() {
+        return Some(RelationRows::NoRows);
     }
     let passes_every_row = plan.is::<CayenneAccelerationExec>()
         || plan.is::<UnionExec>()
@@ -646,10 +685,26 @@ pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
         || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
         || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
-        || plan.is::<datafusion_physical_plan::empty::EmptyExec>()
+        || plan.is::<runtime_datafusion::extension::bytes_processed::BytesProcessedExec>()
         || plan.is::<crate::provider::delete::KeyBasedDeletionFilterExec>()
         || plan.is::<crate::provider::delete::Int64PkDeletionFilterExec>();
-    passes_every_row && plan.children().into_iter().all(plan_scans_whole_relation)
+    if !passes_every_row {
+        return None;
+    }
+    let mut rows = RelationRows::NoRows;
+    for child in plan.children() {
+        rows = match (rows, relation_rows(child, applied)?) {
+            (RelationRows::NoRows, child_rows) => child_rows,
+            (matching, RelationRows::NoRows) => matching,
+            (RelationRows::Matching(predicate), RelationRows::Matching(child_predicate)) => {
+                if predicate != child_predicate {
+                    return None;
+                }
+                RelationRows::Matching(predicate)
+            }
+        };
+    }
+    Some(rows)
 }
 
 /// Whether every column `plan` outputs is the table column of the same name, with

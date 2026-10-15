@@ -131,7 +131,9 @@ impl Runtime {
                         responses_support_map.insert(
                             m.name.clone(),
                             crate::model::ResponsesApiSupport::EvaluateOnly {
-                                provider: ModelSource::TypeSafe.to_string(),
+                                provider: m
+                                    .get_source()
+                                    .map_or_else(|| m.from.clone(), |source| source.to_string()),
                             },
                         );
                         drop(responses_support_map);
@@ -147,46 +149,7 @@ impl Runtime {
                 }),
             }
         } else {
-            match self.load_llm(m.clone(), params.clone()).await {
-                Ok((completions_model, responses_model, responses_api_support)) => {
-                    let rate_controller =
-                        crate::model::rate_limit::build_model_rate_controller(m, &params);
-
-                    // Every chat model also answers `/v1/evaluate`.
-                    let evaluator = completions_model.evaluator(&m.name);
-
-                    let completion_llms = self.completion_llms();
-                    let mut llm_map = completion_llms.write().await;
-                    llm_map.insert(m.name.clone(), completions_model.chat);
-                    drop(llm_map);
-
-                    let evaluate_models = self.llm_runtime_stores.evaluate_models();
-                    let mut evaluate_map = evaluate_models.write().await;
-                    evaluate_map.insert(m.name.clone(), evaluator);
-                    drop(evaluate_map);
-
-                    if let Some(responses_model) = responses_model {
-                        let responses_llms = self.responses_llms();
-                        let mut responses_llm_map = responses_llms.write().await;
-                        responses_llm_map.insert(m.name.clone(), responses_model);
-                    }
-
-                    let responses_api_support_store =
-                        self.llm_runtime_stores.responses_api_support();
-                    let mut responses_support_map = responses_api_support_store.write().await;
-                    responses_support_map.insert(m.name.clone(), responses_api_support);
-                    drop(responses_support_map);
-
-                    let model_rate_controllers = self.model_rate_controllers();
-                    let mut rc_map = model_rate_controllers.write().await;
-                    rc_map.insert(m.name.clone(), rate_controller);
-                    Ok(())
-                }
-                Err(e) => Err(Error::FailedToLoadLLM {
-                    name: m.name.clone(),
-                    source: Box::new(e),
-                }),
-            }
+            self.load_chat_model(m, &params).await
         };
         match result {
             Ok(()) => {
@@ -225,6 +188,63 @@ impl Runtime {
                 tracing::warn!("{e}");
             }
         }
+    }
+
+    async fn load_chat_model(
+        &self,
+        m: &SpicepodModel,
+        params: &HashMap<String, secrecy::SecretString>,
+    ) -> Result<(), Error> {
+        let (completions_model, responses_model, responses_api_support) = self
+            .load_llm(m.clone(), params.clone())
+            .await
+            .map_err(|source| Error::FailedToLoadLLM {
+                name: m.name.clone(),
+                source: Box::new(source),
+            })?;
+
+        // Models with a native Decisions API keep that evaluator alongside chat.
+        let (evaluator, rate_controller) = if matches!(m.get_source(), Some(ModelSource::OpenAi))
+            && m.get_model_id()
+                .is_some_and(|id| llms::openai::decisions::is_decision_model_id(&id))
+        {
+            try_to_evaluate_model(m, params, &self.secrets())
+                .await
+                .map_err(|source| Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source: Box::new(source),
+                })?
+        } else {
+            let rate_controller = crate::model::rate_limit::build_model_rate_controller(m, params);
+            let evaluator = completions_model.evaluator(&m.name, Arc::clone(&rate_controller));
+            (evaluator, rate_controller)
+        };
+
+        let completion_llms = self.completion_llms();
+        let mut llm_map = completion_llms.write().await;
+        llm_map.insert(m.name.clone(), completions_model.chat);
+        drop(llm_map);
+
+        let evaluate_models = self.llm_runtime_stores.evaluate_models();
+        let mut evaluate_map = evaluate_models.write().await;
+        evaluate_map.insert(m.name.clone(), evaluator);
+        drop(evaluate_map);
+
+        if let Some(responses_model) = responses_model {
+            let responses_llms = self.responses_llms();
+            let mut responses_llm_map = responses_llms.write().await;
+            responses_llm_map.insert(m.name.clone(), responses_model);
+        }
+
+        let responses_api_support_store = self.llm_runtime_stores.responses_api_support();
+        let mut responses_support_map = responses_api_support_store.write().await;
+        responses_support_map.insert(m.name.clone(), responses_api_support);
+        drop(responses_support_map);
+
+        let model_rate_controllers = self.model_rate_controllers();
+        let mut rc_map = model_rate_controllers.write().await;
+        rc_map.insert(m.name.clone(), rate_controller);
+        Ok(())
     }
 
     async fn remove_model(&self, m: &SpicepodModel) {

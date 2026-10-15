@@ -272,7 +272,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
@@ -353,7 +353,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
@@ -415,7 +415,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: images-amd64-cuda
           path: /tmp/images-amd64-cuda.tar
@@ -434,14 +434,14 @@ jobs:
     steps:
       - name: Download AMD64 artifacts
         if: needs.setup.outputs.run_amd64 == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: images-amd64
           path: /tmp
 
       - name: Download ARM64 artifacts
         if: needs.setup.outputs.run_arm64 == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: images-arm64
           path: /tmp
@@ -557,7 +557,7 @@ jobs:
       SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
     steps:
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: images-amd64-cuda
           path: /tmp

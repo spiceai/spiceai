@@ -19,12 +19,15 @@ use app::App;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
-use aws_sdk_glue::{Client, types::Table};
+use aws_sdk_glue::{Client, error::DisplayErrorContext, types::Table};
 use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
     CatalogBuilder, NamespaceIdent, TableIdent,
-    io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
+    io::{
+        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+        S3_SESSION_TOKEN,
+    },
 };
 use iceberg_catalog_glue::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
@@ -36,6 +39,7 @@ use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
+use url::Url;
 
 use crate::{
     component::dataset::DatasetSpec,
@@ -56,9 +60,13 @@ static PREFIX: &str = "glue";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Cannot retrieve table '{table}' from Glue database '{database}'. Verify that the database and table exist and are accessible. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve table '{table}' from Glue database '{database}': {message}. Verify that the database and table exist and are accessible. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
-    GetTable { database: String, table: String },
+    GetTable {
+        database: String,
+        table: String,
+        message: String,
+    },
     #[snafu(display(
         "Cannot load AWS configuration for Glue data connector. Verify your AWS credentials and region settings. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue {source}"
     ))]
@@ -170,10 +178,13 @@ impl GlueDataConnector {
             glue_table_builder = glue_table_builder.catalog_id(catalog_id.expose_secret());
         }
 
-        let get_table_output = glue_table_builder.send().await.map_err(|_| {
+        let get_table_output = glue_table_builder.send().await.map_err(|e| {
             let e = Error::GetTable {
                 database: database.to_string(),
                 table: table.to_string(),
+                message: e
+                    .as_service_error()
+                    .map_or_else(|| DisplayErrorContext(&e).to_string(), ToString::to_string),
             };
             super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
@@ -187,6 +198,7 @@ impl GlueDataConnector {
             let e = Error::GetTable {
                 database: database.to_string(),
                 table: table.to_string(),
+                message: "Glue returned no table definition".to_string(),
             };
             super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
@@ -217,7 +229,14 @@ impl GlueDataConnector {
                 .await
             }
             InputFormat::Iceberg => {
-                create_iceberg_provider(dataset, &config, database.to_string(), &table).await
+                create_iceberg_provider(
+                    dataset,
+                    &config,
+                    &self.params,
+                    database.to_string(),
+                    &table,
+                )
+                .await
             }
         }
     }
@@ -422,6 +441,7 @@ impl TryFrom<&Table> for InputFormat {
 async fn create_iceberg_provider(
     dataset: &DatasetSpec,
     config: &SdkConfig,
+    params: &Parameters,
     database: String,
     table: &Table,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -498,6 +518,8 @@ async fn create_iceberg_provider(
     // or other credentials from the environment that may not be valid for this specific connection.
     props.insert("s3.disable-config-load".to_string(), "true".to_string());
 
+    props.extend(s3_addressing_props(params, &metadata_location));
+
     props.insert(
         GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
         metadata_location.clone(),
@@ -520,7 +542,7 @@ async fn create_iceberg_provider(
             .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
-                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
+                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)': {e}. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
                 source: e.into(),
             })?,
     );
@@ -536,11 +558,35 @@ async fn create_iceberg_provider(
     .map_err(|e| super::DataConnectorError::InvalidConfiguration {
         dataconnector: PREFIX.to_string(),
         connector_component: dataset.into(),
-        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)': {e}. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
         source: e.into(),
     })?;
 
     Ok(Arc::new(table_provider))
+}
+
+/// Iceberg `FileIO` properties that address the table's S3 bucket the way the S3
+/// connector does. An explicit `url_style` wins. Otherwise a bucket name with dots
+/// uses path style: the virtual-hosted host (`my.dotted.bucket.s3.<region>.amazonaws.com`)
+/// fails TLS validation against the single-label wildcard certificate.
+fn s3_addressing_props(params: &Parameters, metadata_location: &str) -> Vec<(String, String)> {
+    let mut props = Vec::new();
+
+    if let Some(endpoint) = params.get("endpoint").expose().ok() {
+        props.push((S3_ENDPOINT.to_string(), endpoint.to_string()));
+    }
+
+    let path_style = match params.get("url_style").expose().ok() {
+        Some(url_style) => Some(url_style == "path"),
+        None => Url::parse(metadata_location)
+            .is_ok_and(|url| url.host_str().is_some_and(|bucket| bucket.contains('.')))
+            .then_some(true),
+    };
+    if let Some(path_style) = path_style {
+        props.push((S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string()));
+    }
+
+    props
 }
 
 async fn create_s3_provider(
@@ -753,6 +799,78 @@ mod tests {
                 InputFormat::Orc
             );
         }
+    }
+
+    async fn glue_params(params: &[(&str, &str)]) -> Parameters {
+        Parameters::try_new(
+            "glue_test",
+            params
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into()))
+                .collect(),
+            PREFIX,
+            Arc::new(tokio::sync::RwLock::new(runtime_secrets::Secrets::new())),
+            PARAMETERS.as_ref(),
+        )
+        .await
+        .expect("valid Glue test parameters")
+    }
+
+    async fn iceberg_s3_addressing(
+        params: &[(&str, &str)],
+        metadata_location: &str,
+    ) -> HashMap<String, String> {
+        s3_addressing_props(&glue_params(params).await, metadata_location)
+            .into_iter()
+            .collect()
+    }
+
+    const DOTTED_METADATA: &str =
+        "s3://my.dotted.bucket/warehouse/orders/metadata/00001-abc.metadata.json";
+    const PLAIN_METADATA: &str =
+        "s3://plain-bucket/warehouse/orders/metadata/00001-abc.metadata.json";
+
+    #[tokio::test]
+    async fn iceberg_tables_in_dotted_buckets_use_path_style() {
+        let props = iceberg_s3_addressing(&[], DOTTED_METADATA).await;
+        assert_eq!(
+            props.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn iceberg_tables_in_plain_buckets_keep_the_iceberg_default() {
+        let props = iceberg_s3_addressing(&[], PLAIN_METADATA).await;
+        assert!(props.is_empty(), "unexpected props: {props:?}");
+    }
+
+    #[tokio::test]
+    async fn glue_url_style_overrides_iceberg_addressing() {
+        let props = iceberg_s3_addressing(&[("glue_url_style", "vhost")], DOTTED_METADATA).await;
+        assert_eq!(
+            props.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("false")
+        );
+
+        let props = iceberg_s3_addressing(&[("glue_url_style", "path")], PLAIN_METADATA).await;
+        assert_eq!(
+            props.get(S3_PATH_STYLE_ACCESS).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn glue_endpoint_reaches_iceberg_file_io() {
+        let props = iceberg_s3_addressing(
+            &[("glue_endpoint", "https://s3.us-west-2.amazonaws.com")],
+            PLAIN_METADATA,
+        )
+        .await;
+        assert_eq!(
+            props.get(S3_ENDPOINT).map(String::as_str),
+            Some("https://s3.us-west-2.amazonaws.com")
+        );
     }
 
     #[test]

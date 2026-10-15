@@ -82,6 +82,7 @@ use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
+use runtime_cluster::{ExecutorRegistration, Registered};
 use telemetry::metrics_reader::MetricsReader;
 
 /// Handle for sending messages to a connected executor.
@@ -190,6 +191,17 @@ pub struct ClusterServiceImpl {
 }
 
 impl ClusterServiceImpl {
+    /// Where the cluster keeps its shared state, for messages about it: the
+    /// scheduler state location, or this scheduler's address when there is none.
+    async fn state_location(&self) -> String {
+        self.app
+            .read()
+            .await
+            .as_ref()
+            .and_then(|app| app.runtime.scheduler_state())
+            .map_or_else(|| self.advertise_address.clone(), |state| state.location)
+    }
+
     /// Creates a new cluster service implementation.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
@@ -417,7 +429,7 @@ impl ClusterService for ClusterServiceImpl {
             );
             // Same status/message shape as a miss so callers cannot distinguish
             // "not in spicepod" from "not in any store" for unallowlisted keys.
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::not_found(format!(
                 "Unable to expand secret {}",
                 request.key
             )));
@@ -446,7 +458,7 @@ impl ClusterService for ClusterServiceImpl {
             lookup.map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
         else {
             tracing::error!(target: "task_history", "Secret not found");
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::not_found(format!(
                 "Unable to expand secret {}",
                 request.key
             )));
@@ -580,8 +592,9 @@ impl ClusterService for ClusterServiceImpl {
         let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();
+        let state_location = self.state_location().await;
         let inbound_task = tokio::spawn(async move {
-            let executor_id = match inbound.next().await {
+            let (executor_id, process_id) = match inbound.next().await {
                 Some(Ok(msg)) => {
                     let executor_id = msg.executor_id.clone();
                     if executor_id.is_empty() {
@@ -594,7 +607,7 @@ impl ClusterService for ClusterServiceImpl {
                     if let Some(message) = msg.message {
                         handle_executor_message(&executor_id, &message, &datafusion).await;
                     }
-                    executor_id
+                    (executor_id, msg.process_id)
                 }
                 Some(Err(e)) => {
                     tracing::warn!("Error receiving first executor control message: {e}");
@@ -607,9 +620,48 @@ impl ClusterService for ClusterServiceImpl {
             };
 
             // Register the executor with the registry.
-            let handles = executor_registry
-                .register(executor_id.clone(), outbound_tx_for_registry)
+            let Registered {
+                handles,
+                registration,
+                connection,
+            } = executor_registry
+                .register(executor_id.clone(), &process_id, outbound_tx_for_registry)
                 .await;
+            match registration {
+                ExecutorRegistration::Duplicate => {
+                    tracing::error!(
+                        "{}",
+                        util::instance_id::duplicate_instance_message(
+                            &executor_id,
+                            &state_location
+                        )
+                    );
+                    // Keep the stream open and ignore it, so the duplicate does not
+                    // reconnect and register again.
+                    while let Some(Ok(_)) = inbound.next().await {}
+                    return;
+                }
+                ExecutorRegistration::Restarted => {
+                    tracing::info!(
+                        "Executor '{executor_id}' restarted, so the tasks and shuffle output of its earlier run are rescheduled"
+                    );
+                    if let Err(err) = notify_scheduler_executor_shutdown(
+                        &datafusion,
+                        &executor_id,
+                        "the executor restarted",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to reschedule the work of executor '{executor_id}' after its restart, so queries running on its earlier run wait until it is reaped: {err}"
+                        );
+                    }
+                    if let Some(tracker) = datafusion.partition_load_tracker.as_ref() {
+                        tracker.drop_executor(&executor_id).await;
+                    }
+                }
+                ExecutorRegistration::New | ExecutorRegistration::Reconnected => {}
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
@@ -618,6 +670,7 @@ impl ClusterService for ClusterServiceImpl {
             // Register the executor stream for PollNow broadcasts.
             executor_streams.register(&executor_id, registration_tx);
 
+            let mut reported_duplicate = false;
             loop {
                 tokio::select! {
                     () = inbound_cancel.cancelled() => {
@@ -626,6 +679,20 @@ impl ClusterService for ClusterServiceImpl {
                     }
                     result = inbound.next() => {
                         match result {
+                            // A later process registered under this id while this
+                            // one is still sending: two processes share the id.
+                            Some(Ok(_)) if !executor_registry.is_current(&executor_id, connection) => {
+                                if !reported_duplicate {
+                                    reported_duplicate = true;
+                                    tracing::error!(
+                                        "{}",
+                                        util::instance_id::duplicate_instance_message(
+                                            &executor_id,
+                                            &state_location
+                                        )
+                                    );
+                                }
+                            }
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
                                     // Route correlated responses (metrics, acks) to their waiters;
@@ -677,8 +744,12 @@ impl ClusterService for ClusterServiceImpl {
                 }
             }
 
-            // Unregister the executor when the stream ends.
-            executor_registry.unregister(&executor_id).await;
+            // Unregister the executor when the stream ends, unless a later
+            // connection under its id replaced this one.
+            if !executor_registry.unregister(&executor_id, connection).await {
+                tracing::debug!("Replaced executor control stream ended: {executor_id}");
+                return;
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
@@ -711,13 +782,21 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
-        let AllocateInitialPartitionsRequest { executor_url } = request.into_inner();
+        let AllocateInitialPartitionsRequest {
+            executor_url,
+            executor_id,
+            process_id,
+        } = request.into_inner();
 
-        // Current standard is to have executor id be without scheme.
-        let executor_id = if let Some(index) = executor_url.find("://") {
-            &executor_url[index + 3..]
+        // The executor's advertise address, without the scheme. An executor that
+        // sends no id is identified by it.
+        let executor_address = executor_url
+            .split_once("://")
+            .map_or(executor_url.as_str(), |(_, address)| address);
+        let executor_id = if executor_id.is_empty() {
+            executor_address
         } else {
-            &executor_url
+            executor_id.as_str()
         };
 
         // Gate on dataset readiness. Partition-expression serialization needs
@@ -763,14 +842,48 @@ impl ClusterService for ClusterServiceImpl {
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
-                self.executor_registry
-                    .insert_flight_sql_client(executor_id.to_string(), client)
-                    .await;
+                if !self
+                    .executor_registry
+                    .insert_flight_sql_client(
+                        executor_id.to_string(),
+                        executor_address.to_string(),
+                        &process_id,
+                        client,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        "Ignoring the Flight endpoint of a replaced process of executor {executor_id}"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     "Failed to create Flight SQL client for executor {executor_id}: {e}"
                 );
+            }
+        }
+
+        // Partitions assigned while this executor was identified by its advertise
+        // address follow it to its instance identity.
+        if executor_id != executor_address {
+            for store in [
+                self.executor_registry.accelerations_partition_store(),
+                self.executor_registry.federated_partition_store(),
+            ] {
+                match store.move_assignments(executor_address, executor_id).await {
+                    Ok(0) => {}
+                    Ok(moved) => tracing::info!(
+                        "Moved {moved} partition assignments of executor '{executor_address}' to its instance identity '{executor_id}'"
+                    ),
+                    // Unavailable makes the executor retry, rather than start with
+                    // none of the partitions still assigned to its address.
+                    Err(err) => {
+                        return Err(Status::unavailable(format!(
+                            "Failed to move the partition assignments of executor '{executor_address}' to its instance identity '{executor_id}': {err}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -1517,9 +1630,11 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use app::AppBuilder;
+    use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::datasource::MemTable;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
     use runtime_proto::{
         cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
     };
@@ -1538,6 +1653,20 @@ mod tests {
     impl SecretStore for FakeSecretStore {
         async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
             Ok(self.0.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
+    /// Fixed-map secret store that records every key it is asked for.
+    struct RecordingSecretStore {
+        values: HashMap<String, String>,
+        lookups: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SecretStore for RecordingSecretStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            self.lookups.lock().push(key.to_string());
+            Ok(self.values.get(key).map(|v| SecretString::from(v.clone())))
         }
     }
 
@@ -1568,6 +1697,19 @@ mod tests {
         secrets: Secrets,
         allow_secret_expansion: bool,
     ) -> ClusterServiceImpl {
+        make_test_service_full(app, secrets, allow_secret_expansion, None, &[]).await
+    }
+
+    /// Builds the service under test. `trace_ids` seed the local task history
+    /// table (a single `trace_id` column), and `metrics_reader` is what
+    /// `GetMetrics` collects from.
+    async fn make_test_service_full(
+        app: Option<Arc<App>>,
+        secrets: Secrets,
+        allow_secret_expansion: bool,
+        metrics_reader: Option<MetricsReader>,
+        trace_ids: &[&str],
+    ) -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
@@ -1582,9 +1724,20 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
+        let task_history_batches = if trace_ids.is_empty() {
+            vec![]
+        } else {
+            vec![
+                RecordBatch::try_new(
+                    Arc::clone(&task_history_schema),
+                    vec![Arc::new(StringArray::from(trace_ids.to_vec()))],
+                )
+                .expect("seeded task history batch should be valid"),
+            ]
+        };
         let task_history_table = Arc::new(
-            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
-                .expect("empty task history table should be created"),
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![task_history_batches])
+                .expect("task history table should be created"),
         );
         datafusion
             .ctx
@@ -1633,7 +1786,7 @@ mod tests {
             Arc::new(TokioRwLock::new(HashMap::new())),
             datafusion,
             executor_registry,
-            None,
+            metrics_reader,
             allow_secret_expansion,
         )
     }
@@ -1642,8 +1795,73 @@ mod tests {
         make_test_service_with(None, Secrets::default(), true).await
     }
 
-    async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
-        let service = make_test_service().await;
+    /// A service whose local task history holds `trace_ids`.
+    async fn make_test_service_with_task_history(trace_ids: &[&str]) -> ClusterServiceImpl {
+        make_test_service_full(None, Secrets::default(), true, None, trace_ids).await
+    }
+
+    /// A metrics reader holding one cumulative counter,
+    /// `cluster_rpc_test_counter`, at 7, so a `GetMetrics` payload carries a
+    /// known value. The provider is local rather than global, so no other test
+    /// sees it, and must be held for as long as the reader is collected.
+    fn metrics_reader_with_test_counter() -> (MetricsReader, SdkMeterProvider) {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let reader = MetricsReader::new_cumulative();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader.clone())
+            .build();
+        provider
+            .meter("cluster_service_test")
+            .u64_counter("cluster_rpc_test_counter")
+            .build()
+            .add(7, &[]);
+        (reader, provider)
+    }
+
+    /// Every integer data point of the sum `name` in an OTLP `GetMetrics`
+    /// payload.
+    fn otlp_sum_points(payload: &[u8], name: &str) -> Vec<i64> {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{metric::Data, number_data_point::Value};
+        use prost::Message as _;
+
+        let request = ExportMetricsServiceRequest::decode(payload)
+            .expect("GetMetrics payload should be an OTLP export request");
+        request
+            .resource_metrics
+            .iter()
+            .flat_map(|resource| &resource.scope_metrics)
+            .flat_map(|scope| &scope.metrics)
+            .filter(|metric| metric.name == name)
+            .flat_map(|metric| match &metric.data {
+                Some(Data::Sum(sum)) => sum.data_points.iter(),
+                other => panic!("{name} should be a sum, got {other:?}"),
+            })
+            .map(|point| match &point.value {
+                Some(Value::AsInt(value)) => *value,
+                other => panic!("{name} should have an integer value, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Decodes a `GetTaskHistory` Arrow IPC payload and renders it as a table.
+    fn render_task_history(arrow_ipc: Vec<u8>) -> String {
+        let reader =
+            arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(arrow_ipc), None)
+                .expect("task history payload should be an Arrow IPC stream");
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("task history batches should decode");
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("task history batches should render")
+            .to_string()
+    }
+
+    /// Serves `service` over a real tonic transport on a loopback port.
+    async fn serve_test_service(
+        service: ClusterServiceImpl,
+    ) -> (ClusterServiceClient<Channel>, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test cluster service listener should bind");
@@ -1732,7 +1950,7 @@ mod tests {
             .await
             .expect_err("unreferenced secret must be denied");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(
             err.message().contains("Unable to expand secret"),
             "unexpected message: {}",
@@ -1831,7 +2049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_secret_referenced_but_missing_from_store_is_invalid_argument() {
+    async fn expand_secret_referenced_but_missing_from_store_is_not_found() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         // Allowlisted key is referenced by the app but not present in any store.
         let secrets = secrets_with(&[]);
@@ -1845,56 +2063,165 @@ mod tests {
             .await
             .expect_err("missing allowlisted secret must fail");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(err.message().contains("Unable to expand secret PG_PASS"));
     }
 
     #[tokio::test]
+    async fn executor_secrets_treat_keys_the_scheduler_declines_as_not_found() {
+        let mut ds = Dataset::new("memory:data", "orders");
+        ds.params = Some(Params::from_string_map(HashMap::from([
+            ("pg_pass".to_string(), "${ secrets:PG_PASS }".to_string()),
+            ("pg_user".to_string(), "${ secrets:PG_USER }".to_string()),
+        ])));
+        let app = Arc::new(AppBuilder::new("test").with_dataset(ds).build());
+        let lookups = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(RecordingSecretStore {
+                values: HashMap::from([
+                    ("PG_PASS".to_string(), "correct-horse".to_string()),
+                    ("s3_region".to_string(), "us-west-2".to_string()),
+                ]),
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let service = make_test_service_with(Some(app), secrets, true).await;
+        let (client, shutdown) = serve_test_service(service).await;
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
+            "executor-1".to_string(),
+        );
+
+        // Not referenced by the app, so the scheduler declines it even though
+        // its store has a value.
+        assert!(matches!(
+            executor_secrets.get_secret("s3_region").await,
+            Ok(None)
+        ));
+        // Referenced by the app, but in no store.
+        assert!(matches!(
+            executor_secrets.get_secret("PG_USER").await,
+            Ok(None)
+        ));
+        let value = executor_secrets
+            .get_secret("PG_PASS")
+            .await
+            .expect("referenced secret lookup should succeed")
+            .expect("referenced secret should resolve");
+        assert_eq!(value.expose_secret(), "correct-horse");
+        // The declined key never reaches the store, and each key is
+        // requested once.
+        assert_eq!(
+            *lookups.lock(),
+            vec!["PG_USER".to_string(), "PG_PASS".to_string()]
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn executor_secrets_report_unreachable_scheduler_as_error() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        drop(listener);
+        let channel = Channel::from_shared(format!("http://{address}"))
+            .expect("loopback URI should parse")
+            .connect_lazy();
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(
+                ClusterServiceClient::new(channel),
+            )),
+            "executor-1".to_string(),
+        );
+
+        let err = executor_secrets
+            .get_secret("s3_region")
+            .await
+            .expect_err("an unreachable scheduler must be an error, not a missing key");
+        assert!(
+            err.to_string()
+                .contains("Failed to expand secret from scheduler"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Back-to-back requests a transport test issues: well past any burst a
+    /// rate limiter would let through.
+    const REPEATED_REQUESTS: usize = 20;
+
+    #[tokio::test]
     async fn test_internal_get_metrics_transport_allows_repeated_requests() {
-        let (mut client, shutdown) = make_test_client().await;
+        let (metrics_reader, _provider) = metrics_reader_with_test_counter();
+        let service =
+            make_test_service_full(None, Secrets::default(), true, Some(metrics_reader), &[]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
 
         // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
-        // metrics endpoint applies the external scrape limit.
-        client
-            .get_metrics(Request::new(GetMetricsRequest {}))
-            .await
-            .expect("first metrics request should succeed");
-
-        client
-            .get_metrics(Request::new(GetMetricsRequest {}))
-            .await
-            .expect("second metrics request should also succeed");
+        // metrics endpoint applies the external scrape limit. Every request must succeed
+        // and carry the node's metrics.
+        for attempt in 1..=REPEATED_REQUESTS {
+            let response = client
+                .get_metrics(Request::new(GetMetricsRequest {}))
+                .await
+                .unwrap_or_else(|status| {
+                    panic!("metrics request {attempt} should succeed, got {status:?}")
+                });
+            assert_eq!(
+                otlp_sum_points(
+                    &response.into_inner().otlp_metrics,
+                    "cluster_rpc_test_counter"
+                ),
+                vec![7],
+                "metrics request {attempt}"
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test]
     async fn test_internal_get_task_history_transport_allows_repeated_requests() {
-        let (mut client, shutdown) = make_test_client().await;
+        let service = make_test_service_with_task_history(&["trace-a", "trace-b"]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
         let request = || {
             Request::new(GetTaskHistoryRequest {
                 sql: format!(
-                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\" ORDER BY trace_id"
                 ),
             })
         };
 
-        client
-            .get_task_history(request())
-            .await
-            .expect("first task history request should succeed");
-
-        client
-            .get_task_history(request())
-            .await
-            .expect("second task history request should also succeed");
+        for attempt in 1..=REPEATED_REQUESTS {
+            let response = client
+                .get_task_history(request())
+                .await
+                .unwrap_or_else(|status| {
+                    panic!("task history request {attempt} should succeed, got {status:?}")
+                });
+            assert_eq!(
+                render_task_history(response.into_inner().arrow_ipc),
+                "+----------+\n\
+                 | trace_id |\n\
+                 +----------+\n\
+                 | trace-a  |\n\
+                 | trace-b  |\n\
+                 +----------+",
+                "task history request {attempt}"
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test]
     async fn get_task_history_allows_select() {
-        let service = make_test_service().await;
+        let service = make_test_service_with_task_history(&["trace-a"]).await;
         let response = service
             .get_task_history(Request::new(GetTaskHistoryRequest {
                 sql: format!(
@@ -1903,8 +2230,16 @@ mod tests {
             }))
             .await
             .expect("SELECT against task_history must succeed under read-only");
-        // Empty MemTable still produces a valid response (possibly empty IPC).
-        let _ = response.into_inner().arrow_ipc;
+        // The query named `task_history`; the row can only have come from the
+        // seeded `local_task_history`, so the rewrite ran under the read-only gate.
+        assert_eq!(
+            render_task_history(response.into_inner().arrow_ipc),
+            "+----------+\n\
+             | trace_id |\n\
+             +----------+\n\
+             | trace-a  |\n\
+             +----------+"
+        );
     }
 
     #[tokio::test]
@@ -2067,17 +2402,20 @@ mod tests {
     #[test]
     fn test_rewrite_task_history_sql_rejects_other_tables() {
         let sql = r#"SELECT * FROM "runtime"."other_table""#;
-        let result = rewrite_task_history_sql(sql);
-        assert!(result.is_err(), "Should reject queries to other tables");
+        assert_eq!(
+            rewrite_task_history_sql(sql),
+            Err(r#"Query must reference the "runtime"."task_history" table"#.to_string())
+        );
     }
 
     #[test]
     fn test_rewrite_task_history_sql_rejects_multiple_statements() {
+        // Both statements parse, so this is the statement-smuggling guard, not a
+        // parse failure.
         let sql = r#"SELECT * FROM "runtime"."task_history"; DROP TABLE foo"#;
-        let result = rewrite_task_history_sql(sql);
-        assert!(
-            result.is_err(),
-            "Should reject multiple statements: {result:?}"
+        assert_eq!(
+            rewrite_task_history_sql(sql),
+            Err("Expected single SQL statement, got 2".to_string())
         );
     }
 

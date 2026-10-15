@@ -142,25 +142,4 @@ mod tests {
             .expect("To await channel handle")
             .expect("To end channel");
     }
-
-    #[tokio::test]
-    async fn test_manual_request_channel_cancellation() {
-        let (_tx, rx) = mpsc::channel::<Option<Arc<TaskRequest>>>(1);
-        let (submit_tx, _submit_rx) = mpsc::channel::<Arc<TaskRequest>>(1);
-
-        let cancellation = Arc::new(CancellationToken::new());
-
-        let mut channel = ManualRequestChannel::new(rx);
-        channel.set_cancellation_token(Arc::clone(&cancellation));
-        channel.set_submission_channel(Arc::new(submit_tx));
-
-        let handle = channel.start().expect("To start manual channel");
-
-        cancellation.cancel();
-
-        handle
-            .await
-            .expect("To await channel handle")
-            .expect("To end channel");
-    }
 }

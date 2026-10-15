@@ -20,22 +20,116 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    name: Plan WAL E2E legs
+    # Every leg runs the change's code on persistent self-hosted runners in a
+    # public repository, so a pull request from a fork or from Dependabot runs
+    # none before review. The merge queue runs them once a maintainer queues it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
+    runs-on: spiceai-dev-runners
+    # A merge group's checkout takes the full history, sized for a cold runner
+    # cloning from scratch.
+    timeout-minutes: 45
+    outputs:
+      legs: ${{ steps.legs.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          persist-credentials: false
+          # A pull request's merge commit and its base parent suffice for its diff.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 2 }}
+      # A merge group cannot be filtered by path, and every leg holds a
+      # self-hosted runner, so a queue entry that touches none of the
+      # pull_request paths above runs no leg. Keep the two lists equal.
+      - name: Check the merge group for WAL changes
+        id: changes
+        if: github.event_name == 'merge_group'
+        uses: ./.github/actions/check-code-changes
+        with:
+          filters: |
+            code_changes:
+              - 'crates/object_store_occ/**'
+              - 'test/object_store_occ/**'
+              - '.github/workflows/object_store_wal.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+      # spiceio keeps a lock record on the shared NAS for every key ever written
+      # under a strict prefix, and nothing may remove one, so every run of its leg
+      # leaves about a thousand behind. Most runs here come from dependency
+      # changes, which the MinIO and RustFS legs cover. The spiceio leg runs for
+      # changes to the WAL, its harness, or this workflow, which pins spiceio.
+      - name: Check for changes the spiceio leg covers
+        id: spiceio
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || 'HEAD^1' }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only "$BASE" HEAD -- crates/object_store_occ test/object_store_occ .github/workflows/object_store_wal.yml)
+          echo "relevant=$([ -n "$changed" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Choose legs
+        id: legs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
+          SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
+          HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+        with:
+          script: |
+            // Every leg runs in parallel. The disk legs qualify the local
+            // conditional-write emulation on each platform's filesystem; the
+            // others run the same histories through the S3 client against each
+            // service. spiceio fronts an SMB share through macOS CommonCrypto,
+            // so it has no Linux leg.
+            //
+            // A macOS leg takes whichever Mac is free first in either
+            // self-hosted pool, `spiceai-macos` or `spiceai-macos-large`. The
+            // pools are separate runner groups, and `runs-on` cannot name
+            // either of two labels, so the legs ask for the labels every
+            // self-hosted Apple Silicon runner registers with by default.
+            const mac = ['self-hosted', 'macOS', 'ARM64'];
+            const legs = [
+              { os: 'Linux', runner: 'spiceai-dev-runners', store: 'disk' },
+              { os: 'Linux', runner: 'spiceai-dev-runners', store: 'minio' },
+              { os: 'Linux', runner: 'spiceai-dev-runners', store: 'rustfs' },
+              { os: 'macOS', runner: mac, store: 'disk' },
+              { os: 'macOS', runner: mac, store: 'minio' },
+              { os: 'macOS', runner: mac, store: 'rustfs' },
+              { os: 'macOS', runner: mac, store: 'spiceio' },
+            ];
+            if (process.env.RELEVANT !== 'true') {
+              core.notice('This merge group changes nothing the WAL E2E suite covers, so no leg runs.');
+              return [];
+            }
+            if (process.env.SPICEIO_RELEVANT !== 'true') {
+              core.notice('This change leaves the WAL crate, its harness and this workflow untouched, so the spiceio leg does not run. Dispatch the workflow to run it anyway.');
+              return legs.filter((leg) => leg.store !== 'spiceio');
+            }
+            if (process.env.HAS_SPICEIO_SECRET !== 'true') {
+              core.warning('UNAS_SMB_PASS is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
+              return legs.filter((leg) => leg.store !== 'spiceio');
+            }
+            return legs;
+
   qualify:
-    name: WAL E2E differential (${{ matrix.os }})
+    name: WAL E2E (${{ matrix.os }}, ${{ matrix.store }})
+    needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.legs != '[]'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            redis-image: redis:7.4.11-bookworm
-          - os: macos-latest
-            redis-image: ''
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+        include: ${{ fromJson(needs.plan.outputs.legs) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     services:
       redis:
         # GitHub service containers require Linux. An empty image skips macOS.
-        image: ${{ matrix.redis-image }}
+        image: ${{ matrix.os == 'Linux' && 'redis:7.4.11-bookworm' || '' }}
         ports:
           - 6379/tcp
         options: >-
@@ -48,34 +142,280 @@ jobs:
       RUSTC_WRAPPER: ''
       RUSTC_WORKSPACE_WRAPPER: ''
       SLATEDB_UNIFFI_RUNTIME_THREADS: 2
+      STORE: ${{ matrix.store }}
+      # The S3 client settings for every object-store leg; each leg's start step
+      # adds AWS_ENDPOINT. The keys belong to the MinIO and RustFS servers this
+      # job starts on loopback; spiceio does not check them.
+      AWS_ALLOW_HTTP: 'true'
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: spice-wal
+      AWS_SECRET_ACCESS_KEY: spice-wal-secret
+      WAL_BUCKET: wal
+      # Unique per attempt: a WAL namespace is never reused, and spiceio's share
+      # outlives the job.
+      WAL_PREFIX: object_store_wal/${{ github.run_id }}-${{ github.run_attempt }}
+      WAL_CONTAINER: wal-${{ matrix.store }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
+      # The dev runner image has no C toolchain, and rustc links through cc. The
+      # Macs already have one.
+      - uses: ./.github/actions/setup-cc
+        if: runner.os == 'Linux'
+      # The dev runner image has python3 but no pip. The macOS runners carry
+      # Homebrew interpreters, and installing one through setup-python needs sudo.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: runner.os == 'Linux'
         with:
           python-version: '3.12'
       - name: Install the independent test oracles
         run: |
-          python -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+          set -euo pipefail
+          # SlateDB 0.17.0 needs Python 3.10 or newer; a macOS python3 can be 3.9.
+          python=''
+          for candidate in python3.12 python3.13 python3.14 python3.11 python3.10; do
+            if python=$(command -v "$candidate"); then
+              break
+            fi
+          done
+          : "${python:?The independent oracles need Python 3.10 or newer on PATH}"
+          "$python" -m venv "$RUNNER_TEMP/wal-oracle"
+          "$RUNNER_TEMP/wal-oracle/bin/python" -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+          echo "$RUNNER_TEMP/wal-oracle/bin" >> "$GITHUB_PATH"
       - name: Test state protocol and cancellation
+        if: matrix.store == 'disk'
         run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
       - name: Build the process worker
         run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
-      - name: Run process histories against SlateDB and Redis
-        if: runner.os == 'Linux'
+
+      - name: Start ${{ matrix.store }} in a container
+        if: runner.os == 'Linux' && (matrix.store == 'minio' || matrix.store == 'rustfs')
+        run: |
+          set -euo pipefail
+          case "$STORE" in
+            # MinIO no longer publishes images or binaries. Chainguard builds the
+            # upstream source (this is its 2026-10-10 build) and runs it as a user
+            # that cannot create /data.
+            minio)
+              image=cgr.dev/chainguard/minio@sha256:7df55d002b698e4494a131b848dd553361bbe58b7e19f62d9623c29af1ba9ccf
+              docker run -d --name "$WAL_CONTAINER" --user 0:0 --publish 127.0.0.1::9000 \
+                -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+                -e MINIO_BROWSER=off "$image" server /data
+              ;;
+            rustfs)
+              image=rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+              docker run -d --name "$WAL_CONTAINER" --publish 127.0.0.1::9000 \
+                -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+                "$image" /data
+              ;;
+          esac
+          docker exec "$WAL_CONTAINER" "$STORE" --version || echo "::warning::Could not read the $STORE version from $image."
+          port=$(docker port "$WAL_CONTAINER" 9000/tcp | head -n 1 | sed 's/.*://')
+          echo "AWS_ENDPOINT=http://127.0.0.1:${port:?no published port for the $STORE container}" >> "$GITHUB_ENV"
+
+      - name: Start ${{ matrix.store }} on the host
+        if: runner.os == 'macOS' && (matrix.store == 'minio' || matrix.store == 'rustfs')
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/wal-$STORE"
+          mkdir -p "$dir/data"
+          case "$STORE" in
+            # MinIO no longer publishes binaries. This builds the final community
+            # release, RELEASE.2025-10-15T17-29-55Z, the way MinIO built its own
+            # releases: without cgo. Homebrew's bottles use cgo, which compiles in
+            # go-m1cpu's initializer. That reads Apple Silicon power-manager
+            # properties through IOKit, and on a Mac that lacks one it
+            # dereferences null, so the server dies with SIGSEGV before it starts.
+            minio)
+              # The toolchain MinIO's go.mod names for that release.
+              curl -fsSL --retry 3 -o "$dir/go.tar.gz" https://go.dev/dl/go1.24.8.darwin-arm64.tar.gz
+              echo "0db27ff8c3e35fd93ccf9d31dd88a0f9c6454e8d9b30c28bd88a70b930cc4240  $dir/go.tar.gz" | shasum -a 256 -c -
+              tar -xzf "$dir/go.tar.gz" -C "$dir"
+              commit=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+              GOBIN="$dir" GOMODCACHE="$dir/go-mod" GOCACHE="$dir/go-build" GOFLAGS=-modcacherw \
+                GOTOOLCHAIN=local CGO_ENABLED=0 "$dir/go/bin/go" install -tags kqueue -trimpath -ldflags "-s -w \
+                -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z \
+                -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z \
+                -X github.com/minio/minio/cmd.CommitID=$commit \
+                -X github.com/minio/minio/cmd.ShortCommitID=${commit:0:12} \
+                -X github.com/minio/minio/cmd.CopyrightYear=2025" \
+                "github.com/minio/minio@$commit"
+              # The toolchain and the module and build caches take over 2 GB on a
+              # shared Mac.
+              rm -rf "$dir/go" "$dir/go.tar.gz" "$dir/go-mod" "$dir/go-build"
+              ;;
+            rustfs)
+              digest=18aac7101c3484b98f93de64a0609aaa8e02aba072ba7927172c4b2eae7d4843
+              curl -fsSL --retry 3 -o "$dir/rustfs.zip" \
+                https://github.com/rustfs/rustfs/releases/download/1.0.1/rustfs-macos-aarch64-v1.0.1.zip
+              echo "$digest  $dir/rustfs.zip" | shasum -a 256 -c -
+              unzip -q -o "$dir/rustfs.zip" rustfs -d "$dir"
+              ;;
+          esac
+          "$dir/$STORE" --version
+          # Several runner instances share each Mac. Port 0 has the kernel pick a
+          # free port as the server binds it, so no other process can take the port
+          # in between, and RustFS's console, on a fixed port, stays off.
+          case "$STORE" in
+            minio)
+              MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" MINIO_BROWSER=off \
+                "$dir/minio" server "$dir/data" --address 127.0.0.1:0 > "$dir/server.log" 2>&1 &
+              ;;
+            rustfs)
+              RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" RUSTFS_CONSOLE_ENABLE=false \
+                "$dir/rustfs" server --address 127.0.0.1:0 "$dir/data" > "$dir/server.log" 2>&1 &
+              ;;
+          esac
+          pid=$!
+          {
+            echo "WAL_SERVER_PID=$pid"
+            echo "WAL_SERVER_LOG=$dir/server.log"
+          } >> "$GITHUB_ENV"
+          port=''
+          for _ in $(seq 1 30); do
+            port=$(lsof -nP -a -p "$pid" -iTCP@127.0.0.1 -sTCP:LISTEN -Fn 2> /dev/null | sed -n 's/^n127\.0\.0\.1://p' | head -n 1) || true
+            if [ -n "$port" ] || ! kill -0 "$pid" 2> /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$port" ]; then
+            echo "::error::$STORE was not listening on 127.0.0.1 within 30 seconds; its log is printed below."
+            exit 1
+          fi
+          echo "AWS_ENDPOINT=http://127.0.0.1:$port" >> "$GITHUB_ENV"
+
+      - name: Create the WAL bucket
+        if: matrix.store == 'minio' || matrix.store == 'rustfs'
+        run: |
+          set -euo pipefail
+          server_running() {
+            if [ -n "${WAL_SERVER_PID:-}" ]; then
+              kill -0 "$WAL_SERVER_PID" 2> /dev/null
+            else
+              [ "$(docker container inspect --format '{{.State.Running}}' "$WAL_CONTAINER" 2> /dev/null)" = true ]
+            fi
+          }
+          # The server accepts connections before its S3 API answers, so the first
+          # signed request that succeeds is also the readiness check.
+          code=000
+          for _ in $(seq 1 60); do
+            code=$(curl -sS -o "$RUNNER_TEMP/create-bucket.xml" -w '%{http_code}' -X PUT \
+              --aws-sigv4 "aws:amz:$AWS_REGION:s3" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+              -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
+              "$AWS_ENDPOINT/$WAL_BUCKET") || true
+            if [ "$code" = 200 ]; then
+              exit 0
+            fi
+            # A server that has exited would otherwise be waited out here.
+            if ! server_running; then
+              echo "::error::$STORE exited before it created bucket '$WAL_BUCKET' at $AWS_ENDPOINT; its log is printed below."
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::$STORE did not create bucket '$WAL_BUCKET' at $AWS_ENDPOINT within 60 seconds; the last answer was HTTP $code."
+          cat "$RUNNER_TEMP/create-bucket.xml" 2>/dev/null
+          exit 1
+
+      # Conditional writes need spiceio's strict prefixes (spiceai/spiceio#50),
+      # which no spiceio release carries yet, so this builds the commit that added them.
+      - name: Build spiceio
+        if: matrix.store == 'spiceio'
+        run: cargo install --locked --git https://github.com/spiceai/spiceio --rev 35977eac95098f348bb93bde6fc7beb498725a04 --root "$RUNNER_TEMP/spiceio" spiceio
+      - name: Start spiceio
+        if: matrix.store == 'spiceio'
+        env:
+          SPICEIO_SMB_SERVER: 192.168.3.148
+          SPICEIO_SMB_USER: runner
+          SPICEIO_SMB_PASS: ${{ secrets.UNAS_SMB_PASS }}
+          SPICEIO_SMB_SHARE: ai_platform_dev
+          SPICEIO_BUCKET: ${{ env.WAL_BUCKET }}
+          # spiceio moves to the next port when this one is taken.
+          SPICEIO_BIND: 127.0.0.1:8333
+          SPICEIO_SMB_CONNECTIONS: '8'
+          # spiceio refuses a conditional write outside a strict prefix. Write-back
+          # and the machine-wide spill suit a cache; a WAL acknowledgement must mean
+          # the NAS has the object.
+          SPICEIO_STRICT_PREFIXES: object_store_wal/
+          SPICEIO_WRITE_BACK: '0'
+          SPICEIO_SPILL_DIR: 'off'
+          SPICEIO_LOG_FILE: ${{ runner.temp }}/spiceio.log
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/spiceio/bin/spiceio" > "$RUNNER_TEMP/spiceio.out" 2>&1 &
+          pid=$!
+          {
+            echo "WAL_SERVER_PID=$pid"
+            echo "WAL_SERVER_LOG=$SPICEIO_LOG_FILE"
+          } >> "$GITHUB_ENV"
+          # spiceio binds first and answers 503 until the share is connected, then
+          # logs the address it settled on.
+          for _ in $(seq 1 150); do
+            endpoint=$(sed -n 's/.*ready, listening on \(http:[^ ]*\).*/\1/p' "$SPICEIO_LOG_FILE" 2>/dev/null | tail -n 1) || true
+            if [ -n "$endpoint" ]; then
+              echo "AWS_ENDPOINT=$endpoint" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          echo "::error::spiceio did not connect to the SMB share within 150 seconds."
+          cat "$RUNNER_TEMP/spiceio.out" "$SPICEIO_LOG_FILE" 2>/dev/null
+          exit 1
+
+      - name: Test OCC primitives against ${{ matrix.store }}
+        if: matrix.store != 'disk'
+        env:
+          AWS_S3_BUCKET: ${{ env.WAL_BUCKET }}
+          AWS_S3_PREFIX: ${{ env.WAL_PREFIX }}/s3_integration
+        run: cargo test --locked --profile dev -p object_store_occ --test s3_integration -- --nocapture
+      - name: Run process histories against ${{ matrix.store }}
+        timeout-minutes: 30
         env:
           REDIS_PORT: ${{ job.services.redis.ports['6379'] }}
         run: |
-          python test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb --redis-url "redis://127.0.0.1:${REDIS_PORT:?Redis service port missing}/0"
-      - name: Run process histories against SlateDB
-        if: runner.os == 'macOS'
-        run: python test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb
+          set -euo pipefail
+          args=(--driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb)
+          if [ "$STORE" != disk ]; then
+            args+=(--store "s3://$WAL_BUCKET/$WAL_PREFIX/e2e")
+          fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            args+=(--redis-url "redis://127.0.0.1:${REDIS_PORT:?Redis service port missing}/0")
+          fi
+          python test/object_store_occ/e2e.py "${args[@]}"
+
+      # The WAL keeps no garbage collector, and the share is shared. spiceio keeps
+      # its per-key lock records by design; only the objects are removed.
+      - name: Remove this run's objects from the spiceio share
+        if: always() && matrix.store == 'spiceio' && env.AWS_ENDPOINT != ''
+        run: target/debug/examples/wal_test_driver --purge "s3://$WAL_BUCKET/$WAL_PREFIX"
+      - name: Stop ${{ matrix.store }}
+        if: always() && matrix.store != 'disk'
+        run: |
+          mkdir -p wal-e2e-artifacts
+          if [ "$RUNNER_OS" = Linux ]; then
+            docker logs "$WAL_CONTAINER" > wal-e2e-artifacts/server.log 2>&1 || true
+            docker rm -f "$WAL_CONTAINER" > /dev/null 2>&1 || true
+          else
+            if [ -n "${WAL_SERVER_PID:-}" ]; then
+              kill "$WAL_SERVER_PID" 2> /dev/null || true
+            fi
+            cp "${WAL_SERVER_LOG:-/dev/null}" wal-e2e-artifacts/server.log 2> /dev/null || true
+          fi
+      - name: Show the ${{ matrix.store }} log
+        if: failure() && matrix.store != 'disk'
+        run: tail -n 200 wal-e2e-artifacts/server.log 2> /dev/null || echo "No server log was captured."
+      # Pull request and merge-queue checks keep no artifacts. To keep a failed
+      # history, dispatch this workflow on the branch.
       - name: Retain histories and backing stores
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: wal-e2e-${{ matrix.os }}
+          name: wal-e2e-${{ matrix.os }}-${{ matrix.store }}
           path: wal-e2e-artifacts/
           retention-days: 7

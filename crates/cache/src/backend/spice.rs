@@ -108,6 +108,31 @@ where
     {
         self.cache.invalidate_matching(predicate)
     }
+
+    /// Insert `value` or replace the resident only when `admit` accepts what is
+    /// stored now (`None` when the key is empty). `weight` must be
+    /// [`Sizeable::get_memory_size`] of `value`.
+    ///
+    /// The predicate is borrowed, so this cannot move onto the blocking pool.
+    /// It follows [`CacheBackend::replace_if`]: `block_in_place` on a
+    /// multi-thread runtime, inline on a current-thread runtime.
+    pub fn insert_if(
+        &self,
+        key: u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool {
+        let run = || self.cache.insert_if(key, value, weight, admit);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread =>
+            {
+                run()
+            }
+            _ => tokio::task::block_in_place(run),
+        }
+    }
 }
 
 #[async_trait]

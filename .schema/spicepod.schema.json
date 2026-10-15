@@ -32,7 +32,7 @@
       ]
     },
     "snapshots": {
-      "description": "Optional acceleration snapshot configuration",
+      "description": "Deprecated: snapshots are stored in the `snapshots/` folder of\n`runtime.state.location`. A dataset sets `acceleration.snapshots_location`,\n`acceleration.snapshots_params` and\n`acceleration.snapshots_bootstrap_on_failure_behavior` to override it.",
       "anyOf": [
         {
           "$ref": "#/$defs/Snapshots"
@@ -40,7 +40,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "deprecated": true
     },
     "extensions": {
       "description": "Optional extensions configuration",
@@ -573,6 +574,10 @@
             "type": "string"
           }
         },
+        "adaptive_tuning": {
+          "description": "Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives\nCayenne's knobs statically; `enabled` also runs its closed-loop controller.",
+          "$ref": "#/$defs/AdaptiveTuning"
+        },
         "task_history": {
           "$ref": "#/$defs/TaskHistory"
         },
@@ -688,7 +693,7 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, source rate-control, and distributed query state when those sections do not set their own `state_location`.",
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. Each feature writes under its own folder: `results-cache/`, `rate-control/` and `cluster/`. A `runtime.scheduler.state_location` overrides it for the scheduler.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"
@@ -1190,6 +1195,21 @@
         }
       ]
     },
+    "AdaptiveTuning": {
+      "description": "Turns adaptive tuning on or off for the whole runtime.\n\n`disabled` (the default) derives Cayenne's knobs statically from the host and, where\navailable, the inferred schema. `enabled` additionally runs Cayenne's closed-loop\ncontroller, which moves them within the statically derived bounds. The\n`runtime.params.target_*` setpoints steer the controller and never turn it on.\n\nOnly the exact values `enabled` and `disabled` are accepted, matching the published\nschema. Anything else, including a different case or surrounding whitespace, fails the\nSpicepod load.",
+      "oneOf": [
+        {
+          "description": "Derive the knobs statically. No closed loop.",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "Run the closed-loop controller (preview).",
+          "type": "string",
+          "const": "enabled"
+        }
+      ]
+    },
     "TaskHistory": {
       "type": "object",
       "properties": {
@@ -1498,7 +1518,7 @@
       "type": "object",
       "properties": {
         "allowed_hosts": {
-          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nDefaults to rmcp defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
+          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nUnset or empty uses the defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
           "type": [
             "array",
             "null"
@@ -1727,11 +1747,12 @@
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
-          "type": "string"
+          "description": "Deprecated: set `runtime.state.location`, which keeps cluster state in its\n`cluster/` folder. Root URI for shared cluster state (see\n[`Runtime::scheduler_state`]).",
+          "type": "string",
+          "deprecated": true
         },
         "params": {
-          "description": "Optional object store params for the shared cluster state.",
+          "description": "Deprecated: set `runtime.state.params`. Object store params for the shared\ncluster state.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -1739,7 +1760,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "deprecated": true
         },
         "partition_assignment_interval": {
           "description": "How often the scheduler assigns accelerated table partitions to executors.",
@@ -1771,26 +1793,8 @@
     "SourceRateControl": {
       "type": "object",
       "properties": {
-        "state_location": {
-          "description": "Root URI for globally persisted source rate-control state.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "params": {
-          "description": "Optional object store params for source rate-control state.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "refresh_interval": {
-          "description": "How often each runtime refreshes and persists per-source rate-control state in object storage.",
+          "description": "How often each runtime refreshes and persists per-source rate-control state at `runtime.state.location`.",
           "type": "string",
           "default": "30s"
         },
@@ -1849,7 +1853,7 @@
           "default": true
         },
         "location": {
-          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`",
+          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`\n\nWhen not set, snapshots go to the `snapshots/` folder of\n`runtime.state.location`. A dataset's `acceleration.snapshots_location`\nwins over it.",
           "type": [
             "string",
             "null"
@@ -1860,7 +1864,7 @@
           "$ref": "#/$defs/BootstrapOnFailureBehavior"
         },
         "params": {
-          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.",
+          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.\nThey apply to this section's `location`, and replace `runtime.state.params`\nfor the `runtime.state` location. A dataset's `acceleration.snapshots_params`\nwin over them.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3122,6 +3126,7 @@
           "default": "auto"
         },
         "engine": {
+          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.",
           "type": [
             "string",
             "null"
@@ -3190,7 +3195,7 @@
           ]
         },
         "params": {
-          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
+          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: cayenne). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3284,7 +3289,7 @@
           }
         },
         "snapshots": {
-          "description": "Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
+          "description": "Enables snapshots for this dataset. Snapshots are stored in the first of\n`snapshots_location`, the deprecated top-level `snapshots.location` and the\n`snapshots/` folder of `runtime.state.location` that is set.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
           "$ref": "#/$defs/SnapshotBehavior"
         },
         "snapshots_trigger": {
@@ -3311,6 +3316,35 @@
         },
         "snapshots_creation_policy": {
           "$ref": "#/$defs/SnapshotsCreationPolicy"
+        },
+        "snapshots_location": {
+          "description": "The object store location of this dataset's snapshots, for example\n`s3://my-bucket/spice/snapshots/`. Defaults to the deprecated top-level\n`snapshots.location`, then to the `snapshots/` folder of\n`runtime.state.location`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshots_params": {
+          "description": "Object store params for this dataset's snapshots, such as `s3_region` or\n`s3_queue_url`. When set, they are the only params used. Otherwise a\n`snapshots_location` uses no params, the deprecated top-level\n`snapshots.location` uses `snapshots.params`, and the `runtime.state`\nlocation uses `snapshots.params` when set, else `runtime.state.params`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshots_bootstrap_on_failure_behavior": {
+          "description": "The behavior when loading a snapshot fails: `warn`, `retry` or `fallback`.\nDefaults to the deprecated top-level `snapshots.bootstrap_on_failure_behavior`,\nthen to `warn`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BootstrapOnFailureBehavior"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -3466,7 +3500,7 @@
               "params": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/ArrowAcceleratorParams"
+                    "$ref": "#/$defs/CayenneAcceleratorParams"
                   },
                   {
                     "type": "null"
@@ -9445,7 +9479,7 @@
           ]
         },
         "cayenne_deletion_mode": {
-          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for refresh_mode: changes tables with a primary key (key-based deletes compact concurrently with writers and ride the in-memory CDC tier, where position-delete compaction must serialize with continuous writes), and to 'position' (merge-on-read) everywhere else: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a CDC table back into merge-on-read.",
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more physical CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.",
           "type": "string",
           "default": "auto",
           "enum": [
@@ -9543,31 +9577,6 @@
         },
         "cayenne_cdc_mem_tier_shards": {
           "description": "Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling.",
-          "type": "string"
-        },
-        "cayenne_tuning": {
-          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "adaptive"
-          ]
-        },
-        "cayenne_goal_replication_lag": {
-          "description": "Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps.",
-          "type": "string"
-        },
-        "cayenne_goal_freshness": {
-          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
-          "type": "string"
-        },
-        "cayenne_goal_query_latency": {
-          "description": "Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
-          "type": "string"
-        },
-        "cayenne_goal_convergence_window": {
-          "description": "Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface.",
           "type": "string"
         },
         "cdc_prefetch_buffer": {
@@ -11343,6 +11352,10 @@
         },
         "anthropic_auth_token": {
           "description": "The Anthropic Auth Token.",
+          "type": "string"
+        },
+        "anthropic_workspace_id": {
+          "description": "The Anthropic workspace ID, sent as the `anthropic-workspace-id` header. Required when the API key is not scoped to a workspace.",
           "type": "string"
         },
         "anthropic_usage_tier": {
@@ -22680,7 +22693,7 @@
       "type": "object",
       "properties": {
         "from": {
-          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
+          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.",
           "type": "string",
           "pattern": "^typesafe($|:.+|/.+)"
         },

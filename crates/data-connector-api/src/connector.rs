@@ -43,6 +43,11 @@ use crate::{AnyErrorResult, DataConnectorResult};
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
+/// Request timeout of the client [`default_spice_client`] builds. Connectors
+/// that use that client derive rate-control defaults from it, the same way the
+/// HTTPS connector derives them from its `client_timeout` parameter.
+pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Creates a default reqwest client with standard Spice settings.
 ///
 /// # Errors
@@ -57,7 +62,7 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
     reqwest::Client::builder()
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
         .default_headers(headers)
         .build()
 }

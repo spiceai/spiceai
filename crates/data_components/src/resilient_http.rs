@@ -307,6 +307,15 @@ fn retry_reason_from_status(status: StatusCode) -> Option<RetryReason> {
     }
 }
 
+/// Whether `status` is a retryable failure (408/429/5xx) for the purposes of
+/// adaptive rate control. Shares the classification with the retry logic so a
+/// status the connector retries and a status the adaptive controller counts as
+/// a failure never drift apart.
+#[must_use]
+pub fn status_is_retryable(status: StatusCode) -> bool {
+    retry_reason_from_status(status).is_some()
+}
+
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
     crate::rate_limit::retry_after_duration(headers, SystemTime::now())
 }

@@ -26,6 +26,22 @@ limitations under the License.
 //!   the window LRU competes with the probation LRU via the Count-Min Sketch
 //!   before entering the main space. A hit on probation promotes into
 //!   protected.
+//!
+//! # Expiry order
+//!
+//! Every resident is also threaded onto a second intrusive list, in the order
+//! its TTL clock last started (`inserted_at`): appended on insert, moved to
+//! the newest end when a replace restarts the clock, unlinked on removal. All
+//! entries share one TTL and `inserted_at` is sampled under the shard lock, so
+//! this list is sorted oldest-first and the expired entries are exactly a
+//! prefix of it. Expiry pops that prefix ([`Shard::expire_older_than`]) and
+//! never visits a live entry, rather than walking the recency lists, which
+//! hits reorder and which therefore say nothing about age.
+//!
+//! The list only decides when an entry is *reclaimed*. Whether it is *served*
+//! is still decided by its own `inserted_at` on every read, so even a clock
+//! that stepped backwards would delay reclaiming an entry by that step, never
+//! return an expired one.
 
 use crate::EvictionPolicy;
 use crate::hasher::IdentityBuildHasher;
@@ -45,6 +61,57 @@ pub(crate) enum Region {
     Protected,
 }
 
+/// When an entry's TTL clock started: nanoseconds since its shard's `epoch`.
+///
+/// Eight bytes where an `Instant` takes sixteen, which is what keeps a slot
+/// to one 64-byte cache line now that it also carries the expiry-order links.
+/// A hit reads one slot under the shard lock, so a slot that straddled two
+/// lines would cost the contended hit path a second miss. Nanoseconds lose
+/// nothing against `Instant` on the platforms Spice runs on, and `i64` spans
+/// 292 years either side of the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Stamp(i64);
+
+/// Whether `ttl` has run out for an entry stamped `at`, as of `now`:
+/// `now - at >= ttl`, with a negative age read as zero, as
+/// `Instant::saturating_duration_since` reads it. Every expiry decision —
+/// serving a hit, admitting over a resident, reclaiming — goes through here.
+fn ttl_elapsed(now: Stamp, at: Stamp, ttl: Duration) -> bool {
+    let age = u128::try_from(now.0.saturating_sub(at.0)).unwrap_or(0);
+    age >= ttl.as_nanos()
+}
+
+/// A node's link in the expiry-order list: an `Option<u32>` packed into four
+/// bytes, with `u32::MAX` as `None`. No slot reaches that index — the cache
+/// cannot hold `u32::MAX` entries.
+///
+/// The packing holds the list's cost to 8 bytes per entry rather than 16. The
+/// recency links stay `Option<u32>`: they are relinked on every promoted hit,
+/// and converting through the sentinel there measurably slowed that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Link(u32);
+
+impl Link {
+    const NONE: Self = Self(u32::MAX);
+
+    fn get(self) -> Option<u32> {
+        (self != Self::NONE).then_some(self.0)
+    }
+}
+
+impl From<Option<u32>> for Link {
+    fn from(idx: Option<u32>) -> Self {
+        idx.map_or(Self::NONE, Self)
+    }
+}
+
+/// Oldest and newest ends of a shard's expiry-order list.
+#[derive(Debug, Default, Clone, Copy)]
+struct ExpiryEnds {
+    oldest: Option<u32>,
+    newest: Option<u32>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct ListEnds {
     head: Option<u32>,
@@ -52,12 +119,16 @@ struct ListEnds {
 }
 
 pub(crate) struct Shard<V> {
+    /// Origin of every [`Stamp`] in this shard.
+    epoch: Instant,
     map: HashMap<u64, u32, IdentityBuildHasher>,
     slots: Vec<Slot<V>>,
     free: Vec<u32>,
     window: ListEnds,
     probation: ListEnds,
     protected: ListEnds,
+    /// Every resident, oldest `inserted_at` first. See the module docs.
+    expiry: ExpiryEnds,
     weight: u64,
     window_weight: u64,
     protected_weight: u64,
@@ -75,13 +146,17 @@ struct Node<V> {
     /// Shared handle so a hit can `Arc::clone` under a short shard lock and
     /// clone the fat `V` only after unlock.
     value: Arc<V>,
-    inserted_at: Instant,
+    inserted_at: Stamp,
     weight: u64,
     region: Region,
     /// Saturating hit count for [`EvictionPolicy::Lfu`].
     freq: u16,
     prev: Option<u32>,
     next: Option<u32>,
+    /// Neighbour in the expiry-order list with an older (or equal) `inserted_at`.
+    older: Link,
+    /// Neighbour in the expiry-order list with a newer (or equal) `inserted_at`.
+    newer: Link,
 }
 
 pub(crate) fn into_owned<V: Clone>(value: Arc<V>) -> V {
@@ -138,12 +213,14 @@ pub(crate) enum ReplaceOutcome<V> {
 impl<V> Shard<V> {
     pub(crate) fn new(policy: EvictionPolicy) -> Self {
         Self {
+            epoch: Instant::now(),
             map: HashMap::with_hasher(IdentityBuildHasher),
             slots: Vec::new(),
             free: Vec::new(),
             window: ListEnds::default(),
             probation: ListEnds::default(),
             protected: ListEnds::default(),
+            expiry: ExpiryEnds::default(),
             weight: 0,
             window_weight: 0,
             protected_weight: 0,
@@ -156,8 +233,33 @@ impl<V> Shard<V> {
         self.map.len()
     }
 
+    /// `at` as a [`Stamp`] of this shard, saturating at the ends of `i64`.
+    fn stamp(&self, at: Instant) -> Stamp {
+        match at.checked_duration_since(self.epoch) {
+            Some(since) => Stamp(i64::try_from(since.as_nanos()).unwrap_or(i64::MAX)),
+            None => Stamp(
+                i64::try_from(self.epoch.duration_since(at).as_nanos()).map_or(i64::MIN, |n| -n),
+            ),
+        }
+    }
+
     pub(crate) fn contains(&self, key: u64) -> bool {
         self.map.contains_key(&key)
+    }
+
+    /// The resident at `key` when it is still inside `ttl`, otherwise `None`.
+    ///
+    /// An expired resident is absent here so a conditional insert can replace
+    /// it. Expiry matches [`Self::get`]: `now - inserted_at >= ttl`.
+    pub(crate) fn peek_live(&self, key: u64, now: Instant, ttl: Duration) -> Option<&V> {
+        let &idx = self.map.get(&key)?;
+        let now = self.stamp(now);
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) if !ttl_elapsed(now, node.inserted_at, ttl) => {
+                Some(node.value.as_ref())
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn window_weight(&self) -> u64 {
@@ -249,7 +351,7 @@ impl<V> Shard<V> {
             return false;
         };
         match self.slots.get(idx as usize) {
-            Some(Slot::Occupied(node)) => now.saturating_duration_since(node.inserted_at) >= ttl,
+            Some(Slot::Occupied(node)) => ttl_elapsed(self.stamp(now), node.inserted_at, ttl),
             _ => false,
         }
     }
@@ -268,6 +370,21 @@ impl<V> Shard<V> {
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = u64> + '_ {
         self.map.keys().copied()
+    }
+
+    /// Keys in expiry order, oldest TTL origin first.
+    #[cfg(test)]
+    pub(crate) fn keys_oldest_first(&self) -> Vec<u64> {
+        let mut keys = Vec::with_capacity(self.map.len());
+        let mut cursor = self.expiry.oldest;
+        while let Some(idx) = cursor {
+            let Some(Slot::Occupied(node)) = self.slots.get(idx as usize) else {
+                break;
+            };
+            keys.push(node.key);
+            cursor = node.newer.get();
+        }
+        keys
     }
 
     /// Keys most-recently-used first. For W-TinyLFU: protected, then probation,
@@ -341,10 +458,27 @@ impl<V: Clone> Shard<V> {
         let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) else {
             return false;
         };
-        let Some(earlier) = node.inserted_at.checked_sub(by) else {
+        let Some(earlier) = i64::try_from(by.as_nanos())
+            .ok()
+            .and_then(|by| node.inserted_at.0.checked_sub(by))
+            .map(Stamp)
+        else {
             return false;
         };
         node.inserted_at = earlier;
+        // Keep the expiry-order list sorted: move the entry behind the newest
+        // resident that is still no younger than it.
+        self.expiry_unlink(idx);
+        let mut cursor = self.expiry.newest;
+        while let Some(other) = cursor {
+            match self.slots.get(other as usize) {
+                Some(Slot::Occupied(node)) if node.inserted_at > earlier => {
+                    cursor = node.older.get();
+                }
+                _ => break,
+            }
+        }
+        self.expiry_link_after(idx, cursor);
         true
     }
 
@@ -356,7 +490,7 @@ impl<V: Clone> Shard<V> {
             return GetOutcome::Miss;
         };
         let expired = match self.slots.get(idx as usize) {
-            Some(Slot::Occupied(node)) => now.saturating_duration_since(node.inserted_at) >= ttl,
+            Some(Slot::Occupied(node)) => ttl_elapsed(self.stamp(now), node.inserted_at, ttl),
             _ => return GetOutcome::Miss,
         };
         if expired {
@@ -400,18 +534,22 @@ impl<V: Clone> Shard<V> {
             return self.replace(idx, value, weight, now);
         }
         let region = self.admit_region();
+        let inserted_at = self.stamp(now);
         let idx = self.alloc(Node {
             key,
             value: Arc::new(value),
-            inserted_at: now,
+            inserted_at,
             weight,
             region,
             freq: 0,
             prev: None,
             next: None,
+            older: Link::NONE,
+            newer: Link::NONE,
         });
         self.map.insert(key, idx);
         self.push_front(idx, region);
+        self.expiry_push_newest(idx);
         self.weight = self.weight.saturating_add(weight);
         let mut delta = WeightDelta {
             added: weight,
@@ -516,10 +654,51 @@ impl<V: Clone> Shard<V> {
         self.remove_indices(matched)
     }
 
+    /// Remove every resident whose TTL has run out at `now`.
+    ///
+    /// Costs one step per expired entry plus one: the expired residents are
+    /// the oldest prefix of the expiry-order list.
     pub(crate) fn expire_older_than(&mut self, now: Instant, ttl: Duration) -> (Vec<Arc<V>>, u64) {
-        let matched =
-            self.collect_matching(|node| now.saturating_duration_since(node.inserted_at) >= ttl);
-        self.remove_indices(matched)
+        let (values, weight, _) = self.expire_older_than_at_most(now, ttl, usize::MAX);
+        (values, weight)
+    }
+
+    /// [`Self::expire_older_than`], stopping after `limit` removals so a
+    /// caller can release the shard lock between batches. The final `bool`
+    /// is `true` when the limit was reached and expired residents may remain.
+    ///
+    /// Entries stamped after `now` are never removed, even under a zero TTL
+    /// that counts them as expired: a caller that holds `now` fixed across
+    /// batches then reclaims only what the shard held when it started, however
+    /// fast the shard is refilled between batches.
+    pub(crate) fn expire_older_than_at_most(
+        &mut self,
+        now: Instant,
+        ttl: Duration,
+        limit: usize,
+    ) -> (Vec<Arc<V>>, u64, bool) {
+        let now = self.stamp(now);
+        let mut values = Vec::new();
+        let mut weight: u64 = 0;
+        while values.len() < limit {
+            let Some(idx) = self.expiry.oldest else {
+                return (values, weight, false);
+            };
+            let key = match self.slots.get(idx as usize) {
+                Some(Slot::Occupied(node))
+                    if node.inserted_at <= now && ttl_elapsed(now, node.inserted_at, ttl) =>
+                {
+                    node.key
+                }
+                _ => return (values, weight, false),
+            };
+            self.map.remove(&key);
+            if let Some(Slot::Occupied(node)) = self.take_slot(idx) {
+                weight = weight.saturating_add(node.weight);
+                values.push(node.value);
+            }
+        }
+        (values, weight, true)
     }
 
     pub(crate) fn take_all(&mut self) -> (Vec<Arc<V>>, u64) {
@@ -529,6 +708,7 @@ impl<V: Clone> Shard<V> {
         self.window = ListEnds::default();
         self.probation = ListEnds::default();
         self.protected = ListEnds::default();
+        self.expiry = ExpiryEnds::default();
         self.weight = 0;
         self.window_weight = 0;
         self.protected_weight = 0;
@@ -628,6 +808,7 @@ impl<V: Clone> Shard<V> {
         weight: u64,
         now: Instant,
     ) -> (WeightDelta, Option<Arc<V>>) {
+        let now = self.stamp(now);
         let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old_weight = node.weight;
@@ -679,6 +860,9 @@ impl<V: Clone> Shard<V> {
             delta.protected_removed = old_weight;
         }
         self.promote(idx, region);
+        // The clock restarted at `now`, the newest time this shard has seen.
+        self.expiry_unlink(idx);
+        self.expiry_push_newest(idx);
         (delta, Some(old_value))
     }
 
@@ -708,6 +892,7 @@ impl<V: Clone> Shard<V> {
         if !accept {
             return ReplaceOutcome::Declined { value };
         }
+        let now = self.stamp(now);
         let (old_weight, old_value, region) = match self.slots.get_mut(idx as usize) {
             Some(Slot::Occupied(node)) => {
                 let old_weight = node.weight;
@@ -749,7 +934,11 @@ impl<V: Clone> Shard<V> {
             delta.protected_removed = old_weight;
         }
         // In-place rewrite: do not bump recency (promotion would restart LRU order).
-        let _ = (idx, region);
+        if !keep_ttl {
+            // The clock restarted at `now`, the newest time this shard has seen.
+            self.expiry_unlink(idx);
+            self.expiry_push_newest(idx);
+        }
         ReplaceOutcome::Replaced {
             delta,
             old: old_value,
@@ -808,6 +997,56 @@ impl<V: Clone> Shard<V> {
         }
     }
 
+    /// Append `idx` at the newest end of the expiry-order list. Callers
+    /// guarantee its `inserted_at` is no older than the current newest
+    /// resident's: both are sampled under this shard's lock, and `Instant` is
+    /// monotonic.
+    fn expiry_push_newest(&mut self, idx: u32) {
+        self.expiry_link_after(idx, self.expiry.newest);
+    }
+
+    /// Link the unlinked `idx` directly after `after` in the expiry-order
+    /// list, or at the oldest end when `after` is `None`.
+    fn expiry_link_after(&mut self, idx: u32, after: Option<u32>) {
+        let newer = match after {
+            None => self.expiry.oldest,
+            Some(after) => match self.slots.get(after as usize) {
+                Some(Slot::Occupied(node)) => node.newer.get(),
+                _ => return,
+            },
+        };
+        if let Some(Slot::Occupied(node)) = self.slots.get_mut(idx as usize) {
+            node.older = after.into();
+            node.newer = newer.into();
+        }
+        match after.and_then(|i| self.slots.get_mut(i as usize)) {
+            Some(Slot::Occupied(node)) => node.newer = Link(idx),
+            _ => self.expiry.oldest = Some(idx),
+        }
+        match newer.and_then(|i| self.slots.get_mut(i as usize)) {
+            Some(Slot::Occupied(node)) => node.older = Link(idx),
+            _ => self.expiry.newest = Some(idx),
+        }
+    }
+
+    fn expiry_unlink(&mut self, idx: u32) {
+        let (older, newer) = match self.slots.get_mut(idx as usize) {
+            Some(Slot::Occupied(node)) => (
+                std::mem::replace(&mut node.older, Link::NONE).get(),
+                std::mem::replace(&mut node.newer, Link::NONE).get(),
+            ),
+            _ => return,
+        };
+        match older.and_then(|i| self.slots.get_mut(i as usize)) {
+            Some(Slot::Occupied(node)) => node.newer = newer.into(),
+            _ => self.expiry.oldest = newer,
+        }
+        match newer.and_then(|i| self.slots.get_mut(i as usize)) {
+            Some(Slot::Occupied(node)) => node.older = older.into(),
+            _ => self.expiry.newest = older,
+        }
+    }
+
     fn alloc(&mut self, node: Node<V>) -> u32 {
         if let Some(idx) = self.free.pop() {
             self.slots[idx as usize] = Slot::Occupied(node);
@@ -834,6 +1073,7 @@ impl<V: Clone> Shard<V> {
 
     fn take_slot(&mut self, idx: u32) -> Option<Slot<V>> {
         self.unlink(idx);
+        self.expiry_unlink(idx);
         let slot = self.slots.get_mut(idx as usize)?;
         let taken = std::mem::replace(slot, Slot::Vacant);
         if let Slot::Occupied(ref node) = taken {
@@ -991,5 +1231,298 @@ mod tests {
             "full LFU scan must find the cold MRU, not a hotter LRU-tail sample"
         );
         assert_eq!(victim.2, 0);
+    }
+
+    /// A slot is one cache line on 64-bit targets: a contended hit reads one
+    /// slot under the shard lock, and a slot that straddled two lines measurably
+    /// lengthened the tail of hits on other keys of that shard.
+    #[test]
+    fn a_slot_fits_one_cache_line() {
+        assert_eq!(std::mem::size_of::<Slot<u32>>(), 64);
+        assert_eq!(std::mem::size_of::<Slot<String>>(), 64);
+    }
+
+    /// `ttl_elapsed` over stamps must decide exactly what the `Instant`
+    /// arithmetic it replaced decides: `now.saturating_duration_since(at) >= ttl`.
+    #[test]
+    fn ttl_elapsed_agrees_with_instant_arithmetic() {
+        let shard = shard();
+        let epoch = shard.epoch;
+        let ns = Duration::from_nanos;
+        let mut rng = Rng(7);
+        let mut instants = vec![epoch, epoch + ns(1), epoch + Duration::from_hours(48)];
+        // Before the epoch too, where the platform's clock allows it.
+        instants.extend(epoch.checked_sub(Duration::from_secs(5)));
+        for _ in 0..200 {
+            instants.push(epoch + ns(rng.below(10_000_000_000)));
+            if let Some(before) = epoch.checked_sub(ns(rng.below(1_000_000_000))) {
+                instants.push(before);
+            }
+        }
+        let ttls = [
+            Duration::ZERO,
+            ns(1),
+            Duration::from_secs(1),
+            Duration::from_mins(48 * 60 + 1),
+            Duration::from_secs(u64::MAX),
+            Duration::MAX,
+        ];
+        let mut checked = 0;
+        for &at in &instants {
+            for &now in &instants {
+                // Exact boundaries: the age equal to the TTL, and one nanosecond short.
+                let age = now.saturating_duration_since(at);
+                let boundary = [age, age.saturating_sub(ns(1)), age + ns(1)];
+                for ttl in ttls.iter().copied().chain(boundary) {
+                    assert_eq!(
+                        ttl_elapsed(shard.stamp(now), shard.stamp(at), ttl),
+                        now.saturating_duration_since(at) >= ttl,
+                        "at {at:?}, now {now:?}, ttl {ttl:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100_000, "only {checked} cases ran");
+    }
+
+    #[test]
+    fn expiry_pops_only_the_expired_prefix_of_insert_order() {
+        let mut shard = shard();
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(10);
+        for key in 0..6u64 {
+            shard.insert(key, 0, 1, t0 + Duration::from_secs(key));
+        }
+        // Hits reorder recency but must not reorder expiry.
+        for key in [0, 1, 2] {
+            let _ = shard.get(key, t0, ttl);
+            shard.apply_touch(key);
+        }
+        // Restarting key 1's clock moves it behind key 5.
+        shard.insert(1, 0, 1, t0 + Duration::from_secs(6));
+        // A kept TTL leaves key 2 where it was.
+        assert!(matches!(
+            shard.replace_if(2, 0, 1, t0 + Duration::from_secs(7), true, |_| true),
+            ReplaceOutcome::Replaced { .. }
+        ));
+        assert_eq!(shard.keys_oldest_first(), vec![0, 2, 3, 4, 5, 1]);
+
+        // At t0+13s, entries inserted at or before t0+3s are expired.
+        let at = t0 + Duration::from_secs(13);
+        let (values, weight, more) = shard.expire_older_than_at_most(at, ttl, 2);
+        assert_eq!((values.len(), weight, more), (2, 2, true));
+        assert_eq!(shard.keys_oldest_first(), vec![3, 4, 5, 1]);
+        let (values, weight, more) = shard.expire_older_than_at_most(at, ttl, 2);
+        assert_eq!((values.len(), weight, more), (1, 1, false));
+        assert_eq!(shard.keys_oldest_first(), vec![4, 5, 1]);
+        let mut left: Vec<u64> = shard.keys().collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![1, 4, 5]);
+    }
+
+    /// Expiry order, checked against two oracles over seeded random operation
+    /// histories: a plain model of each resident's TTL origin, and the full
+    /// recency-list walk expiry used before it had its own list.
+    #[test]
+    fn expiry_order_matches_a_model_over_random_histories() {
+        for seed in 0..64u64 {
+            for policy in [
+                EvictionPolicy::Lru,
+                EvictionPolicy::Lfu,
+                EvictionPolicy::TinyLfu,
+            ] {
+                run_expiry_history(seed, policy);
+            }
+        }
+    }
+
+    /// splitmix64, so every history is reproducible from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one operation per match arm keeps the history readable"
+    )]
+    fn run_expiry_history(seed: u64, policy: EvictionPolicy) {
+        use std::collections::BTreeMap;
+
+        let ctx = format!("seed {seed}, policy {policy:?}");
+        let mut rng = Rng(seed);
+        let mut shard: Shard<u32> = Shard::new(policy);
+        // key -> (inserted_at, weight)
+        let mut model: BTreeMap<u64, (Instant, u64)> = BTreeMap::new();
+        let ttl = Duration::from_secs(50);
+        let t0 = Instant::now();
+        let mut now = t0;
+        let key_space = 1 + rng.below(40);
+
+        for step in 0..600 {
+            let ctx = format!("{ctx}, step {step}");
+            // Time mostly creeps forward and sometimes stands still, so equal
+            // timestamps are exercised too.
+            now += Duration::from_millis(rng.below(4) * 500);
+            let key = rng.below(key_space);
+            let weight = 1 + rng.below(9);
+            match rng.below(12) {
+                0..=3 => {
+                    shard.insert(key, 0, weight, now);
+                    model.insert(key, (now, weight));
+                }
+                4 => {
+                    let keep_ttl = rng.below(2) == 0;
+                    let outcome = shard.replace_if(key, 0, weight, now, keep_ttl, |_| true);
+                    if let Some(entry) = model.get_mut(&key) {
+                        assert!(matches!(outcome, ReplaceOutcome::Replaced { .. }), "{ctx}");
+                        entry.1 = weight;
+                        if !keep_ttl {
+                            entry.0 = now;
+                        }
+                    } else {
+                        assert!(matches!(outcome, ReplaceOutcome::Declined { .. }), "{ctx}");
+                    }
+                }
+                5 => {
+                    let removed = shard.remove(key).map(|(_, w)| w);
+                    assert_eq!(removed, model.remove(&key).map(|(_, w)| w), "{ctx}");
+                }
+                6 => {
+                    let outcome = shard.get(key, now, ttl);
+                    match model.get(&key).copied() {
+                        None => assert!(matches!(outcome, GetOutcome::Miss), "{ctx}"),
+                        Some((at, w)) if now.saturating_duration_since(at) >= ttl => {
+                            assert!(
+                                matches!(outcome, GetOutcome::Expired { weight, .. } if weight == w),
+                                "{ctx}"
+                            );
+                            model.remove(&key);
+                        }
+                        Some(_) => {
+                            assert!(matches!(outcome, GetOutcome::Hit(_)), "{ctx}");
+                            shard.apply_touch(key);
+                        }
+                    }
+                }
+                7 => {
+                    let region = match rng.below(3) {
+                        0 => Region::Window,
+                        1 => Region::Probation,
+                        _ => Region::Protected,
+                    };
+                    if let Some((evicted, _, w)) = shard.evict_region_lru(region) {
+                        assert_eq!(model.remove(&evicted).map(|(_, w)| w), Some(w), "{ctx}");
+                    }
+                }
+                8 => {
+                    // Region moves relink the recency lists only.
+                    let _ = shard.move_window_to_probation(key);
+                    let _ = shard.demote_protected_lru_to_probation();
+                }
+                9 | 10 => {
+                    let limit = usize::try_from(1 + rng.below(6)).expect("small");
+                    let mut expected: Vec<u64> = shard
+                        .collect_matching(|n| ttl_elapsed(shard.stamp(now), n.inserted_at, ttl))
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    expected.sort_unstable();
+                    let mut modeled: Vec<u64> = model
+                        .iter()
+                        .filter(|(_, (at, _))| now.saturating_duration_since(*at) >= ttl)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    modeled.sort_unstable();
+                    assert_eq!(
+                        expected, modeled,
+                        "{ctx}: the recency walk disagrees with the model"
+                    );
+                    let before: Vec<u64> = shard.keys_oldest_first();
+                    let (values, weight, more) = shard.expire_older_than_at_most(now, ttl, limit);
+                    assert_eq!(values.len(), expected.len().min(limit), "{ctx}");
+                    assert_eq!(more, values.len() == limit, "{ctx}");
+                    // The removed entries are the oldest ones, in order.
+                    let removed = &before[..values.len()];
+                    let mut removed_sorted = removed.to_vec();
+                    removed_sorted.sort_unstable();
+                    for key in &removed_sorted {
+                        assert!(expected.binary_search(key).is_ok(), "{ctx}: {key} was live");
+                    }
+                    let modeled_weight: u64 = removed
+                        .iter()
+                        .map(|k| model.remove(k).map_or(0, |(_, w)| w))
+                        .sum();
+                    assert_eq!(weight, modeled_weight, "{ctx}");
+                }
+                _ => {
+                    if rng.below(8) == 0 {
+                        let _ = shard.take_all();
+                        model.clear();
+                    }
+                }
+            }
+            assert_expiry_list_consistent(&shard, &model, &ctx);
+        }
+    }
+
+    fn assert_expiry_list_consistent(
+        shard: &Shard<u32>,
+        model: &std::collections::BTreeMap<u64, (Instant, u64)>,
+        ctx: &str,
+    ) {
+        let mut seen = Vec::new();
+        let mut prev = None;
+        let mut cursor = shard.expiry.oldest;
+        let mut last: Option<Stamp> = None;
+        while let Some(idx) = cursor {
+            let Some(Slot::Occupied(node)) = shard.slots.get(idx as usize) else {
+                panic!("{ctx}: expiry list reaches vacant slot {idx}");
+            };
+            assert_eq!(
+                node.older.get(),
+                prev,
+                "{ctx}: broken back link at {}",
+                node.key
+            );
+            assert!(
+                last.is_none_or(|t| t <= node.inserted_at),
+                "{ctx}: expiry list out of order at {}",
+                node.key
+            );
+            assert_eq!(
+                model.get(&node.key).map(|&(at, w)| (shard.stamp(at), w)),
+                Some((node.inserted_at, node.weight)),
+                "{ctx}: resident {} disagrees with the model",
+                node.key
+            );
+            last = Some(node.inserted_at);
+            seen.push(node.key);
+            assert!(seen.len() <= model.len(), "{ctx}: expiry list has a cycle");
+            prev = cursor;
+            cursor = node.newer.get();
+        }
+        assert_eq!(shard.expiry.newest, prev, "{ctx}: newest end is stale");
+        seen.sort_unstable();
+        let keys: Vec<u64> = model.keys().copied().collect();
+        assert_eq!(seen, keys, "{ctx}: expiry list and residents differ");
+        assert_eq!(shard.len(), model.len(), "{ctx}");
+        assert_eq!(
+            shard.weight,
+            model.values().map(|(_, w)| w).sum::<u64>(),
+            "{ctx}"
+        );
     }
 }

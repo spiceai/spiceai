@@ -348,12 +348,18 @@ mod tests {
         let data_source_exec = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
 
         // Wrap in MockUdtfExec
-        let udtf_exec = Arc::new(MockUdtfExec::new(data_source_exec));
+        let udtf_exec: Arc<dyn ExecutionPlan> = Arc::new(MockUdtfExec::new(data_source_exec));
 
-        let optimizer = EnsureSupportedFileScan::new();
+        let rule = EnsureSupportedFileScan::new();
         let config = ConfigOptions::default();
 
-        let result = optimizer.optimize(udtf_exec, &config);
-        assert!(result.is_ok(), "Expected success when wrapped in UdtfExec");
+        let optimized = rule
+            .optimize(Arc::clone(&udtf_exec), &config)
+            .expect("a memory scan wrapped in UdtfExec must be accepted");
+        assert!(
+            Arc::ptr_eq(&optimized, &udtf_exec),
+            "the UDTF exemption must return the plan unchanged, got {}",
+            optimized.name()
+        );
     }
 }

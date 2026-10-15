@@ -486,6 +486,7 @@ async fn persist_remote_excluding(
 pub(crate) async fn build_results_cache_warmer(
     enabled: bool,
     runtime_state: Option<&RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> ResultsCacheWarmer {
@@ -493,16 +494,22 @@ pub(crate) async fn build_results_cache_warmer(
         return ResultsCacheWarmer::new(default_warmup_store_path(), enabled).await;
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
-        &state.location,
-        state.params.as_ref(),
-        "SQL results cache warmup state",
+        &state.into(),
+        runtime_state_location::StateFeature::ResultsCacheWarmup,
     )
     .await
     {
         Ok((store, prefix)) => {
+            let store = match state_location_check {
+                Some(check) => check.guard(
+                    runtime_state_location::StateFeature::ResultsCacheWarmup,
+                    store,
+                ),
+                None => store,
+            };
             tracing::info!(
                 "SQL results cache warmup will store query plans at '{}'",
                 state.location
@@ -2186,6 +2193,7 @@ mod tests {
         let warmer = build_results_cache_warmer(
             true,
             Some(&runtime_state),
+            None,
             Arc::clone(&secrets),
             Handle::current(),
         )
@@ -2208,7 +2216,7 @@ mod tests {
 
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store_occ::LocalConditionalPut::new(&dir).expect("local store"));
-        let state = ObjectState::<Vec<WarmupTemplate>>::new(store);
+        let state = ObjectState::<Vec<WarmupTemplate>>::new(store).with_prefix("results-cache/");
         let start = std::time::Instant::now();
         loop {
             if state
@@ -2222,14 +2230,19 @@ mod tests {
             }
             assert!(
                 start.elapsed() < Duration::from_secs(5),
-                "warmup catalog was not written to runtime.state location"
+                "warmup catalog was not written to the results-cache folder of the runtime.state location"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let reloaded =
-            build_results_cache_warmer(true, Some(&runtime_state), secrets, Handle::current())
-                .await;
+        let reloaded = build_results_cache_warmer(
+            true,
+            Some(&runtime_state),
+            None,
+            secrets,
+            Handle::current(),
+        )
+        .await;
         assert_eq!(
             reloaded.templates_snapshot().len(),
             1,
@@ -2587,19 +2600,31 @@ mod tests {
         status.hold_dataset_ready();
         assert!(!status.is_ready());
 
+        // The replay signals once it is running, then stalls forever.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let stalled_replay = async move {
+            started_tx
+                .send(())
+                .expect("the test waits for the replay to start");
+            std::future::pending::<()>().await;
+        };
+
         let shutdown = CancellationToken::new();
         let task = tokio::spawn({
             let status = Arc::clone(&status);
             let shutdown = shutdown.clone();
             async move {
-                run_warmup_releasing_ready(status, shutdown, std::future::pending()).await;
+                run_warmup_releasing_ready(status, shutdown, stalled_replay).await;
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the warmup replay must start")
+            .expect("the replay signals before it stalls");
         assert!(
             !status.is_ready(),
-            "the ready-hold must stay until shutdown cancels warmup"
+            "the ready-hold must stay while the replay is stalled, until shutdown cancels warmup"
         );
         shutdown.cancel();
 

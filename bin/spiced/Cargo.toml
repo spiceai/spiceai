@@ -6,6 +6,7 @@ license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 [dependencies]
@@ -31,6 +32,7 @@ connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional 
 connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
 connector-git = { path = "../../crates/data-connectors/connector-git" }
 connector-github = { path = "../../crates/data-connectors/connector-github" }
+connector-huggingface = { path = "../../crates/data-connectors/connector-huggingface" }
 connector-glue = { path = "../../crates/data-connectors/connector-glue" }
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
@@ -227,3 +229,8 @@ vortex = ["runtime/vortex"]
 
 [lints]
 workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

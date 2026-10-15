@@ -27,6 +27,7 @@ pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
+pub use format::bounds_account_for_nan;
 pub use segment_cache::{
     install_process_segment_cache, process_segment_cache_capacity_bytes,
     register_segment_cache_metrics,
@@ -930,6 +931,90 @@ mod tests {
             1,
             "2024-03-01 matches, so the file cannot be pruned"
         );
+
+        Ok(())
+    }
+
+    /// A filter that casts an integer column to a string returns the matching rows.
+    ///
+    /// Vortex casts an integer to a string neither on a column's rows nor on the min/max
+    /// statistics that prune zones, so the filter has to stay in `DataFusion`. The
+    /// literals do not round-trip through an integer, so the optimizer cannot unwrap the
+    /// cast into `k = <integer>`, and the table spans many zones.
+    #[rstest]
+    #[case::equality("CAST(k AS VARCHAR) = '03'", 0)]
+    #[case::prefix("CAST(k AS VARCHAR) LIKE '19999%'", 11)]
+    #[tokio::test]
+    async fn an_integer_to_string_cast_filter_returns_the_matching_rows(
+        #[case] filter: &str,
+        #[case] expected: i64,
+    ) -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE numbers (k BIGINT NOT NULL) \
+                 STORED AS vortex LOCATION '/numbers/'",
+            )
+            .await?;
+        ctx.session
+            .sql("INSERT INTO numbers SELECT value FROM generate_series(1, 200000)")
+            .await?
+            .collect()
+            .await?;
+
+        let sql = format!("SELECT count(*) FROM numbers WHERE {filter}");
+        assert_eq!(scalar_count(&ctx, &sql).await?, expected);
+
+        Ok(())
+    }
+
+    /// A join of a Vortex table to a decimal key returns every match.
+    ///
+    /// `DataFusion` casts the Vortex table's key to a decimal, so the dynamic filter
+    /// bounds `CAST(farm_id AS DECIMAL)`. Vortex evaluates that cast from an integer; it
+    /// has none from a string, so that filter has to stay out of the scan.
+    #[rstest]
+    #[case::integer_key("BIGINT", "value % 360 + 1", true)]
+    #[case::string_key("VARCHAR", "CAST(value % 360 + 1 AS VARCHAR)", false)]
+    #[tokio::test]
+    async fn a_join_on_a_decimal_key_returns_every_match(
+        #[case] key_type: &str,
+        #[case] key_value: &str,
+        #[case] pushed: bool,
+    ) -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+
+        ctx.session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE leads (farm_id {key_type} NOT NULL) \
+                 STORED AS vortex LOCATION '/leads/'"
+            ))
+            .await?;
+        ctx.session
+            .sql(&format!(
+                "INSERT INTO leads SELECT {key_value} FROM generate_series(1, 900)"
+            ))
+            .await?
+            .collect()
+            .await?;
+        ctx.session
+            .sql(
+                "CREATE TABLE farms AS \
+                 SELECT CAST(value AS DECIMAL(19, 0)) AS id FROM generate_series(1, 360)",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let sql = "SELECT count(*) FROM leads l JOIN farms f ON f.id = l.farm_id";
+        let plan = physical_plan_display(&ctx.session, sql).await?;
+        assert_eq!(
+            plan.contains("file_type=vortex, predicate: DynamicFilter"),
+            pushed,
+            "unexpected dynamic filter pushdown in plan:\n{plan}"
+        );
+        assert_eq!(scalar_count(&ctx, sql).await?, 900);
 
         Ok(())
     }

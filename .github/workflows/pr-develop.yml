@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-check-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -185,7 +185,7 @@ jobs:
           # Intersected with the gate's own filterset by the Makefile. Passing it
           # as a second `-E` would union with that filterset and widen the run,
           # because that is how nextest composes repeated `-E` flags.
-          NEXTEST_FILTER_EXTRA: "not (package(aws-sdk-credential-bridge) | package(object_store_occ))"
+          NEXTEST_FILTER_EXTRA: "not package(aws-sdk-credential-bridge)"
 
       - name: Build testoperator
         env:
@@ -216,7 +216,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-build-logs
           path: ${{ runner.temp }}/spiceio.log

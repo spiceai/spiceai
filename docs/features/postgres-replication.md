@@ -55,18 +55,18 @@ On managed Postgres services:
 | Azure Database    | Under **Replication**, set *Replication support* to `LOGICAL`.        |
 | Supabase / Neon   | Logical replication is enabled by default.                            |
 
-### 2. The source table must have a replica identity
+### 2. Every row needs a primary key
 
-Spice needs the primary key columns in every `UPDATE`/`DELETE` event, so one of the following must be true:
+Spice applies each `UPDATE` and `DELETE` to the row with the same primary key, so the key columns must be in every event:
 
 - The table has a **primary key** (default — nothing to do).
-- Or the table has `REPLICA IDENTITY FULL`:
+- Or the table has no primary key: set `acceleration.primary_key` to columns that identify a row, and make Postgres send those columns with every event — `REPLICA IDENTITY USING INDEX` on a unique index over them, or `REPLICA IDENTITY FULL`:
 
   ```sql
   ALTER TABLE public.users REPLICA IDENTITY FULL;
   ```
 
-Tables with `REPLICA IDENTITY NOTHING` are rejected at startup with an actionable error.
+`REPLICA IDENTITY FULL` alone is not enough: a dataset with no primary key fails to load. Tables with `REPLICA IDENTITY NOTHING` are rejected at startup with an actionable error.
 
 ### 3. The Postgres role needs these privileges
 
@@ -237,6 +237,9 @@ Every Spice replica must have its own replication slot. Spice handles this autom
 | ------------------------------- | --------------------------------------------------------------- |
 | `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica.                      |
 | `HOSTNAME` / `COMPUTERNAME` env | Fallback — works on k8s where each pod has a distinct hostname. |
+| The host name                   | Last fallback, when none of the variables above is set.         |
+
+An empty variable counts as unset. When an instance's identity changes, for example when `SPICE_INSTANCE_ID` is set on an instance that had none, its default slot name changes too: Spice creates a new slot, and the old slot keeps retaining WAL on the source until it is dropped. Find slots no replica consumes with `SELECT slot_name, active FROM pg_replication_slots WHERE slot_name LIKE 'spice_%'`, then drop a confirmed-abandoned one with `SELECT pg_drop_replication_slot('<slot name>')`.
 
 ### Example: Kubernetes StatefulSet
 
@@ -466,8 +469,9 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 | Symptom                                                                    | Cause and fix                                                                                                                                                           |
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                     | Run `ALTER TABLE public.X REPLICA IDENTITY FULL;` (or add a primary key).                                                                                               |
-| Error: *`Table public.X has no primary key and no REPLICA IDENTITY FULL`*  | Either add a primary key, or run `ALTER TABLE ... REPLICA IDENTITY FULL;`.                                                                                              |
+| Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                     | Run `ALTER TABLE public.X REPLICA IDENTITY DEFAULT;` if the table has a primary key. Otherwise run `ALTER TABLE public.X REPLICA IDENTITY FULL;` and set `acceleration.primary_key`. |
+| Error: *`Table public.X has no primary key and REPLICA IDENTITY DEFAULT`*  | Add a primary key, or run `ALTER TABLE public.X REPLICA IDENTITY FULL;` and set `acceleration.primary_key`.                                                               |
+| Error: *`Table public.X has no primary key, and refresh_mode: changes needs one`* | Set `acceleration.primary_key` to columns that identify a row. Postgres must send them with every change: run `ALTER TABLE public.X REPLICA IDENTITY FULL;`, or use `REPLICA IDENTITY USING INDEX` on a unique index over them. |
 | Error: *`Source table public.X does not exist`*                            | The fully qualified table in `from: postgres:<schema>.<table>` is wrong or the role lacks SELECT.                                                                       |
 | Error: *`replication slot "..." already exists`* on startup                | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas.                          |
 | Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |

@@ -51,6 +51,7 @@ ALLOWED: dict[str, str] = {
     # Table-valued functions: their own plan, not a dataset's stack.
     "RerankUDTFProvider": "table-valued function provider",
     "VectorSearchUDTFProvider": "table-valued function provider",
+    "TopKByScoreProvider": "table-valued function provider",
     "SearchQueryProvider": "table-valued function provider",
     # Connector- and cluster-specific providers.
     "CommitsTableProvider": "github connector provider",
@@ -61,6 +62,7 @@ ALLOWED: dict[str, str] = {
     "FailFirstWriteProvider": "test double",
     "FailAfterNWrites": "test double",
     "SlowProvider": "test double",
+    "FirstWriteHeldForBuilds": "test double",
     "WriteOrderRecordingProvider": "test double",
     "DelayedNativeTableProvider": "test double",
     "CountingAccelerator": "test double",

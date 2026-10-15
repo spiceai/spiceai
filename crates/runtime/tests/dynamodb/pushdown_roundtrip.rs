@@ -261,7 +261,7 @@ async fn seed_colliding(client: &Client) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn create_table(client: &Client, table: &str) -> Result<(), anyhow::Error> {
+pub(super) async fn create_table(client: &Client, table: &str) -> Result<(), anyhow::Error> {
     let _ = client.delete_table().table_name(table).send().await;
     let key = |name: &str, key_type: KeyType| {
         KeySchemaElement::builder()
@@ -329,6 +329,7 @@ fn dataset_with(
     if accelerated {
         dataset.acceleration = Some(Acceleration {
             enabled: true,
+            engine: Some("arrow".to_string()),
             ..Acceleration::default()
         });
     }

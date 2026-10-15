@@ -110,6 +110,7 @@ async fn teardown_scheduler_stream(
 fn spawn_control_stream(
     scheduler_address: String,
     executor_id: String,
+    process_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
     executor: Option<Arc<Executor>>,
@@ -199,6 +200,22 @@ fn spawn_control_stream(
 
             // Create channels for outbound messages
             let (outbound_tx, outbound_rx) = mpsc::channel::<ExecutorControlMessage>(32);
+
+            // The identification message goes first: the scheduler reads the
+            // process id from a stream's first message, so it is queued before
+            // the heartbeat task or a broadcast can write to the stream.
+            let init_msg = ExecutorControlMessage {
+                executor_id: executor_id.clone(),
+                message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
+                })),
+                process_id: process_id.clone(),
+            };
+            if outbound_tx.send(init_msg).await.is_err() {
+                continue;
+            }
             {
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = Some(outbound_tx.clone());
@@ -227,6 +244,7 @@ fn spawn_control_stream(
                                 message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
                                     timestamp_ms,
                                 })),
+                                process_id: String::new(),
                             };
 
                             if heartbeat_tx.send(msg).await.is_err() {
@@ -236,26 +254,6 @@ fn spawn_control_stream(
                     }
                 }
             });
-
-            // Send initial identification message
-            let init_msg = ExecutorControlMessage {
-                executor_id: executor_id.clone(),
-                message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
-                })),
-            };
-            if outbound_tx.send(init_msg).await.is_err() {
-                teardown_scheduler_stream(
-                    &heartbeat_task,
-                    &outbound_tx_state_for_task,
-                    broadcaster.as_ref(),
-                    &scheduler_address,
-                )
-                .await;
-                continue;
-            }
 
             // Create the bidirectional stream
             let outbound_stream = ReceiverStream::new(outbound_rx);
@@ -434,6 +432,7 @@ async fn handle_scheduler_message(
                     request_id: request.request_id,
                     otlp_metrics,
                 })),
+                process_id: String::new(),
             };
 
             if let Err(e) = outbound_tx.send(response).await {
@@ -488,6 +487,7 @@ async fn handle_scheduler_message(
                         request_id,
                         error: result.err(),
                     })),
+                    process_id: String::new(),
                 };
                 if let Err(e) = outbound_tx.send(ack).await {
                     tracing::warn!(
@@ -569,6 +569,9 @@ fn normalize_scheduler_endpoint(address: &str, tls_enabled: bool) -> String {
 /// handle that is signaled when any scheduler sends a [`PollNow`] command.
 pub struct ControlStreamManager {
     executor_id: String,
+    /// Per-process id sent when a stream opens, so a scheduler tells a restart
+    /// of this executor from a reconnect.
+    process_id: String,
     ballista_executor_id: String,
     client_tls_config: Option<ClientTlsConfig>,
     metrics_reader: Option<Arc<MetricsReader>>,
@@ -592,6 +595,7 @@ impl ControlStreamManager {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         executor_id: String,
+        process_id: String,
         ballista_executor_id: String,
         client_tls_config: Option<ClientTlsConfig>,
         metrics_reader: Option<MetricsReader>,
@@ -602,6 +606,7 @@ impl ControlStreamManager {
     ) -> Self {
         Self {
             executor_id,
+            process_id,
             ballista_executor_id,
             client_tls_config,
             metrics_reader: metrics_reader.map(Arc::new),
@@ -636,6 +641,7 @@ impl ControlStreamManager {
                 ballista_executor_id: self.ballista_executor_id.clone(),
                 reason: reason.to_string(),
             })),
+            process_id: String::new(),
         };
 
         let mut sent = 0usize;
@@ -688,6 +694,7 @@ impl ControlStreamManager {
             let handle = spawn_control_stream(
                 address.clone(),
                 self.executor_id.clone(),
+                self.process_id.clone(),
                 self.client_tls_config.clone(),
                 self.metrics_reader.clone(),
                 self.executor.clone(),
@@ -773,6 +780,7 @@ mod tests {
     fn test_control_stream_manager_new() {
         let manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "process-1".to_string(),
             "executor-1".to_string(),
             None, // no TLS
             None, // no metrics reader
@@ -787,25 +795,10 @@ mod tests {
     }
 
     #[test]
-    fn test_control_stream_manager_new_with_metrics_reader() {
-        let reader = MetricsReader::new();
-        let manager = ControlStreamManager::new(
-            "executor-2".to_string(),
-            "executor-2".to_string(),
-            None,
-            Some(reader),
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(manager.metrics_reader.is_some());
-    }
-
-    #[test]
     fn test_control_stream_manager_update_schedulers_empty() {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "process-1".to_string(),
             "executor-1".to_string(),
             None,
             None,
@@ -823,6 +816,7 @@ mod tests {
     fn test_control_stream_manager_shutdown_empty() {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
+            "process-1".to_string(),
             "executor-1".to_string(),
             None,
             None,

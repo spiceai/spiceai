@@ -113,13 +113,27 @@ impl<T: 'static, P: 'static> SQLExecutor for DenyFunctionsSqlExecutor<T, P> {
 /// `function_support` deny-list (e.g. `json_get_str`) falls back to local
 /// `DataFusion` evaluation instead of being unparsed into the remote engine's
 /// SQL.
+///
+/// The same policy is installed on the `SqlTable` itself, which is why the table
+/// is taken by value. The executor's policy only decides whether a *plan*
+/// federates, and a filtered scan never reaches that decision: the filter is
+/// pushed into the scan first, through the adaptor's `supports_filters_pushdown`,
+/// which asks the `SqlTable` — and the `SqlTable` then unparses it into the
+/// `WHERE` clause it sends. Without its own copy of the policy, `WHERE
+/// json_get_str(payload, 'k') = 'x'` reached the remote engine even though the
+/// same call in a projection stayed local (#13664). A table that already
+/// carries a policy keeps it when `function_support` is `None`.
 #[must_use]
 pub fn create_spice_federated_table_provider<T: 'static, P: 'static>(
-    table: Arc<SqlTable<T, P>>,
+    table: SqlTable<T, P>,
     schema: SchemaRef,
     table_reference: TableReference,
     function_support: Option<FunctionSupport>,
 ) -> FederatedTableProviderAdaptor {
+    let table = Arc::new(match &function_support {
+        Some(policy) => table.with_function_support(Some(policy.clone())),
+        None => table,
+    });
     let executor: Arc<dyn SQLExecutor> = Arc::new(DenyFunctionsSqlExecutor::new(
         Arc::clone(&table),
         function_support,
@@ -209,19 +223,21 @@ mod tests {
     }
 
     fn test_sql_table() -> Arc<SqlTable<(), &'static dyn ToString>> {
+        Arc::new(owned_test_sql_table())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool: each test chooses the policy it exercises"
+    )]
+    fn owned_test_sql_table() -> SqlTable<(), &'static dyn ToString> {
         let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
             Arc::new(MockPool {});
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
         ]));
-        Arc::new(SqlTable::new_with_schema(
-            "test",
-            &pool,
-            schema,
-            TableReference::bare("t"),
-            None,
-        ))
+        SqlTable::new_with_schema("test", &pool, schema, TableReference::bare("t"), None)
     }
 
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
@@ -329,10 +345,10 @@ mod tests {
     fn create_spice_federated_table_provider_wires_deny_list() {
         // Regression test for #10703: building the federated adaptor must route
         // logical optimization through the deny-list wrapper.
-        let table = test_sql_table();
+        let table = owned_test_sql_table();
         let schema = table.schema();
         let adaptor = create_spice_federated_table_provider(
-            Arc::clone(&table),
+            table,
             Arc::clone(&schema),
             TableReference::bare("t"),
             Some(deny_support(&["json_get_str"])),
@@ -344,6 +360,106 @@ mod tests {
 
         // Federation source schema must match the SqlTable schema verbatim.
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
+    }
+
+    /// The SQL `plan`'s only remote node would send: a `SqlExec` when the scan
+    /// serves the table itself, a `VirtualExecutionPlan` when the plan federated.
+    fn pushed_sql(plan: &Arc<dyn ExecutionPlan>) -> String {
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("SqlExec") || line.contains("VirtualExecutionPlan"))
+            .unwrap_or_else(|| panic!("expected a remote scan in:\n{rendered}"));
+        line.split_once("sql=").map_or_else(
+            || panic!("expected the scan to render its SQL: {line}"),
+            |(_, sql)| sql.trim().to_string(),
+        )
+    }
+
+    /// Regression test for the filter half of #13664: a Spice-only function in a
+    /// `WHERE` clause must be evaluated locally, not unparsed into the SQL the
+    /// remote scan sends.
+    ///
+    /// The executor's deny-list only decides whether a *plan* federates, and a
+    /// filtered scan never reaches that decision: the federation analyzer's
+    /// filter pushdown moves the predicate into the scan first, through the
+    /// adaptor's `supports_filters_pushdown`, which asks the wrapped `SqlTable`.
+    /// A `SqlTable` built without its own copy of the policy answers `Exact` for
+    /// anything the dialect can spell, so the remote engine was sent `WHERE
+    /// json_get_str(...) = 'x'` and failed with an unknown-function error — on
+    /// every `PostgreSQL`, Snowflake and `ClickHouse` table built through this
+    /// helper. A built-in the remote engine does have keeps pushing down.
+    #[tokio::test]
+    async fn a_denied_function_in_a_where_clause_is_not_pushed_into_the_scan() {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::functions::string::expr_fn::upper;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion_federation::FederatedQueryPlanner;
+
+        let table = owned_test_sql_table();
+        let schema = table.schema();
+        let provider = Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            TableReference::bare("t"),
+            Some(deny_support(&["json_get_str"])),
+        ));
+
+        let denied = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf("json_get_str"),
+            vec![col("val")],
+        ))
+        .eq(lit("x"));
+        let allowed = upper(col("val")).eq(lit("X"));
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&denied, &allowed])
+                .expect("pushdown verdicts"),
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact
+            ],
+            "the deny-listed call must stay local; the built-in must still push down"
+        );
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(stub_udf("json_get_str").as_ref().clone());
+        ctx.register_table("t", provider)
+            .expect("register the federated table");
+
+        let denied_plan = ctx
+            .sql("SELECT id FROM t WHERE json_get_str(val) = 'x'")
+            .await
+            .expect("plan the denied query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the denied query");
+        assert_eq!(
+            pushed_sql(&denied_plan),
+            "SELECT id, val FROM t",
+            "the remote scan must not be asked to evaluate json_get_str: it returns `val` and \
+             the filter runs locally"
+        );
+
+        let allowed_plan = ctx
+            .sql("SELECT id FROM t WHERE upper(val) = 'X'")
+            .await
+            .expect("plan the control query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the control query");
+        assert_eq!(
+            pushed_sql(&allowed_plan),
+            "SELECT t.id FROM t WHERE (upper(t.val) = 'X')",
+            "a built-in the remote engine has must keep pushing down"
+        );
     }
 
     /// Unparse a plan the way a federated connector would, and demand it
@@ -1110,6 +1226,255 @@ mod tests {
             ),
             "refused for another reason: {err}"
         );
+    }
+
+    /// A scan of `name(id)` holding `ids`. Unlike `id_source`'s, `DataFusion` can
+    /// execute it, so a guard can set what the plan returns beside what its
+    /// unparsed SQL returns from a real engine.
+    fn id_table(name: &str, ids: &[&str]) -> LogicalPlan {
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::datasource::{MemTable, provider_as_source};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("build the id batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the id table");
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(table)), Some(vec![0]))
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    /// `id_table(name, ids)` keeping only the row whose `id` is `kept`.
+    fn id_table_where(name: &str, ids: &[&str], kept: &str) -> LogicalPlan {
+        LogicalPlanBuilder::from(id_table(name, ids))
+            .filter(col(format!("{name}.id")).eq(lit(kept)))
+            .expect("filter")
+            .build()
+            .expect("build filter")
+    }
+
+    /// Sorted rows as text, with `None` for NULL, so two engines' answers compare
+    /// as multisets.
+    #[cfg(feature = "sqlite")]
+    type Rows = Vec<Vec<Option<String>>>;
+
+    /// What `DataFusion` returns for `plan`: the oracle the unparsed SQL is held
+    /// to. Executing a plan shares no code with unparsing it.
+    #[cfg(feature = "sqlite")]
+    async fn datafusion_rows(plan: &LogicalPlan) -> Rows {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::compute::cast;
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan.clone())
+            .await
+            .expect("plan the oracle")
+            .collect()
+            .await
+            .expect("execute the oracle");
+        let mut rows = Rows::new();
+        for batch in batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| cast(column, &DataType::Utf8).expect("render a column as text"))
+                .collect::<Vec<_>>();
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.as_string::<i32>();
+                            (!column.is_null(row)).then(|| column.value(row).to_string())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// What `SQLite` returns for `sql` over `tables`, each `name(id TEXT)`.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_rows(tables: &[(&str, &[&str])], sql: &str) -> Rows {
+        let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+        for (name, ids) in tables {
+            conn.execute(&format!("CREATE TABLE {name} (id TEXT NOT NULL)"), [])
+                .expect("create a table");
+            for id in *ids {
+                conn.execute(&format!("INSERT INTO {name} VALUES (?1)"), [id])
+                    .expect("insert a row");
+            }
+        }
+        let mut statement = conn
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+        let width = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_else(|error| panic!("SQLite could not run {sql}: {error}"))
+            .collect::<Result<Rows, _>>()
+            .unwrap_or_else(|error| panic!("SQLite failed reading the rows of {sql}: {error}"));
+        rows.sort();
+        rows
+    }
+
+    /// Unparses `plan` for `SQLite`, runs it over `tables`, and demands the rows
+    /// `DataFusion` returns for the plan itself.
+    #[cfg(feature = "sqlite")]
+    async fn assert_sqlite_returns_the_plans_rows(
+        shape: &str,
+        plan: &LogicalPlan,
+        tables: &[(&str, &[&str])],
+    ) {
+        let expected = datafusion_rows(plan).await;
+        assert!(
+            expected.len() > 1,
+            "{shape}: the plan returns {} row(s), too few for a wrong scope to change",
+            expected.len()
+        );
+        let sql = unparse_with("sqlite", &SqliteDialect {}, plan);
+        assert_eq!(
+            sqlite_rows(tables, &sql),
+            expected,
+            "{shape}: SQLite returned other rows than the plan for: {sql}"
+        );
+    }
+
+    /// Regression test for #14373, fixed by fork PR #233: a join that is the
+    /// *right* input of another join was linearised into the enclosing `FROM`
+    /// with its right side first — `a ⋈ (b ⋈ c)` came out as
+    /// `FROM a INNER JOIN c ON b.id = c.id … JOIN b ON a.id = b.id`, naming `b`
+    /// before it is in scope. `PostgreSQL`, `DuckDB` and `SQLite` reject it, and an
+    /// engine that binds lazily runs a different join tree. The nested join stays
+    /// a parenthesised joined table on the right, and a LEFT JOIN folds a filter
+    /// from inside it into its own `ON`, since the shared `WHERE` would discard
+    /// the left rows the LEFT JOIN preserves.
+    #[tokio::test]
+    async fn a_join_that_is_another_joins_right_input_stays_on_its_right() {
+        let a: &[&str] = &["1", "2", "3"];
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1", "2", "4"];
+        let nested = |b_input: LogicalPlan, outer: JoinType| {
+            LogicalPlanBuilder::from(id_table("a", a))
+                .join(
+                    id_join(b_input, id_table("c", c), JoinType::Inner, ("b.id", "c.id")),
+                    outer,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )
+                .expect("outer join")
+                .project(vec![col("a.id"), col("b.id"), col("c.id")])
+                .expect("projection")
+                .build()
+                .expect("build")
+        };
+        let shapes = [
+            (
+                "a INNER JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Inner),
+            ),
+            (
+                "a FULL JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Full),
+            ),
+            (
+                "a LEFT JOIN (b[id = '1'] JOIN c)",
+                nested(id_table_where("b", b, "1"), JoinType::Left),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("a", a), ("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            // `b` has to be in scope where the outer join's `ON` names it, so the
+            // nested join is introduced, parenthesised, before that `ON`.
+            assert_precedes(&sql, "JOIN (b", "ON a.id = b.id");
+            assert!(
+                !sql.contains("WHERE"),
+                "{shape}: a filter from the nested input reached the enclosing WHERE: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14375, fixed by fork PR #234: a `Limit` that is a join
+    /// input got a scope of its own only when the enclosing `SELECT` already had a
+    /// `WHERE` or a projection. Without either, its `LIMIT` landed on the enclosing
+    /// query and bounded the join's output instead of one input — with
+    /// `b = {1, 2}` and `c = {1}`, `b FULL JOIN (c LIMIT 1)` returns two rows and
+    /// the SQL returned one. The limited input is derived under its scan's own
+    /// name, which the join's `ON` and the select list already use.
+    #[tokio::test]
+    async fn a_limit_on_a_join_input_bounds_that_input_rather_than_the_join() {
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1"];
+        let limited = |name: &str, ids: &[&str]| {
+            LogicalPlanBuilder::from(id_table(name, ids))
+                .limit(0, Some(1))
+                .expect("limit")
+                .build()
+                .expect("build limit")
+        };
+        let shapes = [
+            (
+                "b FULL JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Full,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "b LEFT JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Left,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "(c LIMIT 1) RIGHT JOIN b",
+                id_join(
+                    limited("c", c),
+                    id_table("b", b),
+                    JoinType::Right,
+                    ("c.id", "b.id"),
+                ),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            assert!(
+                paren_depth_at(&sql, first_offset_of(&sql, "LIMIT 1")) >= 1,
+                "{shape}: the input's LIMIT bounds the whole join instead of a derived table \
+                 of its own: {sql}"
+            );
+        }
     }
 
     fn federation_dialects() -> Vec<(&'static str, Arc<dyn Dialect>)> {
@@ -3003,7 +3368,7 @@ mod tests {
         ]));
         Arc::new(DefaultTableSource::new(Arc::new(
             create_spice_federated_table_provider(
-                test_sql_table(),
+                owned_test_sql_table(),
                 schema,
                 TableReference::bare("t"),
                 None,
@@ -3476,6 +3841,95 @@ mod tests {
                 count, 3,
                 "SQLite must keep the three 1994 rows the filter selects: {sql}"
             );
+        }
+    }
+
+    /// MySQL's bare `DATETIME` keeps no fractional seconds and rounds a literal with
+    /// more than six, so a fractional-second filter must reach it as `DATETIME(6)`
+    /// with the literal cut to six digits, or it compares a different instant.
+    #[test]
+    fn a_fractional_second_filter_unparsed_for_mysql_keeps_its_precision() {
+        let at = |nanos: i64| lit(ScalarValue::TimestampNanosecond(Some(nanos), None));
+        // 1994-06-15 12:30:00.5 and 12:30:00.123456789 as nanoseconds since the Unix epoch.
+        let (half_second, nine_digits) = (771_683_400_500_000_000, 771_683_400_123_456_789);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            None,
+        )
+        .expect("scan events")
+        .filter(
+            col("ts")
+                .eq(at(half_second))
+                .or(col("ts").eq(at(nine_digits))),
+        )
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("mysql", &MySqlDialect {}, &plan);
+        for literal in [
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))",
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))",
+        ] {
+            assert!(
+                sql.contains(literal),
+                "MySQL must compare at microsecond precision, or the filter selects the wrong \
+                 rows: expected {literal} in {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14941: `INTERSECT` and `EXCEPT` are planned as semi
+    /// and anti joins whose keys match NULLs, because a set operation treats two
+    /// NULLs as the same value. `=` is never true on NULL, so the federated
+    /// statement must compare those keys with `IS NOT DISTINCT FROM` (`<=>` on
+    /// MySQL), or the remote engine drops every row with a NULL in a compared
+    /// column from an `INTERSECT` and keeps it in an `EXCEPT`.
+    #[test]
+    fn intersect_and_except_unparse_keys_that_match_nulls() {
+        let scan = |name: &str| {
+            LogicalPlanBuilder::scan(
+                name,
+                table_source(vec![Field::new("k", DataType::Utf8, true)]),
+                None,
+            )
+            .and_then(|scan| scan.project(vec![col("k")]))
+            .and_then(LogicalPlanBuilder::build)
+            .unwrap_or_else(|error| panic!("scan {name}: {error}"))
+        };
+        // (dialect, identifier quote, how it spells a key comparison that matches NULLs)
+        let dialects: [(&str, &dyn Dialect, char, &str); 3] = [
+            ("duckdb", &DuckDBDialect::new(), '"', "IS NOT DISTINCT FROM"),
+            (
+                "postgres",
+                &PostgreSqlDialect {},
+                '"',
+                "IS NOT DISTINCT FROM",
+            ),
+            ("mysql", &MySqlDialect {}, '`', "<=>"),
+        ];
+        for (operation, exists) in [("INTERSECT", "EXISTS"), ("EXCEPT", "NOT EXISTS")] {
+            let plan = if operation == "INTERSECT" {
+                LogicalPlanBuilder::intersect(scan("a"), scan("b"), false)
+            } else {
+                LogicalPlanBuilder::except(scan("a"), scan("b"), false)
+            }
+            .unwrap_or_else(|error| panic!("{operation}: {error}"));
+            for (dialect_name, dialect, q, matches) in dialects {
+                assert_eq!(
+                    unparse_with(dialect_name, dialect, &plan),
+                    format!(
+                        "SELECT DISTINCT {q}a{q}.{q}k{q} FROM {q}a{q} WHERE {exists} \
+                         (SELECT 1 FROM {q}b{q} WHERE ({q}a{q}.{q}k{q} {matches} {q}b{q}.{q}k{q}))"
+                    ),
+                    "{dialect_name}: {operation} must compare its keys so that NULLs match"
+                );
+            }
         }
     }
 

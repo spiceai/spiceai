@@ -450,10 +450,39 @@ impl DataAccelerator for SqliteAccelerator {
         )))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !source.is_file_accelerated() {
+            return Ok(());
+        }
+        let path = self.file_path(source)?;
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("sqlite_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
         }
@@ -464,21 +493,6 @@ impl DataAccelerator for SqliteAccelerator {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
 
             // Before a snapshot download or a connection opens the file. See
@@ -575,12 +589,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .iter()
                 .filter_map(|spicepod_ds| {
                     let acceleration = spicepod_ds.acceleration.as_ref()?;
-                    let engine_str = acceleration
-                        .engine
-                        .as_deref()
-                        .unwrap_or("arrow")
-                        .to_lowercase();
-                    if engine_str != "sqlite" {
+                    if !acceleration.engine_name().eq_ignore_ascii_case("sqlite") {
                         return None;
                     }
                     if !matches!(
@@ -838,8 +847,9 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray},
+        array::{Date32Array, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Schema},
+        util::pretty::pretty_format_batches,
     };
     use data_accelerator_api::DataAccelerator;
     use datafusion::{
@@ -1403,5 +1413,124 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "should have 3 rows");
+    }
+    /// Regression test for [#14491](https://github.com/spiceai/spiceai/issues/14491):
+    /// a date filter the `SQLite` scan takes must select the same rows as local
+    /// evaluation. The scan renders a `Date32` literal as a cast, and `SQLite`
+    /// gives the type name `DATE` numeric affinity, so `CAST('1994-01-01' AS
+    /// DATE)` is the integer `1994`; the stored dates are `YYYY-MM-DD` text,
+    /// which compares greater than every number, so a literal rendered that way
+    /// matches no row and the query silently answers too few rows. The dialect
+    /// renders the cast as `TEXT`, and the literal has to take the same type.
+    ///
+    /// The filter is written in SQL rather than handed to `scan` directly so it
+    /// reaches the accelerator the way a query does: simplified to a `Date32`
+    /// literal by the optimizer, then pushed into the `SQLite` scan.
+    #[tokio::test]
+    async fn a_date_filter_pushed_into_the_sqlite_scan_selects_the_same_rows_as_local_evaluation() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("l_shipdate", DataType::Date32, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("lineitem"),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        // Days since the epoch: 1993-12-31, 1994-01-01, 1994-06-15, 1994-12-31,
+        // 1995-01-01 -- one row on each side of both bounds and one inside.
+        let ids = Int64Array::from(vec![1, 2, 3, 4, 5]);
+        let dates = Date32Array::from(vec![8765, 8766, 8931, 9130, 9131]);
+        let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(dates)])
+            .expect("data should be created");
+        let exec = MockExec::new(vec![Ok(data)], schema);
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        ctx.register_table("lineitem", table)
+            .expect("table should register");
+        let query = "SELECT id FROM lineitem \
+                     WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' \
+                     ORDER BY id";
+
+        // The plan is the artifact: it carries the SQL the scan sends to SQLite.
+        let plan = ctx
+            .sql(&format!("EXPLAIN {query}"))
+            .await
+            .expect("explain should plan")
+            .collect()
+            .await
+            .expect("explain should run");
+        let plan = pretty_format_batches(&plan)
+            .expect("plan should format")
+            .to_string();
+        let batches = ctx
+            .sql(query)
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should run");
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column should be Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        // The rows are the user-visible failure; the plan says why.
+        assert_eq!(
+            ids,
+            vec![2, 3, 4],
+            "the scan should select the 1994 rows and only those, got plan:\n{plan}"
+        );
+        // `SQLiteSqlExec` is in every plan over this table, so the filter's
+        // presence has to be read off the SQL it carries, and the absence of a
+        // local `FilterExec` pins that the engine did not re-apply it above.
+        let pushed_sql = plan
+            .lines()
+            .find(|line| line.contains("SQLiteSqlExec sql="))
+            .expect("the plan should scan through SQLiteSqlExec");
+        assert!(
+            pushed_sql.contains("WHERE") && pushed_sql.contains("l_shipdate"),
+            "the date filter should be pushed into the SQLite scan, got plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("FilterExec"),
+            "the date filter should not be re-applied locally above the scan, got plan:\n{plan}"
+        );
+        assert!(
+            plan.contains("AS TEXT)") && !plan.contains("AS DATE)"),
+            "SQLite reads a DATE cast as a number, so the scan must render the literal's cast as \
+             TEXT, got plan:\n{plan}"
+        );
     }
 }

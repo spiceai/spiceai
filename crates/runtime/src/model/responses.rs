@@ -46,7 +46,7 @@ pub enum ResponsesApiSupport {
     UnsupportedProvider {
         provider: String,
     },
-    /// Provider is evaluate-only (`POST /v1/evaluate`); chat and Responses are unsupported.
+    /// Provider is a decision model (`POST /v1/decisions`); chat and Responses are unsupported.
     EvaluateOnly {
         provider: String,
     },

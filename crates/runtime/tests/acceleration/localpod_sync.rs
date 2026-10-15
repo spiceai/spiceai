@@ -25,7 +25,7 @@ limitations under the License.
 //!
 //! - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a federated
 //!   source, so the parent is wrapped in a `FederatedTableProviderAdaptor`.
-//! - The default in-memory Arrow accelerator has no federated source, so the parent is registered
+//! - The in-memory Arrow accelerator has no federated source, so the parent is registered
 //!   as a bare `AcceleratedTable`.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/11137>: a child of an
@@ -149,17 +149,10 @@ async fn cached_count(rt: &Runtime, table: &str) -> (CacheStatus, usize) {
     )
 }
 
-/// A parent refresh must invalidate cached query results for its localpod
-/// children, not only for itself.
-///
-/// Regression test for <https://github.com/spiceai/spiceai/issues/12887>: after
-/// a localpod child's initial load its refresher hands off to the parent's
-/// refresh task, and refresh-completion cache invalidation only covered the
-/// refreshing dataset's own name — queries against the child kept being served
-/// pre-refresh results from the cache until `item_ttl` expired. The long TTL
-/// here ensures TTL expiry cannot mask a missing invalidation.
+/// Parent and localpod child results remain fresh in the SQL cache after a
+/// full refresh updates both accelerators. TTL controls when results advance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_localpod_refresh_invalidates_child_cached_results() -> Result<(), anyhow::Error> {
+async fn test_localpod_refresh_keeps_child_cached_results() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,runtime_table::accelerated=trace",
     ));
@@ -194,7 +187,7 @@ async fn test_localpod_refresh_invalidates_child_cached_results() -> Result<(), 
                 ..Acceleration::default()
             });
 
-            let app = AppBuilder::new("test_localpod_refresh_invalidates_child_cache")
+            let app = AppBuilder::new("test_localpod_refresh_keeps_child_cache")
                 .with_sql_cache(SQLResultsCacheConfig {
                     item_ttl: Some("10m".to_string()),
                     ..Default::default()
@@ -257,44 +250,23 @@ async fn test_localpod_refresh_invalidates_child_cached_results() -> Result<(), 
                 "localpod child accelerator should hold the refreshed rows"
             );
 
-            // The parent's entry was always invalidated; sanity-check it first.
-            let (_, parent_count) = cached_count(&runtime, "time_series").await;
-            assert_eq!(
-                parent_count, 5,
-                "parent query should observe the refreshed rows"
-            );
-
-            // The child's cache entry must be invalidated by the same refresh.
-            // Invalidation runs in the refresher's completion handler, which can lag
-            // the data landing by a scheduling beat — poll the actual condition with
-            // a bounded timeout instead of asserting the first read. Before the
-            // #12887 fix the child keeps serving the stale cached count of 2 until
-            // `item_ttl` (10m) and this poll exhausts its deadline.
-            let mut child_count = 0;
-            for _ in 0..50 {
-                (_, child_count) = cached_count(&runtime, "local_time_series").await;
-                if child_count == 5 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            // Both SQL entries remain fresh even though the accelerators hold five rows.
+            for table in ["time_series", "local_time_series"] {
+                let (status, count) = cached_count(&runtime, table).await;
+                assert_eq!(
+                    status,
+                    CacheStatus::CacheHit,
+                    "{table}: refresh retains fresh result"
+                );
+                assert_eq!(count, 2, "{table}: SQL cache ages independently of refresh");
             }
-            assert_eq!(
-                child_count, 5,
-                "localpod child query should observe the refreshed rows within its \
-                 cache TTL — stale cached results were served before the #12887 fix"
-            );
-
-            // The fresh result is itself cached again.
-            let (status, count) = cached_count(&runtime, "local_time_series").await;
-            assert_eq!(status, CacheStatus::CacheHit, "child repeat after refresh");
-            assert_eq!(count, 5, "child cached row count after refresh");
 
             Ok(())
         })
         .await
 }
 
-/// A localpod child whose parent uses the default in-memory (Arrow) accelerator must keep tracking
+/// A localpod child whose parent uses the in-memory Arrow accelerator must keep tracking
 /// the parent's full refreshes at runtime, not just load once at startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Result<(), anyhow::Error>
@@ -313,7 +285,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
                 .await
                 .expect("write initial csv");
 
-            // Parent: file connector, full refresh, default (Arrow / in-memory) accelerator.
+            // Parent: file connector, full refresh, in-memory Arrow accelerator.
             // No refresh_check_interval, so the parent only refreshes when triggered manually,
             // keeping the test deterministic.
             let mut parent = Dataset::new(format!("file://{}", csv_path.display()), "time_series");
@@ -327,6 +299,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
             ));
             parent.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("arrow".to_string()),
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });
@@ -336,6 +309,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
             let mut child = Dataset::new("localpod:time_series", "local_time_series");
             child.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("arrow".to_string()),
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });

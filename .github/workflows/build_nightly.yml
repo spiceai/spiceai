@@ -149,12 +149,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiced_linux_x86_64
           path: spiced_linux_x86_64.tar.gz
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spice_linux_x86_64
           path: spice_linux_x86_64.tar.gz
@@ -220,12 +220,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiced_linux_aarch64
           path: spiced_linux_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spice_linux_aarch64
           path: spice_linux_aarch64.tar.gz
@@ -321,21 +321,26 @@ jobs:
           # gets its own; unchanged on Apple Silicon. A derived value carries an injection
           # surface a literal does not — a two-line `$GITHUB_ENV` entry appends a second
           # variable to every later step — so refuse one, as `setup-cc` does for its own.
-          rustflags="-L $brew_prefix/lib"
+          #
+          # Only the unixodbc keg, never `$brew_prefix/lib`. A RUSTFLAGS `-L` is searched
+          # before a build script's own `rustc-link-search`, so whatever static library
+          # Homebrew has linked into `$brew_prefix/lib` under the same name replaces the
+          # vendored one when rustc bundles it. With a foreign `libcrypto.a` there,
+          # openssl-sys bundles that instead of the vendored OpenSSL that librdkafka was
+          # compiled against, and the link fails on undefined `_ENGINE_*` symbols. The keg
+          # holds only the libodbc* families, which is all the odbc build needs.
+          rustflags="-L $brew_prefix/opt/unixodbc/lib"
           if [ "$(printf '%s' "$rustflags" | wc -l | tr -d ' ')" != "0" ]; then
             echo "::error::Refusing to export a multi-line RUSTFLAGS built from '$brew_prefix'."
             exit 1
           fi
           echo "RUSTFLAGS=$rustflags" >> "$GITHUB_ENV"
           # The probe above accepts an unlinked unixodbc keg — `$brew_prefix/opt/unixodbc`
-          # exists for a formula that was never linked — and in that state the `-L` above
-          # points at a directory holding no `libodbc.dylib`, so the link dies downstream as
-          # "ld: library 'odbc' not found" (#13475). Before this step probed, `brew install
-          # unixodbc` ran every time and linked it, so the gap is this step's to close.
-          # `setup-cc` covers the same case by publishing the keg's own lib directory, and
-          # deliberately only that one: `$brew_prefix/lib` additionally satisfies -lcrypto,
-          # -lssl and -lzstd, so a crate whose build script emits one of those names would
-          # link a second, differently-built copy. clang expands LIBRARY_PATH into -L entries
+          # exists for a formula that was never linked — and in that state nothing under
+          # `$brew_prefix/lib` holds `libodbc.dylib`, so a link that searched only there
+          # would die as "ld: library 'odbc' not found" (#13475). The keg's own lib
+          # directory covers it, for rustc above and for the C toolchain here, as `setup-cc`
+          # does for every other macOS job. clang expands LIBRARY_PATH into -L entries
           # after those already on the command line, so this restores the search path without
           # displacing anything a build script emitted, and it is not a cargo fingerprint
           # input, so it costs no rebuild.
@@ -373,12 +378,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiced_darwin_aarch64
           path: spiced_darwin_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spice_darwin_aarch64
           path: spice_darwin_aarch64.tar.gz
@@ -397,7 +402,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download spiced binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: spiced_linux_aarch64
           path: /tmp
@@ -451,7 +456,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-arm64,mode=max
 
       - name: Upload ARM64 Docker image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: images-arm64
           path: /tmp/image-arm64-default.tar
@@ -467,7 +472,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download spiced binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: spiced_linux_x86_64
           path: /tmp
@@ -502,7 +507,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-amd64,mode=max
 
       - name: Upload AMD64 Docker image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: images-amd64
           path: /tmp/image-amd64-default.tar
@@ -521,7 +526,7 @@ jobs:
 
       # Download Docker image artifacts
       - name: Download Docker image artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: /tmp
           pattern: images-*

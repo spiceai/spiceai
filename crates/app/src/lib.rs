@@ -23,7 +23,7 @@ use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
     Spicepod,
-    acceleration::Mode as AccelerationMode,
+    acceleration::{Acceleration, Mode as AccelerationMode, RefreshMode, SnapshotBehavior},
     component::{
         caching::{CacheConfig, SQLResultsCacheConfig},
         catalog::Catalog,
@@ -33,14 +33,15 @@ use spicepod::{
         management::Management,
         model::Model,
         rerankers::Reranker,
-        runtime::{CorsConfig, Runtime, TlsConfig},
+        runtime::{CorsConfig, Runtime, TlsConfig, runtime_state_folder},
         secret::Secret,
-        snapshot::Snapshots,
+        snapshot::{SNAPSHOTS_QUEUE_URL_PARAM, SNAPSHOTS_STATE_FOLDER, Snapshots},
         tool::Tool,
         view::View,
         worker::Worker,
     },
     extension::Extension,
+    param::Params,
 };
 use util::in_tracing_context;
 
@@ -78,10 +79,165 @@ pub struct App {
 
     pub management: Option<Management>,
 
+    /// The deprecated top-level `snapshots` section as written. Use
+    /// [`App::dataset_snapshots`], which resolves a dataset's snapshot configuration.
     pub snapshots: Option<Arc<Snapshots>>,
 }
 
+/// The setting whose params a dataset's snapshots use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotParamsSetting {
+    /// The dataset's `acceleration.snapshots_params`.
+    Dataset,
+    /// The top-level `snapshots.params`.
+    Section,
+    /// `runtime.state.params`.
+    RuntimeState,
+}
+
 impl App {
+    /// The snapshot configuration of a dataset with `acceleration`. Read the
+    /// snapshot configuration through this, not the `snapshots` field.
+    ///
+    /// The location and the bootstrap failure behavior each come from the
+    /// acceleration's `snapshots_*` field, else the top-level `snapshots` section,
+    /// else `runtime.state` (its `snapshots/` folder) or the default. The params
+    /// are the acceleration's `snapshots_params` when set, else the params beside
+    /// the location.
+    #[must_use]
+    pub fn dataset_snapshots(&self, acceleration: &Acceleration) -> Arc<Snapshots> {
+        let section = self.snapshots.as_deref();
+        let state = self.runtime.state.as_ref();
+        let location = acceleration
+            .snapshots_location
+            .clone()
+            .or_else(|| section.and_then(|section| section.location.clone()))
+            .or_else(|| {
+                state.map(|state| runtime_state_folder(&state.location, SNAPSHOTS_STATE_FOLDER))
+            });
+        let params = match self.snapshot_params_setting(acceleration) {
+            Some(SnapshotParamsSetting::Dataset) => acceleration.snapshots_params.clone(),
+            Some(SnapshotParamsSetting::Section) => {
+                section.and_then(|section| section.params.clone())
+            }
+            Some(SnapshotParamsSetting::RuntimeState) => {
+                state.and_then(|state| state.params.clone())
+            }
+            None => None,
+        };
+        Arc::new(Snapshots {
+            enabled: section.is_none_or(|section| section.enabled),
+            location,
+            bootstrap_on_failure_behavior: acceleration
+                .snapshots_bootstrap_on_failure_behavior
+                .or_else(|| section.map(|section| section.bootstrap_on_failure_behavior))
+                .unwrap_or_default(),
+            params,
+        })
+    }
+
+    /// The setting that holds a dataset's snapshot params, or `None` when none
+    /// apply. The acceleration's `snapshots_params` always apply when set.
+    /// Otherwise the params sit beside the location: a `snapshots_location` has
+    /// none, the top-level `snapshots.location` has the section's `params` as
+    /// written, and the `runtime.state` location has the section's `params`, else
+    /// `runtime.state.params`.
+    fn snapshot_params_setting(
+        &self,
+        acceleration: &Acceleration,
+    ) -> Option<SnapshotParamsSetting> {
+        let section = self.snapshots.as_deref();
+        if acceleration.snapshots_params.is_some() {
+            return Some(SnapshotParamsSetting::Dataset);
+        }
+        if acceleration.snapshots_location.is_some() {
+            return None;
+        }
+        if section.is_some_and(|section| section.params.is_some()) {
+            return Some(SnapshotParamsSetting::Section);
+        }
+        if section.is_some_and(|section| section.location.is_some()) {
+            return None;
+        }
+        self.runtime
+            .state
+            .as_ref()
+            .and_then(|state| state.params.as_ref())
+            .map(|_| SnapshotParamsSetting::RuntimeState)
+    }
+
+    /// The settings that set `s3_queue_url` for snapshots that no dataset with
+    /// `refresh_mode: snapshot` and `snapshots: enabled` or `bootstrap_only` reads, named as a user writes them, for example
+    /// `` `runtime.state.params.s3_queue_url` ``. Empty when the top-level
+    /// `snapshots` section turns snapshots off.
+    #[must_use]
+    pub fn unread_snapshot_queues(&self) -> Vec<String> {
+        if self
+            .snapshots
+            .as_ref()
+            .is_some_and(|section| !section.enabled)
+        {
+            return Vec::new();
+        }
+        let sets_queue = |params: Option<&Params>| {
+            params.is_some_and(|params| params.data.contains_key(SNAPSHOTS_QUEUE_URL_PARAM))
+        };
+        let read: Vec<(SnapshotParamsSetting, &str)> = self
+            .datasets
+            .iter()
+            .filter_map(|dataset| {
+                let acceleration = dataset.acceleration.as_ref().filter(|acceleration| {
+                    acceleration.enabled
+                        && acceleration.refresh_mode == Some(RefreshMode::Snapshot)
+                        && matches!(
+                            acceleration.snapshots,
+                            SnapshotBehavior::Enabled | SnapshotBehavior::BootstrapOnly
+                        )
+                })?;
+                Some((
+                    self.snapshot_params_setting(acceleration)?,
+                    dataset.name.as_str(),
+                ))
+            })
+            .collect();
+        let is_read = |setting| read.iter().any(|(read, _)| *read == setting);
+
+        let mut unread = Vec::new();
+        if sets_queue(
+            self.runtime
+                .state
+                .as_ref()
+                .and_then(|state| state.params.as_ref()),
+        ) && !is_read(SnapshotParamsSetting::RuntimeState)
+        {
+            unread.push(format!(
+                "`runtime.state.params.{SNAPSHOTS_QUEUE_URL_PARAM}`"
+            ));
+        }
+        if sets_queue(
+            self.snapshots
+                .as_ref()
+                .and_then(|section| section.params.as_ref()),
+        ) && !is_read(SnapshotParamsSetting::Section)
+        {
+            unread.push(format!("`snapshots.params.{SNAPSHOTS_QUEUE_URL_PARAM}`"));
+        }
+        for dataset in &self.datasets {
+            let Some(acceleration) = dataset.acceleration.as_ref() else {
+                continue;
+            };
+            if sets_queue(acceleration.snapshots_params.as_ref())
+                && !read.contains(&(SnapshotParamsSetting::Dataset, dataset.name.as_str()))
+            {
+                unread.push(format!(
+                    "`acceleration.snapshots_params.{SNAPSHOTS_QUEUE_URL_PARAM}` of dataset '{}'",
+                    dataset.name
+                ));
+            }
+        }
+        unread
+    }
+
     /// Retrieve all dataset names that are of a specific connector type.
     #[must_use]
     pub fn datasets_of_connector_type(&self, prefix: &str) -> Vec<String> {
@@ -159,14 +315,15 @@ fn cayenne_file_path_conflict(datasets: &[Dataset]) -> Option<String> {
         .iter()
         .filter_map(|dataset| {
             let acceleration = dataset.acceleration.as_ref()?;
-            let declared_cayenne_file = acceleration.engine.as_deref().is_some_and(|engine| {
-                engine.eq_ignore_ascii_case("cayenne") || engine.eq_ignore_ascii_case("vortex")
-            }) && matches!(
-                acceleration.mode,
-                AccelerationMode::File
-                    | AccelerationMode::FileCreate
-                    | AccelerationMode::FileUpdate
-            );
+            let engine = acceleration.engine_name();
+            let declared_cayenne_file = (engine.eq_ignore_ascii_case("cayenne")
+                || engine.eq_ignore_ascii_case("vortex"))
+                && matches!(
+                    acceleration.mode,
+                    AccelerationMode::File
+                        | AccelerationMode::FileCreate
+                        | AccelerationMode::FileUpdate
+                );
             // A snapshot dataset names neither: its engine comes from the snapshots and
             // its mode is always file, so a `cayenne_file_path` on it is a Cayenne file path.
             if !acceleration.enabled || !(declared_cayenne_file || reads_snapshots(dataset)) {
@@ -695,6 +852,24 @@ mod tests {
             .expect("acceleration")
             .engine = Some("vortex".into());
 
+        // Both spellings must be recognized as Cayenne, so the error names both datasets.
+        assert_eq!(
+            cayenne_file_path_conflict(&datasets).as_deref(),
+            Some("`orders` (`/mnt/a/cayenne`), `customers` (`/mnt/b/cayenne`)")
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn cayenne_rejects_conflicts_for_datasets_that_name_no_engine() {
+        let mut datasets = vec![
+            cayenne_dataset("orders", "/mnt/a/cayenne", None),
+            cayenne_dataset("customers", "/mnt/b/cayenne", None),
+        ];
+        for dataset in &mut datasets {
+            dataset.acceleration.as_mut().expect("acceleration").engine = None;
+        }
+
         assert!(cayenne_file_path_conflict(&datasets).is_some());
     }
 
@@ -724,5 +899,356 @@ mod tests {
             snapshot_dataset("customers", "/data/customers", Some("/data/metadata")),
         ];
         assert!(cayenne_file_path_conflict(&datasets).is_none());
+    }
+
+    mod dataset_snapshots {
+        use crate::{App, AppBuilder};
+        use spicepod::acceleration::{Acceleration, RefreshMode, SnapshotBehavior};
+        use spicepod::component::dataset::Dataset;
+        use spicepod::component::runtime::{Runtime, RuntimeState};
+        use spicepod::component::snapshot::{BootstrapOnFailureBehavior, Snapshots};
+        use spicepod::param::Params;
+
+        const QUEUE_URL: &str = "https://sqs.us-east-1.amazonaws.com/123456789012/snapshots";
+
+        fn params(entries: &[(&str, &str)]) -> Params {
+            Params::from_string_map(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            )
+        }
+
+        fn app(snapshots: Option<Snapshots>, state: Option<RuntimeState>) -> App {
+            app_with(snapshots, state, Vec::new())
+        }
+
+        fn app_with(
+            snapshots: Option<Snapshots>,
+            state: Option<RuntimeState>,
+            datasets: Vec<Dataset>,
+        ) -> App {
+            let mut builder = AppBuilder::new("snapshots").with_runtime(Runtime {
+                state,
+                ..Default::default()
+            });
+            if let Some(snapshots) = snapshots {
+                builder = builder.with_snapshots(snapshots);
+            }
+            for dataset in datasets {
+                builder = builder.with_dataset(dataset);
+            }
+            builder.build()
+        }
+
+        fn state() -> RuntimeState {
+            RuntimeState {
+                location: "s3://state-bucket/spice/".to_string(),
+                params: Some(params(&[("s3_region", "us-east-1")])),
+            }
+        }
+
+        fn section(location: Option<&str>, section_params: Option<Params>) -> Snapshots {
+            Snapshots {
+                location: location.map(ToString::to_string),
+                params: section_params,
+                ..Default::default()
+            }
+        }
+
+        fn acceleration(location: Option<&str>, dataset_params: Option<Params>) -> Acceleration {
+            Acceleration {
+                snapshots_location: location.map(ToString::to_string),
+                snapshots_params: dataset_params,
+                ..Default::default()
+            }
+        }
+
+        fn resolved(app: &App, acceleration: &Acceleration) -> (Option<String>, Option<Params>) {
+            let snapshots = app.dataset_snapshots(acceleration);
+            (snapshots.location.clone(), snapshots.params.clone())
+        }
+
+        fn state_folder() -> String {
+            "s3://state-bucket/spice/snapshots/".to_string()
+        }
+
+        fn section_params() -> Params {
+            params(&[("s3_region", "eu-west-1")])
+        }
+
+        fn dataset_params() -> Params {
+            params(&[("s3_region", "ap-south-1")])
+        }
+
+        #[test]
+        fn without_any_setting_there_is_no_location() {
+            assert_eq!(
+                *app(None, None).dataset_snapshots(&Acceleration::default()),
+                Snapshots::default()
+            );
+        }
+
+        #[test]
+        fn runtime_state_gives_its_snapshots_folder_and_params() {
+            assert_eq!(
+                resolved(&app(None, Some(state())), &Acceleration::default()),
+                (Some(state_folder()), state().params)
+            );
+        }
+
+        #[test]
+        fn section_location_wins_over_runtime_state_and_keeps_its_params_as_written() {
+            let without_params = app(
+                Some(section(Some("s3://snapshot-bucket/snapshots/"), None)),
+                Some(state()),
+            );
+            assert_eq!(
+                resolved(&without_params, &Acceleration::default()),
+                (Some("s3://snapshot-bucket/snapshots/".to_string()), None),
+                "runtime.state.params are not for the section's location"
+            );
+
+            let with_params = app(
+                Some(section(
+                    Some("s3://snapshot-bucket/snapshots/"),
+                    Some(section_params()),
+                )),
+                Some(state()),
+            );
+            assert_eq!(
+                resolved(&with_params, &Acceleration::default()),
+                (
+                    Some("s3://snapshot-bucket/snapshots/".to_string()),
+                    Some(section_params())
+                )
+            );
+        }
+
+        /// The section's `params` replace `runtime.state.params` as a whole for the
+        /// `runtime.state` location, so `s3_region` from `runtime.state` is gone.
+        #[test]
+        fn section_params_replace_runtime_state_params() {
+            let queue = params(&[("s3_queue_url", QUEUE_URL)]);
+            assert_eq!(
+                resolved(
+                    &app(Some(section(None, Some(queue.clone()))), Some(state())),
+                    &Acceleration::default()
+                ),
+                (Some(state_folder()), Some(queue))
+            );
+        }
+
+        #[test]
+        fn dataset_location_wins_and_takes_no_inherited_params() {
+            let location = Some("s3://archive-bucket/snapshots/");
+            for app in [
+                app(None, Some(state())),
+                app(
+                    Some(section(
+                        Some("s3://snapshot-bucket/"),
+                        Some(section_params()),
+                    )),
+                    Some(state()),
+                ),
+                app(Some(section(None, Some(section_params()))), None),
+            ] {
+                assert_eq!(
+                    resolved(&app, &acceleration(location, None)),
+                    (location.map(ToString::to_string), None)
+                );
+            }
+        }
+
+        #[test]
+        fn dataset_params_apply_whatever_gives_the_location() {
+            let dataset_location = "s3://archive-bucket/snapshots/";
+            for (app, acceleration, location) in [
+                (
+                    app(None, Some(state())),
+                    acceleration(None, Some(dataset_params())),
+                    Some(state_folder()),
+                ),
+                (
+                    app(
+                        Some(section(
+                            Some("s3://snapshot-bucket/"),
+                            Some(section_params()),
+                        )),
+                        Some(state()),
+                    ),
+                    acceleration(None, Some(dataset_params())),
+                    Some("s3://snapshot-bucket/".to_string()),
+                ),
+                (
+                    app(Some(section(None, Some(section_params()))), Some(state())),
+                    acceleration(Some(dataset_location), Some(dataset_params())),
+                    Some(dataset_location.to_string()),
+                ),
+            ] {
+                assert_eq!(
+                    resolved(&app, &acceleration),
+                    (location, Some(dataset_params()))
+                );
+            }
+        }
+
+        #[test]
+        fn bootstrap_on_failure_behavior_falls_back_on_its_own() {
+            let section = Snapshots {
+                bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Retry,
+                ..Default::default()
+            };
+            let behavior = |app: &App, acceleration: &Acceleration| {
+                app.dataset_snapshots(acceleration)
+                    .bootstrap_on_failure_behavior
+            };
+            let dataset = Acceleration {
+                snapshots_bootstrap_on_failure_behavior: Some(BootstrapOnFailureBehavior::Fallback),
+                snapshots_location: Some("s3://archive-bucket/".to_string()),
+                ..Default::default()
+            };
+
+            let with_section = app(Some(section), Some(state()));
+            assert_eq!(
+                behavior(&with_section, &dataset),
+                BootstrapOnFailureBehavior::Fallback
+            );
+            assert_eq!(
+                behavior(
+                    &with_section,
+                    &acceleration(Some("s3://archive-bucket/"), None)
+                ),
+                BootstrapOnFailureBehavior::Retry,
+                "falls back to the section even when the dataset sets the location"
+            );
+            assert_eq!(
+                behavior(&app(None, Some(state())), &Acceleration::default()),
+                BootstrapOnFailureBehavior::Warn
+            );
+        }
+
+        #[test]
+        fn section_enabled_false_turns_snapshots_off() {
+            let disabled = Snapshots {
+                enabled: false,
+                ..Default::default()
+            };
+            assert!(
+                !app(Some(disabled), Some(state()))
+                    .dataset_snapshots(&acceleration(Some("s3://archive-bucket/"), None))
+                    .enabled
+            );
+        }
+
+        fn snapshot_reader(name: &str, acceleration: Acceleration) -> Dataset {
+            let mut dataset = Dataset::new("spice.ai:orders", name);
+            dataset.acceleration = Some(Acceleration {
+                refresh_mode: Some(RefreshMode::Snapshot),
+                snapshots: SnapshotBehavior::BootstrapOnly,
+                ..acceleration
+            });
+            dataset
+        }
+
+        fn snapshot_writer(name: &str, acceleration: Acceleration) -> Dataset {
+            let mut dataset = Dataset::new("spice.ai:orders", name);
+            dataset.acceleration = Some(acceleration);
+            dataset
+        }
+
+        fn state_with_queue() -> RuntimeState {
+            RuntimeState {
+                params: Some(params(&[("s3_queue_url", QUEUE_URL)])),
+                ..state()
+            }
+        }
+
+        #[test]
+        fn a_queue_a_snapshot_reader_uses_is_read() {
+            let queue = Some(params(&[("s3_queue_url", QUEUE_URL)]));
+            for app in [
+                app_with(
+                    None,
+                    Some(state_with_queue()),
+                    vec![snapshot_reader("orders", Acceleration::default())],
+                ),
+                app_with(
+                    Some(section(None, queue.clone())),
+                    Some(state()),
+                    vec![snapshot_reader("orders", Acceleration::default())],
+                ),
+                app_with(
+                    None,
+                    None,
+                    vec![snapshot_reader("orders", acceleration(None, queue))],
+                ),
+            ] {
+                assert_eq!(app.unread_snapshot_queues(), Vec::<String>::new());
+            }
+        }
+
+        #[test]
+        fn each_unread_queue_is_named_by_its_setting() {
+            let queue = Some(params(&[("s3_queue_url", QUEUE_URL)]));
+            let only_writers = app_with(
+                Some(section(None, queue.clone())),
+                Some(state_with_queue()),
+                vec![
+                    snapshot_writer("orders", acceleration(None, queue)),
+                    snapshot_reader(
+                        "events",
+                        acceleration(Some("s3://archive-bucket/snapshots/"), None),
+                    ),
+                ],
+            );
+            assert_eq!(
+                only_writers.unread_snapshot_queues(),
+                vec![
+                    "`runtime.state.params.s3_queue_url`".to_string(),
+                    "`snapshots.params.s3_queue_url`".to_string(),
+                    "`acceleration.snapshots_params.s3_queue_url` of dataset 'orders'".to_string(),
+                ]
+            );
+
+            // A reader with its own params does not read `runtime.state.params`.
+            let reader_with_own_params = app_with(
+                None,
+                Some(state_with_queue()),
+                vec![snapshot_reader(
+                    "orders",
+                    acceleration(None, Some(params(&[("s3_region", "us-east-1")]))),
+                )],
+            );
+            assert_eq!(
+                reader_with_own_params.unread_snapshot_queues(),
+                vec!["`runtime.state.params.s3_queue_url`".to_string()]
+            );
+
+            // Only `enabled` and `bootstrap_only` snapshots read the queue.
+            for snapshots in [SnapshotBehavior::Disabled, SnapshotBehavior::CreateOnly] {
+                let mut dataset = snapshot_reader("orders", Acceleration::default());
+                if let Some(acceleration) = dataset.acceleration.as_mut() {
+                    acceleration.snapshots = snapshots;
+                }
+                let not_loading = app_with(None, Some(state_with_queue()), vec![dataset]);
+                assert_eq!(
+                    not_loading.unread_snapshot_queues(),
+                    vec!["`runtime.state.params.s3_queue_url`".to_string()],
+                    "{snapshots:?}"
+                );
+            }
+
+            let disabled = app_with(
+                Some(Snapshots {
+                    enabled: false,
+                    ..Default::default()
+                }),
+                Some(state_with_queue()),
+                Vec::new(),
+            );
+            assert_eq!(disabled.unread_snapshot_queues(), Vec::<String>::new());
+        }
     }
 }

@@ -115,6 +115,10 @@ impl EvictionListener for NoopListener {
 /// (Moka-like): eviction heuristics tolerate lost promotions under overload.
 const TOUCH_DRAIN_THRESHOLD: usize = 64;
 const TOUCH_BUFFER_CAP: usize = 1024;
+/// Most expired entries [`ShardedCache::run_pending_tasks`] removes per hold of
+/// a shard lock. Expiry costs one step per expired entry, so this bounds how
+/// long a reader of that shard can wait when a large cohort expires at once.
+const EXPIRE_BATCH: usize = 1024;
 /// Region order the guaranteed-progress fallback reclaims from: coldest main
 /// space first, then new admissions, and only then the protected segment.
 const FALLBACK_EVICT_ORDER: [shard::Region; 3] = [
@@ -319,6 +323,65 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             return;
         }
         self.evict_to_limit(shard_idx, Some(key));
+    }
+
+    /// Insert `value`, or replace the resident, only when `admit` accepts the
+    /// current resident (`None` when the key is empty or expired).
+    ///
+    /// The decision and the write share the shard lock, so a slower result
+    /// cannot overwrite one the predicate has already rejected. A value heavier
+    /// than `max_weight` is refused without removing the resident — unlike
+    /// [`Self::insert`], which drops an uncacheable key.
+    pub fn insert_if<F>(&self, key: u64, value: V, weight: usize, admit: F) -> bool
+    where
+        F: FnOnce(Option<&V>) -> bool,
+    {
+        let weight = u64::try_from(weight).unwrap_or(u64::MAX);
+        if weight > self.max_weight {
+            return false;
+        }
+        let shard_idx = shard_index(key);
+        let displaced;
+        let mut expired: Vec<std::sync::Arc<V>> = Vec::new();
+        {
+            let _gate = self.invalidate_gate.read();
+            self.drain_touches_blocking(shard_idx);
+            let mut shard = self.shards[shard_idx].0.lock();
+            let now = Instant::now();
+            if !admit(shard.peek_live(key, now, self.ttl)) {
+                return false;
+            }
+            if matches!(self.policy, EvictionPolicy::TinyLfu) {
+                let before_window = shard.window_weight();
+                let before_protected = shard.protected_weight();
+                let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
+                if expired_weight > 0 {
+                    self.sub_weight(expired_weight);
+                }
+                self.sync_segment_weights_after_removal(
+                    before_window,
+                    shard.window_weight(),
+                    before_protected,
+                    shard.protected_weight(),
+                );
+                expired = values;
+                shard.increment_sketch(key);
+            }
+
+            let (delta, replaced) = shard.insert(key, value, weight, now);
+            self.apply_delta(&delta);
+            drop(shard);
+            self.note_write();
+            displaced = replaced;
+            #[cfg(test)]
+            self.wait_after_publish();
+        }
+        drop(displaced);
+        for _ in expired.drain(..) {
+            L::on_evict(EvictionReason::Expired);
+        }
+        self.evict_to_limit(shard_idx, Some(key));
+        true
     }
 
     /// Insert `value` under `key` only if admitting it needs no cache-wide work,
@@ -617,21 +680,29 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             self.drain_touches_blocking(shard_idx);
         }
         for shard_idx in 0..NUM_SHARDS {
-            let mut shard = self.shards[shard_idx].0.lock();
+            // One cutoff per shard, so entries inserted while this loop yields
+            // the lock between batches cannot keep it going.
             let now = Instant::now();
-            let before_window = shard.window_weight();
-            let before_protected = shard.protected_weight();
-            let (expired, weight) = shard.expire_older_than(now, self.ttl);
-            self.sub_weight(weight);
-            self.sync_segment_weights_after_removal(
-                before_window,
-                shard.window_weight(),
-                before_protected,
-                shard.protected_weight(),
-            );
-            drop(shard);
-            for _ in expired {
-                L::on_evict(EvictionReason::Expired);
+            loop {
+                let mut shard = self.shards[shard_idx].0.lock();
+                let before_window = shard.window_weight();
+                let before_protected = shard.protected_weight();
+                let (expired, weight, more) =
+                    shard.expire_older_than_at_most(now, self.ttl, EXPIRE_BATCH);
+                self.sub_weight(weight);
+                self.sync_segment_weights_after_removal(
+                    before_window,
+                    shard.window_weight(),
+                    before_protected,
+                    shard.protected_weight(),
+                );
+                drop(shard);
+                for _ in expired {
+                    L::on_evict(EvictionReason::Expired);
+                }
+                if !more {
+                    break;
+                }
             }
         }
         self.evict_to_limit(0, None);
@@ -2115,24 +2186,49 @@ mod tests {
 
     #[test]
     fn tinylfu_keeps_a_hot_key_over_a_one_shot() {
-        let cache: ShardedCache<TestValue> =
-            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::TinyLfu);
+        // Both keys land on shard 0, and the 100-byte budget holds only one of
+        // the two 100-byte values.
         let hot = 16u64;
-        cache.insert(hot, TestValue::with_size("hot", 100), 100);
-        for _ in 0..64 {
-            assert!(cache.get(&hot).is_some());
-        }
-        for one_shot in (32..48).step_by(16) {
-            cache.insert(
-                one_shot,
-                TestValue::with_size(&format!("c{one_shot}"), 100),
-                100,
-            );
-        }
-        assert!(
-            cache.get(&hot).is_some(),
-            "`TinyLFU` must not admit one-shot keys over a frequently read resident"
+        let one_shot = 32u64;
+        let data = |cache: &ShardedCache<TestValue>, key: u64| {
+            cache.get(&key).map(|value| value.data.clone())
+        };
+        let read_hot_then_insert_one_shot = |policy: EvictionPolicy| {
+            let cache: ShardedCache<TestValue> =
+                ShardedCache::new(100, Duration::from_mins(1), policy);
+            cache.insert(hot, TestValue::with_size("hot", 100), 100);
+            for _ in 0..64 {
+                assert_eq!(data(&cache, hot), Some("hot".to_string()), "{policy:?}");
+            }
+            cache.insert(one_shot, TestValue::with_size("one-shot", 100), 100);
+            cache
+        };
+
+        let tinylfu = read_hot_then_insert_one_shot(EvictionPolicy::TinyLfu);
+        assert_eq!(
+            data(&tinylfu, hot),
+            Some("hot".to_string()),
+            "`TinyLFU` must not admit a one-shot key over a frequently read resident"
         );
+        assert_eq!(
+            data(&tinylfu, one_shot),
+            None,
+            "the one-shot key is refused"
+        );
+        assert_eq!(tinylfu.len(), 1);
+        assert_eq!(tinylfu.weighted_size(), 100);
+
+        // The same sequence under LRU evicts the hot key, so keeping it above is
+        // the admission policy's doing rather than the access pattern's.
+        let lru = read_hot_then_insert_one_shot(EvictionPolicy::Lru);
+        assert_eq!(
+            data(&lru, hot),
+            None,
+            "LRU evicts the least recently used key"
+        );
+        assert_eq!(data(&lru, one_shot), Some("one-shot".to_string()));
+        assert_eq!(lru.len(), 1);
+        assert_eq!(lru.weighted_size(), 100);
     }
 
     struct CountingListener;
@@ -2763,6 +2859,99 @@ mod tests {
         );
         assert_eq!(cache.protected_weight_for_test(), 0);
         assert_eq!(cache.len(), 0);
+    }
+
+    struct ExpiryCountingListener;
+    static EXPIRED_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+    impl EvictionListener for ExpiryCountingListener {
+        fn on_evict(reason: EvictionReason) {
+            if reason == EvictionReason::Expired {
+                EXPIRED_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// More expired entries on one shard than one lock hold removes: a single
+    /// `run_pending_tasks` must still reclaim all of them, and only them.
+    #[test]
+    fn run_pending_tasks_expires_a_shard_past_one_batch() {
+        let cache: ShardedCache<TestValue, ExpiryCountingListener> =
+            ShardedCache::new(1 << 40, Duration::from_mins(1), EvictionPolicy::Lru);
+        let stale = u64::try_from(2 * EXPIRE_BATCH + 7).expect("fits u64");
+        // Multiples of NUM_SHARDS all land on shard 0.
+        let shard_key = |i: u64| i * NUM_SHARDS as u64;
+        for i in 0..stale {
+            cache.insert(shard_key(i), TestValue::with_size("old", 3), 3);
+        }
+        for i in 0..stale {
+            assert!(
+                cache.rewind_ttl_for_test(shard_key(i), Duration::from_mins(2)),
+                "the resident must be present to be aged past its deadline"
+            );
+        }
+        for i in stale..stale + 5 {
+            cache.insert(shard_key(i), TestValue::with_size("new", 2), 2);
+        }
+        let before = EXPIRED_EVICTIONS.load(Ordering::Relaxed);
+
+        cache.run_pending_tasks();
+
+        assert_eq!(EXPIRED_EVICTIONS.load(Ordering::Relaxed) - before, stale);
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.weighted_size(), 10);
+        let mut left = cache.iter_keys();
+        left.sort_unstable();
+        assert_eq!(left, (stale..stale + 5).map(shard_key).collect::<Vec<_>>());
+    }
+
+    /// Refills shard 0 of [`REFILLED`] with one new entry per expiry it hears
+    /// about, so the shard being swept never runs out of expired entries.
+    struct RefillingListener;
+    static REFILLED: std::sync::OnceLock<ShardedCache<TestValue, RefillingListener>> =
+        std::sync::OnceLock::new();
+    static REFILL_EXPIRED: AtomicU64 = AtomicU64::new(0);
+    static REFILL_NEXT_KEY: AtomicU64 = AtomicU64::new(1 << 32);
+    /// Bounds the refills so a pass that never stops still ends the test.
+    const REFILL_CAP: u64 = 100_000;
+
+    impl EvictionListener for RefillingListener {
+        fn on_evict(reason: EvictionReason) {
+            if reason != EvictionReason::Expired {
+                return;
+            }
+            if REFILL_EXPIRED.fetch_add(1, Ordering::Relaxed) >= REFILL_CAP {
+                return;
+            }
+            let key = REFILL_NEXT_KEY.fetch_add(NUM_SHARDS as u64, Ordering::Relaxed);
+            if let Some(cache) = REFILLED.get() {
+                cache.insert(key, TestValue::with_size("refill", 1), 1);
+            }
+        }
+    }
+
+    /// A pass reclaims what had expired when it reached the shard, not what
+    /// was inserted while it ran. Under a zero TTL every entry is expired on
+    /// insert, so without that cutoff a shard refilled between batches would
+    /// keep one `run_pending_tasks` call going for as long as the refills do.
+    #[test]
+    fn run_pending_tasks_stops_at_entries_inserted_during_the_pass() {
+        let cache = REFILLED
+            .get_or_init(|| ShardedCache::new(1 << 40, Duration::ZERO, EvictionPolicy::Lru));
+        let initial = u64::try_from(2 * EXPIRE_BATCH + 7).expect("fits u64");
+        // Multiples of NUM_SHARDS all land on shard 0.
+        for i in 0..initial {
+            cache.insert(i * NUM_SHARDS as u64, TestValue::with_size("old", 1), 1);
+        }
+
+        cache.run_pending_tasks();
+
+        assert_eq!(
+            REFILL_EXPIRED.load(Ordering::Relaxed),
+            initial,
+            "one pass must reclaim exactly the entries present when it started"
+        );
+        assert_eq!(cache.len(), usize::try_from(initial).expect("fits usize"));
     }
 
     #[test]

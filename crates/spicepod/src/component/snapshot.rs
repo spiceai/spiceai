@@ -47,6 +47,10 @@ pub struct Snapshots {
     /// The object store location pointing to a folder
     /// containing the dataset snapshots.
     /// i.e. `s3://my-bucket/spice/snapshots/`
+    ///
+    /// When not set, snapshots go to the `snapshots/` folder of
+    /// `runtime.state.location`. A dataset's `acceleration.snapshots_location`
+    /// wins over it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
 
@@ -61,9 +65,19 @@ pub struct Snapshots {
     /// Auth params for accessing the object store location.
     /// For S3, this is the same as the S3 dataset connector params
     /// with the notable exception that `s3_auth` is set to `iam_role` by default.
+    /// They apply to this section's `location`, and replace `runtime.state.params`
+    /// for the `runtime.state` location. A dataset's `acceleration.snapshots_params`
+    /// win over them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 }
+
+/// The folder of `runtime.state.location` that holds acceleration snapshots.
+pub const SNAPSHOTS_STATE_FOLDER: &str = "snapshots";
+
+/// The snapshot `params` key that names the SQS queue receiving a snapshot
+/// location's S3 event notifications.
+pub const SNAPSHOTS_QUEUE_URL_PARAM: &str = "s3_queue_url";
 
 impl Default for Snapshots {
     fn default() -> Self {

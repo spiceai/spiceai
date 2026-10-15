@@ -47,6 +47,15 @@ pub(crate) enum SnapshotMaintenanceTrigger {
         number_picker_candidate_files: usize,
         compaction_trigger_files: usize,
     },
+    /// The in-memory key deletion index has grown past the point where it must be
+    /// reclaimed, on a table whose only reclaiming pass is the current-snapshot
+    /// full rewrite. `over_memory_ceiling` distinguishes the routine size trigger
+    /// from the OOM backstop, which is worth a WARN.
+    DeletionIndexSize {
+        deletion_index_len: usize,
+        trigger_len: usize,
+        over_memory_ceiling: bool,
+    },
 }
 
 fn should_warn_protected_snapshot_age(

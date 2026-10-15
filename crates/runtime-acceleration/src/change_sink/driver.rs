@@ -25,7 +25,7 @@ use datafusion::execution::context::SessionContext;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::batching::{AppendBurst, CdcBurst, CdcIngress, CoalescingBurst};
+use super::batching::{AppendBurst, ApplyingGuard, CdcBurst, CdcIngress, CoalescingBurst};
 use super::source_policy::SchemaDecision;
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
@@ -153,7 +153,10 @@ struct ApplyCommand {
 }
 
 enum Command {
-    Apply(ApplyCommand),
+    /// Boxed: `ApplyCommand` carries a `ChangeBatch` / `LazyChangeBatch`, and
+    /// the reader's deferred-row prebuild keeps a `ChangeBatchError` beside
+    /// the source. An unboxed `Apply` trips `clippy::large_enum_variant`.
+    Apply(Box<ApplyCommand>),
     Flush(oneshot::Sender<Result<()>>),
     Evolve {
         plan: WideningPlan,
@@ -227,13 +230,13 @@ impl ChangePermit {
             }),
             ChangePayload::Rows { .. } => None,
         };
-        self.permit.send(Command::Apply(ApplyCommand {
+        self.permit.send(Command::Apply(Box::new(ApplyCommand {
             batch,
             options,
             reply,
             charge,
             admitted_at: Instant::now(),
-        }));
+        })));
         Ok(())
     }
 }
@@ -513,9 +516,9 @@ impl Owner {
                     if let Some(error) = &self.failure {
                         input.reply.refuse(error);
                     } else if matches!(input.batch.payload(), ChangePayload::Cdc(_)) {
-                        self.apply_cdc(input).await;
+                        self.apply_cdc(*input).await;
                     } else if input.batch.append_ingress().is_some() {
-                        self.apply_append(input).await;
+                        self.apply_append(*input).await;
                     } else {
                         // A row vector is one operation. Its scope and chunk
                         // boundaries are not CDC coalescing boundaries.
@@ -609,7 +612,7 @@ impl Owner {
                         reply,
                         admitted_at,
                         charge,
-                    } = input;
+                    } = *input;
                     let byte_cap = limits.is_some_and(|limits| {
                         burst.bytes().saturating_add(batch.estimated_bytes())
                             > limits.max_bytes.max(1)
@@ -617,13 +620,13 @@ impl Owner {
                     match burst.push(batch, options) {
                         ControlFlow::Continue(()) => replies.push_back(reply),
                         ControlFlow::Break(batch) => {
-                            self.carried = Some(Command::Apply(ApplyCommand {
+                            self.carried = Some(Command::Apply(Box::new(ApplyCommand {
                                 batch,
                                 options,
                                 reply,
                                 admitted_at,
                                 charge,
-                            }));
+                            })));
                             break if byte_cap {
                                 "byte_cap"
                             } else {
@@ -704,6 +707,7 @@ impl Owner {
             .drain(&mut burst, &mut replies, admitted_at, self.previous_cycle)
             .await;
         let ingress = burst.ingress().cloned();
+        let _applying = ingress.as_ref().map(ApplyingGuard::enter);
         if let Some(ingress) = &ingress {
             ingress.record_drain(burst.len(), burst.bytes(), admitted_at, reason);
             if let Some(previous) = self.previous_cycle {
@@ -861,5 +865,24 @@ impl Owner {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_is_boxed_so_command_stays_under_the_large_variant_lint() {
+        let command = std::mem::size_of::<Command>();
+        let apply = std::mem::size_of::<ApplyCommand>();
+        assert!(
+            apply >= 200,
+            "ApplyCommand is {apply} bytes; the lint exists because this payload is large"
+        );
+        assert!(
+            command < 200,
+            "Command is {command} bytes; box Apply so clippy::large_enum_variant stays silent"
+        );
     }
 }

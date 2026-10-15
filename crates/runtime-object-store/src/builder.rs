@@ -38,8 +38,9 @@ use std::{collections::HashMap, sync::Arc};
 use datafusion::error::DataFusionError;
 use object_store::{
     ClientOptions, ObjectStore, RetryConfig, azure::MicrosoftAzureBuilder,
-    client::SpawnedReqwestConnector, gcp::GoogleCloudStorageBuilder,
+    gcp::GoogleCloudStorageBuilder,
 };
+use object_store_spawn::SpawnedReqwestConnector;
 use tokio::runtime::Handle;
 use url::Url;
 
@@ -381,9 +382,12 @@ mod tests {
             "ZHVtbXlrZXk=".to_string(),
         );
 
-        assert!(
-            build_azure_object_store(&url, &params, handle()).is_ok(),
-            "azure object store should build with explicit credentials"
+        let store = build_azure_object_store(&url, &params, handle())
+            .expect("azure object store should build with explicit credentials");
+        // The container and the account are the ones the abfss URL names.
+        assert_eq!(
+            store.to_string(),
+            "MicrosoftAzure { account: account, container: container }"
         );
     }
 
@@ -395,9 +399,13 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("use_emulator".to_string(), "true".to_string());
 
-        assert!(
-            build_azure_object_store(&url, &params, handle()).is_ok(),
-            "azure emulator object store should build without explicit account"
+        let store = build_azure_object_store(&url, &params, handle())
+            .expect("azure emulator object store should build without explicit account");
+        // The abfs host is the container, and the emulator supplies its
+        // well-known account.
+        assert_eq!(
+            store.to_string(),
+            "MicrosoftAzure { account: devstoreaccount1, container: testcontainer }"
         );
     }
 
@@ -418,13 +426,25 @@ mod tests {
 
     #[tokio::test]
     async fn gcs_builder_with_skip_signature_anonymous() {
+        // A service account file that does not exist fails the build whenever
+        // credentials are loaded, so building with it proves `skip_signature`
+        // never loads them.
         let mut params = HashMap::new();
-        params.insert("skip_signature".to_string(), "true".to_string());
-
-        assert!(
-            build_gcs_object_store("my-bucket", &params, handle()).is_ok(),
-            "gcs object store should build with skip_signature"
+        params.insert(
+            "service_account_path".to_string(),
+            "/nonexistent/spice-test-service-account.json".to_string(),
         );
+        let err = build_gcs_object_store("my-bucket", &params, handle())
+            .expect_err("a missing service account file must fail a signed build");
+        assert!(
+            matches!(err, DataFusionError::ObjectStore(_)),
+            "unexpected error: {err}"
+        );
+
+        params.insert("skip_signature".to_string(), "true".to_string());
+        let store = build_gcs_object_store("my-bucket", &params, handle())
+            .expect("gcs object store should build with skip_signature");
+        assert_eq!(store.to_string(), "GoogleCloudStorage(my-bucket)");
     }
 
     #[tokio::test]

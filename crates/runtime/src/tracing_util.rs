@@ -213,6 +213,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_dataset_registered_trace_default_acceleration_cache() {
         let acceleration = Acceleration {
@@ -234,7 +235,7 @@ mod tests {
         let info = dataset_registered_trace(test_data_connector.as_ref(), &ds, true);
         assert_eq!(
             info,
-            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (arrow), results cache enabled."
+            "Dataset taxi_trips registered (s3://taxi_trips/2024/), acceleration (cayenne), results cache enabled."
         );
     }
 
@@ -278,6 +279,7 @@ mod tests {
         assert_eq!(info, "View taxi_trips_vw registered.");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_view_registered_trace_with_default_acceleration() {
         let table_ref = TableReference::from("taxi_trips_vw");
@@ -286,7 +288,10 @@ mod tests {
             ..Default::default()
         });
         let info = view_registered_trace(&table_ref, acceleration.as_ref());
-        assert_eq!(info, "View taxi_trips_vw registered, acceleration (arrow).");
+        assert_eq!(
+            info,
+            "View taxi_trips_vw registered, acceleration (cayenne)."
+        );
     }
 
     #[test]

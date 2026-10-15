@@ -298,7 +298,7 @@ impl SnapshotFixture {
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.snapshots.clone())
+            .map(|app| app.dataset_snapshots(&spicepod::acceleration::Acceleration::default()))
             .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
         let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
             runtime_snapshots,
@@ -2694,6 +2694,227 @@ async fn snapshot_int_test_cayenne_reader_started_before_first_snapshot() -> Res
             load.abort();
             fixture.cleanup().await?;
             outcome
+        })
+        .await
+}
+
+/// Every file under `dir`, recursively.
+fn all_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .flat_map(|path| {
+            if path.is_dir() {
+                all_files(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}
+
+/// A Cayenne dataset with a secondary index is snapshotted the moment its
+/// refresh returns. The snapshot carries the refresh's index runs, a runtime
+/// that bootstraps from it loads them (no rebuild), and its first lookup is
+/// answered from the index alone: no file is read in full (#14803).
+#[tokio::test]
+async fn snapshot_int_test_cayenne_bootstrap_serves_lookups_from_its_index() -> Result<()> {
+    const ROWS: i64 = 50_000;
+    const LOCATIONS: i64 = 250;
+    let _guard = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = TempDir::new().context("Creating temporary directory")?;
+            // Enough rows to be written as data files: a write of at most
+            // 1,024 rows is inlined into the metastore and has no index runs.
+            let source_path = temp_dir.path().join("lookups.csv");
+            let csv: String = std::iter::once("id,location".to_string())
+                .chain((0..ROWS).map(|id| format!("{id},{}", id % LOCATIONS)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&source_path, csv)
+                .await
+                .context("Writing the source CSV")?;
+            let from = format!("file://{}", source_path.display());
+            let snapshot_dir = temp_dir.path().join("snapshots");
+            fs::create_dir_all(&snapshot_dir)
+                .await
+                .context("Creating snapshot directory")?;
+
+            let build_app = |name: &str, root: &Path| {
+                let mut dataset = Dataset::new(&from, "lookups");
+                dataset.params = Some(Params::from_string_map(HashMap::from([
+                    ("file_format".to_string(), "csv".to_string()),
+                    ("csv_has_header".to_string(), "true".to_string()),
+                ])));
+                dataset.acceleration = Some(Acceleration {
+                    mode: Mode::File,
+                    engine: Some("cayenne".to_string()),
+                    refresh_mode: Some(RefreshMode::Full),
+                    indexes: HashMap::from([(
+                        "location".to_string(),
+                        spicepod::acceleration::IndexType::Enabled,
+                    )]),
+                    params: Some(Params::from_string_map(HashMap::from([
+                        (
+                            "cayenne_file_path".to_string(),
+                            root.join("data").to_string_lossy().to_string(),
+                        ),
+                        (
+                            "cayenne_metadata_dir".to_string(),
+                            root.join("metadata").to_string_lossy().to_string(),
+                        ),
+                    ]))),
+                    refresh_on_startup: RefreshOnStartup::Auto,
+                    snapshots: DatasetSnapshotBehavior::Enabled,
+                    ..Default::default()
+                });
+                AppBuilder::new(name)
+                    .with_snapshots(Snapshots {
+                        enabled: true,
+                        location: Some(format!("file://{}/", snapshot_dir.display())),
+                        bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Warn,
+                        params: None,
+                    })
+                    .with_dataset(dataset)
+                    .build()
+            };
+
+            configure_test_datafusion();
+
+            // The writer: its first refresh publishes a snapshot as soon as it returns.
+            let writer_root = temp_dir.path().join("writer");
+            let runtime = Arc::new(
+                Runtime::builder()
+                    .with_app(build_app("snapshot_index_writer", &writer_root))
+                    .build()
+                    .await,
+            );
+            load_runtime(Arc::clone(&runtime)).await?;
+            let metadata_path = snapshot_dir.join("metadata.json");
+            let published = wait_until_true(Duration::from_mins(1), || async {
+                fs::read(&metadata_path)
+                    .await
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|metadata| {
+                        metadata
+                            .get("lookups")
+                            .and_then(|entry| entry.get("snapshots"))
+                            .and_then(Value::as_array)
+                            .is_some_and(|snapshots| !snapshots.is_empty())
+                    })
+            })
+            .await;
+            assert!(published, "the writer must publish a snapshot of lookups");
+            runtime.shutdown().await;
+
+            // The published archive carries the refresh's index runs.
+            // A Cayenne snapshot archive is named `<dataset>_<time>_<id>.cayenne`.
+            let archives: Vec<PathBuf> = all_files(&snapshot_dir)
+                .into_iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "cayenne"))
+                .collect();
+            let [archive] = archives.as_slice() else {
+                return Err(anyhow!("expected one snapshot archive, found {archives:?}"));
+            };
+            let unpacked = temp_dir.path().join("unpacked");
+            runtime_acceleration::snapshot::directory_archive::extract_archive_file_with_options(
+                archive,
+                &unpacked,
+                runtime_acceleration::snapshot::directory_archive::ExtractOptions::skip_existing(),
+            )
+            .await
+            .context("Unpacking the snapshot archive")?;
+            let runs = all_files(&unpacked)
+                .into_iter()
+                .filter(|path| path.extension().is_some_and(|ext| ext == "run"))
+                .count();
+            assert!(
+                runs > 0,
+                "the snapshot taken right after the refresh must carry its index runs; archive {archive:?} holds none"
+            );
+
+            // A runtime on a fresh node bootstraps from that snapshot.
+            let runtime = Arc::new(
+                Runtime::builder()
+                    .with_app(build_app(
+                        "snapshot_index_reader",
+                        &temp_dir.path().join("reader"),
+                    ))
+                    .build()
+                    .await,
+            );
+            load_runtime(Arc::clone(&runtime)).await?;
+            // The restored table's index comes from the archived run files, not
+            // from a rebuild: it covers every file and no build has started (the
+            // open-time catch-up found nothing to index).
+            let provider = runtime
+                .datafusion()
+                .get_accelerated_table_provider("lookups")
+                .await?;
+            let accelerated = spice_table::find_layer::<runtime_table::accelerated::AcceleratedTable>(
+                provider.as_ref(),
+                spice_table::LayerWalk::Read,
+            )
+            .ok_or_else(|| anyhow!("lookups has no accelerated-table layer"))?;
+            let Some(runtime_table::accelerated::write::dual_write::CayenneWriteTarget::Staged(
+                cayenne,
+            )) = runtime_table::accelerated::write::dual_write::extract_cayenne_write_target(
+                accelerated.get_accelerator_ref(),
+            )
+            else {
+                return Err(anyhow!("lookups is not an unpartitioned Cayenne table"));
+            };
+            let verification = cayenne
+                .verify_lookup_index_against_read_back()
+                .await
+                .map_err(|error| anyhow!("verifying the restored index: {error}"))?;
+            let counters = cayenne
+                .lookup_index_counters()
+                .ok_or_else(|| anyhow!("lookups declares no secondary index"))?;
+            assert!(
+                verification.agrees()
+                    && verification.files > 0
+                    && verification.uncovered_files == 0
+                    && counters.builds_started == 0,
+                "the bootstrapped table must load its index from the snapshot, not rebuild it: {verification:?} {counters:?}"
+            );
+            let lookup = "SELECT id FROM lookups WHERE location = 186";
+            let rows: usize = run_query(&runtime, lookup)
+                .await
+                .context("Running the first lookup")?
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert_eq!(
+                rows,
+                usize::try_from(ROWS / LOCATIONS).context("Expected row count")?,
+                "the lookup returns every row of location 186"
+            );
+            let plan = run_query(&runtime, &format!("EXPLAIN ANALYZE {lookup}"))
+            .await
+            .context("Explaining the first lookup")?;
+            let plan = pretty_format_batches(&plan)
+                .context("Formatting the plan")?
+                .to_string();
+            let scans: Vec<&str> = plan
+                .lines()
+                .filter(|line| line.contains("CayenneAccelerationExec"))
+                .collect();
+            assert!(
+                !scans.is_empty()
+                    && scans.iter().all(|scan| {
+                        !scan.contains("lookup_index=none") && scan.contains("uncovered_files=0")
+                    }),
+                "the first lookup after the bootstrap must read no file in full:\n{plan}"
+            );
+            runtime.shutdown().await;
+            Ok(())
         })
         .await
 }

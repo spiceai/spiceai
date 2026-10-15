@@ -618,8 +618,8 @@ pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
-pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
+pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 #[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
@@ -793,6 +793,8 @@ pub struct ResolvedClusterConfig {
     scheduler_address_url: Option<Url>,
     /// Advertise address with port stripped (if present in the original input).
     node_advertise_host: Option<String>,
+    /// Instance identity set for this runtime instead of the process-wide one.
+    instance_id: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -949,7 +951,27 @@ impl ResolvedClusterConfig {
             scheduler_url,
             scheduler_address_url,
             node_advertise_host,
+            instance_id: None,
         })
+    }
+
+    /// Sets the instance identity of this runtime, for processes that run several
+    /// cluster nodes, such as integration tests.
+    #[must_use]
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = Some(instance_id.into());
+        self
+    }
+
+    /// The identity this node registers under in shared cluster state:
+    /// [`util::instance_id::instance_id`] unless set with [`Self::with_instance_id`].
+    /// Distinct from the advertise address, which is how other nodes reach it.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        match &self.instance_id {
+            Some(instance_id) => instance_id,
+            None => util::instance_id::instance_id(),
+        }
     }
 
     /// Returns the cluster role.
@@ -1212,6 +1234,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let self_ref = Arc::clone(rt);
         let cluster_state = rt.cluster_state();
         let heartbeats = rt.scheduler_heartbeats();
+        let scheduler_state = app.runtime.scheduler_state();
         let scheduler_registry_fut = self_for_task
             .start_runtime_task(
                 CLUSTER_SCHEDULER_REGISTRY,
@@ -1227,7 +1250,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     };
                     start_scheduler_registry(
                         self_ref,
-                        &config,
+                        scheduler_state.as_ref(),
                         registry_shutdown.clone(),
                         peers,
                         cluster_state,
@@ -1318,7 +1341,10 @@ pub async fn initialize_cluster_executor(
             (hostname, bind_addr.port())
         };
 
-    let executor_id = format!("{advertise_host}:{advertise_port}");
+    let executor_id = rt.df.cluster_config.instance_id().to_string();
+    // Tells the scheduler this process apart from an earlier run under the same
+    // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
+    let process_id = uuid::Uuid::now_v7().to_string();
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
@@ -1583,6 +1609,7 @@ pub async fn initialize_cluster_executor(
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     let control_stream_executor_id = executor_id.clone();
+    let control_stream_process_id = process_id.clone();
     let control_stream_ballista_id = executor_id.clone();
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
@@ -1650,6 +1677,7 @@ pub async fn initialize_cluster_executor(
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
             control_stream_executor_id,
+            control_stream_process_id,
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
@@ -1783,6 +1811,8 @@ pub async fn initialize_cluster_executor(
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
+                    rt.datafusion().cluster_config.instance_id().to_string(),
+                    process_id.clone(),
                     task_ctx.as_ref(),
                 )
                 .await
@@ -2143,7 +2173,7 @@ async fn create_scheduler_server(
     // a fibonacci backoff and keep retrying until it loads (warning periodically)
     // rather than giving up — when a state location is configured we must honor it,
     // not silently degrade to in-memory.
-    let scheduler_cfg = {
+    let scheduler_state = {
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(None)
             .build();
@@ -2156,7 +2186,7 @@ async fn create_scheduler_server(
         tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
-                break app.runtime.resolved_scheduler();
+                break app.runtime.scheduler_state();
             }
             if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
                 tracing::warn!(
@@ -2180,39 +2210,31 @@ async fn create_scheduler_server(
             }
         }
     };
-    let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
-        if let Some(state_location) = scheduler_cfg.state_location.as_deref() {
-            tracing::info!(
-                state_location = %state_location,
-                "Scheduler using shared object-store job state"
-            );
-            let (store, base_prefix) =
-                scheduler_registry::build_object_store(rt.as_ref(), state_location, &scheduler_cfg)
-                    .await
-                    .map_err(|e| crate::Error::FailedToStartClusterScheduler {
-                        source: Box::new(e),
-                    })?;
-            let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
-                SpiceLogicalCodec::new_codec(),
-                SpicePhysicalCodec::new(Arc::clone(rt))
-                    .boxed()
-                    .context(FailedToStartClusterSchedulerSnafu)?,
-            );
-            Arc::new(shared_job_state::SharedJobState::new(
-                metrics_node_id,
-                store,
-                base_prefix,
-                codec,
-                session_builder,
-                config_producer,
-            ))
-        } else {
-            Arc::new(InMemoryJobState::new(
-                metrics_node_id,
-                session_builder,
-                config_producer,
-            ))
-        }
+    let job_state: Arc<dyn JobState> = if let Some(scheduler_state) = scheduler_state {
+        tracing::info!(
+            state_location = %scheduler_state.location,
+            "Scheduler using shared object-store job state"
+        );
+        let (store, base_prefix) =
+            scheduler_registry::build_object_store(rt.as_ref(), &scheduler_state)
+                .await
+                .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+                    source: Box::new(e),
+                })?;
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+            SpiceLogicalCodec::new_codec(),
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        );
+        Arc::new(shared_job_state::SharedJobState::new(
+            metrics_node_id,
+            store,
+            base_prefix,
+            codec,
+            session_builder,
+            config_producer,
+        ))
     } else {
         Arc::new(InMemoryJobState::new(
             metrics_node_id,
@@ -2356,22 +2378,21 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
         &self,
         executor_id: &str,
         key: &str,
-    ) -> Result<secrecy::SecretString, String> {
+    ) -> Result<Option<secrecy::SecretString>, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
         };
 
-        let response = self
-            .client
-            .clone()
-            .expand_secret(request)
-            .await
-            .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
-
-        // Wrap at the earliest point we own the plaintext so downstream code
-        // cannot accidentally stash it in a non-zeroizing buffer.
-        Ok(secrecy::SecretString::from(response.into_inner().value))
+        match self.client.clone().expand_secret(request).await {
+            // Wrap at the earliest point we own the plaintext so downstream code
+            // cannot accidentally stash it in a non-zeroizing buffer.
+            Ok(response) => Ok(Some(secrecy::SecretString::from(
+                response.into_inner().value,
+            ))),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(format!("Failed to expand secret from scheduler: {status}")),
+        }
     }
 }
 
@@ -2395,6 +2416,13 @@ async fn executor_bind_app(
     };
 
     let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
+    rt.df.set_runtime_state_location(
+        app_def
+            .runtime
+            .state
+            .as_ref()
+            .map(|state| state.location.clone()),
+    );
     *rt.app.write().await = Some(app_def);
 
     // Create a cluster client for secrets. This channel outlives every secret
@@ -2856,25 +2884,58 @@ mod tests {
 
     #[test]
     fn cluster_tls_config_accepts_valid_node_certificate() {
+        use rcgen::{
+            CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose, SanType,
+        };
+
         install_crypto_provider();
         let temp_dir = TempDir::new().expect("temp dir should create");
-        let ca_key = generate_key();
-        let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
 
-        let node_key = generate_key();
-        let node_cert =
-            create_signed_certificate("Spice Test Node", "Spice Test CA", &node_key, &ca_key);
+        // A real handshake needs certificates webpki accepts: a CA with basic
+        // constraints and a node certificate carrying a SAN and both TLS usages,
+        // since a cluster node is both server and client.
+        let mut ca_dn = DistinguishedName::new();
+        ca_dn.push(DnType::CommonName, "Spice Test CA");
+        let mut ca_params = CertificateParams::default();
+        ca_params.distinguished_name = ca_dn;
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().expect("ca keypair");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let ca_issuer = Issuer::new(ca_params, ca_key);
+
+        let mut node_dn = DistinguishedName::new();
+        node_dn.push(DnType::CommonName, "Spice Test Node");
+        let mut node_params = CertificateParams::default();
+        node_params.distinguished_name = node_dn;
+        node_params
+            .subject_alt_names
+            .push(SanType::DnsName("spice-node".try_into().expect("dns name")));
+        node_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        node_params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let node_key = KeyPair::generate().expect("node keypair");
+        let node_cert = node_params
+            .signed_by(&node_key, &ca_issuer)
+            .expect("node certificate signed by the CA");
 
         let ca_path = temp_dir.path().join("ca.pem");
         let node_cert_path = temp_dir.path().join("node.pem");
         let node_key_path = temp_dir.path().join("node.key");
 
-        write_cert(&ca_path, &ca_cert);
-        write_cert(&node_cert_path, &node_cert);
-        write_key(&node_key_path, &node_key);
+        std::fs::write(&ca_path, ca_cert.pem()).expect("CA certificate should write");
+        std::fs::write(&node_cert_path, node_cert.pem()).expect("node certificate should write");
+        std::fs::write(&node_key_path, node_key.serialize_pem()).expect("node key should write");
 
         let control = runtime_tls::TlsControl::new().expect("watcher");
-        ClusterTlsConfig::try_new(
+        let config = ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
                 .to_str()
@@ -2885,6 +2946,140 @@ mod tests {
             &control,
         )
         .expect("valid certificates should be accepted");
+
+        let server_config = config.server_config();
+        assert_eq!(server_config.alpn_protocols, vec![b"h2".to_vec()]);
+
+        // Acceptance must yield a working mTLS server: a client presenting the
+        // CA-signed node identity completes a handshake against it, negotiates
+        // h2, and is seen with exactly that certificate.
+        let node_cert_der = rustls::pki_types::CertificateDer::from(node_cert.der().to_vec());
+        let node_key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(node_key.serialize_der().into());
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PinnedServerCertificate(
+                node_cert_der.clone(),
+            )))
+            .with_client_auth_cert(vec![node_cert_der.clone()], node_key_der)
+            .expect("the node identity is a valid client certificate");
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from("spice-node").expect("valid server name"),
+        )
+        .expect("client connection");
+        let mut server = rustls::ServerConnection::new(server_config).expect("server connection");
+
+        complete_handshake(&mut client, &mut server);
+
+        assert_eq!(server.alpn_protocol(), Some(&b"h2"[..]));
+        assert_eq!(
+            server.peer_certificates().map(|certs| certs
+                .iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect::<Vec<_>>()),
+            Some(vec![node_cert_der.as_ref().to_vec()]),
+            "the server must accept and record the CA-signed client certificate"
+        );
+    }
+
+    /// Trusts exactly one server certificate, the node's own. The test checks
+    /// the server half of the handshake, so the client pins what it expects the
+    /// server to present instead of validating a hostname the test PKI lacks.
+    #[derive(Debug)]
+    struct PinnedServerCertificate(rustls::pki_types::CertificateDer<'static>);
+
+    impl rustls::client::danger::ServerCertVerifier for PinnedServerCertificate {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if end_entity.as_ref() == self.0.as_ref() {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(
+                    "the server presented an unexpected certificate".to_string(),
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Runs a TLS handshake between `client` and `server` in memory, failing if
+    /// either side rejects the other's flight or it does not finish.
+    fn complete_handshake(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) {
+        for _ in 0..16 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+            let mut flight = Vec::new();
+            client
+                .write_tls(&mut flight)
+                .expect("the client writes its flight");
+            let mut pending = flight.as_slice();
+            while !pending.is_empty() {
+                server
+                    .read_tls(&mut pending)
+                    .expect("the server reads the client's flight");
+                server
+                    .process_new_packets()
+                    .expect("the server accepts the client's flight");
+            }
+            let mut flight = Vec::new();
+            server
+                .write_tls(&mut flight)
+                .expect("the server writes its flight");
+            let mut pending = flight.as_slice();
+            while !pending.is_empty() {
+                client
+                    .read_tls(&mut pending)
+                    .expect("the client reads the server's flight");
+                client
+                    .process_new_packets()
+                    .expect("the client accepts the server's flight");
+            }
+        }
+        panic!("the TLS handshake did not complete");
     }
 
     #[test]

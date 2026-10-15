@@ -516,9 +516,7 @@ fn next_round_tool_choice(
             ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)
         }
         Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
-            for entry in &mut allowed.allowed_tools {
-                entry.mode = ToolChoiceAllowedMode::Auto;
-            }
+            allowed.allowed_tools.mode = ToolChoiceAllowedMode::Auto;
             ChatCompletionToolChoiceOption::AllowedTools(allowed)
         }
         Some(
@@ -697,6 +695,11 @@ fn make_a_stream(
 ) -> ChatCompletionResponseStream {
     let (sender, receiver) = mpsc::channel(100);
     let sender_clone = sender;
+    let wants_usage = req
+        .stream_options
+        .as_ref()
+        .and_then(|o| o.include_usage)
+        .unwrap_or(false);
 
     tokio::spawn(
         request_context
@@ -706,9 +709,12 @@ fn make_a_stream(
                 > = Arc::new(Mutex::new(HashMap::new()));
 
                 let mut chat_output = String::new();
+                // Usage is withheld from every round and sent once, last, as the total across rounds.
+                let mut total_usage: Option<CompletionUsage> = None;
+                let mut usage_chunk: Option<CreateChatCompletionStreamResponse> = None;
 
                 while let Some(result) = s.next().await {
-                    let response = match result {
+                    let mut response = match result {
                         Ok(response) => response,
                         Err(e) => {
                             if let Err(e) = sender_clone.send(Err(e)).await
@@ -718,6 +724,13 @@ fn make_a_stream(
                             return;
                         }
                     };
+                    let round_usage = response.usage.take();
+                    if round_usage.is_some() {
+                        let mut template = response.clone();
+                        template.choices.clear();
+                        usage_chunk = Some(template);
+                        total_usage = combine_usage(total_usage, round_usage.clone());
+                    }
                     let mut finished_choices: Vec<ChatChoiceStream> = vec![];
                     for chat_choice1 in &response.choices {
                         let chat_choice = chat_choice1.clone();
@@ -837,12 +850,25 @@ fn make_a_stream(
                             .chat_stream_inner(create_new_recursive_req(
                                 &req,
                                 new_messages,
-                                response.usage.as_ref(),
+                                round_usage.as_ref(),
                             ))
                             .await
                         {
                             Ok(mut s) => {
                                 while let Some(resp) = s.next().await {
+                                    let resp = match resp {
+                                        Ok(mut chunk) => {
+                                            if let Some(nested) = chunk.usage.take() {
+                                                total_usage = combine_usage(total_usage, Some(nested));
+                                                if chunk.choices.is_empty() {
+                                                    usage_chunk = Some(chunk);
+                                                    continue;
+                                                }
+                                            }
+                                            Ok(chunk)
+                                        }
+                                        Err(e) => Err(e),
+                                    };
                                     // TODO check if this works for choices > 1.
                                     if let Err(e) = sender_clone.send(resp).await {
                                         if !sender_clone.is_closed() {
@@ -874,13 +900,17 @@ fn make_a_stream(
                                 tracing::error!("Error sending error: {}", e);
                             }
                     }
+                }
 
-                    // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with no choices).
-                    if response.choices.is_empty() && response.usage.is_some()
-                        && let Err(e) = sender_clone.send(Ok(response)).await
-                            && !sender_clone.is_closed() {
-                                tracing::error!("Error sending error: {}", e);
-                            }
+                if wants_usage
+                    && let Some(mut chunk) = usage_chunk
+                    && total_usage.is_some()
+                {
+                    chunk.usage = total_usage;
+                    if let Err(e) = sender_clone.send(Ok(chunk)).await
+                        && !sender_clone.is_closed() {
+                            tracing::error!("Error sending error: {}", e);
+                        }
                 }
 
                 tracing::info!(target: "task_history", captured_output = %chat_output);
@@ -1177,13 +1207,13 @@ mod tests {
 
     fn allowed_tools(mode: ToolChoiceAllowedMode) -> ChatCompletionToolChoiceOption {
         ChatCompletionToolChoiceOption::AllowedTools(ChatCompletionAllowedToolsChoice {
-            allowed_tools: vec![ChatCompletionAllowedTools {
+            allowed_tools: ChatCompletionAllowedTools {
                 mode,
                 tools: vec![serde_json::json!({
                     "type": "function",
                     "function": { "name": "list_datasets" }
                 })],
-            }],
+            },
         })
     }
 

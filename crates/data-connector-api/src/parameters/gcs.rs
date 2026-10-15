@@ -14,18 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use snafu::prelude::*;
 use tonic::async_trait;
 
 use super::{ConnectorParams, Validator};
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(
-        "Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
-    ))]
-    MultipleAuthMethods,
-}
+pub use runtime_parameters::gcs::{Error, validate_auth};
 
 /// Validates GCS authentication configuration.
 /// Ensures only one authentication method is used.
@@ -36,52 +29,7 @@ impl Validator for GcsAuthValidator {
     type Error = Error;
 
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
-        // Check for each authentication method
-        let has_service_account_path = params
-            .parameters
-            .get("service_account_path")
-            .expose()
-            .ok()
-            .is_some();
-        let has_service_account_key = params
-            .parameters
-            .get("service_account_key")
-            .expose()
-            .ok()
-            .is_some();
-
-        // skip_signature must be explicitly "true" to count as an auth method
-        let has_skip_signature = params
-            .parameters
-            .get("skip_signature")
-            .expose()
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-        // application_default_credentials must be explicitly "true" to count as an auth method
-        let has_application_default_credentials = params
-            .parameters
-            .get("application_default_credentials")
-            .expose()
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-        // Count active authentication methods
-        let auth_method_count = [
-            has_service_account_path,
-            has_service_account_key,
-            has_skip_signature,
-            has_application_default_credentials,
-        ]
-        .iter()
-        .filter(|&&b| b)
-        .count();
-
-        if auth_method_count > 1 {
-            return Err(Error::MultipleAuthMethods);
-        }
-
-        Ok(())
+        validate_auth(&params.parameters)
     }
 }
 

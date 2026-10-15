@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow_flight::HandshakeResponse;
 use futures::Stream;
-use runtime_auth::FlightBasicAuth;
+use runtime_auth::{AuthRequestContext, FlightBasicAuth};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,13 +52,24 @@ pub(crate) async fn handle(
     let request_context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&request_context);
 
+    // The session belongs to the client certificate's principal when one was
+    // applied, otherwise to the API key the client authenticated with.
+    let owner_stable_id = request_context
+        .auth_principal()
+        .and_then(|principal| principal.stable_id().map(std::borrow::Cow::into_owned))
+        .or_else(|| {
+            auth_token
+                .as_deref()
+                .and_then(SessionStore::api_key_stable_id)
+        });
+
     // Create a new session from the base context, associating it with the auth token
     let (session_id, _session_ctx) =
-        session_store.create_session(&datafusion.ctx, auth_token.as_deref());
+        session_store.create_session(&datafusion.ctx, auth_token.as_deref(), owner_stable_id);
 
     tracing::debug!(
         authenticated = auth_token.is_some(),
-        "Created new Flight SQL session: {session_id}"
+        "Created new Flight SQL session"
     );
 
     // Return the session ID in the response payload

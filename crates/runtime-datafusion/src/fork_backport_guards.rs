@@ -414,3 +414,81 @@ async fn write_parquet(ctx: &SessionContext, select: &str, path: &Path) {
     )
     .await;
 }
+
+/// spiceai/datafusion#252. `FilterPushdown` gives a hash join its dynamic filter
+/// after `JoinSelection` has chosen the build side, and `HashJoinExec::swap_inputs`
+/// rejects a join that has one. A plan that is optimized twice (a table provider
+/// that returns an optimized sub-plan from `scan`, as `vector_search` does) runs
+/// `JoinSelection` again on such a join, so the join must keep its order.
+#[test]
+fn join_selection_keeps_the_order_of_a_join_with_a_dynamic_filter() {
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::config::ConfigOptions;
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_optimizer::join_selection::JoinSelection;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use std::sync::Arc;
+
+    let source = |name: &str, rows: i32| -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+        )
+        .expect("batch matches its schema");
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+            .expect("memory source builds")
+    };
+    // The build (left) side is bigger, so statistics alone would swap the inputs.
+    let (big, small) = (source("big_col", 10_000), source("small_col", 10));
+    let probe_key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("small_col", 0));
+    let join = |dynamic_filter: Option<Arc<DynamicFilterPhysicalExpr>>| {
+        let join = HashJoinExec::try_new(
+            Arc::clone(&big),
+            Arc::clone(&small),
+            vec![(Arc::new(Column::new("big_col", 0)), Arc::clone(&probe_key))],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .expect("join builds");
+        let join = match dynamic_filter {
+            Some(filter) => join
+                .with_dynamic_filter_expr(filter)
+                .expect("filter matches the probe side"),
+            None => join,
+        };
+        Arc::new(join) as Arc<dyn ExecutionPlan>
+    };
+    let select = |plan| {
+        JoinSelection::new()
+            .optimize(plan, &ConfigOptions::new())
+            .expect("join selection succeeds")
+    };
+
+    // Without a dynamic filter the bigger build side is swapped behind a projection.
+    assert!(
+        select(join(None)).downcast_ref::<HashJoinExec>().is_none(),
+        "the join should swap when it has no dynamic filter"
+    );
+
+    let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&probe_key)],
+        lit(true),
+    ));
+    let kept = select(join(Some(filter)));
+    let kept = kept
+        .downcast_ref::<HashJoinExec>()
+        .expect("a join with a dynamic filter keeps its inputs");
+    assert_eq!(kept.left().schema().field(0).name(), "big_col");
+    assert_eq!(kept.dynamic_expressions_produced().len(), 1);
+}

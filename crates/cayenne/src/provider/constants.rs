@@ -24,6 +24,12 @@ limitations under the License.
 /// remains unchanged.
 pub const STAGING_DIR_NAME: &str = "_staging";
 
+/// Reserved directory name for persisted secondary index runs, one
+/// subdirectory per indexed key: `{table_path}/{table_id}/_lookup_index/`.
+/// Underscore-prefixed like every reserved directory, so snapshot cleanup
+/// never mistakes it for a snapshot.
+pub const LOOKUP_INDEX_DIR_NAME: &str = "_lookup_index";
+
 /// Filename for the staging write-ahead log (WAL).
 ///
 /// Written inside `_staging/` after all data files are staged but before

@@ -1781,10 +1781,25 @@ mod tests {
     fn test_schema_mismatch_returns_error() {
         let schema = test_schema(); // expects id (Int64), name (Utf8)
         let values = [json!({"wrong_field": "value"})];
+        // A message without the non-nullable `id` column must be refused, never ingested with a
+        // NULL key. Production decodes the raw payload unless `flatten_json` is set, so both
+        // decode paths must refuse it, naming the column.
+        let expected = "Json error: Encountered unmasked nulls in non-nullable StructArray child: Field { \"id\": Int64 }";
 
-        let result = values_to_change_batch(values.iter(), None, &schema);
+        let err = values_to_change_batch(values.iter(), None, &schema)
+            .expect_err("a message missing the non-nullable `id` must be refused");
+        assert!(
+            matches!(&err, cdc::StreamError::Arrow(message) if message == expected),
+            "value decode path returned an unexpected error: {err:?}"
+        );
 
-        result.expect_err("error");
+        let payload = values[0].to_string();
+        let err = payloads_to_change_batch(&[payload.as_bytes()], &schema)
+            .expect_err("a message missing the non-nullable `id` must be refused");
+        assert!(
+            matches!(&err, cdc::StreamError::Arrow(message) if message == expected),
+            "payload decode path returned an unexpected error: {err:?}"
+        );
     }
 
     #[test]

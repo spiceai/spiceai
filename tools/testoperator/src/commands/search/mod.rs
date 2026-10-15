@@ -17,6 +17,7 @@ limitations under the License.
 mod dataset;
 mod harness;
 mod mteb;
+mod per_query;
 use self::dataset::SearchDataset;
 use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor};
@@ -138,18 +139,15 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
-    let retrieval_metrics_at_all_k = test
-        .calculate_search_score_metrics_at_all_k(&qrels, |results| {
-            dataset.transform_results(results)
-        })?;
+    let evaluation =
+        test.evaluate_search_results(&qrels, |results| dataset.transform_results(results))?;
+    let retrieval_metrics_at_all_k = evaluation.mean_at_all_k();
 
     // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
     // to the largest available k when fewer results were returned) for the fixed-schema run row.
     print_retrieval_metrics_table(&retrieval_metrics_at_all_k);
-    let retrieval_metrics = retrieval_metrics_at_all_k
-        .get(&10)
-        .or_else(|| retrieval_metrics_at_all_k.values().next_back())
-        .copied()
+    let (primary_k, retrieval_metrics) = per_query::primary_k(&evaluation)
+        .and_then(|k| evaluation.mean_at_k(k).map(|metrics| (k, metrics)))
         .ok_or_else(|| anyhow::anyhow!("No retrieval metrics were computed for any rank cutoff"))?;
 
     let metrics: QueryMetrics<_, _> =
@@ -195,6 +193,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         crate::metrics::SEARCH_MRR.record(metrics_at_k.mrr, &k_attr);
         crate::metrics::SEARCH_PRECISION.record(metrics_at_k.precision, &k_attr);
     }
+    per_query::record_metrics(&evaluation, primary_k)?;
     if let Some((max_memory, median_memory)) = memory_usage {
         crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
@@ -272,7 +271,7 @@ fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {
     if let Some(engine) = ds
         .acceleration
         .as_ref()
-        .map(|acc| acc.engine.clone().unwrap_or("arrow".to_string()))
+        .map(|acc| acc.engine_name().to_string())
     {
         attributes.push(KeyValue::new("engine", engine));
     }

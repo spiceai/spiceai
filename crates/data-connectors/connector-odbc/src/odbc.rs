@@ -80,6 +80,10 @@ where
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "routed through `create_spice_federated_table_provider` with the factory's policy below"
+        )]
         let table = SqlTable::new(
             "odbc",
             &dyn_pool,
@@ -94,11 +98,11 @@ where
         } else {
             table
         };
-
-        let sql_table = Arc::new(table);
-        let schema = sql_table.schema();
+        // `create_spice_federated_table_provider` installs the policy on the
+        // scan's own filter pushdown as well as on the federation decision.
+        let schema = table.schema();
         let table_provider = Arc::new(create_spice_federated_table_provider(
-            sql_table,
+            table,
             schema,
             table_reference,
             self.function_support.clone(),

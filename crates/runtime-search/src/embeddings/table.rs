@@ -948,7 +948,9 @@ impl TableLayer for EmbeddingTable {
             LayerWalk::Read | LayerWalk::Source | LayerWalk::Index | LayerWalk::RetentionDelete => {
                 Some(below)
             }
-            LayerWalk::CdcDetection | LayerWalk::Write => None,
+            // The embedding columns it computes are not in the table beneath,
+            // so that table cannot stand in for this one.
+            LayerWalk::CdcDetection | LayerWalk::Write | LayerWalk::Passthrough => None,
         }
     }
 

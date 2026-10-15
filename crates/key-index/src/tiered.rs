@@ -385,6 +385,88 @@ impl IndexRun {
         out
     }
 
+    /// Checks the encoded layout without allocating and bounds the working
+    /// memory for decoding and publishing this run, excluding `bytes` itself.
+    ///
+    /// The file allowance covers name reference counts, the duplicate-name
+    /// set, vector growth, file states and both publication coverage sets.
+    /// The word allowance covers words, slots, the directory and both Bloom
+    /// filters. Postings can coexist with their replacement allocation.
+    /// Fixed headroom includes minimum Bloom blocks and publication metadata,
+    /// including when the run has no files or words.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a truncated layout or overflowing allocation sizes.
+    pub fn decode_memory_bound(bytes: &[u8]) -> crate::persist::Result<usize> {
+        Self::decode_memory_bound_from_reader(crate::persist::open(
+            bytes,
+            crate::persist::KIND_RUN,
+        )?)
+    }
+
+    fn decode_memory_bound_from_reader(
+        mut reader: crate::persist::Reader<'_>,
+    ) -> crate::persist::Result<usize> {
+        use crate::persist::Error;
+        reader.u64()?;
+        let files = reader.u32()? as usize;
+        if files > MAX_RUN_FILES {
+            return Err(Error::Corrupt);
+        }
+        let mut names = 0_usize;
+        for _ in 0..files {
+            let len = reader.u32()? as usize;
+            reader.bytes(len)?;
+            names = names.checked_add(len).ok_or(Error::Corrupt)?;
+        }
+        reader.len()?;
+        let words = reader.len()?;
+        reader.bytes(words.checked_mul(8).ok_or(Error::Corrupt)?)?;
+        reader.bytes(words.checked_mul(4).ok_or(Error::Corrupt)?)?;
+        let postings = reader.len()?;
+        reader.bytes(postings)?;
+        if !reader.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        files
+            .checked_mul(16 * size_of::<Arc<str>>())
+            .and_then(|size| size.checked_add(names))
+            .and_then(|size| {
+                words
+                    .checked_mul(32)
+                    .and_then(|words| size.checked_add(words))
+            })
+            .and_then(|size| {
+                postings
+                    .checked_mul(2)
+                    .and_then(|postings| size.checked_add(postings))
+            })
+            .and_then(|size| size.checked_add(8192))
+            .ok_or(Error::Corrupt)
+    }
+
+    /// Resident bytes plus temporary metadata and the table filter needed to
+    /// publish this decoded run. Decoder buffers no longer contribute.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the allocation sizes overflow.
+    pub fn publication_memory_bound(&self) -> crate::persist::Result<usize> {
+        use crate::persist::Error;
+        self.files
+            .len()
+            .checked_mul(8 * size_of::<Arc<str>>())
+            .and_then(|files| self.heap_bytes().checked_add(files))
+            .and_then(|size| {
+                self.keys()
+                    .checked_mul(2)
+                    .and_then(|filter| size.checked_add(filter))
+            })
+            .and_then(|size| size.checked_add(4096))
+            .ok_or(Error::Corrupt)
+    }
+
     /// Read a run written by [`Self::to_bytes`]. Its words must ascend and
     /// its offsets must fall inside its postings: a run read out of order
     /// would miss rows.
@@ -396,6 +478,7 @@ impl IndexRun {
     pub fn from_bytes(bytes: &[u8]) -> crate::persist::Result<Self> {
         use crate::persist::Error;
         let mut reader = crate::persist::open(bytes, crate::persist::KIND_RUN)?;
+        Self::decode_memory_bound_from_reader(reader)?;
         let encoding = reader.u64()?;
         let count = reader.u32()? as usize;
         // No builder writes more, and a merge involving more could never be

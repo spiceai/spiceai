@@ -15,9 +15,11 @@ limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 #![allow(clippy::missing_errors_doc)]
+use std::pin::Pin;
 use std::time::SystemTime;
 
 use crate::anthropic::types::{EffortLevel, OutputConfig, OutputFormat};
+use crate::anthropic::types_stream::MessageCreateStreamResponse;
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
@@ -37,7 +39,7 @@ use async_openai::types::chat::{
     CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, ReasoningEffort,
     ResponseFormat, ResponseFormatJsonSchema, Role, StopConfiguration, ToolChoiceOptions,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde_json::json;
 
 use super::types::{
@@ -67,16 +69,27 @@ impl Chat for Anthropic {
         anth_req.stream = Some(true);
         let controls = forwarded_sampling_controls(&anth_req);
 
-        let stream = self
+        let opened = self
             .client
             .chat()
             .path("/messages")?
             .create_stream_byot(anth_req)
-            .await?;
+            .await;
 
-        // A streaming request naming a model Anthropic does not serve still returns 200 from
-        // `create_stream_byot` and delivers the `not_found_error` as a stream item, so the
-        // explanation is mapped over the items rather than over this call — and upstream of
+        // `create_stream_byot` fails to open the stream on a non-2xx status. That refusal is
+        // delivered as the stream's only item instead, so it takes the same explanation and
+        // error formatting as one Anthropic sends mid-stream.
+        let stream: Pin<
+            Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>,
+        > = match opened {
+            Ok(stream) => Box::pin(stream),
+            Err(refusal @ OpenAIError::ApiError(_)) => {
+                Box::pin(futures::stream::once(async move { Err(refusal) }))
+            }
+            Err(e) => return Err(e),
+        };
+
+        // The `not_found_error` explanation is mapped over the stream items, upstream of
         // `transform_stream`, which rewrites the error type its own way. A refused sampling
         // control is explained inside `transform_stream` instead, which is handed what that
         // takes: see `StreamErrorContext`.
@@ -312,6 +325,10 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
     }
 }
 
+fn non_empty_text_block(text: String) -> Option<ContentBlock> {
+    (!text.is_empty()).then(|| ContentBlock::Text(TextBlockParam::new(text)))
+}
+
 fn assistant_messages_to_content_blocks(
     msg: ChatCompletionRequestAssistantMessage,
 ) -> Result<MessageParam, OpenAIError> {
@@ -321,19 +338,20 @@ fn assistant_messages_to_content_blocks(
         ..
     } = msg;
 
+    // Anthropic rejects empty text blocks. OpenAI clients send `content: ""` alongside `tool_calls`.
     let mut content_blocks: Vec<ContentBlock> = match content {
         Some(ChatCompletionRequestAssistantMessageContent::Text(text)) => {
-            vec![ContentBlock::Text(TextBlockParam::new(text))]
+            non_empty_text_block(text).into_iter().collect()
         }
         Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts
             .iter()
-            .map(|p| match p {
+            .filter_map(|p| match p {
                 ChatCompletionRequestAssistantMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText { text },
-                ) => Ok(ContentBlock::Text(TextBlockParam::new(text.clone()))),
-                ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => Err(
+                ) => non_empty_text_block(text.clone()).map(Ok),
+                ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => Some(Err(
                     OpenAIError::InvalidArgument("Refusal not supported".to_string()),
-                ),
+                )),
             })
             .collect::<Result<Vec<_>, OpenAIError>>()?,
         None => vec![],
@@ -428,8 +446,8 @@ fn refuse_unsupported_logprobs(
              See: https://spiceai.org/docs/components/models/anthropic"
         ),
         // The caller sent something this provider cannot serve, so it is their request that is
-        // invalid. `openai_error_to_response` reads `code` to pick the status, and anything it
-        // does not recognize becomes a 500 — which would report a client error as a server fault.
+        // invalid: `ApiErrorKind::of` reads it as an invalid request, which the HTTP layer
+        // reports as a 400 rather than as a server fault.
         r#type: Some("invalid_request_error".to_string()),
         param: Some(param.to_string()),
         code: Some("invalid_request_error".to_string()),
@@ -536,14 +554,14 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                 ResponseFormat::JsonSchema {
                     json_schema:
                         ResponseFormatJsonSchema {
-                            schema: Some(schema_v),
+                            schema: schema_v,
                             ..
                         },
                 } => Some(OutputFormat {
                     format_type: "json_schema".to_string(),
                     schema: schema_v,
                 }),
-                _ => None,
+                ResponseFormat::Text => None,
             }),
         })
     }
@@ -594,6 +612,28 @@ mod tests {
     use async_openai::types::chat::{
         ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
     };
+
+    #[test]
+    fn assistant_tool_call_with_empty_content_has_no_text_block() {
+        for content in [json!(""), json!([{ "type": "text", "text": "" }])] {
+            let msg: ChatCompletionRequestMessage = serde_json::from_value(json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "sql", "arguments": "{}" }
+                }]
+            }))
+            .expect("assistant message should deserialize");
+
+            let param = MessageParam::try_from(msg).expect("message should convert");
+            let value = serde_json::to_value(&param).expect("message should serialize");
+            let blocks = value["content"].as_array().expect("content is an array");
+            assert_eq!(blocks.len(), 1, "content: {content}");
+            assert_eq!(blocks[0]["type"], "tool_use");
+        }
+    }
 
     #[test]
     fn prompt_cache_key_enables_automatic_cache_control() {
@@ -687,9 +727,8 @@ mod tests {
             let refusal = refusal(&err);
 
             assert_eq!(refusal.param.as_deref(), Some(param));
-            // `openai_error_to_response` picks the HTTP status from `code`, and maps anything it
-            // does not recognize to 500. This is a client error, so it has to be the code that
-            // maps to 400.
+            // This is a client error, so both fields `ApiErrorKind::of` reads name an invalid
+            // request, which the HTTP layer reports as a 400.
             assert_eq!(refusal.code.as_deref(), Some("invalid_request_error"));
             assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
 

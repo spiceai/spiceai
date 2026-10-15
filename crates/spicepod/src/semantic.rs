@@ -515,9 +515,15 @@ typee: bigint
 nulleble: false
 ";
         let result: Result<Column, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown fields on columns[] should be rejected due to deny_unknown_fields"
+        // The first misspelled key is named, followed by every key the user could
+        // have meant (the `type` alias `data_type` included).
+        assert_eq!(
+            result
+                .expect_err(
+                    "unknown fields on columns[] should be rejected due to deny_unknown_fields"
+                )
+                .to_string(),
+            "unknown field `typee`, expected one of `name`, `description`, `data_type`, `type`, `nullable`, `embeddings`, `full_text_search`, `metadata`"
         );
     }
 
@@ -528,9 +534,13 @@ from: model_name
 vector_sizee: 384
 ";
         let result: Result<ColumnLevelEmbeddingConfig, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown fields on columns[].embeddings[] should be rejected due to deny_unknown_fields"
+        assert_eq!(
+            result
+                .expect_err(
+                    "unknown fields on columns[].embeddings[] should be rejected due to deny_unknown_fields"
+                )
+                .to_string(),
+            "unknown field `vector_sizee`, expected one of `from`, `chunking`, `row_id`, `vector_size`, `engine`, `params`, `aggregation`, `max_elements_per_row`"
         );
     }
 
@@ -541,9 +551,13 @@ enabled: true
 index_storee: memory
 ";
         let result: Result<FullTextSearchConfig, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown fields on columns[].full_text_search should be rejected due to deny_unknown_fields"
+        assert_eq!(
+            result
+                .expect_err(
+                    "unknown fields on columns[].full_text_search should be rejected due to deny_unknown_fields"
+                )
+                .to_string(),
+            "unknown field `index_storee`, expected one of `enabled`, `row_id`, `index_store`, `index_directory`, `engine`, `params`"
         );
     }
 }

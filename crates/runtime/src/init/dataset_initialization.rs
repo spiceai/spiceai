@@ -51,8 +51,8 @@ use tokio::sync::Semaphore;
 
 use crate::Error as RuntimeError;
 use crate::component::dataset::Dataset;
-use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::{DataConnector, NewDataConnectorResult};
+use crate::datafusion::AcceleratorBootstrap;
 use crate::{Result, Runtime, accelerated::AcceleratedTable};
 
 /// Where the `DataConnector` for this dataset comes from.
@@ -120,9 +120,9 @@ pub struct DatasetInitialization {
     runtime: Arc<Runtime>,
     connector_source: ConnectorSource,
     schema_source: SchemaSource,
-    bootstrap_status: BootstrapStatus,
+    bootstrap_status: AcceleratorBootstrap,
     load_semaphore: Option<Arc<Semaphore>>,
-    preloaded_accelerated_table: Option<Arc<AcceleratedTable>>,
+    preloaded_accelerated_table: Option<crate::datafusion::PreparedAcceleratedTable>,
 }
 
 impl DatasetInitialization {
@@ -133,16 +133,16 @@ impl DatasetInitialization {
         dataset: Arc<Dataset>,
         runtime: Arc<Runtime>,
         connector: Arc<dyn DataConnector>,
-        bootstrap_status: BootstrapStatus,
+        bootstrap_status: impl Into<AcceleratorBootstrap>,
         load_semaphore: Option<Arc<Semaphore>>,
-        preloaded_accelerated_table: Option<Arc<AcceleratedTable>>,
+        preloaded_accelerated_table: Option<crate::datafusion::PreparedAcceleratedTable>,
     ) -> Self {
         Self {
             dataset,
             runtime,
             connector_source: ConnectorSource::Eager(connector),
             schema_source: SchemaSource::FromProvider,
-            bootstrap_status,
+            bootstrap_status: bootstrap_status.into(),
             load_semaphore,
             preloaded_accelerated_table,
         }
@@ -161,7 +161,7 @@ impl DatasetInitialization {
         runtime: Arc<Runtime>,
         connector_builder: LazyConnectorBuilder,
         schema: SchemaRef,
-        bootstrap_status: BootstrapStatus,
+        bootstrap_status: impl Into<AcceleratorBootstrap>,
         load_semaphore: Option<Arc<Semaphore>>,
     ) -> Self {
         Self {
@@ -169,10 +169,14 @@ impl DatasetInitialization {
             runtime,
             connector_source: ConnectorSource::Lazy(connector_builder),
             schema_source: SchemaSource::Known { schema },
-            bootstrap_status,
+            bootstrap_status: bootstrap_status.into(),
             load_semaphore,
             preloaded_accelerated_table: None,
         }
+    }
+
+    pub(crate) fn bootstrap(&self) -> &AcceleratorBootstrap {
+        &self.bootstrap_status
     }
 
     /// Synchronous accessor: the dataset this plan will initialize.
@@ -217,14 +221,21 @@ impl DatasetInitialization {
             }
 
             (ConnectorSource::Lazy(builder), SchemaSource::Known { schema }) => {
-                let connector = match builder().await {
-                    Ok(connector) => connector,
-                    Err(source) => {
-                        return Err(report_deferred_failure(
-                            &runtime,
-                            &dataset,
-                            RuntimeError::UnableToInitializeDataConnector { source },
-                        ));
+                // A deferred dataset whose existing acceleration can serve it answers
+                // its first query from that acceleration rather than connecting to the
+                // source first; the source is connected in the background.
+                let connector = if Runtime::serves_existing_acceleration(&dataset).await {
+                    Runtime::reconnecting_connector(&dataset)
+                } else {
+                    match builder().await {
+                        Ok(connector) => connector,
+                        Err(source) => {
+                            return Err(report_deferred_failure(
+                                &runtime,
+                                &dataset,
+                                RuntimeError::UnableToInitializeDataConnector { source },
+                            ));
+                        }
                     }
                 };
 

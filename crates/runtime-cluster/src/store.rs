@@ -56,6 +56,15 @@ pub enum Error {
 
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
+
+    #[snafu(display(
+        "Failed to move the partitions assigned to executor {from} to {to}: {source}"
+    ))]
+    MoveAssignments {
+        from: String,
+        to: String,
+        source: Box<MutateError>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -278,6 +287,53 @@ impl PartitionStore {
             });
         }
         Ok(())
+    }
+
+    /// Moves every partition assigned to executor `from` to executor `to`, in one
+    /// cluster-document write, and returns how many partitions moved. Used when an
+    /// executor identified by its advertise address (`from`) starts identifying
+    /// itself by its instance identity (`to`), so its assignments follow it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn move_assignments(&self, from: &str, to: &str) -> Result<usize> {
+        let scope = self.scope;
+        let mut moved = 0;
+        self.cluster
+            .mutate(|state| {
+                moved = 0;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                for metadata in scope.map_mut(state).values_mut() {
+                    let mut changed = false;
+                    for partition in &mut metadata.partitions {
+                        if partition.is_assigned_to(from) {
+                            partition.unassign_from(from);
+                            partition.assign_to(to.to_string(), now_ms);
+                            moved += 1;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        metadata.updated_at = now_ms;
+                    }
+                }
+                if moved == 0 {
+                    MutationOutcome::NoChange
+                } else {
+                    MutationOutcome::Apply
+                }
+            })
+            .await
+            .map_err(|e| Error::MoveAssignments {
+                from: from.to_string(),
+                to: to.to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(moved)
     }
 
     /// Atomically apply many `(table, partition, executor)` assignments
@@ -615,6 +671,61 @@ mod tests {
         let p2_meta = find_partition("2");
         assert!(p2_meta.is_assigned_to("executor-1"));
         assert!(!p2_meta.is_assigned_to("executor-2"));
+    }
+
+    /// An executor that starts identifying itself by its instance identity
+    /// takes over the partitions assigned to its advertise address; other
+    /// executors' partitions stay where they are.
+    #[tokio::test]
+    async fn assignments_move_from_the_advertise_address_to_the_identity() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+        pm.initialize_metadata(&tbl, vec!["bucket(3, id)".to_string()])
+            .await
+            .expect("init");
+        let p0 = partition_value("bucket(3, id)", "0");
+        let p1 = partition_value("bucket(3, id)", "1");
+        let p2 = partition_value("bucket(3, id)", "2");
+        pm.add_and_assign_partitions(
+            &tbl,
+            &[
+                (&p0, "127.0.0.1:50062"),
+                (&p1, "exec-b"),
+                (&p2, "127.0.0.1:50062"),
+            ],
+        )
+        .await
+        .expect("add and assign");
+
+        let moved = pm
+            .move_assignments("127.0.0.1:50062", "exec-a")
+            .await
+            .expect("move assignments");
+        assert_eq!(moved, 2);
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+        let owners = |val: &str| {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&Some(val.to_string())))
+                .expect("partition not found")
+                .assigned_executors
+                .clone()
+        };
+        assert_eq!(owners("0"), ["exec-a"]);
+        assert_eq!(owners("1"), ["exec-b"]);
+        assert_eq!(owners("2"), ["exec-a"]);
+        assert_eq!(
+            pm.move_assignments("127.0.0.1:50062", "exec-a")
+                .await
+                .expect("move again"),
+            0
+        );
     }
 
     #[tokio::test]

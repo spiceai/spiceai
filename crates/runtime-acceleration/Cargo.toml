@@ -16,7 +16,6 @@ datafusion-table-providers.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
-aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
@@ -32,8 +31,8 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 fundu.workspace = true
 futures.workspace = true
-gethostname.workspace = true
 object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
 parking_lot.workspace = true
 opentelemetry.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
@@ -43,6 +42,7 @@ telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
+runtime-state-location = { path = "../runtime-state-location" }
 s3-event-notifications = { path = "../s3-event-notifications" }
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
@@ -59,6 +59,9 @@ url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v7"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []
