@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Deletes the shared rate-control state of origins no instance uses.
 
+use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
@@ -37,13 +38,13 @@ pub const UNUSED_ORIGIN_RETENTION: Duration = Duration::from_hours(7 * 24);
 ///
 /// # Errors
 ///
-/// Returns the store's error when listing or deleting fails. Files deleted
-/// before the failure stay deleted.
+/// Returns the store's error, with the number of files deleted before it, when
+/// listing or deleting fails. Those files stay deleted.
 pub async fn delete_unused_state(
     store: &dyn ObjectStore,
     prefix: &str,
     now: SystemTime,
-) -> object_store::Result<usize> {
+) -> Result<usize, CleanupError> {
     let retention_ms = millis(cleanup::age(UNUSED_ORIGIN_RETENTION));
     let now_ms = now.duration_since(UNIX_EPOCH).map_or(0, millis);
     let prefix = prefix.trim_matches('/');
@@ -53,18 +54,44 @@ pub async fn delete_unused_state(
     let prefix = Path::from(prefix);
     let mut objects = store.list(Some(&prefix));
     let mut deleted = 0;
-    while let Some(object) = objects.try_next().await? {
+    while let Some(object) = objects
+        .try_next()
+        .await
+        .map_err(|source| CleanupError { deleted, source })?
+    {
         let is_state_file = object
             .location
             .extension()
             .is_some_and(|extension| extension == "json");
         let last_written_ms = u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0);
         if is_state_file && now_ms >= last_written_ms.saturating_add(retention_ms) {
-            cleanup::delete_if_present(store, &object.location).await?;
+            cleanup::delete_if_present(store, &object.location)
+                .await
+                .map_err(|source| CleanupError { deleted, source })?;
             deleted += 1;
         }
     }
     Ok(deleted)
+}
+
+/// Why [`delete_unused_state`] stopped.
+#[derive(Debug)]
+pub struct CleanupError {
+    /// The files deleted before the error.
+    pub deleted: usize,
+    pub source: object_store::Error,
+}
+
+impl Display for CleanupError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for CleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 fn millis(duration: Duration) -> u64 {
