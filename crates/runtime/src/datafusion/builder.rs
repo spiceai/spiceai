@@ -1183,7 +1183,7 @@ impl DataFusionBuilder {
             if let Some(registry) = &self.executor_registry {
                 let reg = Arc::clone(registry);
                 let addresses: ExecutorAddressProvider =
-                    Arc::new(move || reg.ready_executor_ids_sync());
+                    Arc::new(move || reg.ready_executor_addresses_sync());
                 // The primary gate is the scale-invariant cost test
                 // (dim_rows × executors < fact_rows); this is the absolute cap
                 // on the broadcast dimension's row count to bound per-executor
