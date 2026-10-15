@@ -347,15 +347,16 @@ impl SchedulerRegistryRunner {
             tokio::time::Instant::now() + JOB_CLEANUP_INTERVAL,
             JOB_CLEANUP_INTERVAL,
         );
-        // A cleanup pass issues requests for as long as there are expired jobs to delete,
-        // so it runs beside the other arms rather than inside one: a long pass must not
-        // hold up the heartbeat that tells peers this scheduler is alive.
+        // A cleanup pass issues requests for as long as there is something to delete,
+        // so each cleanup runs beside the other arms rather than inside one: a long pass
+        // must not hold up the heartbeat that tells peers this scheduler is alive.
         let mut cleanup = std::pin::pin!(Fuse::terminated());
         let (heartbeat_cleanup_interval, heartbeat_retention) = heartbeat_cleanup_timing();
-        let mut heartbeat_cleanup = std::pin::pin!(tokio::time::sleep(heartbeat::jitter(
+        let mut heartbeat_cleanup_due = std::pin::pin!(tokio::time::sleep(heartbeat::jitter(
             heartbeat_cleanup_interval,
             0.5
         )));
+        let mut heartbeat_cleanup = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -404,8 +405,15 @@ impl SchedulerRegistryRunner {
                         "Failed to delete expired async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
                     ),
                 },
-                () = &mut heartbeat_cleanup => {
-                    match self.reaper.delete_departed_heartbeats(heartbeat_retention).await {
+                () = &mut heartbeat_cleanup_due, if heartbeat_cleanup.is_terminated() => {
+                    heartbeat_cleanup.set(
+                        self.reaper
+                            .delete_departed_heartbeats(heartbeat_retention)
+                            .fuse(),
+                    );
+                }
+                result = &mut heartbeat_cleanup => {
+                    match result {
                         Ok(deleted) => tracing::info!(
                             "{}",
                             reaper::heartbeat_cleanup_message(deleted, heartbeat_retention)
@@ -414,7 +422,7 @@ impl SchedulerRegistryRunner {
                             "Failed to delete the heartbeat files of schedulers that left the cluster, so they stay in the scheduler state location until the next attempt: {err}"
                         ),
                     }
-                    heartbeat_cleanup.as_mut().reset(
+                    heartbeat_cleanup_due.as_mut().reset(
                         tokio::time::Instant::now()
                             + heartbeat::jitter(heartbeat_cleanup_interval, 0.5),
                     );
@@ -494,10 +502,7 @@ impl SchedulerRegistryRunner {
             match res {
                 Ok(_) => break observed_version,
                 Err(MutateError::Conflict { .. }) => {
-                    if self
-                        .holder_keeps_beating(observed_version.as_ref())
-                        .await
-                    {
+                    if self.holder_keeps_beating(observed_version.as_ref()).await {
                         return Err(Error::SchedulerIdConflict {
                             scheduler_id: self.scheduler_id.clone(),
                         });
@@ -1062,10 +1067,7 @@ mod tests {
         // Shutdown removes membership and deliberately leaves the heartbeat
         // object alone: deleting a key shared with a possible successor races
         // that successor. With no registered entry the object is inert.
-        let alive = heartbeats
-            .list_alive(&snap)
-            .await
-            .expect("list alive");
+        let alive = heartbeats.list_alive(&snap).await.expect("list alive");
         assert!(!alive.contains("test:50051"));
     }
 
@@ -2975,6 +2977,119 @@ mod tests {
                 .map(|entry| entry.instance_id),
             Some(restarted.instance_id)
         );
+    }
+
+    /// Object store whose deletes never finish and whose listings date every
+    /// object to the Unix epoch, so a heartbeat cleanup pass finds a departed
+    /// scheduler's file and then stalls deleting it.
+    #[derive(Debug)]
+    struct StalledDeletes {
+        inner: Arc<dyn ObjectStore>,
+        deletes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for StalledDeletes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StalledDeletes")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StalledDeletes {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            futures::StreamExt::boxed(futures::StreamExt::map(self.inner.list(prefix), |meta| {
+                meta.map(|meta| object_store::ObjectMeta {
+                    last_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                    ..meta
+                })
+            }))
+        }
+        fn delete_stream(
+            &self,
+            _locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            futures::StreamExt::boxed(futures::stream::pending())
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A heartbeat cleanup pass that stalls must not hold up the heartbeat that
+    /// tells peers this scheduler is alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_heartbeat_cleanup_does_not_hold_up_the_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wrapper = Arc::new(StalledDeletes {
+            inner: Arc::clone(&inner),
+            deletes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store: Arc<dyn ObjectStore> = Arc::clone(&wrapper) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        heartbeats
+            .heartbeat("departed", Uuid::new_v4(), 0, 30_000)
+            .await
+            .expect("a departed scheduler's heartbeat");
+        let runner = runner_over(&cluster, &heartbeats, &store, Uuid::new_v4());
+        let run = tokio::spawn(runner.run(CancellationToken::new()));
+
+        // Past the longest delay before the first cleanup: the pass has started
+        // and stalled on its delete.
+        tokio::time::sleep(HEARTBEAT_CLEANUP_INTERVAL * 2).await;
+        assert_eq!(wrapper.deletes.load(Ordering::SeqCst), 1);
+
+        let path = heartbeats.path_for("test:50051");
+        let before = inner.head(&path).await.expect("heartbeat").e_tag;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let after = inner.head(&path).await.expect("heartbeat").e_tag;
+        assert_ne!(
+            after, before,
+            "the heartbeat keeps changing during the cleanup"
+        );
+        run.abort();
     }
 
     /// A scheduler registered under both its previous `host:port` key and its

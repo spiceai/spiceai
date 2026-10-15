@@ -116,7 +116,9 @@ impl Reaper {
                 None => {
                     // No heartbeat at all. Only reap once the entry has had
                     // its TTL, in this process's observation, to publish one.
-                    if self.heartbeats.observe(id, None) >= Duration::from_millis(entry.ttl_ms) {
+                    if self.heartbeats.observe_missing(id, entry.instance_id)
+                        >= Duration::from_millis(entry.ttl_ms)
+                    {
                         stale.push((id.clone(), entry.instance_id));
                     }
                 }
@@ -175,7 +177,10 @@ impl Reaper {
 
     /// The schedulers whose heartbeat files [`Self::delete_departed_heartbeats`]
     /// deletes.
-    pub(crate) async fn departed_heartbeats(&self, retention: Duration) -> Result<Vec<SchedulerId>> {
+    pub(crate) async fn departed_heartbeats(
+        &self,
+        retention: Duration,
+    ) -> Result<Vec<SchedulerId>> {
         let files = self
             .heartbeats
             .list_files()
@@ -303,6 +308,25 @@ mod tests {
         tokio::time::advance(TTL).await;
         let out = r.tick().await.expect("tick");
         assert_eq!(out.evicted, vec!["a".to_string()]);
+    }
+
+    /// A scheduler that registers under the id of one reaped before its first
+    /// heartbeat has its own TTL to publish one.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_registration_under_a_reaped_id_has_its_own_ttl() {
+        let (cs, hb) = setup().await;
+        let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
+        add_entry(&cs, entry("a", Uuid::new_v4(), 0, 30_000)).await;
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(TTL).await;
+        assert_eq!(r.tick().await.expect("tick").evicted, vec!["a".to_string()]);
+
+        add_entry(&cs, entry("a", Uuid::new_v4(), 0, 30_000)).await;
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(TTL - Duration::from_secs(1)).await;
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(r.tick().await.expect("tick").evicted, vec!["a".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]

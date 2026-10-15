@@ -48,9 +48,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use object_store::UpdateVersion;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutPayload, PutResult};
-use object_store::UpdateVersion;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -210,7 +210,9 @@ impl RenewClock {
 fn wall_clock_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// A lease as read from the store.
@@ -343,7 +345,9 @@ pub enum LeaseError<E> {
 impl<E: std::fmt::Display> std::fmt::Display for LeaseError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Read { path, source } => write!(f, "Failed to read the lease at {path}: {source}"),
+            Self::Read { path, source } => {
+                write!(f, "Failed to read the lease at {path}: {source}")
+            }
             Self::Write { path, source } => {
                 write!(f, "Failed to write the lease at {path}: {source}")
             }
@@ -510,53 +514,57 @@ impl Lease {
 
             let unchanged_for = self.unchanged_for(observed.as_ref());
             let now_ms = self.next_renew_time_ms();
-            let (expected, record, acquired) =
-                match plan(observed.as_ref(), &self.holder, self.duration, unchanged_for) {
-                    Plan::Standby {
+            let (expected, record, acquired) = match plan(
+                observed.as_ref(),
+                &self.holder,
+                self.duration,
+                unchanged_for,
+            ) {
+                Plan::Standby {
+                    holder,
+                    lease_duration,
+                } => {
+                    return Ok(Attempt::Done(Role::Standby {
                         holder,
                         lease_duration,
-                    } => {
-                        return Ok(Attempt::Done(Role::Standby {
-                            holder,
-                            lease_duration,
-                        }));
-                    }
-                    Plan::Create => (
-                        Expected::Absent,
-                        self.record(
-                            next_generation(0).await.map_err(LeaseError::Generation)?,
-                            now_ms,
-                            now_ms,
-                        ),
-                        Acquired::Created,
+                    }));
+                }
+                Plan::Create => (
+                    Expected::Absent,
+                    self.record(
+                        next_generation(0).await.map_err(LeaseError::Generation)?,
+                        now_ms,
+                        now_ms,
                     ),
-                    Plan::Renew { version, record } => (
-                        Expected::Version(version),
-                        self.record(record.generation, record.acquire_time_ms, now_ms),
-                        Acquired::Renewed {
-                            by_other_process: record.holder_process != self.holder.process(),
-                        },
+                    Acquired::Created,
+                ),
+                Plan::Renew { version, record } => (
+                    Expected::Version(version),
+                    self.record(record.generation, record.acquire_time_ms, now_ms),
+                    Acquired::Renewed {
+                        by_other_process: record.holder_process != self.holder.process(),
+                    },
+                ),
+                Plan::TakeOver {
+                    version,
+                    holder,
+                    unrenewed_for,
+                    previous_generation,
+                } => (
+                    Expected::Version(version),
+                    self.record(
+                        next_generation(previous_generation)
+                            .await
+                            .map_err(LeaseError::Generation)?,
+                        now_ms,
+                        now_ms,
                     ),
-                    Plan::TakeOver {
-                        version,
+                    Acquired::TookOver {
                         holder,
                         unrenewed_for,
-                        previous_generation,
-                    } => (
-                        Expected::Version(version),
-                        self.record(
-                            next_generation(previous_generation)
-                                .await
-                                .map_err(LeaseError::Generation)?,
-                            now_ms,
-                            now_ms,
-                        ),
-                        Acquired::TookOver {
-                            holder,
-                            unrenewed_for,
-                        },
-                    ),
-                };
+                    },
+                ),
+            };
 
             let body =
                 serde_json::to_vec_pretty(&record).map_err(|source| LeaseError::Serialize {
@@ -620,10 +628,11 @@ impl Lease {
             renew_time_ms: self.next_renew_time_ms(),
             ..record
         };
-        let body = serde_json::to_vec_pretty(&released).map_err(|source| LeaseError::Serialize {
-            path: path.to_string(),
-            source,
-        })?;
+        let body =
+            serde_json::to_vec_pretty(&released).map_err(|source| LeaseError::Serialize {
+                path: path.to_string(),
+                source,
+            })?;
         let expected = Expected::at_version(version).ok_or_else(|| LeaseError::Write {
             path: path.to_string(),
             source: ObjectStoreError::NotSupported {
@@ -1224,7 +1233,9 @@ mod tests {
                     holders += 1;
                     assert_eq!(acquired, Acquired::Created);
                 }
-                Role::Standby { holder, .. } => assert_eq!(holder.as_deref(), Some(winner.as_str())),
+                Role::Standby { holder, .. } => {
+                    assert_eq!(holder.as_deref(), Some(winner.as_str()))
+                }
                 Role::Unsupported => panic!("the in-memory store writes conditionally"),
             }
         }

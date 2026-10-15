@@ -1059,7 +1059,11 @@ mod tests {
                     tokio::spawn(async move {
                         barrier.wait().await;
                         match n {
-                            0 => job_store.complete_job(&job_id, &driver, empty_result()).await,
+                            0 => {
+                                job_store
+                                    .complete_job(&job_id, &driver, empty_result())
+                                    .await
+                            }
                             1 => {
                                 job_store
                                     .fail_job(&job_id, &driver, JobErrorCode::Internal, "failed")
@@ -1934,10 +1938,7 @@ mod tests {
                 .expect_err("the former driver must not write results");
             assert!(matches!(err, Error::JobTakenOver { .. }), "{err:?}");
             assert!(
-                store
-                    .head(&former.chunk_path(&job_id, 0))
-                    .await
-                    .is_err(),
+                store.head(&former.chunk_path(&job_id, 0)).await.is_err(),
                 "the refused chunk must not be written"
             );
             for err in [

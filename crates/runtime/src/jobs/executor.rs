@@ -51,7 +51,10 @@ fn report_job_end(job_id: &str, result: Result<()>, what: &str) {
     match result {
         Ok(()) => {}
         Err(Error::JobTakenOver { .. }) => {
-            tracing::debug!(job_id, "Stopped driving the job: another scheduler took it over");
+            tracing::debug!(
+                job_id,
+                "Stopped driving the job: another scheduler took it over"
+            );
         }
         Err(e) => tracing::error!(job_id = %job_id, error = %e, "{what}"),
     }

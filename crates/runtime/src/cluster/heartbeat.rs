@@ -127,7 +127,7 @@ pub struct SchedulerHeartbeatStore {
     /// e.g. `prefix/heartbeats/` or `heartbeats/`. Always ends with `/`.
     prefix: String,
     /// How long this process has seen each scheduler's heartbeat object, or
-    /// its absence, unchanged. Keyed by scheduler id.
+    /// its absence under one registration, unchanged. Keyed by scheduler id.
     lapse: LapseClock,
     /// Renewal times of this process's heartbeats, so each beat it writes
     /// changes the object's version.
@@ -156,6 +156,18 @@ impl SchedulerHeartbeatStore {
     /// version unchanged.
     pub fn observe(&self, scheduler_id: &str, version: Option<&UpdateVersion>) -> Duration {
         self.lapse.observe(scheduler_id, version)
+    }
+
+    /// Records that `scheduler_id`, registered by `instance_id`, has no
+    /// heartbeat object, and returns how long this process has seen it so.
+    /// Absence under another registration is another state, so each
+    /// registration has its own TTL to publish its first beat.
+    pub fn observe_missing(&self, scheduler_id: &str, instance_id: Uuid) -> Duration {
+        let absent = UpdateVersion {
+            e_tag: None,
+            version: Some(format!("absent; registered by {instance_id}")),
+        };
+        self.lapse.observe(scheduler_id, Some(&absent))
     }
 
     /// Returns the full path for a given scheduler id.
@@ -452,7 +464,10 @@ impl SchedulerHeartbeatStore {
                 Some(observed) => {
                     entry.instance_id == observed.beat.instance_id && !observed.lapsed()
                 }
-                None => self.observe(id, None) < Duration::from_millis(entry.ttl_ms),
+                None => {
+                    self.observe_missing(id, entry.instance_id)
+                        < Duration::from_millis(entry.ttl_ms)
+                }
             };
             if live {
                 alive.insert(id.clone());
@@ -565,6 +580,24 @@ mod tests {
         }
     }
 
+    /// A scheduler registered without a heartbeat lapses after its TTL. A new
+    /// registration under the same id gets a TTL of its own.
+    #[tokio::test(start_paused = true)]
+    async fn list_alive_gives_each_registration_its_own_ttl_to_publish_a_beat() {
+        let s = SchedulerHeartbeatStore::new(Arc::new(InMemory::new()), "");
+        let first = cluster_with(&[entry("a", Uuid::new_v4())]).await;
+        assert!(s.list_alive(&first).await.expect("list").contains("a"));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(!s.list_alive(&first).await.expect("list").contains("a"));
+
+        let second = cluster_with(&[entry("a", Uuid::new_v4())]).await;
+        assert!(s.list_alive(&second).await.expect("list").contains("a"));
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(s.list_alive(&second).await.expect("list").contains("a"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!s.list_alive(&second).await.expect("list").contains("a"));
+    }
+
     /// Liveness reads no wall clock: a scheduler whose clock is a minute behind
     /// or ahead of the reader's stays alive while it renews.
     #[tokio::test(start_paused = true)]
@@ -582,12 +615,22 @@ mod tests {
         )
         .expect("fits");
         for renewal in 0..10_u64 {
-            s.heartbeat("behind", behind, reader_now - 60_000 + renewal * 10_000, 30_000)
-                .await
-                .expect("behind");
-            s.heartbeat("ahead", ahead, reader_now + 60_000 + renewal * 10_000, 30_000)
-                .await
-                .expect("ahead");
+            s.heartbeat(
+                "behind",
+                behind,
+                reader_now - 60_000 + renewal * 10_000,
+                30_000,
+            )
+            .await
+            .expect("behind");
+            s.heartbeat(
+                "ahead",
+                ahead,
+                reader_now + 60_000 + renewal * 10_000,
+                30_000,
+            )
+            .await
+            .expect("ahead");
             let alive = s.list_alive(&cluster).await.expect("list");
             assert!(
                 alive.contains("behind") && alive.contains("ahead"),

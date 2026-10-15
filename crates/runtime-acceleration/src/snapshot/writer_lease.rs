@@ -52,7 +52,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStoreExt, PutPayload, PutResult, UpdateVersion, path::Path as ObjectPath};
+use object_store::{
+    ObjectStoreExt, PutPayload, PutResult, UpdateVersion, path::Path as ObjectPath,
+};
 use object_store_occ::lease::{Acquired, Holder, Lease, LeaseError, LeaseIo, Role};
 use object_store_occ::{ConditionalWriteError, Expected};
 use parking_lot::Mutex;
@@ -266,9 +268,12 @@ impl SnapshotManager {
         let path = self.writer_lease_path();
         self.writer_lease
             .lease
-            .acquire(&RetryingLeaseIo(self), &path, &self.conflict_retry, |previous| {
-                self.next_writer_generation(previous)
-            })
+            .acquire(
+                &RetryingLeaseIo(self),
+                &path,
+                &self.conflict_retry,
+                |previous| self.next_writer_generation(previous),
+            )
             .await
             .map_err(|err| match err {
                 LeaseError::Read { path, source } | LeaseError::Write { path, source } => {
@@ -300,7 +305,9 @@ impl SnapshotManager {
                     .and_then(published_writer_generation)
             })
             .unwrap_or(0);
-        Ok(object_store_occ::lease::next_generation(previous.max(published)))
+        Ok(object_store_occ::lease::next_generation(
+            previous.max(published),
+        ))
     }
 
     /// Logs a change of role; an unchanged role is logged at debug only.
@@ -706,7 +713,13 @@ mod tests {
                 by_other_process: true,
             },
         });
-        assert!(!second_run.writer_lease.reported.lock().warned_shared_identity);
+        assert!(
+            !second_run
+                .writer_lease
+                .reported
+                .lock()
+                .warned_shared_identity
+        );
 
         // Were the first process still running, its next renewal would find the
         // second's: two live processes share the identity.
@@ -714,7 +727,13 @@ mod tests {
             .hold_writer_lease()
             .await
             .expect("first run renews");
-        assert!(first_run.writer_lease.reported.lock().warned_shared_identity);
+        assert!(
+            first_run
+                .writer_lease
+                .reported
+                .lock()
+                .warned_shared_identity
+        );
     }
 
     #[tokio::test]
