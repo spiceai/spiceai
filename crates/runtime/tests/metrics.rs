@@ -2045,7 +2045,6 @@ fn histogram_totals(registry: &prometheus::Registry, name: &str) -> (u64, f64) {
 #[cfg(feature = "models")]
 #[tokio::test]
 async fn model_request_durations_are_recorded_in_milliseconds() {
-    use llms::{chat::Chat as _, embeddings::Embed as _};
     use spicepod::component::{embeddings::Embeddings, model::Model};
 
     let registry = &*PROMETHEUS;
