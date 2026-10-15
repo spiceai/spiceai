@@ -767,6 +767,65 @@ async fn shared_group_single_dataset_streams_snapshot_and_changes() -> Result<()
     Ok(())
 }
 
+/// A change carries its source transaction's commit time to the millisecond. `MySQL`
+/// writes the commit time in microseconds into each transaction's GTID event; an event
+/// header has whole seconds only, which read up to a second old, and the replication-lag
+/// metrics and the freshness goal report and act on that age as lag.
+///
+/// The container shares the host clock, so each commit falls between the moment its
+/// `INSERT` is sent and the moment it returns. A whole-second time lands inside that
+/// window only when the commit happens in the first milliseconds of a second; for five
+/// commits in a row that is not a chance the test can lose to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_carries_its_source_commit_time_to_the_millisecond() -> Result<(), anyhow::Error> {
+    // Allows for the timer granularity on either side of the window.
+    const SLACK_MS: i64 = 50;
+
+    fn unix_ms() -> i64 {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch");
+        i64::try_from(since_epoch.as_millis()).expect("milliseconds since the epoch fit in i64")
+    }
+
+    let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
+
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
+    let pool = common::get_mysql_conn(port)?;
+    setup_table(&pool, "commit_time", &[(1, "c1")]).await?;
+
+    let store: Arc<dyn PositionStore> = Arc::new(MemoryPositionStore::default());
+    let mut stream = start_replication_stream(stream_input(port, 210_801, "commit_time", store));
+    drain_bootstrap(&mut stream, "commit_time member", &[1]).await?;
+    wait_for_ready(&mut stream, "commit_time member readiness").await?;
+
+    for id in 2..7 {
+        let sent = unix_ms();
+        exec(
+            &pool,
+            &format!("INSERT INTO commit_time VALUES ({id}, 'c{id}')"),
+        )
+        .await?;
+        let returned = unix_ms();
+        let envelope = next_change_envelope(&mut stream, "commit_time insert").await?;
+        assert_eq!(ids_of(&envelope), vec![id], "insert {id}: id");
+        let committed = envelope
+            .source_commit_ts_ms()
+            .expect("a change carries its source commit time");
+        assert!(
+            (sent - SLACK_MS..=returned + SLACK_MS).contains(&committed),
+            "insert {id}: source commit time {committed} ms is outside [{sent}, {returned}] ms, \
+             when the INSERT was sent and returned"
+        );
+        envelope.commit().await?;
+    }
+
+    drop(stream);
+    pool.disconnect().await?;
+    Ok(())
+}
+
 /// A purged resume position with `invalid_checkpoint_behavior: restart` must
 /// rebuild the member in place instead of fatally erroring — for BOTH the
 /// file+offset and GTID positioning paths (a purge surfaces as `MySQL` error 1236
