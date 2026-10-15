@@ -277,7 +277,7 @@ impl DeliveryQueue {
     /// Batches the store accepted are retried and are *not* counted here; see
     /// [`DeadLetterStore::discarded`](crate::dead_letter::DeadLetterStore::discarded)
     /// for the ones it gave up on.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn dead_lettered(&self) -> u64 {
         self.dead_lettered.load(Ordering::Relaxed)

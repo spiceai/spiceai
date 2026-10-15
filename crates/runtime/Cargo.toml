@@ -232,6 +232,7 @@ yaml = { path = "../yaml" }
 
 [dev-dependencies]
 anyhow.workspace = true
+runtime-drasi = { path = "../runtime-drasi", features = ["test-util"] }
 async-graphql = "7.0.17"
 async-graphql-axum = "7.0.16"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }

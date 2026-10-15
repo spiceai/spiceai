@@ -140,8 +140,8 @@ impl DeadLetterStore {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or listed.
-    #[cfg(test)]
-    pub(crate) async fn open(dir: PathBuf, component: String, max_batches: usize) -> Result<Self> {
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn open(dir: PathBuf, component: String, max_batches: usize) -> Result<Self> {
         Self::open_with(
             dir,
             component,

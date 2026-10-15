@@ -44,6 +44,10 @@ tracing.workspace = true
 url.workspace = true
 util = { path = "../util" }
 
+[features]
+# Test helpers that the `runtime` crate's own tests call.
+test-util = []
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
