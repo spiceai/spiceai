@@ -113,9 +113,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::binlog::{
     AdoptedLayout, MIN_VALID_EVENT_POS, QueryKind, StatementKind, adopt_current_layout,
-    classify_query, classify_statement, commit_ts_ms, compute_pk_source_indexes,
+    classify_query, classify_statement, compute_pk_source_indexes, immediate_commit_ts_ms,
     layout_event_mismatch, log_transient_reconnect, open_binlog_stream, purged_position_error,
-    readiness_heartbeat, record_watermark,
+    readiness_heartbeat, record_watermark, transaction_commit_ts_ms,
 };
 use super::changes::{MemberLayout, MysqlChangeRows};
 use super::config::{BinlogPosition, ReplicationParams};
@@ -1593,6 +1593,9 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
         // `GtidEvent`, folded into members' executed sets at commit/idle-credit).
         // `None` between transactions or when not GTID-positioning.
         let mut current_txn_gtid: Option<(uuid::Uuid, u64)> = None;
+        // Commit time of the transaction currently being read, in milliseconds, from
+        // its GTID event; taken by the commit or statement that closes it.
+        let mut current_txn_commit_ts_ms: Option<i64> = None;
 
         'recv: loop {
             if crate::cdc::shutdown_epoch() != shutdown_epoch {
@@ -1836,7 +1839,7 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                         &routes,
                         std::mem::take(&mut txn),
                         &commit_pos,
-                        event_timestamp,
+                        transaction_commit_ts_ms(current_txn_commit_ts_ms.take(), event_timestamp),
                         shutdown_epoch,
                         current_txn_gtid,
                     )
@@ -1859,7 +1862,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                                 &routes,
                                 std::mem::take(&mut txn),
                                 &commit_pos,
-                                event_timestamp,
+                                transaction_commit_ts_ms(
+                                    current_txn_commit_ts_ms.take(),
+                                    event_timestamp,
+                                ),
                                 shutdown_epoch,
                                 current_txn_gtid,
                             )
@@ -1875,7 +1881,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                                 &default_db,
                                 &current_file,
                                 event_end_pos,
-                                event_timestamp,
+                                transaction_commit_ts_ms(
+                                    current_txn_commit_ts_ms.take(),
+                                    event_timestamp,
+                                ),
                                 shutdown_epoch,
                                 current_txn_gtid,
                             )
@@ -1899,8 +1908,10 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     txn_open = true;
                     current_txn_gtid =
                         Some((uuid::Uuid::from_bytes(gtid_event.sid()), gtid_event.gno()));
+                    current_txn_commit_ts_ms =
+                        immediate_commit_ts_ms(gtid_event.immediate_commit_timestamp());
                 }
-                Some(EventData::AnonymousGtidEvent(_)) => {
+                Some(EventData::AnonymousGtidEvent(anonymous)) => {
                     // An anonymous transaction carries no GTID. Under GTID
                     // positioning it must not happen (source not fully
                     // `gtid_mode = ON`): the executed set could not describe it,
@@ -1920,6 +1931,8 @@ async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::Shutdow
                     }
                     txn_open = true;
                     current_txn_gtid = None;
+                    current_txn_commit_ts_ms =
+                        immediate_commit_ts_ms(anonymous.0.immediate_commit_timestamp());
                 }
                 Some(_) | None => {}
             }
@@ -1994,11 +2007,10 @@ async fn deliver_commit(
     routes: &FxHashMap<u64, Route>,
     txn: FxHashMap<u64, Vec<RowsEventData<'static>>>,
     commit_pos: &BinlogPosition,
-    event_timestamp: u32,
+    commit_ts: Option<i64>,
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
-    let commit_ts = commit_ts_ms(event_timestamp);
     for (table_id, events) in txn {
         if events.is_empty() {
             continue;
@@ -2018,7 +2030,7 @@ async fn deliver_commit(
         }
         // O(1), no decode: freshness watermark + transaction count. The per-row
         // op counters are recorded off-pump in `MysqlChangeRows::build`.
-        record_watermark(&member.metrics, event_timestamp);
+        record_watermark(&member.metrics, commit_ts);
         member.metrics.inc_transaction();
         let is_ready = crate::cdc::source_commit_within_ready_lag(commit_ts, member.ready_lag);
         // Hand the OWNED payload + immutable layout/columns snapshots downstream;
@@ -2077,7 +2089,7 @@ async fn handle_statement(
     default_db: &str,
     current_file: &str,
     event_end_pos: u64,
-    event_timestamp: u32,
+    commit_ts: Option<i64>,
     shutdown_epoch: u64,
     gtid: Option<(uuid::Uuid, u64)>,
 ) {
@@ -2100,8 +2112,7 @@ async fn handle_statement(
                 }
                 member.metrics.inc_truncate();
                 member.metrics.inc_transaction();
-                record_watermark(&member.metrics, event_timestamp);
-                let commit_ts = commit_ts_ms(event_timestamp);
+                record_watermark(&member.metrics, commit_ts);
                 let batch = {
                     let g = lock(&member.layout);
                     build_change_batch(
