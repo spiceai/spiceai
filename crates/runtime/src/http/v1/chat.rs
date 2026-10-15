@@ -62,6 +62,13 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 /// Create Chat Completion
 ///
 /// Creates a model response for the given chat conversation.
+///
+/// When a model writes text and calls a Spice tool in the same step, the message carries that
+/// text, a blank line, then the answer the tool results produce, whether or not it is streamed.
+/// There is no blank line when either side already has whitespace where they meet, or when the
+/// request sets `logprobs`, so that `content` is exactly the text its log probabilities cover. A
+/// response that is not streamed and has a `json_object` or `json_schema` `response_format`
+/// carries only the answer.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/chat/completions",

@@ -32,8 +32,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
     ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason, FunctionCall, FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode,
-    ToolChoiceOptions,
+    FinishReason, FunctionCall, FunctionObject, PromptTokensDetails, ResponseFormat,
+    ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -354,7 +354,7 @@ impl ToolUsingChat {
                         )
                         .await?;
                     resp.usage = combine_usage(usage, resp.usage);
-                    prepend_text(&mut resp, &text, logprobs, inner_req.logprobs == Some(true));
+                    prepend_text(&mut resp, &text, logprobs, &inner_req);
                     Ok(resp)
                 }
                 None => Ok(resp),
@@ -551,18 +551,21 @@ fn paragraph_break(before: &str, after: &str) -> Option<&'static str> {
 /// Puts `text_before`, the text a model wrote beside the tool calls of an earlier round, ahead of
 /// the answer in `resp`, so a response carries the same text whether or not it is streamed.
 ///
-/// When the client asked for log probabilities, `logprobs_before` are that text's, and the
-/// response carries the text as the model wrote it: both rounds' tokens, and no paragraph break,
-/// which has no token of its own.
+/// A response to a `req` with a JSON `response_format` is the answer a client parses, so it
+/// carries only the answer. When `req` asks for log probabilities, `logprobs_before` are that
+/// text's, and the response carries the text as the model wrote it: both rounds' tokens, and no
+/// paragraph break, which has no token of its own.
 fn prepend_text(
     resp: &mut CreateChatCompletionResponse,
     text_before: &str,
     logprobs_before: Option<ChatChoiceLogprobs>,
-    wants_logprobs: bool,
+    req: &CreateChatCompletionRequest,
 ) {
-    if text_before.is_empty() {
+    let wants_text = matches!(req.response_format, None | Some(ResponseFormat::Text));
+    if text_before.is_empty() || !wants_text {
         return;
     }
+    let wants_logprobs = req.logprobs == Some(true);
     let Some(choice) = resp.choices.first_mut() else {
         return;
     };
@@ -1417,6 +1420,25 @@ mod tests {
 
         assert_eq!(tokens, ["Let me", " check.", "There are 3 rows."]);
         assert_eq!(text, tokens.concat());
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_a_json_response_carries_only_the_answer() {
+        let provider = ScriptedChat::new("Let me check.");
+        let tool = Arc::new(Sql(AtomicUsize::new(0)));
+        let mut req = chat_request(false);
+        req.response_format = Some(ResponseFormat::JsonObject);
+        let response = tool_using_chat(&provider, &tool)
+            .await
+            .chat_request(req)
+            .await
+            .expect("a response");
+
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("There are 3 rows.")
+        );
         assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
     }
 
