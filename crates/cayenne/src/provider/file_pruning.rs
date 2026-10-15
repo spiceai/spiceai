@@ -371,6 +371,59 @@ mod tests {
         );
     }
 
+    /// A segment's null count is the column's logical nulls. A dictionary row whose key is
+    /// valid but whose dictionary value is null, and every row of a `Null`-typed column, is
+    /// null without a null bit of its own; counting only null bits reports none, and
+    /// `IS NULL` then prunes a segment that holds a matching row.
+    #[test]
+    fn segment_statistics_count_logical_nulls() {
+        use arrow::array::{ArrayRef, DictionaryArray, Int32Array, NullArray, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("nothing", DataType::Null, true),
+        ]));
+        // Key 0 names the null dictionary value; key 1 names "x".
+        let tags = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![None, Some("x")])) as ArrayRef,
+        )
+        .expect("dictionary");
+        let segment = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(tags),
+                Arc::new(NullArray::new(2)),
+            ],
+        )
+        .expect("batch");
+        let stats = statistics_from_record_batches(&schema, &[segment]);
+        assert_eq!(
+            stats.column_statistics[1].null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.column_statistics[2].null_count,
+            datafusion_common::stats::Precision::Exact(2)
+        );
+        for column in ["tag", "nothing"] {
+            let predicate = build_listing_pruning_predicate(&schema, &[col(column).is_null()])
+                .expect("predicate")
+                .expect("some");
+            assert!(
+                !should_prune_statistics(&stats, &schema, &predicate),
+                "a segment holding a null {column} must be kept for {column} IS NULL"
+            );
+        }
+    }
+
     #[test]
     fn keeps_segment_overlapping_predicate() {
         let schema = test_schema();
