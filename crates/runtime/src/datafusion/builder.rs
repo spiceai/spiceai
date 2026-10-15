@@ -365,6 +365,7 @@ pub struct DataFusionBuilder {
     results_cache_warmup_store: Option<std::path::PathBuf>,
     results_cache_warmup_enabled: bool,
     results_cache_warmer: Option<super::query::ResultsCacheWarmer>,
+    runtime_state_location: Option<String>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
@@ -497,6 +498,7 @@ impl DataFusionBuilder {
             results_cache_warmup_store: None,
             results_cache_warmup_enabled: false,
             results_cache_warmer: None,
+            runtime_state_location: None,
             spill_compression: None,
             cluster_config: None,
             metrics: None,
@@ -555,6 +557,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_results_cache_warmup_enabled(mut self, enabled: bool) -> Self {
         self.results_cache_warmup_enabled = enabled;
+        self
+    }
+
+    /// The spicepod's `runtime.state.location`, which snapshot notifications
+    /// route by.
+    #[must_use]
+    pub fn with_runtime_state_location(mut self, location: Option<String>) -> Self {
+        self.runtime_state_location = location;
         self
     }
 
@@ -1456,7 +1466,9 @@ impl DataFusionBuilder {
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             snapshot_notifications: Arc::new(
-                runtime_acceleration::snapshot::notifications::SnapshotNotifications::default(),
+                runtime_acceleration::snapshot::notifications::SnapshotNotifications::new(
+                    self.runtime_state_location,
+                ),
             ),
             dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,

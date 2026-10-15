@@ -2414,6 +2414,13 @@ async fn executor_bind_app(
 
     let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
     let telemetry = app_def.runtime.telemetry.clone();
+    rt.df.set_runtime_state_location(
+        app_def
+            .runtime
+            .state
+            .as_ref()
+            .map(|state| state.location.clone()),
+    );
     *rt.app.write().await = Some(app_def);
 
     // Create a cluster client for secrets. This channel outlives every secret

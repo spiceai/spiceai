@@ -1726,6 +1726,63 @@ pub struct RuntimeState {
     pub params: Option<Params>,
 }
 
+/// The folder of `runtime.state.location` that holds the scheduler's cluster state.
+pub const SCHEDULER_STATE_FOLDER: &str = "cluster";
+
+/// `<location>/<folder>/`: where a feature keeps its objects in the
+/// `runtime.state` location `location`. A location that is not a URL is joined
+/// as text, so the feature's store still reports it as invalid.
+#[must_use]
+pub fn runtime_state_folder(location: &str, folder: &str) -> String {
+    let folder = format!("{folder}/");
+    match url::Url::parse(location) {
+        Ok(mut url) => {
+            if !url.path().ends_with('/') {
+                let path = format!("{}/", url.path());
+                url.set_path(&path);
+            }
+            url.join(&folder).map_or_else(
+                |_| format!("{}/{folder}", location.trim_end_matches('/')),
+                String::from,
+            )
+        }
+        Err(_) => format!("{}/{folder}", location.trim_end_matches('/')),
+    }
+}
+
+/// The `runtime.state.location` whose `folder/` is `location`, when `location`
+/// is a URL whose last path segment is `folder`.
+#[must_use]
+pub fn runtime_state_location_holding(location: &str, folder: &str) -> Option<String> {
+    let mut url = url::Url::parse(location).ok()?;
+    let parent = url
+        .path()
+        .trim_end_matches('/')
+        .strip_suffix(folder)?
+        .to_string();
+    if !parent.ends_with('/') {
+        return None;
+    }
+    url.set_path(&parent);
+    Some(url.to_string())
+}
+
+/// Whether `a` and `b` name the same folder, however their trailing `/` is written.
+#[must_use]
+pub fn same_folder(a: &str, b: &str) -> bool {
+    fn normalized(location: &str) -> String {
+        match url::Url::parse(location) {
+            Ok(mut url) => {
+                let path = format!("{}/", url.path().trim_end_matches('/'));
+                url.set_path(&path);
+                url.to_string()
+            }
+            Err(_) => format!("{}/", location.trim_end_matches('/')),
+        }
+    }
+    normalized(a) == normalized(b)
+}
+
 /// An object-store location for one feature's shared state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateLocation {
@@ -1764,13 +1821,17 @@ pub enum StateSource {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
-    /// Root URI for shared cluster state. Optional when [`Runtime::state`]
-    /// provides the location (see [`Runtime::scheduler_state`]).
+    /// Deprecated: set `runtime.state.location`, which keeps cluster state in its
+    /// `cluster/` folder. Root URI for shared cluster state (see
+    /// [`Runtime::scheduler_state`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     pub state_location: Option<String>,
 
-    /// Optional object store params for the shared cluster state.
+    /// Deprecated: set `runtime.state.params`. Object store params for the shared
+    /// cluster state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     pub params: Option<Params>,
 
     /// How often the scheduler assigns accelerated table partitions to executors.
@@ -4155,5 +4216,66 @@ datasets:
             cors.mcp_allowed_origins(),
             vec!["https://app.example.com".to_string()]
         );
+    }
+
+    #[test]
+    fn runtime_state_folder_joins_the_folder_to_the_location() {
+        for (location, expected) in [
+            ("s3://my-bucket/spice/", "s3://my-bucket/spice/snapshots/"),
+            ("s3://my-bucket/spice", "s3://my-bucket/spice/snapshots/"),
+            ("s3://my-bucket", "s3://my-bucket/snapshots/"),
+            ("s3://my-bucket/", "s3://my-bucket/snapshots/"),
+            ("file:///", "file:///snapshots/"),
+            (
+                "file:///var/spice/state",
+                "file:///var/spice/state/snapshots/",
+            ),
+            (
+                "abfss://container@account.dfs.core.windows.net/spice/",
+                "abfss://container@account.dfs.core.windows.net/spice/snapshots/",
+            ),
+            ("abfs://container", "abfs://container/snapshots/"),
+            ("gs://bucket/a%20b/", "gs://bucket/a%20b/snapshots/"),
+            ("not a url", "not a url/snapshots/"),
+        ] {
+            assert_eq!(
+                runtime_state_folder(location, "snapshots"),
+                expected,
+                "{location}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_state_location_holding_is_the_parent_of_the_folder() {
+        for (location, expected) in [
+            (
+                "s3://my-bucket/spice/cluster/",
+                Some("s3://my-bucket/spice/"),
+            ),
+            (
+                "s3://my-bucket/spice/cluster",
+                Some("s3://my-bucket/spice/"),
+            ),
+            ("s3://my-bucket/cluster/", Some("s3://my-bucket/")),
+            ("file:///var/spice/cluster", Some("file:///var/spice/")),
+            ("s3://my-bucket/spice/my-cluster/", None),
+            ("s3://my-bucket/spice/", None),
+            ("not a url/cluster/", None),
+        ] {
+            assert_eq!(
+                runtime_state_location_holding(location, SCHEDULER_STATE_FOLDER).as_deref(),
+                expected,
+                "{location}"
+            );
+            if let Some(parent) = expected {
+                assert!(same_folder(
+                    &runtime_state_folder(parent, SCHEDULER_STATE_FOLDER),
+                    location
+                ));
+            }
+        }
+        assert!(same_folder("s3://b/p", "s3://b/p/"));
+        assert!(!same_folder("s3://b/p/", "s3://b/q/"));
     }
 }
