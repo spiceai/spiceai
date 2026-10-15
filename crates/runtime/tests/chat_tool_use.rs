@@ -37,32 +37,68 @@ use spicepod::component::model::Model;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const QUESTION: &str = "How many rows are there?";
+/// A question the mock's model answers after two `sql` calls rather than one.
+const QUESTION_TWO_CALLS: &str = "How many rows are there? Check twice.";
 const PREAMBLE: &str = "Let me check.";
 const ANSWER: &str = "There are 3 rows.";
-const SQL_CALL_ID: &str = "toolu_sql";
+/// The answer to a request for structured output, in the shape `/v1/nsql` asks for.
+const NSQL_ANSWER: &str = r#"{"sql": "SELECT 3 AS n"}"#;
 
 /// The requests the runtime sent to the mock, in order.
 #[derive(Clone, Default)]
 struct Recorded(Arc<Mutex<Vec<Value>>>);
 
+/// Whether the last message of `request` carries a tool result.
+fn has_tool_result(request: &Value) -> bool {
+    request["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|last| last["content"].as_array())
+        .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+}
+
+/// The number of tool results across the messages of `request`.
+fn tool_results(request: &Value) -> usize {
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == "tool_result")
+        .count()
+}
+
+/// Whether `request` asks [`QUESTION_TWO_CALLS`].
+fn asks_twice(request: &Value) -> bool {
+    request["messages"][0]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|block| block["text"] == QUESTION_TWO_CALLS)
+}
+
 /// The text and the tool call, if any, the mock's model replies with: a plain reply to a request
-/// without tools (the runtime's health check), [`ANSWER`] once the last message carries a tool
-/// result, else [`PREAMBLE`] and a `sql` call.
+/// without tools (the runtime's health check); [`PREAMBLE`] and a `sql` call until it has the
+/// results of one call, or of two for [`QUESTION_TWO_CALLS`]; then [`NSQL_ANSWER`] to a request
+/// for structured output and [`ANSWER`] to any other.
 fn reply(request: &Value) -> (&'static str, Option<Value>) {
     if request["tools"].as_array().is_none_or(Vec::is_empty) {
         return ("ok", None);
     }
-    let has_tool_result = request["messages"]
-        .as_array()
-        .and_then(|messages| messages.last())
-        .and_then(|last| last["content"].as_array())
-        .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"));
-    if has_tool_result {
-        return (ANSWER, None);
+    let calls = tool_results(request);
+    if calls >= if asks_twice(request) { 2 } else { 1 } {
+        let structured = request
+            .get("output_format")
+            .is_some_and(|format| !format.is_null());
+        return (if structured { NSQL_ANSWER } else { ANSWER }, None);
     }
     (
         PREAMBLE,
-        Some(json!({ "id": SQL_CALL_ID, "name": "sql", "input": { "query": "SELECT 3 AS n" } })),
+        Some(json!({
+            "id": format!("toolu_sql_{calls}"), "name": "sql",
+            "input": { "query": "SELECT 3 AS n" },
+        })),
     )
 }
 
@@ -250,7 +286,7 @@ fn replayed_assistant_turn(recorded: &Recorded) -> Vec<(String, String)> {
     let requests = recorded.0.lock();
     let follow_up = requests
         .iter()
-        .find(|r| reply(r).0 == ANSWER)
+        .find(|r| has_tool_result(r))
         .expect("the runtime sends the model the sql result");
     let messages = follow_up["messages"]
         .as_array()
@@ -303,5 +339,89 @@ async fn a_non_streamed_answer_includes_the_text_beside_a_tool_call() -> anyhow:
         format!("{PREAMBLE}\n\n{ANSWER}")
     );
     assert_eq!(replayed_assistant_turn(&recorded), the_turn_as_written());
+    Ok(())
+}
+
+/// `/v1/nsql` asks for structured output and parses the answer as JSON, so the text the model
+/// wrote beside its tool call must not reach the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nsql_answers_when_the_model_writes_text_beside_a_tool_call() -> anyhow::Result<()> {
+    let (endpoint, recorded) = start_mock_anthropic().await?;
+    let base_url = start_runtime(&endpoint).await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/nsql"))
+        .json(&json!({ "query": QUESTION, "model": "claude" }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body)?, json!([{ "n": 3 }]));
+    assert_eq!(replayed_assistant_turn(&recorded), the_turn_as_written());
+    Ok(())
+}
+
+/// Each round of a tool-using answer keeps what Anthropic's prompt caching reuses: every request
+/// asks for caching, and starts with the whole of the request before it, so the text the model
+/// wrote beside its first tool call is part of the prefix the third round can read from cache.
+/// <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_tool_round_extends_the_request_before_it() -> anyhow::Result<()> {
+    let (endpoint, recorded) = start_mock_anthropic().await?;
+    let base_url = start_runtime(&endpoint).await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude", "prompt_cache_key": "chat_tool_use",
+            "messages": [{ "role": "user", "content": QUESTION_TWO_CALLS }],
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "chat completion failed: {status} {body}"
+    );
+
+    let rounds: Vec<Value> = recorded
+        .0
+        .lock()
+        .iter()
+        .filter(|request| asks_twice(request))
+        .cloned()
+        .collect();
+    assert_eq!(rounds.len(), 3, "two tool calls, then the answer");
+    for (i, round) in rounds.iter().enumerate() {
+        assert_eq!(
+            round["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "round {i}"
+        );
+    }
+    for (i, (before, after)) in rounds.iter().zip(rounds.iter().skip(1)).enumerate() {
+        assert_eq!(after["tools"], before["tools"], "round {}", i + 1);
+        assert_eq!(after["system"], before["system"], "round {}", i + 1);
+        let before = before["messages"]
+            .as_array()
+            .expect("a request carries messages");
+        let after = after["messages"]
+            .as_array()
+            .expect("a request carries messages");
+        assert_eq!(
+            after.get(..before.len()),
+            Some(before.as_slice()),
+            "round {} starts with the request before it",
+            i + 1
+        );
+    }
+    assert_eq!(
+        rounds[2]["messages"][1]["content"][0],
+        json!({ "type": "text", "text": PREAMBLE }),
+        "the third round's prefix carries the text the model wrote beside its first call"
+    );
     Ok(())
 }

@@ -274,6 +274,18 @@ jobs:
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
+      - name: Run Anthropic prompt caching test
+        if: ${{ !cancelled() && env.HAS_ANTHROPIC_SECRET == 'true' }}
+        env:
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- anthropic_prompt_caching_through_tool_calls
+
       - name: Run AI UDF with dataset test
         if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
