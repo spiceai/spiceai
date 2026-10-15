@@ -6406,9 +6406,11 @@ dependencies = [
  "runtime-metrics",
  "runtime-parameters",
  "runtime-rate-control",
+ "serde_json",
  "tokio",
  "tracing",
  "url",
+ "util",
  "uuid 1.23.2",
 ]
 
@@ -17750,7 +17752,6 @@ dependencies = [
  "duckdb",
  "fundu",
  "futures",
- "gethostname",
  "hex",
  "libc",
  "object_store 0.13.2",
@@ -23490,6 +23491,7 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "futures",
+ "gethostname",
  "http-body 1.0.1",
  "humantime",
  "parking_lot",
