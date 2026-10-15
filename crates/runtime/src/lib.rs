@@ -124,6 +124,7 @@ mod management;
 mod metrics_server;
 pub mod model;
 pub mod opentelemetry;
+pub mod opentelemetry_store;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
@@ -835,34 +836,29 @@ impl Runtime {
         Arc::clone(&self.rerankers)
     }
 
-    /// How each loaded model supports the Responses API, including which models are
-    /// evaluation-only.
+    /// What each loaded model can serve, by model name.
     #[must_use]
-    pub fn responses_api_support(
-        &self,
-    ) -> Arc<RwLock<HashMap<String, crate::model::ResponsesApiSupport>>> {
-        self.llm_runtime_stores.responses_api_support()
-    }
-
-    pub async fn responses_api_support_for_model(
-        &self,
-        model_name: &str,
-    ) -> Option<crate::model::ResponsesApiSupport> {
-        self.llm_runtime_stores
-            .responses_api_support()
-            .read()
-            .await
-            .get(model_name)
-            .cloned()
+    pub fn model_capabilities(&self) -> Arc<RwLock<model_capabilities::CapabilityStore>> {
+        self.llm_runtime_stores.capabilities()
     }
 
     pub async fn responses_supported_model_names(&self) -> HashSet<String> {
-        self.llm_runtime_stores
-            .responses_api_support()
-            .read()
-            .await
-            .iter()
-            .filter_map(|(name, support)| support.supports_responses_api().then_some(name.clone()))
+        let capabilities = self.llm_runtime_stores.capabilities();
+        let capabilities = capabilities.read().await;
+        let responses = self.llm_runtime_stores.responses_llms();
+        let responses = responses.read().await;
+        capabilities
+            .keys()
+            .filter(|name| {
+                model_capabilities::require(
+                    &capabilities,
+                    &responses,
+                    name,
+                    model_capabilities::Capability::Responses,
+                )
+                .is_ok()
+            })
+            .cloned()
             .collect()
     }
 

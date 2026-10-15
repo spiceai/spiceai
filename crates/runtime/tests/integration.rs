@@ -143,6 +143,7 @@ mod cayenne_catalog_tuning;
 mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
+mod cluster_task_history;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;

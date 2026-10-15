@@ -1,0 +1,16 @@
+[package]
+name = "model-capabilities"
+description = "What each model can serve (chat, the Responses API, decisions), and the one gate every serving path asks for a model's handler."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+spicepod = { path = "../spicepod", default-features = false }
+
+[lints]
+workspace = true

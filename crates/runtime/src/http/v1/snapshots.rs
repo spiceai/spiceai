@@ -144,7 +144,7 @@ pub async fn list_snapshots(
     // Create a snapshot manager to query the metadata
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.effective_snapshots(),
+        readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -240,7 +240,7 @@ pub async fn get_snapshot(
 
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.effective_snapshots(),
+        readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -342,7 +342,7 @@ pub async fn set_current_snapshot(
 
     let Some(snapshot_manager) = create_snapshot_manager_for_query(
         &dataset_name,
-        readable_app.effective_snapshots(),
+        readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
@@ -421,15 +421,15 @@ async fn snapshot_source_manager(
 /// require a full accelerator setup since we only need access to the object store.
 async fn create_snapshot_manager_for_query(
     dataset_name: &str,
-    app_snapshots: Option<Arc<Snapshots>>,
+    snapshots: Arc<Snapshots>,
     acceleration: &spicepod::acceleration::Acceleration,
     secrets: std::sync::Weak<RwLock<runtime_secrets::Secrets>>,
     io_runtime: tokio::runtime::Handle,
 ) -> Option<SnapshotManager> {
-    // Create the snapshot behavior using the app's global snapshots config
-    // and the dataset's per-acceleration snapshot settings
+    // Create the snapshot behavior using the dataset's resolved snapshot config
+    // and its per-acceleration snapshot settings
     let snapshot_behavior = SnapshotBehavior::from(
-        app_snapshots,
+        Some(snapshots),
         acceleration.snapshots,
         secrets,
         io_runtime,

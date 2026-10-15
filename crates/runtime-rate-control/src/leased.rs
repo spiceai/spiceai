@@ -150,7 +150,7 @@ use std::{
 };
 
 use object_store::ObjectStore;
-use object_store_occ::{InsertResult, ObjectState, UpdateResult};
+use object_store_occ::{Change, ConflictRetry, ModifyError, ObjectState};
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -172,7 +172,6 @@ use crate::phase_change_log::{Damping, PhaseChangeLog};
 /// versions erases the shared state on every tick, in both directions.
 pub(crate) const PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION: u32 = 3;
 
-const MAX_LEASE_RETRIES: usize = 3;
 /// Number of windows of history to retain in the persisted file.
 const STALE_WINDOW_RETENTION: u64 = 60;
 /// Number of completed windows included in the demand EWMA.
@@ -1647,142 +1646,176 @@ impl LeasedBucket {
             (inner.live_counts(), inner.pending_window_publish.take())
         };
 
-        for attempt in 0..MAX_LEASE_RETRIES {
-            let existing = match self.read_state().await {
-                Ok(state) => state,
-                Err(e) => {
-                    self.note_failure();
-                    return Err(e);
-                }
-            };
-            // State from a newer version holds leases this version cannot interpret;
-            // resetting it would wipe every newer peer's grants, and during a rolling
-            // upgrade the two versions would keep resetting each other and over-admit.
-            // State from an older version is replaced: its leases use a layout this
-            // version no longer reads. The warning waits for the write that replaces it,
-            // since a write that loses the race replaced nothing.
-            let (mut state, replaced_version) = match existing {
-                Some(state)
-                    if state.schema_version > PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION =>
-                {
-                    self.note_failure();
-                    return Err(Error::NewerStateVersion {
-                        origin: self.config.origin.clone(),
-                        found: state.schema_version,
-                        supported: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
-                    });
-                }
-                Some(state) if !state.is_current_schema() => {
-                    let replaced = state.schema_version;
-                    (PersistedRateControlState::fresh(window), Some(replaced))
-                }
-                Some(state) => (state, None),
-                None => (PersistedRateControlState::fresh(window), None),
-            };
-            state.stamp(now, window);
-
-            // Publish any counts latched at a window roll between refresh
-            // ticks. Best-effort: if the rolled-out window has already been
-            // pruned from state, drop the pending values and move on.
-            //
-            // This write-back is the only thing that marks a window's counts
-            // final, and the cluster coefficient reads nothing else, so it has
-            // to force a write of its own. Folding it into the grant's dirty
-            // flag would drop a whole window of upstream outcomes whenever
-            // neither the current nor the pre-leased window changed.
-            let mut tail_published = false;
-            // Limiters whose leases all expired go after the same horizon as
-            // the windows of a live one.
-            state.drop_retired_limiters(
-                &self.config.limiter_key,
-                unix_millis(now).saturating_sub(
-                    STALE_WINDOW_RETENTION.saturating_mul(duration_millis_u64(window)),
-                ),
-            );
-            if let Some(limiter) = state.limiter_mut(&self.config.limiter_key) {
-                limiter.retain_recent_windows(now_window);
-
-                if let Some(pending) = pending_publish
-                    && let Some(lease) = limiter
-                        .window_mut(pending.window_id)
-                        .and_then(|window| window.lease_mut(&self.config.instance_id))
-                {
-                    tail_published = lease.merge_counts(pending.counts, now);
-                }
-            }
-
-            let current = self.process_window(
-                &mut state,
-                now_window,
-                now,
-                live_counts,
-                live_counts.attempted,
-            );
-            let next = self.process_window(
-                &mut state,
-                now_window + 1,
-                now,
-                WindowCounts::default(),
-                live_counts.attempted,
-            );
-
-            let dirty = tail_published || current.dirty || next.dirty;
-            if dirty {
-                match self.write_state(state).await {
-                    Ok(WriteOutcome::Written) => {
-                        if let Some(replaced_version) = replaced_version {
-                            tracing::warn!(
-                                origin = %self.config.origin,
-                                "Replacing shared rate-control state for origin {} written by an older Spice version (state version {}), so leases granted by instances still on that version are reset. Finish upgrading every instance that shares the rate-control state location.",
-                                self.config.origin,
-                                replaced_version
-                            );
-                        }
-                    }
-                    Ok(WriteOutcome::Conflict) => {
-                        self.metrics
-                            .lease_acquire_conflicts_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        if attempt + 1 == MAX_LEASE_RETRIES {
-                            self.note_failure();
-                            return Err(Error::ConflictExhausted {
+        let mut attempts = 0_u64;
+        let leased = self
+            .object_state
+            .modify(
+                self.config.object_key.as_str(),
+                &ConflictRetry::default(),
+                |existing| {
+                    attempts += 1;
+                    // State from a newer version holds leases this version cannot
+                    // interpret; resetting it would wipe every newer peer's grants, and
+                    // during a rolling upgrade the two versions would keep resetting each
+                    // other and over-admit. State from an older version is replaced: its
+                    // leases use a layout this version no longer reads. The warning waits
+                    // for the write that replaces it, since a write that loses the race
+                    // replaced nothing.
+                    let (mut state, replaced_version) = match existing {
+                        Some(state)
+                            if state.schema_version
+                                > PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION =>
+                        {
+                            return Err(Error::NewerStateVersion {
                                 origin: self.config.origin.clone(),
+                                found: state.schema_version,
+                                supported: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
                             });
                         }
-                        continue;
-                    }
-                    Err(e) => {
-                        self.note_failure();
-                        return Err(e);
-                    }
-                }
-            }
+                        Some(state) if !state.is_current_schema() => {
+                            let replaced = state.schema_version;
+                            (PersistedRateControlState::fresh(window), Some(replaced))
+                        }
+                        Some(state) => (state, None),
+                        None => (PersistedRateControlState::fresh(window), None),
+                    };
+                    state.stamp(now, window);
 
-            {
-                let mut inner = self.inner.lock().await;
-                inner.adopt_lease(
-                    now_window,
-                    LeaseGrants {
-                        current: current.granted,
-                        next: next.granted,
+                    // Publish any counts latched at a window roll between refresh
+                    // ticks. Best-effort: if the rolled-out window has already been
+                    // pruned from state, drop the pending values and move on.
+                    //
+                    // This write-back is the only thing that marks a window's counts
+                    // final, and the cluster coefficient reads nothing else, so it has
+                    // to force a write of its own. Folding it into the grant's dirty
+                    // flag would drop a whole window of upstream outcomes whenever
+                    // neither the current nor the pre-leased window changed.
+                    let mut tail_published = false;
+                    // Limiters whose leases all expired go after the same horizon as
+                    // the windows of a live one.
+                    state.drop_retired_limiters(
+                        &self.config.limiter_key,
+                        unix_millis(now).saturating_sub(
+                            STALE_WINDOW_RETENTION.saturating_mul(duration_millis_u64(window)),
+                        ),
+                    );
+                    if let Some(limiter) = state.limiter_mut(&self.config.limiter_key) {
+                        limiter.retain_recent_windows(now_window);
+
+                        if let Some(pending) = pending_publish
+                            && let Some(lease) = limiter
+                                .window_mut(pending.window_id)
+                                .and_then(|window| window.lease_mut(&self.config.instance_id))
+                        {
+                            tail_published = lease.merge_counts(pending.counts, now);
+                        }
+                    }
+
+                    let current = self.process_window(
+                        &mut state,
+                        now_window,
+                        now,
+                        live_counts,
+                        live_counts.attempted,
+                    );
+                    let next = self.process_window(
+                        &mut state,
+                        now_window + 1,
+                        now,
+                        WindowCounts::default(),
+                        live_counts.attempted,
+                    );
+
+                    let dirty = tail_published || current.dirty || next.dirty;
+                    let leased = Leased {
+                        current,
+                        next,
+                        dirty,
+                        replaced_version,
+                    };
+                    Ok(if dirty {
+                        Change::Write(state, leased)
+                    } else {
+                        Change::Keep(leased)
+                    })
+                },
+            )
+            .await;
+        // A change call's write lost the race unless that call ended the modify.
+        // Running out of retries and a failed read both end it after a lost race.
+        let conflicts = match &leased {
+            Err(
+                ModifyError::Contention { .. }
+                | ModifyError::State(
+                    object_store_occ::Error::ObjectStore { .. }
+                    | object_store_occ::Error::Deserialization { .. }
+                    | object_store_occ::Error::Unversioned { .. },
+                ),
+            ) => attempts,
+            _ => attempts.saturating_sub(1),
+        };
+        self.metrics
+            .lease_acquire_conflicts_total
+            .fetch_add(conflicts, Ordering::Relaxed);
+        let Leased {
+            current,
+            next,
+            dirty,
+            replaced_version,
+        } = match leased {
+            Ok(leased) => leased,
+            Err(err) => {
+                self.note_failure();
+                return Err(match err {
+                    ModifyError::Rejected(err) => err,
+                    ModifyError::Contention { .. } => Error::ConflictExhausted {
+                        origin: self.config.origin.clone(),
                     },
-                );
+                    ModifyError::State(
+                        source @ (object_store_occ::Error::ObjectStore { .. }
+                        | object_store_occ::Error::Deserialization { .. }),
+                    ) => Error::Read {
+                        origin: self.config.origin.clone(),
+                        source: Box::new(source),
+                    },
+                    ModifyError::State(source) => Error::Write {
+                        origin: self.config.origin.clone(),
+                        source: Box::new(source),
+                    },
+                });
             }
-            self.metrics.record_lease(
-                current.granted,
-                current.budget_remaining_after,
-                started.elapsed(),
+        };
+        if dirty && let Some(replaced_version) = replaced_version {
+            tracing::warn!(
+                origin = %self.config.origin,
+                "Replacing shared rate-control state for origin {} written by an older Spice version (state version {}), so leases granted by instances still on that version are reset. Finish upgrading every instance that shares the rate-control state location.",
+                self.config.origin,
+                replaced_version
             );
-            self.report_throttle(current.throttle);
-            self.report_sibling_limits(&current.sibling_limits);
-            if dirty {
-                // Only a write can have changed what waiters are owed.
-                self.notify.notify_waiters();
-            }
-            return Ok(());
         }
 
-        unreachable!("loop body always returns within MAX_LEASE_RETRIES iterations")
+        {
+            let mut inner = self.inner.lock().await;
+            inner.adopt_lease(
+                now_window,
+                LeaseGrants {
+                    current: current.granted,
+                    next: next.granted,
+                },
+            );
+        }
+        self.metrics.record_lease(
+            current.granted,
+            current.budget_remaining_after,
+            started.elapsed(),
+        );
+        self.report_throttle(current.throttle);
+        self.report_sibling_limits(&current.sibling_limits);
+        if dirty {
+            // Only a write can have changed what waiters are owed.
+            self.notify.notify_waiters();
+        }
+        Ok(())
     }
 
     /// Compute and apply this replica's lease for a single window inside the
@@ -2025,6 +2058,7 @@ impl LeasedBucket {
         }
     }
 
+    #[cfg(test)]
     async fn read_state(&self) -> Result<Option<PersistedRateControlState>> {
         self.object_state
             .get(self.config.object_key.as_str())
@@ -2034,39 +2068,16 @@ impl LeasedBucket {
                 source: Box::new(source),
             })
     }
-
-    async fn write_state(&self, state: PersistedRateControlState) -> Result<WriteOutcome> {
-        // First try update (assumes file exists); if NotFound, fall back to insert.
-        match self
-            .object_state
-            .update(self.config.object_key.as_str(), &state)
-            .await
-            .map_err(|source| Error::Write {
-                origin: self.config.origin.clone(),
-                source: Box::new(source),
-            })? {
-            UpdateResult::Ok => Ok(WriteOutcome::Written),
-            UpdateResult::Conflict { .. } => Ok(WriteOutcome::Conflict),
-            UpdateResult::NotFound => {
-                match self
-                    .object_state
-                    .insert(self.config.object_key.as_str(), &state)
-                    .await
-                    .map_err(|source| Error::Write {
-                        origin: self.config.origin.clone(),
-                        source: Box::new(source),
-                    })? {
-                    InsertResult::Ok => Ok(WriteOutcome::Written),
-                    InsertResult::AlreadyExists => Ok(WriteOutcome::Conflict),
-                }
-            }
-        }
-    }
 }
 
-enum WriteOutcome {
-    Written,
-    Conflict,
+/// What one lease refresh computed from the shared state it read.
+struct Leased {
+    current: WindowOutcome,
+    next: WindowOutcome,
+    /// Whether the shared state changed and was written back.
+    dirty: bool,
+    /// The schema version of older-version state this refresh replaced.
+    replaced_version: Option<u32>,
 }
 
 /// Result of computing this replica's lease for a single window.
@@ -4504,5 +4515,171 @@ mod tests {
         assert_eq!(inner.current_window_id, next_window);
         assert_eq!(inner.granted_this_window, next_grant);
         assert_eq!(inner.consumed_this_window, 1);
+    }
+
+    /// Runs `race` once, when the second request reaches the store: after this
+    /// replica read the shared state, before whatever it does next. The request
+    /// numbered `fail_call` (from 0), if any, fails.
+    struct RaceAfterFirstRead {
+        inner: Arc<dyn ObjectStore>,
+        calls: std::sync::atomic::AtomicUsize,
+        race: tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+        fail_call: Option<usize>,
+    }
+
+    impl RaceAfterFirstRead {
+        async fn before_call(&self) -> object_store::Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                let race = self.race.lock().await.take();
+                if let Some(race) = race {
+                    race.await;
+                }
+            }
+            if self.fail_call == Some(call) {
+                return Err(object_store::Error::Generic {
+                    store: "RaceAfterFirstRead",
+                    source: "injected failure".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl std::fmt::Display for RaceAfterFirstRead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RaceAfterFirstRead")
+        }
+    }
+
+    impl std::fmt::Debug for RaceAfterFirstRead {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RaceAfterFirstRead")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RaceAfterFirstRead {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.before_call().await?;
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.before_call().await?;
+            self.inner.get_opts(location, options).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A replica that found no shared state does not overwrite the state another
+    /// replica creates before its write lands: the other replica's grant is kept.
+    #[tokio::test]
+    async fn a_replica_that_read_no_state_keeps_state_another_replica_created() {
+        let store = Arc::new(InMemory::new());
+        // Long windows, so the test cannot straddle a window boundary.
+        let window = Duration::from_mins(10);
+        let other = per_second_bucket(&store, "b", 10, window);
+        let racing = Arc::new(RaceAfterFirstRead {
+            inner: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            race: tokio::sync::Mutex::new(Some(Box::pin(async move {
+                refresh_with_demand(&other).await;
+            }))),
+            fail_call: None,
+        });
+        let mut config = per_second_config(&store, "a", 10, window);
+        config.store = Arc::clone(&racing) as Arc<dyn ObjectStore>;
+        let bucket = LeasedBucket::new(config);
+
+        refresh_with_demand(&bucket).await;
+
+        assert!(
+            racing.race.lock().await.is_none(),
+            "the other replica must have leased in between"
+        );
+        let window_id = window_id_for(SystemTime::now(), window);
+        assert!(
+            granted_to(&bucket, window_id, "b").await > 0,
+            "the other replica's grant must be kept"
+        );
+        assert!(granted_to(&bucket, window_id, "a").await > 0);
+        assert_eq!(bucket.metrics().lease_acquire_conflicts_total(), 1);
+    }
+
+    /// A write that loses the race is counted as a conflict even when the read
+    /// that retries it fails.
+    #[tokio::test]
+    async fn a_conflict_before_a_failed_read_is_counted() {
+        let store = Arc::new(InMemory::new());
+        let window = Duration::from_mins(10);
+        let other = per_second_bucket(&store, "b", 10, window);
+        // Request 0 reads, request 1 writes after the other replica leased,
+        // request 2 is the read that retries the lost write.
+        let racing = Arc::new(RaceAfterFirstRead {
+            inner: Arc::clone(&store) as Arc<dyn ObjectStore>,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            race: tokio::sync::Mutex::new(Some(Box::pin(async move {
+                refresh_with_demand(&other).await;
+            }))),
+            fail_call: Some(2),
+        });
+        let mut config = per_second_config(&store, "a", 10, window);
+        config.store = Arc::clone(&racing) as Arc<dyn ObjectStore>;
+        let bucket = LeasedBucket::new(config);
+        bucket.inner.lock().await.attempted_this_window = 50;
+
+        let refreshed = bucket.refresh_lease().await;
+
+        assert!(
+            matches!(refreshed, Err(Error::Read { .. })),
+            "the retried read fails: {refreshed:?}"
+        );
+        assert_eq!(bucket.metrics().lease_acquire_conflicts_total(), 1);
     }
 }

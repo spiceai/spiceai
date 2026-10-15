@@ -23,11 +23,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
-use crate::{
-    Runtime,
-    model::{LLMResponsesModelStore, ResponsesApiSupport},
-};
+use crate::{Runtime, model::LLMResponsesModelStore, status::RuntimeStatus};
 use llms::responses::Responses;
+use model_capabilities::{Capability, Refusal, require};
 
 fn extract_text(resp: &OpenAIResponse) -> String {
     resp.output
@@ -44,29 +42,32 @@ fn extract_text(resp: &OpenAIResponse) -> String {
         .join("\n")
 }
 
-fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Option<Response> {
-    match support {
-        ResponsesApiSupport::UnsupportedProvider { provider } => {
-            Some(openai_error_to_response(OpenAIError::ApiError(ApiError {
+/// The response to a request naming a model that has no Responses API handler.
+fn responses_refusal(model_id: &str, refusal: &Refusal, status: &RuntimeStatus) -> Response {
+    match refusal {
+        Refusal::Unsupported(capabilities) if capabilities.has(Capability::Chat) => {
+            let provider = capabilities.provider().short_name();
+            openai_error_to_response(OpenAIError::ApiError(ApiError {
                 message: format!(
                     "Model '{model_id}' uses provider '{provider}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses."
                 ),
                 r#type: Some("invalid_request_error".to_string()),
                 param: Some("model".to_string()),
                 code: Some("invalid_request_error".to_string()),
-            })))
+            }))
         }
-        ResponsesApiSupport::EvaluateOnly { provider } => {
-            Some(openai_error_to_response(OpenAIError::ApiError(ApiError {
+        Refusal::Unsupported(capabilities) => {
+            let provider = capabilities.provider();
+            openai_error_to_response(OpenAIError::ApiError(ApiError {
                 message: format!(
                     "Model '{model_id}' uses provider '{provider}' which is a decision model and does not support the OpenAI Responses API or chat completions. Use POST /v1/decisions, or the SQL decision functions such as ai_if, instead."
                 ),
                 r#type: Some("invalid_request_error".to_string()),
                 param: Some("model".to_string()),
                 code: Some("invalid_request_error".to_string()),
-            })))
+            }))
         }
-        ResponsesApiSupport::Unavailable => {
+        Refusal::Unavailable => {
             let error_response = serde_json::json!({
                 "message": format!("model '{model_id}' is unavailable via /v1/responses"),
                 "type": "service_unavailable_error",
@@ -74,9 +75,14 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
                 "code": "service_unavailable",
             });
 
-            Some((StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response())
+            (StatusCode::SERVICE_UNAVAILABLE, Json(error_response)).into_response()
         }
-        ResponsesApiSupport::Supported => None,
+        Refusal::NotFound => {
+            let message = status
+                .unavailable_model_reason(model_id)
+                .unwrap_or_else(|| format!("model '{model_id}' not found"));
+            (StatusCode::NOT_FOUND, message).into_response()
+        }
     }
 }
 
@@ -199,18 +205,19 @@ pub(crate) async fn post(
         let model_id = model_id.clone();
         let stream = req.stream.unwrap_or(false);
 
-        if let Some(responses_support) = rt.responses_api_support_for_model(&model_id).await
-            && let Some(response) = responses_support_gate(&model_id, &responses_support)
-        {
-            return response;
-        }
-
-        let Some(model) = llms.read().await.get(&model_id).cloned() else {
-            let message = rt
-                .status()
-                .unavailable_model_reason(&model_id)
-                .unwrap_or_else(|| format!("model '{model_id}' not found"));
-            return (StatusCode::NOT_FOUND, message).into_response();
+        let model = {
+            let capabilities = rt.model_capabilities();
+            let capabilities = capabilities.read().await;
+            require(
+                &capabilities,
+                &*llms.read().await,
+                &model_id,
+                Capability::Responses,
+            )
+        };
+        let model = match model {
+            Ok(model) => model,
+            Err(refusal) => return responses_refusal(&model_id, &refusal, &rt.status()),
         };
 
         if stream {
@@ -484,15 +491,20 @@ mod tests {
         );
     }
 
+    fn capabilities(from: &str) -> model_capabilities::ModelCapabilities {
+        model_capabilities::ModelCapabilities::of(&spicepod::component::model::Model::new(
+            from, "model",
+        ))
+        .expect("a known provider")
+    }
+
     #[tokio::test]
     async fn unsupported_provider_returns_invalid_request_error() {
-        let response = responses_support_gate(
+        let response = responses_refusal(
             "anthropic_model",
-            &ResponsesApiSupport::UnsupportedProvider {
-                provider: "anthropic".to_string(),
-            },
-        )
-        .expect("unsupported provider should produce an early response");
+            &Refusal::Unsupported(capabilities("anthropic:claude-3-5-sonnet")),
+            &RuntimeStatus::new(),
+        );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response
@@ -511,8 +523,11 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_support_returns_service_unavailable() {
-        let response = responses_support_gate("temporary_model", &ResponsesApiSupport::Unavailable)
-            .expect("unavailable support should produce an early response");
+        let response = responses_refusal(
+            "temporary_model",
+            &Refusal::Unavailable,
+            &RuntimeStatus::new(),
+        );
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response
@@ -538,13 +553,11 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_only_provider_directs_to_decisions() {
-        let response = responses_support_gate(
+        let response = responses_refusal(
             "jev_model",
-            &ResponsesApiSupport::EvaluateOnly {
-                provider: "typesafe".to_string(),
-            },
-        )
-        .expect("evaluate-only provider should produce an early response");
+            &Refusal::Unsupported(capabilities("typesafe:jev")),
+            &RuntimeStatus::new(),
+        );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = response

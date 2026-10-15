@@ -118,6 +118,7 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
                 worker.name.clone(),
                 load_balance.routing.as_slice(),
                 rt.completion_llms(),
+                rt.model_capabilities(),
             );
             Ok(Arc::new(LoadBalanceWorker::new(
                 Arc::new(model),
