@@ -1156,7 +1156,7 @@ mod tests {
             JobStatus::Succeeded,
         ] {
             deleted.push(finished_job(&job_store, status, twelve_hours + minute).await);
-            kept.push(finished_job(&job_store, status, twelve_hours - minute).await);
+            kept.push(finished_job(&job_store, status, twelve_hours.saturating_sub(minute)).await);
         }
         let running = job_store
             .create_job(make_request("SELECT 2"), false, test_owner())

@@ -107,12 +107,10 @@ impl ClusterState {
         for map in [&mut self.accelerations, &mut self.catalog] {
             map.retain(|table, entry| {
                 match (registered.get(table), entry.unregistered_at_ms) {
-                    (None, _) => {}
                     (Some(true), Some(_)) => {
                         entry.unregistered_at_ms = None;
                         changes.cleared += 1;
                     }
-                    (Some(true), None) => {}
                     (Some(false), None) => {
                         entry.unregistered_at_ms = Some(now_ms);
                         changes.marked += 1;
@@ -123,7 +121,7 @@ impl ClusterState {
                         changes.removed.push(table.clone());
                         return false;
                     }
-                    (Some(false), Some(_)) => {}
+                    (None, _) | (Some(true), None) | (Some(false), Some(_)) => {}
                 }
                 true
             });

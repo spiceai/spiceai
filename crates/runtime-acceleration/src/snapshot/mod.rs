@@ -10711,7 +10711,7 @@ mod tests {
                 .expect("put");
         }
 
-        writer.cleanup_clock = CleanupClock::ahead_by(DAY - std::time::Duration::from_mins(1));
+        writer.cleanup_clock = CleanupClock::ahead_by(std::time::Duration::from_mins(24 * 60 - 1));
         publish_contents(&writer, &local_path, "publish 0", &schema).await;
         assert!(
             object_exists(store.as_ref(), &orphan).await,
@@ -10773,7 +10773,7 @@ mod tests {
         }
 
         *writer.next_sweep.lock() = None;
-        writer.cleanup_clock = CleanupClock::ahead_by(DAY - std::time::Duration::from_mins(1));
+        writer.cleanup_clock = CleanupClock::ahead_by(std::time::Duration::from_mins(24 * 60 - 1));
         publish_contents(&writer, &local_path, "publish 3", &schema).await;
         assert_eq!(
             entry_ids(&dataset_entries(store.as_ref(), &metadata_path).await),
