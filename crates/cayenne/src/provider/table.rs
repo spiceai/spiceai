@@ -856,9 +856,9 @@ pub struct FileDeletionHold {
 }
 
 impl Drop for FileDeletionHold {
-    /// Runs the snapshot-directory sweeps, which skip their pass while the hold
-    /// is held. A table that snapshots after every commit would otherwise skip
-    /// every sweep and keep every directory it supersedes.
+    /// Releases the hold, then runs the snapshot-directory sweeps, which skip
+    /// their pass while it is held. A table that snapshots after every commit
+    /// would otherwise skip every sweep and keep every directory it supersedes.
     fn drop(&mut self) {
         drop(self.guard.take());
         self.table.schedule_old_snapshot_cleanup();
