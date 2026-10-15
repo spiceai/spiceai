@@ -39,30 +39,28 @@ use super::chat::typed_params;
 use super::metrics::{handle_metrics, handle_token_metrics};
 use super::params::openai::OpenAiModelParams;
 use super::params::typesafe::TypeSafeModelParams;
-use super::rate_limit::build_model_rate_controller;
 
 pub use llms::evaluate::EvaluateModelStore;
 
-/// Construct an [`Evaluate`] model from a Spicepod model component.
+/// Construct the native [`Evaluate`] model of a Spicepod model component, whose requests
+/// each take a permit from `rate_controller`.
 ///
-/// Supports decision models: [`ModelSource::TypeSafe`] Jev and `OpenAI` decision models
-/// such as `gpt-6-luna`, including models that also support chat. Other chat models
-/// answer decisions through their own evaluator.
-///
-/// Returns the evaluation model and the rate controller that should also be
-/// registered in the runtime's model rate-controller map.
+/// Supports the providers with a native decisions API: [`ModelSource::TypeSafe`] Jev and
+/// `OpenAI` decision models such as `gpt-6-luna`, including models that also support chat.
+/// Other models answer decisions through their chat evaluator.
 pub async fn try_to_evaluate_model(
     component: &Model,
     params: &HashMap<String, secrecy::SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
-) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
+    rate_controller: Arc<RateController>,
+) -> Result<Arc<dyn Evaluate>, LlmError> {
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
         from: component.from.clone(),
     })?;
 
     match source {
-        ModelSource::TypeSafe => typesafe(component, params, secrets).await,
-        ModelSource::OpenAi => openai_decisions(component, params, secrets).await,
+        ModelSource::TypeSafe => typesafe(component, params, secrets, rate_controller).await,
+        ModelSource::OpenAi => openai_decisions(component, params, secrets, rate_controller).await,
         other => Err(LlmError::UnsupportedTaskForModel {
             from: other.to_string(),
             task: "evaluate".to_string(),
@@ -74,7 +72,8 @@ async fn typesafe(
     component: &Model,
     params: &HashMap<String, secrecy::SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
-) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
+    rate_controller: Arc<RateController>,
+) -> Result<Arc<dyn Evaluate>, LlmError> {
     let typed: TypeSafeModelParams =
         typed_params(component, params, ModelSource::TypeSafe, secrets).await?;
 
@@ -97,12 +96,11 @@ async fn typesafe(
     };
 
     let model_id = component.get_model_id();
-    let rate_controller = build_model_rate_controller(component, params);
     let mut client = TypeSafe::try_new(component.name.clone(), model_id.as_deref(), api_key)
         .map_err(|e| LlmError::FailedToLoadModel {
             source: e.to_string().into(),
         })?
-        .with_rate_controller(Arc::clone(&rate_controller));
+        .with_rate_controller(rate_controller);
 
     if typed.endpoint != llms::typesafe::DEFAULT_BASE_URL {
         client = client.with_base_url(typed.endpoint);
@@ -112,7 +110,7 @@ async fn typesafe(
         name: component.name.clone(),
         model: Arc::new(client),
     };
-    Ok((Arc::new(metered) as Arc<dyn Evaluate>, rate_controller))
+    Ok(Arc::new(metered) as Arc<dyn Evaluate>)
 }
 
 /// An `OpenAI` decision model (`from: openai:gpt-6-luna`), answering through `OpenAI`'s
@@ -122,7 +120,8 @@ async fn openai_decisions(
     component: &Model,
     params: &HashMap<String, secrecy::SecretString>,
     secrets: &Arc<RwLock<Secrets>>,
-) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
+    rate_controller: Arc<RateController>,
+) -> Result<Arc<dyn Evaluate>, LlmError> {
     let typed: OpenAiModelParams =
         typed_params(component, params, ModelSource::OpenAi, secrets).await?;
     let api_key = typed
@@ -136,20 +135,19 @@ async fn openai_decisions(
         });
     }
     let model_id = component.get_model_id().unwrap_or_default();
-    let rate_controller = build_model_rate_controller(component, params);
     let client =
         OpenAiDecisions::try_new(component.name.clone(), model_id, typed.endpoint, api_key)
             .map_err(|e| LlmError::FailedToLoadModel {
                 source: e.to_string().into(),
             })?
             .with_organization(typed.org_id, typed.project_id)
-            .with_rate_controller(Arc::clone(&rate_controller));
+            .with_rate_controller(rate_controller);
 
     let metered = Metered {
         name: component.name.clone(),
         model: Arc::new(client),
     };
-    Ok((Arc::new(metered) as Arc<dyn Evaluate>, rate_controller))
+    Ok(Arc::new(metered) as Arc<dyn Evaluate>)
 }
 
 /// A System One model recorded in the LLM request, failure, duration and token metrics.
@@ -189,14 +187,4 @@ impl Evaluate for Metered {
     async fn health(&self) -> EvaluateResult<()> {
         self.model.health().await
     }
-
-    fn is_decision_model(&self) -> bool {
-        self.model.is_decision_model()
-    }
-}
-
-/// Whether this Spicepod model supports evaluation only, without chat.
-#[must_use]
-pub fn is_evaluate_only(component: &Model) -> bool {
-    matches!(component.get_source(), Some(ModelSource::TypeSafe))
 }

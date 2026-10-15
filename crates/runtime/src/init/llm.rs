@@ -19,24 +19,26 @@ use std::sync::Arc;
 
 use crate::{
     Result, Runtime, UnableToInitializeLlmSnafu,
-    model::{LoadedChatModel, ResponsesApiSupport, try_to_chat_model, try_to_responses_model},
+    model::{LoadedChatModel, try_to_chat_model, try_to_responses_model},
 };
 use llms::{chat::try_map_boxed_error_to_box, responses::Responses};
+use model_capabilities::{Capability, ModelCapabilities};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
 impl Runtime {
-    /// Loads a specific LLM from the spicepod. If an error occurs, no retry attempt is made.
+    /// Loads a chat model from the spicepod, and its Responses API endpoint when
+    /// `capabilities` include one. If an error occurs, no retry attempt is made.
+    ///
+    /// A Responses endpoint that fails to load is left out, so the model is unavailable
+    /// on `/v1/responses` while its chat still serves.
     pub(crate) async fn load_llm(
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
-    ) -> Result<(
-        LoadedChatModel,
-        Option<Arc<dyn Responses>>,
-        ResponsesApiSupport,
-    )> {
+        capabilities: &ModelCapabilities,
+    ) -> Result<(LoadedChatModel, Option<Arc<dyn Responses>>)> {
         let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
             .boxed()
@@ -51,20 +53,14 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        let mut responses_support = ResponsesApiSupport::Unavailable;
+        if !capabilities.has(Capability::Responses) {
+            return Ok((completions_model, None));
+        }
+
         let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
             .await
         {
-            Ok(model) => {
-                responses_support = ResponsesApiSupport::Supported;
-                Some(model)
-            }
-            Err(llms::chat::Error::ResponsesNotSupported { from }) => {
-                responses_support = ResponsesApiSupport::UnsupportedProvider {
-                    provider: from.short_name().to_string(),
-                };
-                None
-            }
+            Ok(model) => Some(model),
             Err(e) => {
                 tracing::warn!(
                     "Failed to construct Responses API endpoint for model '{}': {e}. The model will not be available via /v1/responses.",
@@ -88,10 +84,9 @@ impl Runtime {
         {
             tracing::warn!("{}", responses_unavailable_warning(&m.name, &e));
             responses_model = None;
-            responses_support = ResponsesApiSupport::Unavailable;
         }
 
-        Ok((completions_model, responses_model, responses_support))
+        Ok((completions_model, responses_model))
     }
 }
 
