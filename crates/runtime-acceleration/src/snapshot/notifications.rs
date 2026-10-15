@@ -286,7 +286,8 @@ type Announced = HashMap<String, u64>;
 /// when the last [`Subscription`] to it is dropped.
 #[derive(Default)]
 pub struct SnapshotNotifications {
-    runtime_state_location: Option<String>,
+    /// The `runtime.state.location` that subscriptions resolve against.
+    runtime_state_location: Mutex<Option<String>>,
     /// Keyed by queue URL alone: SQS gives each message to one receiver, so a
     /// second consumer of the queue would take messages its locations do not hold.
     consumers: Mutex<HashMap<String, Weak<Consumer>>>,
@@ -298,9 +299,15 @@ impl SnapshotNotifications {
     #[must_use]
     pub fn new(runtime_state_location: Option<String>) -> Self {
         Self {
-            runtime_state_location,
+            runtime_state_location: Mutex::new(runtime_state_location),
             consumers: Mutex::default(),
         }
+    }
+
+    /// Sets the `runtime.state.location` that later subscriptions resolve
+    /// against: an executor learns it when it binds the scheduler's App.
+    pub fn set_runtime_state_location(&self, runtime_state_location: Option<String>) {
+        *self.runtime_state_location.lock() = runtime_state_location;
     }
 
     /// Subscribe to the queue configured for a bootstrapping or refreshing
@@ -321,11 +328,19 @@ impl SnapshotNotifications {
         let Some(secrets) = secrets.upgrade() else {
             return Ok(None);
         };
-        Ok(
-            NotificationConfig::resolve(snapshots, self.runtime_state_location.as_deref(), secrets)
-                .await?
-                .map(|config| self.subscribe(&config, manager, runtime)),
-        )
+        Ok(self
+            .resolve_config(snapshots, secrets)
+            .await?
+            .map(|config| self.subscribe(&config, manager, runtime)))
+    }
+
+    async fn resolve_config(
+        &self,
+        snapshots: &Snapshots,
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> Result<Option<NotificationConfig>> {
+        let runtime_state_location = self.runtime_state_location.lock().clone();
+        NotificationConfig::resolve(snapshots, runtime_state_location.as_deref(), secrets).await
     }
 
     /// Subscribe `manager`'s dataset to the announcements of the snapshot
@@ -1792,6 +1807,26 @@ mod tests {
                 "{location} in {state_location:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn subscriptions_resolve_against_a_runtime_state_location_set_later() {
+        let notifications = SnapshotNotifications::new(None);
+        let snapshots = snapshots(
+            "s3://my-bucket/spice/snapshots/",
+            &[("s3_queue_url", QUEUE_URL)],
+        );
+        let resolved = || async {
+            notifications
+                .resolve_config(&snapshots, Arc::new(RwLock::new(Secrets::default())))
+                .await
+                .expect("valid config")
+                .expect("a queue is configured")
+                .state_root
+        };
+        assert_eq!(resolved().await, None);
+        notifications.set_runtime_state_location(Some("s3://my-bucket/spice/".to_string()));
+        assert_eq!(resolved().await, Some(at("s3://my-bucket/spice/")));
     }
 
     #[tokio::test]

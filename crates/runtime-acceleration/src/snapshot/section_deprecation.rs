@@ -68,6 +68,22 @@ pub fn section_deprecation_warning(section: &Snapshots, state: Option<&RuntimeSt
         "The top-level `snapshots` section is deprecated and will be removed in a future release. Snapshots are stored in the `snapshots/` folder of `runtime.state.location`.",
     );
     match remedy {
+        // The section's `params`, even empty ones, replace `runtime.state.params`
+        // for the snapshots, so they move to the datasets.
+        Remedy::AlreadyThere
+            if section.params.is_some() && state.is_some_and(|state| state.params.is_some()) =>
+        {
+            warning.push_str(" Your snapshots are already there: delete the section.");
+            if keys.is_empty() {
+                warning.push_str(
+                    " Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and does not set it, so `runtime.state.params` do not apply to its snapshots.",
+                );
+            } else {
+                warning.push_str(&move_keys(
+                    "`acceleration.snapshots_params` on each dataset that enables snapshots and does not set it",
+                ));
+            }
+        }
         Remedy::AlreadyThere => {
             warning.push_str(" Your snapshots are already there: delete the section.");
             warning.push_str(&move_keys("`runtime.state.params`"));
@@ -237,6 +253,39 @@ mod tests {
                 .contains(" Your snapshots are already there: delete the section. See:"),
             "{without_location}"
         );
+    }
+
+    /// The section's `params`, even empty ones, replace `runtime.state.params` for
+    /// the snapshots, so deleting the section must not leave them to apply.
+    #[test]
+    fn section_params_beside_runtime_state_params_move_to_each_dataset() {
+        let state = RuntimeState {
+            params: Some(Params::from_string_map(
+                [(
+                    "s3_endpoint".to_string(),
+                    "https://state.example".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            ..state("s3://my-bucket/spice/")
+        };
+
+        let warning = section_deprecation_warning(&section(None, Some(params())), Some(&state));
+        assert_safe(&warning);
+        assert!(
+            warning.contains(" Your snapshots are already there: delete the section. Move s3_auth, s3_key, s3_region from `snapshots.params` into `acceleration.snapshots_params` on each dataset that enables snapshots and does not set it. See:"),
+            "{warning}"
+        );
+
+        let empty =
+            section_deprecation_warning(&section(None, Some(Params::default())), Some(&state));
+        assert_safe(&empty);
+        assert!(
+            empty.contains(" Your snapshots are already there: delete the section. Set `acceleration.snapshots_params: {}` on each dataset that enables snapshots and does not set it, so `runtime.state.params` do not apply to its snapshots. See:"),
+            "{empty}"
+        );
+        assert!(!empty.contains("https://state.example"), "{empty}");
     }
 
     #[test]

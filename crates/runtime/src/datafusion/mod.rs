@@ -4727,6 +4727,13 @@ impl DataFusion {
             })
     }
 
+    /// Sets the `runtime.state.location` that snapshot queue subscriptions
+    /// resolve against.
+    pub(crate) fn set_runtime_state_location(&self, location: Option<String>) {
+        self.snapshot_notifications
+            .set_runtime_state_location(location);
+    }
+
     /// The queue consumers shared by local snapshot bootstrap and refresh.
     pub(crate) fn snapshot_notifications(&self) -> Option<Arc<SnapshotNotifications>> {
         if matches!(
