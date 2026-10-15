@@ -326,6 +326,7 @@ fn status_code_for(code: tonic::Code) -> StatusCode {
         (status = 403, description = "Write access required"),
         (status = 413, description = "Body too large"),
         (status = 415, description = "Unsupported Content-Type or Content-Encoding"),
+        (status = 503, description = "Failed to write to the metrics store; retry the export"),
     )
 ))]
 pub(crate) async fn post(
@@ -348,6 +349,29 @@ pub(crate) async fn post(
     handle(&service, &headers, body).await
 }
 
+/// Decompresses and decodes an export, as [`decompress`] and [`decode`] do, on the blocking
+/// pool: a gzip body can inflate to [`MAX_DECOMPRESSED_BODY_BYTES`], and inflating and decoding
+/// that much would hold an HTTP runtime thread that also answers `/health`. An error is the
+/// HTTP status and message, which the caller encodes for the request.
+async fn decode_body(
+    encoding_kind: Encoding,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<ExportMetricsServiceRequest, (StatusCode, String)> {
+    let headers = headers.clone();
+    tokio::task::spawn_blocking(move || {
+        let body = decompress(&headers, body)?;
+        decode(encoding_kind, &body).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to decode the OTLP metrics export: {e}"),
+        ))
+    })
+}
+
 pub(crate) async fn handle(
     service: &MetricsIngestService,
     headers: &HeaderMap,
@@ -359,21 +383,10 @@ pub(crate) async fn handle(
     };
     // From here the request's encoding is known, so errors are `google.rpc.Status` bodies.
     // An unsupported Content-Type above has no encoding to answer in and stays plain text.
-    let body = match decompress(headers, body) {
-        Ok(body) => body,
+    let request = match decode_body(encoding_kind, headers, body).await {
+        Ok(request) => request,
         Err((status, message)) => {
             return status_error(encoding_kind, status, grpc_code_for(status), message);
-        }
-    };
-    let request = match decode(encoding_kind, &body) {
-        Ok(request) => request,
-        Err(message) => {
-            return status_error(
-                encoding_kind,
-                StatusCode::BAD_REQUEST,
-                tonic::Code::InvalidArgument,
-                message,
-            );
         }
     };
     match service.export(tonic::Request::new(request)).await {
@@ -391,6 +404,7 @@ pub(crate) async fn handle(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn json_body() -> &'static str {
         r#"{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"spiced"}}]},
@@ -454,6 +468,40 @@ mod tests {
         )
         .expect("decompresses");
         assert_eq!(body.as_ref(), json_body().as_bytes());
+    }
+
+    /// A gzip body can inflate to `MAX_DECOMPRESSED_BODY_BYTES`; inflating and decoding it must
+    /// not hold the HTTP runtime's thread, which also answers `/health`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gzip_bodies_are_decoded_off_the_async_runtime() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder
+            .write_all(&vec![0_u8; 16 * 1024 * 1024])
+            .expect("write");
+        let compressed = Bytes::from(encoder.finish().expect("finish"));
+        let decoded = Arc::new(AtomicBool::new(false));
+        let other_task = tokio::spawn({
+            let decoded = Arc::clone(&decoded);
+            // On this single-threaded runtime the task runs only when the handler yields.
+            async move { decoded.load(Ordering::SeqCst) }
+        });
+        let (status, message) = decode_body(
+            Encoding::Protobuf,
+            &headers(PROTOBUF_CONTENT_TYPE, Some("gzip")),
+            compressed,
+        )
+        .await
+        .expect_err("zero bytes are not a protobuf export");
+        decoded.store(true, Ordering::SeqCst);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.starts_with("Invalid OTLP protobuf body:"),
+            "{message}"
+        );
+        assert!(
+            !other_task.await.expect("task"),
+            "another task ran only after the body was decoded"
+        );
     }
 
     #[test]
