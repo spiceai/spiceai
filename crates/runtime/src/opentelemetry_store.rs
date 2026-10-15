@@ -1,0 +1,1272 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! The OTLP metrics store: one table with a narrow, fixed schema that holds every metric
+//! of an export (#15060).
+//!
+//! A `sink:` dataset opts in with the `otlp_metrics: all` param. Every data point becomes one
+//! row that keeps the metric's semantics (type, temporality, monotonicity, unit) and carries
+//! its attributes as a JSON object, so a new attribute key never changes the table schema.
+//!
+//! `series_hash` identifies a series (metric name, resource attributes, scope, and point
+//! attributes), so `(time_unix_nano, series_hash)` is a complete key and a retried export
+//! writes rows that a primary key deduplicates. It hashes a typed encoding of the attributes
+//! rather than their JSON, which renders some distinct values alike.
+
+use std::sync::{Arc, LazyLock};
+
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder,
+    StringBuilder, UInt32Builder, UInt64Builder,
+};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
+use base64::Engine;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
+use opentelemetry_proto::tonic::metrics::v1::{
+    ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+};
+use serde_json::Value as JsonValue;
+
+/// Dataset param that routes OTLP metrics into a dataset. The only accepted value is `all`.
+pub const OTLP_METRICS_PARAM: &str = "otlp_metrics";
+/// The value of [`OTLP_METRICS_PARAM`] that routes every metric of an export to the dataset.
+pub const OTLP_METRICS_PARAM_ALL: &str = "all";
+
+/// Whether a dataset's `otlp_metrics` param value routes every metric to it.
+#[must_use]
+pub fn is_otlp_metrics_store_param(value: &str) -> bool {
+    // Matches the sink connector's `one_of_ignore_ascii_case` check of the same param.
+    value.eq_ignore_ascii_case(OTLP_METRICS_PARAM_ALL)
+}
+
+fn list_of(item: DataType) -> DataType {
+    DataType::List(Arc::new(Field::new_list_field(item, true)))
+}
+
+/// The fixed schema of the OTLP metrics store table.
+pub static METRICS_STORE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("metric_name", DataType::Utf8, false),
+        Field::new("metric_type", DataType::Utf8, false),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("unit", DataType::Utf8, true),
+        Field::new("temporality", DataType::Utf8, true),
+        Field::new("is_monotonic", DataType::Boolean, true),
+        Field::new("time_unix_nano", DataType::UInt64, false),
+        Field::new("start_time_unix_nano", DataType::UInt64, true),
+        Field::new("series_hash", DataType::UInt64, false),
+        Field::new("attributes", DataType::Utf8, true),
+        Field::new("resource_attributes", DataType::Utf8, true),
+        Field::new("scope_name", DataType::Utf8, true),
+        Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("flags", DataType::UInt32, true),
+        Field::new("value_double", DataType::Float64, true),
+        Field::new("value_int", DataType::Int64, true),
+        Field::new("count", DataType::UInt64, true),
+        Field::new("sum", DataType::Float64, true),
+        Field::new("min", DataType::Float64, true),
+        Field::new("max", DataType::Float64, true),
+        Field::new("explicit_bounds", list_of(DataType::Float64), true),
+        Field::new("bucket_counts", list_of(DataType::UInt64), true),
+        Field::new("scale", DataType::Int32, true),
+        Field::new("zero_count", DataType::UInt64, true),
+        Field::new("zero_threshold", DataType::Float64, true),
+        Field::new("positive_offset", DataType::Int32, true),
+        Field::new("positive_bucket_counts", list_of(DataType::UInt64), true),
+        Field::new("negative_offset", DataType::Int32, true),
+        Field::new("negative_bucket_counts", list_of(DataType::UInt64), true),
+        Field::new("quantiles", list_of(DataType::Float64), true),
+        Field::new("quantile_values", list_of(DataType::Float64), true),
+    ]))
+});
+
+/// JSON form of an OTLP attribute value. Integers, doubles, booleans and strings keep their
+/// JSON type; arrays and key-value lists nest. Bytes become `{"bytes": "<base64>"}` and NaN or
+/// an infinity becomes `{"double": "NaN"}`, so neither reads as a string attribute carrying
+/// the same text. A key-value list can still render the same JSON, so `series_hash` hashes
+/// [`encode_attributes`] instead.
+fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        return JsonValue::Null;
+    };
+    match value {
+        any_value::Value::StringValue(s) => JsonValue::String(s.clone()),
+        any_value::Value::BoolValue(b) => JsonValue::Bool(*b),
+        any_value::Value::IntValue(i) => JsonValue::from(*i),
+        // NaN and infinities have no JSON number form; tag them so they stay distinct from
+        // strings such as "NaN".
+        any_value::Value::DoubleValue(d) => serde_json::Number::from_f64(*d).map_or_else(
+            || serde_json::json!({ "double": d.to_string() }),
+            JsonValue::Number,
+        ),
+        any_value::Value::BytesValue(b) => {
+            serde_json::json!({ "bytes": base64::engine::general_purpose::STANDARD.encode(b) })
+        }
+        any_value::Value::ArrayValue(a) => JsonValue::Array(
+            a.values
+                .iter()
+                .map(|v| any_value_to_json(Some(v)))
+                .collect(),
+        ),
+        any_value::Value::KvlistValue(kv) => attributes_to_json(&kv.values),
+        // String-table references are a profiling-signal encoding; metrics never carry them.
+        any_value::Value::StringValueStrindex(_) => JsonValue::Null,
+    }
+}
+
+/// Attributes as a JSON object with keys in sorted order, so equal attribute sets always
+/// serialize, and hash, the same way. A repeated key keeps its last value.
+fn attributes_to_json(attributes: &[KeyValue]) -> JsonValue {
+    sorted_attributes_to_json(&sorted_attributes(attributes))
+}
+
+fn sorted_attributes_to_json(sorted: &[(&str, Option<&AnyValue>)]) -> JsonValue {
+    let mut map = serde_json::Map::with_capacity(sorted.len());
+    for (key, value) in sorted {
+        map.insert((*key).to_string(), any_value_to_json(*value));
+    }
+    JsonValue::Object(map)
+}
+
+/// Attributes sorted by key, a repeated key keeping its last value.
+fn sorted_attributes(attributes: &[KeyValue]) -> Vec<(&str, Option<&AnyValue>)> {
+    let mut sorted: Vec<_> = attributes
+        .iter()
+        .map(|kv| (kv.key.as_str(), kv.value.as_ref()))
+        .collect();
+    // A stable sort keeps a repeated key's values in order, so the last of a run is the last
+    // one given; `dedup_by` passes the later entry first and drops it after copying it over.
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            *earlier = *later;
+            true
+        } else {
+            false
+        }
+    });
+    sorted
+}
+
+/// Attributes as their stored JSON string, appending their [`encode_attributes`] bytes to
+/// `encoded`. Both come from one sort of the keys.
+fn serialize_attributes(attributes: &[KeyValue], encoded: &mut Vec<u8>) -> String {
+    let sorted = sorted_attributes(attributes);
+    encode_sorted_attributes(&sorted, encoded);
+    sorted_attributes_to_json(&sorted).to_string()
+}
+
+#[cfg(test)]
+fn attributes_to_json_string(attributes: &[KeyValue]) -> String {
+    attributes_to_json(attributes).to_string()
+}
+
+/// Attributes as the stored JSON and as the [`encode_attributes`] bytes `series_hash` hashes.
+struct SerializedAttributes {
+    json: String,
+    encoded: Vec<u8>,
+}
+
+impl SerializedAttributes {
+    fn new(attributes: &[KeyValue]) -> Self {
+        let mut encoded = Vec::new();
+        let json = serialize_attributes(attributes, &mut encoded);
+        Self { json, encoded }
+    }
+}
+
+fn encode_len(len: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(len as u64).to_le_bytes());
+}
+
+fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+    encode_len(bytes.len(), out);
+    out.extend_from_slice(bytes);
+}
+
+/// Appends an unambiguous encoding of `attributes` to `out`: every value is tagged with its
+/// `AnyValue` kind and every string, byte string and collection is length-prefixed, so two
+/// encodings are equal only for equal attributes. Keys are sorted and a repeated key keeps its
+/// last value, as in [`attributes_to_json`].
+fn encode_attributes(attributes: &[KeyValue], out: &mut Vec<u8>) {
+    encode_sorted_attributes(&sorted_attributes(attributes), out);
+}
+
+fn encode_sorted_attributes(sorted: &[(&str, Option<&AnyValue>)], out: &mut Vec<u8>) {
+    encode_len(sorted.len(), out);
+    for (key, value) in sorted {
+        encode_bytes(key.as_bytes(), out);
+        encode_any_value(*value, out);
+    }
+}
+
+fn encode_any_value(value: Option<&AnyValue>, out: &mut Vec<u8>) {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        out.push(0);
+        return;
+    };
+    match value {
+        any_value::Value::StringValue(s) => {
+            out.push(1);
+            encode_bytes(s.as_bytes(), out);
+        }
+        any_value::Value::BoolValue(b) => {
+            out.push(2);
+            out.push(u8::from(*b));
+        }
+        any_value::Value::IntValue(i) => {
+            out.push(3);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        any_value::Value::DoubleValue(d) => {
+            out.push(4);
+            // Every NaN is one value, as in the JSON.
+            let bits = if d.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                d.to_bits()
+            };
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+        any_value::Value::BytesValue(b) => {
+            out.push(5);
+            encode_bytes(b, out);
+        }
+        any_value::Value::ArrayValue(a) => {
+            out.push(6);
+            encode_len(a.values.len(), out);
+            for v in &a.values {
+                encode_any_value(Some(v), out);
+            }
+        }
+        any_value::Value::KvlistValue(kv) => {
+            out.push(7);
+            encode_attributes(&kv.values, out);
+        }
+        any_value::Value::StringValueStrindex(i) => {
+            out.push(8);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+    }
+}
+
+/// Identity of a series: metric name, resource attributes, scope name, version and
+/// attributes, and point attributes, each set of attributes as [`encode_attributes`] bytes.
+/// Each part is length-prefixed so no two different series encode the same bytes. The
+/// encoding and the algorithm (`XxHash3_64`, seed 0) are part of the stored data and must not
+/// change.
+#[must_use]
+pub fn series_hash(
+    metric_name: &str,
+    resource_attributes: &[u8],
+    scope_name: &str,
+    scope_version: &str,
+    scope_attributes: &[u8],
+    attributes: &[u8],
+) -> u64 {
+    let parts = [
+        metric_name.as_bytes(),
+        resource_attributes,
+        scope_name.as_bytes(),
+        scope_version.as_bytes(),
+        scope_attributes,
+        attributes,
+    ];
+    let mut bytes = Vec::with_capacity(parts.iter().map(|p| p.len() + 8).sum());
+    for part in parts {
+        encode_bytes(part, &mut bytes);
+    }
+    twox_hash::XxHash3_64::oneshot(&bytes)
+}
+
+fn temporality_name(temporality: i32) -> Option<&'static str> {
+    match temporality {
+        1 => Some("delta"),
+        2 => Some("cumulative"),
+        _ => None,
+    }
+}
+
+/// Builders for every column of [`METRICS_STORE_SCHEMA`].
+#[derive(Default)]
+struct StoreBuilders {
+    metric_name: StringBuilder,
+    metric_type: StringBuilder,
+    description: StringBuilder,
+    unit: StringBuilder,
+    temporality: StringBuilder,
+    is_monotonic: BooleanBuilder,
+    time_unix_nano: UInt64Builder,
+    start_time_unix_nano: UInt64Builder,
+    series_hash: UInt64Builder,
+    attributes: StringBuilder,
+    resource_attributes: StringBuilder,
+    scope_name: StringBuilder,
+    scope_version: StringBuilder,
+    scope_attributes: StringBuilder,
+    flags: UInt32Builder,
+    value_double: Float64Builder,
+    value_int: Int64Builder,
+    count: UInt64Builder,
+    sum: Float64Builder,
+    min: Float64Builder,
+    max: Float64Builder,
+    explicit_bounds: ListBuilder<Float64Builder>,
+    bucket_counts: ListBuilder<UInt64Builder>,
+    scale: Int32Builder,
+    zero_count: UInt64Builder,
+    zero_threshold: Float64Builder,
+    positive_offset: Int32Builder,
+    positive_bucket_counts: ListBuilder<UInt64Builder>,
+    negative_offset: Int32Builder,
+    negative_bucket_counts: ListBuilder<UInt64Builder>,
+    quantiles: ListBuilder<Float64Builder>,
+    quantile_values: ListBuilder<Float64Builder>,
+    /// Scratch for a point's [`encode_attributes`] bytes, reused across points.
+    encoded_attributes: Vec<u8>,
+}
+
+/// Columns shared by every row of one metric of one scope.
+struct MetricContext<'a> {
+    name: &'a str,
+    metric_type: &'static str,
+    description: &'a str,
+    unit: &'a str,
+    temporality: Option<&'static str>,
+    is_monotonic: Option<bool>,
+    resource_attributes: &'a SerializedAttributes,
+    scope_name: &'a str,
+    scope_version: &'a str,
+    scope_attributes: &'a SerializedAttributes,
+}
+
+fn non_empty(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
+}
+
+/// Values specific to one data point type. Columns not set are null.
+#[derive(Default)]
+struct PointValues<'a> {
+    value_double: Option<f64>,
+    value_int: Option<i64>,
+    count: Option<u64>,
+    sum: Option<f64>,
+    min: Option<f64>,
+    max: Option<f64>,
+    explicit_bounds: Option<&'a [f64]>,
+    bucket_counts: Option<&'a [u64]>,
+    scale: Option<i32>,
+    zero_count: Option<u64>,
+    zero_threshold: Option<f64>,
+    positive: Option<(i32, &'a [u64])>,
+    negative: Option<(i32, &'a [u64])>,
+    quantiles: Option<(Vec<f64>, Vec<f64>)>,
+}
+
+fn append_f64_list(builder: &mut ListBuilder<Float64Builder>, values: Option<&[f64]>) {
+    match values {
+        Some(values) => {
+            builder.values().append_slice(values);
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
+fn append_u64_list(builder: &mut ListBuilder<UInt64Builder>, values: Option<&[u64]>) {
+    match values {
+        Some(values) => {
+            builder.values().append_slice(values);
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
+impl StoreBuilders {
+    fn append(
+        &mut self,
+        ctx: &MetricContext<'_>,
+        time_unix_nano: u64,
+        start_time_unix_nano: u64,
+        attributes: &[KeyValue],
+        flags: u32,
+        values: PointValues<'_>,
+    ) {
+        let mut encoded = std::mem::take(&mut self.encoded_attributes);
+        encoded.clear();
+        let attributes_json = serialize_attributes(attributes, &mut encoded);
+        self.metric_name.append_value(ctx.name);
+        self.metric_type.append_value(ctx.metric_type);
+        self.description.append_option(non_empty(ctx.description));
+        self.unit.append_option(non_empty(ctx.unit));
+        self.temporality.append_option(ctx.temporality);
+        self.is_monotonic.append_option(ctx.is_monotonic);
+        self.time_unix_nano.append_value(time_unix_nano);
+        // OTLP uses 0 for "not set".
+        self.start_time_unix_nano
+            .append_option((start_time_unix_nano != 0).then_some(start_time_unix_nano));
+        self.series_hash.append_value(series_hash(
+            ctx.name,
+            &ctx.resource_attributes.encoded,
+            ctx.scope_name,
+            ctx.scope_version,
+            &ctx.scope_attributes.encoded,
+            &encoded,
+        ));
+        self.encoded_attributes = encoded;
+        self.attributes.append_value(&attributes_json);
+        self.resource_attributes
+            .append_value(&ctx.resource_attributes.json);
+        self.scope_name.append_option(non_empty(ctx.scope_name));
+        self.scope_version
+            .append_option(non_empty(ctx.scope_version));
+        self.scope_attributes
+            .append_option(non_empty(&ctx.scope_attributes.json));
+        self.value_double.append_option(values.value_double);
+        self.value_int.append_option(values.value_int);
+        self.count.append_option(values.count);
+        self.sum.append_option(values.sum);
+        self.min.append_option(values.min);
+        self.max.append_option(values.max);
+        append_f64_list(&mut self.explicit_bounds, values.explicit_bounds);
+        append_u64_list(&mut self.bucket_counts, values.bucket_counts);
+        self.scale.append_option(values.scale);
+        self.zero_count.append_option(values.zero_count);
+        self.zero_threshold.append_option(values.zero_threshold);
+        self.flags.append_value(flags);
+        self.positive_offset
+            .append_option(values.positive.map(|(offset, _)| offset));
+        append_u64_list(
+            &mut self.positive_bucket_counts,
+            values.positive.map(|(_, counts)| counts),
+        );
+        self.negative_offset
+            .append_option(values.negative.map(|(offset, _)| offset));
+        append_u64_list(
+            &mut self.negative_bucket_counts,
+            values.negative.map(|(_, counts)| counts),
+        );
+        let (quantiles, quantile_values) = match values.quantiles {
+            Some((q, v)) => (Some(q), Some(v)),
+            None => (None, None),
+        };
+        append_f64_list(&mut self.quantiles, quantiles.as_deref());
+        append_f64_list(&mut self.quantile_values, quantile_values.as_deref());
+    }
+
+    fn finish(mut self) -> Result<RecordBatch, ArrowError> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.metric_name.finish()),
+            Arc::new(self.metric_type.finish()),
+            Arc::new(self.description.finish()),
+            Arc::new(self.unit.finish()),
+            Arc::new(self.temporality.finish()),
+            Arc::new(self.is_monotonic.finish()),
+            Arc::new(self.time_unix_nano.finish()),
+            Arc::new(self.start_time_unix_nano.finish()),
+            Arc::new(self.series_hash.finish()),
+            Arc::new(self.attributes.finish()),
+            Arc::new(self.resource_attributes.finish()),
+            Arc::new(self.scope_name.finish()),
+            Arc::new(self.scope_version.finish()),
+            Arc::new(self.scope_attributes.finish()),
+            Arc::new(self.flags.finish()),
+            Arc::new(self.value_double.finish()),
+            Arc::new(self.value_int.finish()),
+            Arc::new(self.count.finish()),
+            Arc::new(self.sum.finish()),
+            Arc::new(self.min.finish()),
+            Arc::new(self.max.finish()),
+            Arc::new(self.explicit_bounds.finish()),
+            Arc::new(self.bucket_counts.finish()),
+            Arc::new(self.scale.finish()),
+            Arc::new(self.zero_count.finish()),
+            Arc::new(self.zero_threshold.finish()),
+            Arc::new(self.positive_offset.finish()),
+            Arc::new(self.positive_bucket_counts.finish()),
+            Arc::new(self.negative_offset.finish()),
+            Arc::new(self.negative_bucket_counts.finish()),
+            Arc::new(self.quantiles.finish()),
+            Arc::new(self.quantile_values.finish()),
+        ];
+        RecordBatch::try_new(Arc::clone(&METRICS_STORE_SCHEMA), columns)
+    }
+}
+
+/// Rows per metrics store batch. Bounds the memory one batch takes, since resource and scope
+/// attributes are repeated on every row.
+pub const MAX_STORE_BATCH_ROWS: usize = 8192;
+
+/// One data point of an export, by reference.
+#[derive(Clone, Copy)]
+enum PointRef<'a> {
+    Number(&'a NumberDataPoint),
+    Histogram(&'a HistogramDataPoint),
+    Exponential(&'a ExponentialHistogramDataPoint),
+    Summary(&'a SummaryDataPoint),
+}
+
+/// Columns shared by every point of one metric of one scope, by index into the export's
+/// serialized resource and scope attributes.
+struct OwnedContext<'a> {
+    name: &'a str,
+    metric_type: &'static str,
+    description: &'a str,
+    unit: &'a str,
+    temporality: Option<&'static str>,
+    is_monotonic: Option<bool>,
+    resource: usize,
+    scope_name: &'a str,
+    scope_version: &'a str,
+    scope_attributes: usize,
+}
+
+/// Every data point of an export, in order, ready to build metrics store batches of bounded
+/// size. Attributes shared across points are serialized once.
+pub struct StoreExport<'a> {
+    resources: Vec<SerializedAttributes>,
+    scopes: Vec<SerializedAttributes>,
+    contexts: Vec<OwnedContext<'a>>,
+    points: Vec<(usize, PointRef<'a>)>,
+}
+
+impl<'a> StoreExport<'a> {
+    /// Indexes every data point of every metric in `request`, of every OTLP metric type.
+    #[must_use]
+    pub fn new(request: &'a ExportMetricsServiceRequest) -> Self {
+        let mut export = Self {
+            resources: Vec::new(),
+            scopes: Vec::new(),
+            contexts: Vec::new(),
+            points: Vec::new(),
+        };
+        for resource_metric in &request.resource_metrics {
+            let resource = export.resources.len();
+            export.resources.push(SerializedAttributes::new(
+                resource_metric
+                    .resource
+                    .as_ref()
+                    .map_or(&[][..], |r| r.attributes.as_slice()),
+            ));
+            for scope_metric in &resource_metric.scope_metrics {
+                let scope = scope_metric.scope.as_ref();
+                let scope_attributes = export.scopes.len();
+                export.scopes.push(SerializedAttributes::new(
+                    scope.map_or(&[][..], |s| s.attributes.as_slice()),
+                ));
+                let (scope_name, scope_version) =
+                    scope.map_or(("", ""), |s| (s.name.as_str(), s.version.as_str()));
+                for metric in &scope_metric.metrics {
+                    let Some(data) = metric.data.as_ref() else {
+                        continue;
+                    };
+                    let (metric_type, temporality, is_monotonic) = match data {
+                        Data::Gauge(_) => ("gauge", None, None),
+                        Data::Sum(sum) => (
+                            "sum",
+                            temporality_name(sum.aggregation_temporality),
+                            Some(sum.is_monotonic),
+                        ),
+                        Data::Histogram(h) => (
+                            "histogram",
+                            temporality_name(h.aggregation_temporality),
+                            None,
+                        ),
+                        Data::ExponentialHistogram(h) => (
+                            "exponential_histogram",
+                            temporality_name(h.aggregation_temporality),
+                            None,
+                        ),
+                        Data::Summary(_) => ("summary", None, None),
+                    };
+                    let context = export.contexts.len();
+                    export.contexts.push(OwnedContext {
+                        name: &metric.name,
+                        metric_type,
+                        description: &metric.description,
+                        unit: &metric.unit,
+                        temporality,
+                        is_monotonic,
+                        resource,
+                        scope_name,
+                        scope_version,
+                        scope_attributes,
+                    });
+                    match data {
+                        Data::Gauge(g) => export
+                            .points
+                            .extend(g.data_points.iter().map(|p| (context, PointRef::Number(p)))),
+                        Data::Sum(sum) => export.points.extend(
+                            sum.data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Number(p))),
+                        ),
+                        Data::Histogram(h) => export.points.extend(
+                            h.data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Histogram(p))),
+                        ),
+                        Data::ExponentialHistogram(h) => export.points.extend(
+                            h.data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Exponential(p))),
+                        ),
+                        Data::Summary(summary) => export.points.extend(
+                            summary
+                                .data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Summary(p))),
+                        ),
+                    }
+                }
+            }
+        }
+        export
+    }
+
+    /// Number of data points (rows) in the export.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Metrics store batches of at most `max_rows` rows each, built one at a time.
+    pub fn batches(
+        &self,
+        max_rows: usize,
+    ) -> impl Iterator<Item = Result<RecordBatch, ArrowError>> + '_ {
+        self.points
+            .chunks(max_rows.max(1))
+            .map(|chunk| self.build(chunk))
+    }
+
+    fn build(&self, points: &[(usize, PointRef<'a>)]) -> Result<RecordBatch, ArrowError> {
+        let mut builders = StoreBuilders::default();
+        for (context, point) in points {
+            let c = &self.contexts[*context];
+            let ctx = MetricContext {
+                name: c.name,
+                metric_type: c.metric_type,
+                description: c.description,
+                unit: c.unit,
+                temporality: c.temporality,
+                is_monotonic: c.is_monotonic,
+                resource_attributes: &self.resources[c.resource],
+                scope_name: c.scope_name,
+                scope_version: c.scope_version,
+                scope_attributes: &self.scopes[c.scope_attributes],
+            };
+            match point {
+                PointRef::Number(p) => builders.append(
+                    &ctx,
+                    p.time_unix_nano,
+                    p.start_time_unix_nano,
+                    &p.attributes,
+                    p.flags,
+                    number_values(p.value.as_ref()),
+                ),
+                PointRef::Histogram(p) => builders.append(
+                    &ctx,
+                    p.time_unix_nano,
+                    p.start_time_unix_nano,
+                    &p.attributes,
+                    p.flags,
+                    PointValues {
+                        count: Some(p.count),
+                        sum: p.sum,
+                        min: p.min,
+                        max: p.max,
+                        explicit_bounds: Some(&p.explicit_bounds),
+                        bucket_counts: Some(&p.bucket_counts),
+                        ..PointValues::default()
+                    },
+                ),
+                PointRef::Exponential(p) => builders.append(
+                    &ctx,
+                    p.time_unix_nano,
+                    p.start_time_unix_nano,
+                    &p.attributes,
+                    p.flags,
+                    PointValues {
+                        count: Some(p.count),
+                        sum: p.sum,
+                        min: p.min,
+                        max: p.max,
+                        scale: Some(p.scale),
+                        zero_count: Some(p.zero_count),
+                        zero_threshold: Some(p.zero_threshold),
+                        positive: p
+                            .positive
+                            .as_ref()
+                            .map(|b| (b.offset, b.bucket_counts.as_slice())),
+                        negative: p
+                            .negative
+                            .as_ref()
+                            .map(|b| (b.offset, b.bucket_counts.as_slice())),
+                        ..PointValues::default()
+                    },
+                ),
+                PointRef::Summary(p) => {
+                    let (quantiles, values) = p
+                        .quantile_values
+                        .iter()
+                        .map(|q| (q.quantile, q.value))
+                        .unzip();
+                    builders.append(
+                        &ctx,
+                        p.time_unix_nano,
+                        p.start_time_unix_nano,
+                        &p.attributes,
+                        p.flags,
+                        PointValues {
+                            count: Some(p.count),
+                            sum: Some(p.sum),
+                            quantiles: Some((quantiles, values)),
+                            ..PointValues::default()
+                        },
+                    );
+                }
+            }
+        }
+        builders.finish()
+    }
+}
+
+/// Builds one metrics store batch holding every data point of `request`. Returns `None` when
+/// the export carries no data points. Test helper; ingest uses [`StoreExport::batches`].
+#[cfg(test)]
+fn export_to_store_batch(
+    request: &ExportMetricsServiceRequest,
+) -> Result<Option<RecordBatch>, ArrowError> {
+    let export = StoreExport::new(request);
+    if export.rows() == 0 {
+        return Ok(None);
+    }
+    export.batches(usize::MAX).next().transpose()
+}
+
+fn number_values(value: Option<&Value>) -> PointValues<'static> {
+    match value {
+        Some(Value::AsDouble(d)) => PointValues {
+            value_double: Some(*d),
+            ..PointValues::default()
+        },
+        Some(Value::AsInt(i)) => PointValues {
+            value_int: Some(*i),
+            ..PointValues::default()
+        },
+        None => PointValues::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
+    use opentelemetry_proto::tonic::common::v1::{InstrumentationScope, KeyValueList};
+    use opentelemetry_proto::tonic::metrics::v1::{
+        ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
+        Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
+        exponential_histogram_data_point::Buckets, summary_data_point::ValueAtQuantile,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    fn kv(key: &str, value: any_value::Value) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue { value: Some(value) }),
+            key_strindex: 0,
+        }
+    }
+
+    fn s(key: &str, value: &str) -> KeyValue {
+        kv(key, any_value::Value::StringValue(value.to_string()))
+    }
+
+    fn number_point(time: u64, value: Value, attributes: Vec<KeyValue>) -> NumberDataPoint {
+        NumberDataPoint {
+            attributes,
+            start_time_unix_nano: 0,
+            time_unix_nano: time,
+            exemplars: vec![],
+            flags: 0,
+            value: Some(value),
+        }
+    }
+
+    fn metric(name: &str, unit: &str, data: Data) -> Metric {
+        Metric {
+            name: name.to_string(),
+            description: String::new(),
+            unit: unit.to_string(),
+            metadata: vec![],
+            data: Some(data),
+        }
+    }
+
+    fn request(metrics: Vec<Metric>) -> ExportMetricsServiceRequest {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![s("service.name", "spiced")],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: Some(InstrumentationScope {
+                        name: "runtime".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    metrics,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn all_types_request() -> ExportMetricsServiceRequest {
+        request(vec![
+            metric(
+                "http.server.active_requests",
+                "{request}",
+                Data::Gauge(Gauge {
+                    data_points: vec![number_point(10, Value::AsInt(3), vec![s("route", "/a")])],
+                }),
+            ),
+            metric(
+                "http.server.requests",
+                "{request}",
+                Data::Sum(Sum {
+                    data_points: vec![number_point(
+                        10,
+                        Value::AsDouble(5.0),
+                        vec![s("route", "/a")],
+                    )],
+                    aggregation_temporality: 2,
+                    is_monotonic: true,
+                }),
+            ),
+            metric(
+                "http.server.request.duration",
+                "s",
+                Data::Histogram(Histogram {
+                    data_points: vec![HistogramDataPoint {
+                        attributes: vec![],
+                        start_time_unix_nano: 1,
+                        time_unix_nano: 10,
+                        count: 3,
+                        sum: Some(1.5),
+                        bucket_counts: vec![1, 2, 0],
+                        explicit_bounds: vec![0.1, 1.0],
+                        exemplars: vec![],
+                        flags: 0,
+                        min: Some(0.05),
+                        max: Some(0.9),
+                    }],
+                    aggregation_temporality: 1,
+                }),
+            ),
+            metric(
+                "db.latency",
+                "ms",
+                Data::ExponentialHistogram(ExponentialHistogram {
+                    data_points: vec![ExponentialHistogramDataPoint {
+                        attributes: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 10,
+                        count: 4,
+                        sum: Some(10.0),
+                        scale: 2,
+                        zero_count: 1,
+                        positive: Some(Buckets {
+                            offset: -1,
+                            bucket_counts: vec![1, 2],
+                        }),
+                        negative: None,
+                        flags: 0,
+                        exemplars: vec![],
+                        min: None,
+                        max: None,
+                        zero_threshold: 0.25,
+                    }],
+                    aggregation_temporality: 2,
+                }),
+            ),
+            metric(
+                "rpc.latency",
+                "ms",
+                Data::Summary(Summary {
+                    data_points: vec![SummaryDataPoint {
+                        attributes: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 10,
+                        count: 2,
+                        sum: 3.0,
+                        quantile_values: vec![
+                            ValueAtQuantile {
+                                quantile: 0.5,
+                                value: 1.0,
+                            },
+                            ValueAtQuantile {
+                                quantile: 0.99,
+                                value: 2.0,
+                            },
+                        ],
+                        flags: 0,
+                    }],
+                }),
+            ),
+        ])
+    }
+
+    #[test]
+    fn every_metric_type_lands_in_one_fixed_schema_batch() {
+        let batch = export_to_store_batch(&all_types_request())
+            .expect("batch")
+            .expect("rows");
+        assert_eq!(batch.schema(), *METRICS_STORE_SCHEMA);
+        assert_eq!(batch.num_rows(), 5);
+        let types: Vec<&str> = batch
+            .column_by_name("metric_type")
+            .expect("col")
+            .as_string::<i32>()
+            .iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "gauge",
+                "sum",
+                "histogram",
+                "exponential_histogram",
+                "summary"
+            ]
+        );
+    }
+
+    #[test]
+    fn metric_semantics_are_kept() {
+        let batch = export_to_store_batch(&all_types_request())
+            .expect("batch")
+            .expect("rows");
+        let temporality = batch
+            .column_by_name("temporality")
+            .expect("col")
+            .as_string::<i32>();
+        assert!(temporality.is_null(0));
+        assert_eq!(temporality.value(1), "cumulative");
+        assert_eq!(temporality.value(2), "delta");
+        let monotonic = batch
+            .column_by_name("is_monotonic")
+            .expect("col")
+            .as_boolean();
+        assert!(monotonic.is_null(0));
+        assert!(monotonic.value(1));
+        let unit = batch
+            .column_by_name("unit")
+            .expect("col")
+            .as_string::<i32>();
+        assert_eq!(unit.value(2), "s");
+        let value_int = batch
+            .column_by_name("value_int")
+            .expect("col")
+            .as_primitive::<Int64Type>();
+        assert_eq!(value_int.value(0), 3);
+        assert!(value_int.is_null(1));
+        let value_double = batch
+            .column_by_name("value_double")
+            .expect("col")
+            .as_primitive::<Float64Type>();
+        assert!((value_double.value(1) - 5.0).abs() < f64::EPSILON);
+        let start = batch
+            .column_by_name("start_time_unix_nano")
+            .expect("col")
+            .as_primitive::<UInt64Type>();
+        assert!(start.is_null(0), "0 means unset in OTLP");
+        assert_eq!(start.value(2), 1);
+        let positive = batch
+            .column_by_name("positive_bucket_counts")
+            .expect("col")
+            .as_list::<i32>();
+        assert_eq!(
+            positive
+                .value(3)
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec(),
+            vec![1, 2]
+        );
+        assert!(
+            batch
+                .column_by_name("negative_bucket_counts")
+                .expect("col")
+                .is_null(3)
+        );
+        let quantile_values = batch
+            .column_by_name("quantile_values")
+            .expect("col")
+            .as_list::<i32>();
+        assert_eq!(
+            quantile_values
+                .value(4)
+                .as_primitive::<Float64Type>()
+                .values()
+                .to_vec(),
+            vec![1.0, 2.0]
+        );
+        let resource = batch
+            .column_by_name("resource_attributes")
+            .expect("col")
+            .as_string::<i32>();
+        assert_eq!(resource.value(0), r#"{"service.name":"spiced"}"#);
+    }
+
+    #[test]
+    fn new_attribute_keys_do_not_change_the_schema() {
+        let a = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: vec![number_point(1, Value::AsInt(1), vec![s("a", "1")])],
+            }),
+        )]);
+        let b = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: vec![number_point(
+                    1,
+                    Value::AsInt(1),
+                    vec![s("a", "1"), s("brand_new_key", "x")],
+                )],
+            }),
+        )]);
+        let a = export_to_store_batch(&a).expect("a").expect("rows");
+        let b = export_to_store_batch(&b).expect("b").expect("rows");
+        assert_eq!(a.schema(), b.schema());
+    }
+
+    #[test]
+    fn series_hash_is_stable_across_attribute_order_and_retries() {
+        let one = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: vec![number_point(
+                    1,
+                    Value::AsInt(1),
+                    vec![s("a", "1"), s("b", "2")],
+                )],
+            }),
+        )]);
+        let reordered = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: vec![number_point(
+                    1,
+                    Value::AsInt(1),
+                    vec![s("b", "2"), s("a", "1")],
+                )],
+            }),
+        )]);
+        let hash = |r: &ExportMetricsServiceRequest| {
+            export_to_store_batch(r)
+                .expect("batch")
+                .expect("rows")
+                .column_by_name("series_hash")
+                .expect("col")
+                .as_primitive::<UInt64Type>()
+                .value(0)
+        };
+        assert_eq!(hash(&one), hash(&one));
+        assert_eq!(hash(&one), hash(&reordered));
+    }
+
+    #[test]
+    fn series_hash_distinguishes_every_identity_part() {
+        let base = series_hash("m", b"{}", "s", "1", b"{}", br#"{"a":"1"}"#);
+        assert_ne!(
+            base,
+            series_hash("n", b"{}", "s", "1", b"{}", br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", br#"{"x":1}"#, "s", "1", b"{}", br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "t", "1", b"{}", br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "s", "2", b"{}", br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "s", "1", br#"{"sa":"1"}"#, br#"{"a":"1"}"#)
+        );
+        assert_ne!(
+            base,
+            series_hash("m", b"{}", "s", "1", b"{}", br#"{"a":"2"}"#)
+        );
+        // Length prefixes keep part boundaries from shifting into each other.
+        assert_ne!(
+            series_hash("ab", b"", "", "", b"", b""),
+            series_hash("a", b"b", "", "", b"", b"")
+        );
+    }
+
+    #[test]
+    fn series_hash_distinguishes_attribute_types_whose_json_matches() {
+        let kvlist = |key: &str, value: &str| {
+            any_value::Value::KvlistValue(KeyValueList {
+                values: vec![s(key, value)],
+            })
+        };
+        // Each pair serializes to the same `attributes` JSON but is two series, so it must not
+        // share a `(time_unix_nano, series_hash)` key.
+        let pairs = [
+            (
+                any_value::Value::BytesValue(vec![1, 2]),
+                kvlist("bytes", "AQI="),
+            ),
+            (
+                any_value::Value::DoubleValue(f64::NAN),
+                kvlist("double", "NaN"),
+            ),
+            (
+                any_value::Value::DoubleValue(f64::INFINITY),
+                kvlist("double", "inf"),
+            ),
+        ];
+        for (a, b) in pairs {
+            let req = request(vec![metric(
+                "m",
+                "",
+                Data::Gauge(Gauge {
+                    data_points: vec![
+                        number_point(1, Value::AsInt(1), vec![kv("k", a.clone())]),
+                        number_point(1, Value::AsInt(2), vec![kv("k", b.clone())]),
+                    ],
+                }),
+            )]);
+            let batch = export_to_store_batch(&req).expect("batch").expect("rows");
+            let attributes = batch
+                .column_by_name("attributes")
+                .expect("col")
+                .as_string::<i32>();
+            assert_eq!(attributes.value(0), attributes.value(1), "{a:?} vs {b:?}");
+            let hash = batch
+                .column_by_name("series_hash")
+                .expect("col")
+                .as_primitive::<UInt64Type>();
+            assert_ne!(hash.value(0), hash.value(1), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_attribute_key_keeps_its_last_value() {
+        let repeated = [s("a", "1"), s("b", "x"), s("a", "2"), s("a", "3")];
+        let mut encoded = Vec::new();
+        assert_eq!(
+            serialize_attributes(&repeated, &mut encoded),
+            r#"{"a":"3","b":"x"}"#
+        );
+        let mut expected = Vec::new();
+        encode_attributes(&[s("b", "x"), s("a", "3")], &mut expected);
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn typed_attribute_values_keep_their_json_type() {
+        let json = attributes_to_json_string(&[
+            kv("i", any_value::Value::IntValue(7)),
+            kv("d", any_value::Value::DoubleValue(1.5)),
+            kv("b", any_value::Value::BoolValue(true)),
+            kv("nan", any_value::Value::DoubleValue(f64::NAN)),
+            kv("bytes", any_value::Value::BytesValue(vec![1, 2])),
+        ]);
+        assert_eq!(
+            json,
+            r#"{"b":true,"bytes":{"bytes":"AQI="},"d":1.5,"i":7,"nan":{"double":"NaN"}}"#
+        );
+    }
+
+    #[test]
+    fn exports_are_split_into_bounded_batches() {
+        let points: Vec<NumberDataPoint> = (0..5)
+            .map(|i| number_point(i, Value::AsInt(1), vec![]))
+            .collect();
+        let req = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: points,
+            }),
+        )]);
+        let export = StoreExport::new(&req);
+        let sizes: Vec<usize> = export
+            .batches(2)
+            .map(|b| b.expect("batch").num_rows())
+            .collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn exponential_histogram_zero_threshold_and_flags_are_kept() {
+        let batch = export_to_store_batch(&all_types_request())
+            .expect("batch")
+            .expect("rows");
+        let zero_threshold = batch
+            .column_by_name("zero_threshold")
+            .expect("col")
+            .as_primitive::<Float64Type>();
+        assert!((zero_threshold.value(3) - 0.25).abs() < f64::EPSILON);
+        assert!(zero_threshold.is_null(0));
+        assert!(batch.column_by_name("flags").expect("col").is_valid(0));
+    }
+
+    #[test]
+    fn export_with_no_data_points_builds_no_batch() {
+        assert!(
+            export_to_store_batch(&request(vec![]))
+                .expect("ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn store_param_accepts_only_all() {
+        assert!(is_otlp_metrics_store_param("all"));
+        assert!(is_otlp_metrics_store_param("ALL"));
+        assert!(!is_otlp_metrics_store_param(" all "));
+        assert!(!is_otlp_metrics_store_param("none"));
+        assert!(!is_otlp_metrics_store_param(""));
+    }
+}

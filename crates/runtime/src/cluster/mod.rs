@@ -618,8 +618,8 @@ pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
-pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
+pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 #[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
@@ -793,6 +793,8 @@ pub struct ResolvedClusterConfig {
     scheduler_address_url: Option<Url>,
     /// Advertise address with port stripped (if present in the original input).
     node_advertise_host: Option<String>,
+    /// Instance identity set for this runtime instead of the process-wide one.
+    instance_id: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -949,7 +951,27 @@ impl ResolvedClusterConfig {
             scheduler_url,
             scheduler_address_url,
             node_advertise_host,
+            instance_id: None,
         })
+    }
+
+    /// Sets the instance identity of this runtime, for processes that run several
+    /// cluster nodes, such as integration tests.
+    #[must_use]
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = Some(instance_id.into());
+        self
+    }
+
+    /// The identity this node registers under in shared cluster state:
+    /// [`util::instance_id::instance_id`] unless set with [`Self::with_instance_id`].
+    /// Distinct from the advertise address, which is how other nodes reach it.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        match &self.instance_id {
+            Some(instance_id) => instance_id,
+            None => util::instance_id::instance_id(),
+        }
     }
 
     /// Returns the cluster role.
@@ -1319,7 +1341,10 @@ pub async fn initialize_cluster_executor(
             (hostname, bind_addr.port())
         };
 
-    let executor_id = format!("{advertise_host}:{advertise_port}");
+    let executor_id = rt.df.cluster_config.instance_id().to_string();
+    // Tells the scheduler this process apart from an earlier run under the same
+    // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
+    let process_id = uuid::Uuid::now_v7().to_string();
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
@@ -1581,6 +1606,7 @@ pub async fn initialize_cluster_executor(
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     let control_stream_executor_id = executor_id.clone();
+    let control_stream_process_id = process_id.clone();
     let control_stream_ballista_id = executor_id.clone();
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
@@ -1648,6 +1674,7 @@ pub async fn initialize_cluster_executor(
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
             control_stream_executor_id,
+            control_stream_process_id,
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
@@ -1781,6 +1808,8 @@ pub async fn initialize_cluster_executor(
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
+                    rt.datafusion().cluster_config.instance_id().to_string(),
+                    process_id.clone(),
                     task_ctx.as_ref(),
                 )
                 .await
@@ -2385,6 +2414,13 @@ async fn executor_bind_app(
 
     let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
     let telemetry = app_def.runtime.telemetry.clone();
+    rt.df.set_runtime_state_location(
+        app_def
+            .runtime
+            .state
+            .as_ref()
+            .map(|state| state.location.clone()),
+    );
     *rt.app.write().await = Some(app_def);
 
     // Create a cluster client for secrets. This channel outlives every secret
