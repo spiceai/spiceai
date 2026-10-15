@@ -1694,6 +1694,7 @@ mod tests {
     use datafusion::{
         catalog::TableProvider,
         common::{Constraint, Constraints},
+        error::DataFusionError,
         execution::context::SessionContext,
         logical_expr::{cast, col, lit},
         physical_plan::collect,
@@ -1891,15 +1892,19 @@ mod tests {
             ),
             ("value", vec!["a", "b", "c"]),
         ]);
+        let err = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await
+            .expect_err("MemTable::try_with_constraints should check constraints on initial data");
         assert!(
-            MemTable::try_new(schema, vec![vec![rb]])
-                .expect("mem table should be created")
-                .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
-                    vec![0],
-                )]))
-                .await
-                .is_err(),
-            "MemTable::try_with_constraints should check constraints on initial data"
+            matches!(
+                &err,
+                DataFusionError::Execution(message) if message == "Primary key values must be unique"
+            ),
+            "the repeated primary key '1970-01-01' must be rejected as not unique, got: {err:?}"
         );
 
         // Unique constraint
@@ -1910,15 +1915,19 @@ mod tests {
             ),
             ("value", vec!["a", "b", "c"]),
         ]);
+        let err = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                0,
+            ])]))
+            .await
+            .expect_err("MemTable::try_with_constraints should check constraints on initial data");
         assert!(
-            MemTable::try_new(schema, vec![vec![rb]])
-                .expect("mem table should be created")
-                .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
-                    0
-                ],)]))
-                .await
-                .is_err(),
-            "MemTable::try_with_constraints should check constraints on initial data"
+            matches!(
+                &err,
+                DataFusionError::Execution(message) if message == "Primary key values must be unique"
+            ),
+            "the repeated unique value '1970-01-01' must be rejected as not unique, got: {err:?}"
         );
 
         // Unique constraint, nullity is not checked.
@@ -1929,15 +1938,21 @@ mod tests {
             ),
             ("value", vec![Some("a"), Some("b"), Some("c")]),
         ]);
-        assert!(
-            MemTable::try_new(schema, vec![vec![rb]])
-                .expect("mem table should be created")
-                .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
-                    0
-                ],)]))
-                .await
-                .is_ok(),
-            "MemTable::try_with_constraints should not check nullity on [`Constraint::Unique`]."
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::Unique(vec![
+                0,
+            ])]))
+            .await
+            .expect(
+                "MemTable::try_with_constraints should not check nullity on [`Constraint::Unique`].",
+            );
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::new_unverified(vec![Constraint::Unique(
+                vec![0]
+            )])),
+            "the accepted unique constraint must be applied to the table"
         );
     }
 
@@ -2545,16 +2560,20 @@ mod tests {
             ("value", vec![Some("a"), Some("b"), Some("c")]),
         ]);
 
-        let result = MemTable::try_new(schema, vec![vec![rb]])
+        let err = MemTable::try_new(schema, vec![vec![rb]])
             .expect("mem table should be created")
             .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
                 vec![0],
             )]))
-            .await;
+            .await
+            .expect_err("should reject null values in primary key column");
 
         assert!(
-            result.is_err(),
-            "should reject null values in primary key column"
+            matches!(
+                &err,
+                DataFusionError::Execution(message) if message == "Primary key values must be non-null"
+            ),
+            "the NULL primary key must be rejected as a null key, not a uniqueness or schema error, got: {err:?}"
         );
     }
 
@@ -3109,7 +3128,7 @@ mod tests {
             arrow::datatypes::Field::new("value", DataType::Utf8, false), // Different type
         ]));
 
-        let _batch1 = RecordBatch::try_new(
+        let batch1 = RecordBatch::try_new(
             Arc::clone(&schema1),
             vec![
                 Arc::new(StringArray::from(vec!["1", "2"])),
@@ -3127,8 +3146,20 @@ mod tests {
         )
         .expect("batch should be created");
 
-        let result = MemTable::try_new(schema1, vec![vec![batch2]]);
-        assert!(result.is_err(), "should fail with mismatched schema");
+        // Control: a batch of the table's own schema is accepted, so the rejection below is
+        // caused by the mismatched `value` type and not by the check refusing every batch.
+        MemTable::try_new(Arc::clone(&schema1), vec![vec![batch1]])
+            .expect("a batch matching the table schema should be accepted");
+
+        let err = MemTable::try_new(schema1, vec![vec![batch2]])
+            .expect_err("should fail with mismatched schema");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Plan(message) if message == "Mismatch between schema and batches"
+            ),
+            "a batch whose `value` column is Utf8 instead of Int32 must be rejected as a schema mismatch, got: {err:?}"
+        );
     }
 
     #[tokio::test]

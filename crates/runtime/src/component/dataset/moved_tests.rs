@@ -553,8 +553,31 @@ mod declared_schema_tests {
 
     #[tokio::test]
     async fn invalid_type_returns_error() {
+        use crate::component::dataset::declared_schema::DeclaredSchemaError;
+        use crate::component::dataset::declared_type::ParseTypeError;
+
         let ds = dataset_with_columns(vec![Column::new("bad").with_type("not_a_type")]).await;
-        let result = declared_schema_for(&ds);
-        assert!(result.is_err(), "expected error, got {result:?}");
+        let err = declared_schema_for(&ds).expect_err("an unknown column type must be rejected");
+        assert!(
+            matches!(
+                &err,
+                DeclaredSchemaError::InvalidColumnType { dataset, column, source }
+                    if dataset == "tbl"
+                        && column == "bad"
+                        && matches!(
+                            source.as_ref(),
+                            ParseTypeError::Unrecognized { input } if input == "not_a_type"
+                        )
+            ),
+            "expected InvalidColumnType for column `bad` of dataset `tbl`, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Could not parse declared type for column `bad` of dataset `tbl`: \
+             Could not parse column type `not_a_type`. Accepted forms include Postgres types \
+             (e.g. `bigint`, `text`, `numeric(18,4)`, `timestamptz`, `text[]`), Arrow display \
+             forms (e.g. `Int64`, `Utf8`, `Timestamp(Nanosecond, UTC)`, `List<Int64>`, \
+             `Decimal128(18, 4)`), and Map types (`Map<K, V>` / `map<k, v>`)."
+        );
     }
 }

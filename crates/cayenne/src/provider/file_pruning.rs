@@ -202,14 +202,30 @@ pub(crate) fn statistics_from_record_batches(
             let mut min_value = datafusion_common::stats::Precision::Absent;
             let mut max_value = datafusion_common::stats::Precision::Absent;
             let mut null_count = 0usize;
+            // A batch with a non-null value but no bound (a float column holding a
+            // NaN, say) leaves the bound unknown, rather than contributing nothing.
+            let mut unbounded = false;
 
             for batch in batches {
                 if col_idx >= batch.num_columns() || batch.num_rows() == 0 {
                     continue;
                 }
                 let col = batch.column(col_idx);
-                null_count += col.null_count();
+                let col_nulls = col.null_count();
+                null_count += col_nulls;
+                if unbounded {
+                    continue;
+                }
                 let col_stats = ColumnStatsAccumulator::compute_column_stats(col.as_ref());
+                if col_nulls < col.len()
+                    && (col_stats.min_value.get_value().is_none()
+                        || col_stats.max_value.get_value().is_none())
+                {
+                    unbounded = true;
+                    min_value = datafusion_common::stats::Precision::Absent;
+                    max_value = datafusion_common::stats::Precision::Absent;
+                    continue;
+                }
                 min_value = merge_min(&min_value, &col_stats.min_value);
                 max_value = merge_max(&max_value, &col_stats.max_value);
             }

@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:
@@ -106,6 +106,16 @@ on:
         required: false
         type: boolean
         default: true
+      postgres_version:
+        description: 'PostgreSQL release line of the local source: postgres_tpch (TPC-H/TPC-DS SF1/SF10) or the CH-benCH source; one of its versions in test/source_versions.json'
+        required: false
+        type: string
+        default: '16'
+      layout:
+        description: 'Acceleration layout to configure on every accelerated dataset (testoperator --layout): features from primary_key, indexes, sort, cluster, time_column, partition, joined by commas; empty = the spicepod as written'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   run-bench:
@@ -136,7 +146,7 @@ jobs:
       # postgres-source configs, which read the pre-loaded hits data on the
       # hosted cluster (too large to seed inline).
       postgres_tpch:
-        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && 'postgres:16' || '' }}
+        image: ${{ (contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') && (((startsWith(github.event.inputs.query_set, 'tpch') || github.event.inputs.query_set == 'tpcds') && (github.event.inputs.scale_factor == '1' || github.event.inputs.scale_factor == '10')) || (github.event.inputs.query_set == 'clickbench' && contains(github.event.inputs.spicepod_path, 's3[parquet]-postgres')))) && format('postgres:{0}', github.event.inputs.postgres_version || '16') || '' }}
         ports:
           - 5432:5432
         env:
@@ -188,6 +198,18 @@ jobs:
           fi
 
           echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      # The postgres_tpch service has already started by now; this refuses a line
+      # the version list does not carry (a typo, or a retired release) before any
+      # result is reported against it.
+      - name: Check the PostgreSQL version is supported
+        env:
+          POSTGRES_VERSION: ${{ github.event.inputs.postgres_version || '16' }}
+        run: |
+          if ! jq -e --arg v "${POSTGRES_VERSION}" '.postgres.versions | map(.version) | index($v)' test/source_versions.json > /dev/null; then
+            echo "::error::PostgreSQL ${POSTGRES_VERSION} is not a supported version; use one of: $(jq -r '[.postgres.versions[].version] | join(", ")' test/source_versions.json)"
+            exit 1
+          fi
 
       - name: Validate spicepod file exists
         run: |
@@ -308,7 +330,7 @@ jobs:
             exit 0
           fi
 
-          # SF1/SF10 always run against the self-contained postgres:16 service
+          # SF1/SF10 always run against the self-contained postgres_tpch service
           # container (PGHOST=127.0.0.1), so generating fresh data inline is
           # cheap and expected. Anything larger targets the shared hosted
           # cluster - generating+loading that inline risks a multi-hour job
@@ -347,7 +369,7 @@ jobs:
           echo "Seed complete: $DB_NAME on $PGHOST."
 
       # Postgres-accelerator spicepods need a *_accelerated database that the
-      # empty postgres:16 container doesn't have yet - create it before spiced
+      # empty postgres_tpch container doesn't have yet - create it before spiced
       # starts (idempotent), matching the PGHOST the spicepod will connect to.
       - name: Create postgres acceleration databases
         if: ${{ contains(github.event.inputs.spicepod_path, 'postgres') && !contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -407,6 +429,8 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         if: ${{ github.event.inputs.query_set == 'chbench' }}
         uses: ./.github/actions/setup-chbench-postgres
+        with:
+          version: ${{ github.event.inputs.postgres_version || '16' }}
 
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
@@ -571,9 +595,11 @@ jobs:
             --disable-progress-bars \
             --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
+            ${LAYOUT:+--layout "$LAYOUT"} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
+          LAYOUT: ${{ github.event.inputs.layout }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}

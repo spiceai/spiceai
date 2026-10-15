@@ -215,6 +215,26 @@ impl Display for Mode {
     }
 }
 
+/// Whether a registration may rebuild an existing acceleration whose stored table was
+/// built with settings it cannot adopt in place
+/// ([`Acceleration::rebuilds_on_settings_change`]). Runtime state, never configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsRebuild {
+    /// The storage and refresh modes decide.
+    #[default]
+    Allowed,
+    /// The source cannot be read on the schema the existing acceleration was built with
+    /// — it is unreachable, or the dataset's `on_schema_change` policy holds back its
+    /// schema change — so the runtime keeps serving that acceleration. A rebuilt table
+    /// could not reload until the source can be read again, so the stored settings are
+    /// kept meanwhile.
+    HeldUntilSourceReadable,
+    /// The caller has no way to rebuild the acceleration (an Iceberg DDL table, whose
+    /// acceleration its `CREATE TABLE` creates), so a stored table keeps the settings it
+    /// was built with, as under a refresh mode a reload cannot restore.
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageProfile {
     #[default]
@@ -572,6 +592,11 @@ pub struct Acceleration {
     pub snapshots_reset_expiry_on_load_enabled: bool,
 
     pub snapshots_creation_policy: SnapshotsCreationPolicy,
+
+    /// Whether this registration may rebuild the existing acceleration for changed
+    /// settings. Runtime state set for a single registration, never configured; see
+    /// [`SettingsRebuild`].
+    pub settings_rebuild: SettingsRebuild,
 }
 
 /// What durable write-back has to deliver on, given a primary key's columns.
@@ -630,6 +655,37 @@ impl Acceleration {
             .filter(|location| !location.is_empty())
     }
 
+    /// Whether an existing acceleration whose stored table was built with settings it
+    /// cannot adopt in place — a different primary key or partitioning, for example — may
+    /// be rebuilt from the source with the current settings, rather than kept with the
+    /// settings it was built with, judged from the storage and refresh modes alone. A
+    /// source's own answer also depends on its connector:
+    /// [`crate::acceleration_source::rebuilds_on_settings_change`].
+    ///
+    /// `refresh_mode` is the mode the dataset runs with
+    /// ([`crate::acceleration_source::resolved_refresh_mode`]), not the raw field.
+    ///
+    /// Only `refresh_mode: full`, in a storage mode that keeps a table across restarts
+    /// (`file` or `file_update`), with `write_mode: write_through`, qualifies: every full
+    /// refresh rewrites every row from the source, and every acknowledged write is in the
+    /// source too, so dropping the stored rows loses nothing a reload does not bring back.
+    /// Every other refresh mode can hold rows a reload would not bring back — an append
+    /// window, or a change stream that resumes from a position recorded outside the table
+    /// and so never re-delivers what was dropped — as can `write_mode: acceleration`, whose
+    /// writes never reach the source, and `write_mode: write_back`, whose writes reach it
+    /// only once delivered. `mode: memory` and `mode: file_create` keep no table across a
+    /// restart.
+    ///
+    /// A registration that cannot read its source on the acceleration's schema never
+    /// rebuilds ([`SettingsRebuild::HeldUntilSourceReadable`]).
+    #[must_use]
+    pub fn rebuilds_on_settings_change(&self, refresh_mode: RefreshMode) -> bool {
+        self.settings_rebuild == SettingsRebuild::Allowed
+            && matches!(self.mode, Mode::File | Mode::FileUpdate)
+            && refresh_mode == RefreshMode::Full
+            && self.write_mode == spicepod_acceleration::WriteMode::WriteThrough
+    }
+
     #[must_use]
     pub fn with_primary_key(mut self, primary_key: ColumnReference) -> Self {
         self.primary_key = Some(primary_key);
@@ -646,8 +702,13 @@ impl Acceleration {
     }
 
     /// Returns whether this configuration resolves to durable federated
-    /// write-back: a Cayenne `write_mode: write_back` dataset that declares an
-    /// `on_conflict` key and is CDC-fed (`refresh_mode: changes`).
+    /// write-back: a Cayenne `write_mode: write_back` dataset that is CDC-fed
+    /// (`refresh_mode: changes`).
+    ///
+    /// `on_conflict` plays no part: Cayenne keeps one row per primary key
+    /// whatever it says, and a transactional commit records its markers from the
+    /// keys it validated against that primary key. The key itself is judged at
+    /// registration over the declared `primary_key`.
     ///
     /// Such a dataset marks every committed write's primary keys so a delivery
     /// worker can reconcile them to the federated source. Delivery mutates the
@@ -672,12 +733,9 @@ impl Acceleration {
     /// cannot come to mean one thing to the check and another to what the user is
     /// told to add. Naming the settings only — the sentence around them belongs to
     /// the error that renders it.
-    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 3] {
+    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 2] {
         [
             (self.engine != Engine::Cayenne).then_some("acceleration.engine: cayenne"),
-            self.on_conflict
-                .is_empty()
-                .then_some("an 'acceleration.on_conflict' upsert on the primary key"),
             (self.refresh_mode != Some(RefreshMode::Changes))
                 .then_some("acceleration.refresh_mode: changes"),
         ]
@@ -1127,6 +1185,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 spicepod_acceleration::SnapshotsResetExpiryOnLoad::Enabled
             ),
             snapshots_creation_policy: acceleration.snapshots_creation_policy,
+            settings_rebuild: SettingsRebuild::default(),
         })
     }
 }
@@ -1173,6 +1232,7 @@ impl Default for Acceleration {
             snapshots_compaction: SnapshotsCompaction::Disabled,
             snapshots_reset_expiry_on_load_enabled: false,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
+            settings_rebuild: SettingsRebuild::default(),
         }
     }
 }
@@ -2109,15 +2169,9 @@ mod tests {
 
     /// The exact configuration that turns durable federated write-back on.
     fn durable_write_back_acceleration() -> Acceleration {
-        let mut on_conflict = HashMap::new();
-        on_conflict.insert(
-            ColumnReference::try_from("id").expect("valid column reference"),
-            OnConflictBehavior::Upsert(UpsertOptions::default()),
-        );
         Acceleration {
             engine: Engine::Cayenne,
             write_mode: spicepod_acceleration::WriteMode::WriteBack,
-            on_conflict,
             refresh_mode: Some(RefreshMode::Changes),
             ..Acceleration::default()
         }
@@ -2149,6 +2203,29 @@ mod tests {
         assert!(durable_write_back_acceleration().resolves_to_durable_write_back());
     }
 
+    /// Regression test for #14886: Cayenne keeps one row per primary key without
+    /// `on_conflict`, so write-back must neither require it nor change its answer
+    /// when it is set.
+    #[test]
+    fn durable_write_back_does_not_depend_on_on_conflict() {
+        let without = durable_write_back_acceleration();
+        assert!(without.on_conflict.is_empty());
+        assert!(without.resolves_to_durable_write_back());
+        assert_eq!(without.unmet_durable_write_back_prerequisites(), None);
+
+        let mut on_conflict = HashMap::new();
+        on_conflict.insert(
+            ColumnReference::try_from("id").expect("valid column reference"),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
+        );
+        let with = Acceleration {
+            on_conflict,
+            ..durable_write_back_acceleration()
+        };
+        assert!(with.resolves_to_durable_write_back());
+        assert_eq!(with.unmet_durable_write_back_prerequisites(), None);
+    }
+
     /// Every conjunct must be load-bearing: if dropping one still reports
     /// durable write-back, the registration gate would fire on datasets that
     /// never mark keys (or, worse, stay silent on ones that do).
@@ -2170,15 +2247,6 @@ mod tests {
         assert!(
             !not_write_back.resolves_to_durable_write_back(),
             "write-through commits to the source directly, with no delivery worker"
-        );
-
-        let no_on_conflict = Acceleration {
-            on_conflict: HashMap::new(),
-            ..durable_write_back_acceleration()
-        };
-        assert!(
-            !no_on_conflict.resolves_to_durable_write_back(),
-            "without on_conflict there is no key to reconcile"
         );
 
         for refresh_mode in [
@@ -2214,5 +2282,72 @@ mod tests {
             !Acceleration::default().resolves_to_durable_write_back(),
             "the gate must not fire on ordinary datasets"
         );
+    }
+
+    /// Every storage mode against every refresh mode. A `true` where a reload cannot
+    /// bring every stored row back drops rows that exist nowhere else, so the table is
+    /// exhaustive rather than sampled.
+    #[test]
+    fn rebuilds_on_settings_change_only_where_a_reload_restores_every_row() {
+        let refresh_modes = [
+            RefreshMode::Disabled,
+            RefreshMode::Full,
+            RefreshMode::Append,
+            RefreshMode::Changes,
+            RefreshMode::Caching,
+            RefreshMode::Snapshot,
+        ];
+        let cases = [
+            (Mode::Memory, [false, false, false, false, false, false]),
+            (Mode::FileCreate, [false, false, false, false, false, false]),
+            (Mode::File, [false, true, false, false, false, false]),
+            (Mode::FileUpdate, [false, true, false, false, false, false]),
+        ];
+        for (mode, expected) in cases {
+            let acceleration = Acceleration {
+                mode,
+                ..Acceleration::default()
+            };
+            let held = Acceleration {
+                settings_rebuild: SettingsRebuild::HeldUntilSourceReadable,
+                ..acceleration.clone()
+            };
+            let unsupported = Acceleration {
+                settings_rebuild: SettingsRebuild::Unsupported,
+                ..acceleration.clone()
+            };
+            // Writes that only the acceleration holds, for good or until delivered, are
+            // rows no reload brings back, whatever the refresh mode.
+            let writes_only_here = [
+                spicepod_acceleration::WriteMode::Acceleration,
+                spicepod_acceleration::WriteMode::WriteBack,
+            ]
+            .map(|write_mode| Acceleration {
+                write_mode,
+                ..acceleration.clone()
+            });
+            for (refresh_mode, expected) in refresh_modes.iter().zip(expected) {
+                assert_eq!(
+                    acceleration.rebuilds_on_settings_change(*refresh_mode),
+                    expected,
+                    "mode: {mode}, refresh_mode: {refresh_mode:?}"
+                );
+                assert!(
+                    !held.rebuilds_on_settings_change(*refresh_mode),
+                    "a source that cannot be read holds the rebuild: mode: {mode}, refresh_mode: {refresh_mode:?}"
+                );
+                assert!(
+                    !unsupported.rebuilds_on_settings_change(*refresh_mode),
+                    "a caller with no rebuild path keeps the stored settings: mode: {mode}, refresh_mode: {refresh_mode:?}"
+                );
+                for writes in &writes_only_here {
+                    assert!(
+                        !writes.rebuilds_on_settings_change(*refresh_mode),
+                        "write_mode: {:?} keeps writes a reload would not bring back: mode: {mode}, refresh_mode: {refresh_mode:?}",
+                        writes.write_mode
+                    );
+                }
+            }
+        }
     }
 }

@@ -1,0 +1,5 @@
+---
+source: crates/runtime-search/src/request.rs
+expression: "run_parse_additional_columns(&[\"table.\\\"column with spaces\\\"\"]).as_str()"
+---
+[Column { relation: Some(Bare { table: "table" }), name: "column with spaces" }]

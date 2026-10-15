@@ -161,6 +161,10 @@ runtime = "runtime"
 # interface crates a connector needs (data-connector-api) name a component's
 # configuration without pulling in the orchestrator.
 runtime-component = "shared-utility"
+# Builds the object store behind a shared-state location (`runtime.state`,
+# scheduler, rate control, warmup, snapshots). Below `runtime` so the snapshot
+# code in `runtime-acceleration` builds its store the same way.
+runtime-state-location = "shared-utility"
 # The data-connector contract: the `DataConnector` trait and its factory, the
 # link-time registration, the `ConnectorParams`/`ConnectorContext` a connector is
 # handed, the listing-table connector, and the parameter validators. Below
@@ -312,7 +316,7 @@ yaml = "foundation"
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
 #   datafusion-optimizer-rules, evaluate-chat, llms, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
-#   runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
+#   runtime-decide, runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
 #   runtime-secrets, runtime-table-partition, runtime-tools, search,
 #   test-framework, workers
 #

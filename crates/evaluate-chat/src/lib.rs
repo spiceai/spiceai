@@ -17,7 +17,7 @@ limitations under the License.
 //! Answers System One evaluations with any chat model.
 //!
 //! [`ChatEvaluator`] implements [`Evaluate`] on top of a [`Chat`] model, so
-//! `POST /v1/evaluate` works with every chat model a Spicepod configures, not only
+//! `POST /v1/decisions` and the SQL decision functions work with every chat model a Spicepod configures, not only
 //! System One models such as `TypeSafe` Jev. Each evaluation:
 //!
 //! 1. builds a JSON schema from the typed questions (see `schema`), pinning every
@@ -39,6 +39,7 @@ limitations under the License.
 //! (<https://github.com/typesafe-ai/system-one-adapter-python>, MIT License; see
 //! `NOTICE` in this crate), so results can be compared with that adapter's.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -46,14 +47,16 @@ use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, ResponseFormat,
-    ResponseFormatJsonSchema,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, ReasoningEffort,
+    ResponseFormat, ResponseFormatJsonSchema,
 };
 use async_trait::async_trait;
-use chat_api::Chat;
+use chat_api::{ApiErrorKind, Chat};
 use evaluate_api::{
-    Error, Evaluate, EvaluateRequest, EvaluateResponse, Question, Result, Usage, check_answers,
+    Answer, Error, Evaluate, EvaluateRequest, EvaluateResponse, Question, Result, Usage,
+    check_answers,
 };
+use runtime_rate_control::{Permit, RateController};
 
 mod decode;
 mod prompt;
@@ -122,6 +125,9 @@ pub struct ChatEvaluator {
     name: String,
     chat: Arc<dyn Chat>,
     options: ChatEvaluatorOptions,
+    /// Taken for every request sent to the chat model, a corrective retry included, so
+    /// the model's `max_concurrency` and `requests_per_minute_limit` count each one.
+    rate_controller: Option<Arc<RateController>>,
 }
 
 impl Debug for ChatEvaluator {
@@ -141,13 +147,37 @@ impl ChatEvaluator {
             name: name.into(),
             chat,
             options: ChatEvaluatorOptions::default(),
+            rate_controller: None,
         }
+    }
+
+    /// Takes a permit from `rate_controller` for every request sent to the chat model.
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
+        self.rate_controller = Some(rate_controller);
+        self
     }
 
     #[must_use]
     pub fn with_options(mut self, options: ChatEvaluatorOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Waits for the permit to send one request to the chat model; `None` when the
+    /// evaluator has no rate controller.
+    async fn rate_permit(&self) -> Result<Option<Permit>> {
+        let Some(rate_controller) = &self.rate_controller else {
+            return Ok(None);
+        };
+        rate_controller
+            .acquire()
+            .await
+            .map(Some)
+            .map_err(|e| Error::RatePermitFailed {
+                model: self.name.clone(),
+                source: Box::new(e),
+            })
     }
 
     fn ensure_answerable(&self, request: &EvaluateRequest) -> Result<()> {
@@ -157,16 +187,16 @@ impl ChatEvaluator {
                 message: "questions map must contain at least one question".to_string(),
             });
         }
-        // A choice needs something to choose between. Score rubrics are held to two
-        // levels when the request is read.
+        // A choice needs something to choose. Score rubrics are held to two levels when
+        // the request is read.
         for (id, question) in &request.questions {
             if let Question::Choice { criteria, .. } = question
-                && criteria.len() < 2
+                && criteria.is_empty()
             {
                 return Err(Error::InvalidRequest {
                     model: self.name.clone(),
                     message: format!(
-                        "choice question '{id}' needs at least two options in `criteria`"
+                        "choice question '{id}' needs at least one option in `criteria`"
                     ),
                 });
             }
@@ -206,8 +236,23 @@ impl Evaluate for ChatEvaluator {
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse> {
         self.ensure_answerable(&request)?;
         let EvaluateRequest {
-            state, questions, ..
+            state,
+            mut questions,
+            reasoning_effort,
+            ..
         } = request;
+        let foregone: BTreeMap<String, Answer> = questions
+            .iter()
+            .filter_map(|(id, question)| Some((id.clone(), question.foregone_answer()?)))
+            .collect();
+        questions.retain(|id, _| !foregone.contains_key(id));
+        if questions.is_empty() {
+            return Ok(EvaluateResponse {
+                model: self.name.clone(),
+                answers: foregone,
+                usage: Some(Usage::default()),
+            });
+        }
         let ChatEvaluatorOptions {
             answer_mode,
             output_mode,
@@ -237,7 +282,7 @@ impl Evaluate for ChatEvaluator {
                 json_schema: ResponseFormatJsonSchema {
                     name: "evaluation".to_string(),
                     description: None,
-                    schema: Some(schema),
+                    schema,
                     strict: Some(true),
                 },
             },
@@ -245,28 +290,31 @@ impl Evaluate for ChatEvaluator {
 
         // Every attempt is billed, so usage is the total across them. A count some
         // attempt did not report makes the total unknown rather than too low.
-        let mut usage = Some(Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-        });
+        let mut usage = Some(Usage::default());
         let mut corrective_retries = 0;
         loop {
+            let _permit = self.rate_permit().await?;
+            let mut completion = CreateChatCompletionRequest {
+                model: self.name.clone(),
+                messages: messages.clone(),
+                // Always set, so a `response_format` default configured on the chat
+                // model cannot replace the one this evaluation needs.
+                response_format: Some(response_format.clone()),
+                ..Default::default()
+            };
+            if let Some(effort) = reasoning_effort {
+                completion.reasoning_effort = Some(chat_reasoning_effort(effort));
+            }
             let response = self
                 .chat
-                .chat_request(CreateChatCompletionRequest {
-                    model: self.name.clone(),
-                    messages: messages.clone(),
-                    // Always set, so a `response_format` default configured on the chat
-                    // model cannot replace the one this evaluation needs.
-                    response_format: Some(response_format.clone()),
-                    ..Default::default()
-                })
+                .chat_request(completion)
                 .await
                 .map_err(|e| chat_error(&self.name, e))?;
             usage = match (usage, response.usage.as_ref()) {
                 (Some(total), Some(reported)) => Some(Usage {
                     input_tokens: total.input_tokens + u64::from(reported.prompt_tokens),
                     output_tokens: total.output_tokens + u64::from(reported.completion_tokens),
+                    ..Usage::default()
                 }),
                 _ => None,
             };
@@ -274,12 +322,13 @@ impl Evaluate for ChatEvaluator {
 
             match decode::parse_reply(&reply, &questions, answer_mode) {
                 Ok(answers) => {
-                    let response = EvaluateResponse {
+                    let mut response = EvaluateResponse {
                         model: self.name.clone(),
                         answers,
                         usage,
                     };
                     check_answers(&self.name, &questions, &response)?;
+                    response.answers.extend(foregone);
                     return Ok(response);
                 }
                 Err(problem) if corrective_retries < max_corrective_retries => {
@@ -315,6 +364,11 @@ impl Evaluate for ChatEvaluator {
                 source: Box::new(e),
             })
     }
+
+    /// A chat model answers through a prompt; it is not a decision model.
+    fn is_decision_model(&self) -> bool {
+        false
+    }
 }
 
 /// Maps a chat model's failure onto the evaluation error with the same meaning: a
@@ -322,38 +376,30 @@ impl Evaluate for ChatEvaluator {
 /// reached is unavailable (as a System One provider's transport failure is). Anything
 /// else is a failed call.
 ///
-/// Discriminators live in `code` (OpenAI-shaped) or `type` (Anthropic type-only
-/// `ApiError`s such as `authentication_error` / `permission_error` /
-/// `rate_limit_error`). Both are matched so `/v1/evaluate` can return 401/403/429
-/// instead of 500.
+/// The kind is read by [`ApiErrorKind::of`], the same reading `/v1/chat/completions`
+/// takes of the same failure.
 fn chat_error(model: &str, error: OpenAIError) -> Error {
     let model = model.to_string();
     match error {
         OpenAIError::InvalidArgument(message) => Error::InvalidRequest { model, message },
-        OpenAIError::ApiError(api) => match (api.code.as_deref(), api.r#type.as_deref()) {
-            (Some("invalid_request_error"), _) | (_, Some("invalid_request_error")) => {
-                Error::InvalidRequest {
-                    model,
-                    message: api.message,
-                }
-            }
-            (Some("invalid_api_key"), _) | (_, Some("authentication_error")) => {
-                Error::AuthenticationFailed {
-                    model,
-                    message: api.message,
-                }
-            }
-            (_, Some("permission_error")) => Error::PermissionDenied {
+        OpenAIError::ApiError(api) => match ApiErrorKind::of(&api) {
+            Some(ApiErrorKind::InvalidRequest) => Error::InvalidRequest {
                 model,
                 message: api.message,
             },
-            (Some("rate_limit_exceeded"), _) | (_, Some("rate_limit_error")) => {
-                Error::RateLimited {
-                    model,
-                    message: api.message,
-                }
-            }
-            _ => Error::ModelCallFailed {
+            Some(ApiErrorKind::Authentication) => Error::AuthenticationFailed {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::PermissionDenied) => Error::PermissionDenied {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::RateLimited) => Error::RateLimited {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::InsufficientQuota) | None => Error::ModelCallFailed {
                 model,
                 source: Box::new(OpenAIError::ApiError(api)),
             },
@@ -366,6 +412,17 @@ fn chat_error(model: &str, error: OpenAIError) -> Error {
             model,
             source: Box::new(other),
         },
+    }
+}
+
+fn chat_reasoning_effort(effort: evaluate_api::ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        evaluate_api::ReasoningEffort::None => ReasoningEffort::None,
+        evaluate_api::ReasoningEffort::Minimal => ReasoningEffort::Minimal,
+        evaluate_api::ReasoningEffort::Low => ReasoningEffort::Low,
+        evaluate_api::ReasoningEffort::Medium => ReasoningEffort::Medium,
+        evaluate_api::ReasoningEffort::High => ReasoningEffort::High,
+        evaluate_api::ReasoningEffort::Xhigh => ReasoningEffort::Xhigh,
     }
 }
 
@@ -482,6 +539,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sends_reasoning_effort_when_the_request_sets_one() {
+        let chat = ScriptedChat::new([Ok(reply(&valid_answers()))]);
+        let evaluator = evaluator(&chat);
+        let mut request = request();
+        request.reasoning_effort = Some(evaluate_api::ReasoningEffort::Low);
+
+        evaluator.evaluate(request).await.expect("evaluation");
+
+        let sent = chat.requests().into_iter().next().expect("one request");
+        assert_eq!(sent.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[tokio::test]
     async fn answers_every_question_from_one_reply() {
         let chat = ScriptedChat::new([Ok(reply(&valid_answers()))]);
         let evaluator = evaluator(&chat);
@@ -493,7 +563,8 @@ mod tests {
             response.usage,
             Some(Usage {
                 input_tokens: 100,
-                output_tokens: 20
+                output_tokens: 20,
+                ..Usage::default()
             })
         );
         assert_eq!(
@@ -521,6 +592,10 @@ mod tests {
         assert!(
             sent.tools.is_none(),
             "an evaluation offers the model no tools"
+        );
+        assert!(
+            sent.reasoning_effort.is_none(),
+            "an unset effort stays unset so the model setting applies"
         );
         let [system, document] = sent.messages.as_slice() else {
             panic!(
@@ -554,7 +629,8 @@ mod tests {
             response.usage,
             Some(Usage {
                 input_tokens: 200,
-                output_tokens: 40
+                output_tokens: 40,
+                ..Usage::default()
             }),
             "usage totals every attempt"
         );
@@ -572,6 +648,28 @@ mod tests {
             "The previous response did not match the required schema: question 'team': the probabilities sum to 1.200, but they must sum to 1\n\
              Return a single JSON object that matches the schema exactly, with no other text."
         );
+    }
+
+    /// A corrective retry is a second request to the provider, so it takes a second
+    /// permit and counts against `requests_per_minute_limit`.
+    #[tokio::test]
+    async fn every_request_takes_a_rate_permit() {
+        let malformed = json!({"answers": {
+            "is_urgent": 0.9,
+            "team": {"billing": 0.9, "technical": 0.3},
+            "tone": {"0": 0.1, "1": 0.6, "2": 0.3}
+        }});
+        let chat = ScriptedChat::new([Ok(reply(&malformed)), Ok(reply(&valid_answers()))]);
+        let rate_controller = RateController::builder().build();
+        let evaluator = evaluator(&chat).with_rate_controller(Arc::clone(&rate_controller));
+
+        evaluator
+            .evaluate(request())
+            .await
+            .expect("corrected evaluation");
+
+        assert_eq!(chat.requests().len(), 2);
+        assert_eq!(rate_controller.metrics().permits_acquired_total(), 2);
     }
 
     #[tokio::test]
@@ -697,7 +795,7 @@ mod tests {
             );
         };
         assert_eq!(json_schema.strict, Some(true));
-        let schema = json_schema.schema.as_ref().expect("schema");
+        let schema = &json_schema.schema;
         assert_eq!(
             schema["properties"]["answers"]["required"],
             json!(["is_urgent", "team", "tone"])
@@ -732,8 +830,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_choice_with_one_option_is_an_invalid_request() {
-        let chat = ScriptedChat::new([]);
+    async fn a_choice_with_one_option_is_answered_without_the_model() {
+        let chat = ScriptedChat::new([Ok(reply(&valid_answers()))]);
         let evaluator = evaluator(&chat);
         let mut request = request();
         request.questions.insert(
@@ -742,16 +840,19 @@ mod tests {
                 .expect("question"),
         );
 
-        let error = evaluator.evaluate(request).await.expect_err("one option");
+        let response = evaluator.evaluate(request).await.expect("evaluation");
 
-        assert!(
-            matches!(&error, Error::InvalidRequest { message, .. } if message.contains("'only' needs at least two options")),
-            "{error:?}"
+        assert_eq!(
+            response.answers.get("only"),
+            Some(&Answer::Choice {
+                choice: "yes".to_string(),
+                probabilities: BTreeMap::from([("yes".to_string(), 1.0)]),
+                confidence: 1.0,
+            })
         );
-        assert!(
-            chat.requests().is_empty(),
-            "nothing is sent for an invalid request"
-        );
+        // The reply answers only the other questions, so it parses in one attempt only
+        // when the one-option choice was not asked.
+        assert_eq!(chat.requests().len(), 1);
     }
 
     #[tokio::test]
@@ -774,7 +875,24 @@ mod tests {
                 code: None,
             }))
         };
+        // `OpenAI` puts `invalid_request_error` in `type` and the specific reason in `code`.
+        let openai = |kind: &str, code: &str| {
+            Err(OpenAIError::ApiError(ApiError {
+                message: format!("upstream {code}"),
+                r#type: Some(kind.to_string()),
+                param: None,
+                code: Some(code.to_string()),
+            }))
+        };
         for (failure, expected) in [
+            (
+                openai("invalid_request_error", "invalid_api_key"),
+                "AuthenticationFailed",
+            ),
+            (
+                openai("invalid_request_error", "missing_required_parameter"),
+                "InvalidRequest",
+            ),
             (api_error("rate_limit_exceeded"), "RateLimited"),
             (api_error("invalid_api_key"), "AuthenticationFailed"),
             (api_error("invalid_request_error"), "InvalidRequest"),

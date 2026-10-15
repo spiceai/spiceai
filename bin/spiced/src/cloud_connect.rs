@@ -2724,18 +2724,50 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unsafe_endpoint_override_is_a_configuration_error() {
+        use runtime_cloud_connect::config::EnrollmentEndpointOverrideError;
         use std::os::unix::fs::symlink;
 
         let dir = scratch_dir("unsafe-endpoint-override");
         let target = dir.join("redirected-endpoint");
         std::fs::write(&target, "https://wrong-control-plane.example")
             .expect("write target endpoint");
-        symlink(&target, dir.join("cloud-endpoint")).expect("create endpoint symlink");
+        let override_path = dir.join("cloud-endpoint");
+        symlink(&target, &override_path).expect("create endpoint symlink");
         let mut config = CloudConnectConfig::from_env("test-runtime");
         config.config_dir.clone_from(&dir);
+        let endpoint_before = config.enroll_endpoint.clone();
 
-        apply_endpoint_override(&mut config)
+        let error = apply_endpoint_override(&mut config)
             .expect_err("an unsafe override must disable enrollment and renewal");
+        let override_error = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<EnrollmentEndpointOverrideError>())
+            .expect("the I/O error wraps the endpoint-override error");
+        let EnrollmentEndpointOverrideError::Read { path, source } = override_error else {
+            panic!("the symlinked override must be refused as unreadable, got: {override_error}");
+        };
+        assert_eq!(path, &override_path, "the error names the override file");
+        assert_eq!(
+            source.raw_os_error(),
+            Some(libc::ELOOP),
+            "the symlink must be refused by O_NOFOLLOW rather than read through: {source}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to read the Cloud Connect endpoint override at {}: {}",
+                override_path.display(),
+                std::io::Error::from_raw_os_error(libc::ELOOP)
+            )
+        );
+        assert_eq!(
+            config.enroll_endpoint, endpoint_before,
+            "a refused override must leave the enrollment endpoint untouched"
+        );
+        // Startup resolves the same file through `read_disk_endpoint`, whose
+        // `Invalid` makes `build_config` clear the endpoint so neither
+        // enrollment nor renewal can reach the redirected control plane.
+        assert_eq!(read_disk_endpoint(&dir), DiskControlPlaneEndpoint::Invalid);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

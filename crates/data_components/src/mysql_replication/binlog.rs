@@ -1385,7 +1385,9 @@ mod tests {
     }
 
     /// Widths within the integer family are distinct classes — a swap between
-    /// two integer columns of different widths still scrambles values.
+    /// two integer columns of different widths still scrambles values — while
+    /// each declared width still matches its own wire type, so a healthy
+    /// stream is never failed.
     #[test]
     fn integer_widths_are_distinguished() {
         for (declared, event) in [
@@ -1394,9 +1396,28 @@ mod tests {
             ("mediumint(9)", ColumnType::MYSQL_TYPE_LONG),
             ("bigint(20)", ColumnType::MYSQL_TYPE_LONG),
         ] {
-            assert!(
-                mismatch_against(&[("n", declared)], &[Some(event)]).is_some(),
+            assert_eq!(
+                mismatch_against(&[("n", declared)], &[Some(event)]),
+                Some(LayoutEventMismatch {
+                    ordinal: 0,
+                    column: "n".to_string(),
+                    source_type: declared.to_string(),
+                }),
                 "{declared} must not be accepted against {event:?}"
+            );
+        }
+
+        for (declared, event) in [
+            ("tinyint(4)", ColumnType::MYSQL_TYPE_TINY),
+            ("smallint(6)", ColumnType::MYSQL_TYPE_SHORT),
+            ("mediumint(9)", ColumnType::MYSQL_TYPE_INT24),
+            ("int(11)", ColumnType::MYSQL_TYPE_LONG),
+            ("bigint(20)", ColumnType::MYSQL_TYPE_LONGLONG),
+        ] {
+            assert_eq!(
+                mismatch_against(&[("n", declared)], &[Some(event)]),
+                None,
+                "{declared} must be accepted against its own wire type {event:?}"
             );
         }
     }

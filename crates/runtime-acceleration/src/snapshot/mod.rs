@@ -16,9 +16,6 @@ limitations under the License.
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
-use aws_sdk_credential_bridge::object_store_builder::{
-    S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
-};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::BoxStream};
@@ -31,14 +28,17 @@ use object_store_occ::{
     RetryOnConflictError, conditional_put, probe_conditional_writes, retry_on_conflict,
 };
 use opentelemetry::KeyValue;
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
-use secrecy::ExposeSecret;
+use runtime_parameters::Parameters;
+use runtime_secrets::Secrets;
+use runtime_state_location::StateFeature;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
-use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
+use spicepod::component::{
+    runtime::{StateLocation, StateSource},
+    snapshot::BootstrapOnFailureBehavior,
+};
 use std::{
     collections::HashMap,
     fmt::Write,
@@ -126,9 +126,12 @@ pub mod api {
 }
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
 
+/// The `format-version` of `metadata.json`, the same number a `runtime.state`
+/// location's `_spice/format.json` records.
+use runtime_state_location::FORMAT_VERSION as SNAPSHOT_METADATA_FORMAT_VERSION;
+
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
-const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
@@ -429,7 +432,7 @@ fn describe_datasets(datasets: &[String]) -> String {
 
 /// The engine that created `entry`: the engine recorded on the entry, then the one
 /// recorded for its dataset, then the engine the snapshot file's extension names —
-/// each writer names its snapshots `<dataset>_<timestamp>.<engine>`.
+/// each writer ends its snapshot names with `.<engine>`.
 fn recorded_snapshot_engine(entry: &SnapshotEntry, dataset: &DatasetMetadata) -> Option<String> {
     entry
         .snapshot_engine
@@ -855,11 +858,14 @@ impl<'a> SnapshotPathLayout<'a> {
         }
     }
 
+    /// `<dataset>_<timestamp>_<uuid>.<ext>`. The timestamp has one-second resolution, so
+    /// the UUID keeps two publishes in the same second from writing the same object.
     fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
         format!(
-            "{}_{}{}",
+            "{}_{}_{}{}",
             self.dataset_name,
             instant.format(SNAPSHOT_TIMESTAMP_FORMAT),
+            uuid::Uuid::now_v7().simple(),
             self.engine.snapshot_extension()
         )
     }
@@ -868,6 +874,7 @@ impl<'a> SnapshotPathLayout<'a> {
         format!("dataset={}", self.dataset_name)
     }
 
+    /// Every call names a new object.
     fn build_location(&self, base: &ObjectPath, instant: DateTime<Utc>) -> ObjectPath {
         let month_partition = format!("month={}", instant.format("%Y-%m"));
         let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
@@ -3323,8 +3330,7 @@ impl SnapshotManager {
 
         // Whether `metadata` already holds this publish: an earlier attempt whose write
         // landed but whose response was lost. Every recorded field must match, including the
-        // publish's own timestamp, so a separate publish of identical bytes to the same
-        // second-resolution path is not mistaken for this one.
+        // object name, which is unique to this publish.
         let already_published = |metadata: Option<&SnapshotMetadata>| {
             metadata
                 .and_then(|metadata| metadata.datasets.get(dataset_name))
@@ -3964,38 +3970,6 @@ fn encode_hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    vec![
-        ParameterSpec::component("region").secret(),
-        ParameterSpec::component("endpoint").secret(),
-        ParameterSpec::component("key").secret(),
-        ParameterSpec::component("secret").secret(),
-        ParameterSpec::component("session_token").secret(),
-        ParameterSpec::component("auth")
-            .description("Configures the authentication method for S3. Supported methods are: iam_role, key.")
-            .default("iam_role")
-            .one_of(&["iam_role", "key"])
-            .secret(),
-        ParameterSpec::runtime("client_timeout")
-            .description("The timeout setting for S3 client."),
-        ParameterSpec::runtime("allow_http")
-            .description("Allow HTTP protocol for S3 endpoint."),
-        ParameterSpec::component(notifications::QUEUE_URL_PARAM)
-            .description("The URL of an SQS queue that receives the snapshot location's S3 event notifications. Datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published instead of waiting for `refresh_check_interval`.")
-            .secret(),
-    ]
-});
-
-#[derive(Debug, Snafu)]
-enum S3ObjectStoreError {
-    #[snafu(display("Failed to build S3 object store: {source}"))]
-    BuilderError { source: S3ObjectStoreBuilderError },
-    #[snafu(display("'snapshots.params' is invalid: {source}"))]
-    InvalidParameters {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-}
-
 /// The object path of an `s3://` snapshot location inside its bucket. The
 /// notification consumer matches S3 event keys against the same path, so both
 /// derive it here.
@@ -4003,8 +3977,7 @@ fn s3_location_path(url: &Url) -> ObjectPath {
     ObjectPath::from(url.path())
 }
 
-/// Build the object store backing a snapshot location, dispatching on the
-/// URL scheme to the correct credential-aware builder.
+/// Build the object store backing a snapshot location.
 ///
 /// Returns `None` on failure after logging the error — matching the existing
 /// behavior of snapshot construction, which treats a failed store as "no
@@ -4016,163 +3989,132 @@ async fn build_snapshot_object_store(
     io_runtime: Handle,
     dataset_name: &str,
 ) -> Option<(Arc<dyn ObjectStore>, ObjectPath)> {
-    match snapshots_location_url.scheme() {
-        "s3" => {
-            let store = build_s3_object_store(
-                snapshots_location_url,
-                secrets,
-                snapshot_config.params.as_ref().map(Params::as_string_map),
-                io_runtime,
-            )
-            .await
-            .inspect_err(|e| match e {
-                S3ObjectStoreError::InvalidParameters { .. } => {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because {e}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
-                    );
-                }
-                S3ObjectStoreError::BuilderError { .. } => {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to connect to S3 snapshot location",
-                    );
-                }
-            })
-            .ok()?;
-            Some((store, s3_location_path(snapshots_location_url)))
-        }
-        "abfss" | "abfs" => {
-            let params = resolve_secret_params(secrets, snapshot_config.params.as_ref()).await;
-            let store = runtime_object_store::build_azure_object_store(
-                snapshots_location_url,
-                &params,
-                io_runtime,
-            )
-            .inspect_err(|e| {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    error = %e,
-                    "Failed to connect to Azure ADLS snapshot location",
-                );
-            })
-            .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
-            Some((store, path))
-        }
-        "gs" | "gcs" => {
-            let Some(bucket_name) = snapshots_location_url.host_str() else {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "GCS snapshot location is missing a bucket name",
-                );
-                return None;
-            };
-            let params = resolve_secret_params(secrets, snapshot_config.params.as_ref()).await;
-            let store =
-                runtime_object_store::build_gcs_object_store(bucket_name, &params, io_runtime)
-                    .inspect_err(|e| {
-                        tracing::error!(
-                            dataset = %dataset_name,
-                            location = %snapshots_location_url,
-                            error = %e,
-                            "Failed to connect to GCS snapshot location",
-                        );
-                    })
-                    .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
-            Some((store, path))
-        }
-        "file" => {
-            // Every publish after the first updates `metadata.json` at the version it read,
-            // which `LocalFileSystem` cannot do; `LocalConditionalPut` can, so a local
-            // directory holds snapshots the way an object store does.
-            let Ok(local_path) = snapshots_location_url.to_file_path() else {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not a local directory path. See: {SNAPSHOTS_DOCS}",
-                );
-                return None;
-            };
-            if let Err(e) = fs::create_dir_all(&local_path).await {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "Snapshots are disabled for dataset '{dataset_name}': failed to create the snapshot directory '{}'. Cause: {e}",
-                    local_path.display(),
-                );
-                return None;
-            }
-            let store = object_store_occ::LocalConditionalPut::new(&local_path)
-                .inspect_err(|e| {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to build snapshot object store",
-                    );
-                })
-                .ok()?;
-            Some((Arc::new(store), ObjectPath::default()))
-        }
-        _ => {
-            let (store, path) = object_store::parse_url(snapshots_location_url)
-                .inspect_err(|e| {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to build snapshot object store",
-                    );
-                })
-                .ok()?;
-            Some((store.into(), path))
+    let location = StateLocation {
+        location: snapshots_location_url.to_string(),
+        params: snapshot_config.params.clone(),
+        source: StateSource::FeatureSetting,
+    };
+    match runtime_state_location::build_object_store(
+        secrets,
+        io_runtime,
+        &location,
+        StateFeature::Snapshots,
+    )
+    .await
+    {
+        Ok((store, prefix)) => Some((store, ObjectPath::from(prefix))),
+        Err(error) => {
+            log_snapshot_store_error(dataset_name, snapshots_location_url, &error);
+            None
         }
     }
 }
 
-/// Resolves `${ secrets:… }` references in a snapshot location's `params`, for the
-/// builders that take plain strings.
-async fn resolve_secret_params(
-    secrets: Arc<RwLock<Secrets>>,
-    params: Option<&Params>,
-) -> HashMap<String, String> {
-    let Some(params) = params else {
-        return HashMap::new();
-    };
-    get_params_with_secrets(secrets, &params.as_string_map())
-        .await
-        .into_iter()
-        .map(|(key, value)| (key, value.expose_secret().to_string()))
-        .collect()
+/// Logs why a snapshot location's store could not be built, which disables
+/// snapshots for the dataset.
+fn log_snapshot_store_error(
+    dataset_name: &str,
+    snapshots_location_url: &Url,
+    error: &runtime_state_location::Error,
+) {
+    use runtime_state_location::Error;
+    match error {
+        Error::S3ParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because 'snapshots.params' is invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::GcsParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because its GCS parameters are invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::S3ObjectStoreInit { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %format!("Failed to build S3 object store: {source}"),
+                "Failed to connect to S3 snapshot location",
+            );
+        }
+        Error::ObjectStoreInit { source, .. }
+            if matches!(snapshots_location_url.scheme(), "abfs" | "abfss") =>
+        {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to connect to Azure ADLS snapshot location",
+            );
+        }
+        Error::ObjectStoreInit { source, .. }
+            if matches!(snapshots_location_url.scheme(), "gs" | "gcs") =>
+        {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to connect to GCS snapshot location",
+            );
+        }
+        Error::InvalidGcsLocation { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "GCS snapshot location is missing a bucket name",
+            );
+        }
+        Error::InvalidFileLocation { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not a local directory path. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::CreateLocalDirectory {
+            location: path,
+            source,
+            ..
+        } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': failed to create the snapshot directory '{path}'. Cause: {source}",
+            );
+        }
+        Error::LocalFileSystemInit { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to build snapshot object store",
+            );
+        }
+        Error::ObjectStoreParse { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to build snapshot object store",
+            );
+        }
+        Error::InvalidStateLocation { .. } | Error::ObjectStoreInit { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %error,
+                "Failed to build snapshot object store",
+            );
+        }
+    }
 }
 
-async fn build_s3_object_store(
-    snapshots_url: &Url,
-    secrets: Arc<RwLock<Secrets>>,
-    params: Option<HashMap<String, String>>,
-    io_runtime: Handle,
-) -> Result<Arc<dyn ObjectStore>, S3ObjectStoreError> {
-    let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref())
-        .await
-        .map_err(|source| S3ObjectStoreError::InvalidParameters { source })?;
-
-    S3ObjectStoreBuilder::from_url(snapshots_url, io_runtime)
-        .context(BuilderSnafu)?
-        .with_secret_params(&s3_params.to_secret_map())
-        .context(BuilderSnafu)?
-        .build()
-        .await
-        .context(BuilderSnafu)
-}
-
-/// Validates a snapshot location's S3 `params`.
+/// Validates a snapshot location's S3 `params`, which also take the queue that
+/// receives its S3 event notifications.
 ///
 /// An invalid parameter is an error, not a reason to fall back to the defaults: the
 /// defaults drop every other parameter too — the endpoint, the region and the keys — so
@@ -4182,20 +4124,12 @@ async fn build_s3_parameters(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<&HashMap<String, String>>,
 ) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
-    match params {
-        Some(p) => {
-            let secret_params = get_params_with_secrets(Arc::clone(&secrets), p).await;
-            Parameters::try_new(
-                "snapshot",
-                secret_params.into_iter().collect(),
-                "s3",
-                secrets,
-                &S3_PARAMETERS,
-            )
-            .await
-        }
-        None => Ok(Parameters::new(vec![], "s3", &S3_PARAMETERS)),
-    }
+    runtime_state_location::build_s3_parameters(secrets, params, StateFeature::Snapshots)
+        .await
+        .map_err(|error| match error {
+            runtime_state_location::Error::S3ParameterValidation { source, .. } => source,
+            other => Box::new(other),
+        })
 }
 
 #[cfg(test)]
@@ -5020,28 +4954,26 @@ mod tests {
             &metadata_with(&schema, vec![broken.clone()], 7),
         )
         .await;
+        // The replacement's archive is stored up front; it only becomes the current snapshot
+        // once metadata naming it is published.
+        let replacement = put_cayenne_snapshot_entry(&store, 8, 2, b"replacement").await;
+        let replacement_metadata = metadata_with(&schema, vec![broken, replacement], 8);
+        let replacement_payload =
+            serde_json::to_vec_pretty(&replacement_metadata).expect("serialize metadata");
 
         let root = TempDir::new().expect("create temp dir");
         let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
         manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
 
-        let writer_store = Arc::clone(&store);
-        let writer_path = metadata_path.clone();
-        let writer_schema = Arc::clone(&schema);
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let replacement = put_cayenne_snapshot_entry(&writer_store, 8, 2, b"replacement").await;
-            write_metadata(
-                &writer_store,
-                &writer_path,
-                &metadata_with(&writer_schema, vec![broken, replacement], 8),
-            )
-            .await;
-        });
-
+        // The first validation runs after the first attempt has read, and pinned, the broken
+        // snapshot's metadata. Publishing the replacement from inside it means only a retry
+        // that reads the metadata again can find snapshot 8, whatever the task scheduling.
         let validated = std::sync::atomic::AtomicUsize::new(0);
         let validator = |_: &SchemaRef| {
-            validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                let publish = store.put(&metadata_path, replacement_payload.clone().into());
+                futures::executor::block_on(publish).expect("publish replacement metadata");
+            }
             true
         };
         let poll = tokio::time::timeout(
@@ -5051,13 +4983,25 @@ mod tests {
         .await
         .expect("retry must observe the replacement snapshot instead of retrying forever")
         .expect("download_if_newer should succeed");
-        writer.await.expect("writer task");
 
         assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
-        assert!(poll.metadata_e_tag.is_some());
+        let current_e_tag = store
+            .head(&metadata_path)
+            .await
+            .expect("head replacement metadata")
+            .e_tag;
         assert!(
-            validated.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-            "each retry validates the snapshot it downloads"
+            current_e_tag.is_some(),
+            "the in-memory store reports an ETag"
+        );
+        assert_eq!(
+            poll.metadata_e_tag, current_e_tag,
+            "the poll reports the ETag of the metadata it loaded"
+        );
+        assert_eq!(
+            validated.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the failed attempt and the retry that downloaded the replacement each validate"
         );
         let restored = fs::read(root.path().join("data").join("part-8.vortex"))
             .await
@@ -5574,12 +5518,12 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// A `file://` location keeps accepting snapshots after the first: every later publish
-    /// updates `metadata.json` at the version it read, which a plain `LocalFileSystem`
-    /// refuses with `NotImplemented`.
-    #[tokio::test]
-    async fn file_location_publishes_more_than_once() {
-        let dir = TempDir::new().expect("tempdir");
+    /// A manager that publishes `<dir>/accelerated.db` to a `file://` location in `dir`,
+    /// with the location's store and the path of its `metadata.json`.
+    async fn file_location_manager(
+        dir: &TempDir,
+        schema: &SchemaRef,
+    ) -> (SnapshotManager, Arc<dyn ObjectStore>, Path) {
         let location =
             Url::from_directory_path(dir.path().join("snapshots")).expect("directory url");
         let config = spicepod::component::snapshot::Snapshots {
@@ -5599,29 +5543,93 @@ mod tests {
         .expect("a file location builds a store");
 
         let local_path = dir.path().join("accelerated.db");
-        let schema = sample_schema();
-        let mut manager = build_manager_over(Arc::clone(&store), local_path.clone(), &schema);
+        let mut manager = build_manager_over(Arc::clone(&store), local_path, schema);
         manager.snapshots_location = snapshots_location.clone();
         manager.snapshot_location_uri = location.to_string();
+        (manager, store, snapshots_location.join(METADATA_FILE_NAME))
+    }
+
+    /// A `file://` location keeps accepting snapshots after the first: every later publish
+    /// updates `metadata.json` at the version it read, which a plain `LocalFileSystem`
+    /// refuses with `NotImplemented`.
+    #[tokio::test]
+    async fn file_location_publishes_more_than_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let (manager, store, metadata_path) = file_location_manager(&dir, &schema).await;
 
         for content in [
             b"first".as_slice(),
             b"second".as_slice(),
             b"third".as_slice(),
         ] {
-            std::fs::write(&local_path, content).expect("write accelerator file");
+            std::fs::write(dir.path().join("accelerated.db"), content)
+                .expect("write accelerator file");
             publish(&manager, &schema)
                 .await
                 .expect("publish to a file location")
                 .expect("snapshot created");
         }
 
-        let entries = dataset_entries(
-            store.as_ref(),
-            &snapshots_location.clone().join(METADATA_FILE_NAME),
-        )
-        .await;
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
         assert_eq!(entries.len(), 3, "every publish is recorded: {entries:?}");
+    }
+
+    /// Two publishes of one dataset in the same second each keep their own object, so
+    /// every recorded entry still names the bytes its checksum describes.
+    #[tokio::test]
+    async fn publishes_in_the_same_second_keep_their_own_objects() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let (manager, store, metadata_path) = file_location_manager(&dir, &schema).await;
+
+        // Publish until the last two snapshots share a second, the resolution of the
+        // timestamp in a snapshot's name.
+        let mut entries = Vec::new();
+        for publish_number in 0..10 {
+            std::fs::write(
+                dir.path().join("accelerated.db"),
+                format!("publish {publish_number}"),
+            )
+            .expect("write accelerator file");
+            publish(&manager, &schema)
+                .await
+                .expect("publish to a file location")
+                .expect("snapshot created");
+            entries = dataset_entries(store.as_ref(), &metadata_path).await;
+            if let [.., previous, last] = entries.as_slice()
+                && previous.timestamp_ms / 1000 == last.timestamp_ms / 1000
+            {
+                break;
+            }
+        }
+        let [.., previous, last] = entries.as_slice() else {
+            panic!("expected at least two snapshots: {entries:?}");
+        };
+        assert_eq!(
+            previous.timestamp_ms / 1000,
+            last.timestamp_ms / 1000,
+            "no two publishes shared a second: {entries:?}"
+        );
+
+        for entry in &entries {
+            let path = manager
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot object path");
+            let stored = store
+                .get(&path)
+                .await
+                .expect("snapshot object stored")
+                .bytes()
+                .await
+                .expect("read snapshot object");
+            assert_eq!(
+                compute_sha256_hex(&stored),
+                entry.snapshot_checksum,
+                "snapshot {} names an object that holds another publish's bytes: {entries:?}",
+                entry.snapshot_id
+            );
+        }
     }
 
     /// A store that accepts write conditions and ignores them is refused before anything

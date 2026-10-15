@@ -25,6 +25,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
+use data_components::http::provider::HttpTableProvider;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -566,6 +567,89 @@ pub fn extend_schema_with_cache_namespace(
 /// refresh is rebuilt from and the key eviction removes an entry by.
 pub const REQUEST_KEY_COLUMNS: [&str; 3] = ["request_path", "request_query", "request_body"];
 
+/// The request-key column that tells an HTTP GET from a POST: the HTTP
+/// connector sends a POST for each body a lookup's filters name and a GET when
+/// they name none.
+pub const REQUEST_BODY_COLUMN: &str = "request_body";
+
+/// Whether `filters` make the HTTP connector send an explicit-empty POST.
+///
+/// Its response is stored with `request_body = ''`, exactly as a GET's is, so
+/// the cache cannot tell the two apart; such a read bypasses the cache and goes
+/// to the source, as the unaccelerated dataset would.
+#[must_use]
+pub fn sends_explicit_empty_request_body(filters: &[Expr]) -> bool {
+    HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).contains(&"")
+}
+
+/// The storage-only predicates that keep a lookup to the entries of the method
+/// it uses: `request_body = ''` when the lookup names a request but sends no
+/// body. The HTTP connector stores a GET with `request_body = ''` and a POST
+/// with its body, so without it a GET lookup would match a POST cached for the
+/// same path.
+///
+/// Only `request_body` identifies a cached request reliably: a paginated
+/// response stores each page's own path and query, but every page the
+/// request's body. Empty when the lookup has no predicate on a request column,
+/// so filters only on other columns read across every cached entry, as an
+/// unfiltered scan does.
+///
+/// Like the namespace predicate, they scope the accelerator read only; the
+/// source still receives the user's filters, so the request is unchanged.
+#[must_use]
+pub fn request_identity_filters(
+    filters: &[Expr],
+    cache_schema: &arrow::datatypes::Schema,
+) -> Vec<Expr> {
+    // Any predicate on a request column makes the read a lookup — even one the
+    // connector turns into no request value, such as `request_body <> 'z'`,
+    // which still sends a GET. Request headers count, though they are not part
+    // of the key an entry is evicted and refreshed by.
+    let names_request = filters.iter().flat_map(Expr::column_refs).any(|column| {
+        REQUEST_KEY_COLUMNS
+            .into_iter()
+            .chain(["request_headers"])
+            .any(|name| column.name == name)
+    });
+    if names_request
+        && cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
+        && HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).is_empty()
+    {
+        vec![col(REQUEST_BODY_COLUMN).eq(lit(""))]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The filters that re-request a stored entry from the source. The row stores
+/// a GET with `request_body = ''`, and an explicit-empty POST is never cached,
+/// so that predicate is dropped: sent to the source it would replay the GET as
+/// an empty POST and store the POST's response under the GET's entry.
+fn source_replay_filters(filters: &[Expr]) -> Vec<Expr> {
+    filters
+        .iter()
+        .filter(|filter| !is_empty_request_body_predicate(filter))
+        .cloned()
+        .collect()
+}
+
+fn is_empty_request_body_predicate(filter: &Expr) -> bool {
+    let Expr::BinaryExpr(binary) = filter else {
+        return false;
+    };
+    binary.op == datafusion::logical_expr::Operator::Eq
+        && matches!(binary.left.as_ref(), Expr::Column(column) if column.name == REQUEST_BODY_COLUMN)
+        && matches!(
+            binary.right.as_ref(),
+            Expr::Literal(
+                ScalarValue::Utf8(Some(value))
+                    | ScalarValue::LargeUtf8(Some(value))
+                    | ScalarValue::Utf8View(Some(value)),
+                _,
+            ) if value.is_empty()
+        )
+}
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -905,6 +989,12 @@ async fn flush_cache_writes(
             }
         };
         let mut filters = req.filters;
+        // A GET entry's replace must not delete the POST entries cached for
+        // the same path, so it carries the predicate its lookup reads by.
+        if !filters.is_empty() {
+            let identity = request_identity_filters(&filters, &storage_schema);
+            filters.extend(identity);
+        }
         if needs_namespace_stamp {
             filters.push(namespace_filter_expr(ns_id));
         }
@@ -1537,7 +1627,7 @@ impl CacheRefreshHelper {
                     &federated,
                     &session_state,
                     &dataset_name,
-                    &row_filters,
+                    &source_replay_filters(&row_filters),
                     None,
                     cache_write_tx.task_context(&session_state),
                     cache_write_tx.memory_pool(),
@@ -4269,8 +4359,9 @@ mod pool_tests {
                     .is_err(),
                 "public empty path stays invalid"
             );
+            // A GET: the row stores `request_body = ''`, which the refresh
+            // must not replay as an explicit-empty POST (#14768).
             let filters = vec![
-                col("request_body").eq(lit("")),
                 col("request_path").eq(lit("/items")),
                 col("request_query").eq(lit("key=A")),
             ];
@@ -4361,7 +4452,7 @@ mod pool_tests {
             assert!(
                 requests
                     .iter()
-                    .all(|wire| wire.starts_with("POST /items?key=A ")),
+                    .all(|wire| wire.starts_with("GET /items?key=A ")),
                 "enriched={enriched}: {requests:?}",
             );
             println!(
@@ -4515,6 +4606,128 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Every filter shape that makes the HTTP connector send an empty POST
+    /// body bypasses the cache; shapes that send a GET or a non-empty body do
+    /// not.
+    #[test]
+    fn explicit_empty_request_body_is_detected_in_every_filter_shape() {
+        let body = || col("request_body");
+        let cases: Vec<(&str, Vec<Expr>, bool)> = vec![
+            ("eq ''", vec![body().eq(lit(""))], true),
+            (
+                "in list",
+                vec![body().in_list(vec![lit("x"), lit("")], false)],
+                true,
+            ),
+            ("or", vec![body().eq(lit("x")).or(body().eq(lit("")))], true),
+            (
+                "beside other filters",
+                vec![col("request_path").eq(lit("/items")), body().eq(lit(""))],
+                true,
+            ),
+            ("eq 'x'", vec![body().eq(lit("x"))], false),
+            ("not eq '' sends a GET", vec![body().not_eq(lit(""))], false),
+            (
+                "no body filter",
+                vec![col("request_path").eq(lit("/items"))],
+                false,
+            ),
+            (
+                "empty query, no body",
+                vec![col("request_query").eq(lit(""))],
+                false,
+            ),
+            ("no filters", vec![], false),
+        ];
+        for (name, filters, expected) in cases {
+            assert_eq!(
+                sends_explicit_empty_request_body(&filters),
+                expected,
+                "{name}: {filters:?}"
+            );
+        }
+    }
+
+    /// A lookup that names a request but sends no body is pinned to GET
+    /// entries; a POST lookup, one that names no request value, or a cache
+    /// without the column, is not pinned.
+    #[test]
+    fn request_identity_filters_pin_get_lookups_to_get_entries() {
+        let http = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+        ]);
+        let other = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let get = vec![col("request_body").eq(lit(""))];
+        let path = col("request_path").eq(lit("/items"));
+        let cases: Vec<(&str, Vec<Expr>, &Schema, Vec<Expr>)> = vec![
+            ("path only", vec![path.clone()], &http, get.clone()),
+            (
+                "query only",
+                vec![col("request_query").eq(lit("q=a"))],
+                &http,
+                get.clone(),
+            ),
+            (
+                "body predicate that sends no body",
+                vec![path.clone(), col("request_body").not_eq(lit("z"))],
+                &http,
+                get.clone(),
+            ),
+            (
+                "path and body",
+                vec![path.clone(), col("request_body").eq(lit("x"))],
+                &http,
+                vec![],
+            ),
+            (
+                "headers only",
+                vec![col("request_headers").eq(lit(r#"{"x-test":"a"}"#))],
+                &http,
+                get.clone(),
+            ),
+            (
+                "no request value named",
+                vec![col("response_status").eq(lit(200_u16))],
+                &http,
+                vec![],
+            ),
+            (
+                "only a body predicate that sends no body",
+                vec![col("request_body").not_eq(lit("z"))],
+                &http,
+                get,
+            ),
+            ("not an HTTP cache", vec![path], &other, vec![]),
+        ];
+        for (name, filters, schema, expected) in cases {
+            assert_eq!(
+                request_identity_filters(&filters, schema),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// A stored GET entry is re-requested without its `request_body = ''`
+    /// predicate, and every other request predicate is kept.
+    #[test]
+    fn source_replay_filters_drop_only_the_empty_body() {
+        let path = col("request_path").eq(lit("/items"));
+        let query = col("request_query").eq(lit(""));
+        let empty_body = col("request_body").eq(lit(""));
+        let body = col("request_body").eq(lit("x"));
+        assert_eq!(
+            source_replay_filters(&[path.clone(), query.clone(), empty_body]),
+            vec![path.clone(), query.clone()]
+        );
+        assert_eq!(
+            source_replay_filters(&[path.clone(), query.clone(), body.clone()]),
+            vec![path, query, body]
+        );
+    }
 
     /// Test-only stand-in for the shared `Arc<SessionState>`.
     fn test_session_state() -> Arc<SessionState> {
@@ -4689,12 +4902,18 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Refreshing);
 
         health.record_failure(&"write failed");
-        assert!(
+        // The re-report names the dataset and carries the run as it now stands: a
+        // fourth consecutive failure, not the third the first report counted.
+        assert_eq!(
             status
                 .get_dataset_status(&dataset)
                 .as_ref()
-                .and_then(ComponentStatus::error_message)
-                .is_some(),
+                .and_then(ComponentStatus::error_message),
+            Some(
+                "Dataset 'api_data' failed to write to its accelerator 4 times in a row, so no new \
+                 result is being cached and anything already cached will not be updated. Cause: \
+                 write failed. See: https://spiceai.org/docs/components/data-accelerators"
+            ),
             "a still-failing accelerator must report itself again once its status is replaced"
         );
     }
@@ -5037,6 +5256,55 @@ mod tests {
     /// Counts the rows a stream yields.
     async fn drain_rows(stream: SendableRecordBatchStream) -> usize {
         drain(stream).await.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Waits for a batched cache writer to exit. It exits once every sender is
+    /// gone, after flushing whatever is still queued, so the accelerator then
+    /// holds every write that was ever enqueued: a test can assert the absence
+    /// of a write as firmly as its presence, with no flush-interval guess.
+    async fn await_writer_exit(writer: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the cache writer should exit within 5s of its last sender dropping")
+            .expect("the cache writer task should not panic");
+    }
+
+    /// Waits until `accelerator` holds at least `rows` rows, so a test can
+    /// observe a periodic flush while the write channel stays open.
+    async fn wait_for_accelerator_rows(accelerator: &MockAcceleratorTableProvider, rows: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let held: usize = accelerator
+                .get_data()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            if held >= rows {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the accelerator held {held} row(s) within 5s, expected {rows}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The `content` of every row the accelerator holds, in storage order.
+    fn stored_contents(accelerator: &MockAcceleratorTableProvider) -> Vec<String> {
+        accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                let content = batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("content column");
+                (0..batch.num_rows())
+                    .map(|row| content.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Waits until `origin` has been scanned `scans` times, so a test can start a
@@ -5843,7 +6111,7 @@ mod tests {
         let in_flight_revalidations: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let (batch_write_tx, _consumer_handle) =
+        let (batch_write_tx, consumer_handle) =
             spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
 
         // Create a tokio runtime handle for the background task
@@ -5866,9 +6134,11 @@ mod tests {
             &batch_write_tx,
             CacheNamespace::Public,
         );
-
-        // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // `handle_cache_hit` clones the sender it is lent, so dropping this one
+        // leaves the background refresh holding the only sender: once it has queued
+        // its write and finished, the writer flushes that write and exits.
+        drop(batch_write_tx);
+        await_writer_exit(consumer_handle).await;
 
         // Verify the federated source was called with the SPECIFIC filters only
         let recorded = federated.get_recorded_filters();
@@ -5952,7 +6222,11 @@ mod tests {
     }
 
     /// Tests that batched cache writer accumulates multiple requests and flushes them periodically.
-    #[tokio::test]
+    ///
+    /// Paused time: the flush interval elapses only when the test advances the
+    /// clock, so "not yet written" and "written at the interval" are both checked
+    /// deterministically, with the channel left open throughout.
+    #[tokio::test(start_paused = true)]
     async fn test_batched_cache_writer_flushes_multiple_requests() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
@@ -5983,15 +6257,33 @@ mod tests {
             .expect("to send write request");
         }
 
-        // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // The writer takes the requests but holds them: nothing is written per
+        // request, only when the flush interval elapses.
+        tokio::task::yield_now().await;
+        assert!(
+            accelerator.get_data().is_empty(),
+            "requests must be buffered until the flush interval, not written one by one"
+        );
 
-        // Verify accelerator received data
-        let data = accelerator.get_data();
-        assert!(!data.is_empty(), "Accelerator should have data after flush");
+        tokio::time::advance(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS)).await;
+        wait_for_accelerator_rows(&accelerator, 3).await;
 
-        let total_rows: usize = data.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
+        // All three requests landed in that one flush, each row exactly once.
+        let mut ids: Vec<i32> = accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2], "Should have the 3 rows from 3 requests");
     }
 
     /// Test that 5xx and 429 responses are returned to users but NOT written to the cache.
@@ -6017,7 +6309,7 @@ mod tests {
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // --- 500 request ---
         let mut stream = CacheRefreshHelper::handle_cache_miss(
@@ -6100,8 +6392,10 @@ mod tests {
             .expect("status column");
         assert_eq!(status_col.value(0), 429, "User should see status 429");
 
-        // Wait for cache write flush
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // Both misses have returned and dropped their senders, so the writer
+        // flushes anything they enqueued and exits: the check below covers every
+        // write ever queued, not only those flushed within a guessed window.
+        await_writer_exit(handle).await;
 
         // Verify accelerator is empty — neither 5xx nor 429 should be cached
         let cached_data = accelerator.get_data();
@@ -6754,8 +7048,9 @@ mod tests {
 
         drop(stream);
         drop(leader);
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // The follower's sender went with the miss, so the writer flushes
+        // anything ever enqueued and exits.
+        await_writer_exit(handle).await;
 
         assert!(
             accelerator.get_data().is_empty(),
@@ -6772,12 +7067,13 @@ mod tests {
     /// callers rather than one.
     #[tokio::test]
     async fn concurrent_cache_misses_for_one_key_fetch_the_origin_once() {
-        // A delay long enough that the followers reach `acquire` and coalesce
-        // while the leader is still inside its single scan.
+        // Any delay makes the leader's scan await, and `join!` below drives all
+        // five misses on one task: the followers reach `acquire` and coalesce
+        // while the leader is parked inside its single scan.
         let origin = Arc::new(CountingHttpTableProvider::new(
             200,
             "shared-body",
-            Duration::from_millis(200),
+            Duration::from_millis(1),
         ));
         let schema = origin.schema();
         let accelerator = Arc::new(MockAcceleratorTableProvider::new(
@@ -6845,8 +7141,15 @@ mod tests {
             );
         }
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // Single-flight writes once too: only the leader holds the claim. With
+        // every sender gone the writer flushes all that was queued and exits.
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
+        assert_eq!(
+            stored_contents(&accelerator),
+            vec!["shared-body".to_string()],
+            "five misses for one key must cache its response exactly once"
+        );
     }
 
     /// Single-flight applies to an empty origin too: N concurrent misses for a
@@ -6910,8 +7213,10 @@ mod tests {
             "every caller is served the shared empty result"
         );
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // With every sender gone the writer flushes all that was queued and
+        // exits, so the check covers every write ever enqueued.
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
         assert!(
             accelerator.get_data().is_empty(),
             "an empty result is not written to the cache"
@@ -6982,16 +7287,12 @@ mod tests {
             "the bounded-below fetch cannot be shared, so the origin is asked twice"
         );
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
-        let written: usize = accelerator
-            .get_data()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
         assert_eq!(
-            written, 1,
-            "only the leader writes; the caller that fetched for itself holds no claim"
+            stored_contents(&accelerator),
+            vec!["row".to_string()],
+            "only the leader writes its one row; the caller that fetched for itself holds no claim"
         );
     }
 
@@ -7086,8 +7387,15 @@ mod tests {
             .expect("content column");
         assert_eq!(content.value(0), "revalidated-body");
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // The revalidation's write is the only one: the miss followed it and
+        // holds no claim. With every sender gone the writer flushes and exits.
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
+        assert_eq!(
+            stored_contents(&accelerator),
+            vec!["revalidated-body".to_string()],
+            "the revalidation writes its one row and the coalesced miss writes nothing"
+        );
     }
 
     /// The periodic stale-row refresh holds the claim for each entry across its
@@ -7426,8 +7734,9 @@ mod tests {
             batch.expect("stream");
         }
         drop(stream);
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // The miss took the only sender with it, so the writer flushes anything
+        // enqueued (and releases its claim) before it exits.
+        await_writer_exit(handle).await;
 
         assert!(
             in_flight.lock().is_empty(),
@@ -7535,7 +7844,7 @@ mod tests {
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
         let mut stream = CacheRefreshHelper::handle_cache_miss(
@@ -7580,8 +7889,9 @@ mod tests {
             .expect("status column");
         assert_eq!(status_col.value(0), 404, "User should see status 404");
 
-        // Wait for cache write flush
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // The miss took the only sender with it, so the writer flushes what it
+        // enqueued and exits.
+        await_writer_exit(handle).await;
 
         // 4. Verify accelerator has the 404 response cached
         let cached_data = accelerator.get_data();

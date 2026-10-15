@@ -228,31 +228,30 @@ pub fn is_shutdown_cancellation(error: &(dyn std::error::Error + 'static)) -> bo
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::task::JoinSet;
     use tokio::time::sleep;
 
-    /// Waits for all tasks in the `JoinSet` to complete and reports any errors that
-    /// occurred.
-    ///
-    /// If we don't do this, any errors that occur in the task (such as IO errors)
-    /// are not reported.
-    async fn drain_join_set(mut join_set: JoinSet<Result<()>>) {
-        // retrieve any errors from the tasks
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(())) => {}                                   // task completed successfully
-                Ok(Err(e)) => tracing::debug!("Task failed: {e}"), // task failed
-                Err(e) => tracing::debug!("JoinSet error: {e}"),   // JoinSet error
-            }
-        }
-    }
-
+    /// Drop joins the runtime's thread, and that thread drops the runtime, so by
+    /// the time `drop` returns every task still pending on it has been cancelled
+    /// — the shutdown cancellation `is_shutdown_cancellation` classifies.
     #[test]
-    fn test_managed_tokio_runtime_creation() {
-        let runtime = ManagedTokioRuntime::try_new();
-        assert!(runtime.is_ok());
+    fn dropping_the_runtime_cancels_its_pending_tasks_before_returning() {
+        let runtime = ManagedTokioRuntime::try_new().expect("Failed to create runtime");
+        let pending = runtime.handle().spawn(std::future::pending::<()>());
+        assert!(!pending.is_finished(), "the task cannot finish on its own");
 
-        let _runtime = runtime.expect("Failed to create ManagedTokioRuntime");
+        drop(runtime);
+        assert!(
+            pending.is_finished(),
+            "drop returns only once the runtime has shut down and cancelled its tasks"
+        );
+
+        let join_error = futures::executor::block_on(pending)
+            .expect_err("a task on a dropped runtime cannot complete");
+        assert!(
+            join_error.is_cancelled(),
+            "expected a cancellation, got: {join_error}"
+        );
+        assert!(is_shutdown_cancellation(&join_error));
     }
 
     #[test]
@@ -350,34 +349,5 @@ mod tests {
 
         let results = results.expect("Failed to collect concurrent task results");
         assert_eq!(results, vec![0, 2, 4, 6, 8]);
-    }
-
-    #[tokio::test]
-    async fn test_drain_join_set_with_successful_tasks() {
-        let mut join_set = JoinSet::new();
-
-        // Add some successful tasks
-        for i in 0..3 {
-            join_set.spawn(async move {
-                sleep(Duration::from_millis(i * 10)).await;
-                Ok(()) as Result<()>
-            });
-        }
-
-        // This should complete without panicking
-        drain_join_set(join_set).await;
-    }
-
-    #[tokio::test]
-    async fn test_drain_join_set_with_failed_tasks() {
-        let mut join_set = JoinSet::new();
-
-        // Add a mix of successful and failed tasks
-        join_set.spawn(async { Ok(()) as Result<()> });
-        join_set.spawn(async { Err(Error::TaskExecution) });
-        join_set.spawn(async { Ok(()) as Result<()> });
-
-        // This should complete without panicking, even with failed tasks
-        drain_join_set(join_set).await;
     }
 }

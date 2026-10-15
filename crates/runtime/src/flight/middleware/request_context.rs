@@ -16,11 +16,10 @@ limitations under the License.
 
 use crate::{
     datafusion::{
-        DataFusion, flight_session_extension::FlightSessionExtension,
-        job_executor_context_extension::JobExecutorContextExtension,
+        DataFusion, job_executor_context_extension::JobExecutorContextExtension,
         request_context_extension::DataFusionContextExtension,
     },
-    flight::SessionStore,
+    flight::server_timing::ServerTimingTrailers,
     jobs::JobExecutor,
     model::ModelContextExtension,
     secrets,
@@ -45,7 +44,6 @@ use tower::{Layer, Service};
 pub struct RequestContextLayer {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    session_store: SessionStore,
     secrets: Arc<RwLock<secrets::Secrets>>,
     job_executor: Option<Arc<JobExecutor>>,
 }
@@ -55,13 +53,11 @@ impl RequestContextLayer {
     pub fn new(
         app: Arc<RwLock<Option<Arc<App>>>>,
         df: Arc<DataFusion>,
-        session_store: SessionStore,
         secrets: Arc<RwLock<secrets::Secrets>>,
     ) -> Self {
         Self {
             app,
             df,
-            session_store,
             secrets,
             job_executor: None,
         }
@@ -83,7 +79,6 @@ impl<S> Layer<S> for RequestContextLayer {
             inner,
             app: Arc::clone(&self.app),
             df: Arc::clone(&self.df),
-            session_store: self.session_store.clone(),
             secrets: Arc::clone(&self.secrets),
             job_executor: self.job_executor.clone(),
         }
@@ -95,7 +90,6 @@ pub struct RequestContextMiddleware<S> {
     inner: S,
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
-    session_store: SessionStore,
     secrets: Arc<RwLock<secrets::Secrets>>,
     job_executor: Option<Arc<JobExecutor>>,
 }
@@ -107,7 +101,8 @@ where
     ResBody: http_body::Body + Send + 'static,
     ReqBody: Send + 'static,
 {
-    type Response = http::Response<util::cancel_guard_body::CancelGuardBody<ResBody>>;
+    type Response =
+        http::Response<ServerTimingTrailers<util::cancel_guard_body::CancelGuardBody<ResBody>>>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -118,17 +113,6 @@ where
     fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-
-        // Try to get or create a session for this request. Capture the owning
-        // principal's stable id (if the request names an existing, owned session)
-        // so the session can be bound to its owner at execution time. This layer
-        // runs before auth, so ownership is *recorded* here and *enforced* later
-        // where the authenticated principal is known.
-        let owner_stable_id = self.session_store.owner_stable_id_from_http(req.headers());
-        let session_ext = self
-            .session_store
-            .get_or_create_session_from_http(req.headers(), &self.df.ctx)
-            .map(|ctx| FlightSessionExtension::new(ctx, owner_stable_id));
 
         let app_lock = Arc::clone(&self.app);
         let df = Arc::clone(&self.df);
@@ -153,17 +137,14 @@ where
                 builder = builder.with_extension(JobExecutorContextExtension::new(executor));
             }
 
-            // Add session extension if we have one
-            if let Some(session_ext) = session_ext {
-                builder = builder.with_extension(session_ext);
-            }
-
             let request_context = Arc::new(builder.from_headers(req.headers()).build());
 
             req.extensions_mut()
                 .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(
                     Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>
                 );
+            // Read by `FlightSessionLayer`, which runs after authentication.
+            req.extensions_mut().insert(Arc::clone(&request_context));
 
             Arc::clone(&request_context)
                 .scope(async move {
@@ -183,6 +164,9 @@ where
                     // the id too.
                     runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
                     let body = util::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
+                    // The trailers frame comes after the stream ends, so this is
+                    // where a query `DoGet` can report its server time.
+                    let body = ServerTimingTrailers::new(body, Arc::clone(&request_context));
                     Ok(http::Response::from_parts(parts, body))
                 })
                 .await
@@ -327,7 +311,6 @@ mod tests {
         let mut service = RequestContextLayer::new(
             Arc::clone(&app),
             df,
-            SessionStore::new(),
             Arc::new(RwLock::new(secrets::Secrets::new())),
         )
         .layer(ObserveContext {

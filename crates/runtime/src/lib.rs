@@ -123,7 +123,6 @@ pub mod jobs;
 mod management;
 mod metrics_server;
 pub mod model;
-mod object_store_state;
 pub mod opentelemetry;
 pub mod otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
@@ -150,7 +149,9 @@ pub(crate) mod secrets {
 }
 pub mod cluster;
 mod secrets_preflight;
+mod server_timing;
 pub mod spice_metrics;
+mod state_location;
 pub mod status;
 pub mod task_history;
 pub mod token_providers;
@@ -348,7 +349,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, and also set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
         dataset_name: String,
@@ -362,6 +363,17 @@ pub enum Error {
         dataset_name: String,
         connector: String,
         retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. {advice} See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionDisabled {
+        dataset_name: String,
+        connector: String,
+        param: String,
+        consequence: String,
+        advice: String,
     },
 
     #[snafu(display(
@@ -596,6 +608,9 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display("{reason}"))]
+    StateLocationRefused { reason: String },
+
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -643,26 +658,16 @@ pub struct LogErrors(pub bool);
 
 /// State of the initial [`Runtime::load_components`] pass.
 ///
-/// The load has no deadline: `load_dataset` retries a transient failure for as
-/// long as the runtime is up, so a spicepod the runtime cannot satisfy — an
-/// unreachable source, a `${ secrets:… }` reference nothing resolves — leaves
-/// the load running indefinitely. A caller holding the configuration that fixes
-/// that (Spice Cloud Connect applying a deployment) needs to supersede the load
-/// rather than race it: a load left running keeps registering datasets from the
-/// app it started against, after a new app has replaced it.
-///
 /// `in_flight` starts `true` — a load is pending from the moment the runtime
-/// exists — so a supersede that lands before the load begins still stops it,
-/// and `load_components` returns without starting.
+/// exists — and turns `false` once the load is over, however it ends. See
+/// [`Runtime::initial_load_in_flight`].
 struct InitialLoad {
-    cancel: CancellationToken,
     in_flight: AtomicBool,
 }
 
 impl Default for InitialLoad {
     fn default() -> Self {
         Self {
-            cancel: CancellationToken::new(),
             in_flight: AtomicBool::new(true),
         }
     }
@@ -684,9 +689,9 @@ pub struct Runtime {
     /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
-    /// State of the process's one-time initial component load, so a caller that
-    /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
-    /// Shared, not copied, so every clone of the runtime supersedes the same load.
+    /// State of the process's one-time initial component load. See
+    /// [`Runtime::initial_load_in_flight`]. Shared, not copied, so every clone of
+    /// the runtime reports the same load.
     initial_load: Arc<InitialLoad>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
@@ -695,7 +700,7 @@ pub struct Runtime {
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
     /// LLM-as-reranker usage is needed — chat models are resolved from
-    /// `completion_llms` as a fallback.
+    /// `completion_llms`, then evaluation models from `evaluate_models`, as fallbacks.
     rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
@@ -740,6 +745,8 @@ pub struct Runtime {
     /// The dataset loads still retrying, so a Spicepod change can stop the load
     /// of a configuration it replaces or removes.
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
+    view_loads: Arc<init::view_loads::ViewLoads>,
 
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
@@ -750,6 +757,9 @@ pub struct Runtime {
     /// The engines found to have created the snapshots of datasets that read snapshots
     /// (`file_format: snapshot`), which building those datasets needs.
     snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    state_location_check: Option<Arc<runtime_state_location::StateLocationCheck>>,
 }
 
 impl Debug for Runtime {
@@ -893,6 +903,13 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    pub(crate) fn state_location_check(
+        &self,
+    ) -> Option<&Arc<runtime_state_location::StateLocationCheck>> {
+        self.state_location_check.as_ref()
     }
 
     /// The engines of the snapshot sources this runtime has resolved.
@@ -1698,6 +1715,7 @@ impl Runtime {
                 executor_future,
                 flight_future,
                 health_http_future,
+                self.state_location_refusal(),
             )
             .map(|_| ());
         }
@@ -1789,7 +1807,8 @@ impl Runtime {
                 pods_watcher_future,
                 cache_maintenance_future,
                 cluster_future,
-                shutdown_signal_future
+                shutdown_signal_future,
+                self.state_location_refusal()
             ) {
                 Err(err) => Err(err),
                 _ => Ok(()),
@@ -1802,10 +1821,27 @@ impl Runtime {
             metrics_future,
             pods_watcher_future,
             cache_maintenance_future,
-            shutdown_signal_future
+            shutdown_signal_future,
+            self.state_location_refusal()
         ) {
             Err(err) => Err(err),
             _ => Ok(()),
+        }
+    }
+
+    /// Fails when the startup check refuses `runtime.state.location`, which
+    /// stops startup. Otherwise resolves once the check passes, or at shutdown.
+    async fn state_location_refusal(&self) -> Result<()> {
+        let Some(check) = &self.state_location_check else {
+            return Ok(());
+        };
+        let shutdown = self.status.shutdown_token();
+        tokio::select! {
+            refused = check.finished() => match refused {
+                Some(reason) => StateLocationRefusedSnafu { reason: reason.to_string() }.fail(),
+                None => Ok(()),
+            },
+            () = shutdown.cancelled() => Ok(()),
         }
     }
 
@@ -1910,32 +1946,6 @@ impl Runtime {
         }
     }
 
-    /// Abandon the initial component load.
-    ///
-    /// The load has no deadline — `load_dataset` retries a transient failure for
-    /// as long as the runtime is up — so a process that is on its way out (a
-    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
-    /// stop it: left running it keeps registering datasets from the
-    /// configuration being replaced, for the whole of the shutdown drain.
-    ///
-    /// Returns `true` only when this call is the one that stopped a pending or
-    /// running load, and `false` once the load has finished or was already
-    /// superseded.
-    ///
-    /// Components already registered when this fires stay registered; only the
-    /// load's remaining work is dropped.
-    pub fn supersede_initial_load(&self) -> bool {
-        if self.initial_load.in_flight.swap(false, Ordering::SeqCst) {
-            tracing::info!(
-                "Superseding the initial component load: a new configuration replaces the one being loaded"
-            );
-            self.initial_load.cancel.cancel();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Whether the initial component load is still running.
     ///
     /// While it is, what is registered is not yet what the loaded app describes,
@@ -1983,18 +1993,7 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    ///
-    /// [`Runtime::supersede_initial_load`] abandons the load — including before
-    /// it starts, in which case this returns immediately and the superseding
-    /// caller loads the app it applied.
     pub async fn load_components(self: Arc<Self>) {
-        if self.initial_load.cancel.is_cancelled() {
-            tracing::info!(
-                "Skipping the initial component load: it was superseded before it started"
-            );
-            return;
-        }
-
         self.secrets_preflight().await;
 
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
@@ -2083,8 +2082,7 @@ impl Runtime {
         let components = vec![task_history, datasets, catalogs, models];
 
         // Signal that the load must be canceled if the runtime is shut down before the components are loaded.
-        // A child of the initial-load token so `supersede_initial_load` abandons the load through this same path.
-        let cancel_loading = self.initial_load.cancel.child_token();
+        let cancel_loading = CancellationToken::new();
 
         // Wait for all components to load returning the first error
         // or canceling spawned tokio tasks if the runtime is shutting down
@@ -2115,8 +2113,7 @@ impl Runtime {
 
         let load_outcome = load_result.await;
 
-        // The initial load is over — completed, failed, or cancelled — so a
-        // later deployment has nothing left to supersede and applies normally.
+        // The initial load is over — completed, failed, or cancelled.
         self.initial_load.in_flight.store(false, Ordering::SeqCst);
 
         if let Err(err) = load_outcome {

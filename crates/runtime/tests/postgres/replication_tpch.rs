@@ -34,6 +34,7 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,9 +45,10 @@ use arrow::util::pretty::pretty_format_batches;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
-use spicepod::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
+use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
+use spicepod::partitioning::PartitionedBy;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
@@ -197,13 +199,21 @@ async fn setup_schema_and_seed(port: u16) -> Result<tokio_postgres::Client, anyh
     Ok(client)
 }
 
-fn make_dataset(ds: &TpchDataset, pg_params: &HashMap<String, String>, engine: &str) -> Dataset {
+/// A replicated dataset. With `partitioned_in`, the acceleration is a file-mode
+/// one partitioned into four buckets of its primary key, stored under that
+/// directory.
+fn make_dataset(
+    ds: &TpchDataset,
+    pg_params: &HashMap<String, String>,
+    engine: &str,
+    partitioned_in: Option<&Path>,
+) -> Dataset {
     let mut dataset = Dataset::new(
         format!("postgres:{}", ds.pg_table),
         ds.dataset_name.to_string(),
     );
     dataset.params = Some(Params::from_string_map(pg_params.clone()));
-    dataset.acceleration = Some(Acceleration {
+    let mut acceleration = Acceleration {
         enabled: true,
         engine: Some(engine.to_string()),
         refresh_mode: Some(RefreshMode::Changes),
@@ -216,8 +226,42 @@ fn make_dataset(ds: &TpchDataset, pg_params: &HashMap<String, String>, engine: &
             HashMap::from([(ds.primary_key.to_string(), OnConflictBehavior::Upsert)])
         },
         ..Acceleration::default()
-    });
+    };
+    if let Some(dir) = partitioned_in {
+        acceleration.mode = Mode::File;
+        acceleration.partition_by = vec![PartitionedBy {
+            name: "bucket".to_string(),
+            expression: format!("bucket(4, {})", ds.primary_key),
+        }];
+        acceleration.params = Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                dir.join("data").to_string_lossy().into_owned(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                dir.join("metadata").to_string_lossy().into_owned(),
+            ),
+        ])));
+    }
+    dataset.acceleration = Some(acceleration);
     dataset
+}
+
+/// Fail unless every dataset holds exactly one row per primary key.
+async fn assert_one_row_per_key(rt: &Runtime) -> Result<(), anyhow::Error> {
+    for ds in TPCH_DATASETS {
+        assert_scalar_i64(
+            rt,
+            &format!(
+                "SELECT count(*) - count(DISTINCT {}) FROM {}",
+                ds.primary_key, ds.dataset_name
+            ),
+            0,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -342,17 +386,30 @@ async fn assert_scalar_f64_approx(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
-    run_tpch_postgres_replication("duckdb").await
+    run_tpch_postgres_replication("duckdb", false).await
 }
 
 /// The same lifecycle on Cayenne, keyed by `primary_key` alone.
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
-    run_tpch_postgres_replication("cayenne").await
+    run_tpch_postgres_replication("cayenne", false).await
 }
 
-async fn run_tpch_postgres_replication(engine: &str) -> Result<(), anyhow::Error> {
+/// The same lifecycle on Cayenne file accelerations partitioned on their
+/// primary key, then a restart. Regression test for #14947: each update kept
+/// the row's earlier versions, and a restart read every partition's earlier
+/// snapshots again.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_postgres_replication_end_to_end_cayenne_partitioned() -> Result<(), anyhow::Error> {
+    run_tpch_postgres_replication("cayenne", true).await
+}
+
+async fn run_tpch_postgres_replication(
+    engine: &str,
+    partitioned: bool,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components=debug,\
          data_components::postgres_replication=trace,info",
@@ -379,14 +436,19 @@ async fn run_tpch_postgres_replication(engine: &str) -> Result<(), anyhow::Error
                 .map(|(k, v)| (k, v.expose_secret().to_string()))
                 .collect();
 
-            let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"));
-            for ds in TPCH_DATASETS {
-                builder = builder.with_dataset(make_dataset(ds, &pg_params, engine));
-            }
-            let app = builder.build();
+            let acceleration_dir = tempfile::tempdir()?;
+            let partitioned_in = partitioned.then_some(acceleration_dir.path());
+            let app = || {
+                let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"));
+                for ds in TPCH_DATASETS {
+                    builder =
+                        builder.with_dataset(make_dataset(ds, &pg_params, engine, partitioned_in));
+                }
+                builder.build()
+            };
 
             configure_test_datafusion();
-            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let rt = Arc::new(Runtime::builder().with_app(app()).build().await);
 
             // Wait for initial load with a generous timeout — bootstrap of 4
             // tables plus slot setup takes a few seconds.
@@ -599,8 +661,38 @@ async fn run_tpch_postgres_replication(engine: &str) -> Result<(), anyhow::Error
             let pretty =
                 pretty_format_batches(&regions).map_err(|e| anyhow!("format regions: {e}"))?;
             insta::assert_snapshot!("tpch_postgres_replication_regions", pretty);
-
+            assert_one_row_per_key(&rt).await?;
             rt.shutdown().await;
+
+            if partitioned {
+                // Reopen the accelerations from their directories, resuming each
+                // replication slot, and read the same rows back.
+                let rt = Arc::new(Runtime::builder().with_app(app()).build().await);
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(90)) => {
+                        return Err(anyhow!("Timed out waiting for datasets to reload"));
+                    }
+                    () = Arc::clone(&rt).load_components() => {}
+                }
+                runtime_ready_check(&rt).await;
+                for (dataset, expected) in [
+                    ("tpch_region", 3),
+                    ("tpch_nation", 4),
+                    ("tpch_customer", 10),
+                    ("tpch_orders", 9),
+                ] {
+                    wait_for_row_count(&rt, dataset, expected).await?;
+                }
+                assert_one_row_per_key(&rt).await?;
+                assert_scalar_f64_approx(
+                    &rt,
+                    "SELECT c_acctbal FROM tpch_customer WHERE c_custkey = 1",
+                    9999.99,
+                    0.01,
+                )
+                .await?;
+                rt.shutdown().await;
+            }
             Ok(())
         })
         .await

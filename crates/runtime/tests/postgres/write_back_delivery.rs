@@ -45,6 +45,7 @@ use anyhow::anyhow;
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
+use runtime::status::ComponentStatus;
 use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, WriteMode};
 use spicepod::component::dataset::replication::Replication;
@@ -56,7 +57,7 @@ use tokio_postgres::Client;
 use crate::cayenne::transaction::{describe, run_txn};
 use crate::postgres::common;
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -212,9 +213,6 @@ fn cdc_dataset(
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some("id".to_string()),
-        on_conflict: [("id".to_string(), OnConflictBehavior::Upsert)]
-            .into_iter()
-            .collect(),
         write_mode,
         params: Some(Params::from_string_map(accel_params)),
         ..Acceleration::default()
@@ -324,8 +322,28 @@ async fn create_bumping_table(source: &Client, table: &str) -> Result<(), anyhow
     Ok(())
 }
 
+/// Wait for one dataset to report `Ready`, for a test whose runtime also holds a
+/// dataset that is refused on purpose and so never passes `runtime_ready_check`.
+async fn wait_for_ready(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    let name = datafusion::common::TableReference::from(table);
+    let ready = wait_until_true(PROPAGATION_TIMEOUT, || async {
+        matches!(
+            rt.status().get_dataset_statuses().get(&name),
+            Some(ComponentStatus::Ready)
+        )
+    })
+    .await;
+    let status = rt.status().get_dataset_statuses().get(&name).cloned();
+    anyhow::ensure!(ready, "{table} should load, got {status:?}");
+    Ok(())
+}
+
 /// Wait for the dataset's bootstrap snapshot — the one seed row.
+///
+/// Waits for `Ready` first: before that the query fails with "Acceleration not
+/// ready", and `wait_for` returns a failed probe instead of retrying it.
 async fn wait_for_bootstrap(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    wait_for_ready(rt, table).await?;
     let sql = format!("SELECT count(*) FROM {table}");
     wait_for("the bootstrap snapshot", Some(1), || accel_scalar(rt, &sql)).await
 }
@@ -482,6 +500,147 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
             })
             .await?;
 
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test for #14924: `REPLICA IDENTITY FULL` does not give a table a
+/// key. A changes dataset over a table with no primary key fails to load, with
+/// an error that names both fixes. The same table with a declared
+/// `primary_key`, and a table whose own primary key is not declared on the
+/// dataset, both load and follow UPDATE and DELETE.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(tracing_filter()));
+
+    test_request_context()
+        .scope(async {
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
+            let source = connect(port).await?;
+            exec(
+                &source,
+                "CREATE TABLE public.cdc_keyless (k text NOT NULL, v int NOT NULL); \
+                 ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL; \
+                 INSERT INTO public.cdc_keyless VALUES ('a', 1), ('b', 2); \
+                 CREATE TABLE public.cdc_source_key (id int PRIMARY KEY, v int NOT NULL); \
+                 INSERT INTO public.cdc_source_key VALUES (1, 1), (2, 2)",
+            )
+            .await?;
+
+            let keyless_dir = tempfile::tempdir()?;
+            let mut keyless = cdc_dataset(
+                port,
+                "cdc_keyless",
+                None,
+                keyless_dir.path(),
+                WriteMode::WriteThrough,
+            );
+            let keyed_dir = tempfile::tempdir()?;
+            let mut keyed = cdc_dataset(
+                port,
+                "cdc_keyless",
+                None,
+                keyed_dir.path(),
+                WriteMode::WriteThrough,
+            );
+            keyed.name = "cdc_keyed".to_string();
+            let source_key_dir = tempfile::tempdir()?;
+            let mut source_key = cdc_dataset(
+                port,
+                "cdc_source_key",
+                None,
+                source_key_dir.path(),
+                WriteMode::WriteThrough,
+            );
+            for (dataset, key) in [
+                (&mut keyless, None),
+                (&mut keyed, Some("k")),
+                (&mut source_key, None),
+            ] {
+                let acceleration = dataset
+                    .acceleration
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("cdc_dataset sets an acceleration"))?;
+                acceleration.primary_key = key.map(ToString::to_string);
+                acceleration.on_conflict = key
+                    .map(|key| (key.to_string(), OnConflictBehavior::Upsert))
+                    .into_iter()
+                    .collect();
+            }
+
+            register_test_connectors().await;
+            configure_test_datafusion();
+            let app = AppBuilder::new("cdc_keyless")
+                .with_dataset(keyless)
+                .with_dataset(keyed)
+                .with_dataset(source_key)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            // A refused dataset is retried, so loading never finishes.
+            let load = tokio::spawn(Arc::clone(&rt).load_components());
+
+            let name = datafusion::common::TableReference::from("cdc_keyless");
+            let refused = wait_until_true(Duration::from_mins(1), || async {
+                matches!(
+                    rt.status().get_dataset_statuses().get(&name),
+                    Some(ComponentStatus::Error(_))
+                )
+            })
+            .await;
+            let status = rt.status().get_dataset_statuses().get(&name).cloned();
+            anyhow::ensure!(refused, "the keyless dataset should fail to load, got {status:?}");
+            let Some(ComponentStatus::Error(Some(message))) = status else {
+                anyhow::bail!("expected an error message, got {status:?}");
+            };
+            assert_eq!(
+                message,
+                "Not served: waits for its source because it uses `refresh_mode: changes`. \
+                 Cause: Cannot setup the dataset cdc_keyless (postgres) with an invalid configuration. \
+                 Table `public.cdc_keyless` has no primary key, and `refresh_mode: changes` needs \
+                 one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the \
+                 columns that identify a row. Postgres sends those columns with every change \
+                 only under `REPLICA IDENTITY FULL` (run \
+                 `ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL;`) or \
+                 `REPLICA IDENTITY USING INDEX` on a unique index over them. \
+                 See: https://spiceai.org/docs/features/cdc/postgres-replication"
+            );
+
+            for table in ["cdc_keyed", "cdc_source_key"] {
+                wait_for_ready(&rt, table).await?;
+                let sum = format!("SELECT sum(v) FROM {table}");
+                wait_for(&format!("the {table} bootstrap"), Some(3), || {
+                    accel_scalar(&rt, &sum)
+                })
+                .await?;
+            }
+            exec(
+                &source,
+                "UPDATE public.cdc_keyless SET v = 10 WHERE k = 'a'; \
+                 DELETE FROM public.cdc_keyless WHERE k = 'b'; \
+                 UPDATE public.cdc_source_key SET v = 10 WHERE id = 1; \
+                 DELETE FROM public.cdc_source_key WHERE id = 2",
+            )
+            .await?;
+            // 10 only once the UPDATE replaced one row and the DELETE removed the other.
+            for table in ["cdc_keyed", "cdc_source_key"] {
+                let sum = format!("SELECT sum(v) FROM {table}");
+                wait_for(&format!("the {table} update and delete"), Some(10), || {
+                    accel_scalar(&rt, &sum)
+                })
+                .await?;
+                assert_accel(
+                    &rt,
+                    &format!("SELECT count(*) FROM {table}"),
+                    1,
+                    "one row remains",
+                )
+                .await?;
+            }
+
+            load.abort();
             rt.shutdown().await;
             Ok(())
         })
@@ -840,4 +999,159 @@ async fn timestamp_microseconds_survive_write_back_and_echo() -> Result<(), anyh
         crate::postgres::replication::drop_replication_slot_when_inactive(&source, slot).await?;
         Ok(())
     }).await
+}
+
+// ── refused configurations ──────────────────────────────────────────────────
+
+fn with_pk_conflict_detection_none(mut dataset: Dataset) -> Dataset {
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        let mut params: HashMap<String, String> = acceleration
+            .params
+            .as_ref()
+            .map(Params::as_string_map)
+            .unwrap_or_default();
+        params.insert(
+            "cayenne_pk_conflict_detection".to_string(),
+            "none".to_string(),
+        );
+        acceleration.params = Some(Params::from_string_map(params));
+    }
+    dataset
+}
+
+/// Regression test for #14889: with `cayenne_pk_conflict_detection: none` a
+/// staged upsert neither replaces the stored row for its key nor records the key
+/// for write-back delivery, so a CDC or write-back dataset would keep duplicate
+/// rows or acknowledge writes it never delivers. Registration refuses both,
+/// permanently, with the setting to change. A dataset beside them without the
+/// setting loads and follows the source, and so does a read-only full-refresh
+/// dataset with the setting: it takes no writes, whatever its `write_mode`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(tracing_filter()));
+
+    test_request_context()
+        .scope(async {
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
+            let source = connect(port).await?;
+            for table in ["pkd_cdc", "pkd_wb", "pkd_ctl", "pkd_ro"] {
+                exec(
+                    &source,
+                    &format!("CREATE TABLE public.{table} (id int PRIMARY KEY, n int NOT NULL)"),
+                )
+                .await?;
+                exec(&source, &format!("INSERT INTO public.{table} VALUES (1, 10)")).await?;
+            }
+
+            let accel = tempfile::tempdir()?;
+            let datasets = vec![
+                with_pk_conflict_detection_none(cdc_dataset(
+                    port,
+                    "pkd_cdc",
+                    Some("spice_pkd_slot"),
+                    accel.path(),
+                    WriteMode::WriteThrough,
+                )),
+                with_pk_conflict_detection_none(write_back_dataset(
+                    port,
+                    "pkd_wb",
+                    "spice_pkd_slot",
+                    accel.path(),
+                )),
+                cdc_dataset(
+                    port,
+                    "pkd_ctl",
+                    Some("spice_pkd_slot"),
+                    accel.path(),
+                    WriteMode::WriteThrough,
+                ),
+                {
+                    let mut read_only = with_pk_conflict_detection_none(cdc_dataset(
+                        port,
+                        "pkd_ro",
+                        None,
+                        accel.path(),
+                        WriteMode::Acceleration,
+                    ));
+                    read_only.access = AccessMode::Read;
+                    if let Some(acceleration) = read_only.acceleration.as_mut() {
+                        acceleration.refresh_mode = Some(RefreshMode::Full);
+                    }
+                    read_only
+                },
+            ];
+
+            register_test_connectors().await;
+            let mut builder = AppBuilder::new("pk_conflict_detection_none");
+            for dataset in datasets {
+                builder = builder.with_dataset(dataset);
+            }
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(builder.build()).build().await);
+            tokio::select! {
+                () = sleep(Duration::from_mins(2)) => {
+                    return Err(anyhow!("timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            let status = |name: &str| rt.status().get_component_status(&format!("dataset:{name}"));
+            for (table, consequence) in [
+                (
+                    "pkd_cdc",
+                    "this dataset applies its source's changes ('refresh_mode: changes'), so a change to an existing key would add a second row for that key instead of replacing it",
+                ),
+                (
+                    "pkd_wb",
+                    "this dataset uses 'acceleration.write_mode: write_back', which records each committed write for delivery from that check, so every write would be acknowledged and never reach the source",
+                ),
+            ] {
+                let expected = format!(
+                    "Failed to register dataset {table} (postgres): 'cayenne_pk_conflict_detection: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. Set 'cayenne_pk_conflict_detection' to 'auto', its default. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+                let refused = crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    matches!(status(table), Some(ComponentStatus::Error(Some(message))) if message.contains(&expected))
+                })
+                .await;
+                assert!(refused, "{table} must be refused with {expected:?}, got {:?}", status(table));
+            }
+
+            // The refusal is permanent: a retry would move the status off `Error`
+            // while it rebuilds. Elapsed time is what is under test here.
+            sleep(Duration::from_secs(10)).await;
+            for table in ["pkd_cdc", "pkd_wb"] {
+                assert!(
+                    matches!(status(table), Some(ComponentStatus::Error(Some(_)))),
+                    "{table} stays refused, got {:?}",
+                    status(table)
+                );
+            }
+
+            // A read-only dataset takes no accelerator writes, so the setting is
+            // not refused there: it loads its full refresh.
+            wait_for_ready(&rt, "pkd_ro").await?;
+            assert_eq!(
+                accel_scalar(&rt, "SELECT n FROM pkd_ro WHERE id = 1").await?,
+                Some(10)
+            );
+
+            // The dataset without the setting loads and follows the source.
+            wait_for_bootstrap(&rt, "pkd_ctl").await?;
+            exec(&source, "UPDATE public.pkd_ctl SET n = 20 WHERE id = 1").await?;
+            wait_for("the source update", Some(20), || {
+                accel_scalar(&rt, "SELECT n FROM pkd_ctl WHERE id = 1")
+            })
+            .await?;
+            assert_eq!(
+                accel_scalar(&rt, "SELECT count(*) FROM pkd_ctl").await?,
+                Some(1),
+                "the control keeps one row per key"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
 }

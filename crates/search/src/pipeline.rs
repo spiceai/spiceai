@@ -329,10 +329,16 @@ pub(crate) mod tests {
             "keYwOrD4".to_string(),
         ];
         // Test all lowercase
-        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hello")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+        insta::assert_snapshot!(
+            "prepare_keywords_lowercase_column",
+            format!("{:?}", prepare_keywords(&keywords, "hello"))
+        );
 
         // Test with casing
-        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hElLo")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+        insta::assert_snapshot!(
+            "prepare_keywords_mixed_case_column",
+            format!("{:?}", prepare_keywords(&keywords, "hElLo"))
+        );
     }
 
     #[test]

@@ -2,12 +2,9 @@
 
 source [file join [file dirname [info script]] repl_helpers.exp]
 
-# Local Hugging Face / Metal inference can stream well past 30s after the model
-# is already loaded: merge-queue job 103597842965 spent the whole 30s budget on
-# one long Qwen2.5-3B answer and never reached `chat>`. 120s is the default so a
-# slow generation still finishes; override with SPICE_CHAT_EXPECT_TIMEOUT
-# (seconds) for CI or a local run. Search stays on its own 5s timeout.
-set timeout [repl_timeout_seconds 120]
+# How long the runtime may go silent before the script calls it stalled. This is
+# not a bound on how long a response may take — see repl_idle_timeout.
+set timeout [repl_idle_timeout]
 
 spawn spice chat {*}[repl_endpoint_args]
 
@@ -26,12 +23,16 @@ proc chat {message}  {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. Whole lines only, for the
+            # reason given in repl_helpers.exp.
+            exp_continue
+        }
         eof {
             repl_died "Waiting for the response to \"$message\""
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the response to \"$message\""
         }
     }
 
@@ -43,12 +44,15 @@ proc chat {message}  {
 # block while the REPL is already ready for input.
 expect {
     "chat> " {}
+    -re {[^\n]*\n} {
+        # Banner and connection lines the CLI prints on its way to the prompt.
+        exp_continue
+    }
     eof {
         repl_died "Waiting for the initial chat prompt"
     }
     timeout {
-        send_user "Timeout waiting for initial chat prompt\n"
-        exit 1
+        repl_stalled "Waiting for the initial chat prompt"
     }
 }
 

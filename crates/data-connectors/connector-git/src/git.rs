@@ -1652,27 +1652,180 @@ mod tests {
         );
     }
 
+    /// The libgit2 credential type `cred` was built as. `credtype()` is a C
+    /// enum whose width is platform dependent (`u32`, or `i32` under MSVC), so
+    /// both sides of a comparison are widened to `i64`.
+    fn credtype_of(cred: &Cred) -> i64 {
+        i64::from(cred.credtype())
+    }
+
+    fn credtype_bits(kind: CredentialType) -> i64 {
+        i64::from(kind.bits())
+    }
+
+    /// A local HTTP server that answers every request with a `401` Basic
+    /// challenge until one arrives carrying an `Authorization` header, answers
+    /// that one with `404`, and hands back the header. libgit2 only sends
+    /// credentials in reply to a challenge, so the captured header is exactly
+    /// the username and password the credentials callback produced.
+    struct BasicAuthChallenge {
+        url: String,
+        addr: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: std::thread::JoinHandle<Option<String>>,
+    }
+
+    impl BasicAuthChallenge {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind a local port for the auth challenge server");
+            let addr = listener
+                .local_addr()
+                .expect("local address of the auth challenge server");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_flag = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop_flag.load(Ordering::SeqCst) {
+                        return None;
+                    }
+                    let Ok(mut stream) = stream else {
+                        continue;
+                    };
+                    if let Some(authorization) = Self::serve(&mut stream) {
+                        return Some(authorization);
+                    }
+                }
+                None
+            });
+            Self {
+                url: format!("http://{addr}/owner/repo.git"),
+                addr,
+                stop,
+                handle,
+            }
+        }
+
+        /// Serves requests on one connection until one carries an
+        /// `Authorization` header (returned), or the client goes away.
+        fn serve(stream: &mut std::net::TcpStream) -> Option<String> {
+            use std::io::{Read, Write};
+
+            const CHALLENGE: &str = concat!(
+                "HTTP/1.1 401 Unauthorized\r\n",
+                "WWW-Authenticate: Basic realm=\"spice-test\"\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            );
+            const NOT_FOUND: &str = concat!(
+                "HTTP/1.1 404 Not Found\r\n",
+                "Content-Length: 0\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+            );
+
+            let read_timeout = Some(Duration::from_secs(10));
+            stream.set_read_timeout(read_timeout).ok()?;
+            loop {
+                let mut request_bytes = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let received = stream.read(&mut chunk).ok()?;
+                    if received == 0 {
+                        return None;
+                    }
+                    request_bytes.extend_from_slice(&chunk[..received]);
+                }
+                let request = String::from_utf8_lossy(&request_bytes).into_owned();
+                let authorization = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
+                if let Some(authorization) = authorization {
+                    // Best effort: the header is already captured, and the
+                    // client fails the connection either way.
+                    let _ = stream.write_all(NOT_FOUND.as_bytes());
+                    return Some(authorization);
+                }
+                stream.write_all(CHALLENGE.as_bytes()).ok()?;
+            }
+        }
+
+        /// Stops the server and returns the `Authorization` header it
+        /// captured, if the client ever sent one.
+        fn finish(self) -> Option<String> {
+            self.stop.store(true, Ordering::SeqCst);
+            // Wake the accept loop in case the client never came back with
+            // credentials; refused once the server has already returned.
+            let _ = std::net::TcpStream::connect(self.addr);
+            self.handle
+                .join()
+                .expect("auth challenge server thread must not panic")
+        }
+    }
+
     #[test]
     fn resolve_credentials_token_is_used_for_userpass() {
         let creds = GitCredentials {
             token: Some("ghp_token".to_string()),
             ..Default::default()
         };
-        let result =
-            GitClient::resolve_credentials(&creds, None, CredentialType::USER_PASS_PLAINTEXT);
-        assert!(result.is_ok(), "should produce userpass cred");
+        let cred =
+            GitClient::resolve_credentials(&creds, None, CredentialType::USER_PASS_PLAINTEXT)
+                .expect("a token must produce a userpass credential");
+        assert_eq!(
+            credtype_of(&cred),
+            credtype_bits(CredentialType::USER_PASS_PLAINTEXT)
+        );
+
+        // `Cred` does not expose the username and password it carries, so let
+        // libgit2 put them on the wire through the same callback the client
+        // installs, and read them back off the challenge server.
+        let server = BasicAuthChallenge::start();
+        let mut remote = git2::Remote::create_detached(server.url.as_str())
+            .expect("detached remote for the auth challenge server");
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(|_url, username_from_url, allowed_types| {
+            GitClient::resolve_credentials(&creds, username_from_url, allowed_types)
+        });
+        // The server answers the authenticated request with 404, so the
+        // connection itself fails once the header has been captured.
+        let outcome = remote
+            .connect_auth(git2::Direction::Fetch, Some(callbacks), None)
+            .map(|_connection| ());
+        drop(remote);
+
+        assert_eq!(
+            server.finish().as_deref(),
+            // base64("x-access-token:ghp_token")
+            Some("Basic eC1hY2Nlc3MtdG9rZW46Z2hwX3Rva2Vu"),
+            "a token must be the password of user `x-access-token`; connect: {outcome:?}"
+        );
     }
 
     #[test]
     fn resolve_credentials_ssh_agent_only_when_enabled() {
-        // With ssh_use_agent = false and no ssh_key_path, SSH_KEY should fall
-        // through — not auto-use the agent based on URL shape.
-        let creds = GitCredentials::default();
-        let fallthrough =
-            GitClient::resolve_credentials(&creds, Some("git"), CredentialType::SSH_KEY);
-        // The code tries SSH_KEY first, has nothing to return, and falls into
-        // the USERNAME/USER_PASS/DEFAULT branches which are not allowed here,
-        // producing an "unsupported credential type" error.
-        assert!(fallthrough.is_err(), "expected error when agent disabled");
+        // With ssh_use_agent = false and no ssh_key_path, SSH_KEY must fall
+        // through — not auto-use the agent based on URL shape — and with no
+        // other credential type allowed there is nothing left to offer.
+        let disabled = GitCredentials::default();
+        let Err(err) =
+            GitClient::resolve_credentials(&disabled, Some("git"), CredentialType::SSH_KEY)
+        else {
+            panic!("an ssh-agent credential must not be offered while `ssh_use_agent` is off");
+        };
+        assert_eq!(err.message(), "unsupported credential type");
+        assert_eq!(err.code(), git2::ErrorCode::GenericError);
+
+        // With the agent enabled, the same request is answered from the agent.
+        let enabled = GitCredentials {
+            ssh_use_agent: true,
+            ..Default::default()
+        };
+        let cred = GitClient::resolve_credentials(&enabled, Some("git"), CredentialType::SSH_KEY)
+            .expect("`ssh_use_agent` must produce an ssh-agent credential");
+        assert_eq!(credtype_of(&cred), credtype_bits(CredentialType::SSH_KEY));
     }
 }

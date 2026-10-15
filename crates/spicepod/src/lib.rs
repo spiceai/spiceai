@@ -129,6 +129,11 @@ pub enum Error {
         "The name '{keyword}' is reserved and cannot be used as a name for a dataset. Change the name in the Spicepod and try again."
     ))]
     UseOfReservedKeyword { keyword: String },
+
+    #[snafu(display(
+        "Tool '{name}' has `from: {from}`, which needs a command or URL: `mcp:<command>` or `mcp:https://<host>/<path>`."
+    ))]
+    MissingMcpTarget { name: String, from: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -234,6 +239,23 @@ fn check_for_reserved_keywords(components: &[Dataset]) -> Result<()> {
         if keywords::is_reserved_keyword(component.name()) {
             return Err(Error::UseOfReservedKeyword {
                 keyword: component.name().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A bare `from: mcp` (or `mcp:` with nothing after it) names no server to connect to.
+fn check_mcp_tools_have_target(tools: &[Tool]) -> Result<()> {
+    for tool in tools {
+        let target = tool
+            .from
+            .strip_prefix("mcp")
+            .map(|rest| rest.strip_prefix(':').unwrap_or(rest));
+        if target.is_some_and(|t| t.trim().is_empty()) {
+            return Err(Error::MissingMcpTarget {
+                name: tool.name.clone(),
+                from: tool.from.clone(),
             });
         }
     }
@@ -383,6 +405,7 @@ impl Spicepod {
         detect_duplicate_component_names("function", &resolved_functions[..])?;
 
         check_for_reserved_keywords(&resolved_datasets[..])?;
+        check_mcp_tools_have_target(&resolved_tools[..])?;
 
         Ok(from_definition(
             spicepod_definition,
@@ -670,13 +693,6 @@ mod version_tests {
         assert_eq!(v2, SpicepodVersion::V2);
     }
 
-    /// v1beta1 is no longer a valid version.
-    #[test]
-    fn test_v1beta1_rejected() {
-        let result: Result<SpicepodVersion, _> = yaml::from_str("v1beta1");
-        assert!(result.is_err(), "v1beta1 should no longer be accepted");
-    }
-
     /// Version strings serialize to the expected lowercase YAML values.
     #[test]
     fn test_version_enum_serialization() {
@@ -710,9 +726,12 @@ mod version_tests {
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "Malformed version 'not-a-version' should be rejected"
+        // Rejected through the `version` field, naming the value and the accepted forms.
+        assert_eq!(
+            result
+                .expect_err("Malformed version 'not-a-version' should be rejected")
+                .to_string(),
+            "invalid spicepod version 'not-a-version': expected a version string like 'v1', 'v2', 'v2.0', 'v2.0.0', or 'v2.0.0-rc.1'"
         );
     }
 

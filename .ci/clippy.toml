@@ -17,8 +17,26 @@ future-size-threshold = 45520 # Large futures are in tests
 # `cpu_budget::cpu_budget()` resolves the real entitlement and owns every value
 # derived from it; `cpu-budget` itself opts out with `#[expect]` at its one
 # detection site.
+# Table factories and `SqlTable` constructors whose default federates to a remote
+# SQL engine with no Spice function deny-list: a provider built from one unparses
+# every Spice-only UDF (`json_get_str` and the rest of the JSON set, the
+# embedding/distance UDFs, every user-registered function) into the SQL the
+# remote engine is sent, and it answers with an unknown-function error. That is
+# how the ADBC, MySQL, PostgreSQL, DuckLake and Snowflake catalogs each shipped
+# without one (#13664). A legitimate call site installs the backend's deny-list
+# — `.with_function_support(..)`, or `create_spice_federated_table_provider` for
+# a `SqlTable` — and says where in its `#[expect(clippy::disallowed_methods)]`.
 disallowed-methods = [
     { path = "std::thread::available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
     { path = "num_cpus::get", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
     { path = "datafusion_common::utils::get_available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
+    { path = "datafusion_table_providers::adbc::AdbcTableFactory::new", reason = "install the backend deny-list with .with_function_support(..) — this factory federates every Spice-only UDF into the remote SQL by default (#13664)" },
+    { path = "datafusion_table_providers::mysql::MySQLTableFactory::new", reason = "install the backend deny-list with .with_function_support(..) — this factory federates every Spice-only UDF into the remote SQL by default (#13664)" },
+    { path = "datafusion_table_providers::duckdb::DuckDBTableFactory::new", reason = "install the backend deny-list with .with_function_support(..) — this factory federates every Spice-only UDF into the remote SQL by default (#13664)" },
+    { path = "datafusion_table_providers::postgres::PostgresTableFactory::new", reason = "build PostgreSQL read providers with data_components::federation::create_spice_federated_table_provider — this factory has no deny-list seam and federates every Spice-only UDF into the remote SQL (#13664)" },
+    { path = "datafusion_table_providers::sql::sql_provider_datafusion::SqlTable::new", reason = "pass the table to data_components::federation::create_spice_federated_table_provider with the backend deny-list, or set .with_function_support(..) — a bare SqlTable pushes Spice-only UDFs into the remote SQL (#13664)" },
+    { path = "datafusion_table_providers::sql::sql_provider_datafusion::SqlTable::new_with_schema", reason = "pass the table to data_components::federation::create_spice_federated_table_provider with the backend deny-list, or set .with_function_support(..) — a bare SqlTable pushes Spice-only UDFs into the remote SQL (#13664)" },
+    { path = "data_components::snowflake::SnowflakeTableFactory::new", reason = "install the deny-list with .with_function_support(..) — this factory federates every Spice-only UDF into the remote SQL by default (#13664)" },
+    { path = "data_components::flight::FlightFactory::new", reason = "install the deny-list with .with_function_support(..), or say why the remote can run every pushed function — this factory federates every Spice-only UDF by default (#13664)" },
+    { path = "data_components::flightsql::FlightSQLFactory::new", reason = "install the deny-list with .with_function_support(..) — this factory federates every Spice-only UDF into the remote SQL by default (#13664)" },
 ]

@@ -1395,14 +1395,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_mode_turso_creation() {
-        // Test that file mode creates a Turso database at a specified path
-        let test_path = "/tmp/test_turso_file_mode.db";
-
-        // Clean up if file exists from previous test
-        let _ = std::fs::remove_file(test_path);
-        let _ = std::fs::remove_file(format!("{test_path}-wal"));
-        let _ = std::fs::remove_file(format!("{test_path}-shm"));
-        let _ = std::fs::remove_file(format!("{test_path}-log"));
+        // Test that file mode creates a Turso database at a specified path. The
+        // database lives in a directory owned by this process, so two concurrent runs
+        // (a second checkout, a retried test) never open one file, and removing the
+        // directory removes every sidecar Turso leaves beside the database.
+        let dir = std::env::temp_dir().join(format!(
+            "spice_turso_file_mode_creation_{}",
+            std::process::id()
+        ));
+        // Only a crashed earlier process that reused this pid can have left the
+        // directory behind; a stale MVCC log in it would fail the open below.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp directory should be creatable");
+        let test_path = dir
+            .join("test_turso_file_mode.db")
+            .to_string_lossy()
+            .to_string();
 
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
@@ -1412,7 +1420,7 @@ mod tests {
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
         let mut options = HashMap::new();
-        options.insert("file".to_string(), test_path.to_string());
+        options.insert("file".to_string(), test_path.clone());
 
         let external_table = CreateExternalTable {
             schema: df_schema,
@@ -1439,7 +1447,7 @@ mod tests {
 
         // Verify the file was created
         assert!(
-            std::path::Path::new(test_path).exists(),
+            std::path::Path::new(&test_path).exists(),
             "Turso database file should be created at specified path"
         );
 
@@ -1496,18 +1504,12 @@ mod tests {
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");
 
-        // Clean up - drop the table first to close connections
+        // Clean up: drop the table to close its connections, then remove the database
+        // and its sidecars with the directory. Cleanup is best effort, as before, and
+        // nothing waits on it: the directory is private to this process.
         drop(table);
         drop(ctx);
-
-        // Give a moment for connections to close
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Clean up all database files
-        let _ = std::fs::remove_file(test_path);
-        let _ = std::fs::remove_file(format!("{test_path}-wal"));
-        let _ = std::fs::remove_file(format!("{test_path}-shm"));
-        let _ = std::fs::remove_file(format!("{test_path}-log"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

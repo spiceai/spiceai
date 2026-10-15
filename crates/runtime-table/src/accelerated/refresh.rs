@@ -78,11 +78,9 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionsByTime {
     /// The accelerator resolves a full refresh's repeated keys as it writes them, by
-    /// the row versions the refresh supplies (unpartitioned Cayenne).
+    /// the row versions the refresh supplies. An append's first load into an empty
+    /// table gets them too when the accelerator says it would take it.
     pub versions_resolved_after_write: bool,
-    /// It also resolves them for an append into an empty table (unpartitioned
-    /// file-mode Cayenne; a table with `retention_sql` refuses such a load).
-    pub appends_resolved_after_write: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1418,13 +1416,13 @@ impl Refresher {
                                     // No cache provider means runtime is shutting down and cache is already cleaned up
                                     if let Some(cache_provider) = cache_provider_ref.upgrade() {
                                         // The refresh rewrote every synchronized (e.g. localpod) child's
-                                        // accelerator along with this dataset's, so cached results for the
-                                        // children are exactly as stale as the parent's (#12887). Children
+                                        // accelerator along with this dataset's, so their plans and search
+                                        // caches must be invalidated as well (#12887). Children
                                         // attach after their own initial load completes, so the set is
                                         // resolved live rather than captured when this loop started.
                                         for table_name in refresh_task.get_dataset_names().await {
-                                            if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
-                                                tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                            if let Err(e) = cache_provider.invalidate_for_refresh(table_name.clone()).await {
+                                                tracing::warn!("Failed to invalidate cached query plans and search results for dataset {table_name} after a refresh, so they may reflect the previous data until they expire: {e}");
                                             }
                                         }
                                     }
@@ -1652,12 +1650,12 @@ fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) ->
     )
 }
 
-/// After a refresh task finishes: invalidate cached results, then publish
+/// After a refresh task finishes: invalidate plans and search caches, then publish
 /// `initial_load_completed`, then record the outcome.
 ///
 /// Results-cache warmup waits on the outcome recorded here after the first
-/// full/append refresh. Publishing the flag before invalidation would let a
-/// poller of that flag store entries this callback then evicts. The flag still
+/// full/append refresh. Publishing the flag after derived-cache invalidation
+/// lets warmup plan against refreshed state. SQL results age independently. The flag still
 /// precedes `record_done`, so a waiter woken by a successful completion
 /// observes the initial load as done — the same pairing as
 /// `RefreshTask::signal_dataset_ready`.
@@ -2545,12 +2543,13 @@ mod tests {
         )
     }
 
-    /// Reproduction for warmup vs checkpoint-backed startup refresh: the
-    /// reusable `initial_load_completed` flag is already true, so a poller
-    /// that waits on it stores while this process's first refresh is still
-    /// in flight; that refresh then invalidates the warmed entry.
+    /// Warmup vs checkpoint-backed startup refresh: the reusable
+    /// `initial_load_completed` flag is already true, so a poller that waits on
+    /// it stores while this process's first refresh is still in flight. The
+    /// refresh does not invalidate SQL results, so the warmed entry survives it
+    /// and ages out on `item_ttl` like any other entry.
     #[tokio::test]
-    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_invalidation() {
+    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_refresh() {
         const WARMUP_KEY: u64 = 7;
         let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
             started_gated_checkpoint_always_refresher().await;
@@ -2577,18 +2576,17 @@ mod tests {
             .expect("the gated startup refresh completes after the source opens");
 
         assert!(
-            !warmup_entry_present(&cache, WARMUP_KEY).await,
-            "the startup refresh must invalidate entries stored while it was in flight"
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "a refresh leaves cached SQL results to age out on item_ttl"
         );
 
         drop(refresh_handle);
     }
 
-    /// The wait warmup must use: a store after the per-process completion
-    /// cannot be evicted by that same refresh, because invalidation already
-    /// ran.
+    /// The wait warmup uses: a store after the per-process completion reads
+    /// the refreshed data and stays cached.
     #[tokio::test]
-    async fn warmup_store_after_refresh_completion_survives_startup_invalidation() {
+    async fn warmup_store_after_refresh_completion_survives_startup_refresh() {
         const WARMUP_KEY: u64 = 11;
         let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
             started_gated_checkpoint_always_refresher().await;
@@ -2614,7 +2612,7 @@ mod tests {
         store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
         assert!(
             warmup_entry_present(&cache, WARMUP_KEY).await,
-            "a store after the completion is recorded must survive that refresh's invalidation"
+            "a store after the completion is recorded stays cached"
         );
 
         drop(refresh_handle);

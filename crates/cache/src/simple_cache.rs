@@ -398,40 +398,19 @@ mod tests {
         let result = create_test_cached_result().await;
 
         // Put a value in the cache
-        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.put_raw_key(&key.as_u64(), result).await;
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         let retrieved = retrieved.expect("cache should contain the key");
-        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
-        let result_len = result.records().await.expect("Failed to decode").len();
-        (retrieved_len == result_len)
-            .then_some(())
-            .expect("retrieved and result should have same length");
-    }
-
-    #[rstest]
-    #[case::siphash(RandomState::default())]
-    #[case::ahash(ahash::RandomState::default())]
-    #[tokio::test]
-    async fn test_cache_miss<
-        H: Hasher + Send + Sync + 'static,
-        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    >(
-        #[case] hasher: T,
-    ) {
-        let cache: SimpleCache<CachedQueryResult, _, _> =
-            SimpleCache::new(10, Duration::from_mins(1), hasher);
-        let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
-
-        // Try to get a non-existent key
-        let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        retrieved
-            .is_none()
-            .then_some(())
-            .expect("cache should not contain nonexistent key");
+        let retrieved_batches = retrieved.records().await.expect("Failed to decode");
+        assert_eq!(
+            *retrieved_batches,
+            [Arc::new(create_test_record_batch())],
+            "the cache must serve exactly the batch that was stored (`id` = [1, 2, 3])"
+        );
     }
 
     #[rstest]

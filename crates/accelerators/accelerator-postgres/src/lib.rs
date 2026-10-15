@@ -227,6 +227,22 @@ impl DataAccelerator for PostgresAccelerator {
         )))
     }
 
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(
+                Error::InvalidConnectionPoolConfiguration { .. }
+                    | Error::InvalidParameterValue { .. }
+            )
+        ) || matches!(
+            error.downcast_ref::<data_accelerator_api::Error>(),
+            Some(data_accelerator_api::Error::InvalidConfiguration { .. })
+        )
+    }
+
     fn prefix(&self) -> &'static str {
         "pg"
     }

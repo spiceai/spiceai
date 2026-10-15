@@ -17,20 +17,25 @@ limitations under the License.
 // ============================================================================
 // Append-mode coordinator (issue #10125 §6.3 + step 6).
 //
-// Append cannot use the overwrite path's MetastoreTransaction batching
-// because append commits don't mutate the catalog at all — visibility is
-// filesystem state + the in-memory ListingTable. The cross-partition
-// guarantee is delivered by a *barrier*: every participating partition's
-// listing fence is held for write while file moves + ListingTable swaps
-// happen, so any reader going through `CayenneTableProvider::scan()`
-// resolves either before or after the whole barrier, never in the middle.
+// Every participating partition stages its rows into a private target
+// snapshot, and one MetastoreTransaction commits all of them: a partition whose
+// write publishes on-conflict state (tombstones and re-insert records keyed by
+// primary key) stages into an overlay, a protected snapshot holding only the
+// write's rows, committed by recording its sequence; any other partition's
+// target is a clone of its current snapshot plus the write's rows, committed
+// by advancing its current-snapshot pointer. Publication is delivered by a
+// *barrier*: every participating partition's listing fence is held for write
+// while the targets become visible, so any reader going through
+// `CayenneTableProvider::scan()` resolves either before or after the whole
+// barrier, never in the middle.
 //
 // Crash safety: the top-level `PartitionedWal`
 // written at `<table_root>/_partitioned_wal/<commit_id>.json` records every
 // partition participating in this barrier. If the writer crashes, provider
-// startup converges each participant from the catalog pointer and then this
-// coordinator validates and removes the stale set anchor. Local filesystems
-// use an atomic file; S3-compatible stores use object-store put/delete.
+// startup converges each participant from the catalog (its pointer, or its
+// overlay's sequence) and then this coordinator validates and removes the
+// stale set anchor. Local filesystems use an atomic file; S3-compatible stores
+// use object-store put/delete.
 // ============================================================================
 
 use std::collections::HashMap;
@@ -40,7 +45,9 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use cayenne::{CayenneCatalog, PartitionedWal, PartitionedWalEntry, PreparedStagedAppend};
+use cayenne::{
+    CayenneCatalog, MetadataCatalog, PartitionedWal, PartitionedWalEntry, PreparedStagedAppend,
+};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
@@ -341,6 +348,7 @@ impl DataSink for CayennePartitionedAppendSink {
             .map(|p| PartitionedWalEntry {
                 table_id: p.table_id().to_string(),
                 target_snapshot_id: Some(p.target_snapshot_id().to_string()),
+                overlay: p.publishes_overlay(),
                 staging_wal_path: Some(p.staging_wal_path().to_string_lossy().to_string()),
             })
             .collect();
@@ -404,10 +412,17 @@ impl DataSink for CayennePartitionedAppendSink {
         // Build every fallible in-memory publication object before moving a
         // staged file. Once the barrier move starts, rollback is no longer a
         // generally safe option; after the catalog commit publication itself
-        // must be infallible and await-free.
+        // must be infallible and await-free. An overlay replaces no current
+        // snapshot, so it has none to build.
         let publish_states = match prepared
             .iter()
-            .map(PreparedStagedAppend::prepare_deferred_snapshot_publish)
+            .map(|receipt| {
+                if receipt.publishes_overlay() {
+                    Ok(None)
+                } else {
+                    receipt.prepare_deferred_snapshot_publish().map(Some)
+                }
+            })
             .collect::<cayenne::provider::Result<Vec<_>>>()
         {
             Ok(states) => states,
@@ -487,9 +502,9 @@ impl DataSink for CayennePartitionedAppendSink {
         let table_root = self.table_root.clone();
         let completion = tokio::spawn(async move {
             let _coordinator_guard = _coordinator_guard;
-            // The complete post-append contents now exist in one private snapshot
-            // per partition. Flip every pointer in a single metastore transaction;
-            // readers cannot observe a subset through a fresh directory listing.
+            // Every partition's target is staged. Commit them all in a single
+            // metastore transaction; readers cannot observe a subset through a
+            // fresh directory listing.
             if let Err(error) = Self::commit_append_snapshots_in_one_txn(
                 catalog.as_ref(),
                 &prepared,
@@ -502,10 +517,11 @@ impl DataSink for CayennePartitionedAppendSink {
                 match append_commit_failure_disposition(commit_state) {
                     AppendCommitFailureDisposition::RecoverCommitted => {
                         // `COMMIT` can complete but report an ambiguous transport
-                        // failure. Durable pointers are the decision: restore each
-                        // payload, prove its generated DV paths are in committed
-                        // metadata, then let per-partition WAL recovery reload and
-                        // publish the complete durable state.
+                        // failure. The durable catalog is the decision — pointers,
+                        // and the sequences of overlays: restore each payload,
+                        // prove its generated DV paths are in committed metadata,
+                        // then let per-partition WAL recovery reload and publish
+                        // the complete durable state.
                         for (receipt, on_conflict) in prepared.iter_mut().zip(prepared_on_conflicts)
                         {
                             receipt.restore_prepared_on_conflict(on_conflict);
@@ -520,6 +536,14 @@ impl DataSink for CayennePartitionedAppendSink {
                                 .recover_committed_snapshot()
                                 .await
                                 .map_err(DataFusionError::from)?;
+                            // Recovery publishes a target that became the current
+                            // snapshot; an overlay leaves the pointer where it was.
+                            if receipt.publishes_overlay() {
+                                receipt
+                                    .publish_recovered_overlay()
+                                    .await
+                                    .map_err(DataFusionError::from)?;
+                            }
                         }
                         return Err(error);
                     }
@@ -590,7 +614,10 @@ impl DataSink for CayennePartitionedAppendSink {
                 .zip(publish_states)
                 .zip(prepared_on_conflicts)
             {
-                receipt.publish_deferred_snapshot_under_held_fence(publish_state);
+                // An overlay becomes visible through its on-conflict state below.
+                if let Some(publish_state) = publish_state {
+                    receipt.publish_deferred_snapshot_under_held_fence(publish_state);
+                }
                 // Capture the on-conflict publish sequence before the value is
                 // consumed below; an on-conflict append has no `append_sequence`,
                 // so this is the sequence its validated keys must be stamped with.
@@ -697,11 +724,22 @@ impl CayennePartitionedAppendSink {
     ) -> datafusion::common::Result<AppendCommitState> {
         let mut pointer_matches = Vec::with_capacity(prepared.len());
         for receipt in prepared {
-            let current = catalog
-                .current_snapshot_id_for_table(receipt.table_id())
-                .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            pointer_matches.push(current == receipt.target_snapshot_id());
+            // An overlay's commit is its recorded sequence; any other target's
+            // is the partition's pointer.
+            let committed = if receipt.publishes_overlay() {
+                catalog
+                    .get_snapshot_sequence(receipt.table_id(), receipt.target_snapshot_id())
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?
+                    .is_some()
+            } else {
+                catalog
+                    .current_snapshot_id_for_table(receipt.table_id())
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?
+                    == receipt.target_snapshot_id()
+            };
+            pointer_matches.push(committed);
         }
         Ok(classify_pointer_matches(pointer_matches))
     }
@@ -714,10 +752,26 @@ impl CayennePartitionedAppendSink {
         >],
     ) -> datafusion::common::Result<()> {
         let max_attempts = turso_shared::DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        // An overlay moves no pointer: its recorded sequence, written by its
+        // on-conflict payload below, publishes it.
         let snapshots: Vec<(&str, &str)> = prepared
             .iter()
+            .filter(|receipt| !receipt.publishes_overlay())
             .map(|receipt| (receipt.table_id(), receipt.target_snapshot_id()))
             .collect();
+        // An overlay's commit evidence is the sequence its payload records, so
+        // committing one without a payload would commit a write recovery could
+        // never recognize.
+        if prepared
+            .iter()
+            .zip(prepared_on_conflicts.iter())
+            .any(|(receipt, on_conflict)| receipt.publishes_overlay() && on_conflict.is_none())
+        {
+            return Err(DataFusionError::Internal(
+                "a partition's overlay append carries no on-conflict payload to commit it"
+                    .to_string(),
+            ));
+        }
 
         'attempts: for attempt in 1..=max_attempts {
             let mut txn = catalog
@@ -769,8 +823,8 @@ impl CayennePartitionedAppendSink {
                 }
             }
             for receipt in prepared {
-                if let Some(manifest) = receipt.deferred_manifest()
-                    && let Err(error) = catalog
+                let recorded = if let Some(manifest) = receipt.deferred_manifest() {
+                    catalog
                         .replace_snapshot_files_in_txn(
                             &mut *txn,
                             receipt.table_id(),
@@ -778,7 +832,16 @@ impl CayennePartitionedAppendSink {
                             manifest,
                         )
                         .await
-                {
+                } else if receipt.publishes_overlay() {
+                    // A pointer update deletes the exact statistics a replacement
+                    // snapshot no longer matches; an overlay adds rows too.
+                    catalog
+                        .clear_table_statistics_in_txn(&mut *txn, receipt.table_id())
+                        .await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = recorded {
                     // Roll back explicitly (not via the transaction's best-effort,
                     // possibly-detached Drop) so the metastore writer lock is released
                     // deterministically before this attempt backs off and retries.

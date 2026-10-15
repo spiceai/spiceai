@@ -976,13 +976,21 @@ mod inferred_schema_tests {
     fn keeps_hidden_and_ttl_indexes() {
         // Hidden indexes are still maintained (and still enforce uniqueness); TTL
         // indexes are ordinary single-field b-tree indexes.
-        assert!(
-            parse_mongo_index(&doc! { "key": { "email": 1 }, "unique": true, "hidden": true })
-                .is_some()
+        assert_eq!(
+            parse_mongo_index(&doc! { "key": { "email": 1 }, "unique": true, "hidden": true }),
+            Some(InferredIndex {
+                columns: vec!["email".to_string()],
+                unique: true
+            }),
+            "a hidden unique index keeps its column and still enforces uniqueness"
         );
-        assert!(
-            parse_mongo_index(&doc! { "key": { "created_at": 1 }, "expireAfterSeconds": 3600 })
-                .is_some()
+        assert_eq!(
+            parse_mongo_index(&doc! { "key": { "created_at": 1 }, "expireAfterSeconds": 3600 }),
+            Some(InferredIndex {
+                columns: vec!["created_at".to_string()],
+                unique: false
+            }),
+            "a TTL index is an ordinary non-unique single-column index"
         );
     }
 

@@ -2296,6 +2296,7 @@ mod tests {
         ];
 
         for (k, v) in extra {
+            params.retain(|(key, _)| key.as_str() != *k);
             params.push(((*k).to_string(), (*v).to_string().into()));
         }
 
@@ -2424,12 +2425,16 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         }
     }
 
-    fn assert_conflicting_rate_control_error(error: DataConnectorError) {
+    /// Assert a shared-origin rate-control conflict that quotes exactly
+    /// `differences`, the parameters it resolves differently with both values.
+    fn assert_conflicting_rate_control_error(error: DataConnectorError, differences: &str) {
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("different rate-control settings"),
-                    "expected shared-origin rate-control conflict, got: {message}"
+                    message.contains(&format!(
+                        "must resolve to the same rate-control settings, but this one differs from those already targeting it: {differences}. Set "
+                    )),
+                    "expected shared-origin rate-control conflict on {differences}, got: {message}"
                 );
             }
             other => panic!("expected shared-origin rate-control conflict, got: {other}"),
@@ -2771,7 +2776,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         else {
             panic!("mixed configured/unconfigured origin should be rejected");
         };
-        assert_conflicting_rate_control_error(error);
+        assert_conflicting_rate_control_error(
+            error,
+            "`max_concurrent_requests` is unset here and 2 there",
+        );
 
         let unconfigured = test_connector_with(&[]).await;
         let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
@@ -2798,7 +2806,148 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         else {
             panic!("mixed unconfigured/configured origin should be rejected");
         };
-        assert_conflicting_rate_control_error(error);
+        assert_conflicting_rate_control_error(
+            error,
+            "`max_concurrent_requests` is 2 here and unset there",
+        );
+    }
+
+    /// Create HTTP providers for `datasets` (each a name and its params) that
+    /// all target `origin`, in order, returning the first failure.
+    async fn create_providers_on_one_origin(
+        origin: &str,
+        datasets: &[&[(&str, &str)]],
+    ) -> DataConnectorResult<()> {
+        for (index, params) in datasets.iter().enumerate() {
+            let connector = test_connector_with(params).await;
+            let dataset =
+                test_dataset(&format!("{origin}/data{index}"), RefreshMode::Append, None).await;
+            connector.create_http_table_provider(&dataset).await?;
+        }
+        Ok(())
+    }
+
+    /// Regression test for #14914: an explicit `rate_control_window` equal to
+    /// the default resolves to the same window as an unset one, so datasets that
+    /// set it either way share their origin, in either load order.
+    #[tokio::test]
+    async fn test_http_rate_control_window_equal_to_default_shares_origin() {
+        let explicit: &[(&str, &str)] = &[
+            ("requests_per_second_limit", "10"),
+            ("rate_control_window", "10s"),
+        ];
+        let unset: &[(&str, &str)] = &[("requests_per_second_limit", "10")];
+
+        create_providers_on_one_origin(
+            "https://window-explicit-first.example.com",
+            &[explicit, unset],
+        )
+        .await
+        .expect("an explicit default window must share an origin with an unset one");
+        create_providers_on_one_origin(
+            "https://window-unset-first.example.com",
+            &[unset, explicit],
+        )
+        .await
+        .expect("an unset window must share an origin with an explicit default one");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://window-differs.example.com",
+            &[
+                unset,
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_window", "20s"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("a window that resolves differently must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_window` is 20s here and 10s there",
+        );
+    }
+
+    /// The acquire timeout defaults to each dataset's `client_timeout`, but only
+    /// bounds the wait of a rate controller. Datasets without rate control build
+    /// none, so different client timeouts cannot conflict; rate-limited datasets
+    /// that share a controller must agree on its bound.
+    #[tokio::test]
+    async fn test_http_rate_control_acquire_default_conflicts_only_with_a_controller() {
+        create_providers_on_one_origin(
+            "https://client-timeouts-unlimited.example.com",
+            &[&[("client_timeout", "30")], &[("client_timeout", "60")]],
+        )
+        .await
+        .expect("datasets without rate control must share an origin whatever their timeouts");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://client-timeouts-limited.example.com",
+            &[
+                &[
+                    ("client_timeout", "30"),
+                    ("requests_per_second_limit", "10"),
+                ],
+                &[
+                    ("client_timeout", "60"),
+                    ("requests_per_second_limit", "10"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("rate-limited datasets with different acquire bounds must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_acquire_timeout` is 60s here and 30s there",
+        );
+    }
+
+    /// One failure threshold written as a percentage and as a fraction parses
+    /// to two adjacent floats, and must still share an origin.
+    #[tokio::test]
+    async fn test_http_rate_control_failure_threshold_spellings_share_origin() {
+        create_providers_on_one_origin(
+            "https://threshold-spellings.example.com",
+            &[
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "33.3%"),
+                ],
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "0.333"),
+                ],
+            ],
+        )
+        .await
+        .expect("two spellings of one failure threshold must share an origin");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://threshold-differs.example.com",
+            &[
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "33.3%"),
+                ],
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "0.334"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("a different failure threshold must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_failure_threshold` is 33.4% here and 33.3% there",
+        );
     }
 
     #[tokio::test]
@@ -3323,6 +3472,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity comes from exactly the inline PEMs given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromPem {
+                cert_pem: resolved_cert,
+                key_pem: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_pem.as_bytes());
+                assert_eq!(resolved_key, key_pem.as_bytes());
+            }
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected an inline identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the inline identity should parse")
+                .is_some(),
+            "a configured inline identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3351,6 +3525,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity is read from exactly the two files given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromFiles {
+                cert_path: resolved_cert,
+                key_path: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_path);
+                assert_eq!(resolved_key, key_path);
+            }
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected a file-based identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the identity files should be read and parse")
+                .is_some(),
+            "a configured file identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3481,20 +3680,47 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     /// Rate-control metrics keep working through the combined provider — a
     /// delegating impl that silently answered `None` would leave them
     /// registered but never observed.
+    /// An `AsyncInstrument` that records what a metric callback observes.
+    #[derive(Default)]
+    struct RecordingInstrument(parking_lot::Mutex<Vec<u64>>);
+
+    impl opentelemetry::metrics::AsyncInstrument<u64> for RecordingInstrument {
+        fn observe(&self, measurement: u64, _attributes: &[KeyValue]) {
+            self.0.lock().push(measurement);
+        }
+    }
+
     #[tokio::test]
     async fn rate_control_metrics_still_observe_through_the_combined_provider() {
         let connector = test_connector_with(&[("max_concurrent_requests", "4")]).await;
+        // Apply the resolved config the way creating the table provider does,
+        // so the metric has the configured value to report.
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+        let config = http_rate_control::resolve_config(
+            &connector.params,
+            connector.runtime_rate_control_params.as_ref(),
+            &dataset,
+            "https",
+        )
+        .expect("the rate-control config should resolve");
+        connector.metrics.set_config(&config);
         let metrics_provider =
             DataConnector::metrics_provider(&connector).expect("the connector exposes metrics");
 
         let metric = metrics_provider
             .get_metric("rate_control_max_concurrent_requests")
             .expect("rate-control metrics remain available");
-        assert!(
-            metrics_provider
-                .callback_to_observe_metric(metric, vec![])
-                .is_some(),
-            "a rate-control metric must still be observed, not just listed"
+        let Some(ObserveMetricCallback::U64(callback)) =
+            metrics_provider.callback_to_observe_metric(metric, vec![])
+        else {
+            panic!("a rate-control metric must still be observed, as a u64, not just listed");
+        };
+        let observed = RecordingInstrument::default();
+        callback(&observed);
+        assert_eq!(
+            *observed.0.lock(),
+            vec![4],
+            "the callback must observe the configured max_concurrent_requests"
         );
     }
 

@@ -24,7 +24,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod common;
+use crate::common;
 
 use common::lookup_index::{
     SplitMix64, TableSpec, counters, file_mode_config, int64_column, memory_mode_config,

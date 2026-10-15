@@ -368,6 +368,21 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The engine rejected the acceleration settings while creating the table.
+    #[snafu(display("Acceleration creation failed: {source}"))]
+    EngineRejectedConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The engine's stored table was built with settings it cannot adopt in place, and
+    /// the dataset's settings let it be rebuilt from the source
+    /// ([`DataAccelerator::requires_rebuild`]): the caller drops the table and creates
+    /// it again. Displays as the engine's cause clause.
+    #[snafu(display("{source}"))]
+    RebuildRequired {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     // Worded as the cause clause it appears as: the messages that embed it supply the
     // impact and where to report it. Reaching this means a caller paired an engine's
     // registration with another engine's settings, which every path here chooses by engine.
@@ -394,6 +409,17 @@ pub enum FilePathError {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether creating the table again with the same settings could succeed.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            Self::InvalidConfiguration { .. } | Self::EngineRejectedConfiguration { .. }
+        )
+    }
+}
 
 impl AcceleratorEngineRegistry {
     /// Builds the accelerator [`TableProvider`] for a dataset from its acceleration settings.
@@ -567,7 +593,15 @@ impl AcceleratorEngineRegistry {
                 Some(ctx.runtime_env()),
             )
             .await
-            .context(AccelerationCreationFailedSnafu)?;
+            .map_err(|source| {
+                if accelerator.requires_rebuild(source.as_ref()) {
+                    Error::RebuildRequired { source }
+                } else if accelerator.rejects_configuration(source.as_ref()) {
+                    Error::EngineRejectedConfiguration { source }
+                } else {
+                    Error::AccelerationCreationFailed { source }
+                }
+            })?;
 
         Ok(table_provider)
     }
@@ -601,6 +635,33 @@ pub trait DataAccelerator: Send + Sync {
         partition_by: Vec<PartitionedBy>,
         runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Whether `error`, returned by [`Self::create_external_table`], rejects the
+    /// acceleration settings, so creating the table again with them cannot succeed.
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::InvalidConfiguration { .. })
+        )
+    }
+
+    /// Whether `error`, returned by [`Self::create_external_table`], reports that the
+    /// dataset's stored table was built with settings it cannot adopt in place — a
+    /// different primary key or partitioning, for example — for a dataset whose settings
+    /// let it be rebuilt from the source
+    /// ([`runtime_acceleration::acceleration_source::rebuilds_on_settings_change`]).
+    ///
+    /// The caller answers it by dropping the table with [`Self::drop_table`], clearing
+    /// the dataset checkpoint, and creating the table again, which then reloads from the
+    /// source as on a first start. An engine reports this only for a dataset that
+    /// predicate admits; for any other it opens the table with the settings it was
+    /// built with. The default reports nothing, for engines that never rebuild.
+    fn requires_rebuild(&self, _error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+        false
+    }
 
     /// The name of the accelerator
     fn name(&self) -> &'static str;
@@ -692,15 +753,17 @@ pub trait DataAccelerator: Send + Sync {
     /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
     /// configured before any of them exists.
     ///
-    /// `tuning` is the operator's raw `tuning` parameter, interpreted by the engine
-    /// because it owns the vocabulary; `data_path` and `metastore_path` are the
+    /// `adaptive_tuning` is the runtime's `runtime.adaptive_tuning` switch and
+    /// `runtime_params` its `runtime.params`, from which the engine reads the `target_*`
+    /// targets because it owns that vocabulary; `data_path` and `metastore_path` are the
     /// directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
     /// engine with no adaptive controller returns the default outcome and keeps its
     /// static values.
     async fn adaptive_tuning_seeds(
         &self,
-        _tuning: Option<&str>,
+        _adaptive_tuning: spicepod::component::runtime::AdaptiveTuning,
+        _runtime_params: &std::collections::HashMap<String, String>,
         _data_path: &str,
         _metastore_path: &str,
     ) -> AdaptiveTuningOutcome {
@@ -898,6 +961,18 @@ pub trait DataAccelerator: Send + Sync {
         Err(Box::new(SnapshotReloadUnsupported {
             engine: self.name(),
         }))
+    }
+
+    /// Perform the engine's maintenance after a snapshot was restored and
+    /// `provider` serves it: after the initial provider is installed, and after
+    /// each reload's replacement is swapped in — never before a swap, since the
+    /// replaced provider keeps serving if the swap is refused. The default does
+    /// nothing.
+    async fn maintain_after_snapshot_restore(
+        &self,
+        _source: &dyn AccelerationSource,
+        _provider: &Arc<dyn TableProvider>,
+    ) {
     }
 
     /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
@@ -1230,13 +1305,36 @@ pub fn get_primary_keys_from_constraints(
         .collect()
 }
 
+/// The parameter that turns Cayenne's primary-key conflict detection off, or
+/// `None` when detection stays on.
+///
+/// Resolves the two spellings the way the Cayenne accelerator does:
+/// `cayenne_pk_conflict_detection` takes precedence over the unprefixed
+/// `pk_conflict_detection`, and the value is matched without regard to case.
+/// Table creation and the runtime's registration refusal both read it here, so
+/// they cannot disagree about whether a dataset turned detection off.
+#[must_use]
+pub fn cayenne_pk_conflict_detection_disabled_by(
+    acceleration_settings: &Acceleration,
+) -> Option<&'static str> {
+    if !matches!(acceleration_settings.engine, Engine::Cayenne) {
+        return None;
+    }
+    ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+        .into_iter()
+        .find_map(|key| {
+            acceleration_settings
+                .params
+                .get(key)
+                .map(|value| (key, value))
+        })
+        .filter(|(_, value)| value.eq_ignore_ascii_case("none"))
+        .map(|(key, _)| key)
+}
+
 #[must_use]
 pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) -> bool {
-    matches!(acceleration_settings.engine, Engine::Cayenne)
-        && ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
-            .iter()
-            .filter_map(|key| acceleration_settings.params.get(*key))
-            .any(|value| value.eq_ignore_ascii_case("none"))
+    cayenne_pk_conflict_detection_disabled_by(acceleration_settings).is_some()
 }
 
 /// Starting values for an engine's adaptive-tuning knobs, derived from the host.
@@ -1260,12 +1358,37 @@ pub struct AdaptiveTuningSeeds {
 /// The outcome of asking an engine to seed adaptive tuning.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdaptiveTuningOutcome {
-    /// The operator's `tuning` value was not one the engine recognizes. Reported rather
-    /// than corrected so the caller can warn once and carry on with the default.
-    pub tuning_value_invalid: bool,
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
     /// keeps its static defaults.
     pub seeds: Option<AdaptiveTuningSeeds>,
+    /// The `target_*` targets the operator configured, resolved whether or not adaptive
+    /// tuning is on, so the caller can report targets that will have no effect.
+    pub targets: TuningTargets,
+}
+
+/// The runtime-wide `target_*` targets the adaptive controller steers toward.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TuningTargets {
+    pub replication_lag_secs: Option<f64>,
+    pub freshness_secs: Option<f64>,
+    pub query_latency_ms: Option<f64>,
+    /// Paces how fast the loop chases the targets; it is not a target itself.
+    pub convergence_window_secs: Option<f64>,
+    pub qph: Option<f64>,
+}
+
+impl TuningTargets {
+    /// Whether any `runtime.params.target_*` key is set. Every one of them, the
+    /// pacing-only convergence window included, is inert while adaptive tuning is
+    /// disabled, so this decides whether that is reported.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.replication_lag_secs.is_some()
+            || self.freshness_secs.is_some()
+            || self.query_latency_ms.is_some()
+            || self.convergence_window_secs.is_some()
+            || self.qph.is_some()
+    }
 }
 
 /// How an engine's writes accumulate for one acceleration, classified from the Spicepod
@@ -1294,7 +1417,8 @@ pub struct SpicepodWriteProfile {
 mod tests {
     use super::{
         AcceleratorExternalTableBuilder, AcceleratorRuntimeConfig,
-        cayenne_pk_conflict_detection_none, format_engine_list, get_primary_keys_from_constraints,
+        cayenne_pk_conflict_detection_disabled_by, cayenne_pk_conflict_detection_none,
+        format_engine_list, get_primary_keys_from_constraints,
         upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -1498,6 +1622,39 @@ mod tests {
         }
     }
 
+    /// Both spellings set: the prefixed one decides, as it does in the Cayenne
+    /// accelerator. Reading either `none` as authoritative created a table with no
+    /// key resolution while the accelerator ran with detection on.
+    #[test]
+    fn pk_conflict_detection_prefixed_spelling_takes_precedence() {
+        for (prefixed, unprefixed, expected) in [
+            ("auto", "none", None),
+            ("none", "auto", Some("cayenne_pk_conflict_detection")),
+            ("NONE", "none", Some("cayenne_pk_conflict_detection")),
+        ] {
+            let mut acceleration = Acceleration {
+                engine: Engine::Cayenne,
+                ..Acceleration::default()
+            };
+            acceleration.params.insert(
+                "cayenne_pk_conflict_detection".to_string(),
+                prefixed.to_string(),
+            );
+            acceleration
+                .params
+                .insert("pk_conflict_detection".to_string(), unprefixed.to_string());
+            assert_eq!(
+                cayenne_pk_conflict_detection_disabled_by(&acceleration),
+                expected,
+                "cayenne_pk_conflict_detection={prefixed}, pk_conflict_detection={unprefixed}"
+            );
+            assert_eq!(
+                cayenne_pk_conflict_detection_none(&acceleration),
+                expected.is_some()
+            );
+        }
+    }
+
     #[test]
     fn pk_conflict_detection_stays_on_when_unconfigured() {
         let acceleration = Acceleration {
@@ -1559,5 +1716,27 @@ mod tests {
                 "default_for({engine}) must produce the {engine} variant"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tuning_targets_tests {
+    use super::TuningTargets;
+
+    #[test]
+    fn convergence_window_alone_counts_as_set() {
+        let targets = TuningTargets {
+            convergence_window_secs: Some(120.0),
+            ..TuningTargets::default()
+        };
+        assert!(
+            targets.any_set(),
+            "a lone `target_convergence_window` is inert while adaptive tuning is disabled, so it must be reported"
+        );
+    }
+
+    #[test]
+    fn nothing_set_is_not_reported() {
+        assert!(!TuningTargets::default().any_set());
     }
 }

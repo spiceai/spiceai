@@ -539,6 +539,46 @@ pub fn extract_cayenne_write_target(
     None
 }
 
+/// Stop the background maintenance of every Cayenne instance `table_provider`
+/// serves from — the provider itself, each partition of a partitioned table, and
+/// what a poly or upsert-dedup wrapper writes to — and wait for maintenance they
+/// already started.
+///
+/// Called when a dataset generation is drained for replacement or removal: the
+/// replacement opens the same table on the same catalog, and nothing in memory
+/// serializes the two instances' maintenance (#11581). Every instance is
+/// quiesced at once, and the wait is not bounded: a drain publishes completion
+/// only once the work it drains has ended, and a pass still running when the
+/// replacement starts is exactly the overlap this exists to prevent.
+pub async fn quiesce_cayenne_maintenance(table_provider: &Arc<dyn TableProvider>) {
+    let mut instances = Vec::new();
+    let mut pending = vec![Arc::clone(table_provider)];
+    while let Some(provider) = pending.pop() {
+        if let Some(cayenne) = spice_table::find_concrete::<CayenneTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            instances.push(cayenne.clone_for_write_operations());
+        } else if let Some(partitioned) = spice_table::find_concrete::<PartitionTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.push(poly.writer());
+        } else if let Some(upsert_dedup) = spice_table::find_concrete::<UpsertDedupTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.push(Arc::clone(upsert_dedup.inner()));
+        }
+    }
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
+}
+
 fn spawn_staged_append(
     accelerator: CayenneTableProvider,
     schema: SchemaRef,
@@ -1061,7 +1101,14 @@ mod tests {
             .await
             .expect("stage a");
 
-        // The dual write reaches `b` first, then `a`.
+        // Every clone of the coordinator is a holder or a waiter. With the lock
+        // held here, a dual write that adds one is parked on it: a positive,
+        // deterministic signal that it serializes with this writer, rather than a
+        // window in which a writer ignoring the coordinator might take `b`.
+        let coordinator_handle = partitioned.write_coordinator();
+        let idle_holders = Arc::strong_count(&coordinator_handle);
+
+        // The dual write would reach `b` first, then `a`.
         let (input, input_rx) = mpsc::channel(4);
         let dual_write = tokio::spawn(super::write_all_with_partitioned_cayenne(
             refresher,
@@ -1073,34 +1120,33 @@ mod tests {
             )),
             1,
         ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&coordinator_handle) == idle_holders {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dual write never queued on the table's write coordinator \
+                 ({idle_holders} holder(s) throughout)"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Parked on the coordinator it reads none of its input, so it cannot take
+        // `b` whatever order the input reaches the partitions in.
         input
             .send(Ok(rows(vec![1, 2], "b")))
             .await
             .expect("the dual write accepts input");
-        // Give a dual write that ignores the coordinator every chance to take `b`
-        // before it sees `a`: poll until something holds `b`, briefly releasing
-        // each probe that gets it.
-        let b = partition("b").await;
-        for _ in 0..40 {
-            match tokio::time::timeout(Duration::from_millis(50), b.begin_overwrite(nothing(), 1))
-                .await
-            {
-                Ok(probe) => {
-                    probe
-                        .expect("probe b")
-                        .rollback()
-                        .await
-                        .expect("release the probe");
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(_) => break,
-            }
-        }
         input
             .send(Ok(rows(vec![3], "a")))
             .await
             .expect("the dual write accepts input");
+        assert_eq!(
+            input.capacity(),
+            2,
+            "a dual write parked on the coordinator must not have read its input"
+        );
 
+        let b = partition("b").await;
         let staged_b =
             tokio::time::timeout(Duration::from_secs(10), b.begin_overwrite(nothing(), 1))
                 .await

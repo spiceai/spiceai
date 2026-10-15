@@ -78,10 +78,28 @@ pub struct App {
 
     pub management: Option<Management>,
 
+    /// The `snapshots` section as written. Use [`App::effective_snapshots`], which
+    /// also resolves a location from `runtime.state`.
     pub snapshots: Option<Arc<Snapshots>>,
 }
 
 impl App {
+    /// The snapshot configuration in effect. `snapshots.location` when it is set;
+    /// otherwise, with `runtime.state` set, the `snapshots` folder of
+    /// `runtime.state.location` (see [`Snapshots::in_runtime_state`]). Read the
+    /// snapshot configuration through this, not the `snapshots` field.
+    #[must_use]
+    pub fn effective_snapshots(&self) -> Option<Arc<Snapshots>> {
+        match (&self.snapshots, self.runtime.state.as_ref()) {
+            (Some(snapshots), _) if snapshots.location.is_some() => Some(Arc::clone(snapshots)),
+            (snapshots, Some(state)) => Some(Arc::new(Snapshots::in_runtime_state(
+                snapshots.as_deref(),
+                state,
+            ))),
+            (snapshots, None) => snapshots.clone(),
+        }
+    }
+
     /// Retrieve all dataset names that are of a specific connector type.
     #[must_use]
     pub fn datasets_of_connector_type(&self, prefix: &str) -> Vec<String> {
@@ -696,7 +714,11 @@ mod tests {
             .expect("acceleration")
             .engine = Some("vortex".into());
 
-        assert!(cayenne_file_path_conflict(&datasets).is_some());
+        // Both spellings must be recognized as Cayenne, so the error names both datasets.
+        assert_eq!(
+            cayenne_file_path_conflict(&datasets).as_deref(),
+            Some("`orders` (`/mnt/a/cayenne`), `customers` (`/mnt/b/cayenne`)")
+        );
     }
 
     #[test]
@@ -739,5 +761,100 @@ mod tests {
             snapshot_dataset("customers", "/data/customers", Some("/data/metadata")),
         ];
         assert!(cayenne_file_path_conflict(&datasets).is_none());
+    }
+
+    mod effective_snapshots {
+        use crate::{App, AppBuilder};
+        use spicepod::component::runtime::{Runtime, RuntimeState};
+        use spicepod::component::snapshot::Snapshots;
+        use spicepod::param::Params;
+        use std::sync::Arc;
+
+        fn params(entries: &[(&str, &str)]) -> Params {
+            Params::from_string_map(
+                entries
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            )
+        }
+
+        fn app(snapshots: Option<Snapshots>, state: Option<RuntimeState>) -> App {
+            let mut builder = AppBuilder::new("snapshots").with_runtime(Runtime {
+                state,
+                ..Default::default()
+            });
+            if let Some(snapshots) = snapshots {
+                builder = builder.with_snapshots(snapshots);
+            }
+            builder.build()
+        }
+
+        fn state() -> RuntimeState {
+            RuntimeState {
+                location: "s3://state-bucket/spice/".to_string(),
+                params: Some(params(&[("s3_region", "us-east-1")])),
+            }
+        }
+
+        #[test]
+        fn without_runtime_state_the_section_is_used_as_written() {
+            assert_eq!(app(None, None).effective_snapshots(), None);
+
+            let section = Snapshots {
+                params: Some(params(&[("s3_region", "eu-west-1")])),
+                ..Default::default()
+            };
+            assert_eq!(
+                app(Some(section.clone()), None).effective_snapshots(),
+                Some(Arc::new(section))
+            );
+        }
+
+        #[test]
+        fn snapshots_location_wins_over_runtime_state() {
+            let section = Snapshots {
+                location: Some("s3://snapshot-bucket/snapshots/".to_string()),
+                params: Some(params(&[("s3_region", "eu-west-1")])),
+                ..Default::default()
+            };
+            assert_eq!(
+                app(Some(section.clone()), Some(state())).effective_snapshots(),
+                Some(Arc::new(section))
+            );
+        }
+
+        #[test]
+        fn runtime_state_gives_the_location_without_a_snapshots_section() {
+            assert_eq!(
+                app(None, Some(state())).effective_snapshots(),
+                Some(Arc::new(Snapshots {
+                    location: Some("s3://state-bucket/spice/snapshots/".to_string()),
+                    params: Some(params(&[("s3_region", "us-east-1")])),
+                    ..Default::default()
+                }))
+            );
+        }
+
+        /// `snapshots.params` replace `runtime.state.params` as a whole, as
+        /// `runtime.scheduler.params` do, so `s3_region` from `runtime.state` is gone.
+        #[test]
+        fn snapshots_params_replace_runtime_state_params() {
+            let section = Snapshots {
+                enabled: false,
+                params: Some(params(&[(
+                    "s3_queue_url",
+                    "https://sqs.us-east-1.amazonaws.com/123456789012/snapshots",
+                )])),
+                ..Default::default()
+            };
+            assert_eq!(
+                app(Some(section.clone()), Some(state())).effective_snapshots(),
+                Some(Arc::new(Snapshots {
+                    location: Some("s3://state-bucket/spice/snapshots/".to_string()),
+                    ..section
+                }))
+            );
+        }
     }
 }

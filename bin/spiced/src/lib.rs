@@ -67,6 +67,7 @@ use connector_git as _;
 use connector_github as _;
 use connector_glue as _;
 use connector_graphql as _;
+use connector_huggingface as _;
 #[cfg(feature = "imap")]
 use connector_imap as _;
 #[cfg(feature = "kafka")]
@@ -193,6 +194,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
     UnableToStartServers { source: Box<runtime::Error> },
+
+    #[snafu(display("{source}"))]
+    StateLocationRefused { source: Box<runtime::Error> },
 
     #[snafu(display("Failed to load dataset: {source}"))]
     UnableToLoadDataset { source: Box<runtime::Error> },
@@ -1282,6 +1286,11 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
     let result = match server_thread.await {
         // Don't treat force terminated as an error
         Ok(Err(runtime::Error::ForceTerminated)) => Ok(()),
+        Ok(Err(e @ runtime::Error::StateLocationRefused { .. })) => {
+            Err(Error::StateLocationRefused {
+                source: Box::new(e),
+            })
+        }
         Ok(ok) => ok.map_err(|e| Error::UnableToStartServers {
             source: Box::new(e),
         }),
@@ -1849,6 +1858,7 @@ async fn start_anonymous_telemetry(
         telemetry::anonymous::start(
             spicepod_name.map_or_else(|| "unknown", String::as_str),
             telemetry_properties,
+            cpu_budget::cpu_budget().configured_cores(),
         )
         .await;
     }

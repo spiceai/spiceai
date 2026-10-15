@@ -45,6 +45,7 @@ use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
+use spicepod::component::runtime::{RENAMED_RUNTIME_TUNING_PARAMS, renamed_runtime_param_warning};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
@@ -61,21 +62,6 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
-
-/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
-/// `runtime.params` and overridden per-dataset via the matching
-/// `acceleration.params` key (see `accelerator_cayenne`). `cayenne_goal_qph`
-/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
-/// is global-only and a per-dataset value is ignored. Declared here so the keys
-/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
-/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
-/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
-/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
-/// knob), not a target outcome, so it stays a per-dataset advanced override.
-const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
-const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
-const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
-const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -123,10 +109,6 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
-    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
-    CAYENNE_GOAL_FRESHNESS_PARAM,
-    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
-    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -158,9 +140,11 @@ fn known_runtime_params() -> Vec<&'static str> {
             + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
+            + spicepod::component::runtime::TUNING_TARGET_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(spicepod::component::runtime::TUNING_TARGET_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
@@ -642,12 +626,28 @@ impl RuntimeBuilder {
             Some(ClusterRole::Executor)
         );
 
+        // Every instance with `runtime.state` checks its location at startup. The
+        // features that keep state there write only once the check has passed.
+        let state_location_check = spicepod_rt
+            .state
+            .as_ref()
+            .map(|state| runtime_state_location::StateLocationCheck::new(&state.location));
+        if let Some(check) = &state_location_check
+            && self
+                .app
+                .as_deref()
+                .is_some_and(crate::state_location::snapshots_use_runtime_state)
+        {
+            check.record_feature(runtime_state_location::StateFeature::Snapshots);
+        }
+
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
         let http_rate_control_registry = build_http_rate_control_registry(
             spicepod_rt.source_rate_control.as_ref(),
             spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -656,6 +656,7 @@ impl RuntimeBuilder {
         let results_cache_warmer = crate::datafusion::query::build_results_cache_warmer(
             results_cache_warmup_enabled,
             spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -683,6 +684,7 @@ impl RuntimeBuilder {
                         Arc::clone(&secrets),
                         io_runtime.clone(),
                         &scheduler_state,
+                        state_location_check.as_ref(),
                     )
                     .await
                     {
@@ -887,9 +889,15 @@ impl RuntimeBuilder {
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             dataset_loads: Arc::default(),
+            view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),
+            state_location_check: state_location_check.clone(),
         };
+
+        if let (Some(state), Some(check)) = (spicepod_rt.state.clone(), state_location_check) {
+            crate::state_location::spawn_check(&rt, state, check);
+        }
 
         // Executors: register cluster status before any concurrent
         // `load_components` / `start_servers` race so readiness cannot pass on
@@ -959,10 +967,16 @@ impl Default for RuntimeBuilder {
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (source_rate_control, &secrets, &io_runtime);
+    let _ = (
+        source_rate_control,
+        state_location_check,
+        &secrets,
+        &io_runtime,
+    );
     // `runtime.state` also serves the scheduler and results-cache warmup, so
     // setting it is not a request for cluster rate control: no warning.
     if runtime_state.is_some() {
@@ -980,6 +994,7 @@ async fn build_http_rate_control_registry(
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
@@ -991,15 +1006,21 @@ async fn build_http_rate_control_registry(
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         &state.into(),
-        crate::object_store_state::StateFeature::RateControl,
+        runtime_state_location::StateFeature::RateControl,
     )
     .await
     {
         Ok((store, base_prefix)) => {
+            let store = match state_location_check {
+                Some(check) => {
+                    check.guard(runtime_state_location::StateFeature::RateControl, store)
+                }
+                None => store,
+            };
             tracing::info!(
                 "Initialized persisted HTTP governor rate-control state with location: {}",
                 state.location
@@ -1176,6 +1197,15 @@ fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
     let known = known_runtime_params();
     for key in params.keys() {
         if known.contains(&key.as_str()) {
+            continue;
+        }
+        // A renamed key gets one message naming its replacement, not a second
+        // "not recognized" one.
+        if let Some((old, new)) = RENAMED_RUNTIME_TUNING_PARAMS
+            .iter()
+            .find(|(old, _)| *old == key.as_str())
+        {
+            tracing::warn!("{}", renamed_runtime_param_warning(old, new));
             continue;
         }
         if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
@@ -2232,14 +2262,52 @@ mod test {
     #[cfg(not(windows))]
     #[test]
     fn a_cayenne_acceleration_reserves_its_write_path_state() {
-        let app = Arc::new(
+        const MIB: u64 = 1024 * 1024;
+        let inline_admission = u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES)
+            .expect("the inline entry cap fits in u64")
+            + u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
+                .expect("the inline buffer cap fits in u64");
+
+        // A full-refresh table (postgres leaves `refresh_mode` unset, which is
+        // `full`) is a whole-table replace: it reserves the inline-admission pair
+        // and no CDC write path.
+        let full = Arc::new(
             app::AppBuilder::new("test")
                 .with_dataset(dataset_with_cayenne("accelerated", None))
                 .build(),
         );
+        assert_cayenne_reservation(&full, inline_admission);
+
+        // A `changes` table also holds the CDC write path: the keyset cache (set
+        // explicitly to 64 MiB so the figure does not depend on the host), the
+        // default 128 MiB coalesce buffer and the default 8 MiB inline memtable.
+        let mut changes = dataset_with_cayenne("changes", None);
+        let acceleration = changes
+            .acceleration
+            .as_mut()
+            .expect("the dataset has a Cayenne acceleration");
+        acceleration.refresh_mode = Some(spicepod::acceleration::RefreshMode::Changes);
+        acceleration.params = Some(spicepod::param::Params::from_string_map(
+            [("cayenne_pk_keyset_cache_mb".to_string(), "64".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let changes = Arc::new(app::AppBuilder::new("test").with_dataset(changes).build());
+        assert_cayenne_reservation(&changes, inline_admission + 64 * MIB + 128 * MIB + 8 * MIB);
+    }
+
+    /// Asserts the reservation for `app` is `write_path` plus the process-wide
+    /// segment cache. That cache is installed at most once per process, so the
+    /// estimate, which reads it between the two reads here, matches one of them.
+    #[cfg(not(windows))]
+    fn assert_cayenne_reservation(app: &Arc<app::App>, write_path: u64) {
+        let cache_before = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
+        let estimate = estimate_cayenne_reservation_bytes(Some(app), &HashMap::new());
+        let cache_after = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
         assert!(
-            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
-            "a Cayenne table reserves against the query pool"
+            estimate == write_path + cache_before || estimate == write_path + cache_after,
+            "expected {write_path} bytes of write-path state plus the segment cache \
+             ({cache_before} or {cache_after} bytes), got {estimate}"
         );
     }
 
@@ -3615,6 +3683,7 @@ mod test {
             .iter()
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(spicepod::component::runtime::TUNING_TARGET_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {
             assert!(
@@ -3631,6 +3700,18 @@ mod test {
             known.len(),
             "duplicate keys in known_runtime_params()"
         );
+    }
+
+    #[test]
+    fn renamed_tuning_params_are_not_known_runtime_params() {
+        let known = known_runtime_params();
+        for (old, new) in RENAMED_RUNTIME_TUNING_PARAMS {
+            assert!(
+                !known.contains(old),
+                "`{old}` is no longer read, so it must not be recognized"
+            );
+            assert!(known.contains(new), "`{new}` must be recognized");
+        }
     }
 
     #[test]

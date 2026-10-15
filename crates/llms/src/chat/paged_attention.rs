@@ -81,9 +81,19 @@ mod tests {
     fn rejects_values_outside_the_spec() {
         // Booleans in particular: a Spicepod that spells this `true`/`false` has to fail
         // loudly rather than have one of them quietly read as a mode.
-        for raw in ["true", "false", "1", "0", "on", "off", "eager", "maybe"] {
-            assert!(
-                raw.parse::<PagedAttentionMode>().is_err(),
+        for (raw, expected) in [
+            ("true", "must be one of: auto, disabled. Found true"),
+            ("false", "must be one of: auto, disabled. Found false"),
+            ("1", "must be one of: auto, disabled. Found 1"),
+            ("0", "must be one of: auto, disabled. Found 0"),
+            ("on", "must be one of: auto, disabled. Found on"),
+            ("off", "must be one of: auto, disabled. Found off"),
+            ("eager", "must be one of: auto, disabled. Found eager"),
+            ("maybe", "must be one of: auto, disabled. Found maybe"),
+        ] {
+            assert_eq!(
+                raw.parse::<PagedAttentionMode>(),
+                Err(expected.to_string()),
                 "{raw:?} should be rejected"
             );
         }

@@ -115,7 +115,7 @@ Cayenne is built on the [Vortex columnar format](https://github.com/vortex-data/
 
 ### Results caching — repeat queries in microseconds
 
-Spice keeps a results cache in front of every data source and accelerator. A repeated query is answered from memory without being planned or scanned, and an entry is retired as soon as a refresh, CDC burst, or write changes a table it read. With `stale_while_revalidate_ttl` set, a refresh marks dependent entries stale instead of evicting them, so high-QPS dashboards keep hitting while one background query per key revalidates. Responses report `Results-Cache-Status`, clients steer freshness with `Cache-Control`, and `Spice-Cache-Key` lets an application name its own entries. For slow HTTP APIs, `refresh_mode: caching` stores each response as rows in the accelerator — bounded by `caching_max_size` and `caching_max_items`, serving the last good response when the origin fails (`caching_stale_if_error`), and coalescing concurrent misses for the same request into one origin call. [Caching docs →](https://spiceai.org/docs/features/caching)
+Spice keeps a results cache in front of every data source and accelerator. A repeated query is answered from memory without being planned or scanned. An entry is fresh for `item_ttl` after its query started: a write, reload, or unload of a table it read retires it at once, while refreshes and CDC leave it to age out, so entries expire at different times instead of all at once on every refresh. With `stale_while_revalidate_ttl` set, an entry past `item_ttl` is still served while one background query per key revalidates it, so high-QPS dashboards keep hitting. Responses report `Results-Cache-Status`, clients steer freshness with `Cache-Control`, and `Spice-Cache-Key` lets an application name its own entries. For slow HTTP APIs, `refresh_mode: caching` stores each response as rows in the accelerator — bounded by `caching_max_size` and `caching_max_items`, serving the last good response when the origin fails (`caching_stale_if_error`), and coalescing concurrent misses for the same request into one origin call. [Caching docs →](https://spiceai.org/docs/features/caching)
 
 ### Apache Iceberg: query, accelerate, and write
 
@@ -264,6 +264,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `cdc`                              | Debezium push ingest (no Kafka)       | Alpha             | JSON + Avro HTTP             |
 | `elasticsearch`<sup>†</sup>        | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
 | `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
+| `hf`                               | [Hugging Face][huggingface] datasets  | Alpha             | Parquet, CSV, TSV, JSON, ORC |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
 | `scylladb`<sup>†</sup>             | ScyllaDB                              | Alpha             |                              |
@@ -276,6 +277,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 [ducklake]: https://ducklake.select/
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
 [gcs]: docs/features/gcs-connector.md
+[huggingface]: docs/features/huggingface-connector.md
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
 [dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme
@@ -383,7 +385,7 @@ Under `queued`, the replication log is no longer what replays a failure — the 
 
 `forwarding: disabled` keeps a whole block in place without publishing anything, so it can be switched off and back on without reconstructing the endpoint, labels and keys.
 
-Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source, and they default to `on_delivery_error: skip` — blocking the runtime's telemetry writer on a downstream outage buys nothing:
+Spice's own operational tables can be forwarded the same way, so continuous queries can react to events like a query exceeding its budget or a refresh failing. These are configured under `runtime` because they are not CDC-fed from an external source:
 
 ```yaml
 runtime:
@@ -393,9 +395,13 @@ runtime:
       drasi_http_endpoint: http://localhost:9000
     tables:
       - name: task_history
+      - name: metrics
+        key: [time_unix_nano, name, series_id]
 ```
 
-Runtime tables are always queued — they have no replication position to hold, so there is nothing for blocking to protect. Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`); a table that declares none — such as `runtime.metrics` — must name its identifying columns with `key:`, since a synthesized id would publish a duplicate node on every delivery retry.
+Runtime tables are always queued. `RuntimeDrasi` has no `on_delivery_error` field and rejects it. An unreachable Drasi does not stall the writer. A change that cannot be delivered is retried from the dead-letter store, or counted and discarded when it cannot succeed.
+
+Only the tables named are forwarded. A table's element id comes from its declared primary key (`task_history` uses `span_id`). `runtime.metrics` declares no primary key, so name its columns with `key:`. `series_id` is a scalar identity of the attribute set: two rows that share `time_unix_nano` and `name` and differ in `attributes` stay distinct nodes. The list-typed `attributes` column is not a key. A synthesized id would publish a duplicate node on every delivery retry.
 
 ## Supported Catalogs
 

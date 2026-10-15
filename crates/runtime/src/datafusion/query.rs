@@ -1022,7 +1022,14 @@ impl Query {
                 // Check for cached results using the standard cache lookup.
                 // Resume drives the persisted graph, so skip the short-circuit
                 // entirely (returning a cached result would orphan the job).
-                if mode != DistributedSubmitMode::Resume
+                // Plans containing non-Immutable functions (e.g. `random()`,
+                // `now()`, Stable remote UDFs) are never served from or stored
+                // in the results cache, matching the text-query path.
+                let plan_cacheable =
+                    Query::should_cache_results(&self.df, &logical_plan, CacheStatus::CacheMiss)
+                        == CacheStatus::CacheMiss;
+                if plan_cacheable
+                    && mode != DistributedSubmitMode::Resume
                     && results_cache_mode == ResultsCacheMode::Default
                     && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
@@ -1065,7 +1072,8 @@ impl Query {
                 }
 
                 // Don't cache results for a recovered job or a query that bypasses caching.
-                let cache_key = (mode != DistributedSubmitMode::Resume
+                let cache_key = (plan_cacheable
+                    && mode != DistributedSubmitMode::Resume
                     && results_cache_mode == ResultsCacheMode::Default)
                     .then_some(plan_cache_key);
                 (*logical_plan, tracker, cache_key)
@@ -1477,7 +1485,11 @@ impl Query {
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cache_status = match results_cache_mode {
-                            ResultsCacheMode::Default => CacheStatus::CacheMiss,
+                            ResultsCacheMode::Default => Query::should_cache_results(
+                                &ctx.df,
+                                &logical_plan,
+                                CacheStatus::CacheMiss,
+                            ),
                             ResultsCacheMode::Bypass => CacheStatus::CacheDisabled,
                         };
                         let cache_manager = RequestCacheManager::new(
@@ -1630,10 +1642,7 @@ impl Query {
                     let session_ctx = if let Some(flight_session) =
                         owned_flight_session(&request_context)
                     {
-                        tracing::debug!(
-                            "Statement plan using Flight session: {}",
-                            flight_session.session_context().session_id()
-                        );
+                        tracing::debug!("Statement plan using the request's Flight session");
                         Arc::clone(flight_session.session_context())
                     } else {
                         tracing::debug!(
@@ -2009,6 +2018,25 @@ impl Query {
                     }
                 }
             }
+        };
+
+        // Bind any supplied parameter values the same way execution does, so the
+        // advertised schema matches the streamed one: a bound `$1` becomes a
+        // typed, non-null literal (e.g. `SELECT $1` is `Int64 NOT NULL`, not a
+        // nullable `Null`).
+        let plan = match &self.sql {
+            QueryMethod::Text {
+                parameters: Some(parameters),
+                ..
+            } => match plan.with_param_values(parameters.clone()) {
+                Ok(bound) => Box::new(bound),
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            },
+            _ => plan,
         };
 
         // Verify the plan against the restricted options
@@ -3692,6 +3720,70 @@ mod tests {
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
     }
 
+    /// `Query::run` on a submitted plan stores its result but never looks it
+    /// up, so a second submission is a `CacheMiss` either way. What the plan
+    /// path controls is whether it stores, so count the stored entries.
+    #[tokio::test]
+    async fn from_logical_plan_does_not_cache_volatile_plans() {
+        async fn run_plan(df: &Arc<DataFusion>, sql: &str) -> CacheStatus {
+            let plan = df
+                .ctx
+                .state()
+                .create_logical_plan(sql)
+                .await
+                .expect("logical plan");
+            let mut query = Query::from_logical_plan(df, plan)
+                .run()
+                .await
+                .expect("Query::run");
+            while let Some(Ok(_)) = query.data.next().await {}
+            query.cache_status
+        }
+
+        let config = SQLResultsCacheConfig::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_results_cache(Arc::clone(&cache_provider)),
+            ))
+            .build(),
+        );
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            statuses.push(run_plan(&df, "SELECT random() AS r").await);
+        }
+        cache_provider.run_pending_tasks().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a volatile plan's result must not be stored"
+        );
+        assert_eq!(
+            statuses,
+            [CacheStatus::CacheDisabled, CacheStatus::CacheDisabled]
+        );
+
+        // Immutable plans submitted directly are still cached.
+        assert_eq!(
+            run_plan(&df, "SELECT 1 + 1 AS two").await,
+            CacheStatus::CacheMiss
+        );
+        cache_provider.run_pending_tasks().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            1,
+            "an immutable plan's result must be stored"
+        );
+    }
+
     #[tokio::test]
     async fn get_schema_preserves_parameter_schema_for_unbound_parameters() {
         let df = Arc::new(
@@ -3956,7 +4048,12 @@ mod tests {
     /// losing the intended backpressure and against leaking / never releasing a
     /// permit (a deadlock). The block is real — A holds the only permit — not
     /// timing-dependent: B can finish early only if admission is broken.
-    #[tokio::test]
+    ///
+    /// The clock is paused, so it advances only once every task on the runtime
+    /// (B's query included, since the query runtime here is the test's own) is
+    /// blocked: the observation window below cannot close before B has gone as
+    /// far as it can, which with working admission is the permit wait.
+    #[tokio::test(start_paused = true)]
     async fn query_admission_blocks_second_query_until_first_stream_drops() {
         use std::time::Duration;
         let df = Arc::new(
@@ -3980,18 +4077,38 @@ mod tests {
         // B uses different query text (`SELECT 43`, a cache miss → it actually
         // reaches the admission gate, not an early cache-hit return) and is spawned
         // so the test task can observe whether run() blocks.
+        let query_id = uuid::Uuid::new_v4();
         let df_b = Arc::clone(&df);
         let mut b_handle = tokio::spawn(async move {
             QueryBuilder::new("SELECT 43 AS value", df_b)
+                .query_id(query_id)
                 .build()
                 .run()
                 .await
                 .map(|_q| ())
         });
 
+        // Wait until B has entered `run`: it registers in the cancel registry
+        // before the results-cache probe and the admission permit.
+        let registry = df.query_cancel_registry();
+        let mut registered = false;
+        for _ in 0..500 {
+            if registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id)
+            {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(registered, "query B never entered run()");
+
         // While A's stream lives, B's run() must NOT return. `biased` polls B's
         // completion before the timer, so a regression that lets B through is
-        // caught immediately.
+        // caught immediately, and the paused clock only lets the timer fire once
+        // B is parked.
         tokio::select! {
             biased;
             r = &mut b_handle => panic!(
@@ -3999,6 +4116,10 @@ mod tests {
             ),
             () = tokio::time::sleep(Duration::from_millis(750)) => {}
         }
+        assert!(
+            !b_handle.is_finished(),
+            "query B must still be waiting for the permit A holds"
+        );
 
         // Releasing A's stream frees the permit; B can now finish run().
         drop(query_a);
