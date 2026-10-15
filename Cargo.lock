@@ -20414,7 +20414,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-prometheus",
- "opentelemetry-proto 0.32.0",
+ "opentelemetry-proto",
  "opentelemetry-zipkin",
  "opentelemetry_sdk",
  "otel-arrow",
