@@ -442,9 +442,11 @@ async fn a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast() {
             "SELECT k FROM decimal_narrow WHERE CAST(price AS BIGINT) <> 173665 ORDER BY k",
             &["1", "6", "7", "8"],
         ),
+        // Two members, because the simplifier folds a one-member list into `=`
+        // before the IN-list guard is consulted.
         (
-            "SELECT k FROM decimal_narrow WHERE CAST(price AS INT) IN (173665) ORDER BY k",
-            &["2", "3", "4", "5"],
+            "SELECT k FROM decimal_narrow WHERE CAST(price AS INT) IN (173665, 173666) ORDER BY k",
+            &["2", "3", "4", "5", "6"],
         ),
         (
             "SELECT k FROM decimal_narrow WHERE CAST(price AS DECIMAL(15, 0)) = 173665 ORDER BY k",
@@ -469,8 +471,12 @@ async fn a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast() {
     .await
     .expect("explain runs")
     .join("\n");
+    let filter = plan
+        .lines()
+        .find(|line| line.contains("Filter: "))
+        .expect("the logical plan keeps a Filter");
     assert!(
-        plan.contains("price = Decimal128(173665.29,15,2)"),
+        filter.contains("decimal_narrow.price = ") && !filter.contains("CAST("),
         "the widening cast still folds onto the column:\n{plan}"
     );
 }
