@@ -18,6 +18,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+mod error;
 mod list_models;
 mod responses;
 
@@ -61,13 +62,25 @@ pub struct Xai {
 impl Xai {
     #[must_use]
     pub fn new(model: Option<&str>, api_key: &str) -> Self {
+        Self::with_endpoint(model, api_key, DEFAULT_ENDPOINT)
+    }
+
+    /// An xAI model served from `endpoint` rather than `https://api.x.ai/v1`.
+    #[must_use]
+    pub fn with_endpoint(model: Option<&str>, api_key: &str, endpoint: &str) -> Self {
         let cfg = OpenAIConfig::default()
-            .with_api_base(DEFAULT_ENDPOINT)
+            .with_api_base(endpoint)
             .with_api_key(api_key);
+
+        // No retries, as `crate::provider::client_without_retry`. The service also reads xAI's
+        // error bodies, which `async-openai` cannot.
+        let http_client = reqwest::Client::new();
+        let client = Client::build(http_client.clone(), cfg)
+            .with_http_service(error::XaiErrorService::new(http_client));
 
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
-            client: crate::provider::client_without_retry(cfg),
+            client,
             rate_controller: default_rate_controller(),
         }
     }

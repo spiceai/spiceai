@@ -390,10 +390,12 @@ fn chat_error(model: &str, error: OpenAIError) -> Error {
                 model,
                 message: api.message,
             },
-            Some(ApiErrorKind::InsufficientQuota) | None => Error::ModelCallFailed {
-                model,
-                source: Box::new(OpenAIError::ApiError(api)),
-            },
+            Some(ApiErrorKind::NotFound | ApiErrorKind::InsufficientQuota) | None => {
+                Error::ModelCallFailed {
+                    model,
+                    source: Box::new(OpenAIError::ApiError(api)),
+                }
+            }
         },
         OpenAIError::Reqwest(e) => Error::ServiceUnavailable {
             model,

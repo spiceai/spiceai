@@ -420,6 +420,7 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
                 Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
                 Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+                Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
                 Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
                 Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
                 None => StatusCode::INTERNAL_SERVER_ERROR,
@@ -653,6 +654,10 @@ mod tests {
             (
                 api_error(Some("permission_error"), None),
                 StatusCode::FORBIDDEN,
+            ),
+            (
+                api_error(Some("not_found_error"), Some("not_found")),
+                StatusCode::NOT_FOUND,
             ),
             (
                 api_error(Some("insufficient_quota"), Some("insufficient_quota")),

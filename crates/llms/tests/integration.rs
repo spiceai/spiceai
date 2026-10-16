@@ -22,6 +22,7 @@ mod anthropic_stream_errors;
 mod list_models_errors;
 #[cfg(feature = "local_embed")]
 mod model2vec_hf_cache;
+mod xai_errors;
 
 use std::{collections::HashSet, sync::LazyLock};
 
