@@ -874,6 +874,139 @@ mod tests {
         assert_eq!(state.status, JobStatus::Failed);
     }
 
+    /// How a takeover write that landed reports back.
+    #[derive(Debug, Clone, Copy)]
+    enum LostResponse {
+        /// The response never arrived.
+        Error,
+        /// The write was sent again after it landed, and its condition failed.
+        Conflict,
+    }
+
+    /// Object store whose first write marking an async-query job running lands
+    /// and then reports `lost`.
+    #[derive(Debug)]
+    struct LoseFirstRunningWrite {
+        inner: Arc<dyn object_store::ObjectStore>,
+        lost: LostResponse,
+        reported: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for LoseFirstRunningWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LoseFirstRunningWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for LoseFirstRunningWrite {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let marks_running = payload
+                .iter()
+                .any(|chunk| chunk.windows(9).any(|w| w == b"\"RUNNING\""));
+            let written = self.inner.put_opts(location, payload, opts).await?;
+            if marks_running
+                && !self
+                    .reported
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(match self.lost {
+                    LostResponse::Error => object_store::Error::Generic {
+                        store: "test",
+                        source: "the response did not arrive".into(),
+                    },
+                    LostResponse::Conflict => object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: "the object changed".into(),
+                    },
+                });
+            }
+            Ok(written)
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A takeover write that lands but reports an error: the recoverer reads
+    /// the job back, finds it holds the job, and drives it.
+    #[tokio::test]
+    async fn resume_drives_a_job_whose_takeover_landed_but_reported_an_error() {
+        for lost in [LostResponse::Error, LostResponse::Conflict] {
+            let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let lost_scheduler = JobStore::new(Arc::clone(&inner), "test", "node-lost");
+            let job_id = seed_job(&lost_scheduler, PUBLIC_JOB_OWNER).await;
+            let running = lost_scheduler
+                .set_job_running(&job_id)
+                .await
+                .expect("the lost scheduler had started the job");
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(LoseFirstRunningWrite {
+                inner: Arc::clone(&inner),
+                lost,
+                reported: std::sync::atomic::AtomicBool::new(false),
+            });
+            let recoverer = Arc::new(JobStore::new(store, "test", "node-b"));
+            let executor = executor(Arc::clone(&recoverer));
+
+            executor.resume(&running).await;
+
+            assert!(
+                executor.active_jobs.read().await.contains_key(&job_id),
+                "{lost:?}: the recoverer drives the job it took over"
+            );
+            let state = wait_until_finished(&recoverer, &job_id).await;
+            assert_eq!(state.scheduler_node.as_deref(), Some("node-b"), "{lost:?}");
+            assert_eq!(state.generation, Some(2), "{lost:?}");
+        }
+    }
+
     #[tokio::test]
     async fn get_status_refuses_a_job_another_principal_submitted() {
         let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));

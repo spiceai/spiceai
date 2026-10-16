@@ -222,8 +222,14 @@ impl JobStore {
     /// it under the next generation. The takeover lands only while the job is
     /// still running and driven as in `observed`, so of the schedulers that
     /// recover the same job one takes it over and the others get `None`.
+    ///
+    /// A takeover write can land and still report an error, or be retried after
+    /// it landed. The job is then read back: when it is running under this
+    /// node at the next generation, the takeover is this store's.
     pub async fn take_over_job(&self, observed: &JobState) -> Result<Option<JobState>> {
-        let (state, taken) = self
+        let mut intended = observed.clone();
+        intended.set_running(self.node_id.clone());
+        let taken = match self
             .modify_job(&observed.job_id, |state| {
                 if !still_driven_as(state, observed) {
                     return Ok(false);
@@ -231,8 +237,17 @@ impl JobStore {
                 state.set_running(self.node_id.clone());
                 Ok(true)
             })
-            .await?;
-        Ok(taken.then_some(state))
+            .await
+        {
+            Ok((state, written)) => {
+                (written || still_driven_as(&state, &intended)).then_some(state)
+            }
+            Err(e) => match self.get_job(&observed.job_id).await {
+                Ok(state) if still_driven_as(&state, &intended) => Some(state),
+                _ => return Err(e),
+            },
+        };
+        Ok(taken)
     }
 
     /// Marks a running job whose driver is gone as failed, without driving it.
@@ -867,7 +882,6 @@ impl JobStore {
     }
 }
 
-/// Refuses a write by `driver` to a job that another scheduler took over.
 /// Whether `state` is still running and driven as in `observed`.
 fn still_driven_as(state: &JobState, observed: &JobState) -> bool {
     state.status == JobStatus::Running
@@ -875,6 +889,7 @@ fn still_driven_as(state: &JobState, observed: &JobState) -> bool {
         && state.generation == observed.generation
 }
 
+/// Refuses a write by `driver` to a job that another scheduler took over.
 fn ensure_driven_by(state: &JobState, driver: &JobDriver) -> Result<()> {
     if state.is_driven_by(driver) {
         Ok(())
