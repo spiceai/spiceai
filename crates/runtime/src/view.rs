@@ -109,7 +109,11 @@ pub(crate) async fn prepare_view(
     statement: &parser::Statement,
     view: &Arc<View>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let plan = ctx.state().statement_to_plan(statement.clone()).await?;
+    // Keep the spellings of float tokens the planned `f64` literals lose, as the
+    // query planner does, so a view filtering a decimal column on such a literal
+    // matches what its SQL says.
+    let plan = runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(statement)
+        .retain(ctx.state().statement_to_plan(statement.clone()).await?)?;
     let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
     let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
 

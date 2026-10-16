@@ -22,6 +22,8 @@ limitations under the License.
 
 pub mod connector;
 pub(crate) mod dead_letter;
+#[cfg(test)]
+mod forward_metrics_tests;
 pub(crate) mod internal;
 pub(crate) mod queue;
 
@@ -93,7 +95,7 @@ pub(crate) async fn sink_for_dataset(
     Ok(match spec.delivery {
         spicepod::drasi::DrasiDelivery::Acknowledged => DeliveryMode::Acknowledged(sink),
         spicepod::drasi::DrasiDelivery::Queued => {
-            let store = open_dead_letter_store(&name).await;
+            let store = open_dead_letter_store(&name, transport_name(spec.transport)).await;
             DeliveryMode::Queued(Arc::new(DeliveryQueue::spawn(
                 sink,
                 name,
@@ -109,11 +111,23 @@ pub(crate) async fn sink_for_dataset(
 /// A store that cannot be opened is reported and skipped rather than failing the
 /// component: forwarding without durable retry is a degraded mode, but refusing
 /// to start the dataset over it would be worse.
-pub(crate) async fn open_dead_letter_store(component: &str) -> Option<Arc<DeadLetterStore>> {
-    match DeadLetterStore::open(
+pub(crate) fn transport_name(transport: DrasiTransportSpec) -> &'static str {
+    match transport {
+        DrasiTransportSpec::Http => "http",
+        DrasiTransportSpec::Redis => "redis",
+    }
+}
+
+pub(crate) async fn open_dead_letter_store(
+    component: &str,
+    transport: &'static str,
+) -> Option<Arc<DeadLetterStore>> {
+    match DeadLetterStore::open_with(
         store_path(component),
         component.to_string(),
         DEFAULT_MAX_BATCHES,
+        transport,
+        runtime_metrics::drasi::DrasiForwardMetrics::global(),
     )
     .await
     {
@@ -398,6 +412,7 @@ pub(crate) async fn forward_change_envelope(
                             .collect(),
                         data: data.clone(),
                         source_commit_ts_ms: batch.source_commit_ts_ms(),
+                        queued_at_ms: queue::now_ms(),
                     })
                     .await;
             }

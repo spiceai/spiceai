@@ -118,6 +118,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         rerankers: runtime.rerankers(),
         chat_models: runtime.completion_llms(),
         evaluate_models: runtime.evaluate_models(),
+        capabilities: runtime.model_capabilities(),
     };
     ctx.register_udf(
         RerankTableFunc::new(std::sync::Weak::clone(&weak_df), rerank_models.clone()).into(),
@@ -144,12 +145,18 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
     ctx.register_udf(JsonTreeScalar::new().into());
 
+    // OTLP metrics store time-series aggregates (#15060).
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::HistogramQuantile::new().into());
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::CounterGrowth::increase().into());
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::CounterGrowth::rate().into());
+
     #[cfg(feature = "models")]
     {
         ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
         ctx.register_udf(
             Ai::new(
                 runtime.completion_llms(),
+                runtime.model_capabilities(),
                 runtime.model_rate_controllers(),
                 runtime.status(),
             )
@@ -162,8 +169,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // the decision and chat models in the evaluation store, with the planner rules that
     // place their model calls. Registered once per runtime, so the rules are appended
     // once.
-    runtime_decide::DecisionFunctions::new(runtime.evaluate_models(), runtime.status())
-        .register(ctx);
+    runtime_decide::DecisionFunctions::new(
+        runtime.evaluate_models(),
+        runtime.model_capabilities(),
+        runtime.status(),
+    )
+    .register(ctx);
 
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
@@ -694,6 +705,7 @@ mod deny_list_registration_tests {
         inner_product::INNER_PRODUCT_UDF_NAME,
         l2_distance::{L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME},
         l2_norm::L2_NORM_UDF_NAME,
+        timeseries::{HISTOGRAM_QUANTILE_UDAF_NAME, INCREASE_UDAF_NAME, RATE_UDAF_NAME},
         truncate::TRUNCATE_SCALAR_UDF_NAME,
     };
     use runtime_datafusion_udfs::{
@@ -723,6 +735,9 @@ mod deny_list_registration_tests {
             L2_SQUARED_DISTANCE_UDF_NAME,
             L2_NORM_UDF_NAME,
             TRUNCATE_SCALAR_UDF_NAME,
+            HISTOGRAM_QUANTILE_UDAF_NAME,
+            INCREASE_UDAF_NAME,
+            RATE_UDAF_NAME,
             OBJ_DESCRIPTION_UDF_NAME,
             COL_DESCRIPTION_UDF_NAME,
             EMBED_UDF_NAME,

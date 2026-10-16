@@ -124,7 +124,7 @@ message GetMetricsResponse {
 
 // Message sent from executor to scheduler on the control stream.
 message ExecutorControlMessage {
-    // Executor's advertise address (used as identifier).
+    // Executor's instance identity.
     string executor_id = 1;
     oneof message {
         ExecutorHeartbeat heartbeat = 2;
@@ -134,7 +134,11 @@ message ExecutorControlMessage {
         Ack ack = 5;
         PartitionsLoaded partitions_loaded = 6;
         ExecutorStatistics executor_statistics = 7;
+        FlightEndpoint flight_endpoint = 9;
     }
+    // Per-process id of the executor, set on the first message of a stream. A
+    // new value under the same executor_id means the executor restarted.
+    string process_id = 8;
 }
 
 // Periodic per-table statistics report from an executor, decoupled from the
@@ -196,8 +200,13 @@ message UpdatePartitions {
 
 // Request message for AllocateInitialPartitions RPC.
 message AllocateInitialPartitionsRequest {
-  // Executor's advertise address (used as identifier).
+  // Executor's advertise URL, used to reach it.
   string executor_url = 1;
+  // Executor's instance identity. Empty from executors that use their advertise
+  // address as their identity.
+  string executor_id = 2;
+  // Per-process id of the executor, the one its control stream sends.
+  string process_id = 3;
 }
 
 message BytesArray {
@@ -246,6 +255,13 @@ message RefreshDatasetCommand {
 // Heartbeat message sent by executor to scheduler.
 message ExecutorHeartbeat {
     int64 timestamp_ms = 1;
+}
+
+// The executor's Flight endpoint, sent on every control stream once the executor serves
+// queries. The scheduler sends executor-bound scans to it.
+message FlightEndpoint {
+    // Executor's advertise URL, used to reach it.
+    string executor_url = 1;
 }
 
 // Executor shutdown notification sent by executor to scheduler.

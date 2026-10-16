@@ -49,6 +49,17 @@ impl SqliteBlobCheckpointStore {
             table_name,
         }
     }
+
+    fn create_table_sql(table: &str) -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {table} (
+                dataset_name TEXT PRIMARY KEY,
+                checkpoint_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"
+        )
+    }
 }
 
 #[async_trait]
@@ -66,15 +77,7 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
             .call(move |conn: &mut rusqlite::Connection| -> Result<Option<BlobCheckpoint>, rusqlite::Error> {
                 // Ensure the sidecar table exists so a fresh accelerator reads as
                 // "no checkpoint yet" (Ok(None)) rather than a missing-table error.
-                let create_table = format!(
-                    "CREATE TABLE IF NOT EXISTS {table} (
-                        dataset_name TEXT PRIMARY KEY,
-                        checkpoint_data TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )"
-                );
-                conn.execute(&create_table, [])?;
+                conn.execute(&Self::create_table_sql(table), [])?;
 
                 let query = format!(
                     "SELECT checkpoint_data, strftime('%s', updated_at) FROM {table} WHERE dataset_name = ?"
@@ -112,15 +115,7 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
         conn.conn
             .call(
                 move |conn: &mut rusqlite::Connection| -> Result<(), rusqlite::Error> {
-                    let create_table = format!(
-                        "CREATE TABLE IF NOT EXISTS {table} (
-                            dataset_name TEXT PRIMARY KEY,
-                            checkpoint_data TEXT,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )"
-                    );
-                    conn.execute(&create_table, [])?;
+                    conn.execute(&Self::create_table_sql(table), [])?;
 
                     let upsert = format!(
                         "INSERT INTO {table} (dataset_name, checkpoint_data, updated_at)
@@ -130,6 +125,30 @@ impl BlobCheckpointStore for SqliteBlobCheckpointStore {
                             updated_at = CURRENT_TIMESTAMP"
                     );
                     conn.execute(&upsert, [dataset_name, checkpoint_data])?;
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(crate::store_error)
+    }
+
+    async fn delete(&self) -> Result<(), CheckpointError> {
+        let dataset_name = self.dataset_name.clone();
+        let table = self.table_name;
+
+        let conn_sync = self.pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(crate::downcast_failed());
+        };
+
+        conn.conn
+            .call(
+                move |conn: &mut rusqlite::Connection| -> Result<(), rusqlite::Error> {
+                    // The table may not exist yet: a dataset that never checkpointed
+                    // has nothing to discard, and that is not an error.
+                    conn.execute(&Self::create_table_sql(table), [])?;
+                    let delete = format!("DELETE FROM {table} WHERE dataset_name = ?1");
+                    conn.execute(&delete, [dataset_name])?;
                     Ok(())
                 },
             )

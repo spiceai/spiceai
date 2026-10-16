@@ -115,4 +115,16 @@ pub trait BlobCheckpointStore: Send + Sync {
     /// Persist `data` as the current blob checkpoint for this dataset, overwriting any
     /// previously stored value.
     async fn upsert(&self, data: &str) -> Result<(), CheckpointError>;
+
+    /// Discard this dataset's blob checkpoint, so the next [`Self::get`] returns
+    /// `Ok(None)`. Deleting a checkpoint that does not exist is not an error.
+    ///
+    /// Called when the accelerated table is rebuilt (a schema change recreates it):
+    /// a checkpoint describing the old contents would otherwise make the next refresh
+    /// resume as if the new, empty table were already populated.
+    ///
+    /// Deliberately has no default implementation: this trait reaches its callers as
+    /// `Arc<dyn BlobCheckpointStore>`, and a defaulted method that an engine silently
+    /// inherits compiles and then does nothing at runtime.
+    async fn delete(&self) -> Result<(), CheckpointError>;
 }

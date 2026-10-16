@@ -25,6 +25,7 @@ use llms::{
     chat::{Chat, nsql::SqlGeneration},
     progress::Progress,
 };
+use model_capabilities::{Capability, CapabilityStore, require};
 use rand::{
     distr::{Distribution, weighted::WeightedIndex},
     rng,
@@ -42,6 +43,7 @@ pub struct RouterModel {
     models_cfg: Vec<worker::RouterConfig>,
     state: RouterState,
     models: Arc<RwLock<HashMap<String, Arc<dyn Chat>>>>,
+    capabilities: Arc<RwLock<CapabilityStore>>,
 }
 
 pub enum RouterState {
@@ -55,6 +57,7 @@ impl RouterModel {
         router_name: String,
         models_cfg: &[worker::RouterConfig],
         models: Arc<RwLock<HashMap<String, Arc<dyn Chat>>>>,
+        capabilities: Arc<RwLock<CapabilityStore>>,
     ) -> Self {
         let initial_state = match models_cfg.first() {
             Some(worker::RouterConfig::RoundRobin { .. }) => RouterState::RoundRobin {
@@ -67,8 +70,21 @@ impl RouterModel {
             router_name,
             models_cfg: models_cfg.to_vec(),
             models,
+            capabilities,
             state: initial_state,
         }
+    }
+
+    /// The chat model the router sends a request to, if `name` serves chat.
+    async fn chat_model(&self, name: &str) -> Option<Arc<dyn Chat>> {
+        let capabilities = self.capabilities.read().await;
+        require(
+            &capabilities,
+            &*self.models.read().await,
+            name,
+            Capability::Chat,
+        )
+        .ok()
     }
 
     async fn select_from_weighted(&self) -> Result<Arc<dyn Chat>, OpenAIError> {
@@ -84,7 +100,7 @@ impl RouterModel {
                 "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
             )).to_jsonl(),
         );
-        let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
+        let Some(model) = self.chat_model(&name).await else {
             return Err(OpenAIError::InvalidArgument(format!(
                 "Model router '{}' expects a model '{name}' to exist, but does not",
                 self.router_name
@@ -114,7 +130,7 @@ impl RouterModel {
                 "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
             )).to_jsonl(),
         );
-        let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
+        let Some(model) = self.chat_model(&name).await else {
             return Err(OpenAIError::InvalidArgument(format!(
                 "Model router '{}' expects a model '{name}' to exist, but does not",
                 self.router_name
@@ -148,7 +164,7 @@ impl Chat for RouterModel {
                             "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
                         )).to_jsonl(),
                     );
-                    let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
+                    let Some(model) = self.chat_model(&name).await else {
                         return Err(OpenAIError::InvalidArgument(format!(
                             "Model router '{}' expects a model '{name}' to exist, but does not",
                             self.router_name.clone()
@@ -232,7 +248,7 @@ impl Chat for RouterModel {
                             "Worker '{}' deferring request to model '{name}'", self.router_name.clone()
                         )).to_jsonl(),
                     );
-                    let Some(model) = self.models.read().await.get(&name).map(Arc::clone) else {
+                    let Some(model) = self.chat_model(&name).await else {
                         return Err(OpenAIError::InvalidArgument(format!(
                             "Model router '{}' expects a model '{name}' to exist, but does not",
                             self.router_name.clone()

@@ -42,9 +42,13 @@ use uuid::Uuid;
 use crate::Runtime;
 use crate::cluster::cluster_state::{
     self, ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerEntry,
+    TableEntryChanges, UNREGISTERED_TABLE_RETENTION,
 };
 use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
 use crate::cluster::reaper::Reaper;
+use crate::datafusion::DataFusion;
+use datafusion::common::TableReference;
+use object_store_occ::cleanup;
 use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
@@ -92,9 +96,6 @@ fn worst_case_tick(ttl_ms: u64) -> Duration {
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
-/// How often a scheduler deletes jobs whose results expired. Expired jobs already
-/// read as expired; this only reclaims their state and result chunks.
-const JOB_CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
@@ -112,7 +113,12 @@ pub enum Error {
     #[snafu(display(
         "Scheduler registration record already exists for {scheduler_id} and is still active"
     ))]
-    SchedulerIdConflict { scheduler_id: String },
+    SchedulerIdConflict {
+        scheduler_id: String,
+        /// The process holding the id was seen heartbeating after this one
+        /// tried to register, so two running processes share the identity.
+        holder_running: bool,
+    },
 
     #[snafu(display("Missing scheduler advertise address for registration"))]
     MissingAdvertiseAddress,
@@ -127,6 +133,20 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type SchedulerPeers = HashMap<String, SchedulerEntry>;
+
+/// The advertise addresses of the peer schedulers other than `local`, each once.
+/// During a rolling upgrade one scheduler can be registered under both its
+/// previous `host:port` key and its instance identity until the older entry
+/// expires; both entries carry the same address.
+#[must_use]
+pub fn remote_scheduler_addresses(peers: &SchedulerPeers, local: &str) -> Vec<String> {
+    let addresses: std::collections::BTreeSet<&str> = peers
+        .values()
+        .map(|peer| peer.advertise_address.as_str())
+        .filter(|address| *address != local)
+        .collect();
+    addresses.into_iter().map(str::to_string).collect()
+}
 
 struct SchedulerRegistryRunner {
     cluster: Arc<ClusterStateStore>,
@@ -164,17 +184,17 @@ pub async fn start_scheduler_registry(
         .ok_or(Error::MissingAdvertiseAddress)?
         .to_string();
 
-    let scheduler_id = format!(
-        "{advertise_host}:{}",
-        rt.datafusion().cluster_config.node_bind_address().port()
-    );
+    let scheduler_id = datafusion.cluster_config.instance_id().to_string();
 
     let instance_id = Uuid::new_v4();
     let now = now_ms()?;
     let entry = SchedulerEntry {
         scheduler_id: scheduler_id.clone(),
         instance_id,
-        advertise_address: scheduler_id.clone(),
+        advertise_address: format!(
+            "{advertise_host}:{}",
+            datafusion.cluster_config.node_bind_address().port()
+        ),
         grpc_address: format!(
             "{advertise_host}:{}",
             rt.config().flight_bind_address.port()
@@ -226,7 +246,96 @@ pub async fn start_scheduler_registry(
         last_written_version: Arc::new(ArcSwapOption::empty()),
     };
 
-    runner.run(cancel).await
+    let result = runner.run(cancel).await;
+    if let Err(Error::SchedulerIdConflict {
+        scheduler_id,
+        holder_running: true,
+    }) = &result
+    {
+        tracing::error!(
+            "{}",
+            util::instance_id::duplicate_instance_message(scheduler_id, &state.location)
+        );
+    }
+    result
+}
+
+/// What one scheduler cleanup pass did.
+struct CleanupPass {
+    jobs: crate::jobs::Result<usize>,
+    tables: std::result::Result<TableEntryChanges, MutateError>,
+}
+
+impl CleanupPass {
+    fn log(&self) {
+        tracing::debug!(
+            jobs_deleted = self.jobs.as_ref().ok(),
+            tables_removed = self
+                .tables
+                .as_ref()
+                .ok()
+                .map(|changes| changes.removed.len()),
+            "State cleanup pass finished"
+        );
+        match &self.jobs {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                "State cleanup deleted {deleted} async query jobs, with their results, that finished more than {} ago.",
+                cleanup::describe(cleanup::age(crate::jobs::DEFAULT_RESULT_TTL))
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to delete finished async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
+            ),
+        }
+        match &self.tables {
+            Ok(changes) if changes.removed.is_empty() => {}
+            Ok(changes) => tracing::info!(
+                "State cleanup removed {} tables from the cluster state, as no scheduler has had them registered for {}: {}.",
+                changes.removed.len(),
+                cleanup::describe(cleanup::age(UNREGISTERED_TABLE_RETENTION)),
+                changes
+                    .removed
+                    .iter()
+                    .map(|table| format!("'{table}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to remove unregistered tables from the cluster state, so they stay until the next attempt: {err}"
+            ),
+        }
+    }
+}
+
+/// Records in the cluster document which of its tables this scheduler has
+/// registered, which removes the entries of tables no scheduler has registered
+/// for [`UNREGISTERED_TABLE_RETENTION`].
+async fn reconcile_table_entries(
+    cluster: &ClusterStateStore,
+    df: &DataFusion,
+) -> std::result::Result<TableEntryChanges, MutateError> {
+    let state = cluster.read().await?;
+    let mut registered = HashMap::new();
+    for table in state.accelerations.keys().chain(state.catalog.keys()) {
+        if !registered.contains_key(table) {
+            registered.insert(table.clone(), is_registered(df, table).await);
+        }
+    }
+    cluster.reconcile_table_entries(&registered).await
+}
+
+/// Whether `table`, a table entry's `catalog.schema.table` name, resolves to a
+/// table this scheduler has registered. A name that does not split into exactly
+/// three parts cannot be resolved without guessing where its dots belong, so it
+/// counts as registered and its entry stays.
+async fn is_registered(df: &DataFusion, table: &str) -> bool {
+    let parts: Vec<&str> = table.split('.').collect();
+    let [catalog, schema, name] = parts.as_slice() else {
+        return true;
+    };
+    df.get_table(&TableReference::full(*catalog, *schema, *name))
+        .await
+        .is_some()
 }
 
 /// Resumes any running job whose recorded scheduler instance is not currently
@@ -291,13 +400,10 @@ impl SchedulerRegistryRunner {
             tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
             JOB_RECOVERY_INTERVAL,
         );
-        let mut cleanup_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + JOB_CLEANUP_INTERVAL,
-            JOB_CLEANUP_INTERVAL,
-        );
-        // A cleanup pass issues requests for as long as there are expired jobs to delete,
-        // so it runs beside the other arms rather than inside one: a long pass must not
-        // hold up the heartbeat that tells peers this scheduler is alive.
+        let mut next_cleanup = std::pin::pin!(tokio::time::sleep(cleanup::next_pass_delay()));
+        // A cleanup pass issues requests for as long as there is state to delete, so it
+        // runs beside the other arms rather than inside one: a long pass must not hold up
+        // the heartbeat that tells peers this scheduler is alive.
         let mut cleanup = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
@@ -342,20 +448,28 @@ impl SchedulerRegistryRunner {
                 _ = recovery_tick.tick() => {
                     recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
                 }
-                _ = cleanup_tick.tick(), if cleanup.is_terminated() => {
-                    cleanup.set(self.job_executor.cleanup_expired_jobs().fuse());
+                () = &mut next_cleanup, if cleanup.is_terminated() => {
+                    cleanup.set(self.cleanup_pass().fuse());
                 }
-                result = &mut cleanup => match result {
-                    Ok(0) => {}
-                    Ok(deleted) => tracing::debug!(deleted, "Deleted expired async query jobs"),
-                    Err(err) => tracing::warn!(
-                        "Failed to delete expired async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
-                    ),
-                },
+                pass = &mut cleanup => {
+                    pass.log();
+                    next_cleanup
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + cleanup::next_pass_delay());
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Deletes the async query jobs that finished long enough ago, and removes the
+    /// entries of tables no scheduler has had registered for
+    /// [`UNREGISTERED_TABLE_RETENTION`].
+    async fn cleanup_pass(&self) -> CleanupPass {
+        let jobs = self.job_executor.cleanup_expired_jobs().await;
+        let tables = reconcile_table_entries(&self.cluster, self.job_executor.datafusion()).await;
+        CleanupPass { jobs, tables }
     }
 
     async fn register_self(&self) -> Result<()> {
@@ -428,8 +542,10 @@ impl SchedulerRegistryRunner {
         match res {
             Ok(_) => {}
             Err(MutateError::Conflict { .. }) => {
+                let holder_running = self.holder_keeps_beating(observed_beat.as_ref()).await;
                 return Err(Error::SchedulerIdConflict {
                     scheduler_id: self.scheduler_id.clone(),
+                    holder_running,
                 });
             }
             Err(other) => return Err(Error::ClusterState { source: other }),
@@ -518,6 +634,23 @@ impl SchedulerRegistryRunner {
         }
     }
 
+    /// Whether the process holding this scheduler's id is still running: its
+    /// heartbeat moves within one heartbeat interval. A process that crashed
+    /// leaves a heartbeat that stays fresh for a while but no longer moves, so a
+    /// fresh heartbeat alone does not tell the two apart.
+    async fn holder_keeps_beating(&self, observed: Option<&heartbeat::SchedulerHeartbeat>) -> bool {
+        let interval =
+            Duration::from_millis(self.entry.ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+        tokio::time::sleep(interval + interval / 2).await;
+        match self.heartbeats.read(&self.scheduler_id).await {
+            Ok(Some(beat)) => observed.is_none_or(|before| {
+                beat.instance_id != before.instance_id
+                    || beat.last_heartbeat_ms > before.last_heartbeat_ms
+            }),
+            Ok(None) | Err(_) => false,
+        }
+    }
+
     /// A registration heartbeat write, bounded like the loop's writes: an
     /// unbounded put here can outlast the grace period that lets another
     /// incarnation take the id over, which is worse than publishing late.
@@ -551,7 +684,7 @@ impl SchedulerRegistryRunner {
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
-        // `scheduler_id` is `{advertise_host}:{port}` and so is stable across
+        // `scheduler_id` is the instance identity and so is stable across
         // restarts, while `instance_id` is per-process. Two incarnations can
         // therefore share the heartbeat key, and registration deliberately
         // lets a new one take over once the old looks stale. An incarnation
@@ -825,7 +958,7 @@ impl SchedulerRegistryRunner {
             );
         }
         *peers = next;
-        cluster_metrics::set_scheduler_count(&self.scheduler_id, peers.len() as u64);
+        cluster_metrics::set_scheduler_count(&self.entry.advertise_address, peers.len() as u64);
         Ok(())
     }
 
@@ -2716,6 +2849,141 @@ mod tests {
         assert!(
             !runner.superseded.load(Ordering::Relaxed),
             "a read failure is not evidence of supersession"
+        );
+    }
+
+    /// Registers a holder under the shared test id and returns a runner for a
+    /// second process with the same identity.
+    async fn second_process_under_one_identity(
+        store: &Arc<dyn ObjectStore>,
+    ) -> (
+        Arc<SchedulerHeartbeatStore>,
+        Uuid,
+        SchedulerRegistryRunner,
+        Arc<ClusterStateStore>,
+    ) {
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+        let holder = Uuid::new_v4();
+        runner_over(&cluster, &heartbeats, store, holder)
+            .register_self()
+            .await
+            .expect("the holder registers");
+        let second = runner_over(&cluster, &heartbeats, store, Uuid::new_v4());
+        (heartbeats, holder, second, cluster)
+    }
+
+    /// A second running process under one identity is refused, and is reported
+    /// as a duplicate because the holder keeps heartbeating.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_running_process_under_one_identity_is_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (heartbeats, holder, second, cluster) = second_process_under_one_identity(&store).await;
+        let first_beat = heartbeats
+            .read("test:50051")
+            .await
+            .expect("read hb")
+            .expect("the holder's heartbeat")
+            .last_heartbeat_ms;
+        let beater = tokio::spawn({
+            let heartbeats = Arc::clone(&heartbeats);
+            async move {
+                for beat in 1..=10 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    heartbeats
+                        .heartbeat("test:50051", holder, first_beat + beat * 5_000, 30_000)
+                        .await
+                        .expect("the holder heartbeats");
+                }
+            }
+        });
+
+        let err = second
+            .register_self()
+            .await
+            .expect_err("a second running process must be refused");
+        beater.abort();
+
+        assert!(
+            matches!(
+                err,
+                Error::SchedulerIdConflict {
+                    holder_running: true,
+                    ..
+                }
+            ),
+            "the holder kept heartbeating, so this is a duplicate: {err:?}"
+        );
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(holder),
+            "the holder keeps its registration"
+        );
+    }
+
+    /// A process whose predecessor crashed moments ago is refused until the
+    /// predecessor's heartbeat goes stale, but it is not reported as a duplicate:
+    /// the predecessor's heartbeat no longer moves.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_after_a_crash_is_not_a_duplicate() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (_heartbeats, holder, second, cluster) =
+            second_process_under_one_identity(&store).await;
+
+        let err = second
+            .register_self()
+            .await
+            .expect_err("the crashed predecessor's heartbeat is still fresh");
+
+        assert!(
+            matches!(
+                err,
+                Error::SchedulerIdConflict {
+                    holder_running: false,
+                    ..
+                }
+            ),
+            "the predecessor stopped heartbeating, so this is not a duplicate: {err:?}"
+        );
+        let snap = cluster.read().await.expect("read");
+        assert_eq!(
+            snap.schedulers
+                .get("test:50051")
+                .map(|entry| entry.instance_id),
+            Some(holder)
+        );
+    }
+
+    /// A scheduler registered under both its previous `host:port` key and its
+    /// instance identity is reached once, and this scheduler not at all.
+    #[test]
+    fn remote_scheduler_addresses_are_listed_once() {
+        let entry = |id: &str, address: &str| SchedulerEntry {
+            scheduler_id: id.to_string(),
+            instance_id: Uuid::new_v4(),
+            advertise_address: address.to_string(),
+            grpc_address: address.to_string(),
+            http_address: address.to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let peers = SchedulerPeers::from([
+            (
+                "10.0.0.2:50052".to_string(),
+                entry("10.0.0.2:50052", "10.0.0.2:50052"),
+            ),
+            ("sched-b".to_string(), entry("sched-b", "10.0.0.2:50052")),
+            ("sched-a".to_string(), entry("sched-a", "10.0.0.1:50052")),
+        ]);
+        assert_eq!(
+            remote_scheduler_addresses(&peers, "10.0.0.1:50052"),
+            ["10.0.0.2:50052"]
         );
     }
 }

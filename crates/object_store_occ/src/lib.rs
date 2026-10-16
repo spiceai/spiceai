@@ -26,8 +26,10 @@ limitations under the License.
 //! - [`retry_on_conflict`]: a bounded, jittered compare-and-swap loop.
 //! - [`probe_conditional_writes`]: detects a store that ignores write conditions.
 //! - [`LocalConditionalPut`]: conditional writes for a local directory.
+//! - [`cleanup`]: the schedule and age rules of state cleanup.
 
 mod capabilities;
+pub mod cleanup;
 mod conditional;
 pub mod local_conditional_put;
 mod retry;
@@ -42,7 +44,7 @@ pub use conditional::{ConditionalWriteError, Expected, conditional_put};
 pub use local_conditional_put::LocalConditionalPut;
 pub use object_store::UpdateVersion;
 pub use retry::{Attempt, ConflictRetry, RetryOnConflictError, retry_on_conflict};
-pub use state::{InsertResult, ObjectState, UpdateResult, WriteResult};
+pub use state::{Change, InsertResult, ModifyError, ObjectState, UpdateResult};
 
 /// Errors that can occur during object state operations.
 #[derive(Debug, Snafu)]
@@ -66,8 +68,16 @@ pub enum Error {
         operation: &'static str,
         source: object_store::Error,
     },
-    #[snafu(display("Unexpected deletion of object with key {key}"))]
-    UnexpectedDeletionError { key: String },
+    #[snafu(display("Failed to write the object for key {key}: {source}"))]
+    ConditionalWrite {
+        key: String,
+        source: Box<ConditionalWriteError>,
+    },
+
+    #[snafu(display(
+        "The object store reported neither an ETag nor a version for key {key}, so it cannot be updated conditionally"
+    ))]
+    Unversioned { key: String },
 }
 
 impl Error {
@@ -83,10 +93,12 @@ impl Error {
                 }
             }
             Error::ObjectStore { source, .. } => source,
-            Error::UnexpectedDeletionError { .. } => object_store::Error::Generic {
-                store,
-                source: Box::new(self),
-            },
+            Error::ConditionalWrite { .. } | Error::Unversioned { .. } => {
+                object_store::Error::Generic {
+                    store,
+                    source: Box::new(self),
+                }
+            }
         }
     }
 }
