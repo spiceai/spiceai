@@ -503,6 +503,8 @@ pub struct Builder {
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
 }
 
 impl Builder {
@@ -562,6 +564,7 @@ impl Builder {
             user_facing_schema: None,
             cdc_param_overrides: None,
             fallback_retention_keep: None,
+            append_cursor_store: None,
         }
     }
 
@@ -750,6 +753,16 @@ impl Builder {
         checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> &mut Self {
         self.checkpointer = checkpointer;
+        self
+    }
+
+    /// Where an append refresh keeps the source snapshot it last loaded, so an Iceberg
+    /// source's append refresh follows its snapshots. Unset, every source reads by time.
+    pub fn append_cursor_store(
+        &mut self,
+        store: refresh_task::append_cursor::AppendCursorStore,
+    ) -> &mut Self {
+        self.append_cursor_store = Some(store);
         self
     }
 
@@ -1141,6 +1154,7 @@ impl Builder {
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
+        refresher.with_append_cursor_store(self.append_cursor_store);
         refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
