@@ -249,6 +249,12 @@
         "schemaRef": "#/$defs/GraphqlDataset"
       },
       {
+        "name": "hf",
+        "prefix": "hf",
+        "paramsRef": "#/$defs/HfDataConnectorParams",
+        "schemaRef": "#/$defs/HfDataset"
+      },
+      {
         "name": "http",
         "prefix": "http",
         "paramsRef": "#/$defs/HttpDataConnectorParams",
@@ -692,7 +698,6 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. Each feature writes under its own folder: `results-cache/`, `rate-control/` and `cluster/`. A `runtime.scheduler.state_location` overrides it for the scheduler.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"
@@ -903,7 +908,7 @@
           "default": "moka"
         },
         "stale_while_revalidate_ttl": {
-          "description": "Maximum age for serving stale cached results while revalidating in the background.\nWhen set, cached results past their TTL (but within this additional window) will be\nserved immediately while a background refresh is triggered.\n\nSetting this also changes what an accelerated refresh (or DML) does to the cached\nresults that read the affected dataset: instead of evicting them, it marks them stale\nas of the refresh, and this window then runs from that instant. Requests arriving\ninside it are served the previous result while a single background revalidation\nreplaces the entry, rather than every dependent result becoming a synchronous miss on\nthe same refresh tick; if that revalidation does not land, the previous result keeps\nbeing served until the window closes. An entry is still dropped\n`item_ttl` + `stale_while_revalidate_ttl` after it was stored, so a refresh late in an\nentry's life may leave less than the full window. Leaving this unset keeps a refresh a\nhard invalidation.\n\nFormat: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
+          "description": "Entries past `item_ttl` and within this extra window are served stale\nwhile one background revalidation replaces them. Age counts from when\nthe query that produced the entry started. Accelerated refreshes do not\ninvalidate cached results; results reflect a refresh once they age past\n`item_ttl` and revalidation completes.\n\nFormat: duration string (e.g., \"30s\", \"5m\"). This is a response directive.",
           "type": [
             "string",
             "null"
@@ -915,13 +920,8 @@
           "default": "none"
         },
         "warmup": {
-          "description": "Replay recorded query plans into the results cache after the first full/append refresh. Datasets stay not ready until warmup completes. Requires `enabled`. Default: `disabled`.",
-          "allOf": [
-            {
-              "$ref": "#/$defs/ResultsCacheWarmup"
-            }
-          ],
-          "default": "disabled"
+          "description": "Replay recorded query plans into the results cache after the first\nfull/append refresh. Datasets stay not ready until warmup completes.\nHas no effect unless [`Self::enabled`] is `true`. Default: `disabled`.",
+          "$ref": "#/$defs/ResultsCacheWarmup"
         },
         "eviction_policy": {
           "$ref": "#/$defs/CachingPolicy",
@@ -930,8 +930,15 @@
       },
       "additionalProperties": false
     },
+    "Encoding": {
+      "type": "string",
+      "enum": [
+        "none",
+        "zstd"
+      ]
+    },
     "ResultsCacheWarmup": {
-      "description": "Whether the SQL results cache records query plans and replays them after the first full/append refresh.",
+      "description": "Whether the SQL results cache records query plans and replays them after\nthe first full/append refresh.",
       "oneOf": [
         {
           "description": "Do not record query plans or replay them after a refresh.",
@@ -939,17 +946,10 @@
           "const": "disabled"
         },
         {
-          "description": "After the first full/append refresh, replay the first 10 distinct query plans (equality-filter values taken from distinct keys in the dataset) until the cache is full. Datasets stay not ready until that warmup completes. Later refreshes do not re-warm.",
+          "description": "After the first full/append refresh, replay the first 10 distinct query\nplans (equality-filter values taken from distinct keys in the dataset)\nuntil the cache is full. Datasets stay not ready until that warmup\ncompletes. Later refreshes do not re-warm.",
           "type": "string",
           "const": "on_first_refresh"
         }
-      ]
-    },
-    "Encoding": {
-      "type": "string",
-      "enum": [
-        "none",
-        "zstd"
       ]
     },
     "CacheConfig": {
@@ -1096,7 +1096,7 @@
           "default": "full"
         },
         "properties": {
-          "description": "Custom key/value attributes attached to telemetry metrics emitted by\nspiced. Applied as OpenTelemetry resource attributes on the runtime's\n`MeterProvider`, so they appear as dimensions on every metric exported\nvia the Prometheus scrape endpoint, the cluster on-demand OTLP reader,\nand the `otel_exporter` push exporter, and as labels on anonymous\nusage telemetry. Currently does not affect tracing spans or logs.\nExample: `{ environment: prod, region: us-west-2, team: data-platform }`.",
+          "description": "Custom key/value attributes attached to telemetry metrics emitted by\nspiced. Applied as OpenTelemetry resource attributes on the runtime's\n`MeterProvider`, so they appear as dimensions on every metric exported\nvia the Prometheus scrape endpoint, the cluster on-demand OTLP reader,\nand the `otel_exporter` push exporter, and as labels on anonymous\nusage telemetry. The log records `otel_exporter` sends carry the same\nresource. Does not affect tracing spans.\nExample: `{ environment: prod, region: us-west-2, team: data-platform }`.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -1132,7 +1132,7 @@
       ]
     },
     "OtelExporterConfig": {
-      "description": "Configuration for pushing metrics to an OpenTelemetry collector.\n\nThe protocol is inferred from the endpoint:\n- **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`\n- **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)\n\n# Examples\n\ngRPC (hostname only, port defaults to 4317):\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"otel-collector\"\n```\n\nWith metric whitelist:\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"otel-collector:4317\"\n  metrics:\n    - requests_total\n    - request_duration_seconds\n```\n\nHTTP:\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"http://localhost:4318/v1/metrics\"\n```",
+      "description": "Configuration for pushing metrics and logs to an OpenTelemetry collector.\n\nThe protocol is inferred from the endpoint:\n- **HTTP**: When endpoint has `http://` or `https://` scheme, or contains `/v1/metrics`\n- **gRPC**: When endpoint is just a hostname and optional port (defaults to 4317)\n\n`signals` chooses what is sent, and defaults to metrics only.\n\n# Examples\n\ngRPC (hostname only, port defaults to 4317):\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"otel-collector\"\n```\n\nWith metric whitelist:\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"otel-collector:4317\"\n  metrics:\n    - requests_total\n    - request_duration_seconds\n```\n\nHTTP:\n```yaml\notel_exporter:\n  enabled: true\n  endpoint: \"http://localhost:4318/v1/metrics\"\n```\n\nMetrics and logs:\n```yaml\notel_exporter:\n  endpoint: \"otel-collector:4317\"\n  signals: [metrics, logs]\n```",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1167,6 +1167,16 @@
           "description": "Aggregation temporality preference for exported metrics.\n\nDefaults to `delta`, which is required by Datadog and recommended for\nmost push-based OTLP backends (`CloudWatch`, New Relic, etc.). Set to\n`cumulative` when forwarding to an `OTel` collector that feeds Prometheus\nor another cumulative-native backend. See [`OtelTemporality`] for\ndetails.",
           "$ref": "#/$defs/OtelTemporality",
           "default": "delta"
+        },
+        "signals": {
+          "description": "What the exporter sends to `endpoint`: `metrics`, `logs`, or both.\n\nDefaults to `[metrics]`. `endpoint` and `headers` apply to every signal;\n`push_interval`, `temporality`, and `metrics` apply to metrics only.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OtelSignal"
+          },
+          "default": [
+            "metrics"
+          ]
         }
       },
       "additionalProperties": false,
@@ -1191,6 +1201,21 @@
           "description": "Counters use cumulative, histograms use delta.",
           "type": "string",
           "const": "low_memory"
+        }
+      ]
+    },
+    "OtelSignal": {
+      "description": "A kind of telemetry the OTEL exporter sends, in OpenTelemetry's own terms.",
+      "oneOf": [
+        {
+          "description": "The runtime's metrics, pushed every `push_interval`.",
+          "type": "string",
+          "const": "metrics"
+        },
+        {
+          "description": "The runtime's log records, as printed to stdout.",
+          "type": "string",
+          "const": "logs"
         }
       ]
     },
@@ -1640,6 +1665,10 @@
         "cte_materialization": {
           "description": "Whether the Cayenne query path should materialize a non-recursive CTE\nonce and reuse the result at every reference.\n\n`DataFusion` inlines `WITH` bodies, so a CTE used twice is planned and\nexecuted twice. `auto` finds those multi-reference CTEs whose body is\nexpensive (aggregation, join, window, distinct, sort, unnest, or union)\nand that scan a Cayenne-accelerated table, computes the body once into\na memory-accounted buffer, and shares it. Simple pass-through CTEs are\nleft inlined so projection pushdown can still prune columns.\n\nDefault `disabled` preserves the inlining behavior. No-op on queries\nthat do not scan Cayenne.\n\n```yaml\nruntime:\n  query:\n    cte_materialization: auto   # disabled (default) | auto\n```",
           "$ref": "#/$defs/CteMaterialization"
+        },
+        "log_errors": {
+          "description": "Which failed queries are logged, to stdout and — when\n`runtime.telemetry.otel_exporter.signals` includes `logs` — to the OTLP\nendpoint. Default `none` logs nothing beyond a query refused for memory,\nbecause failed queries can be frequent.\n\n```yaml\nruntime:\n  query:\n    log_errors: execution   # none (default) | execution | all\n```",
+          "$ref": "#/$defs/QueryErrorLogging"
         }
       }
     },
@@ -1663,6 +1692,26 @@
           "description": "Materialize a CTE once when it is referenced more than once, its body is\nexpensive, and it scans a Cayenne-accelerated table.",
           "type": "string",
           "const": "auto"
+        }
+      ]
+    },
+    "QueryErrorLogging": {
+      "description": "Which failed queries `spiced` logs.\n\nA failure is either a query rejected before it ran — a syntax error, or a\nplanning error such as an unknown table or column — which is the client's to\nfix, or a valid query that failed while running — a source or object-store\nerror, a timeout, an internal error — which may need the operator.",
+      "oneOf": [
+        {
+          "description": "Log a query refused for want of memory as a warning, and every other\nfailure at debug level only.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Also log queries that failed while running, as warnings.",
+          "type": "string",
+          "const": "execution"
+        },
+        {
+          "description": "Also log queries rejected before running, at info level.",
+          "type": "string",
+          "const": "all"
         }
       ]
     },
@@ -1720,12 +1769,9 @@
     "RuntimeState": {
       "description": "Shared object-store location for runtime state.",
       "type": "object",
-      "required": [
-        "location"
-      ],
       "properties": {
         "location": {
-          "description": "Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).",
+          "description": "Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).",
           "type": "string"
         },
         "params": {
@@ -1740,14 +1786,20 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "location"
+      ]
     },
     "Scheduler": {
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
-          "type": "string"
+          "description": "Root URI for shared cluster state. Optional when [`Runtime::state`]\nprovides the location (see [`Runtime::scheduler_state`]).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "params": {
           "description": "Optional object store params for the shared cluster state.",
@@ -1791,7 +1843,7 @@
       "type": "object",
       "properties": {
         "refresh_interval": {
-          "description": "How often each runtime refreshes and persists per-source rate-control state at `runtime.state.location`.",
+          "description": "How often each runtime refreshes and persists per-source rate-control\nstate at `runtime.state.location`.",
           "type": "string",
           "default": "30s"
         },
@@ -1850,7 +1902,7 @@
           "default": true
         },
         "location": {
-          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`",
+          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`\n\nWhen not set, snapshots go to the `snapshots/` folder of\n`runtime.state.location`.",
           "type": [
             "string",
             "null"
@@ -1861,7 +1913,7 @@
           "$ref": "#/$defs/BootstrapOnFailureBehavior"
         },
         "params": {
-          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.",
+          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.\nWhen set, they replace `runtime.state.params` for a location taken from\n`runtime.state`.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -2623,6 +2675,18 @@
           "if": {
             "properties": {
               "from": {
+                "pattern": "^hf:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/HfDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
                 "pattern": "^http:"
               }
             }
@@ -3252,10 +3316,12 @@
           ]
         },
         "on_conflict": {
+          "description": "Deprecated, and removed in 3.0: a Cayenne acceleration keeps one row per\n`primary_key`, the newest by `time_column` when the dataset sets one.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/OnConflictBehavior"
-          }
+          },
+          "deprecated": true
         },
         "maintained_aggregates": {
           "$ref": "#/$defs/MaintainedAggregates"
@@ -3488,7 +3554,7 @@
           "const": "always"
         },
         {
-          "description": "Only start a refresh if an existing acceleration is not available.",
+          "description": "Keep the refresh schedule across restarts: refresh at startup only when there\nis no existing acceleration, or when `refresh_check_interval` has elapsed since\nits last refresh. The refresh runs in the background while an existing\nacceleration serves queries.",
           "type": "string",
           "const": "auto"
         }
@@ -3531,17 +3597,17 @@
       "description": "Controls when the dataset is marked ready for queries.",
       "oneOf": [
         {
-          "description": "The table is ready once the initial load completes.",
+          "description": "The table is ready once the initial load completes, or immediately when an existing\nacceleration from a previous run can serve it.",
           "type": "string",
           "const": "on_load"
         },
         {
-          "description": "The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.",
+          "description": "The table is ready immediately on registration. Until the initial load completes, queries\nare served from an existing acceleration if there is one, and otherwise fall back to the\nfederated source.",
           "type": "string",
           "const": "on_registration"
         },
         {
-          "description": "The table is ready once the federated source's schema has been resolved (which also implies access\nto the source has been verified), without waiting for the initial data refresh to complete. Queries\nfall back to the federated source until the initial load completes. Subsequent refresh failures are\nstill reported via dataset status and metrics.",
+          "description": "The table is ready once the federated source's schema has been resolved (which also implies access\nto the source has been verified), without waiting for the initial data refresh to complete. Queries\nare served from an existing acceleration if there is one, and otherwise fall back to the federated\nsource until the initial load completes. Subsequent refresh failures are still reported via dataset\nstatus and metrics.",
           "type": "string",
           "const": "on_schema_resolved"
         }
@@ -3555,12 +3621,27 @@
       ]
     },
     "OnConflictBehavior": {
-      "type": "string",
-      "enum": [
-        "drop",
-        "upsert",
-        "upsert_dedup",
-        "upsert_dedup_by_row_id"
+      "oneOf": [
+        {
+          "description": "Keep the stored row and drop the incoming one.",
+          "type": "string",
+          "const": "drop"
+        },
+        {
+          "description": "Replace the stored row.",
+          "type": "string",
+          "const": "upsert"
+        },
+        {
+          "description": "Replace the stored row; identical copies of a key in one write collapse.",
+          "type": "string",
+          "const": "upsert_dedup"
+        },
+        {
+          "description": "Replace the stored row; of a key's copies in one write, the last is kept.",
+          "type": "string",
+          "const": "upsert_dedup_by_row_id"
+        }
       ]
     },
     "MaintainedAggregates": {
@@ -3675,11 +3756,12 @@
       ]
     },
     "WriteMode": {
-      "description": "Controls the write behavior for accelerated read-write datasets.\n\n- `write_through` (default): Writes go to the federated source (e.g. Postgres)\n  synchronously. The user receives confirmation after a full ACID commit to the\n  source. The local accelerator is updated via the normal refresh mechanism\n  (e.g. WAL replication with `refresh_mode: changes`).\n\n- `write_back`: Writes commit to the local accelerator and are carried to the\n  federated source afterwards by a delivery worker, so the source may lag.\n  Every write must be sent as a single `BEGIN; ...; COMMIT;` body: only the\n  transactional commit records the write for delivery, so a statement outside\n  a transaction is refused rather than accepted with weaker durability than a\n  caller would assume. `INSERT` and `UPDATE` only — `DELETE` is not supported.\n  To delete, first stop writing and wait for\n  `dataset_acceleration_write_back_pending_keys` to reach zero while write-back\n  is still enabled (the delivery worker is what drains it), then disable\n  write-back, delete at the source, and let the change stream carry it back.\n  Requires a\n  single-column `primary_key` to key each delivery on, and\n  `replication.enabled: true` as an explicit opt-in to the source lagging the\n  accelerator.",
+      "description": "Controls the write behavior for accelerated read-write datasets.\n\n- `write_through` (default): Writes go to the federated source (e.g. Postgres)\n  synchronously. The user receives confirmation after a full ACID commit to the\n  source. The local accelerator is updated via the normal refresh mechanism\n  (e.g. WAL replication with `refresh_mode: changes`).\n\n- `write_back`: Writes commit to the local accelerator and are carried to the\n  federated source afterwards by a delivery worker, so the source may lag.\n  Every write must be sent as a single `BEGIN; ...; COMMIT;` body: only the\n  transactional commit records the write for delivery, so a statement outside\n  a transaction is refused rather than accepted with weaker durability than a\n  caller would assume. `INSERT` and `UPDATE` only — `DELETE` is not supported.\n  To delete, first stop writing and wait for\n  `dataset_acceleration_write_back_pending_keys` to reach zero while write-back\n  is still enabled (the delivery worker is what drains it), then disable\n  write-back, delete at the source, and let the change stream carry it back.\n  Requires a\n  single-column `primary_key` to key each delivery on, and\n  `replication.enabled: true` as an explicit opt-in to the source lagging the\n  accelerator.\n\n- `acceleration`: Writes go only to the acceleration and never reach the\n  federated source, which need not accept writes. Refreshes still load the\n  source's data into the acceleration. Not valid with `refresh_mode: changes`,\n  whose changes would overwrite the writes.",
       "type": "string",
       "enum": [
         "write_through",
-        "write_back"
+        "write_back",
+        "acceleration"
       ]
     },
     "StorageProfile": {
@@ -5383,6 +5465,10 @@
           "description": "Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
         },
+        "rate_control_acquire_timeout": {
+          "description": "Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Defaults to `client_timeout`. Use '0' for no limit.",
+          "type": "string"
+        },
         "databricks_token": {
           "description": "The personal access token used to authenticate against the DataBricks API.\n\nSee: https://spiceai.org/docs/components/data-connectors/databricks",
           "type": "string",
@@ -6710,6 +6796,46 @@
           "type": "string",
           "default": "enabled"
         },
+        "glue_changes_queue_url": {
+          "description": "SQS queue URL subscribed to S3 event notifications for `refresh_mode: changes`. Must be a queue URL, not an ARN. The queue must be exclusive to this dataset.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "https://sqs.us-east-1.amazonaws.com/123456789012/s3-events"
+          ],
+          "x-secret": true
+        },
+        "glue_changes_region": {
+          "description": "AWS region of the SQS queue. Defaults to the region in `s3_changes_queue_url`, then `s3_region`.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "us-east-1"
+          ]
+        },
+        "glue_changes_key_prefix": {
+          "description": "Object-key prefix to apply from the SQS queue and listing backfill. Defaults to the dataset `from` prefix. Must be equal to or nested under the dataset path.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "examples": [
+            "events/year=2026/"
+          ]
+        },
+        "glue_changes_backfill_interval": {
+          "description": "How often to list the dataset prefix and apply objects not yet reflected, so SQS downtime does not permanently miss objects. Must be greater than 0.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "1h",
+          "examples": [
+            "1h",
+            "30m"
+          ]
+        },
+        "glue_on_object_removed": {
+          "description": "What to do with `s3:ObjectRemoved:*` notifications. `ignore` leaves deleted objects in the accelerator. `rebuild` replaces the accelerator from the listing prefix (`history_unavailable`); this is not a row-level delete.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
+          "type": "string",
+          "default": "ignore",
+          "enum": [
+            "ignore",
+            "rebuild"
+          ]
+        },
         "client_timeout": {
           "description": "The timeout setting for S3 client.\n\nSee: https://spiceai.org/docs/components/data-connectors/s3",
           "type": "string",
@@ -6912,11 +7038,170 @@
         "rate_control_jitter_max": {
           "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
+        },
+        "rate_control_acquire_timeout": {
+          "description": "Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set.",
+          "type": "string"
+        },
+        "rate_control_failure_threshold": {
+          "description": "The upstream error rate above which adaptive rate control begins throttling, as a percentage like '25%' or a fraction like '0.25'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate, always within the configured limits. With runtime.state.location set, every instance derives the same admission from the shared state, so the cluster backs off together; cluster rate control scales requests_per_second_limit and requests_per_minute_limit only, never the instance-local max_concurrent_requests. Overrides runtime.params.http_rate_control_failure_threshold when set. Defaults to 10%.",
+          "type": "string"
+        },
+        "rate_control_window": {
+          "description": "The reaction and recovery window for adaptive rate control, as a duration such as '10s' — the half-life over which request outcomes decay. A shorter window reacts to and recovers from failures faster; a longer one is smoother and slower. Overrides runtime.params.http_rate_control_window when set. Defaults to 10s, or to runtime.source_rate_control.refresh_interval when cluster rate control is in use (runtime.state.location is set), where the shared state records outcomes one window at a time and a value shorter than one refresh_interval is raised to one.",
+          "type": "string"
         }
       },
       "required": [
         "graphql_query"
       ],
+      "additionalProperties": true
+    },
+    "HfDataConnectorParams": {
+      "title": "HfParams",
+      "type": "object",
+      "properties": {
+        "hf_token": {
+          "description": "A Hugging Face User Access Token, to read private and gated datasets.",
+          "type": "string",
+          "x-secret": true
+        },
+        "hf_endpoint": {
+          "description": "The Hugging Face Hub endpoint, to read through a mirror or proxy of the Hub.",
+          "type": "string",
+          "default": "https://huggingface.co"
+        },
+        "file_format": {
+          "description": "File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, socrata, vortex, orc, or auto. Inferred from the path extension when unset.",
+          "type": "string"
+        },
+        "file_extension": {
+          "type": "string"
+        },
+        "schema_infer_max_records": {
+          "description": "Set a limit in terms of records to scan to infer the schema.",
+          "type": "string"
+        },
+        "tsv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "tsv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "tsv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "tsv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "csv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "csv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "csv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_delimiter": {
+          "description": "The character separating values within a row.",
+          "type": "string"
+        },
+        "file_compression_type": {
+          "description": "The type of compression used on the file. If unset, Spice infers compression from file extensions such as .gz, .bz2, .xz, and .zst. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "type": "string",
+          "enum": [
+            "GZIP",
+            "BZIP2",
+            "XZ",
+            "ZSTD",
+            "UNCOMPRESSED"
+          ]
+        },
+        "hive_partitioning_enabled": {
+          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "schema_source_path": {
+          "description": "Specify a path to use for schema inference.",
+          "type": "string"
+        },
+        "json_format": {
+          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "json",
+            "jsonl",
+            "ndjson",
+            "ldjson",
+            "array",
+            "object",
+            "soda",
+            "socrata",
+            "auto"
+          ]
+        },
+        "json_pointer": {
+          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
+          "type": "string"
+        },
+        "json_path": {
+          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
+          "type": "string"
+        },
+        "flatten_json": {
+          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "soda_metadata": {
+          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
+          "type": "string",
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "refresh_skip": {
+          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
+          "type": "string",
+          "default": "enabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        }
+      },
       "additionalProperties": true
     },
     "HttpDataConnectorParams": {
@@ -6971,6 +7256,10 @@
         },
         "http_headers": {
           "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.",
+          "type": "string"
+        },
+        "on_error_response": {
+          "description": "What a response the origin did not mark successful becomes: 'error' fails the request (a refresh then keeps the accelerated table's previous contents), 'warn' records it as a row and warns, 'store' records it as a row silently. 'warn' and 'store' apply to client errors only — a 5xx or 429 that outlives the retries always fails the request, because a server error is a statement about the origin rather than about the resource. Applies to a response the origin answered; a connection failure or timeout is unaffected. Defaults to 'error'.",
           "type": "string"
         },
         "max_retries": {
@@ -7155,6 +7444,18 @@
         },
         "rate_control_jitter_max": {
           "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_acquire_timeout": {
+          "description": "Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set.",
+          "type": "string"
+        },
+        "rate_control_failure_threshold": {
+          "description": "The upstream error rate above which adaptive rate control begins throttling, as a percentage like '25%' or a fraction like '0.25'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate, always within the configured limits. With runtime.state.location set, every instance derives the same admission from the shared state, so the cluster backs off together; cluster rate control scales requests_per_second_limit and requests_per_minute_limit only, never the instance-local max_concurrent_requests. Overrides runtime.params.http_rate_control_failure_threshold when set. Defaults to 10%.",
+          "type": "string"
+        },
+        "rate_control_window": {
+          "description": "The reaction and recovery window for adaptive rate control, as a duration such as '10s' — the half-life over which request outcomes decay. A shorter window reacts to and recovers from failures faster; a longer one is smoother and slower. Overrides runtime.params.http_rate_control_window when set. Defaults to 10s, or to runtime.source_rate_control.refresh_interval when cluster rate control is in use (runtime.state.location is set), where the shared state records outcomes one window at a time and a value shorter than one refresh_interval is raised to one.",
           "type": "string"
         },
         "file_format": {
@@ -7344,6 +7645,10 @@
           "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests. Applies to dynamic JSON API endpoints only; structured HTTP file datasets ignore these headers.",
           "type": "string"
         },
+        "on_error_response": {
+          "description": "What a response the origin did not mark successful becomes: 'error' fails the request (a refresh then keeps the accelerated table's previous contents), 'warn' records it as a row and warns, 'store' records it as a row silently. 'warn' and 'store' apply to client errors only — a 5xx or 429 that outlives the retries always fails the request, because a server error is a statement about the origin rather than about the resource. Applies to a response the origin answered; a connection failure or timeout is unaffected. Defaults to 'error'.",
+          "type": "string"
+        },
         "max_retries": {
           "description": "Maximum number of retries for HTTP requests. Default: 3",
           "type": "string"
@@ -7528,6 +7833,18 @@
           "description": "Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
           "type": "string"
         },
+        "rate_control_acquire_timeout": {
+          "description": "Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set.",
+          "type": "string"
+        },
+        "rate_control_failure_threshold": {
+          "description": "The upstream error rate above which adaptive rate control begins throttling, as a percentage like '25%' or a fraction like '0.25'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate, always within the configured limits. With runtime.state.location set, every instance derives the same admission from the shared state, so the cluster backs off together; cluster rate control scales requests_per_second_limit and requests_per_minute_limit only, never the instance-local max_concurrent_requests. Overrides runtime.params.http_rate_control_failure_threshold when set. Defaults to 10%.",
+          "type": "string"
+        },
+        "rate_control_window": {
+          "description": "The reaction and recovery window for adaptive rate control, as a duration such as '10s' — the half-life over which request outcomes decay. A shorter window reacts to and recovers from failures faster; a longer one is smoother and slower. Overrides runtime.params.http_rate_control_window when set. Defaults to 10s, or to runtime.source_rate_control.refresh_interval when cluster rate control is in use (runtime.state.location is set), where the shared state records outcomes one window at a time and a value shorter than one refresh_interval is raised to one.",
+          "type": "string"
+        },
         "file_format": {
           "description": "File format: parquet, csv, tsv, json, jsonl, ndjson, ldjson, soda, socrata, vortex, orc, or auto. Inferred from the path extension when unset.",
           "type": "string"
@@ -7665,9 +7982,14 @@
       "title": "IcebergParams",
       "type": "object",
       "properties": {
-        "metadata_path": {
-          "description": "The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`",
+        "iceberg_metadata_path": {
+          "description": "The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog. A version hint file (`/metadata/version-hint.text`) is read on every query instead, and names the metadata file to read.",
           "type": "string"
+        },
+        "metadata_path": {
+          "description": "**DEPRECATED**: Use `iceberg_metadata_path`, which accepts the same full URL and also a path relative to `from`, such as `/metadata/v1.metadata.json`.",
+          "type": "string",
+          "deprecated": true
         },
         "iceberg_token": {
           "description": "Bearer token value to use for Authorization header.",
@@ -9438,7 +9760,7 @@
           "default": "auto"
         },
         "cayenne_pk_conflict_detection": {
-          "description": "Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.",
+          "description": "Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and keeps one row per primary key. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and no row reaches the table twice; a full or append refresh does not guarantee that (an append without a time_column re-appends stored rows). 'none' is refused on a dataset that rewrites stored keys: refresh_mode: changes, or a writable dataset whose writes go to Cayenne (write_mode: write_back, write_mode: acceleration, or a sink source). A table created with 'none' keeps it: switching to 'auto' is refused until the acceleration is rebuilt, for example by one restart with mode: file_create.",
           "type": "string",
           "default": "auto",
           "enum": [
@@ -10016,6 +10338,10 @@
         },
         "rate_control_jitter_max": {
           "description": "Maximum random delay added before Databricks HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms.",
+          "type": "string"
+        },
+        "rate_control_acquire_timeout": {
+          "description": "Maximum time a Databricks HTTP request waits for rate-control capacity before it fails. Overrides runtime.params.http_rate_control_acquire_timeout when set. Accepts durations such as '30s' or '500ms'. Defaults to `client_timeout`. Use '0' for no limit.",
           "type": "string"
         },
         "databricks_auth_mode": {
@@ -16254,6 +16580,203 @@
           "anyOf": [
             {
               "$ref": "#/$defs/GraphqlDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "on_schema_change": {
+          "$ref": "#/$defs/OnSchemaChange"
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "full_text_search": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FtsStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "drasi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Drasi"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "check_availability_interval": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "HfDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for hf connector. Format: hf:<path>",
+          "type": "string",
+          "pattern": "^hf:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the hf data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HfDataConnectorParams"
             },
             {
               "type": "null"
