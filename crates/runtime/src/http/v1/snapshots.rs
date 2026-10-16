@@ -265,7 +265,8 @@ pub async fn get_snapshot(
     }
 }
 
-/// Set the current snapshot for a dataset.
+/// Pin a dataset to a snapshot: make it current, and keep it current while newer
+/// snapshots are published, until the dataset is unpinned.
 ///
 /// `POST /v1/datasets/{name}/acceleration/snapshots/current`
 pub async fn set_current_snapshot(
@@ -274,22 +275,89 @@ pub async fn set_current_snapshot(
     Path(dataset_name): Path<String>,
     Json(request): Json<api::SetCurrentSnapshotRequest>,
 ) -> Response {
+    let snapshot_manager = match writable_snapshot_manager(&app, &rt, &dataset_name).await {
+        Ok(manager) => manager,
+        Err(response) => return *response,
+    };
+    match snapshot_manager.set_current_snapshot(request.snapshot_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(MessageResponse {
+                message: format!(
+                    "Dataset {dataset_name} is pinned to snapshot {}. Readers load it at their next check. Newer snapshots are published but not made current until the dataset is unpinned with DELETE /v1/datasets/{dataset_name}/acceleration/snapshots/current.",
+                    request.snapshot_id
+                ),
+            }),
+        )
+            .into_response(),
+        Err(e) => snapshot_api_error_to_response(&e),
+    }
+}
+
+/// Unpin a dataset: make its newest snapshot current, and newer snapshots current as
+/// they are published. Deletes no snapshot.
+///
+/// `DELETE /v1/datasets/{name}/acceleration/snapshots/current`
+pub async fn unpin_current_snapshot(
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    Extension(rt): Extension<Arc<Runtime>>,
+    Path(dataset_name): Path<String>,
+) -> Response {
+    let snapshot_manager = match writable_snapshot_manager(&app, &rt, &dataset_name).await {
+        Ok(manager) => manager,
+        Err(response) => return *response,
+    };
+    match snapshot_manager.unpin_current_snapshot().await {
+        Ok(unpinned) => {
+            let state = if unpinned.was_pinned {
+                "is no longer pinned"
+            } else {
+                "is not pinned"
+            };
+            (
+                StatusCode::OK,
+                Json(MessageResponse {
+                    message: format!(
+                        "Dataset {dataset_name} {state}. Its current snapshot is {}, the newest.",
+                        unpinned.current_snapshot_id
+                    ),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => snapshot_api_error_to_response(&e),
+    }
+}
+
+/// The `SnapshotManager` that changes which snapshot of `dataset_name` is current, or
+/// the response refusing the request.
+async fn writable_snapshot_manager(
+    app: &RwLock<Option<Arc<App>>>,
+    rt: &Runtime,
+    dataset_name: &str,
+) -> Result<SnapshotManager, Box<Response>> {
     if let Some(resp) = snapshots_feature_response() {
-        return resp;
+        return Err(Box::new(resp));
     }
     if let Some(response) = require_write_access().await {
-        return response;
+        return Err(Box::new(response));
     }
 
     let app_lock = tokio::select! {
         lock = app.read() => lock,
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            return (StatusCode::REQUEST_TIMEOUT, "timeout").into_response();
+            return Err(Box::new((StatusCode::REQUEST_TIMEOUT, "timeout").into_response()));
         }
     };
 
     let Some(readable_app) = &*app_lock else {
-        return (StatusCode::INTERNAL_SERVER_ERROR).into_response();
+        return Err(Box::new(
+            (StatusCode::INTERNAL_SERVER_ERROR).into_response(),
+        ));
+    };
+
+    let bad_request = |message: String| {
+        Box::new((StatusCode::BAD_REQUEST, Json(MessageResponse { message })).into_response())
     };
 
     let Some(dataset) = readable_app
@@ -297,83 +365,44 @@ pub async fn set_current_snapshot(
         .iter()
         .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
     else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(MessageResponse {
-                message: format!("Dataset {dataset_name} not found"),
-            }),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(MessageResponse {
+                    message: format!("Dataset {dataset_name} not found"),
+                }),
+            )
+                .into_response(),
+        ));
     };
 
     // A dataset reading snapshots never changes them: its current snapshot is the one
     // the publishing instance names in the metadata this dataset reads.
     if SnapshotSource::from_spicepod(dataset).is_ok_and(|source| source.is_some()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(MessageResponse {
-                message: format!(
-                    "Dataset {dataset_name} reads snapshots (`file_format: snapshot`) and never changes them. Set the current snapshot on the Spice instance that publishes them."
-                ),
-            }),
-        )
-            .into_response();
+        return Err(bad_request(format!(
+            "Dataset {dataset_name} reads snapshots (`file_format: snapshot`) and never changes them. Set the current snapshot on the Spice instance that publishes them."
+        )));
     }
 
-    let Some(acceleration) = &dataset.acceleration else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(MessageResponse {
-                message: format!("Dataset {dataset_name} does not have acceleration enabled"),
-            }),
-        )
-            .into_response();
+    let Some(acceleration) = dataset.acceleration.as_ref().filter(|a| a.enabled) else {
+        return Err(bad_request(format!(
+            "Dataset {dataset_name} does not have acceleration enabled"
+        )));
     };
 
-    if !acceleration.enabled {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(MessageResponse {
-                message: format!("Dataset {dataset_name} does not have acceleration enabled"),
-            }),
-        )
-            .into_response();
-    }
-
-    let Some(snapshot_manager) = create_snapshot_manager_for_query(
-        &dataset_name,
+    create_snapshot_manager_for_query(
+        dataset_name,
         readable_app.dataset_snapshots(acceleration),
         acceleration,
         rt.secrets_weak(),
         rt.tokio_io_runtime(),
     )
     .await
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(MessageResponse {
-                message: format!("Dataset {dataset_name} does not have snapshots configured"),
-            }),
-        )
-            .into_response();
-    };
-
-    // Need to drop the app lock before the async call
-    drop(app_lock);
-
-    match snapshot_manager.set_current_snapshot(request.snapshot_id).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(MessageResponse {
-                message: format!(
-                    "Current snapshot for dataset {} set to {}. Restart the runtime to bootstrap from this snapshot.",
-                    dataset_name, request.snapshot_id
-                ),
-            }),
-        )
-            .into_response(),
-        Err(e) => snapshot_api_error_to_response(&e),
-    }
+    .ok_or_else(|| {
+        bad_request(format!(
+            "Dataset {dataset_name} does not have snapshots configured"
+        ))
+    })
 }
 
 /// A `SnapshotManager` over the snapshots `dataset` reads, when it reads snapshots
@@ -449,7 +478,7 @@ async fn create_snapshot_manager_for_query(
 
 fn snapshot_api_error_to_response(error: &SnapshotApiError) -> Response {
     match error {
-        SnapshotApiError::SnapshotNotFound { .. } => (
+        SnapshotApiError::SnapshotNotFound { .. } | SnapshotApiError::NoSnapshots { .. } => (
             StatusCode::NOT_FOUND,
             Json(MessageResponse {
                 message: error.to_string(),
@@ -524,10 +553,20 @@ mod tests {
 
         assert_enterprise_only_response(
             set_current_snapshot(
+                Extension(Arc::clone(&app)),
+                Extension(Arc::clone(&runtime)),
+                Path("test_dataset".to_string()),
+                Json(api::SetCurrentSnapshotRequest { snapshot_id: 1 }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_enterprise_only_response(
+            unpin_current_snapshot(
                 Extension(app),
                 Extension(runtime),
                 Path("test_dataset".to_string()),
-                Json(api::SetCurrentSnapshotRequest { snapshot_id: 1 }),
             )
             .await,
         )

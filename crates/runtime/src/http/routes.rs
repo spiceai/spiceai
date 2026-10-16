@@ -443,7 +443,7 @@ pub(crate) fn routes(
         )
         .route(
             "/v1/datasets/{name}/acceleration/snapshots/current",
-            post(v1::snapshots::set_current_snapshot),
+            post(v1::snapshots::set_current_snapshot).delete(v1::snapshots::unpin_current_snapshot),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));

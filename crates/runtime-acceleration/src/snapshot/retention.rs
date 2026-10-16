@@ -18,8 +18,8 @@ limitations under the License.
 //! `metadata.json` when it publishes, and when their files may be deleted.
 //!
 //! A dataset keeps its snapshots of the last [`SNAPSHOT_RETENTION`], and always
-//! its current snapshot (a rollback can make an older one current) and its
-//! newest one. The writer drops the other entries in the conditional write that
+//! its current snapshot (a rollback can make an older one current), the snapshot
+//! it is pinned to, and its newest one. The writer drops the other entries in the conditional write that
 //! publishes a snapshot and records when it dropped each, so a reader that read
 //! the entry before the drop can still download its file for [`FILE_GRACE`].
 
@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use super::{DatasetMetadata, SnapshotEntry};
+use super::{DatasetMetadata, SnapshotEntry, pin};
 
-/// How long a dataset keeps a snapshot that is neither its current nor its newest.
+/// How long a dataset keeps a snapshot that is not its current, pinned or newest one.
 pub(super) const SNAPSHOT_RETENTION: Duration = Duration::from_hours(14 * 24);
 
 /// How long a dropped snapshot's file stays, so a reader that is still
@@ -83,11 +83,13 @@ pub(super) struct Retention {
     /// Snapshots dropped at least the file grace ago, whose files may now be
     /// deleted. Their drop records were removed.
     pub(super) expired: Vec<String>,
+    /// The pinned snapshot, kept although its file is gone.
+    pub(super) pinned_gone: Option<SnapshotEntry>,
 }
 
 /// Applies retention to `dataset` at `now_ms`.
 ///
-/// Drops every entry that is neither the current nor the newest snapshot and is
+/// Drops every entry that is not the current, pinned or newest snapshot and is
 /// either older than `retention` or names a snapshot in `gone`, and records when
 /// it dropped each aged-out entry. Removes the drop records that are at least
 /// `grace` old and returns their snapshots in [`Retention::expired`].
@@ -99,6 +101,7 @@ pub(super) fn apply(
     grace: Duration,
 ) -> Retention {
     let current = dataset.current_snapshot_id;
+    let pinned = pin::pinned_snapshot_id(dataset);
     let newest = dataset
         .snapshots
         .iter()
@@ -108,7 +111,10 @@ pub(super) fn apply(
 
     let mut result = Retention::default();
     dataset.snapshots.retain(|entry| {
-        if Some(entry.snapshot_id) == current || Some(entry.snapshot_id) == newest {
+        if Some(entry.snapshot_id) == pinned && gone.contains(&entry.snapshot) {
+            result.pinned_gone = Some(entry.clone());
+        }
+        if [current, pinned, newest].contains(&Some(entry.snapshot_id)) {
             return true;
         }
         if gone.contains(&entry.snapshot) {
@@ -251,6 +257,29 @@ mod tests {
 
         assert_eq!(ids(&retention.aged_out), vec![2]);
         assert_eq!(ids(&dataset.snapshots), vec![1, 3]);
+    }
+
+    /// The pinned snapshot stays at any age, also after a version of Spice without
+    /// pins made another snapshot current, and also when its file is gone.
+    #[test]
+    fn the_pinned_snapshot_stays_at_any_age_and_without_its_file() {
+        let mut dataset = dataset(
+            vec![entry(1, 40 * DAY_MS), entry(2, 35 * DAY_MS), entry(3, 0)],
+            2,
+        );
+        dataset
+            .properties
+            .insert("pinned-snapshot-id".to_string(), "1".to_string());
+        let gone: HashSet<String> = ["s3://bucket/snapshots/1.cayenne".to_string()].into();
+
+        let retention = apply_now(&mut dataset, &gone);
+
+        assert_eq!(ids(&dataset.snapshots), vec![1, 2, 3]);
+        assert!(retention.lost.is_empty() && retention.aged_out.is_empty());
+        assert_eq!(
+            retention.pinned_gone.map(|entry| entry.snapshot_id),
+            Some(1)
+        );
     }
 
     /// An entry whose file is gone is dropped at any age, without a drop record,

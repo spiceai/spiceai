@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
     about = "Manage dataset acceleration features",
     long_about = r#"Commands for managing accelerated datasets including snapshots.
 
-Use subcommands to list snapshots, view snapshot details, and perform
-rollback operations.
+Use subcommands to list snapshots, view snapshot details, pin a dataset to
+a snapshot (rollback), and unpin it.
 
 Examples:
   # List all snapshots for a dataset
@@ -38,8 +38,11 @@ Examples:
   # Get details of a specific snapshot
   spice acceleration snapshot taxi_trips 3
 
-  # Set the current snapshot for rollback
-  spice acceleration set-snapshot taxi_trips 2"#
+  # Pin the dataset to snapshot 2 (rollback)
+  spice acceleration set-snapshot taxi_trips 2
+
+  # Unpin the dataset: its newest snapshot becomes current
+  spice acceleration unpin taxi_trips"#
 )]
 pub struct AccelerationArgs {
     #[command(subcommand)]
@@ -54,8 +57,12 @@ pub enum AccelerationCommand {
     /// Get details of a specific acceleration snapshot
     Snapshot(SnapshotArgs),
 
-    /// Set the current snapshot for rollback
+    /// Pin the dataset to a snapshot (rollback): it stays current while newer
+    /// snapshots are published, until the dataset is unpinned
     SetSnapshot(SetSnapshotArgs),
+
+    /// Unpin the dataset: its newest snapshot becomes current
+    Unpin(UnpinArgs),
 }
 
 /// Arguments for the snapshots subcommand.
@@ -93,8 +100,19 @@ pub struct SetSnapshotArgs {
     /// The dataset name
     pub dataset: String,
 
-    /// The snapshot ID to set as current
+    /// The snapshot ID to pin the dataset to
     pub snapshot_id: u64,
+
+    /// Output format
+    #[arg(long, short = 'o', default_value = "table")]
+    pub output: OutputFormat,
+}
+
+/// Arguments for the unpin subcommand.
+#[derive(Args, Debug)]
+pub struct UnpinArgs {
+    /// The dataset name
+    pub dataset: String,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -124,6 +142,8 @@ pub struct SnapshotSummary {
     pub last_updated_ms: i64,
     pub engine: Option<String>,
     pub current_snapshot_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_snapshot_id: Option<u64>,
     pub snapshots: Vec<SnapshotInfo>,
 }
 
@@ -187,6 +207,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &AccelerationArgs) -> Result<()
         AccelerationCommand::Snapshots(snap_args) => execute_snapshots(ctx, snap_args).await,
         AccelerationCommand::Snapshot(snap_args) => execute_snapshot(ctx, snap_args).await,
         AccelerationCommand::SetSnapshot(snap_args) => execute_set_snapshot(ctx, snap_args).await,
+        AccelerationCommand::Unpin(unpin_args) => execute_unpin(ctx, unpin_args).await,
     }
 }
 
@@ -231,6 +252,9 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
     }
     if let Some(current_id) = summary.current_snapshot_id {
         println!("Current Snapshot ID: {current_id}");
+    }
+    if let Some(pinned_id) = summary.pinned_snapshot_id {
+        println!("Pinned Snapshot ID: {pinned_id} (unpin with `spice acceleration unpin`)");
     }
     let last_updated = format_timestamp_ms(summary.last_updated_ms);
     println!("Last Updated: {last_updated}");
@@ -322,6 +346,38 @@ async fn execute_set_snapshot(ctx: &RuntimeContext, args: &SetSnapshotArgs) -> R
     };
 
     let response = ctx.post_json(&url, &request).await.map_err(|_| {
+        RuntimeUnavailableSnafu {
+            endpoint: ctx.http_endpoint().to_string(),
+        }
+        .build()
+    })?;
+
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
+
+    let result: MessageResponse = response.json().await.map_err(|e| {
+        InvalidResponseSnafu {
+            message: format!("Failed to parse response: {e}"),
+        }
+        .build()
+    })?;
+
+    if matches!(args.output, OutputFormat::Json) {
+        return write_json(&result);
+    }
+
+    tracing::info!("{}", result.message);
+
+    Ok(())
+}
+
+/// Execute the unpin subcommand.
+async fn execute_unpin(ctx: &RuntimeContext, args: &UnpinArgs) -> Result<()> {
+    let url = format!(
+        "/v1/datasets/{}/acceleration/snapshots/current",
+        args.dataset
+    );
+
+    let response = ctx.delete(&url).await.map_err(|_| {
         RuntimeUnavailableSnafu {
             endpoint: ctx.http_endpoint().to_string(),
         }
