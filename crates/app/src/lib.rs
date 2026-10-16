@@ -382,21 +382,21 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
     )
 }
 
-/// A metastore directory in the form two datasets' directories are compared in:
-/// trailing separators dropped, a `file:` scheme stripped the way the accelerator
-/// strips it ([`fs_probe_path`]), a local path placed against the working directory
-/// the way the accelerator places it ([`absolute_dir`]), and `.` and `..` components
-/// folded, so `./.spice/data/metadata`, `file:///<cwd>/.spice/data/metadata`,
-/// `<cwd>/.spice/data/../data/metadata` and the default `<cwd>/.spice/data/metadata`
-/// compare equal. Nothing is read from disk, so two spellings that meet only through
-/// a symlink stay distinct; spell the shared directory the same way on every dataset.
-/// An object-store URL only loses its trailing separator.
+/// A metastore directory in the form two datasets' directories are compared in: a
+/// `file:` scheme stripped the way the accelerator strips it ([`fs_probe_path`]), a
+/// local path placed against the working directory the way the accelerator places it
+/// ([`absolute_dir`]), and `.` and `..` components folded, so `./.spice/data/metadata`,
+/// `file:///<cwd>/.spice/data/metadata`, `<cwd>/.spice/data/../data/metadata` and the
+/// default `<cwd>/.spice/data/metadata` compare equal. Paths compare by component, so
+/// a trailing separator does not make two directories differ and the root `/` stays
+/// the root. Nothing is read from disk, so two spellings that meet only through a
+/// symlink stay distinct; spell the shared directory the same way on every dataset.
+/// An object-store URL compares as written, by component.
 fn comparable_metastore_dir(dir: &str) -> PathBuf {
-    let trimmed = dir.trim_end_matches(['/', '\\']);
-    if !is_local_path(trimmed) {
-        return PathBuf::from(trimmed);
+    if !is_local_path(dir) {
+        return PathBuf::from(dir);
     }
-    let path = fs_probe_path(trimmed);
+    let path = fs_probe_path(dir);
     fold_parent_components(&absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path)))
 }
 
@@ -979,6 +979,19 @@ mod tests {
             cayenne_metastore_dir_conflict(&datasets).as_deref(),
             Some("'plain' ('/data/meta'), 'other' ('/data/meta/../other')")
         );
+    }
+
+    /// The filesystem root is a directory of its own, not the working directory a
+    /// trailing separator trimmed to nothing would place it at.
+    #[test]
+    fn cayenne_keeps_the_filesystem_root_distinct_from_the_working_directory() {
+        let cwd = std::env::current_dir().expect("the working directory is readable");
+        let datasets = vec![
+            cayenne_dataset("at_root", None, Some("/")),
+            cayenne_dataset("at_cwd", None, Some(&cwd.to_string_lossy())),
+        ];
+
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_some());
     }
 
     /// A relative `cayenne_metadata_dir` is placed against the working directory, so
