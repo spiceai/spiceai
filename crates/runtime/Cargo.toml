@@ -118,6 +118,7 @@ opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
+    "logs",
     "metrics",
 ] }
 # OTLP/HTTP JSON bodies only (`POST /v1/metrics`). 0.33.1 fixed JSON decoding that
