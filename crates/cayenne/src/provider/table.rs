@@ -851,7 +851,19 @@ struct SnapshotSweepPins {
 /// Keeps maintenance from deleting the table's files until dropped.
 /// See [`CayenneTableProvider::hold_file_deletions`].
 pub struct FileDeletionHold {
-    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    table: CayenneTableProvider,
+}
+
+impl Drop for FileDeletionHold {
+    /// Releases the hold, then runs the snapshot-directory sweeps, which skip
+    /// their pass while it is held. A table that snapshots after every commit
+    /// would otherwise skip every sweep and keep every directory it supersedes.
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.table.schedule_old_snapshot_cleanup();
+        self.table.sweep_retired_snapshot_dirs();
+    }
 }
 
 /// Keeps the table's persisted secondary index runs as they were written until
@@ -21419,10 +21431,12 @@ impl CayenneTableProvider {
     /// Hold off maintenance deleting the table's files until the returned guard
     /// drops, for a reader that copies them, such as an acceleration snapshot. Take
     /// it before exporting the metastore slice and hold it until the archive is
-    /// written. Waits for an in-flight deletion to finish.
+    /// written. Waits for an in-flight deletion to finish. Dropping it runs the
+    /// snapshot-directory sweeps.
     pub async fn hold_file_deletions(&self) -> FileDeletionHold {
         FileDeletionHold {
-            _guard: Arc::clone(&self.file_deletion_fence).read_owned().await,
+            guard: Some(Arc::clone(&self.file_deletion_fence).read_owned().await),
+            table: self.clone_for_write(),
         }
     }
 
@@ -21452,7 +21466,7 @@ impl CayenneTableProvider {
 
     /// Claim file deletion for a snapshot-directory sweep, held until its
     /// deletion finishes. `None` while file deletions are held: the sweep skips its
-    /// pass and the next commit retries it.
+    /// pass, and releasing the hold runs it again.
     fn claim_file_deletions(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         Arc::clone(&self.file_deletion_fence).try_write_owned().ok()
     }
@@ -42985,6 +42999,73 @@ mod tests {
         drop(hold);
         provider.sweep_retired_snapshot_dirs();
         wait_until_removed(&dir).await;
+    }
+
+    /// An overwrite committed while an acceleration snapshot holds file
+    /// deletions supersedes a snapshot directory that its own sweep cannot
+    /// delete. Releasing the hold must delete it: a `refresh_mode: full`
+    /// writer that snapshots after every refresh otherwise keeps every
+    /// directory it supersedes.
+    #[tokio::test]
+    async fn releasing_a_file_deletion_hold_deletes_the_directory_an_overwrite_superseded() {
+        async fn overwrite(ctx: &SessionContext, table: &CayenneTableProvider, value: i64) {
+            let schema = table.table_schema();
+            let source = MemorySourceConfig::try_new_exec(
+                &[vec![id_value_batch(Arc::clone(&schema), &[1], &[value])]],
+                schema,
+                None,
+            )
+            .expect("overwrite source");
+            let plan = table
+                .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(plan, ctx.task_ctx()).await.expect("overwrite");
+        }
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "deletion_hold_overwrite",
+            ctx.runtime_env(),
+            VortexConfig {
+                inline_max_rows: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        overwrite(&ctx, &provider, 10).await;
+        let superseded = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+
+        let hold = provider.hold_file_deletions().await;
+        overwrite(&ctx, &provider, 11).await;
+        let current = provider.snapshot_dir_path_for(&provider.get_current_snapshot_id());
+        assert_ne!(
+            superseded, current,
+            "the overwrite publishes a new snapshot"
+        );
+        // Let the overwrite's sweep run, and skip, under the hold.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while provider.snapshot_cleanup_scheduled.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the overwrite's sweep finishes");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(superseded.exists(), "the sweep keeps the dir while held");
+        // Lapse every other pin, so that only the hold keeps the dir: the
+        // overwrite's cached scan view, the listing grace and the dir's own grace.
+        provider.evict_stale_scan_view(Instant::now() + Duration::from_hours(1));
+        let past = Instant::now()
+            .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
+            .expect("the clock has run longer than two graces");
+        for at in provider.snapshot_last_listed.lock().values_mut() {
+            *at = past;
+        }
+        tokio::time::sleep(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE).await;
+        assert_eq!(provider.snapshot_cleanup_pins().1, HashSet::new());
+
+        drop(hold);
+        wait_until_removed(&superseded).await;
+        assert!(current.exists(), "the current snapshot stays");
     }
 
     /// A hold taken while the retired-snapshot sweep is deleting waits for the
