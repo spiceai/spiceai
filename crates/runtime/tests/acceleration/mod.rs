@@ -85,6 +85,8 @@ mod reload_file_accelerated;
 mod retention_arrow;
 #[cfg(not(target_os = "windows"))]
 mod retention_cayenne;
+#[cfg(not(target_os = "windows"))]
+mod settings_change_cayenne;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
@@ -106,6 +108,28 @@ pub(crate) async fn trigger_refresh(
         .await
         .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
         .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    Ok(())
+}
+
+/// Queue a refresh of `table` and wait for it to complete, within `timeout`.
+pub(crate) async fn refresh_and_wait(
+    rt: &Arc<runtime::Runtime>,
+    table: &str,
+    timeout: std::time::Duration,
+) -> Result<(), anyhow::Error> {
+    let waiter = rt
+        .datafusion()
+        .refresh_table(&datafusion::common::TableReference::from(table), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("refresh_table failed for {table}: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no refresh notifier for {table}"))?;
+    let outcome = tokio::time::timeout(timeout, waiter.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("the refresh of {table} did not complete in {timeout:?}"))?;
+    anyhow::ensure!(
+        outcome.is_answered(),
+        "the refresh of {table} did not complete: {outcome:?}"
+    );
     Ok(())
 }
 

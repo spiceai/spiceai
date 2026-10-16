@@ -25,6 +25,11 @@ on:
         required: false
         default: 1800
         type: number
+      sql_pipeline:
+        description: 'Parameterized SQL search pipeline: a file path or the SQL text. Leave empty to search through /v1/search.'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-bench:
@@ -43,6 +48,22 @@ jobs:
             exit 1
           fi
           echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
+      - name: Validate SQL pipeline
+        if: github.event.inputs.sql_pipeline != ''
+        env:
+          SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
+        run: |
+          # Same rule as `testoperator run search --sql-pipeline`: a value that ends with `.sql` or
+          # has no whitespace is a file path, and other values are SQL text.
+          if [ -f "$SQL_PIPELINE" ]; then
+            echo "SQL pipeline file found at $SQL_PIPELINE"
+          elif [[ "$SQL_PIPELINE" == *.sql || "$SQL_PIPELINE" != *[[:space:]]* ]]; then
+            echo "Error: SQL pipeline file not found at $SQL_PIPELINE"
+            exit 1
+          else
+            echo "SQL pipeline is inline SQL"
+          fi
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -87,6 +108,7 @@ jobs:
 
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
+          SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
@@ -98,8 +120,15 @@ jobs:
         run: |
           rm -rf .spice/data
           # The spicepod loads its own data and names it in `metadata.benchmark_dataset`.
+          # An empty SQL pipeline sends each query to /v1/search; a set one (file or SQL) sends it to
+          # /v1/sql.
+          sql_pipeline_args=()
+          if [ -n "$SQL_PIPELINE" ]; then
+            sql_pipeline_args=(--sql-pipeline "$SQL_PIPELINE")
+          fi
           testoperator run search \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
+            "${sql_pipeline_args[@]}" \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"

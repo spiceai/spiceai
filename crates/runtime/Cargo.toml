@@ -40,6 +40,7 @@ ballista-core = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-scheduler = { workspace = true }
 base64.workspace = true
+flate2 = "1.1"
 byte-unit.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
@@ -100,6 +101,7 @@ linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
 evaluate-chat = { path = "../evaluate-chat" }
+model-capabilities = { path = "../model-capabilities" }
 runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
 moka.workspace = true
@@ -116,7 +118,15 @@ opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
+    "logs",
     "metrics",
+] }
+# OTLP/HTTP JSON bodies only (`POST /v1/metrics`). 0.33.1 fixed JSON decoding that
+# silently dropped fields; decoded requests are re-encoded and read with the 0.32 types above.
+opentelemetry-proto-json = { package = "opentelemetry-proto", version = "0.33.1", default-features = false, features = [
+    "gen-tonic-messages",
+    "metrics",
+    "with-serde",
 ] }
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
@@ -168,6 +178,7 @@ runtime-proto = { path = "../runtime-proto" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-secrets = { path = "../runtime-secrets", default-features = false }
+runtime-state-location = { path = "../runtime-state-location" }
 runtime-status = { path = "../runtime-status" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
@@ -484,8 +495,7 @@ name = "rate_control"
 path = "tests/rate_control.rs"
 required-features = ["rate-control"]
 
-# Installs the process-wide OpenTelemetry meter provider before any instrument
-# binds to it.
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
 [[test]]
 name = "metrics"
 path = "tests/metrics.rs"

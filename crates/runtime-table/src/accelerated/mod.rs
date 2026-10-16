@@ -357,6 +357,8 @@ pub struct AcceleratedTable {
     /// Inverse of configured retention predicates, applied to
     /// `on_zero_results: use_source` fallback scans.
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
+    /// See [`Builder::node_local`].
+    node_local: bool,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -503,6 +505,9 @@ pub struct Builder {
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
+    node_local: bool,
 }
 
 impl Builder {
@@ -562,6 +567,8 @@ impl Builder {
             user_facing_schema: None,
             cdc_param_overrides: None,
             fallback_retention_keep: None,
+            append_cursor_store: None,
+            node_local: false,
         }
     }
 
@@ -661,6 +668,13 @@ impl Builder {
         self
     }
 
+    /// Marks the table as holding only this node's own data, such as its task history.
+    /// A cluster scheduler reads such a table itself; executors do not have its rows.
+    pub fn node_local(&mut self) -> &mut Self {
+        self.node_local = true;
+        self
+    }
+
     /// Enable dual-write mode: writes go simultaneously to both the federated source
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
     /// Reserved for the Iceberg federated catalog cache path — not driven by the
@@ -750,6 +764,16 @@ impl Builder {
         checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> &mut Self {
         self.checkpointer = checkpointer;
+        self
+    }
+
+    /// Where an append refresh keeps the source snapshot it last loaded, so an Iceberg
+    /// source's append refresh follows its snapshots. Unset, every source reads by time.
+    pub fn append_cursor_store(
+        &mut self,
+        store: refresh_task::append_cursor::AppendCursorStore,
+    ) -> &mut Self {
+        self.append_cursor_store = Some(store);
         self
     }
 
@@ -1141,6 +1165,7 @@ impl Builder {
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
+        refresher.with_append_cursor_store(self.append_cursor_store);
         refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
@@ -1467,6 +1492,7 @@ impl Builder {
             cluster_role: self.cluster_role,
             user_facing_schema: self.user_facing_schema,
             fallback_retention_keep,
+            node_local: self.node_local,
         };
         if let Some(prepared_child) = prepared_child {
             let rows = prepared_child.publish().map_err(|source| {
@@ -1498,6 +1524,12 @@ impl AcceleratedTable {
     #[must_use]
     pub fn change_sink(&self) -> Option<&runtime_acceleration::change_sink::ChangeSink> {
         self.change_sink.as_ref()
+    }
+
+    /// Whether the table holds only this node's own data. See [`Builder::node_local`].
+    #[must_use]
+    pub fn is_node_local(&self) -> bool {
+        self.node_local
     }
 
     /// Fence new cache work, stop producers, and drain accepted work before

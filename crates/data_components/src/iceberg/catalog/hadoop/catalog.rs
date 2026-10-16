@@ -583,7 +583,7 @@ impl HadoopCatalog {
         Ok(false)
     }
 
-    /// The table's current metadata file: the one its `version-hint.text` names, or
+    /// The table's current metadata file, found from its `version-hint.text`, or
     /// else the one with the highest version number in its `metadata/` directory.
     async fn current_metadata_location(&self, table: &TableIdent) -> Result<String> {
         let metadata_directory = format!(

@@ -1,0 +1,37 @@
+[package]
+name = "runtime-state-location"
+description = "Builds the object store behind a location where Spice keeps shared state."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+bytes.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
+parking_lot.workspace = true
+runtime-object-store = { path = "../runtime-object-store" }
+runtime-parameters = { path = "../runtime-parameters" }
+runtime-secrets = { path = "../runtime-secrets", default-features = false }
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tokio = { workspace = true, features = ["fs", "sync"] }
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

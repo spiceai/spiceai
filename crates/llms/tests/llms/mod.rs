@@ -598,6 +598,55 @@ async fn test_usage(
     .expect("test failed");
 }
 
+/// A reasoning model's usage counts its reasoning inside `completion_tokens`, as `OpenAI`
+/// does, so `total_tokens` is `prompt_tokens + completion_tokens`. xAI reports reasoning
+/// outside `completion_tokens`; the provider has to count it in.
+#[rstest]
+#[tokio::test]
+async fn test_reasoning_usage(
+    #[values("xai")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 1234 * 5678? Answer with the number only."
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    let Some(resp) = run_test(model_name, "reasoning_usage", req, as_stream, vec![])
+        .await
+        .expect("test failed")
+    else {
+        return;
+    };
+    let usage = resp
+        .usage
+        .unwrap_or_else(|| panic!("{model_name} (stream: {as_stream}) returned no usage"));
+    let reasoning = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+        .unwrap_or_default();
+    assert!(
+        reasoning > 0,
+        "{model_name} (stream: {as_stream}) reported no reasoning, so the check below proves nothing: {usage:?}"
+    );
+    assert!(
+        reasoning <= usage.completion_tokens,
+        "{model_name} (stream: {as_stream}) reported more reasoning tokens than completion tokens: {usage:?}"
+    );
+    assert_eq!(
+        usage.total_tokens,
+        usage.prompt_tokens + usage.completion_tokens,
+        "{model_name} (stream: {as_stream}) total is not prompt + completion: {usage:?}"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_system_prompt(

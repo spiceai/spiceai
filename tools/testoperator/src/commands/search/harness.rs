@@ -31,7 +31,7 @@ use test_framework::{
     },
     futures::TryStreamExt,
     spiced::SpicedInstance,
-    spicetest::search::{SearchConfig, SearchRequest, SearchResult},
+    spicetest::search::{SearchConfig, SearchRequest, SearchResponse, SearchResult, SqlSearchHit},
 };
 
 /// Reads a whole column as UTF-8 strings, accepting `Utf8`, `LargeUtf8`, or any type Arrow can cast
@@ -155,25 +155,28 @@ fn extract_query_relevance_from_batches(
     Ok(query_relevance)
 }
 
-/// Converts raw search results into `query id → (corpus id → score)` for evaluation. The corpus row
-/// id comes from the dataset's declared `row_id`, whose column name differs per dataset (`_id` for
-/// MTEB, `chunk_id` for `ConTEB`), so this takes the single primary-key field of each result rather
-/// than a fixed name. A corpus whose `row_id` names more than one column cannot be matched against
-/// the single `corpus-id` qrel column, so such a result is skipped.
+/// Converts raw search results into `query id → (corpus id → score)` for evaluation. A SQL pipeline
+/// row reads the corpus id from its `_id` column. For a `/v1/search` result, the corpus row id comes
+/// from the dataset's declared `row_id`, whose column name differs per dataset (`_id` for MTEB,
+/// `chunk_id` for `ConTEB`), so this takes the single primary-key field of each result rather than
+/// a fixed name. A corpus whose `row_id` names more than one column cannot be matched against the
+/// single `corpus-id` qrel column, so such a result is skipped.
 pub(crate) fn transform_search_results_for_eval(
     search: &BTreeMap<String, SearchResult>,
 ) -> HashMap<String, HashMap<String, f64>> {
     search
         .iter()
         .map(|(query_id, search_result)| {
-            let corpus_scores: HashMap<String, f64> = search_result
-                .response
-                .results
-                .iter()
-                .filter_map(|result| {
-                    sole_primary_key_value(&result.primary_key).map(|id| (id, result.score))
-                })
-                .collect();
+            let corpus_scores = match &search_result.response {
+                SearchResponse::SearchApi(response) => response
+                    .results
+                    .iter()
+                    .filter_map(|result| {
+                        sole_primary_key_value(&result.primary_key).map(|id| (id, result.score))
+                    })
+                    .collect(),
+                SearchResponse::Sql(response) => rank_scores(&response.hits),
+            };
             (query_id.clone(), corpus_scores)
         })
         .collect()
@@ -188,6 +191,23 @@ fn sole_primary_key_value(primary_key: &HashMap<String, serde_json::Value>) -> O
         (Some(value), None) => primary_key_value_to_string(value),
         _ => None,
     }
+}
+
+/// Scores SQL pipeline rows by their rank, so that evaluation uses the pipeline's own row order. The
+/// evaluator sorts by score, and a pipeline's `_score` can be absent or in a different order than
+/// its rows (for example, after a rerank). When a pipeline returns the same `_id` more than once,
+/// the best rank is kept.
+fn rank_scores(hits: &[SqlSearchHit]) -> HashMap<String, f64> {
+    let mut scores = HashMap::with_capacity(hits.len());
+    for (rank, hit) in hits.iter().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a result count is far below 2^52, so the conversion is exact"
+        )]
+        let score = (hits.len() - rank) as f64;
+        scores.entry(hit.id.to_string()).or_insert(score);
+    }
+    scores
 }
 
 fn primary_key_value_to_string(value: &serde_json::Value) -> Option<String> {
@@ -212,10 +232,35 @@ async fn execute_sql(
 
 #[cfg(test)]
 mod tests {
-    use super::{primary_key_value_to_string, read_text_column, sole_primary_key_value};
+    use super::{
+        primary_key_value_to_string, rank_scores, read_text_column, sole_primary_key_value,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
     use test_framework::arrow::array::{Int64Array, LargeStringArray, RecordBatch, StringArray};
+    use test_framework::spicetest::search::SqlSearchHit;
+
+    fn sql_hits(json: &str) -> Vec<SqlSearchHit> {
+        serde_json::from_str(json).expect("failed to parse SQL rows")
+    }
+
+    #[test]
+    fn rank_scores_follow_row_order_not_score() {
+        // `_score` ascends, but the row order is the rank: "b" is first and must score highest.
+        let scores = rank_scores(&sql_hits(
+            r#"[{"_id":"b","_score":0.1},{"_id":"a","_score":0.9},{"_id":3}]"#,
+        ));
+        assert_eq!(scores.len(), 3);
+        assert!(scores["b"] > scores["a"]);
+        assert!(scores["a"] > scores["3"]);
+    }
+
+    #[test]
+    fn rank_scores_keep_best_rank_of_duplicate_id() {
+        let scores = rank_scores(&sql_hits(r#"[{"_id":"a"},{"_id":"b"},{"_id":"a"}]"#));
+        assert_eq!(scores.len(), 2);
+        assert!(scores["a"] > scores["b"]);
+    }
 
     #[test]
     fn read_text_column_accepts_utf8_largeutf8_and_int() {

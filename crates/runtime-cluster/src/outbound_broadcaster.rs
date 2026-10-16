@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use runtime_proto::{
-    BytesArray, ExecutorControlMessage, ExecutorStatistics, PartitionsLoaded,
+    BytesArray, ExecutorControlMessage, ExecutorStatistics, FlightEndpoint, PartitionsLoaded,
     executor_control_message::Message as ExecutorMessage,
 };
 use tokio::sync::{RwLock, mpsc};
@@ -63,6 +63,10 @@ struct ExecutorOutboundBroadcasterInner {
     /// readiness ack would be broadcast to zero schedulers and lost, leaving
     /// the dataset (and the cluster) stuck in `Refreshing` forever.
     latest_partitions_loaded: RwLock<HashMap<String, Vec<Vec<u8>>>>,
+    /// The executor's Flight endpoint URL once it serves queries, replayed to
+    /// schedulers on (re)connect. A scheduler drops an executor's endpoint when
+    /// its control stream ends, so every new stream must carry it again.
+    flight_endpoint: RwLock<Option<String>>,
 }
 
 impl ExecutorOutboundBroadcaster {
@@ -73,6 +77,7 @@ impl ExecutorOutboundBroadcaster {
                 streams: RwLock::new(HashMap::new()),
                 executor_id: RwLock::new(executor_id),
                 latest_partitions_loaded: RwLock::new(HashMap::new()),
+                flight_endpoint: RwLock::new(None),
             }),
         }
     }
@@ -189,6 +194,70 @@ impl ExecutorOutboundBroadcaster {
         self.inner.streams.write().await.remove(scheduler_address);
     }
 
+    /// Sends the executor's Flight endpoint to every connected scheduler and
+    /// caches it for schedulers that connect later — see
+    /// [`Self::replay_flight_endpoint`]. Returns the number of schedulers it is
+    /// sent to.
+    ///
+    /// The cache is written before the streams are snapshotted, with the same
+    /// ordering argument as [`Self::replay_partitions_loaded`]. Each send waits
+    /// for room in its stream rather than timing out, in its own task so a
+    /// stalled scheduler cannot hold up the others: a scheduler without the
+    /// endpoint cannot send scans to this executor. A send fails only when its
+    /// stream ends, and the next stream to that scheduler replays the endpoint.
+    pub async fn announce_flight_endpoint(&self, executor_url: String) -> usize {
+        *self.inner.flight_endpoint.write().await = Some(executor_url.clone());
+
+        let executor_id = self.inner.executor_id.read().await.clone();
+        let payload = flight_endpoint_message(executor_id, executor_url);
+        let targets: Vec<(String, mpsc::Sender<ExecutorControlMessage>)> = {
+            let streams = self.inner.streams.read().await;
+            streams
+                .iter()
+                .map(|(addr, tx)| (addr.clone(), tx.clone()))
+                .collect()
+        };
+
+        let sent = targets.len();
+        for (scheduler_address, tx) in targets {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                if let Err(err) = tx.send(payload).await {
+                    tracing::debug!(
+                        "FlightEndpoint send to {scheduler_address} failed (channel closed): {err}"
+                    );
+                }
+            });
+        }
+        sent
+    }
+
+    /// Sends the cached Flight endpoint, if any, to a single scheduler over
+    /// `tx`, that scheduler's just-established control stream sender. Returns
+    /// whether it was sent. Waits for room in the stream, like
+    /// [`Self::announce_flight_endpoint`], and fails only when the stream ends.
+    ///
+    /// Must only be called once the stream is established, like
+    /// [`Self::replay_partitions_loaded`].
+    pub async fn replay_flight_endpoint(
+        &self,
+        scheduler_address: &str,
+        tx: &mpsc::Sender<ExecutorControlMessage>,
+    ) -> bool {
+        let Some(executor_url) = self.inner.flight_endpoint.read().await.clone() else {
+            return false;
+        };
+        let executor_id = self.inner.executor_id.read().await.clone();
+        let payload = flight_endpoint_message(executor_id, executor_url);
+        if let Err(err) = tx.send(payload).await {
+            tracing::debug!(
+                "FlightEndpoint replay to {scheduler_address} aborted (channel closed): {err}"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Broadcasts a `PartitionsLoaded` message to every connected scheduler.
     /// Returns the number of schedulers the message was queued for.
     ///
@@ -267,6 +336,7 @@ impl ExecutorOutboundBroadcaster {
                 statistics,
                 column_names,
             })),
+            process_id: String::new(),
         };
 
         let targets: Vec<(String, mpsc::Sender<ExecutorControlMessage>)> = {
@@ -298,6 +368,16 @@ impl ExecutorOutboundBroadcaster {
     }
 }
 
+fn flight_endpoint_message(executor_id: String, executor_url: String) -> ExecutorControlMessage {
+    ExecutorControlMessage {
+        executor_id,
+        message: Some(ExecutorMessage::FlightEndpoint(FlightEndpoint {
+            executor_url,
+        })),
+        process_id: String::new(),
+    }
+}
+
 fn partitions_loaded_message(
     executor_id: String,
     table_name: String,
@@ -311,6 +391,7 @@ fn partitions_loaded_message(
                 items: partition_expr_bytes,
             }),
         })),
+        process_id: String::new(),
     }
 }
 
@@ -466,5 +547,115 @@ mod tests {
                 .await,
             0
         );
+    }
+
+    fn expect_flight_endpoint(msg: ExecutorControlMessage) -> FlightEndpoint {
+        match msg.message {
+            Some(ExecutorMessage::FlightEndpoint(endpoint)) => endpoint,
+            other => panic!("expected FlightEndpoint, got {other:?}"),
+        }
+    }
+
+    /// The endpoint reaches the schedulers connected when it is announced, and
+    /// each scheduler that connects later through the replay.
+    #[tokio::test]
+    async fn flight_endpoint_reaches_connected_and_later_schedulers() {
+        let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
+        let (tx1, mut rx1) = mpsc::channel(8);
+        broadcaster
+            .register("scheduler-1".to_string(), tx1.clone())
+            .await;
+        assert!(
+            !broadcaster
+                .replay_flight_endpoint("scheduler-1", &tx1)
+                .await,
+            "nothing to replay before the endpoint is announced"
+        );
+
+        assert_eq!(
+            broadcaster
+                .announce_flight_endpoint("https://127.0.0.1:50051".to_string())
+                .await,
+            1
+        );
+        let msg = rx1.recv().await.expect("announced endpoint");
+        assert_eq!(msg.executor_id, "exec-1");
+        assert_eq!(
+            expect_flight_endpoint(msg).executor_url,
+            "https://127.0.0.1:50051"
+        );
+
+        let (tx2, mut rx2) = mpsc::channel(8);
+        broadcaster
+            .register("scheduler-2".to_string(), tx2.clone())
+            .await;
+        assert!(
+            broadcaster
+                .replay_flight_endpoint("scheduler-2", &tx2)
+                .await
+        );
+        assert_eq!(
+            expect_flight_endpoint(rx2.recv().await.expect("replayed endpoint")).executor_url,
+            "https://127.0.0.1:50051"
+        );
+    }
+
+    /// A stream that stays full for longer than [`SEND_TIMEOUT`] still receives
+    /// the endpoint, from the announcement and from the replay, once the
+    /// scheduler drains it.
+    #[tokio::test(start_paused = true)]
+    async fn flight_endpoint_waits_for_a_full_stream() {
+        let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
+        let filler = || flight_endpoint_message("exec-1".to_string(), "filler".to_string());
+
+        let (tx1, mut rx1) = mpsc::channel(1);
+        tx1.send(filler()).await.expect("fill the stream");
+        broadcaster
+            .register("scheduler-1".to_string(), tx1.clone())
+            .await;
+        assert_eq!(
+            broadcaster
+                .announce_flight_endpoint("https://127.0.0.1:50051".to_string())
+                .await,
+            1
+        );
+        tokio::time::sleep(SEND_TIMEOUT * 2).await;
+        assert_eq!(
+            expect_flight_endpoint(rx1.recv().await.expect("filler")).executor_url,
+            "filler"
+        );
+        let endpoint = tokio::time::timeout(SEND_TIMEOUT, rx1.recv())
+            .await
+            .expect("the endpoint follows the filler")
+            .expect("announced endpoint");
+        assert_eq!(
+            expect_flight_endpoint(endpoint).executor_url,
+            "https://127.0.0.1:50051"
+        );
+
+        let (tx2, mut rx2) = mpsc::channel(1);
+        tx2.send(filler()).await.expect("fill the stream");
+        let replay = {
+            let broadcaster = broadcaster.clone();
+            tokio::spawn(async move {
+                broadcaster
+                    .replay_flight_endpoint("scheduler-2", &tx2)
+                    .await
+            })
+        };
+        tokio::time::sleep(SEND_TIMEOUT * 2).await;
+        assert_eq!(
+            expect_flight_endpoint(rx2.recv().await.expect("filler")).executor_url,
+            "filler"
+        );
+        let endpoint = tokio::time::timeout(SEND_TIMEOUT, rx2.recv())
+            .await
+            .expect("the endpoint follows the filler")
+            .expect("replayed endpoint");
+        assert_eq!(
+            expect_flight_endpoint(endpoint).executor_url,
+            "https://127.0.0.1:50051"
+        );
+        assert!(replay.await.expect("replay task"));
     }
 }

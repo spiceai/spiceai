@@ -46,12 +46,12 @@ use std::sync::Arc;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage, CompletionUsage,
     CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, ReasoningEffort,
     ResponseFormat, ResponseFormatJsonSchema,
 };
 use async_trait::async_trait;
-use chat_api::Chat;
+use chat_api::{ApiErrorKind, Chat};
 use evaluate_api::{
     Answer, Error, Evaluate, EvaluateRequest, EvaluateResponse, Question, Result, Usage,
     check_answers,
@@ -311,11 +311,7 @@ impl Evaluate for ChatEvaluator {
                 .await
                 .map_err(|e| chat_error(&self.name, e))?;
             usage = match (usage, response.usage.as_ref()) {
-                (Some(total), Some(reported)) => Some(Usage {
-                    input_tokens: total.input_tokens + u64::from(reported.prompt_tokens),
-                    output_tokens: total.output_tokens + u64::from(reported.completion_tokens),
-                    ..Usage::default()
-                }),
+                (Some(total), Some(reported)) => Some(add_usage(&total, reported)),
                 _ => None,
             };
             let reply = self.reply_text(response)?;
@@ -364,11 +360,6 @@ impl Evaluate for ChatEvaluator {
                 source: Box::new(e),
             })
     }
-
-    /// A chat model answers through a prompt; it is not a decision model.
-    fn is_decision_model(&self) -> bool {
-        false
-    }
 }
 
 /// Maps a chat model's failure onto the evaluation error with the same meaning: a
@@ -376,38 +367,30 @@ impl Evaluate for ChatEvaluator {
 /// reached is unavailable (as a System One provider's transport failure is). Anything
 /// else is a failed call.
 ///
-/// Discriminators live in `code` (OpenAI-shaped) or `type` (Anthropic type-only
-/// `ApiError`s such as `authentication_error` / `permission_error` /
-/// `rate_limit_error`). Both are matched so `/v1/decisions` can return 401/403/429
-/// instead of 500.
+/// The kind is read by [`ApiErrorKind::of`], the same reading `/v1/chat/completions`
+/// takes of the same failure.
 fn chat_error(model: &str, error: OpenAIError) -> Error {
     let model = model.to_string();
     match error {
         OpenAIError::InvalidArgument(message) => Error::InvalidRequest { model, message },
-        OpenAIError::ApiError(api) => match (api.code.as_deref(), api.r#type.as_deref()) {
-            (Some("invalid_request_error"), _) | (_, Some("invalid_request_error")) => {
-                Error::InvalidRequest {
-                    model,
-                    message: api.message,
-                }
-            }
-            (Some("invalid_api_key"), _) | (_, Some("authentication_error")) => {
-                Error::AuthenticationFailed {
-                    model,
-                    message: api.message,
-                }
-            }
-            (_, Some("permission_error")) => Error::PermissionDenied {
+        OpenAIError::ApiError(api) => match ApiErrorKind::of(&api) {
+            Some(ApiErrorKind::InvalidRequest) => Error::InvalidRequest {
                 model,
                 message: api.message,
             },
-            (Some("rate_limit_exceeded"), _) | (_, Some("rate_limit_error")) => {
-                Error::RateLimited {
-                    model,
-                    message: api.message,
-                }
-            }
-            _ => Error::ModelCallFailed {
+            Some(ApiErrorKind::Authentication) => Error::AuthenticationFailed {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::PermissionDenied) => Error::PermissionDenied {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::RateLimited) => Error::RateLimited {
+                model,
+                message: api.message,
+            },
+            Some(ApiErrorKind::InsufficientQuota) | None => Error::ModelCallFailed {
                 model,
                 source: Box::new(OpenAIError::ApiError(api)),
             },
@@ -420,6 +403,37 @@ fn chat_error(model: &str, error: OpenAIError) -> Error {
             model,
             source: Box::new(other),
         },
+    }
+}
+
+/// `total` plus what one chat completion `reported`, including the cached and reasoning
+/// tokens `/v1/chat/completions` reports for the same call.
+///
+/// A breakdown sums the attempts that reported it: a decision reports a missing one as
+/// 0, so leaving one out would make it lower still.
+fn add_usage(total: &Usage, reported: &CompletionUsage) -> Usage {
+    let add = |total: Option<u64>, reported: Option<u32>| match (total, reported) {
+        (Some(total), Some(reported)) => Some(total + u64::from(reported)),
+        (total, reported) => total.or(reported.map(u64::from)),
+    };
+    Usage {
+        input_tokens: total.input_tokens + u64::from(reported.prompt_tokens),
+        output_tokens: total.output_tokens + u64::from(reported.completion_tokens),
+        cached_tokens: add(
+            total.cached_tokens,
+            reported
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+        ),
+        reasoning_tokens: add(
+            total.reasoning_tokens,
+            reported
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+        ),
+        ..Usage::default()
     }
 }
 
@@ -784,6 +798,51 @@ mod tests {
         assert_eq!(response.usage, None);
     }
 
+    /// `response` reporting `cached` of its prompt tokens as cached and `reasoning` of its
+    /// completion tokens as reasoning.
+    fn with_token_details(
+        response: CreateChatCompletionResponse,
+        cached: u32,
+        reasoning: u32,
+    ) -> CreateChatCompletionResponse {
+        let mut response = serde_json::to_value(response).expect("chat completion as JSON");
+        response["usage"]["prompt_tokens_details"] = json!({"cached_tokens": cached});
+        response["usage"]["completion_tokens_details"] = json!({"reasoning_tokens": reasoning});
+        serde_json::from_value(response).expect("chat completion")
+    }
+
+    #[tokio::test]
+    async fn usage_totals_the_cached_and_reasoning_tokens_of_every_attempt() {
+        let malformed = json!({"answers": {"is_urgent": 2}});
+        let chat = ScriptedChat::new([
+            Ok(with_token_details(reply(&malformed), 30, 7)),
+            Ok(reply(&malformed)),
+            Ok(with_token_details(reply(&valid_answers()), 40, 5)),
+        ]);
+        let evaluator = evaluator(&chat).with_options(ChatEvaluatorOptions {
+            max_corrective_retries: 2,
+            ..Default::default()
+        });
+
+        let response = evaluator
+            .evaluate(request())
+            .await
+            .expect("corrected evaluation");
+
+        assert_eq!(chat.requests().len(), 3);
+        assert_eq!(
+            response.usage,
+            Some(Usage {
+                input_tokens: 300,
+                output_tokens: 60,
+                cached_tokens: Some(70),
+                reasoning_tokens: Some(12),
+                ..Usage::default()
+            }),
+            "an attempt that reports no breakdown adds nothing to it"
+        );
+    }
+
     #[tokio::test]
     async fn native_mode_sends_the_schema_as_the_response_format() {
         let chat = ScriptedChat::new([Ok(reply(&valid_answers()))]);
@@ -883,7 +942,24 @@ mod tests {
                 code: None,
             }))
         };
+        // `OpenAI` puts `invalid_request_error` in `type` and the specific reason in `code`.
+        let openai = |kind: &str, code: &str| {
+            Err(OpenAIError::ApiError(ApiError {
+                message: format!("upstream {code}"),
+                r#type: Some(kind.to_string()),
+                param: None,
+                code: Some(code.to_string()),
+            }))
+        };
         for (failure, expected) in [
+            (
+                openai("invalid_request_error", "invalid_api_key"),
+                "AuthenticationFailed",
+            ),
+            (
+                openai("invalid_request_error", "missing_required_parameter"),
+                "InvalidRequest",
+            ),
             (api_error("rate_limit_exceeded"), "RateLimited"),
             (api_error("invalid_api_key"), "AuthenticationFailed"),
             (api_error("invalid_request_error"), "InvalidRequest"),

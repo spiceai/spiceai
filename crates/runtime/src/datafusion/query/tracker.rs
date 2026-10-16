@@ -22,6 +22,8 @@ use opentelemetry::KeyValue;
 use tokio::time::Instant;
 
 use runtime_request_context::RequestContext;
+use spicepod::component::runtime::QueryErrorLogging;
+use tracing::Level;
 
 use super::error_code::ErrorCode;
 use super::single_line;
@@ -33,6 +35,8 @@ pub(crate) struct QueryTracker {
     /// Metrics are recorded either way; when `false` the tracker skips only the
     /// work that table consumes: the events and the captured-output preview.
     pub(crate) task_history_enabled: bool,
+    /// Which failures are logged above `debug`; `runtime.query.log_errors`.
+    pub(crate) log_errors: QueryErrorLogging,
     /// Whether this query's output preview is recorded anywhere. When it is not, the
     /// tracker does not build one.
     pub(crate) captured_output_enabled: bool,
@@ -170,11 +174,13 @@ impl QueryTracker {
         // exactly once, on every protocol, while the query's trace span is still
         // entered — which is what puts the id on the record.
         //
-        // A refusal for want of memory is logged at `warn` and everything else at
-        // `debug`. A malformed query is the caller's problem and would only be
-        // noise, but a runtime refusing queries for want of memory is an outage
-        // its operator cannot see any other way: `/health` is served by a
-        // separate tokio runtime and stays green throughout.
+        // A refusal for want of memory is always logged at `warn`: a runtime
+        // refusing queries for want of memory is an outage its operator cannot
+        // see any other way, since `/health` is served by a separate tokio
+        // runtime and stays green throughout. Other failures are logged at the
+        // level `runtime.query.log_errors` gives them — `debug` by default,
+        // because failed queries can be frequent and a malformed one is the
+        // caller's to fix.
         //
         // `single_line` is passed as a macro argument, not bound first, so a
         // multi-KB memory-pool breakdown is only re-collected when the level it
@@ -187,10 +193,12 @@ impl QueryTracker {
                         single_line(error_message)
                     );
                 }
-                Some(code) => {
-                    tracing::debug!("Query failed ({code}): {}", single_line(error_message));
-                }
-                None => tracing::debug!("Query failed: {}", single_line(error_message)),
+                code => log_query_failure(
+                    query_failure_level(self.log_errors, code.as_ref()),
+                    code.as_ref(),
+                    error_message,
+                    &datasets_label,
+                ),
             }
         }
 
@@ -221,6 +229,51 @@ impl QueryTracker {
     pub(crate) fn datasets(mut self, datasets: Arc<HashSet<TableReference>>) -> Self {
         self.datasets = datasets;
         self
+    }
+}
+
+/// The level a failed query is logged at, given `runtime.query.log_errors`.
+///
+/// A query rejected before it ran — a syntax or planning error — is the
+/// client's to fix, so even `all` logs it at `info`. A query that failed while
+/// running may need the operator, so it is a warning. `ResourcesExhausted` is
+/// logged on its own, at `warn`, whatever the setting.
+fn query_failure_level(log_errors: QueryErrorLogging, code: Option<&ErrorCode>) -> Level {
+    let rejected_before_running = matches!(
+        code,
+        Some(ErrorCode::SyntaxError | ErrorCode::QueryPlanningError)
+    );
+    match (log_errors, rejected_before_running) {
+        (QueryErrorLogging::All, true) => Level::INFO,
+        (QueryErrorLogging::Execution | QueryErrorLogging::All, false) => Level::WARN,
+        (QueryErrorLogging::None, _) | (QueryErrorLogging::Execution, true) => Level::DEBUG,
+    }
+}
+
+/// Logs a failed query at `level`, with its error code and the datasets it read
+/// as fields, so a log backend can filter and alert on them. The SQL text is
+/// left out — it can carry data — and is in `runtime.task_history` under the
+/// trace id the record carries.
+fn log_query_failure(level: Level, code: Option<&ErrorCode>, message: &str, datasets: &str) {
+    let error_code = code.map_or_else(|| "Unknown".to_string(), ToString::to_string);
+    macro_rules! failed {
+        ($log:ident) => {
+            if datasets.is_empty() {
+                tracing::$log!(error_code = %error_code, "Query failed: {}", single_line(message));
+            } else {
+                tracing::$log!(
+                    error_code = %error_code,
+                    datasets = datasets,
+                    "Query failed: {}",
+                    single_line(message)
+                );
+            }
+        };
+    }
+    match level {
+        Level::WARN => failed!(warn),
+        Level::INFO => failed!(info),
+        _ => failed!(debug),
     }
 }
 
@@ -261,23 +314,44 @@ mod tests {
     use super::*;
     use runtime_request_context::{Protocol, RequestContextBuilder};
     use std::sync::Mutex;
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// Everything a probe subscriber wrote while a tracker finished with
     /// `error`, with the task-history table off — the configuration whose
     /// failures reach no table at all.
     fn tracker_finished_with(error: Option<(&str, ErrorCode)>) -> String {
+        tracker_finished_under(QueryErrorLogging::None, error, &[])
+    }
+
+    /// [`tracker_finished_with`] under `log_errors`, for a query that read
+    /// `datasets`, with each line's timestamp left out so a test can compare
+    /// whole lines.
+    fn tracker_finished_under(
+        log_errors: QueryErrorLogging,
+        error: Option<(&str, ErrorCode)>,
+        datasets: &[&str],
+    ) -> String {
         let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer = Arc::clone(&buffer);
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(move || WriteTo(Arc::clone(&writer))),
+                .without_time()
+                .with_writer(move || WriteTo(Arc::clone(&writer)))
+                // The tracker's own records only: the first query in a process
+                // also creates the meters it records to, and `opentelemetry`
+                // logs each creation at `debug`.
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target("runtime::datafusion::query::tracker", Level::TRACE),
+                ),
         );
 
         let request_context = RequestContextBuilder::new(Protocol::Internal).build();
         let tracker = QueryTracker {
             task_history_enabled: false,
+            log_errors,
             captured_output_enabled: false,
             schema: None,
             query_duration_secs: None,
@@ -289,7 +363,12 @@ mod tests {
             error_code: None,
             query_duration_timer: Instant::now(),
             query_execution_duration_timer: Instant::now(),
-            datasets: Arc::new(HashSet::new()),
+            datasets: Arc::new(
+                datasets
+                    .iter()
+                    .map(|name| TableReference::bare(*name))
+                    .collect(),
+            ),
         };
 
         tracing::subscriber::with_default(subscriber, || match error {
@@ -366,6 +445,118 @@ mod tests {
         assert!(
             !logged.contains("Query refused, out of memory"),
             "an ordinary query failure is not a capacity condition, got: {logged}"
+        );
+    }
+
+    /// `runtime.query.log_errors` raises a failure out of `debug` by what it
+    /// was: one that happened while the query ran is a warning under
+    /// `execution` and `all`; a rejection before it ran is an `info` under `all`
+    /// only. The record names the code and the datasets as fields, and never
+    /// the SQL.
+    #[test]
+    fn log_errors_sets_the_level_of_each_failure() {
+        const EXECUTION: &str = "External error: Failed to read file 'missing.csv'";
+        const PLANNING: &str = "Error during planning: table 'nope' not found";
+        let cases = [
+            (
+                QueryErrorLogging::None,
+                EXECUTION,
+                ErrorCode::QueryExecutionError,
+                "DEBUG",
+            ),
+            (
+                QueryErrorLogging::None,
+                PLANNING,
+                ErrorCode::QueryPlanningError,
+                "DEBUG",
+            ),
+            (
+                QueryErrorLogging::Execution,
+                EXECUTION,
+                ErrorCode::QueryExecutionError,
+                " WARN",
+            ),
+            (
+                QueryErrorLogging::Execution,
+                EXECUTION,
+                ErrorCode::InternalError,
+                " WARN",
+            ),
+            (
+                QueryErrorLogging::Execution,
+                PLANNING,
+                ErrorCode::QueryPlanningError,
+                "DEBUG",
+            ),
+            (
+                QueryErrorLogging::Execution,
+                PLANNING,
+                ErrorCode::SyntaxError,
+                "DEBUG",
+            ),
+            (
+                QueryErrorLogging::All,
+                EXECUTION,
+                ErrorCode::QueryExecutionError,
+                " WARN",
+            ),
+            (
+                QueryErrorLogging::All,
+                PLANNING,
+                ErrorCode::QueryPlanningError,
+                " INFO",
+            ),
+            (
+                QueryErrorLogging::All,
+                PLANNING,
+                ErrorCode::SyntaxError,
+                " INFO",
+            ),
+        ];
+        for (log_errors, message, code, level) in cases {
+            let expected = format!(
+                "{level} runtime::datafusion::query::tracker: Query failed: {message} error_code={code} datasets=\"trips\"\n"
+            );
+            let case = format!("log_errors={log_errors:?} code={code}");
+            let logged = tracker_finished_under(log_errors, Some((message, code)), &["trips"]);
+            assert_eq!(logged, expected, "{case}");
+        }
+    }
+
+    /// A query refused for memory is a warning whatever `log_errors` says.
+    #[test]
+    fn a_memory_refusal_is_a_warning_under_every_setting() {
+        for log_errors in [
+            QueryErrorLogging::None,
+            QueryErrorLogging::Execution,
+            QueryErrorLogging::All,
+        ] {
+            let logged = tracker_finished_under(
+                log_errors,
+                Some(("Failed to allocate 256.0 MB", ErrorCode::ResourcesExhausted)),
+                &[],
+            );
+            assert_eq!(
+                logged,
+                " WARN runtime::datafusion::query::tracker: Query refused, out of memory (ResourcesExhausted): Failed to allocate 256.0 MB\n",
+                "log_errors={log_errors:?}"
+            );
+        }
+    }
+
+    /// A query that read no dataset logs no empty `datasets` field.
+    #[test]
+    fn a_failure_with_no_datasets_has_no_datasets_field() {
+        assert_eq!(
+            tracker_finished_under(
+                QueryErrorLogging::All,
+                Some((
+                    "SQL error: ParserError(\"Expected: an expression\")",
+                    ErrorCode::SyntaxError
+                )),
+                &[],
+            ),
+            " INFO runtime::datafusion::query::tracker: Query failed: SQL error: ParserError(\"Expected: an expression\") error_code=SyntaxError\n"
         );
     }
 

@@ -1096,6 +1096,38 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
     Ok(())
 }
 
+/// The value of the series of counter `name` whose `label` is `value`, or 0 when it
+/// is not exported.
+fn counter_with_label(
+    registry: &prometheus::Registry,
+    name: &str,
+    label: &str,
+    value: &str,
+) -> f64 {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|pair| pair.name() == label && pair.value() == value)
+        })
+        .map(|metric| metric.get_counter().value())
+        .sum()
+}
+
+/// Asserts a counter moved by exactly `expected`. Counter values are whole numbers
+/// held in an `f64`, so the comparison is exact up to rounding.
+fn assert_counter_delta(recorded: f64, expected: f64, what: &str) {
+    assert!(
+        (recorded - expected).abs() < f64::EPSILON,
+        "{what}: recorded {recorded}, expected {expected}"
+    );
+}
+
 /// The sum of every series of a counter family.
 fn counter_total(registry: &prometheus::Registry, name: &str) -> f64 {
     registry
@@ -1110,12 +1142,24 @@ fn counter_total(registry: &prometheus::Registry, name: &str) -> f64 {
 /// A runtime serving the `scores` fixture, with the SQL results cache on and task
 /// history off, loaded and ready.
 async fn runtime_with_results_cache(dir: &std::path::Path, app_name: &str) -> Arc<Runtime> {
+    runtime_with_results_cache_ttls(dir, app_name, "10m", None).await
+}
+
+/// [`runtime_with_results_cache`] with an explicit `item_ttl` and
+/// `stale_while_revalidate_ttl`.
+async fn runtime_with_results_cache_ttls(
+    dir: &std::path::Path,
+    app_name: &str,
+    item_ttl: &str,
+    stale_while_revalidate_ttl: Option<&str>,
+) -> Arc<Runtime> {
     let app = AppBuilder::new(app_name)
         .with_dataset(csv_backed_dataset(dir, "scores"))
         .with_runtime(SpicepodRuntime {
             caching: Caching {
                 sql_results: Some(SQLResultsCacheConfig {
-                    item_ttl: Some("10m".to_string()),
+                    item_ttl: Some(item_ttl.to_string()),
+                    stale_while_revalidate_ttl: stale_while_revalidate_ttl.map(str::to_string),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1210,6 +1254,199 @@ async fn a_query_counts_one_results_cache_lookup() {
     for (status, recorded) in miss_then_hit {
         assert_lookups(registry, &rt, &plan_keyed, sql, status, recorded).await;
     }
+}
+
+/// A request whose `max-stale` is narrower than the entry's age gets a miss, and the
+/// lookup is counted as one: a hit there would claim a result the request never got.
+///
+/// The entry is older than `item_ttl` (1s) plus the request's `max-stale` (1s) but
+/// well inside the server's stale window (60s), so only the request's own bound turns
+/// it away. The sleep is the entry's age, which is what is under test.
+#[tokio::test]
+async fn a_request_max_stale_narrower_than_the_entry_age_counts_one_miss() {
+    use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+
+    let registry = &*PROMETHEUS;
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let rt = runtime_with_results_cache_ttls(
+        dir.path(),
+        "metrics_results_cache_request_max_stale",
+        "1s",
+        Some("60s"),
+    )
+    .await;
+    let sql = "SELECT id, score FROM scores WHERE id >= 0";
+    let populate = Arc::new(
+        RequestContext::builder(Protocol::Http)
+            .with_cache_control(CacheControl::Cache(CacheKeyType::Raw))
+            .build(),
+    );
+    assert_lookups(
+        registry,
+        &rt,
+        &populate,
+        sql,
+        CacheStatus::CacheMiss,
+        [1.0, 0.0, 1.0],
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let narrow = Arc::new(
+        RequestContext::builder(Protocol::Http)
+            .with_cache_control(CacheControl::MaxStale(
+                CacheKeyType::Raw,
+                Some(Duration::from_secs(1)),
+            ))
+            .build(),
+    );
+    assert_lookups(
+        registry,
+        &rt,
+        &narrow,
+        sql,
+        CacheStatus::CacheMiss,
+        [1.0, 0.0, 1.0],
+    )
+    .await;
+}
+
+/// SQL results record only hard invalidations and table-clock rejections.
+/// The Caching API makes the write/refresh sequence deterministic; the fixture
+/// still runs a real accelerated dataset and exports through the runtime reader.
+#[tokio::test]
+async fn results_cache_invalidation_metrics_contract() {
+    use cache::key::RawCacheKey;
+    use datafusion::common::TableReference;
+
+    let registry = &*PROMETHEUS;
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let rt = runtime_with_results_cache(dir.path(), "metrics_invalidation_contract").await;
+    let df = rt.datafusion();
+    let provider = df
+        .results_cache_provider()
+        .expect("SQL results cache configured");
+    let table = TableReference::bare("scores");
+    let mut query = QueryBuilder::new("SELECT id, score FROM scores", Arc::clone(&df))
+        .build()
+        .run()
+        .await
+        .expect("query the accelerated fixture");
+    assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    let mut batches = Vec::new();
+    while let Some(batch) = query.data.next().await {
+        batches.push(batch.expect("read the fixture batch"));
+    }
+    let schema = batches.first().expect("fixture returns a batch").schema();
+    let key = RawCacheKey::new(u64::MAX);
+    let read_started_at = std::time::Instant::now();
+    let captured = CachedQueryResult::new_raw(
+        batches,
+        schema,
+        Arc::new(HashSet::from([table.clone()])),
+        read_started_at,
+        read_started_at,
+    );
+    provider
+        .put_raw_key(&key, captured.clone())
+        .await
+        .expect("store captured result");
+    assert_eq!(
+        provider
+            .get_raw_key(&key)
+            .await
+            .expect("lookup captured result")
+            .expect("captured result is initially servable")
+            .read_started_at,
+        read_started_at
+    );
+
+    let invalidations_before = counter_total(registry, "results_cache_table_invalidations");
+    let evicted_before =
+        counter_with_label(registry, "results_cache_evictions", "reason", "invalidated");
+    let rejections_before = counter_total(registry, "results_cache_stale_rejections");
+    df.caching()
+        .invalidate_for_table(table.clone())
+        .await
+        .expect("invalidate for client write");
+    assert_counter_delta(
+        counter_total(registry, "results_cache_table_invalidations") - invalidations_before,
+        1.0,
+        "a client write records exactly one eviction invalidation",
+    );
+    // Two entries read `scores`: the result the fixture query above stored, and the
+    // captured one. Each is counted as its own eviction.
+    assert_counter_delta(
+        counter_with_label(registry, "results_cache_evictions", "reason", "invalidated")
+            - evicted_before,
+        2.0,
+        "every entry a client write drops is counted as an eviction with reason `invalidated`",
+    );
+    df.caching()
+        .invalidate_for_refresh(table)
+        .await
+        .expect("invalidate for accelerated refresh");
+    assert_counter_delta(
+        counter_total(registry, "results_cache_table_invalidations") - invalidations_before,
+        1.0,
+        "an accelerated refresh must not record a SQL results invalidation",
+    );
+
+    // Publish the pre-write read after eviction, reproducing an in-flight read
+    // that completes after a client write. Lookup must reject it by the clock.
+    provider
+        .put_raw_key(&key, captured)
+        .await
+        .expect("publish pre-write read");
+    assert!(
+        provider
+            .get_raw_key(&key)
+            .await
+            .expect("lookup invalidated read")
+            .is_none()
+    );
+    assert_counter_delta(
+        counter_total(registry, "results_cache_stale_rejections") - rejections_before,
+        1.0,
+        "a read published after a client write is rejected once as `write_during_read`",
+    );
+    for (name, label_name, expected_value) in [
+        ("results_cache_table_invalidations", "mode", "evict"),
+        (
+            "results_cache_stale_rejections",
+            "reason",
+            "write_during_read",
+        ),
+    ] {
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == name)
+            .expect("the metric family is exported");
+        assert_eq!(
+            family.get_metric().len(),
+            1,
+            "only the current contract series exists for {name}"
+        );
+        let labels: Vec<_> = family.get_metric()[0]
+            .get_label()
+            .iter()
+            .filter(|label| label.name() == label_name)
+            .map(prometheus::proto::LabelPair::value)
+            .collect();
+        assert_eq!(
+            labels,
+            [expected_value],
+            "{name} exports the exact label value"
+        );
+    }
+    assert!(
+        registry
+            .gather()
+            .iter()
+            .all(|family| family.name() != "results_cache_invalidation_stale_hits")
+    );
 }
 
 /// Runs `sql` under `request_context`, reads its whole result, and asserts how it was
@@ -1730,4 +1967,173 @@ async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), any
     );
 
     Ok(())
+}
+
+/// How long [`start_slow_openai_stub`] takes to answer. A duration recorded in seconds
+/// instead of milliseconds lands three orders of magnitude below it.
+#[cfg(feature = "models")]
+const STUB_PROVIDER_DELAY: Duration = Duration::from_millis(200);
+
+/// An `OpenAI`-compatible provider that answers every chat completion and embedding
+/// request after [`STUB_PROVIDER_DELAY`].
+#[cfg(feature = "models")]
+async fn start_slow_openai_stub() -> SocketAddr {
+    use axum::{Json, Router, routing::post};
+    use serde_json::{Value, json};
+
+    async fn chat_completions(Json(body): Json<Value>) -> Json<Value> {
+        tokio::time::sleep(STUB_PROVIDER_DELAY).await;
+        Json(json!({
+            "id": "chatcmpl-stub",
+            "object": "chat.completion",
+            "created": 0,
+            "model": body["model"],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+    }
+
+    async fn embeddings(Json(body): Json<Value>) -> Json<Value> {
+        tokio::time::sleep(STUB_PROVIDER_DELAY).await;
+        let inputs = body["input"].as_array().map_or(1, Vec::len);
+        let data: Vec<Value> = (0..inputs)
+            .map(|index| json!({"object": "embedding", "index": index, "embedding": [0.1, 0.2, 0.3]}))
+            .collect();
+        Json(json!({
+            "object": "list",
+            "model": body["model"],
+            "data": data,
+            "usage": {"prompt_tokens": 1, "total_tokens": 1}
+        }))
+    }
+
+    let listener = tokio::net::TcpListener::bind((LOCALHOST, 0))
+        .await
+        .expect("to bind the stub provider");
+    let addr = listener.local_addr().expect("the stub provider's address");
+    let router = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    addr
+}
+
+/// The sample count and sum of histogram `name`, over all of its series.
+#[cfg(feature = "models")]
+fn histogram_totals(registry: &prometheus::Registry, name: &str) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// `llm_internal_request_duration_ms` and `embeddings_internal_request_duration_ms`
+/// record milliseconds, as their names and units say: a request the provider takes
+/// [`STUB_PROVIDER_DELAY`] to answer records at least that many milliseconds.
+#[cfg(feature = "models")]
+#[tokio::test]
+async fn model_request_durations_are_recorded_in_milliseconds() {
+    use spicepod::component::{embeddings::Embeddings, model::Model};
+
+    let registry = &*PROMETHEUS;
+
+    let endpoint = format!("http://{}/v1", start_slow_openai_stub().await);
+    let provider_params = || {
+        HashMap::from([
+            ("endpoint".to_string(), endpoint.clone().into()),
+            (
+                "openai_api_key".to_string(),
+                "sk-not-a-real-key".to_string().into(),
+            ),
+        ])
+    };
+    let mut model = Model::new("openai:stub-chat", "stub_chat");
+    model.params = provider_params();
+    let mut embedding = Embeddings::new("openai:stub-embed", "stub_embed");
+    embedding.params = provider_params();
+    let app = AppBuilder::new("metrics_model_request_durations")
+        .with_model(model)
+        .with_embedding(embedding)
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the model and embedding to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the model or embedding never loaded"
+    );
+
+    let chat = rt
+        .completion_llms()
+        .read()
+        .await
+        .get("stub_chat")
+        .cloned()
+        .expect("the chat model to be loaded");
+    let embed = rt
+        .embeds()
+        .read()
+        .await
+        .get("stub_embed")
+        .cloned()
+        .expect("the embedding model to be loaded");
+
+    let llm_before = histogram_totals(registry, "llm_internal_request_duration_ms");
+    chat.chat_request(
+        serde_json::from_value(serde_json::json!({
+            "model": "stub_chat",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat completion request"),
+    )
+    .await
+    .expect("the stub to answer the chat completion");
+    let llm_after = histogram_totals(registry, "llm_internal_request_duration_ms");
+
+    let embeddings_before = histogram_totals(registry, "embeddings_internal_request_duration_ms");
+    embed
+        .embed(llms::embeddings::EmbeddingInput::String(
+            "a text no other request embeds".to_string(),
+        ))
+        .await
+        .expect("the stub to answer the embedding request");
+    let embeddings_after = histogram_totals(registry, "embeddings_internal_request_duration_ms");
+
+    let floor_ms = STUB_PROVIDER_DELAY.as_secs_f64() * 1000.0;
+    for (name, before, after) in [
+        ("llm_internal_request_duration_ms", llm_before, llm_after),
+        (
+            "embeddings_internal_request_duration_ms",
+            embeddings_before,
+            embeddings_after,
+        ),
+    ] {
+        let (samples, recorded) = (after.0 - before.0, after.1 - before.1);
+        assert_eq!(samples, 1, "{name}: one request records one sample");
+        assert!(
+            (floor_ms..60_000.0).contains(&recorded),
+            "{name} recorded {recorded} for a request the provider took {floor_ms} ms to answer, \
+             so it is not in milliseconds"
+        );
+    }
 }

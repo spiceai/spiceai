@@ -421,6 +421,10 @@ pub struct SearchArgs {
     pub runner_type: RunnerType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
+    /// Parameterized SQL search pipeline: a file path or the SQL text, as `--sql-pipeline` takes
+    /// it. Omitted to search through `POST /v1/search`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_pipeline: Option<String>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -1224,6 +1228,51 @@ tests:
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["ready_wait", "runner_type", "spicepod_path"]);
+    }
+
+    #[test]
+    fn test_search_section_sql_pipeline_round_trip() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    sql_pipeline: test/spicepods/search/pipelines/text_search.sql
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(
+            test_file.tests.search[0].sql_pipeline.as_deref(),
+            Some("test/spicepods/search/pipelines/text_search.sql")
+        );
+
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(
+            serialized["sql_pipeline"],
+            "test/spicepods/search/pipelines/text_search.sql"
+        );
+    }
+
+    #[test]
+    fn test_search_section_inline_sql_pipeline_round_trip() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    sql_pipeline: |
+      SELECT _id, _score FROM text_search(corpus, :query)
+      LIMIT :limit
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let sql = "SELECT _id, _score FROM text_search(corpus, :query)\nLIMIT :limit\n";
+        assert_eq!(test_file.tests.search[0].sql_pipeline.as_deref(), Some(sql));
+
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(serialized["sql_pipeline"], sql);
     }
 
     #[test]

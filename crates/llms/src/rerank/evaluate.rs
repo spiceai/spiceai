@@ -252,10 +252,6 @@ mod tests {
         async fn health(&self) -> evaluate_api::Result<()> {
             Ok(())
         }
-
-        fn is_decision_model(&self) -> bool {
-            true
-        }
     }
 
     fn state_field<'a>(state: &'a EvaluateState, key: &str) -> Option<&'a Value> {

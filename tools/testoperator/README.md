@@ -309,13 +309,45 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
 
-### Running Vector Search Tests
+### Running Search Tests
 
-Running search tests with the testoperator is still experimental. Search tests support the common options.
+Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options.
 
 `testoperator run search [OPTIONS] -p <SPICEPOD>`
 
 The spicepod loads its own data (for example, parquet files on Hugging Face) and must define the `corpus`, `test_queries`, and `relevance_data` tables. The `benchmark_dataset` metric attribute comes from the spicepod's top-level `metadata.benchmark_dataset` value, or is `custom` when the spicepod does not set it. Refer to [`test/spicepods/search/README.md`](../../test/spicepods/search/README.md) for the table schema.
+
+Where options are:
+
+- `--sql-pipeline <FILE_OR_SQL>`: A parameterized SQL search pipeline. When set, each query goes to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The value is a path to a file that exists, or the SQL text. A value that ends with `.sql` or has no whitespace must be a file. Thus, a mistyped path fails with `SQL pipeline file not found`, and does not run as SQL.
+
+A SQL pipeline can use these named parameters:
+
+| Parameter | Value |
+|---|---|
+| `:query` | The query text from `test_queries.text`. |
+| `:limit` | The result limit (`10`). |
+
+A SQL pipeline must return these columns:
+
+| Column | Required | Description |
+|---|---|---|
+| `_id` | Yes | The corpus id. It must match `relevance_data."corpus-id"`. |
+| `_score` | No | A numeric score. It is recorded, but evaluation does not use it. |
+
+Rows must be in rank order: the first row is the best match. For example:
+
+```bash
+# SQL in a file
+testoperator run search -p spicepod.yaml --sql-pipeline pipelines/text_search.sql
+
+# SQL text
+testoperator run search -p spicepod.yaml \
+  --sql-pipeline "SELECT _id, _score FROM text_search(corpus, :query) ORDER BY _score DESC LIMIT :limit"
+```
+
+> [!NOTE]
+> Search table functions (`text_search`, `vector_search`, `rrf`) do not accept parameters as arguments yet (#15046). Until that is fixed, a pipeline can use parameters only in other positions, for example in `WHERE` and `LIMIT`.
 
 ### Running Text-to-SQL tests
 

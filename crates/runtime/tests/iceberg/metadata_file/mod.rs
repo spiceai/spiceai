@@ -520,12 +520,13 @@ async fn a_from_with_no_metadata_files_is_refused_with_what_a_table_root_holds()
         .await
 }
 
-const S3_ACCESS_KEY: &str = "spiceadmin";
-const S3_SECRET_KEY: &str = "spiceintegrationsecret";
-const S3_BUCKET: &str = "lake";
+pub(crate) const S3_ACCESS_KEY: &str = "spiceadmin";
+pub(crate) const S3_SECRET_KEY: &str = "spiceintegrationsecret";
+pub(crate) const S3_BUCKET: &str = "lake";
 
-async fn start_object_store() -> anyhow::Result<RunningContainer> {
-    let container = ContainerRunnerBuilder::new("spice_test_rustfs_iceberg_metadata_file")
+/// A `RustFS` object store in a container, healthy and reachable on its published port.
+pub(crate) async fn start_object_store(name: &str) -> anyhow::Result<RunningContainer> {
+    let container = ContainerRunnerBuilder::new(name)
         .image("rustfs/rustfs:latest".to_string())
         .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", S3_ACCESS_KEY)
@@ -572,7 +573,7 @@ fn s3_client(endpoint: &str) -> aws_sdk_s3::Client {
     )
 }
 
-async fn create_bucket(endpoint: &str) -> anyhow::Result<()> {
+pub(crate) async fn create_bucket(endpoint: &str) -> anyhow::Result<()> {
     let s3 = s3_client(endpoint);
     // The store can accept connections a moment before it accepts requests.
     let mut last_error = None;
@@ -645,7 +646,7 @@ async fn an_unpinned_table_root_on_s3_reads_each_new_commit() -> anyhow::Result<
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            let container = start_object_store().await?;
+            let container = start_object_store("spice_test_rustfs_iceberg_metadata_file").await?;
             let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
             create_bucket(&endpoint).await?;
             let writer = write_s3_table(&endpoint, &[&[1], &[2]]).await?;
@@ -709,7 +710,7 @@ async fn a_version_hint_on_s3_is_read_on_every_query() -> anyhow::Result<()> {
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            let container = start_object_store().await?;
+            let container = start_object_store("spice_test_rustfs_iceberg_metadata_file").await?;
             let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
             create_bucket(&endpoint).await?;
             write_s3_table(&endpoint, &[&[1], &[2], &[3]]).await?;
@@ -789,7 +790,7 @@ async fn iceberg_metadata_path_reads_a_pinned_table_from_s3() -> anyhow::Result<
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
-            let container = start_object_store().await?;
+            let container = start_object_store("spice_test_rustfs_iceberg_metadata_file").await?;
             let endpoint = format!("http://127.0.0.1:{}", container.host_port(9000)?);
             create_bucket(&endpoint).await?;
 
@@ -859,9 +860,7 @@ pub(crate) async fn glue_metadata_location(namespace: &str, table: &str) -> anyh
 /// documented way: `from` is the table root and `iceberg_metadata_path` the file
 /// relative to it.
 pub(crate) fn pinned_glue_dataset(metadata_location: &str, name: &str) -> anyhow::Result<Dataset> {
-    let (root, file) = metadata_location.rsplit_once("/metadata/").ok_or_else(|| {
-        anyhow::anyhow!("'{metadata_location}' is not under a metadata/ directory")
-    })?;
+    let (root, file) = split_metadata_location(metadata_location)?;
     let mut params = crate::iceberg::connector::glue_s3_params();
     params.insert(
         "iceberg_metadata_path".to_string(),
@@ -870,14 +869,56 @@ pub(crate) fn pinned_glue_dataset(metadata_location: &str, name: &str) -> anyhow
     Ok(dataset_with_params(format!("iceberg:{root}"), name, params))
 }
 
+/// A dataset reading the Glue table rooted where `metadata_location` lives, with no
+/// pin, so each query finds the current metadata file by listing `metadata/`.
+fn unpinned_glue_dataset(metadata_location: &str, name: &str) -> anyhow::Result<Dataset> {
+    let (root, _) = split_metadata_location(metadata_location)?;
+    Ok(dataset_with_params(
+        format!("iceberg:{root}"),
+        name,
+        crate::iceberg::connector::glue_s3_params(),
+    ))
+}
+
+/// Splits a metadata file URL into the table root and the file name.
+fn split_metadata_location(metadata_location: &str) -> anyhow::Result<(&str, &str)> {
+    metadata_location
+        .rsplit_once("/metadata/")
+        .ok_or_else(|| anyhow::anyhow!("'{metadata_location}' is not under a metadata/ directory"))
+}
+
+/// The metadata file `dataset` reads now: the location of the table its Iceberg
+/// catalog loads, the same lookup Spice's Iceberg REST `loadTable` serves.
+async fn current_metadata_location(rt: &Arc<Runtime>, dataset: &str) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let table = rt
+        .datafusion()
+        .get_table(&datafusion::common::TableReference::bare(dataset))
+        .await
+        .with_context(|| format!("dataset {dataset} is not registered"))?;
+    let provider = spice_table::peel_to(&table, spice_table::LayerWalk::Passthrough)
+        .downcast_ref::<IcebergTableProvider>()
+        .with_context(|| format!("dataset {dataset} is not read as an Iceberg table"))?;
+    let loaded = provider
+        .catalog()
+        .load_table(provider.table_ident())
+        .await?;
+    loaded
+        .metadata_location()
+        .map(str::to_string)
+        .with_context(|| format!("dataset {dataset} reads no metadata file"))
+}
+
 /// The differential check against a real catalog: a table AWS Glue manages, on S3,
-/// read once through the Glue Iceberg REST endpoint and once from the metadata file
-/// Glue records for it, must return the same rows. The row multisets are compared
-/// in both directions, and the count is pinned to TPC-H SF1's 150,000 customers so
-/// two empty or truncated reads cannot agree.
+/// read through the Glue Iceberg REST endpoint, from the metadata file Glue records
+/// for it, and from its table root with no pin, must return the same rows. The
+/// unpinned read must also pick the metadata file Glue records, so the check does
+/// not depend on the newest commit changing rows. The row multisets are compared in
+/// both directions, and the count is pinned to TPC-H SF1's 150,000 customers so two
+/// empty or truncated reads cannot agree.
 #[tokio::test]
-async fn a_glue_table_reads_the_same_rows_pinned_as_through_the_glue_catalog() -> anyhow::Result<()>
-{
+async fn a_glue_table_reads_the_same_rows_pinned_and_unpinned_as_through_the_glue_catalog()
+-> anyhow::Result<()> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
@@ -891,23 +932,33 @@ async fn a_glue_table_reads_the_same_rows_pinned_as_through_the_glue_catalog() -
                 "customer_glue",
             )?;
             let pinned = pinned_glue_dataset(&location, "customer_pinned")?;
-            let rt = start_runtime("iceberg_metadata_path_glue", vec![through_glue, pinned]).await;
+            let unpinned = unpinned_glue_dataset(&location, "customer_root")?;
+            let rt = start_runtime(
+                "iceberg_metadata_path_glue",
+                vec![through_glue, pinned, unpinned],
+            )
+            .await;
 
-            for sql in [
-                "SELECT count(*) FROM customer_glue",
-                "SELECT count(*) FROM customer_pinned",
-            ] {
-                assert_eq!(count(&rt, sql).await?, 150_000, "{sql}");
+            assert_eq!(
+                current_metadata_location(&rt, "customer_root").await?,
+                location,
+                "the unpinned read must pick the metadata file Glue records"
+            );
+            for name in ["customer_glue", "customer_pinned", "customer_root"] {
+                let sql = format!("SELECT count(*) FROM {name}");
+                assert_eq!(count(&rt, &sql).await?, 150_000, "{sql}");
             }
-            for sql in [
-                "SELECT count(*) FROM (SELECT * FROM customer_glue EXCEPT ALL SELECT * FROM customer_pinned)",
-                "SELECT count(*) FROM (SELECT * FROM customer_pinned EXCEPT ALL SELECT * FROM customer_glue)",
-            ] {
-                assert_eq!(
-                    count(&rt, sql).await?,
-                    0,
-                    "{sql}: the pinned read ({location}) and the Glue read differ"
-                );
+            for read in ["customer_pinned", "customer_root"] {
+                for (left, right) in [("customer_glue", read), (read, "customer_glue")] {
+                    let sql = format!(
+                        "SELECT count(*) FROM (SELECT * FROM {left} EXCEPT ALL SELECT * FROM {right})"
+                    );
+                    assert_eq!(
+                        count(&rt, &sql).await?,
+                        0,
+                        "{sql}: the {read} read and the Glue read ({location}) differ"
+                    );
+                }
             }
             Ok(())
         })
