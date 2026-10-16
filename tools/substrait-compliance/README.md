@@ -18,7 +18,7 @@ job.
 |------|--------|
 | Suite | [spiceai/substrait-compliance](https://github.com/spiceai/substrait-compliance) branch `spiceai` @ `43d31411c69ef7594887c7d759037bcf8244eeed` = IBM `main` `b9b5f6a` (suite files identical to `v0.1.1`) plus the TPC-H q01 shipdate-cutoff correction, the only difference from upstream |
 | Workspace `datafusion` / `datafusion-substrait` | `54.1.0` |
-| spiceai/datafusion fork | `spiceai-54` @ `f9bd47df2cbc536a9af95b57132602f121365f1b` (workspace `[patch.crates-io]`; merged spiceai/datafusion#227, #230, #231 and #232; spiceai-54 also merged #235, #220, #221 and #226 and includes #215) |
+| spiceai/datafusion fork | `spiceai-55` @ `c2d9009f618b10d1e1d019130cf061b3269da80b` (workspace `[patch.crates-io]`; the revision `Cargo.toml` pins, which `DATAFUSION_FORK_REV` must equal) |
 | Tables at `--scale-factor` | `tpchgen` `3.0.0` (workspace `Cargo.lock`): the TPC's reference `dbgen` rows, generated in memory |
 | SF 1 goldens | [`expected/sf1`](expected/sf1): `DuckDB` `1.5.6` `tpch_queries()` over those rows ([provenance](expected/sf1/README.md)) |
 
