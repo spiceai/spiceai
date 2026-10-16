@@ -30,6 +30,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::optimizer::Optimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use evaluate_api::{Answer, Evaluate, EvaluateRequest, EvaluateResponse, EvaluateState, Question};
+use model_capabilities::{CapabilityStore, ModelCapabilities};
 use runtime_decide::{DecisionFunctions, guard_async_calls};
 use runtime_status::RuntimeStatus;
 use tokio::sync::RwLock;
@@ -176,10 +177,6 @@ impl Evaluate for Mock {
     async fn health(&self) -> evaluate_api::Result<()> {
         Ok(())
     }
-
-    fn is_decision_model(&self) -> bool {
-        self.decision
-    }
 }
 
 const BODIES: [&str; 4] = [
@@ -241,6 +238,21 @@ fn session_with(
     batch: RecordBatch,
     config: SessionConfig,
 ) -> SessionContext {
+    // A decision mock answers the way `TypeSafe` Jev does, and any other the way a chat
+    // model does.
+    let capabilities: CapabilityStore = models
+        .iter()
+        .map(|(name, model)| {
+            let from = if model.decision {
+                "typesafe:jev"
+            } else {
+                "openai:gpt-4o-mini"
+            };
+            let model = spicepod::component::model::Model::new(from, *name);
+            let found = ModelCapabilities::of(&model).expect("a known provider");
+            ((*name).to_string(), found)
+        })
+        .collect();
     let store: HashMap<String, Arc<dyn Evaluate>> = models
         .into_iter()
         .map(|(name, model)| (name.to_string(), model as Arc<dyn Evaluate>))
@@ -252,7 +264,12 @@ fn session_with(
         .with_optimizer_rules(guard_async_calls(Optimizer::new().rules))
         .build();
     let ctx = SessionContext::new_with_state(state);
-    DecisionFunctions::new(Arc::new(RwLock::new(store)), RuntimeStatus::new()).register(&ctx);
+    DecisionFunctions::new(
+        Arc::new(RwLock::new(store)),
+        Arc::new(RwLock::new(capabilities)),
+        RuntimeStatus::new(),
+    )
+    .register(&ctx);
     let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).expect("table");
     ctx.register_table("tickets", Arc::new(table))
         .expect("register tickets");

@@ -364,11 +364,6 @@ impl Evaluate for ChatEvaluator {
                 source: Box::new(e),
             })
     }
-
-    /// A chat model answers through a prompt; it is not a decision model.
-    fn is_decision_model(&self) -> bool {
-        false
-    }
 }
 
 /// Maps a chat model's failure onto the evaluation error with the same meaning: a

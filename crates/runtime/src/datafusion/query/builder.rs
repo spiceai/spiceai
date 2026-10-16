@@ -191,6 +191,7 @@ impl QueryBuilder {
         // `runtime.task_history.enabled` only controls what a built tracker reports.
         let tracker = self.emit_tracker.then(|| QueryTracker {
             task_history_enabled: self.df.task_history_enabled,
+            log_errors: self.df.query_error_logging,
             captured_output_enabled: self.df.task_history_captured_output,
             schema: None,
             query_duration_secs: None,

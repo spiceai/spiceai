@@ -40,26 +40,6 @@ use tokio::sync::RwLock;
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResponsesApiSupport {
-    Supported,
-    UnsupportedProvider {
-        provider: String,
-    },
-    /// Provider is a decision model (`POST /v1/decisions`); chat and Responses are unsupported.
-    EvaluateOnly {
-        provider: String,
-    },
-    Unavailable,
-}
-
-impl ResponsesApiSupport {
-    #[must_use]
-    pub fn supports_responses_api(&self) -> bool {
-        matches!(self, ResponsesApiSupport::Supported)
-    }
-}
-
 const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
 
 static OPENAI_RESPONSES_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
@@ -78,17 +58,6 @@ pub async fn try_to_responses_model(
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
 ) -> Result<Arc<dyn Responses>, LlmError> {
-    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
-        from: component.from.clone(),
-    })?;
-
-    if !matches!(
-        source,
-        ModelSource::OpenAi | ModelSource::Azure | ModelSource::Xai
-    ) {
-        return Err(LlmError::ResponsesNotSupported { from: source });
-    }
-
     let model = construct_model(component, params, &rt.secrets()).await?;
 
     let openai_responses_tools: Option<Vec<OpenAIResponsesTools>> =
