@@ -29,7 +29,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, InstrumentationScope, KeyValue, any_value::Value,
@@ -182,8 +184,25 @@ fn build_export(args: &LogsLoadArgs, worker: usize, sequence: u64) -> ExportLogs
 #[derive(Default)]
 struct WorkerReport {
     latencies_us: Vec<u64>,
+    /// Records the receiver accepted: each acknowledged export's records less those its
+    /// response reports rejected.
     records: u64,
+    /// Records an acknowledged export's `partial_success` reports rejected.
+    rejected: u64,
     errors: BTreeMap<String, u64>,
+}
+
+impl WorkerReport {
+    /// Counts an acknowledged export of `batch` records whose response is `response`.
+    fn acknowledged(&mut self, elapsed_us: u64, batch: usize, response: &ExportLogsServiceResponse) {
+        let rejected = response
+            .partial_success
+            .as_ref()
+            .map_or(0, |partial| u64::try_from(partial.rejected_log_records).unwrap_or(0));
+        self.latencies_us.push(elapsed_us);
+        self.records += (batch as u64).saturating_sub(rejected);
+        self.rejected += rejected;
+    }
 }
 
 async fn grpc_worker(
@@ -217,10 +236,7 @@ async fn grpc_worker(
         let result = client.export(request).await;
         let elapsed = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         match result {
-            Ok(_) => {
-                report.latencies_us.push(elapsed);
-                report.records += args.batch as u64;
-            }
+            Ok(response) => report.acknowledged(elapsed, args.batch, response.get_ref()),
             Err(status) => {
                 *report
                     .errors
@@ -263,21 +279,20 @@ async fn http_worker(
         let result = match response {
             Ok(response) => {
                 let status = response.status();
-                let _ = response.bytes().await;
-                if status.is_success() {
-                    Ok(())
-                } else {
-                    Err(format!("HTTP {status}"))
+                match response.bytes().await {
+                    // A success carries an `ExportLogsServiceResponse`, which reports any
+                    // records the receiver rejected.
+                    Ok(body) if status.is_success() => ExportLogsServiceResponse::decode(body)
+                        .map_err(|e| format!("undecodable export response: {e}")),
+                    Ok(_) => Err(format!("HTTP {status}")),
+                    Err(e) => Err(format!("HTTP {status}, unreadable body: {e}")),
                 }
             }
             Err(e) => Err(e.to_string()),
         };
         let elapsed = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         match result {
-            Ok(()) => {
-                report.latencies_us.push(elapsed);
-                report.records += args.batch as u64;
-            }
+            Ok(response) => report.acknowledged(elapsed, args.batch, &response),
             Err(error) => *report.errors.entry(error).or_default() += 1,
         }
     }
@@ -329,11 +344,13 @@ pub async fn run(args: LogsLoadArgs) -> Result<(), Box<dyn std::error::Error + S
     stop.store(true, Ordering::Relaxed);
     let mut latencies = Vec::new();
     let mut records = 0_u64;
+    let mut rejected = 0_u64;
     let mut errors: BTreeMap<String, u64> = BTreeMap::new();
     for worker in workers {
         let report = worker.await??;
         latencies.extend(report.latencies_us);
         records += report.records;
+        rejected += report.rejected;
         for (error, count) in report.errors {
             *errors.entry(error).or_default() += count;
         }
@@ -354,6 +371,7 @@ pub async fn run(args: LogsLoadArgs) -> Result<(), Box<dyn std::error::Error + S
         "elapsed_secs": elapsed,
         "exports": latencies.len(),
         "records": records,
+        "rejected_records": rejected,
         "records_per_sec": records_per_sec.round(),
         "export_latency_ms": {
             "p50": percentile(&latencies, 50.0),
