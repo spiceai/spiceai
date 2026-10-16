@@ -1634,6 +1634,10 @@ mod tests {
     /// SPICE_TEST_PG_CONNINFO='host=localhost user=postgres dbname=postgres' \
     ///   cargo test -p data_components --features postgres -- --ignored slot_advance_moves
     /// ```
+    ///
+    /// The slot is temporary and uniquely named, so the server drops it when the
+    /// test's session ends and a shared server is left as it was found; the test
+    /// checks that from a second session.
     #[tokio::test]
     #[ignore = "requires a running PostgreSQL with wal_level=logical, named by SPICE_TEST_PG_CONNINFO"]
     async fn slot_advance_moves_a_logical_slot_to_the_current_wal_position() {
@@ -1644,24 +1648,14 @@ mod tests {
             .expect("connect to PostgreSQL");
         let connection = tokio::spawn(connection);
 
-        let slot = "spice_test_14925";
-        let exists: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        let slot = format!("spice_test_14925_{}", std::process::id());
+        client
+            .execute(
+                "SELECT pg_create_logical_replication_slot($1, 'pgoutput', true)",
                 &[&slot],
             )
             .await
-            .expect("query pg_replication_slots")
-            .get(0);
-        if !exists {
-            client
-                .execute(
-                    "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
-                    &[&slot],
-                )
-                .await
-                .expect("create the logical replication slot");
-        }
+            .expect("create a temporary logical replication slot");
         // Some WAL, so the current position is ahead of the slot.
         client
             .batch_execute(
@@ -1674,7 +1668,7 @@ mod tests {
             .await
             .expect("current WAL position");
 
-        let end_lsn = slot_advance(&client, slot, target)
+        let end_lsn = slot_advance(&client, &slot, target)
             .await
             .expect("the slot advances to the current WAL position");
         assert_eq!(format_lsn(end_lsn), format_lsn(target));
@@ -1688,6 +1682,29 @@ mod tests {
             .expect("read the slot's confirmed_flush_lsn")
             .get(0);
         assert_eq!(confirmed, format_lsn(target));
+
+        // Ending the session is what drops a temporary slot.
+        drop(client);
+        connection
+            .await
+            .expect("the connection task finishes")
+            .expect("the connection closes cleanly");
+        let (client, connection) = tokio_postgres::connect(&conninfo, NoTls)
+            .await
+            .expect("reconnect to PostgreSQL");
+        let connection = tokio::spawn(connection);
+        let still_there: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                &[&slot],
+            )
+            .await
+            .expect("query pg_replication_slots")
+            .get(0);
+        assert!(
+            !still_there,
+            "the temporary slot {slot} outlived its session"
+        );
         connection.abort();
     }
 
