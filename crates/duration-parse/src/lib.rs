@@ -207,12 +207,12 @@ fn parse_number(input: &str) -> Result<(ParsedNumber, &str), ParseError> {
 
     // Ensure we consumed at least some digits
     if int_end == int_start && frac_digits == 0 {
+        // Report the whole first character: slicing the first byte panics when
+        // that character is multi-byte.
+        let found = input.chars().next().unwrap_or_default();
         return Err(ParseError::Syntax {
             position: 0,
-            message: format!(
-                "Expected a number, found '{}'",
-                &input[..1.min(input.len())]
-            ),
+            message: format!("Expected a number, found '{found}'"),
         });
     }
 
