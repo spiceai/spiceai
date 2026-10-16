@@ -38,7 +38,7 @@ use cayenne::{CayennePartitionCreator, ScanViewReuse};
 // half — a metastore on disk that no parameter names — stays in this file, beside the
 // teardown it guards.
 use cayenne::metastore_layout::{
-    absolute_data_dir, fs_probe_path, is_local_path, overlapping_metastore_dir, resolved_data_dir,
+    absolute_data_dir, fs_probe_path, overlapping_metastore_dir, resolved_data_dir,
 };
 use data_components::poly::PolyTableProvider;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -7819,6 +7819,8 @@ mod tests {
     /// still what `remove_dir_all` walks.
     #[tokio::test]
     async fn a_local_data_directory_whose_name_contains_a_scheme_separator_is_still_read() {
+        use cayenne::metastore_layout::is_local_path;
+
         let app = Arc::new(AppBuilder::new("test").build());
         let base = tempfile::tempdir().expect("temp dir");
 
