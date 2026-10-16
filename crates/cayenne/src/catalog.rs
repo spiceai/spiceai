@@ -228,6 +228,15 @@ pub enum CatalogError {
     ))]
     ChangedConfiguration { table_name: String },
 
+    /// The table's stored rows were written under settings the requested ones change
+    /// the meaning of (see [`crate::metadata::SettingsChangeAction`]), and the caller
+    /// asked for such a table to be rebuilt rather than kept. Worded as the cause clause
+    /// the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' was built with settings it cannot adopt in place ({changes})"
+    ))]
+    SettingsChangeRequiresRebuild { table_name: String, changes: String },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]
@@ -241,6 +250,15 @@ pub enum CatalogError {
         "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
     ))]
     PkConflictDetectionEnabledOnExistingTable { table_name: String },
+
+    /// [`Self::PkConflictDetectionEnabledOnExistingTable`] for a table the caller would
+    /// rebuild, but holds until its source can be read
+    /// (`SettingsChangeAction::HoldUntilSourceReadable`): the stored rows cannot be
+    /// served under the check meanwhile.
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. Applying 'auto' rebuilds the table from its source, which cannot be read on the table's schema yet. To keep using the existing data, set 'cayenne_pk_conflict_detection' back to 'none'. To apply 'auto', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionChangeHeld { table_name: String },
 
     #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"

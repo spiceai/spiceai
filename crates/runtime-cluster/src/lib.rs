@@ -41,7 +41,8 @@ pub use cluster_state::{
     SchedulerEntry, SchedulerId,
 };
 pub use executor_registry::{
-    ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,
+    ExecutorRegistration, ExecutorRegistry, FederatedPartitionProvider, Registered,
+    RegisteredHandles, TablePartitions,
 };
 pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,

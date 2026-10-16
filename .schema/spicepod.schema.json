@@ -32,7 +32,7 @@
       ]
     },
     "snapshots": {
-      "description": "Optional acceleration snapshot configuration",
+      "description": "Deprecated: snapshots are stored in the `snapshots/` folder of\n`runtime.state.location`. A dataset sets `acceleration.snapshots_location`,\n`acceleration.snapshots_params` and\n`acceleration.snapshots_bootstrap_on_failure_behavior` to override it.",
       "anyOf": [
         {
           "$ref": "#/$defs/Snapshots"
@@ -40,7 +40,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "deprecated": true
     },
     "extensions": {
       "description": "Optional extensions configuration",
@@ -1746,11 +1747,12 @@
       "type": "object",
       "properties": {
         "state_location": {
-          "description": "Root URI for shared cluster state. Optional when runtime.state provides the location via field-level fallback.",
-          "type": "string"
+          "description": "Deprecated: set `runtime.state.location`, which keeps cluster state in its\n`cluster/` folder. Root URI for shared cluster state (see\n[`Runtime::scheduler_state`]).",
+          "type": "string",
+          "deprecated": true
         },
         "params": {
-          "description": "Optional object store params for the shared cluster state.",
+          "description": "Deprecated: set `runtime.state.params`. Object store params for the shared\ncluster state.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -1758,7 +1760,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "deprecated": true
         },
         "partition_assignment_interval": {
           "description": "How often the scheduler assigns accelerated table partitions to executors.",
@@ -1850,7 +1853,7 @@
           "default": true
         },
         "location": {
-          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`",
+          "description": "The object store location pointing to a folder\ncontaining the dataset snapshots.\ni.e. `s3://my-bucket/spice/snapshots/`\n\nWhen not set, snapshots go to the `snapshots/` folder of\n`runtime.state.location`. A dataset's `acceleration.snapshots_location`\nwins over it.",
           "type": [
             "string",
             "null"
@@ -1861,7 +1864,7 @@
           "$ref": "#/$defs/BootstrapOnFailureBehavior"
         },
         "params": {
-          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.",
+          "description": "Auth params for accessing the object store location.\nFor S3, this is the same as the S3 dataset connector params\nwith the notable exception that `s3_auth` is set to `iam_role` by default.\nThey apply to this section's `location`, and replace `runtime.state.params`\nfor the `runtime.state` location. A dataset's `acceleration.snapshots_params`\nwin over them.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3286,7 +3289,7 @@
           }
         },
         "snapshots": {
-          "description": "Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
+          "description": "Enables snapshots for this dataset. Snapshots are stored in the first of\n`snapshots_location`, the deprecated top-level `snapshots.location` and the\n`snapshots/` folder of `runtime.state.location` that is set.\n\nOptions: `enabled` / `disabled` / `bootstrap_only` / `create_only`.\n\n`disabled` (default) will turn off snapshots for this dataset.\n`enabled` will enable both creating and bootstrapping from snapshots.\n`bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.\n`create_only` will only create snapshots, it won't attempt to bootstrap from one.",
           "$ref": "#/$defs/SnapshotBehavior"
         },
         "snapshots_trigger": {
@@ -3313,6 +3316,35 @@
         },
         "snapshots_creation_policy": {
           "$ref": "#/$defs/SnapshotsCreationPolicy"
+        },
+        "snapshots_location": {
+          "description": "The object store location of this dataset's snapshots, for example\n`s3://my-bucket/spice/snapshots/`. Defaults to the deprecated top-level\n`snapshots.location`, then to the `snapshots/` folder of\n`runtime.state.location`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshots_params": {
+          "description": "Object store params for this dataset's snapshots, such as `s3_region` or\n`s3_queue_url`. When set, they are the only params used. Otherwise a\n`snapshots_location` uses no params, the deprecated top-level\n`snapshots.location` uses `snapshots.params`, and the `runtime.state`\nlocation uses `snapshots.params` when set, else `runtime.state.params`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "snapshots_bootstrap_on_failure_behavior": {
+          "description": "The behavior when loading a snapshot fails: `warn`, `retry` or `fallback`.\nDefaults to the deprecated top-level `snapshots.bootstrap_on_failure_behavior`,\nthen to `warn`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BootstrapOnFailureBehavior"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -9447,7 +9479,7 @@
           ]
         },
         "cayenne_deletion_mode": {
-          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for every table with a primary key: key-based deletes are recorded by primary-key bytes and sequence number, compact concurrently with writers, and are pruned by the seq-prefix bake pass. It resolves to 'position' (merge-on-read) for a table without a primary key, which has no key to record: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe. 'position' explicitly opts a primary-key table into merge-on-read position deletes, where positions are captured via a row_idx() read-back after each write and any row whose position is not yet known falls back to a key-based delete.",
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on Linux with 8 or more physical CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.",
           "type": "string",
           "default": "auto",
           "enum": [

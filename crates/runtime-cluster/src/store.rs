@@ -56,6 +56,15 @@ pub enum Error {
 
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
+
+    #[snafu(display(
+        "Failed to move the partitions assigned to executor {from} to {to}: {source}"
+    ))]
+    MoveAssignments {
+        from: String,
+        to: String,
+        source: Box<MutateError>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -280,6 +289,53 @@ impl PartitionStore {
         Ok(())
     }
 
+    /// Moves every partition assigned to executor `from` to executor `to`, in one
+    /// cluster-document write, and returns how many partitions moved. Used when an
+    /// executor identified by its advertise address (`from`) starts identifying
+    /// itself by its instance identity (`to`), so its assignments follow it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn move_assignments(&self, from: &str, to: &str) -> Result<usize> {
+        let scope = self.scope;
+        let mut moved = 0;
+        self.cluster
+            .mutate(|state| {
+                moved = 0;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                for metadata in scope.map_mut(state).values_mut() {
+                    let mut changed = false;
+                    for partition in &mut metadata.partitions {
+                        if partition.is_assigned_to(from) {
+                            partition.unassign_from(from);
+                            partition.assign_to(to.to_string(), now_ms);
+                            moved += 1;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        metadata.updated_at = now_ms;
+                    }
+                }
+                if moved == 0 {
+                    MutationOutcome::NoChange
+                } else {
+                    MutationOutcome::Apply
+                }
+            })
+            .await
+            .map_err(|e| Error::MoveAssignments {
+                from: from.to_string(),
+                to: to.to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(moved)
+    }
+
     /// Atomically apply many `(table, partition, executor)` assignments
     /// in a single cluster-document write. Existing assignments to the
     /// same `(table, partition)` are overwritten with the new executor.
@@ -409,6 +465,124 @@ impl PartitionStore {
         self.apply_assignments(&requests).await
     }
 
+    /// Adds each of `partition_values` the table does not have yet, unassigned,
+    /// in one cluster-document write. Returns whether any partition was added.
+    ///
+    /// The change is computed from the document each write attempt reads, so a
+    /// concurrent change to the same table is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TableMetadataNotFound`] when the table has no partition
+    /// metadata, or an error if the cluster state mutation fails.
+    pub async fn add_partitions(
+        &self,
+        table: &TableReference,
+        partition_values: &[PartitionValue],
+    ) -> Result<bool> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut missing = false;
+        let res = self
+            .cluster
+            .mutate(|state| {
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let Some(metadata) = scope.map_mut(state).get_mut(&key) else {
+                    missing = true;
+                    return MutationOutcome::NoChange;
+                };
+                missing = false;
+                let mut added = false;
+                for partition_value in partition_values {
+                    if !metadata
+                        .partitions
+                        .iter()
+                        .any(|p| p.partition_value == *partition_value)
+                    {
+                        metadata.add_partition(PartitionMetadata::new(partition_value.clone()));
+                        added = true;
+                    }
+                }
+                if !added {
+                    return MutationOutcome::NoChange;
+                }
+                metadata.updated_at = now_ms;
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        if missing {
+            return Err(Error::TableMetadataNotFound { table: key });
+        }
+        Ok(res == MutateOk::Committed)
+    }
+
+    /// Removes each of `partition_values` from the table in one
+    /// cluster-document write. Returns, per executor, the removed partitions
+    /// that were assigned to it.
+    ///
+    /// The change is computed from the document each write attempt reads, so a
+    /// concurrent change to the same table is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TableMetadataNotFound`] when the table has no partition
+    /// metadata, or an error if the cluster state mutation fails.
+    pub async fn remove_partitions(
+        &self,
+        table: &TableReference,
+        partition_values: &[PartitionValue],
+    ) -> Result<HashMap<String, Vec<PartitionValue>>> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut missing = false;
+        let mut removed: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+        self.cluster
+            .mutate(|state| {
+                removed.clear();
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let Some(metadata) = scope.map_mut(state).get_mut(&key) else {
+                    missing = true;
+                    return MutationOutcome::NoChange;
+                };
+                missing = false;
+                let mut removed_any = false;
+                for partition_value in partition_values {
+                    if let Some(pos) = metadata
+                        .partitions
+                        .iter()
+                        .position(|p| p.partition_value == *partition_value)
+                    {
+                        let partition = metadata.partitions.remove(pos);
+                        for executor_id in partition.assigned_executors {
+                            removed
+                                .entry(executor_id)
+                                .or_default()
+                                .push(partition_value.clone());
+                        }
+                        removed_any = true;
+                    }
+                }
+                if !removed_any {
+                    return MutationOutcome::NoChange;
+                }
+                metadata.updated_at = now_ms;
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        if missing {
+            return Err(Error::TableMetadataNotFound { table: key });
+        }
+        Ok(removed)
+    }
+
     /// Replace this table's metadata wholesale (atomic OCC write). Used
     /// by callers that compute the new metadata externally and just need
     /// to persist it.
@@ -535,6 +709,18 @@ impl PartitionStore {
     }
 }
 
+fn mutate_error(table: &str, err: MutateError) -> Error {
+    match err {
+        MutateError::ConcurrentModification { .. } => Error::ConcurrentModification {
+            table: table.to_string(),
+        },
+        other => Error::MetadataAccess {
+            table: table.to_string(),
+            source: Box::new(other),
+        },
+    }
+}
+
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -615,6 +801,61 @@ mod tests {
         let p2_meta = find_partition("2");
         assert!(p2_meta.is_assigned_to("executor-1"));
         assert!(!p2_meta.is_assigned_to("executor-2"));
+    }
+
+    /// An executor that starts identifying itself by its instance identity
+    /// takes over the partitions assigned to its advertise address; other
+    /// executors' partitions stay where they are.
+    #[tokio::test]
+    async fn assignments_move_from_the_advertise_address_to_the_identity() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+        pm.initialize_metadata(&tbl, vec!["bucket(3, id)".to_string()])
+            .await
+            .expect("init");
+        let p0 = partition_value("bucket(3, id)", "0");
+        let p1 = partition_value("bucket(3, id)", "1");
+        let p2 = partition_value("bucket(3, id)", "2");
+        pm.add_and_assign_partitions(
+            &tbl,
+            &[
+                (&p0, "127.0.0.1:50062"),
+                (&p1, "exec-b"),
+                (&p2, "127.0.0.1:50062"),
+            ],
+        )
+        .await
+        .expect("add and assign");
+
+        let moved = pm
+            .move_assignments("127.0.0.1:50062", "exec-a")
+            .await
+            .expect("move assignments");
+        assert_eq!(moved, 2);
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+        let owners = |val: &str| {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&Some(val.to_string())))
+                .expect("partition not found")
+                .assigned_executors
+                .clone()
+        };
+        assert_eq!(owners("0"), ["exec-a"]);
+        assert_eq!(owners("1"), ["exec-b"]);
+        assert_eq!(owners("2"), ["exec-a"]);
+        assert_eq!(
+            pm.move_assignments("127.0.0.1:50062", "exec-a")
+                .await
+                .expect("move again"),
+            0
+        );
     }
 
     #[tokio::test]

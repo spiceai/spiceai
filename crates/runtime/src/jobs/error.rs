@@ -43,7 +43,9 @@ pub enum Error {
     ObjectStoreRead { source: ObjectStoreError },
 
     #[snafu(display("Failed to write job state to object store: {source}"))]
-    ObjectStoreWrite { source: ObjectStoreError },
+    ObjectStoreWrite {
+        source: object_store_occ::ConditionalWriteError,
+    },
 
     #[snafu(display("Failed to delete job state from object store: {source}"))]
     ObjectStoreDelete { source: ObjectStoreError },

@@ -35,7 +35,7 @@ pub(crate) static LLM_REQUESTS: LazyLock<Counter<u64>> =
 pub(crate) static FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("llm_failures")
-        .with_description("Number of embedding failures.")
+        .with_description("Number of LLM request failures.")
         .build()
 });
 
@@ -43,7 +43,7 @@ pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock:
     METER
         .f64_histogram("llm_internal_request_duration_ms")
         .with_unit("ms")
-        .with_description("The duration of running an embedding(s) internally.")
+        .with_description("The duration of running an LLM request internally.")
         .build()
 });
 
@@ -149,7 +149,7 @@ pub(crate) fn request_labels_responses(req: &CreateResponse) -> Vec<KeyValue> {
 
 pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[KeyValue]) {
     LLM_REQUESTS.add(1, labels);
-    LLM_INTERNAL_DURATION_MS.record(duration.as_secs_f64(), labels);
+    LLM_INTERNAL_DURATION_MS.record(duration.as_secs_f64() * 1000.0, labels);
     if is_failure {
         FAILURES.add(1, labels);
     }

@@ -16,13 +16,12 @@ limitations under the License.
 
 use core::time;
 use std::{
-    collections::HashMap,
     convert::Infallible,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use crate::model::{LLMChatCompletionsModelStore, ResponsesApiSupport};
+use crate::model::LLMChatCompletionsModelStore;
 use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
@@ -46,7 +45,8 @@ use axum::{
 use event_stream::get_event_stream;
 use futures::StreamExt;
 use http::HeaderValue;
-use llms::chat::Chat;
+use llms::chat::{ApiErrorKind, Chat};
+use model_capabilities::{Capability, CapabilityStore, Refusal, require};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;
 use tokio::{
@@ -123,7 +123,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
-    Extension(responses_api_support): Extension<Arc<RwLock<HashMap<String, ResponsesApiSupport>>>>,
+    Extension(capabilities): Extension<Arc<RwLock<CapabilityStore>>>,
     Extension(status): Extension<Arc<RuntimeStatus>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
@@ -143,12 +143,16 @@ pub(crate) async fn post(
     let span_clone = span.clone();
     async move {
         let model_id = req.model.clone();
-        match llms.read().await.get(&model_id) {
-            Some(model) => {
+        let model = {
+            let capabilities = capabilities.read().await;
+            require(&capabilities, &*llms.read().await, &model_id, Capability::Chat)
+        };
+        match model {
+            Ok(model) => {
                 if req.stream.unwrap_or_default() {
                     let include_stream_events = headers.get(SPICE_COMPLETION_PROGRESS_HEADER)
                         .is_some_and(|v| v == HeaderValue::from_static("enabled"));
-                    handle_streaming(model, req, include_stream_events).instrument(span_clone).await
+                    handle_streaming(&model, req, include_stream_events).instrument(span_clone).await
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
@@ -172,18 +176,12 @@ pub(crate) async fn post(
                     }
                 }
             }
-            None => {
-                if matches!(
-                    responses_api_support.read().await.get(&model_id),
-                    Some(ResponsesApiSupport::EvaluateOnly { .. })
-                ) {
-                    evaluate_only_chat_response(&model_id)
-                } else {
-                    let message = status
-                        .unavailable_model_reason(&model_id)
-                        .unwrap_or_else(|| format!("model '{model_id}' not found"));
-                    (StatusCode::NOT_FOUND, message).into_response()
-                }
+            Err(Refusal::Unsupported(_)) => evaluate_only_chat_response(&model_id),
+            Err(Refusal::NotFound | Refusal::Unavailable) => {
+                let message = status
+                    .unavailable_model_reason(&model_id)
+                    .unwrap_or_else(|| format!("model '{model_id}' not found"));
+                (StatusCode::NOT_FOUND, message).into_response()
             }
         }
     }
@@ -301,6 +299,9 @@ pub(crate) fn create_working_stream_payload(
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].
+///
+/// A stream that completes ends with `data: [DONE]`, the Chat Completions API's
+/// terminator; one that fails ends with the error event instead.
 fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
@@ -386,8 +387,8 @@ impl OpenaiErrorEvent {
     }
 }
 
-/// Chat rejection for an evaluate-only model, in the same `OpenAI` JSON envelope
-/// as `/v1/responses`.
+/// Chat rejection for a model without chat, in the same `OpenAI` JSON envelope as
+/// `/v1/responses`.
 fn evaluate_only_chat_response(model_id: &str) -> Response {
     let message = llms::chat::Error::EvaluateOnlyModel {
         model: model_id.to_string(),
@@ -415,12 +416,13 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 "code": api_error.code
             });
 
-            let status_code = match api_error.code.as_deref() {
-                Some("invalid_request_error") => StatusCode::BAD_REQUEST,
-                Some("invalid_api_key") => StatusCode::UNAUTHORIZED,
-                Some("insufficient_quota") => StatusCode::PAYMENT_REQUIRED,
-                Some("rate_limit_exceeded") => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            let status_code = match ApiErrorKind::of(&api_error) {
+                Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
+                Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
+                Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+                Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
+                Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
+                None => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             (status_code, Json(error_response)).into_response()
@@ -436,7 +438,7 @@ mod tests {
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::{LLMChatCompletionsModelStore, ResponsesApiSupport},
+        model::LLMChatCompletionsModelStore,
         status::{ComponentStatus, RuntimeStatus},
     };
     use async_openai::{
@@ -449,7 +451,7 @@ mod tests {
     use tracing::{Level, span};
     use tracing_futures::Instrument;
 
-    use super::create_working_stream_payload;
+    use super::{StatusCode, create_working_stream_payload, openai_error_to_response};
     use async_trait::async_trait;
     use axum::{
         extract::{Extension, Json},
@@ -491,7 +493,7 @@ mod tests {
         let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
-        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
+        let capabilities = Arc::new(RwLock::new(HashMap::new()));
 
         let mut headers = HeaderMap::new();
         if let Some(v) = progress_header {
@@ -519,7 +521,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(responses_api_support),
+            Extension(capabilities),
             Extension(RuntimeStatus::new()),
             headers,
             Json(req_payload),
@@ -534,15 +536,19 @@ mod tests {
             .expect("Failed to collect SSE response from 'post'.");
 
         let body_str = String::from_utf8(body_bytes.to_bytes().to_vec()).expect("Invalid utf8");
-        body_str
+        let mut data: Vec<&str> = body_str
             .split("\n\n")
+            .filter_map(|e| e.strip_prefix("data: "))
+            .collect();
+        assert_eq!(
+            data.pop(),
+            Some("[DONE]"),
+            "a completed stream ends with the Chat Completions terminator: {body_str}"
+        );
+        data.into_iter()
             .filter_map(|e| {
-                let data = e.strip_prefix("data: ")?;
-                if data == "[DONE]" {
-                    return None;
-                }
                 let resp: CreateChatCompletionStreamResponse =
-                    serde_json::from_str(data).expect("Failed to deserialise SSE event");
+                    serde_json::from_str(e).expect("Failed to deserialise SSE event");
                 resp.choices
                     .first()
                     .expect("Expected a choice in SSE event")
@@ -551,6 +557,128 @@ mod tests {
                     .clone()
             })
             .collect()
+    }
+
+    /// A chat model whose stream fails after its first chunk.
+    pub struct FailingStreamChat;
+
+    #[async_trait]
+    impl Chat for FailingStreamChat {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            Ok(Box::pin(futures::stream::iter([
+                create_working_stream_payload("partial".to_string()),
+                Err(OpenAIError::InvalidArgument("the stream broke".to_string())),
+            ])))
+        }
+    }
+
+    /// A stream that fails ends with its error event, not with `[DONE]`, which would tell
+    /// the client the answer it has is complete.
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_its_error_not_done() {
+        let mut store = LLMChatCompletionsModelStore::new();
+        store.insert("failing".to_string(), Arc::new(FailingStreamChat));
+        let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "failing",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(Arc::new(RwLock::new(store))),
+            Extension(Arc::new(RwLock::new(HashMap::new()))),
+            Extension(RuntimeStatus::new()),
+            HeaderMap::new(),
+            Json(req_payload),
+        )
+        .await;
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        let events: Vec<&str> = body.split("\n\n").filter(|e| !e.is_empty()).collect();
+
+        assert_eq!(events.len(), 2, "{body}");
+        assert!(events[0].contains("\"partial\""), "{body}");
+        assert_eq!(
+            events[1],
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"invalid args: the stream broke\"}}"
+        );
+    }
+
+    fn api_error(r#type: Option<&str>, code: Option<&str>) -> OpenAIError {
+        OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "upstream".to_string(),
+            r#type: r#type.map(str::to_string),
+            param: None,
+            code: code.map(str::to_string),
+        })
+    }
+
+    // regression test for #14910: `OpenAI` puts `invalid_request_error` in `type`, and its
+    // 400 for a request it refused was returned as a 500.
+    #[test]
+    fn provider_errors_keep_their_status() {
+        for (error, status) in [
+            (
+                api_error(
+                    Some("invalid_request_error"),
+                    Some("missing_required_parameter"),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                api_error(Some("invalid_request_error"), None),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                api_error(Some("invalid_request_error"), Some("invalid_api_key")),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                api_error(Some("authentication_error"), None),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                api_error(Some("permission_error"), None),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                api_error(Some("insufficient_quota"), Some("insufficient_quota")),
+                StatusCode::PAYMENT_REQUIRED,
+            ),
+            (
+                api_error(Some("tokens"), Some("rate_limit_exceeded")),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                api_error(Some("rate_limit_error"), None),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                api_error(Some("server_error"), None),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (api_error(None, None), StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let described = format!("{error:?}");
+            assert_eq!(
+                openai_error_to_response(error).status(),
+                status,
+                "{described}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -585,15 +713,17 @@ mod tests {
         );
     }
 
-    /// Evaluate-only models return the `OpenAI` JSON error envelope, not plain text.
+    /// A model without chat returns the `OpenAI` JSON error envelope, not plain text.
     #[tokio::test]
     async fn evaluate_only_model_returns_openai_json_400() {
         let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
-        let responses_api_support = Arc::new(RwLock::new(HashMap::from([(
+        let capabilities = Arc::new(RwLock::new(HashMap::from([(
             "jev".to_string(),
-            ResponsesApiSupport::EvaluateOnly {
-                provider: "typesafe".to_string(),
-            },
+            model_capabilities::ModelCapabilities::of(&spicepod::component::model::Model::new(
+                "typesafe:jev",
+                "jev",
+            ))
+            .expect("a known provider"),
         )])));
 
         let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -606,7 +736,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(responses_api_support),
+            Extension(capabilities),
             Extension(RuntimeStatus::new()),
             HeaderMap::new(),
             Json(req_payload),
@@ -637,7 +767,7 @@ mod tests {
 
     async fn post_to_absent_model(status: Arc<RuntimeStatus>) -> (axum::http::StatusCode, String) {
         let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
-        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
+        let capabilities = Arc::new(RwLock::new(HashMap::new()));
         let req: CreateChatCompletionRequest = serde_json::from_value(json!({
             "model": "deepseek",
             "messages": [{"role": "user", "content": "hi"}]
@@ -646,7 +776,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(responses_api_support),
+            Extension(capabilities),
             Extension(status),
             HeaderMap::new(),
             Json(req),

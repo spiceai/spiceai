@@ -37,6 +37,10 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing_futures::Instrument;
 
 use crate::model::EvaluateModelStore;
+use crate::status::RuntimeStatus;
+use model_capabilities::{
+    Capability, CapabilityStore, DecisionsBackend, ModelCapabilities, require,
+};
 
 /// Where to read about the models that answer decisions.
 const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
@@ -61,7 +65,7 @@ const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
         (status = 400, description = "Invalid request, including unknown fields, image inputs, and `reasoning_effort` for a decision model"),
         (status = 401, description = "The model provider rejected the credentials"),
         (status = 403, description = "The model provider denied access"),
-        (status = 404, description = "No model with this name"),
+        (status = 404, description = "No model with this name, or the model failed to load or is still loading"),
         (status = 429, description = "Rate limited"),
         (status = 500, description = "The model could not answer"),
         (status = 503, description = "The model provider is unavailable")
@@ -69,6 +73,8 @@ const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
 ))]
 pub(crate) async fn post(
     Extension(models): Extension<Arc<RwLock<EvaluateModelStore>>>,
+    Extension(capabilities): Extension<Arc<RwLock<CapabilityStore>>>,
+    Extension(status): Extension<Arc<RuntimeStatus>>,
     body: Bytes,
 ) -> Response {
     let request: DecisionRequest = match serde_json::from_slice(&body) {
@@ -96,6 +102,12 @@ pub(crate) async fn post(
     span.in_scope(|| tracing::info!(target: "task_history", model = %request.model, "labels"));
     crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
+    // From here on, every response but a 200 emits an ERROR event, which is what marks
+    // the `ai_decision` row as failed: the exporter derives `error_message` from ERROR
+    // events only. A body refused above never starts the task, so it leaves no row, as
+    // on `/v1/chat/completions`. Task history copies the ERROR text without the
+    // redaction applied to `input` / `captured_output`, so it names the model and the
+    // failure, never other text from the request or the provider.
     async move {
         let translated = match request.to_system_one() {
             Ok(translated) => translated,
@@ -116,27 +128,52 @@ pub(crate) async fn post(
             }
         };
 
-        let Some(model) = models.read().await.get(&request.model).cloned() else {
+        let (model, native) = {
+            let capabilities = capabilities.read().await;
+            let model = require(
+                &capabilities,
+                &*models.read().await,
+                &request.model,
+                Capability::Decisions,
+            );
+            let native = capabilities
+                .get(&request.model)
+                .and_then(ModelCapabilities::decisions)
+                == Some(DecisionsBackend::Native);
+            (model, native)
+        };
+        let Ok(model) = model else {
+            // A model that failed to load, or is still loading, has no capabilities
+            // registered either; its status says which, as on `/v1/chat/completions`.
+            let unavailable = status.unavailable_model_reason(&request.model);
+            // The load error can carry the provider's text, so task history gets only
+            // which of the two it is.
             tracing::error!(
                 target: "task_history",
-                "Evaluation of model '{}' failed: model not found",
-                request.model
+                "Evaluation of model '{}' failed: {}",
+                request.model,
+                if unavailable.is_some() {
+                    "model not loaded"
+                } else {
+                    "model not found"
+                }
             );
+            let message = unavailable.unwrap_or_else(|| format!(
+                "Model '{}' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: {MODELS_DOCS}",
+                request.model
+            ));
             return error_response(
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 Some("model"),
                 Some("model_not_found"),
-                &format!(
-                    "Model '{}' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: {MODELS_DOCS}",
-                    request.model
-                ),
+                &message,
             );
         };
 
         // A decision model has no reasoning effort to set; answering anyway would hide
         // that the level the caller asked for was never applied.
-        if request.reasoning_effort.is_some() && model.is_decision_model() {
+        if request.reasoning_effort.is_some() && native {
             tracing::error!(
                 target: "task_history",
                 "Evaluation of model '{}' failed: unsupported parameter `reasoning_effort`",
@@ -274,6 +311,7 @@ fn evaluate_error_response(err: &EvaluateError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::ComponentStatus;
     use async_trait::async_trait;
     use evaluate_api::{Answer, Evaluate, EvaluateRequest, EvaluateResponse, Usage};
     use http_body_util::BodyExt;
@@ -313,18 +351,26 @@ mod tests {
         async fn health(&self) -> evaluate_api::Result<()> {
             Ok(())
         }
-
-        fn is_decision_model(&self) -> bool {
-            true
-        }
     }
 
-    async fn call(
-        store: EvaluateModelStore,
+    /// Evaluators and their capabilities, as the runtime registers them.
+    #[derive(Default)]
+    struct Models(EvaluateModelStore, CapabilityStore);
+
+    async fn call(models: Models, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        call_with_status(models, RuntimeStatus::new(), body).await
+    }
+
+    async fn call_with_status(
+        models: Models,
+        status: Arc<RuntimeStatus>,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        let Models(store, capabilities) = models;
         let response = post(
             Extension(Arc::new(RwLock::new(store))),
+            Extension(Arc::new(RwLock::new(capabilities))),
+            Extension(status),
             Bytes::from(body.to_string()),
         )
         .await;
@@ -338,17 +384,23 @@ mod tests {
         (status, serde_json::from_slice(&bytes).expect("json body"))
     }
 
-    fn store_with(name: &str, model: Arc<dyn Evaluate>) -> EvaluateModelStore {
-        let mut store = EvaluateModelStore::new();
-        store.insert(name.into(), model);
-        store
+    /// `model` registered as `name`, with the capabilities of a model `from` a provider.
+    fn store_with(name: &str, from: &str, model: Arc<dyn Evaluate>) -> Models {
+        let capabilities = model_capabilities::ModelCapabilities::of(
+            &spicepod::component::model::Model::new(from, name),
+        )
+        .expect("a known provider");
+        Models(
+            EvaluateModelStore::from([(name.to_string(), model)]),
+            CapabilityStore::from([(name.to_string(), capabilities)]),
+        )
     }
 
     #[tokio::test]
     async fn answers_come_back_in_question_order_with_names() {
         let model = Arc::new(DummyEvaluate::default());
         let (status, body) = call(
-            store_with("jev", Arc::clone(&model) as Arc<dyn Evaluate>),
+            store_with("jev", "typesafe:jev", Arc::clone(&model) as Arc<dyn Evaluate>),
             json!({
                 "model": "jev",
                 "input": "The package arrived with a broken screen.",
@@ -382,10 +434,128 @@ mod tests {
         assert_eq!(seen[0].questions.len(), 2);
     }
 
+    /// The `ai_decision` task-history events the handler emits, as `(level, message)`.
+    #[derive(Clone, Default)]
+    struct TaskHistoryEvents(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for TaskHistoryEvents
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+
+            let in_decision_span = ctx
+                .event_span(event)
+                .is_some_and(|span| span.name() == "ai_decision");
+            if event.metadata().target() != "task_history" || !in_decision_span {
+                return;
+            }
+            let mut message = Message(None);
+            event.record(&mut message);
+            if let Some(message) = message.0 {
+                self.0
+                    .lock()
+                    .expect("events lock")
+                    .push((*event.metadata().level(), message));
+            }
+        }
+    }
+
+    /// Runs `body` through the handler and returns its status, its JSON body, and the
+    /// ERROR events it recorded in task history. An ERROR event is what the exporter turns
+    /// into the row's `error_message`; a row without one is recorded as a success.
+    async fn call_recording_task_history(
+        store: Models,
+        status: Arc<RuntimeStatus>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value, Vec<String>) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let events = TaskHistoryEvents::default();
+        // The handler runs on this thread, so a thread-local subscriber sees all of it.
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+        let (status, json) = call_with_status(store, status, body).await;
+        let errors = events
+            .0
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::ERROR)
+            .map(|(_, message)| message.clone())
+            .collect();
+        (status, json, errors)
+    }
+
+    // regression test for #14893: a refused request was recorded as a successful task.
+    #[tokio::test]
+    async fn every_refused_decision_is_recorded_as_failed_in_task_history() {
+        let jev = || store_with("jev", "typesafe:jev", Arc::new(DummyEvaluate::default()));
+        let cases = [
+            (
+                Models::default(),
+                json!({"model": "nope", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
+                StatusCode::NOT_FOUND,
+                "Evaluation of model 'nope' failed: model not found",
+            ),
+            (
+                jev(),
+                json!({"model": "jev", "input": "x", "questions": []}),
+                StatusCode::BAD_REQUEST,
+                "Evaluation of model 'jev' failed: invalid request (`questions`)",
+            ),
+            (
+                jev(),
+                json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}], "reasoning_effort": "high"}),
+                StatusCode::BAD_REQUEST,
+                "Evaluation of model 'jev' failed: unsupported parameter `reasoning_effort`",
+            ),
+        ];
+        let mut expected = Vec::new();
+        let mut recorded = Vec::new();
+        for (store, request, status, error) in cases {
+            let (got, _, errors) =
+                call_recording_task_history(store, RuntimeStatus::new(), request.clone()).await;
+            expected.push((request.clone(), status, vec![error.to_string()]));
+            recorded.push((request, got, errors));
+        }
+        assert_eq!(recorded, expected);
+
+        // The control: a 200 records no error, so the assertions above are not met by
+        // every request.
+        let (status, _, errors) = call_recording_task_history(
+            jev(),
+            RuntimeStatus::new(),
+            json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            errors.is_empty(),
+            "a successful decision recorded {errors:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_model_is_a_404_naming_it() {
         let (status, body) = call(
-            EvaluateModelStore::new(),
+            Models::default(),
             json!({"model": "missing", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
         )
         .await;
@@ -398,9 +568,44 @@ mod tests {
         );
     }
 
+    /// A configured model that failed to load, or is still loading, is absent from the
+    /// store like an unknown one, but the 404 says why, as `/v1/chat/completions` does.
+    /// Task history records only which it is: the load error carries the provider's text.
+    #[tokio::test]
+    async fn an_unloaded_model_is_a_404_naming_why() {
+        let request = json!({"model": "deepseek", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]});
+        let cases = [
+            (
+                ComponentStatus::error_with_message(
+                    "Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance",
+                ),
+                "Model 'deepseek' failed to load, so it cannot serve requests. Cause: Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance",
+            ),
+            (
+                ComponentStatus::Initializing,
+                "Model 'deepseek' is still loading. Retry once it is ready.",
+            ),
+        ];
+        let mut expected = Vec::new();
+        let mut recorded = Vec::new();
+        for (model_status, message) in cases {
+            let status = RuntimeStatus::new();
+            status.update_model("deepseek", model_status);
+            recorded.push(
+                call_recording_task_history(Models::default(), status, request.clone()).await,
+            );
+            expected.push((
+                StatusCode::NOT_FOUND,
+                json!({"error": {"message": message, "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}),
+                vec!["Evaluation of model 'deepseek' failed: model not loaded".to_string()],
+            ));
+        }
+        assert_eq!(recorded, expected);
+    }
+
     #[tokio::test]
     async fn invalid_requests_are_400_in_the_openai_envelope() {
-        let store = || store_with("jev", Arc::new(DummyEvaluate::default()));
+        let store = || store_with("jev", "typesafe:jev", Arc::new(DummyEvaluate::default()));
         let cases = [
             (
                 json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}], "stream": true}),
@@ -442,16 +647,12 @@ mod tests {
         async fn health(&self) -> evaluate_api::Result<()> {
             Ok(())
         }
-
-        fn is_decision_model(&self) -> bool {
-            true
-        }
     }
 
     #[tokio::test]
     async fn an_unavailable_provider_is_a_503() {
         let (status, body) = call(
-            store_with("jev", Arc::new(UnavailableEvaluate)),
+            store_with("jev", "typesafe:jev", Arc::new(UnavailableEvaluate)),
             json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
         )
         .await;
@@ -496,7 +697,13 @@ mod tests {
                     "message": {"role": "assistant", "content": "{\"answers\": {\"q000\": {\"billing\": 0.75, \"technical\": 0.25}}}"},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 9, "total_tokens": 59}
+                "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 9,
+                    "total_tokens": 59,
+                    "prompt_tokens_details": {"cached_tokens": 12},
+                    "completion_tokens_details": {"reasoning_tokens": 4}
+                }
             }))
             .expect("chat completion"))
         }
@@ -508,6 +715,7 @@ mod tests {
         let (status, body) = call(
             store_with(
                 "judge",
+                "openai:gpt-4o-mini",
                 Arc::new(evaluate_chat::ChatEvaluator::new(
                     "judge",
                     Arc::new(AnsweringChat::default()),
@@ -529,7 +737,17 @@ mod tests {
             body["answers"][0]["probabilities"],
             json!([{"value": "technical", "probability": 0.25}, {"value": "billing", "probability": 0.75}])
         );
-        assert_eq!(body["usage"]["input_tokens"], 50);
+        assert_eq!(
+            body["usage"],
+            json!({
+                "input_tokens": 50,
+                "input_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 0},
+                "output_tokens": 9,
+                "output_tokens_details": {"reasoning_tokens": 4},
+                "total_tokens": 59
+            }),
+            "the chat model's cached and reasoning tokens are reported, as on `/v1/chat/completions`"
+        );
     }
 
     /// A chat model receives the requested level on its completion request.
@@ -539,6 +757,7 @@ mod tests {
         let (status, body) = call(
             store_with(
                 "judge",
+                "openai:gpt-4o-mini",
                 Arc::new(evaluate_chat::ChatEvaluator::new(
                     "judge",
                     Arc::clone(&chat) as Arc<dyn llms::chat::Chat>,
@@ -566,7 +785,11 @@ mod tests {
     async fn reasoning_effort_for_a_decision_model_is_a_400() {
         let model = Arc::new(DummyEvaluate::default());
         let (status, body) = call(
-            store_with("jev", Arc::clone(&model) as Arc<dyn Evaluate>),
+            store_with(
+                "jev",
+                "typesafe:jev",
+                Arc::clone(&model) as Arc<dyn Evaluate>,
+            ),
             json!({
                 "model": "jev",
                 "input": "x",

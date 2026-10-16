@@ -161,6 +161,10 @@ runtime = "runtime"
 # interface crates a connector needs (data-connector-api) name a component's
 # configuration without pulling in the orchestrator.
 runtime-component = "shared-utility"
+# Builds the object store behind a shared-state location (`runtime.state`,
+# scheduler, rate control, warmup, snapshots). Below `runtime` so the snapshot
+# code in `runtime-acceleration` builds its store the same way.
+runtime-state-location = "shared-utility"
 # The data-connector contract: the `DataConnector` trait and its factory, the
 # link-time registration, the `ConnectorParams`/`ConnectorContext` a connector is
 # handed, the listing-table connector, and the parameter validators. Below
@@ -269,6 +273,8 @@ runtime-checkpoint-api = "foundation"
 # changing the default can never silently relocate it away from `cache`/`hf-hub`.
 chat-api = "foundation"
 evaluate-api = "foundation"
+# What each model can serve and the gate every serving path asks; its closure is `spicepod`.
+model-capabilities = "foundation"
 embed-api = "shared-utility"
 rerank-api = "foundation"
 runtime-cloud-connect = "foundation"

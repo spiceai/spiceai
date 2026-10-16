@@ -298,7 +298,7 @@ impl SnapshotFixture {
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.snapshots.clone())
+            .map(|app| app.dataset_snapshots(&spicepod::acceleration::Acceleration::default()))
             .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
         let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
             runtime_snapshots,

@@ -412,6 +412,24 @@ impl CachedPkKeyset {
         }
     }
 
+    /// Forget every captured row position: relabel each `FilePositioned` entry
+    /// `FileUnlocated` and drop the record of which files the read-back covered,
+    /// releasing those files' share of `approx_bytes`. A later delete of any of
+    /// these keys then records a key tombstone, not a position delete.
+    pub(crate) fn forget_positions(&mut self) {
+        for entry in self.keys.values_mut() {
+            if matches!(entry.location, RowLocation::FilePositioned { .. }) {
+                entry.location = RowLocation::FileUnlocated;
+            }
+        }
+        let captured_bytes: usize = self
+            .captured_files
+            .drain()
+            .map(|path| approx_captured_file_bytes(&path))
+            .sum();
+        self.approx_bytes = self.approx_bytes.saturating_sub(captured_bytes);
+    }
+
     /// Consume the keyset into `(key, location)` pairs (the shard split).
     pub(crate) fn into_entries(self) -> impl Iterator<Item = (OwnedRow, RowLocation)> {
         self.keys
