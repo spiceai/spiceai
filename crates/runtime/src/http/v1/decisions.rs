@@ -37,6 +37,7 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 use tracing_futures::Instrument;
 
 use crate::model::EvaluateModelStore;
+use crate::status::RuntimeStatus;
 use model_capabilities::{
     Capability, CapabilityStore, DecisionsBackend, ModelCapabilities, require,
 };
@@ -64,7 +65,7 @@ const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
         (status = 400, description = "Invalid request, including unknown fields, image inputs, and `reasoning_effort` for a decision model"),
         (status = 401, description = "The model provider rejected the credentials"),
         (status = 403, description = "The model provider denied access"),
-        (status = 404, description = "No model with this name"),
+        (status = 404, description = "No model with this name, or the model failed to load or is still loading"),
         (status = 429, description = "Rate limited"),
         (status = 500, description = "The model could not answer"),
         (status = 503, description = "The model provider is unavailable")
@@ -73,6 +74,7 @@ const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
 pub(crate) async fn post(
     Extension(models): Extension<Arc<RwLock<EvaluateModelStore>>>,
     Extension(capabilities): Extension<Arc<RwLock<CapabilityStore>>>,
+    Extension(status): Extension<Arc<RuntimeStatus>>,
     body: Bytes,
 ) -> Response {
     let request: DecisionRequest = match serde_json::from_slice(&body) {
@@ -141,20 +143,31 @@ pub(crate) async fn post(
             (model, native)
         };
         let Ok(model) = model else {
+            // A model that failed to load, or is still loading, has no capabilities
+            // registered either; its status says which, as on `/v1/chat/completions`.
+            let unavailable = status.unavailable_model_reason(&request.model);
+            // The load error can carry the provider's text, so task history gets only
+            // which of the two it is.
             tracing::error!(
                 target: "task_history",
-                "Evaluation of model '{}' failed: model not found",
-                request.model
+                "Evaluation of model '{}' failed: {}",
+                request.model,
+                if unavailable.is_some() {
+                    "model not loaded"
+                } else {
+                    "model not found"
+                }
             );
+            let message = unavailable.unwrap_or_else(|| format!(
+                "Model '{}' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: {MODELS_DOCS}",
+                request.model
+            ));
             return error_response(
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 Some("model"),
                 Some("model_not_found"),
-                &format!(
-                    "Model '{}' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: {MODELS_DOCS}",
-                    request.model
-                ),
+                &message,
             );
         };
 
@@ -298,6 +311,7 @@ fn evaluate_error_response(err: &EvaluateError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::ComponentStatus;
     use async_trait::async_trait;
     use evaluate_api::{Answer, Evaluate, EvaluateRequest, EvaluateResponse, Usage};
     use http_body_util::BodyExt;
@@ -344,10 +358,19 @@ mod tests {
     struct Models(EvaluateModelStore, CapabilityStore);
 
     async fn call(models: Models, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        call_with_status(models, RuntimeStatus::new(), body).await
+    }
+
+    async fn call_with_status(
+        models: Models,
+        status: Arc<RuntimeStatus>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let Models(store, capabilities) = models;
         let response = post(
             Extension(Arc::new(RwLock::new(store))),
             Extension(Arc::new(RwLock::new(capabilities))),
+            Extension(status),
             Bytes::from(body.to_string()),
         )
         .await;
@@ -459,6 +482,7 @@ mod tests {
     /// into the row's `error_message`; a row without one is recorded as a success.
     async fn call_recording_task_history(
         store: Models,
+        status: Arc<RuntimeStatus>,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value, Vec<String>) {
         use tracing_subscriber::layer::SubscriberExt as _;
@@ -467,7 +491,7 @@ mod tests {
         // The handler runs on this thread, so a thread-local subscriber sees all of it.
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
-        let (status, json) = call(store, body).await;
+        let (status, json) = call_with_status(store, status, body).await;
         let errors = events
             .0
             .lock()
@@ -506,7 +530,8 @@ mod tests {
         let mut expected = Vec::new();
         let mut recorded = Vec::new();
         for (store, request, status, error) in cases {
-            let (got, _, errors) = call_recording_task_history(store, request.clone()).await;
+            let (got, _, errors) =
+                call_recording_task_history(store, RuntimeStatus::new(), request.clone()).await;
             expected.push((request.clone(), status, vec![error.to_string()]));
             recorded.push((request, got, errors));
         }
@@ -516,6 +541,7 @@ mod tests {
         // every request.
         let (status, _, errors) = call_recording_task_history(
             jev(),
+            RuntimeStatus::new(),
             json!({"model": "jev", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]}),
         )
         .await;
@@ -540,6 +566,41 @@ mod tests {
             body["error"]["message"],
             "Model 'missing' not found. Name a model under `models` in your Spicepod: a decision model such as `from: typesafe:jev`, or any chat model. See: https://spiceai.org/docs/components/models"
         );
+    }
+
+    /// A configured model that failed to load, or is still loading, is absent from the
+    /// store like an unknown one, but the 404 says why, as `/v1/chat/completions` does.
+    /// Task history records only which it is: the load error carries the provider's text.
+    #[tokio::test]
+    async fn an_unloaded_model_is_a_404_naming_why() {
+        let request = json!({"model": "deepseek", "input": "x", "questions": [{"type": "predicate", "instructions": "?"}]});
+        let cases = [
+            (
+                ComponentStatus::error_with_message(
+                    "Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance",
+                ),
+                "Model 'deepseek' failed to load, so it cannot serve requests. Cause: Failed to load LLM: deepseek. An error occurred: unknown_error: Insufficient Balance",
+            ),
+            (
+                ComponentStatus::Initializing,
+                "Model 'deepseek' is still loading. Retry once it is ready.",
+            ),
+        ];
+        let mut expected = Vec::new();
+        let mut recorded = Vec::new();
+        for (model_status, message) in cases {
+            let status = RuntimeStatus::new();
+            status.update_model("deepseek", model_status);
+            recorded.push(
+                call_recording_task_history(Models::default(), status, request.clone()).await,
+            );
+            expected.push((
+                StatusCode::NOT_FOUND,
+                json!({"error": {"message": message, "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}),
+                vec!["Evaluation of model 'deepseek' failed: model not loaded".to_string()],
+            ));
+        }
+        assert_eq!(recorded, expected);
     }
 
     #[tokio::test]
@@ -636,7 +697,13 @@ mod tests {
                     "message": {"role": "assistant", "content": "{\"answers\": {\"q000\": {\"billing\": 0.75, \"technical\": 0.25}}}"},
                     "finish_reason": "stop"
                 }],
-                "usage": {"prompt_tokens": 50, "completion_tokens": 9, "total_tokens": 59}
+                "usage": {
+                    "prompt_tokens": 50,
+                    "completion_tokens": 9,
+                    "total_tokens": 59,
+                    "prompt_tokens_details": {"cached_tokens": 12},
+                    "completion_tokens_details": {"reasoning_tokens": 4}
+                }
             }))
             .expect("chat completion"))
         }
@@ -670,7 +737,17 @@ mod tests {
             body["answers"][0]["probabilities"],
             json!([{"value": "technical", "probability": 0.25}, {"value": "billing", "probability": 0.75}])
         );
-        assert_eq!(body["usage"]["input_tokens"], 50);
+        assert_eq!(
+            body["usage"],
+            json!({
+                "input_tokens": 50,
+                "input_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 0},
+                "output_tokens": 9,
+                "output_tokens_details": {"reasoning_tokens": 4},
+                "total_tokens": 59
+            }),
+            "the chat model's cached and reasoning tokens are reported, as on `/v1/chat/completions`"
+        );
     }
 
     /// A chat model receives the requested level on its completion request.
