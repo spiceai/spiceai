@@ -52,6 +52,7 @@ use object_store_occ::lease::{LapseClock, RenewClock};
 use object_store_occ::{ConditionalWriteError, Expected, conditional_put};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::cluster::cluster_state::{ClusterState, SchedulerId};
@@ -152,22 +153,33 @@ impl SchedulerHeartbeatStore {
     }
 
     /// Records a read of `scheduler_id`'s heartbeat object at `version`
-    /// (`None`: no object) and returns how long this process has seen that
-    /// version unchanged.
-    pub fn observe(&self, scheduler_id: &str, version: Option<&UpdateVersion>) -> Duration {
-        self.lapse.observe(scheduler_id, version)
+    /// (`None`: no object), started at `read_at`, and returns how long this
+    /// process has seen that version unchanged.
+    pub fn observe(
+        &self,
+        scheduler_id: &str,
+        version: Option<&UpdateVersion>,
+        read_at: Instant,
+    ) -> Duration {
+        self.lapse.observe(scheduler_id, version, read_at)
     }
 
     /// Records that `scheduler_id`, registered by `instance_id`, has no
-    /// heartbeat object, and returns how long this process has seen it so.
-    /// Absence under another registration is another state, so each
-    /// registration has its own TTL to publish its first beat.
-    pub fn observe_missing(&self, scheduler_id: &str, instance_id: Uuid) -> Duration {
+    /// heartbeat object in a listing started at `listed_at`, and returns how
+    /// long this process has seen it so. Absence under another registration is
+    /// another state, so each registration has its own TTL to publish its
+    /// first beat.
+    pub fn observe_missing(
+        &self,
+        scheduler_id: &str,
+        instance_id: Uuid,
+        listed_at: Instant,
+    ) -> Duration {
         let absent = UpdateVersion {
             e_tag: None,
             version: Some(format!("absent; registered by {instance_id}")),
         };
-        self.lapse.observe(scheduler_id, Some(&absent))
+        self.lapse.observe(scheduler_id, Some(&absent), listed_at)
     }
 
     /// Returns the full path for a given scheduler id.
@@ -407,6 +419,7 @@ impl SchedulerHeartbeatStore {
             let Some(id) = rest.strip_suffix(".json") else {
                 continue;
             };
+            let read_at = Instant::now();
             match self.store.get(&path).await {
                 Ok(result) => {
                     let version = UpdateVersion {
@@ -419,7 +432,7 @@ impl SchedulerHeartbeatStore {
                     })?;
                     match serde_json::from_slice::<SchedulerHeartbeat>(&bytes) {
                         Ok(beat) => {
-                            let unchanged_for = self.observe(id, Some(&version));
+                            let unchanged_for = self.observe(id, Some(&version), read_at);
                             out.insert(
                                 id.to_string(),
                                 ObservedHeartbeat {
@@ -457,6 +470,7 @@ impl SchedulerHeartbeatStore {
     /// or they have no heartbeat file and this process has not yet seen it
     /// missing for their TTL.
     pub async fn list_alive(&self, cluster_state: &ClusterState) -> Result<HashSet<SchedulerId>> {
+        let listed_at = Instant::now();
         let all = self.list_all().await?;
         let mut alive = HashSet::with_capacity(cluster_state.schedulers.len());
         for (id, entry) in &cluster_state.schedulers {
@@ -465,7 +479,7 @@ impl SchedulerHeartbeatStore {
                     entry.instance_id == observed.beat.instance_id && !observed.lapsed()
                 }
                 None => {
-                    self.observe_missing(id, entry.instance_id)
+                    self.observe_missing(id, entry.instance_id, listed_at)
                         < Duration::from_millis(entry.ttl_ms)
                 }
             };

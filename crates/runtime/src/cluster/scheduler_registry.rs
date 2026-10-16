@@ -452,6 +452,7 @@ impl SchedulerRegistryRunner {
         let registration_lapse = LapseClock::default();
 
         let observed_version = loop {
+            let read_at = tokio::time::Instant::now();
             let observed = self
                 .heartbeats
                 .read_versioned(&self.scheduler_id)
@@ -464,8 +465,11 @@ impl SchedulerRegistryRunner {
                 .cluster
                 .mutate(|state| {
                     if let Some(existing) = state.schedulers.get(&scheduler_id) {
-                        let unchanged_for = registration_lapse
-                            .observe(&existing.instance_id.to_string(), observed_version.as_ref());
+                        let unchanged_for = registration_lapse.observe(
+                            &existing.instance_id.to_string(),
+                            observed_version.as_ref(),
+                            read_at,
+                        );
                         // Judge the registered entry by *its own* heartbeat. The
                         // key is shared, so a beat left by another incarnation says
                         // nothing about this entry: if a successor commits its

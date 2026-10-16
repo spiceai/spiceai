@@ -94,6 +94,7 @@ impl Reaper {
             .read()
             .await
             .map_err(|source| Error::ClusterRead { source })?;
+        let listed_at = tokio::time::Instant::now();
         let heartbeats = self
             .heartbeats
             .list_all()
@@ -116,7 +117,9 @@ impl Reaper {
                 None => {
                     // No heartbeat at all. Only reap once the entry has had
                     // its TTL, in this process's observation, to publish one.
-                    if self.heartbeats.observe_missing(id, entry.instance_id)
+                    if self
+                        .heartbeats
+                        .observe_missing(id, entry.instance_id, listed_at)
                         >= Duration::from_millis(entry.ttl_ms)
                     {
                         stale.push((id.clone(), entry.instance_id));
@@ -342,6 +345,124 @@ mod tests {
             assert!(r.tick().await.expect("tick").evicted.is_empty());
             tokio::time::advance(Duration::from_secs(10)).await;
         }
+    }
+
+    /// Object store whose next armed heartbeat read returns what the store held
+    /// when it was sent, a delay later.
+    #[derive(Debug)]
+    struct LateHeartbeatReads {
+        inner: Arc<dyn ObjectStore>,
+        delay: std::sync::Mutex<Option<Duration>>,
+    }
+
+    impl std::fmt::Display for LateHeartbeatReads {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LateHeartbeatReads")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for LateHeartbeatReads {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let result = self.inner.get_opts(location, options).await;
+            let delay = if location.as_ref().starts_with("heartbeats") {
+                self.delay.lock().expect("delay").take()
+            } else {
+                None
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            result
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A heartbeat read that reaches the reaper late shows the version the
+    /// store held when the read was sent, so the delay is no evidence that the
+    /// version stayed unchanged: the scheduler renews meanwhile and stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_read_that_returns_late_does_not_reap_a_live_scheduler() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let late = Arc::new(LateHeartbeatReads {
+            inner: Arc::clone(&store),
+            delay: std::sync::Mutex::new(None),
+        });
+        let cs = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        cs.bootstrap().await.expect("bootstrap");
+        let peer = SchedulerHeartbeatStore::new(Arc::clone(&store), "");
+        let id = Uuid::new_v4();
+        add_entry(&cs, entry("a", id, 0, 30_000)).await;
+        peer.heartbeat("a", id, 1_000, 30_000).await.expect("hb");
+
+        let late_store: Arc<dyn ObjectStore> = Arc::clone(&late) as Arc<dyn ObjectStore>;
+        let r = Reaper::new(
+            Arc::clone(&cs),
+            Arc::new(SchedulerHeartbeatStore::new(late_store, "")),
+        );
+        assert!(r.tick().await.expect("tick").evicted.is_empty());
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        *late.delay.lock().expect("delay") = Some(Duration::from_secs(25));
+        let renew = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            peer.heartbeat("a", id, 11_000, 30_000).await.expect("hb");
+        };
+        let (out, ()) = tokio::join!(r.tick(), renew);
+        assert!(
+            out.expect("tick").evicted.is_empty(),
+            "a read sent 10s after the first one shows 10s unchanged, not 35s"
+        );
+        assert!(cs.read().await.expect("read").schedulers.contains_key("a"));
     }
 
     /// Clock skew between schedulers cannot get a live one reaped: its

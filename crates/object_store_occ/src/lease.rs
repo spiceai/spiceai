@@ -26,7 +26,10 @@ limitations under the License.
 //!   version it read, so exactly one write wins each race.
 //! - A record lapses once one version of it has stayed unchanged, on the
 //!   observing process's own monotonic clock, for the duration its holder gave
-//!   it ([`LapseClock`]). No two machines' clocks are compared, so clock skew
+//!   it ([`LapseClock`]). That time runs from when the process first received
+//!   the version to the start of its latest read that returned it, so a slow
+//!   read is no evidence that the version stayed unchanged. No two machines'
+//!   clocks are compared, so clock skew
 //!   cannot expire a live holder. A process that has just started has seen no
 //!   version yet, so it judges no holder gone before it has watched one
 //!   version for that duration.
@@ -133,7 +136,7 @@ impl LeaseRecord {
     }
 }
 
-/// A version of an object and when this process first read it.
+/// A version of an object and when this process first received it.
 #[derive(Clone, Debug)]
 struct Seen {
     version: Option<UpdateVersion>,
@@ -141,11 +144,18 @@ struct Seen {
 }
 
 impl Seen {
-    /// Records a read of `version` (`None`: the object was absent) and returns
-    /// how long this process has seen that version unchanged.
-    fn observe(seen: &mut Option<Self>, version: Option<&UpdateVersion>) -> Duration {
+    /// Records a read of `version` (`None`: the object was absent) that started
+    /// at `read_at`, and returns how long this process has seen that version
+    /// unchanged.
+    fn observe(
+        seen: &mut Option<Self>,
+        version: Option<&UpdateVersion>,
+        read_at: Instant,
+    ) -> Duration {
         match seen {
-            Some(current) if current.version.as_ref() == version => current.since.elapsed(),
+            Some(current) if current.version.as_ref() == version => {
+                read_at.saturating_duration_since(current.since)
+            }
             _ => {
                 *seen = Some(Self {
                     version: version.cloned(),
@@ -167,16 +177,29 @@ pub struct LapseClock {
 impl LapseClock {
     /// Records a read of the object `key` at `version` (`None`: the object was
     /// absent) and returns how long this process has seen that version
-    /// unchanged. Zero the first time a version is seen.
-    pub fn observe(&self, key: &str, version: Option<&UpdateVersion>) -> Duration {
+    /// unchanged. `read_at` is when the read started, which bounds what it
+    /// shows. Zero the first time a version is seen.
+    pub fn observe(
+        &self,
+        key: &str,
+        version: Option<&UpdateVersion>,
+        read_at: Instant,
+    ) -> Duration {
         let mut seen = self.seen.lock();
-        Seen::observe(seen.entry(key.to_string()).or_default(), version)
+        Seen::observe(seen.entry(key.to_string()).or_default(), version, read_at)
     }
 
-    /// Whether the object `key`, read at `version`, has stayed unchanged for
-    /// `duration`. Records the read like [`Self::observe`].
-    pub fn lapsed(&self, key: &str, version: Option<&UpdateVersion>, duration: Duration) -> bool {
-        self.observe(key, version) >= duration
+    /// Whether the object `key`, read at `version` by a read that started at
+    /// `read_at`, has stayed unchanged for `duration`. Records the read like
+    /// [`Self::observe`].
+    pub fn lapsed(
+        &self,
+        key: &str,
+        version: Option<&UpdateVersion>,
+        read_at: Instant,
+        duration: Duration,
+    ) -> bool {
+        self.observe(key, version, read_at) >= duration
     }
 
     /// Forgets every object whose key `keep` rejects.
@@ -491,6 +514,7 @@ impl Lease {
         let refused: Mutex<Option<(LeaseRecord, Acquired)>> = Mutex::new(None);
 
         let role = retry_on_conflict(policy, || async {
+            let read_at = Instant::now();
             let observed = self.read(io, path).await?;
             if let Some(observed) = &observed {
                 // A refused write can still have landed: a retry after a lost
@@ -512,7 +536,7 @@ impl Lease {
                 }
             }
 
-            let unchanged_for = self.unchanged_for(observed.as_ref());
+            let unchanged_for = self.unchanged_for(observed.as_ref(), read_at);
             let now_ms = self.next_renew_time_ms();
             let (expected, record, acquired) = match plan(
                 observed.as_ref(),
@@ -672,11 +696,12 @@ impl Lease {
         }
     }
 
-    /// How long this holder has seen the lease's current version unchanged.
-    fn unchanged_for(&self, observed: Option<&ObservedLease>) -> Duration {
+    /// How long this holder has seen the lease's current version unchanged, as
+    /// of a read that started at `read_at`.
+    fn unchanged_for(&self, observed: Option<&ObservedLease>, read_at: Instant) -> Duration {
         let mut state = self.state.lock();
         match observed {
-            Some(observed) => Seen::observe(&mut state.seen, Some(&observed.version)),
+            Some(observed) => Seen::observe(&mut state.seen, Some(&observed.version), read_at),
             None => {
                 state.seen = None;
                 Duration::ZERO
@@ -1167,18 +1192,23 @@ mod tests {
         let clock = LapseClock::default();
         let v1 = version("1");
         // However long ago the holder wrote this version, a first read is no lapse.
-        assert!(!clock.lapsed("a", Some(&v1), Duration::from_secs(30)));
+        assert!(!clock.lapsed("a", Some(&v1), Instant::now(), Duration::from_secs(30)));
         tokio::time::advance(Duration::from_secs(29)).await;
-        assert!(!clock.lapsed("a", Some(&v1), Duration::from_secs(30)));
+        assert!(!clock.lapsed("a", Some(&v1), Instant::now(), Duration::from_secs(30)));
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(clock.lapsed("a", Some(&v1), Duration::from_secs(30)));
+        assert!(clock.lapsed("a", Some(&v1), Instant::now(), Duration::from_secs(30)));
         // A new version restarts the clock; so does an object that disappears.
-        assert!(!clock.lapsed("a", Some(&version("2")), Duration::from_secs(30)));
-        assert!(!clock.lapsed("a", None, Duration::from_secs(30)));
+        assert!(!clock.lapsed(
+            "a",
+            Some(&version("2")),
+            Instant::now(),
+            Duration::from_secs(30)
+        ));
+        assert!(!clock.lapsed("a", None, Instant::now(), Duration::from_secs(30)));
         tokio::time::advance(Duration::from_secs(30)).await;
-        assert!(clock.lapsed("a", None, Duration::from_secs(30)));
+        assert!(clock.lapsed("a", None, Instant::now(), Duration::from_secs(30)));
         clock.retain(|key| key != "a");
-        assert!(!clock.lapsed("a", None, Duration::from_secs(30)));
+        assert!(!clock.lapsed("a", None, Instant::now(), Duration::from_secs(30)));
     }
 
     #[tokio::test]
