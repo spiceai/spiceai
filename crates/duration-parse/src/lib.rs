@@ -697,6 +697,34 @@ mod tests {
         parse_duration("-5s").expect_err("negative duration should fail");
     }
 
+    /// A character where a number is expected is reported as a syntax error
+    /// naming that character, whether it is ASCII or not. A multi-byte
+    /// character must not be sliced at its first byte (regression test for
+    /// spiceai/spiceai#14202, where `runtime.query.timeout: 30秒` panicked
+    /// startup instead of being rejected).
+    #[test]
+    fn a_non_ascii_character_where_a_number_is_expected_is_a_syntax_error() {
+        let cases = [
+            ("秒", '秒'),
+            ("30秒", '秒'),
+            ("1h30秒", '秒'),
+            ("٣s", '٣'),
+            ("é", 'é'),
+            ("1_000", '_'),
+            ("0b11110", 'b'),
+        ];
+        for (input, found) in cases {
+            assert_eq!(
+                parse_duration(input),
+                Err(ParseError::Syntax {
+                    position: 0,
+                    message: format!("Expected a number, found '{found}'"),
+                }),
+                "input {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_format_zero() {
         assert_eq!(format_duration(Duration::ZERO), "0s");
