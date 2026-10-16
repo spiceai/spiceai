@@ -4104,7 +4104,13 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         // For caching mode, we always start ready since it fetches data on-demand.
-        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        // A `sink` has nothing to load either: its rows arrive only by write, so its
+        // acceleration — empty on a first start — already holds the whole dataset, and a scan
+        // must not fail while a refresh that reads no rows runs. A snapshot refresh is the
+        // exception, since its rows do arrive by refresh.
+        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
+            || (source.as_any().is::<SinkConnector>()
+                && !matches!(refresh_mode, RefreshMode::Snapshot));
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
