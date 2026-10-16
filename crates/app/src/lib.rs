@@ -397,21 +397,43 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 /// is read the way SQLite reads a URI: its filename ends at a `?` query or `#`
 /// fragment and its percent escapes are decoded, while a plain path is read as
 /// written. `file:meta%2Fone` is therefore `meta/one/cayenne.db`, not the literal
-/// `meta%2Fone/cayenne.db`. A URI whose escapes do not decode to UTF-8 is compared
-/// as written.
-fn comparable_metastore_dir(dir: &str) -> PathBuf {
+/// `meta%2Fone/cayenne.db`. A URI's query options are part of what it names, since
+/// they can choose another database for the same file (`mode=memory` opens no file
+/// at all), so two URIs name one metastore only when their options match too. A URI
+/// whose escapes do not decode to UTF-8 is compared by its decoded bytes, which no
+/// plain path equals.
+fn comparable_metastore_dir(dir: &str) -> ComparableMetastore {
+    let place = |path: &str| absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path));
     let catalog = format!("{dir}/cayenne.db");
     let path = fs_probe_path(&catalog);
-    let decoded = if catalog.starts_with("file:") {
-        let filename = path.split(['?', '#']).next().unwrap_or(path);
-        percent_encoding::percent_decode_str(filename)
-            .decode_utf8()
-            .ok()
-    } else {
-        None
+    if !catalog.starts_with("file:") {
+        return ComparableMetastore {
+            file: Ok(place(path)),
+            options: None,
+        };
+    }
+
+    let without_fragment = path.split('#').next().unwrap_or(path);
+    let (filename, options) = match without_fragment.split_once('?') {
+        Some((filename, options)) => (filename, Some(options.to_string())),
+        None => (without_fragment, None),
     };
-    let path = decoded.as_deref().unwrap_or(path);
-    absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path))
+    let decoded: Vec<u8> = percent_encoding::percent_decode_str(filename).collect();
+    let file = match String::from_utf8(decoded) {
+        Ok(filename) => Ok(place(&filename)),
+        Err(undecodable) => Err(undecodable.into_bytes()),
+    };
+    ComparableMetastore { file, options }
+}
+
+/// A metastore directory as [`comparable_metastore_dir`] compares it.
+#[derive(Debug, PartialEq, Eq)]
+struct ComparableMetastore {
+    /// The catalog file's absolute path, or a `file:` URI's decoded filename bytes
+    /// when they are not UTF-8.
+    file: Result<PathBuf, Vec<u8>>,
+    /// A `file:` URI's query options.
+    options: Option<String>,
 }
 
 pub struct AppBuilder {
@@ -1076,6 +1098,43 @@ mod tests {
         assert!(conflict("file:meta%2Fone", "meta%2Fone").is_some());
         assert!(conflict("file:meta%2Fone", "meta/one").is_none());
         assert!(conflict("file:shared?label=x", "shared").is_some());
+    }
+
+    /// A URI's query options can choose a different database for the same filename
+    /// (`mode=memory` opens no file at all), so two URIs that differ only in their
+    /// options are two metastores; the same URI spelled twice is one.
+    #[test]
+    fn cayenne_compares_a_file_uri_with_its_options() {
+        let conflict = |a: &str, b: &str| {
+            cayenne_metastore_dir_conflict(&[
+                cayenne_dataset("a", None, Some(a)),
+                cayenne_dataset("b", None, Some(b)),
+            ])
+        };
+
+        assert!(
+            conflict(
+                "file:meta?mode=memory&unused=",
+                "file:meta?mode=rwc&unused="
+            )
+            .is_some()
+        );
+        assert!(conflict("file:meta?mode=rwc&unused=", "file:meta?mode=rwc&unused=").is_none());
+    }
+
+    /// SQLite decodes a URI's escapes to bytes whether or not they form UTF-8, so
+    /// `file:meta%FF` opens a different file from the literal `meta%FF`.
+    #[test]
+    fn cayenne_compares_an_undecodable_file_uri_by_its_decoded_bytes() {
+        let conflict = |a: &str, b: &str| {
+            cayenne_metastore_dir_conflict(&[
+                cayenne_dataset("a", None, Some(a)),
+                cayenne_dataset("b", None, Some(b)),
+            ])
+        };
+
+        assert!(conflict("file:meta%FF", "meta%FF").is_some());
+        assert!(conflict("file:meta%FF", "file:meta%ff").is_none());
     }
 
     /// An object-store data path keeps its metastore at the default local
