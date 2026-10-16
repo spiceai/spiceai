@@ -874,6 +874,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_no_pushdown_of_aggregates_that_differ_by_a_cast() -> Result<()> {
+        use datafusion::physical_expr::expressions::CastExpr;
+
+        // `SUM(x)` and `SUM(CAST(x AS BIGINT))` are different sums (casting each row
+        // before summing is not casting the sum), and the remote engine names both
+        // `sum(x)`, so one remote query cannot return them.
+        let schema = lineitem_schema();
+        let flight = make_flight_exec(&schema, "foo.foo.lineitem", &[]);
+        let quantity: Arc<dyn PhysicalExpr> = Arc::new(Column::new("l_quantity", 0));
+        let sum_expr = AggregateExprBuilder::new(sum_udaf(), vec![Arc::clone(&quantity)])
+            .schema(Arc::clone(&schema))
+            .alias("sum(l_quantity)")
+            .build()?;
+        let sum_cast_expr = AggregateExprBuilder::new(
+            sum_udaf(),
+            vec![Arc::new(CastExpr::new(quantity, DataType::Int64, None))],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("sum(CAST(l_quantity AS Int64))")
+        .build()?;
+
+        assert_no_pushdown(partial_aggregate(
+            flight,
+            &[],
+            vec![Arc::new(sum_expr), Arc::new(sum_cast_expr)],
+        )?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_pushdown_through_projection_exec() -> Result<()> {
         use datafusion::physical_expr::expressions::BinaryExpr;
         use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
