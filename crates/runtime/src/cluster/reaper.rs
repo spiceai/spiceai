@@ -291,7 +291,7 @@ mod tests {
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
         // A reaper that has just started has seen no version yet.
         assert!(r.tick().await.expect("tick").evicted.is_empty());
-        tokio::time::advance(TTL - Duration::from_secs(1)).await;
+        tokio::time::advance(TTL.saturating_sub(Duration::from_secs(1))).await;
         assert!(r.tick().await.expect("tick").evicted.is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
         let out = r.tick().await.expect("tick");
@@ -326,7 +326,7 @@ mod tests {
 
         add_entry(&cs, entry("a", Uuid::new_v4(), 0, 30_000)).await;
         assert!(r.tick().await.expect("tick").evicted.is_empty());
-        tokio::time::advance(TTL - Duration::from_secs(1)).await;
+        tokio::time::advance(TTL.saturating_sub(Duration::from_secs(1))).await;
         assert!(r.tick().await.expect("tick").evicted.is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(r.tick().await.expect("tick").evicted, vec!["a".to_string()]);

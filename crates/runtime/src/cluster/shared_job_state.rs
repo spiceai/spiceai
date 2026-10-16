@@ -1480,20 +1480,20 @@ mod tests {
             .await
             .expect("submit");
 
-        let (taker, retaker, taken) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
+        let (taker, retaker, job_id) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
         *racing.before_meta_read.lock().await = Some(Box::pin(async move {
             taker
-                .try_acquire_job(&taken)
+                .try_acquire_job(&job_id)
                 .await
                 .expect("acquire")
                 .expect("another scheduler takes the job over");
             retaker
-                .try_acquire_job(&taken)
+                .try_acquire_job(&job_id)
                 .await
                 .expect("acquire")
                 .expect("the first owner takes the job back");
             retaker
-                .save_job(&taken, &running_graph(&retaker, "current"))
+                .save_job(&job_id, &running_graph(&retaker, "current"))
                 .await
                 .expect("the current generation saves");
         }));
@@ -1544,20 +1544,20 @@ mod tests {
             .await
             .expect("submit");
 
-        let (taker, retaker, taken) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
+        let (taker, retaker, job_id) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
         *racing.after_meta_write.lock().await = Some(Box::pin(async move {
             taker
-                .try_acquire_job(&taken)
+                .try_acquire_job(&job_id)
                 .await
                 .expect("acquire")
                 .expect("another scheduler takes the job over");
             retaker
-                .try_acquire_job(&taken)
+                .try_acquire_job(&job_id)
                 .await
                 .expect("acquire")
                 .expect("the first owner takes the job back");
             retaker
-                .save_job(&taken, &running_graph(&retaker, "current"))
+                .save_job(&job_id, &running_graph(&retaker, "current"))
                 .await
                 .expect("the current generation saves");
         }));

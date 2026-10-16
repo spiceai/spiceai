@@ -42,7 +42,7 @@ enum Start {
     Submitted,
     /// It was taken over from a scheduler that stopped: this is the state the
     /// takeover wrote.
-    TakenOver(JobState),
+    TakenOver(Box<JobState>),
 }
 
 /// Logs how a job's background task ended. A driver that another scheduler
@@ -251,7 +251,7 @@ impl JobExecutor {
                     &job_id_owned,
                     &active_jobs,
                     cancel_token,
-                    Start::TakenOver(taken),
+                    Start::TakenOver(Box::new(taken)),
                 )
                 .await;
 
@@ -405,7 +405,7 @@ impl JobExecutor {
                 Err(Error::JobAlreadyFinished { .. }) => return Ok(()),
                 Err(e) => return Err(e),
             },
-            Start::TakenOver(state) => state,
+            Start::TakenOver(state) => *state,
         };
         // Every write this task makes for the job is refused once another
         // scheduler takes the job over.

@@ -700,12 +700,11 @@ impl Lease {
     /// of a read that started at `read_at`.
     fn unchanged_for(&self, observed: Option<&ObservedLease>, read_at: Instant) -> Duration {
         let mut state = self.state.lock();
-        match observed {
-            Some(observed) => Seen::observe(&mut state.seen, Some(&observed.version), read_at),
-            None => {
-                state.seen = None;
-                Duration::ZERO
-            }
+        if let Some(observed) = observed {
+            Seen::observe(&mut state.seen, Some(&observed.version), read_at)
+        } else {
+            state.seen = None;
+            Duration::ZERO
         }
     }
 }
@@ -1264,7 +1263,7 @@ mod tests {
                     assert_eq!(acquired, Acquired::Created);
                 }
                 Role::Standby { holder, .. } => {
-                    assert_eq!(holder.as_deref(), Some(winner.as_str()))
+                    assert_eq!(holder.as_deref(), Some(winner.as_str()));
                 }
                 Role::Unsupported => panic!("the in-memory store writes conditionally"),
             }
