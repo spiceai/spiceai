@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Guards for upstream `DataFusion` wrong-results fixes that the `spiceai-54` fork
-//! carries as backports (see `docs/dev/fork_patches.md`). Each test runs the
-//! fix's upstream regression query in a session built from the configuration
-//! every Spice session starts from, and fails if the backport is lost when the
+//! Guards for `DataFusion` wrong-results fixes that the `spiceai-55` fork
+//! carries, as backports or as its own patches (see `docs/dev/fork_patches.md`).
+//! Each test runs the fix's regression query in a session built from the
+//! configuration every Spice session starts from, and fails if the fix is lost when the
 //! fork is re-cut.
 
 use std::path::Path;
@@ -404,33 +404,43 @@ async fn a_cast_aggregate_is_not_answered_from_uncast_statistics() {
     );
 }
 
-/// apache/datafusion#23095. `unwrap_cast` rewrote `CAST(price AS BIGINT) = 173665`
-/// over a `DECIMAL(15, 2)` column into `price = 173665.00`, as if a cast that
-/// truncates two fractional digits kept every value apart; the filter then kept
-/// only a row equal to the literal instead of the four whose truncated value is
-/// 173665 ([#14969](https://github.com/spiceai/spiceai/issues/14969)). A cast to
-/// a decimal of smaller scale rounds the same way. The cast to a larger scale is
-/// the control: it is injective, so that filter is still folded onto the column.
+/// spiceai/datafusion#262, for the class apache/datafusion#23095 tracks.
+/// `unwrap_cast` rewrote `CAST(price AS BIGINT) = 173665` over a `DECIMAL(15, 2)`
+/// column into `price = 173665.00`, as if a cast that truncates two fractional
+/// digits kept every value apart; the filter then kept only a row equal to the
+/// literal instead of the four whose truncated value is 173665 (#14969). A cast
+/// to a decimal of smaller scale rounds the same way. The cast to a larger scale
+/// is the control: it is injective, so that filter is still folded onto the
+/// column.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast() {
     let ctx = spice_session(|_| {});
     run_statements(
         &ctx,
-        &["CREATE TABLE decimal_narrow(k INT, price DECIMAL(15, 2)) AS VALUES           (1, 173664.94), (2, 173665.29), (3, 173665.47), (4, 173665.73),           (5, 173665.91), (6, 173666.04), (7, 205623.50), (8, 193846.25)"],
+        &[
+            "CREATE TABLE decimal_narrow(k INT, price DECIMAL(15, 2)) AS VALUES \
+          (1, 173664.94), (2, 173665.29), (3, 173665.47), (4, 173665.73), \
+          (5, 173665.91), (6, 173666.04), (7, 205623.50), (8, 193846.25)",
+        ],
     )
     .await;
-    let cases: [(&str, &[&str]); 7] = [
+    let cases: [(&str, &[&str]); 8] = [
         (
             "SELECT k FROM decimal_narrow WHERE CAST(price AS BIGINT) = 173665 ORDER BY k",
             &["2", "3", "4", "5"],
         ),
         (
-            "SELECT k FROM decimal_narrow WHERE CAST(price AS BIGINT) > 173664              AND CAST(price AS BIGINT) < 173666 ORDER BY k",
+            "SELECT k FROM decimal_narrow WHERE CAST(price AS BIGINT) > 173664 \
+             AND CAST(price AS BIGINT) < 173666 ORDER BY k",
             &["2", "3", "4", "5"],
         ),
         (
             "SELECT k FROM decimal_narrow WHERE CAST(price AS BIGINT) <= 173665 ORDER BY k",
             &["1", "2", "3", "4", "5"],
+        ),
+        (
+            "SELECT k FROM decimal_narrow WHERE CAST(price AS BIGINT) <> 173665 ORDER BY k",
+            &["1", "6", "7", "8"],
         ),
         (
             "SELECT k FROM decimal_narrow WHERE CAST(price AS INT) IN (173665) ORDER BY k",
@@ -452,20 +462,16 @@ async fn a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast() {
     for (sql, expected) in cases {
         assert_eq!(answer(&ctx, sql).await, Ok(owned(expected)), "{sql}");
     }
-    let plan = ctx
-        .sql("EXPLAIN SELECT k FROM decimal_narrow WHERE CAST(price AS DECIMAL(20, 4)) = CAST(173665.29 AS DECIMAL(20, 4))")
-        .await
-        .expect("explain plans")
-        .collect()
-        .await
-        .expect("explain runs");
-    let rendered = arrow::util::pretty::pretty_format_batches(&plan)
-        .expect("explain renders")
-        .to_string();
+    let plan = answer(
+        &ctx,
+        "EXPLAIN SELECT k FROM decimal_narrow WHERE CAST(price AS DECIMAL(20, 4)) = CAST(173665.29 AS DECIMAL(20, 4))",
+    )
+    .await
+    .expect("explain runs")
+    .join("\n");
     assert!(
-        rendered.contains("price = Decimal128(173665.29,15,2)"),
-        "the widening cast still folds onto the column:
-{rendered}"
+        plan.contains("price = Decimal128(173665.29,15,2)"),
+        "the widening cast still folds onto the column:\n{plan}"
     );
 }
 
