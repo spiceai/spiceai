@@ -475,7 +475,8 @@ impl JobExecutor {
             Error::UnableToExecuteQuery { .. }
             | Error::TableAccessDisallowed { .. }
             | Error::AcceleratedTableNotSupportedInDistributedQuery { .. }
-            | Error::CayenneCatalogTableNotSupportedInDistributedQuery { .. } => {
+            | Error::CayenneCatalogTableNotSupportedInDistributedQuery { .. }
+            | Error::TaskHistoryNotSupportedInDistributedQuery { .. } => {
                 JobErrorCode::ExecutionFailed
             }
             Error::BindingParameters { .. } => JobErrorCode::ParameterBindingFailed,
