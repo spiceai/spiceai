@@ -129,6 +129,14 @@ pub fn record_snapshot_failure(dataset: &str) {
     SNAPSHOT_FAILURE_COUNT.add(1, &labels);
 }
 
+/// Publishes `dataset`'s snapshot failure count at zero, so a dataset that creates
+/// snapshots reports the series before its first failure and an alert can fire on
+/// the rise. Call it only for a dataset that creates snapshots: one that does not
+/// has no failure count to report.
+pub fn publish_snapshot_failure_count_at_zero(dataset: &str) {
+    SNAPSHOT_FAILURE_COUNT.add(0, &[dataset_label(dataset)]);
+}
+
 pub fn record_write_metrics(
     dataset: &str,
     timestamp_secs: i64,
