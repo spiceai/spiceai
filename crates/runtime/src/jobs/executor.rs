@@ -309,7 +309,13 @@ impl JobExecutor {
         Ok(jobs)
     }
 
-    /// Deletes jobs whose results have expired, with their result chunks.
+    /// The query engine jobs run on.
+    pub(crate) fn datafusion(&self) -> &Arc<DataFusion> {
+        &self.df
+    }
+
+    /// Deletes, with their result chunks, the jobs whose results expired and the
+    /// jobs that failed or were cancelled at least the result TTL ago.
     ///
     /// Returns how many were deleted.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {

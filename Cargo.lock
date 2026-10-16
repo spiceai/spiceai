@@ -6420,6 +6420,7 @@ dependencies = [
  "fundu",
  "governor",
  "object_store 0.13.2",
+ "object_store_occ",
  "opentelemetry 0.32.0",
  "runtime-api-types",
  "runtime-metrics",

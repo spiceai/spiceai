@@ -42,9 +42,13 @@ use uuid::Uuid;
 use crate::Runtime;
 use crate::cluster::cluster_state::{
     self, ClusterStateStore, MutateError, MutateOk, MutationOutcome, SchedulerEntry,
+    TableEntryChanges, UNREGISTERED_TABLE_RETENTION,
 };
 use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
 use crate::cluster::reaper::Reaper;
+use crate::datafusion::DataFusion;
+use datafusion::common::TableReference;
+use object_store_occ::cleanup;
 use runtime_metrics::cluster as cluster_metrics;
 
 const DEFAULT_TTL_MS: u64 = 30_000;
@@ -92,9 +96,6 @@ fn worst_case_tick(ttl_ms: u64) -> Duration {
 
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
-/// How often a scheduler deletes jobs whose results expired. Expired jobs already
-/// read as expired; this only reclaims their state and result chunks.
-const JOB_CLEANUP_INTERVAL: Duration = Duration::from_mins(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
@@ -259,6 +260,84 @@ pub async fn start_scheduler_registry(
     result
 }
 
+/// What one scheduler cleanup pass did.
+struct CleanupPass {
+    jobs: crate::jobs::Result<usize>,
+    tables: std::result::Result<TableEntryChanges, MutateError>,
+}
+
+impl CleanupPass {
+    fn log(&self) {
+        tracing::debug!(
+            jobs_deleted = self.jobs.as_ref().ok(),
+            tables_removed = self
+                .tables
+                .as_ref()
+                .ok()
+                .map(|changes| changes.removed.len()),
+            "State cleanup pass finished"
+        );
+        match &self.jobs {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                "State cleanup deleted {deleted} async query jobs, with their results, that finished more than {} ago.",
+                cleanup::describe(cleanup::age(crate::jobs::DEFAULT_RESULT_TTL))
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to delete finished async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
+            ),
+        }
+        match &self.tables {
+            Ok(changes) if changes.removed.is_empty() => {}
+            Ok(changes) => tracing::info!(
+                "State cleanup removed {} tables from the cluster state, as no scheduler has had them registered for {}: {}.",
+                changes.removed.len(),
+                cleanup::describe(cleanup::age(UNREGISTERED_TABLE_RETENTION)),
+                changes
+                    .removed
+                    .iter()
+                    .map(|table| format!("'{table}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to remove unregistered tables from the cluster state, so they stay until the next attempt: {err}"
+            ),
+        }
+    }
+}
+
+/// Records in the cluster document which of its tables this scheduler has
+/// registered, which removes the entries of tables no scheduler has registered
+/// for [`UNREGISTERED_TABLE_RETENTION`].
+async fn reconcile_table_entries(
+    cluster: &ClusterStateStore,
+    df: &DataFusion,
+) -> std::result::Result<TableEntryChanges, MutateError> {
+    let state = cluster.read().await?;
+    let mut registered = HashMap::new();
+    for table in state.accelerations.keys().chain(state.catalog.keys()) {
+        if !registered.contains_key(table) {
+            registered.insert(table.clone(), is_registered(df, table).await);
+        }
+    }
+    cluster.reconcile_table_entries(&registered).await
+}
+
+/// Whether `table`, a table entry's `catalog.schema.table` name, resolves to a
+/// table this scheduler has registered. A name that does not split into exactly
+/// three parts cannot be resolved without guessing where its dots belong, so it
+/// counts as registered and its entry stays.
+async fn is_registered(df: &DataFusion, table: &str) -> bool {
+    let parts: Vec<&str> = table.split('.').collect();
+    let [catalog, schema, name] = parts.as_slice() else {
+        return true;
+    };
+    df.get_table(&TableReference::full(*catalog, *schema, *name))
+        .await
+        .is_some()
+}
+
 /// Resumes any running job whose recorded scheduler instance is not currently
 /// live. Each driving scheduler records its own `instance_id` on the job, and
 /// this scheduler's id is always treated as live so it never reclaims its own
@@ -321,13 +400,10 @@ impl SchedulerRegistryRunner {
             tokio::time::Instant::now() + JOB_RECOVERY_INTERVAL,
             JOB_RECOVERY_INTERVAL,
         );
-        let mut cleanup_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + JOB_CLEANUP_INTERVAL,
-            JOB_CLEANUP_INTERVAL,
-        );
-        // A cleanup pass issues requests for as long as there are expired jobs to delete,
-        // so it runs beside the other arms rather than inside one: a long pass must not
-        // hold up the heartbeat that tells peers this scheduler is alive.
+        let mut next_cleanup = std::pin::pin!(tokio::time::sleep(cleanup::next_pass_delay()));
+        // A cleanup pass issues requests for as long as there is state to delete, so it
+        // runs beside the other arms rather than inside one: a long pass must not hold up
+        // the heartbeat that tells peers this scheduler is alive.
         let mut cleanup = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
@@ -372,20 +448,28 @@ impl SchedulerRegistryRunner {
                 _ = recovery_tick.tick() => {
                     recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
                 }
-                _ = cleanup_tick.tick(), if cleanup.is_terminated() => {
-                    cleanup.set(self.job_executor.cleanup_expired_jobs().fuse());
+                () = &mut next_cleanup, if cleanup.is_terminated() => {
+                    cleanup.set(self.cleanup_pass().fuse());
                 }
-                result = &mut cleanup => match result {
-                    Ok(0) => {}
-                    Ok(deleted) => tracing::debug!(deleted, "Deleted expired async query jobs"),
-                    Err(err) => tracing::warn!(
-                        "Failed to delete expired async query jobs, so their results stay in the scheduler state location until the next attempt: {err}"
-                    ),
-                },
+                pass = &mut cleanup => {
+                    pass.log();
+                    next_cleanup
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + cleanup::next_pass_delay());
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Deletes the async query jobs that finished long enough ago, and removes the
+    /// entries of tables no scheduler has had registered for
+    /// [`UNREGISTERED_TABLE_RETENTION`].
+    async fn cleanup_pass(&self) -> CleanupPass {
+        let jobs = self.job_executor.cleanup_expired_jobs().await;
+        let tables = reconcile_table_entries(&self.cluster, self.job_executor.datafusion()).await;
+        CleanupPass { jobs, tables }
     }
 
     async fn register_self(&self) -> Result<()> {

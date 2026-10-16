@@ -282,6 +282,7 @@ mod tests {
             schema_version: 1,
             updated_at: 1,
             partition_expressions: vec!["date".into()],
+            unregistered_at_ms: None,
         };
 
         assert!(
@@ -312,6 +313,7 @@ mod tests {
             schema_version: 1,
             updated_at: 1,
             partition_expressions: vec!["date".into()],
+            unregistered_at_ms: None,
         };
 
         assert!(
@@ -333,6 +335,7 @@ mod tests {
             schema_version: 1,
             updated_at: 0,
             partition_expressions: vec![],
+            unregistered_at_ms: None,
         };
         assert!(
             !tracker
