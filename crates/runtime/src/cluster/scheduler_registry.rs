@@ -212,7 +212,8 @@ pub async fn start_scheduler_registry(
 
     let scheduler_id = datafusion.cluster_config.instance_id().to_string();
 
-    let instance_id = util::instance_id::process_id();
+    // A new id for each run, so two runs of one instance never share it.
+    let instance_id = Uuid::now_v7();
     let now = now_ms()?;
     let entry = SchedulerEntry {
         scheduler_id: scheduler_id.clone(),
@@ -658,7 +659,7 @@ impl SchedulerRegistryRunner {
 
     async fn send_heartbeat(&self) -> Result<()> {
         // `scheduler_id` is the instance identity and so is stable across
-        // restarts, while `instance_id` is per-process. Two incarnations can
+        // restarts, while `instance_id` is new for each run. Two incarnations can
         // therefore share the heartbeat key, and registration deliberately
         // lets a new one take over once the old looks stale. An incarnation
         // that has been superseded must stop claiming the id: otherwise it

@@ -171,7 +171,8 @@ pub struct JobState {
     /// Query parameters if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
-    /// The process driving this job: the per-process id of its scheduler.
+    /// The scheduler run driving this job: the id its scheduler took when it
+    /// started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduler_node: Option<String>,
     /// The generation under which `scheduler_node` drives the job. Starting

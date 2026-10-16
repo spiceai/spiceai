@@ -20,12 +20,13 @@ limitations under the License.
 //! scheduler in the cluster can read a job's status and, if the owning
 //! scheduler is lost, take ownership and resume driving it to completion.
 //!
-//! Ownership follows [`object_store_occ::lease`]: the owner is the owning
-//! scheduler's process ([`util::instance_id::process_id`]), and `epoch` is the
-//! generation it owns the job under. Every ownership transfer takes the next
-//! generation, and every save checks both the owner and the generation the
-//! saver acquired the job under, so a scheduler that is presumed dead but later
-//! resurfaces, or a save begun under an earlier generation, is refused.
+//! Ownership follows [`object_store_occ::lease`]: the owner is an id the
+//! owning scheduler takes when it starts, so no two scheduler runs share it,
+//! and `epoch` is the generation it owns the job under. Every ownership
+//! transfer takes the next generation, and every save checks both the owner and
+//! the generation the saver acquired the job under, so a scheduler that is
+//! presumed dead but later resurfaces, or a save begun under an earlier
+//! generation, is refused.
 //!
 //! Every write is conditional. Metadata writes are bound to the version they
 //! were computed from. A graph write lands only over the graph its owner last
@@ -172,7 +173,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
         let meta = object_store_occ::ObjectState::new(Arc::clone(&store))
             .with_prefix(format!("{base}/scheduler/meta/"));
         Self {
-            owner_instance_id: util::instance_id::process_id(),
+            owner_instance_id: Uuid::now_v7(),
             scheduler: scheduler.into(),
             store,
             graph_prefix: format!("{base}/scheduler/graph"),
@@ -795,17 +796,14 @@ mod tests {
     fn test_state_on(store: Arc<dyn ObjectStore>) -> TestState {
         let config_producer: ConfigProducer = Arc::new(SessionConfig::new);
         let session_builder: SessionBuilder = Arc::new(|_cfg| Ok(SessionContext::new().state()));
-        let mut state = SharedJobState::new(
+        SharedJobState::new(
             "scheduler-test",
             store,
             "",
             BallistaCodec::default(),
             session_builder,
             config_producer,
-        );
-        // Each test state stands for a scheduler in its own process.
-        state.owner_instance_id = Uuid::new_v4();
-        state
+        )
     }
 
     fn job_status(job_id: &str, status: Status) -> JobStatus {
