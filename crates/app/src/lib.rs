@@ -44,7 +44,7 @@ use spicepod::{
     param::Params,
 };
 use util::in_tracing_context;
-use util::spice_paths::{absolute_dir, cayenne_metastore_dir, fs_probe_path, is_local_path};
+use util::spice_paths::{absolute_dir, cayenne_metastore_dir, fs_probe_path};
 
 pub mod runtime;
 
@@ -378,10 +378,12 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
     )
 }
 
-/// A metastore directory in the form two datasets' directories are compared in: a
-/// `file:` scheme stripped the way the accelerator strips it ([`fs_probe_path`]), a
-/// local path placed against the working directory the way the accelerator places it
-/// ([`absolute_dir`]), compared by component, so `./.spice/data/metadata`,
+/// A metastore directory in the form two datasets' directories are compared in: the
+/// catalog file the accelerator opens in it, `{dir}/cayenne.db` built the way the
+/// accelerator builds it (so an empty directory is `/cayenne.db`, not the working
+/// directory), with a `file:` scheme stripped the way the accelerator strips it
+/// ([`fs_probe_path`]) and placed against the working directory the way the
+/// accelerator places it ([`absolute_dir`]), compared by component, so `./.spice/data/metadata`,
 /// `file:///<cwd>/.spice/data/metadata` and the default `<cwd>/.spice/data/metadata`
 /// compare equal, a trailing separator or a `.` component does not make two
 /// directories differ, and the root `/` stays the root. Nothing is read from disk,
@@ -389,13 +391,12 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 /// names a different directory from `<base>/meta` when `link` is a symlink, and a
 /// check that folded it would pass two metastores off as one. Two spellings that
 /// meet only through `..` or a symlink therefore read as two directories; spell the
-/// shared directory the same way on every dataset. An object-store URL compares as
-/// written, by component.
+/// shared directory the same way on every dataset. The metastore is always opened on
+/// the local filesystem, so a directory that reads like a URL (`meta://shared`) is a
+/// local path too.
 fn comparable_metastore_dir(dir: &str) -> PathBuf {
-    if !is_local_path(dir) {
-        return PathBuf::from(dir);
-    }
-    let path = fs_probe_path(dir);
+    let catalog = format!("{dir}/cayenne.db");
+    let path = fs_probe_path(&catalog);
     absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
@@ -1008,6 +1009,38 @@ mod tests {
         let absolute = cwd.join("meta").to_string_lossy().into_owned();
         let datasets = vec![
             cayenne_dataset("relative", None, Some("./meta")),
+            cayenne_dataset("absolute", None, Some(&absolute)),
+        ];
+
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
+    }
+
+    /// An empty `cayenne_metadata_dir` puts the catalog at `/cayenne.db`, not in the
+    /// working directory, so it is a different metastore from the working directory.
+    #[test]
+    fn cayenne_keeps_an_empty_metadata_dir_distinct_from_the_working_directory() {
+        let cwd = std::env::current_dir().expect("the working directory is readable");
+        let datasets = vec![
+            cayenne_dataset("empty", Some("/mnt/a/cayenne"), Some("")),
+            cayenne_dataset(
+                "at_cwd",
+                Some("/mnt/b/cayenne"),
+                Some(&cwd.to_string_lossy()),
+            ),
+        ];
+
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_some());
+    }
+
+    /// The metastore is always opened on the local filesystem, so a metadata
+    /// directory that reads like a URL is a relative local path, the same metastore
+    /// as its absolute spelling.
+    #[test]
+    fn cayenne_places_a_url_like_metadata_dir_against_the_working_directory() {
+        let cwd = std::env::current_dir().expect("the working directory is readable");
+        let absolute = cwd.join("meta://shared").to_string_lossy().into_owned();
+        let datasets = vec![
+            cayenne_dataset("relative", None, Some("meta://shared")),
             cayenne_dataset("absolute", None, Some(&absolute)),
         ];
 
