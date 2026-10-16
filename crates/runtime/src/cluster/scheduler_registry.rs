@@ -98,35 +98,6 @@ fn worst_case_tick(ttl_ms: u64) -> Duration {
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const JOB_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_DIVISOR: u64 = 3;
-/// How often a scheduler deletes the heartbeat files of schedulers that left
-/// the cluster, before a random delay of up to half of it either way.
-const HEARTBEAT_CLEANUP_INTERVAL: Duration = Duration::from_hours(1);
-
-/// The heartbeat cleanup's interval and retention. A development build takes
-/// overrides, in milliseconds, from `SPICED_DEV_HEARTBEAT_CLEANUP_INTERVAL_MS`
-/// and `SPICED_DEV_HEARTBEAT_RETENTION_MS`, so an end-to-end test can run the
-/// cleanup in seconds.
-fn heartbeat_cleanup_timing() -> (Duration, Duration) {
-    let overridden = |name: &str, default: Duration| {
-        if !cfg!(feature = "dev") {
-            return default;
-        }
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .map_or(default, Duration::from_millis)
-    };
-    (
-        overridden(
-            "SPICED_DEV_HEARTBEAT_CLEANUP_INTERVAL_MS",
-            HEARTBEAT_CLEANUP_INTERVAL,
-        ),
-        overridden(
-            "SPICED_DEV_HEARTBEAT_RETENTION_MS",
-            reaper::HEARTBEAT_RETENTION,
-        ),
-    )
-}
 
 /// Compare-and-set attempts for one heartbeat before skipping this beat.
 /// Contention means another incarnation is writing the same key, which is
@@ -288,6 +259,7 @@ pub async fn start_scheduler_registry(
 struct CleanupPass {
     jobs: crate::jobs::Result<usize>,
     tables: std::result::Result<TableEntryChanges, MutateError>,
+    heartbeats: reaper::Result<usize>,
 }
 
 impl CleanupPass {
@@ -299,6 +271,7 @@ impl CleanupPass {
                 .as_ref()
                 .ok()
                 .map(|changes| changes.removed.len()),
+            heartbeat_files_deleted = self.heartbeats.as_ref().ok(),
             "State cleanup pass finished"
         );
         match &self.jobs {
@@ -326,6 +299,16 @@ impl CleanupPass {
             ),
             Err(err) => tracing::warn!(
                 "Failed to remove unregistered tables from the cluster state, so they stay until the next attempt: {err}"
+            ),
+        }
+        match &self.heartbeats {
+            Ok(0) => {}
+            Ok(deleted) => tracing::info!(
+                "State cleanup deleted {deleted} heartbeat files of schedulers that left the cluster more than {} ago.",
+                cleanup::describe(cleanup::age(reaper::HEARTBEAT_RETENTION))
+            ),
+            Err(err) => tracing::warn!(
+                "Failed to delete the heartbeat files of schedulers that left the cluster, so they stay in the scheduler state location until the next attempt: {err}"
             ),
         }
     }
@@ -430,12 +413,6 @@ impl SchedulerRegistryRunner {
         // not hold up the heartbeat that tells peers this scheduler is alive.
         let mut recovery = std::pin::pin!(Fuse::terminated());
         let mut cleanup = std::pin::pin!(Fuse::terminated());
-        let (heartbeat_cleanup_interval, heartbeat_retention) = heartbeat_cleanup_timing();
-        let mut heartbeat_cleanup_due = std::pin::pin!(tokio::time::sleep(heartbeat::jitter(
-            heartbeat_cleanup_interval,
-            0.5
-        )));
-        let mut heartbeat_cleanup = std::pin::pin!(Fuse::terminated());
 
         // Run an initial discovery so peers are populated promptly.
         if let Err(err) = self.refresh_peers().await {
@@ -487,41 +464,29 @@ impl SchedulerRegistryRunner {
                         .as_mut()
                         .reset(tokio::time::Instant::now() + cleanup::next_pass_delay());
                 }
-                () = &mut heartbeat_cleanup_due, if heartbeat_cleanup.is_terminated() => {
-                    heartbeat_cleanup.set(
-                        self.reaper
-                            .delete_departed_heartbeats(heartbeat_retention)
-                            .fuse(),
-                    );
-                }
-                result = &mut heartbeat_cleanup => {
-                    match result {
-                        Ok(deleted) => tracing::info!(
-                            "{}",
-                            reaper::heartbeat_cleanup_message(deleted, heartbeat_retention)
-                        ),
-                        Err(err) => tracing::warn!(
-                            "Failed to delete the heartbeat files of schedulers that left the cluster, so they stay in the scheduler state location until the next attempt: {err}"
-                        ),
-                    }
-                    heartbeat_cleanup_due.as_mut().reset(
-                        tokio::time::Instant::now()
-                            + heartbeat::jitter(heartbeat_cleanup_interval, 0.5),
-                    );
-                }
             }
         }
 
         Ok(())
     }
 
-    /// Deletes the async query jobs that finished long enough ago, and removes the
+    /// Deletes the async query jobs that finished long enough ago, removes the
     /// entries of tables no scheduler has had registered for
-    /// [`UNREGISTERED_TABLE_RETENTION`].
+    /// [`UNREGISTERED_TABLE_RETENTION`], and deletes the heartbeat files of
+    /// schedulers that left the cluster, once a file is
+    /// [`reaper::HEARTBEAT_RETENTION`] old.
     async fn cleanup_pass(&self) -> CleanupPass {
         let jobs = self.job_executor.cleanup_expired_jobs().await;
         let tables = reconcile_table_entries(&self.cluster, self.job_executor.datafusion()).await;
-        CleanupPass { jobs, tables }
+        let heartbeats = self
+            .reaper
+            .delete_departed_heartbeats(cleanup::age(reaper::HEARTBEAT_RETENTION))
+            .await;
+        CleanupPass {
+            jobs,
+            tables,
+            heartbeats,
+        }
     }
 
     async fn register_self(&self) -> Result<()> {
@@ -3269,8 +3234,8 @@ mod tests {
         }
     }
 
-    /// A heartbeat cleanup pass that stalls must not hold up the heartbeat that
-    /// tells peers this scheduler is alive.
+    /// A state cleanup pass that stalls deleting a departed scheduler's heartbeat
+    /// file must not hold up the heartbeat that tells peers this scheduler is alive.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_heartbeat_cleanup_does_not_hold_up_the_heartbeat() {
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -3290,7 +3255,7 @@ mod tests {
 
         // Past the longest delay before the first cleanup: the pass has started
         // and stalled on its delete.
-        tokio::time::sleep(HEARTBEAT_CLEANUP_INTERVAL * 2).await;
+        tokio::time::sleep(cleanup::PASS_INTERVAL * 2).await;
         assert_eq!(wrapper.deletes.load(Ordering::SeqCst), 1);
 
         let path = heartbeats.path_for("test:50051");

@@ -219,16 +219,6 @@ impl Reaper {
     }
 }
 
-/// The line a heartbeat cleanup run logs.
-#[must_use]
-pub fn heartbeat_cleanup_message(deleted: usize, retention: Duration) -> String {
-    let files = if deleted == 1 { "file" } else { "files" };
-    format!(
-        "Deleted {deleted} heartbeat {files} of schedulers that left the cluster more than {} hours ago.",
-        retention.as_secs() / 3600
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,18 +600,6 @@ mod tests {
                 .await
                 .expect("cleanup"),
             0
-        );
-    }
-
-    #[test]
-    fn heartbeat_cleanup_message_names_the_count_and_the_retention() {
-        assert_eq!(
-            heartbeat_cleanup_message(3, HEARTBEAT_RETENTION),
-            "Deleted 3 heartbeat files of schedulers that left the cluster more than 24 hours ago."
-        );
-        assert_eq!(
-            heartbeat_cleanup_message(1, HEARTBEAT_RETENTION),
-            "Deleted 1 heartbeat file of schedulers that left the cluster more than 24 hours ago."
         );
     }
 }
