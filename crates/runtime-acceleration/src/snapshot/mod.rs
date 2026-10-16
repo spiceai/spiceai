@@ -2282,6 +2282,7 @@ impl SnapshotManager {
                 entry.snapshot
             );
         }
+        runtime_state_location::metrics::record_cleanup_deleted(StateFeature::Snapshots, deleted);
         let aged_out = committed.retention.aged_out.len();
         if aged_out > 0 || deleted > 0 {
             tracing::info!(
