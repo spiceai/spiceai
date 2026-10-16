@@ -630,11 +630,12 @@ async fn pk_less_subset_rewrite_waits_out_a_pipelined_append() {
     );
 }
 
-/// A pass that found nothing to merge retires only the trigger credits its listing covered:
-/// credits an append added after the pass sampled them stay, so the appended files are still
-/// owed a pass, and nothing is retired once the snapshot was replaced.
+/// A pass that found nothing to merge retires the trigger credits its listing covered, down to
+/// one short of the trigger: the next write then admits a pass that re-checks the files it
+/// declined, which may be a file short of qualifying. Credits a write counted after the pass
+/// sampled them stay, and nothing is retired once the snapshot was replaced.
 #[tokio::test]
-async fn a_declined_pass_keeps_the_credits_of_appends_that_landed_during_it() {
+async fn a_declined_pass_leaves_the_next_write_due_a_pass() {
     let schema = id_value_schema();
     let ctx = SessionContext::new();
     let (provider, _temp_dir) = create_cayenne_table_with_config(
@@ -647,33 +648,47 @@ async fn a_declined_pass_keeps_the_credits_of_appends_that_landed_during_it() {
     .await;
     insert_batch(&provider, id_value_rows(&schema, 0, 50)).await;
     let snapshot_id = provider.get_current_snapshot_id();
+    let trigger = provider.context.compaction_picker_config().trigger_files;
+    assert!(trigger >= 2, "fixture: a trigger of at least two files");
     let counter = &provider.new_files_since_last_compaction;
 
-    // Five credits when the pass sampled them, two appends' worth more by the time it declined.
-    counter.store(7, Ordering::Release);
+    // The pass saw exactly a trigger's worth of credits and declined: one short of the trigger
+    // stays, so no idle trigger lists the table...
+    counter.store(trigger, Ordering::Release);
     provider
-        .retire_listed_small_file_credits(&snapshot_id, 5)
+        .retire_listed_small_file_credits(&snapshot_id, trigger, trigger)
+        .await;
+    assert_eq!(counter.load(Ordering::Acquire), trigger - 1);
+    assert!(
+        !provider.post_write_compaction_due(),
+        "an idle table is not due a pass"
+    );
+    // ...and the next write's file makes it due one that re-checks.
+    provider.record_current_snapshot_files_added(1);
+    assert!(
+        provider.post_write_compaction_due(),
+        "the next write admits a pass over the files the declined pass saw"
+    );
+
+    // Credits counted after the sample stay on top of what was seen.
+    counter.store(trigger + 20, Ordering::Release);
+    provider
+        .retire_listed_small_file_credits(&snapshot_id, trigger, trigger)
         .await;
     assert_eq!(
         counter.load(Ordering::Acquire),
-        2,
+        20.max(trigger - 1),
         "the credits counted after the sample stay"
     );
 
-    // Fewer credits than sampled (another pass retired some): none go negative.
-    provider
-        .retire_listed_small_file_credits(&snapshot_id, 5)
-        .await;
-    assert_eq!(counter.load(Ordering::Acquire), 0);
-
     // A replacement restarts the count: a pass over the replaced snapshot retires nothing.
-    counter.store(3, Ordering::Release);
+    counter.store(trigger, Ordering::Release);
     provider
-        .retire_listed_small_file_credits("a-replaced-snapshot", 3)
+        .retire_listed_small_file_credits("a-replaced-snapshot", trigger, trigger)
         .await;
     assert_eq!(
         counter.load(Ordering::Acquire),
-        3,
+        trigger,
         "nothing is retired once the snapshot changed"
     );
 }

@@ -20839,8 +20839,12 @@ impl CayenneTableProvider {
             // Nothing a table with no primary key holds can merge until new files
             // arrive; stop listing it on every trigger until they do.
             if self.pk_deletion_strategy.is_position_based() {
-                self.retire_listed_small_file_credits(&snapshot_id, credits_seen)
-                    .await;
+                self.retire_listed_small_file_credits(
+                    &snapshot_id,
+                    credits_seen,
+                    cfg.trigger_files,
+                )
+                .await;
             }
             return Ok(false);
         };
@@ -20982,24 +20986,36 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Retire the small-file trigger credits a declined pass over `snapshot_id` covered.
+    /// Retire the small-file trigger credits a declined pass over `snapshot_id` covered, so
+    /// idle triggers stop listing a table that has nothing to merge.
     ///
     /// `credits_seen` was sampled before the pass listed the snapshot, and a write counts its
     /// files only once they are in the snapshot directory, so each of those credits is a file
-    /// the listing saw and found nothing to merge with. A write that counted its files after the
-    /// sample keeps its credits, so its files are still owed a pass — resetting the count to
-    /// zero would leave them unmerged until as many new files arrive as the trigger asks for, or
-    /// for good on a table that goes idle. A replacement restarts the count, so nothing is
-    /// retired once the snapshot changed; the listing fence keeps one from landing in between.
-    async fn retire_listed_small_file_credits(&self, snapshot_id: &str, credits_seen: usize) {
+    /// the listing saw and found nothing to merge with. Two things are kept:
+    ///
+    /// - credits a write counted after the sample: its files are still owed a pass;
+    /// - up to `trigger_files - 1` credits: the files the pass declined may be a file or two
+    ///   short of qualifying, so the next write must bring the count back to the trigger and
+    ///   admit a pass that re-checks them. Retiring every credit would leave them unmerged until
+    ///   as many new files arrive as the trigger asks for, or for good on a table that goes idle.
+    ///
+    /// A replacement restarts the count, so nothing is retired once the snapshot changed; the
+    /// listing fence keeps one from landing in between.
+    async fn retire_listed_small_file_credits(
+        &self,
+        snapshot_id: &str,
+        credits_seen: usize,
+        trigger_files: usize,
+    ) {
         let _fence = self.listing_fence.read().await;
         if self.get_current_snapshot_id() != snapshot_id {
             return;
         }
+        let keep = trigger_files.saturating_sub(1);
         let _ = self.new_files_since_last_compaction.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
-            |credits| Some(credits.saturating_sub(credits_seen)),
+            |credits| Some(credits.saturating_sub(credits_seen).max(credits.min(keep))),
         );
     }
 
@@ -23153,8 +23169,12 @@ impl CayenneTableProvider {
             // Nothing a table with no primary key holds can merge until new files
             // arrive; stop listing it on every trigger until they do.
             if self.pk_deletion_strategy.is_position_based() {
-                self.retire_listed_small_file_credits(&snapshot_id, credits_seen)
-                    .await;
+                self.retire_listed_small_file_credits(
+                    &snapshot_id,
+                    credits_seen,
+                    cfg.trigger_files,
+                )
+                .await;
             }
             return Ok(false);
         };
