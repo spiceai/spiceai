@@ -50,7 +50,7 @@ use reqwest::{
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use runtime_rate_control::{Permit, RateController, RequestOutcome};
-use runtime_request_context::{RequestContext, TRACEPARENT_HEADER};
+use runtime_request_context::{TRACEPARENT_HEADER, resolve_request_context};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -750,8 +750,9 @@ struct ForwardedTraceParent(HeaderValue);
 
 impl ForwardedTraceParent {
     /// The trace context of the request that `context` executes, if it has one.
+    /// On a cluster executor, the context arrives as a serialized config extension.
     fn from_task_context(context: &TaskContext) -> Option<Self> {
-        let request_context = context.session_config().get_extension::<RequestContext>()?;
+        let request_context = resolve_request_context(context, false)?;
         let trace_parent = request_context.trace_parent().as_ref()?;
         // Hex digits and dashes only, so the conversion does not fail.
         HeaderValue::try_from(trace_parent.to_string())
@@ -7626,6 +7627,44 @@ mod tests {
         assert_eq!(
             received_traceparents(&origin).await,
             vec![vec![CALLER_TRACEPARENT.to_string()]]
+        );
+    }
+
+    /// On a cluster executor, the request context arrives as the serialized
+    /// `SpiceRequestContextConfig`, not as a typed extension. The origin call
+    /// still carries the caller's `traceparent`, with its sampling decision.
+    #[tokio::test]
+    async fn test_executor_origin_request_carries_the_callers_unsampled_traceparent() {
+        const UNSAMPLED: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("traceparent", http::HeaderValue::from_static(UNSAMPLED));
+        let scheduler_context = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Http,
+        )
+        .from_headers(&headers)
+        .build();
+        let config = datafusion::prelude::SessionConfig::new().with_option_extension(
+            runtime_request_context::SpiceRequestContextConfig::from_request_context(
+                &scheduler_context,
+            ),
+        );
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        ctx.register_table("posts", Arc::new(origin_provider(&origin)))
+            .expect("the HTTP table registers");
+
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts").await,
+            vec![row(&[POST_1])]
+        );
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![UNSAMPLED.to_string()]]
         );
     }
 
