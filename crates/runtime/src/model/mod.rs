@@ -29,6 +29,7 @@ pub(crate) mod rate_limit;
 pub mod rerank;
 mod responses;
 mod responses_tool_history;
+mod tool_trace;
 mod tool_use;
 mod tool_use_responses;
 mod util;
