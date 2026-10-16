@@ -393,10 +393,24 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 /// meet only through `..` or a symlink therefore read as two directories; spell the
 /// shared directory the same way on every dataset. The metastore is always opened on
 /// the local filesystem, so a directory that reads like a URL (`meta://shared`) is a
-/// local path too.
+/// local path too. SQLite opens the catalog with `SQLITE_OPEN_URI`, so a `file:` value
+/// is read the way SQLite reads a URI: its filename ends at a `?` query or `#`
+/// fragment and its percent escapes are decoded, while a plain path is read as
+/// written. `file:meta%2Fone` is therefore `meta/one/cayenne.db`, not the literal
+/// `meta%2Fone/cayenne.db`. A URI whose escapes do not decode to UTF-8 is compared
+/// as written.
 fn comparable_metastore_dir(dir: &str) -> PathBuf {
     let catalog = format!("{dir}/cayenne.db");
     let path = fs_probe_path(&catalog);
+    let decoded = if catalog.starts_with("file:") {
+        let filename = path.split(['?', '#']).next().unwrap_or(path);
+        percent_encoding::percent_decode_str(filename)
+            .decode_utf8()
+            .ok()
+    } else {
+        None
+    };
+    let path = decoded.as_deref().unwrap_or(path);
     absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
@@ -1045,6 +1059,23 @@ mod tests {
         ];
 
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
+    }
+
+    /// SQLite opens a `file:` catalog as a URI, decoding its percent escapes and
+    /// ending its filename at a query, but opens a plain path as written, so the two
+    /// spellings name the same metastore only when they name the same file.
+    #[test]
+    fn cayenne_reads_a_file_uri_the_way_sqlite_opens_it() {
+        let conflict = |uri: &str, plain: &str| {
+            cayenne_metastore_dir_conflict(&[
+                cayenne_dataset("uri", None, Some(uri)),
+                cayenne_dataset("plain", None, Some(plain)),
+            ])
+        };
+
+        assert!(conflict("file:meta%2Fone", "meta%2Fone").is_some());
+        assert!(conflict("file:meta%2Fone", "meta/one").is_none());
+        assert!(conflict("file:shared?label=x", "shared").is_some());
     }
 
     /// An object-store data path keeps its metastore at the default local

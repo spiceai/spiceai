@@ -9,6 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+percent-encoding.workspace = true
 serde.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
