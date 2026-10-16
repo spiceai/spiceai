@@ -2137,3 +2137,580 @@ async fn model_request_durations_are_recorded_in_milliseconds() {
         );
     }
 }
+
+/// The `dataset_acceleration_snapshot_*` families must reach `/metrics` with the
+/// right values: a published snapshot reports what it wrote, a bootstrap reports
+/// what it downloaded, and `dataset_acceleration_snapshot_failure_count` counts
+/// every snapshot a dataset gave up on, whichever step failed, from zero.
+///
+/// Built only with `snapshots`: without it every snapshot behavior resolves to
+/// `Disabled` and nothing is created. Cayenne is the engine because its crate needs
+/// no feature, so the gate's build runs these.
+#[cfg(all(feature = "snapshots", not(windows)))]
+mod snapshot_metrics {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Arc, LazyLock,
+            atomic::{AtomicI64, AtomicUsize, Ordering},
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use app::AppBuilder;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use async_trait::async_trait;
+    use datafusion::common::TableReference;
+    use runtime::Runtime;
+    use runtime_acceleration::{
+        acceleration::{Acceleration as RuntimeAcceleration, RefreshMode as RuntimeRefreshMode},
+        dataset_checkpoint::{self, DatasetCheckpointer},
+        snapshot::{
+            AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager,
+            engine::DefaultSnapshotEngine, metrics as snapshot_metrics,
+        },
+    };
+    use spicepod::{
+        acceleration::{
+            Acceleration, Mode, RefreshMode, SnapshotBehavior as DatasetSnapshotBehavior,
+            SnapshotsCompaction,
+        },
+        component::{dataset::Dataset, snapshot::Snapshots},
+        param::Params,
+    };
+
+    use super::{
+        FIXTURE_EPOCH_SECONDS, PROMETHEUS, counter_value, fixture_csv, wait_until,
+        write_fixture_csv,
+    };
+
+    const FAILURE_COUNT: &str = "dataset_acceleration_snapshot_failure_count";
+    const SKIPPED_COUNT: &str = "dataset_acceleration_snapshot_skipped_count";
+    const WRITE_TIMESTAMP: &str = "dataset_acceleration_snapshot_write_timestamp";
+    const WRITE_DURATION_MS: &str = "dataset_acceleration_snapshot_write_duration_ms";
+    const WRITE_BYTES: &str = "dataset_acceleration_snapshot_write_bytes";
+    const WRITE_CHECKSUM: &str = "dataset_acceleration_snapshot_write_checksum";
+    const BOOTSTRAP_DURATION_MS: &str = "dataset_acceleration_snapshot_bootstrap_duration_ms";
+    const BOOTSTRAP_BYTES: &str = "dataset_acceleration_snapshot_bootstrap_bytes";
+    const BOOTSTRAP_CHECKSUM: &str = "dataset_acceleration_snapshot_bootstrap_checksum";
+
+    /// One attempt plus `SNAPSHOT_MAX_RETRIES` in `runtime_table`'s snapshot path.
+    const SNAPSHOT_ATTEMPTS: usize = 4;
+
+    fn failures(dataset: &str) -> Option<f64> {
+        counter_value(&PROMETHEUS, FAILURE_COUNT, &[("dataset", dataset)])
+    }
+
+    /// Every series of `name` that carries `dataset`.
+    fn series_for(name: &str, dataset: &str) -> Vec<prometheus::proto::Metric> {
+        PROMETHEUS
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(prometheus::proto::MetricFamily::get_metric)
+            .filter(|series| {
+                series
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "dataset" && label.value() == dataset)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn has_series_for(name: &str, dataset: &str) -> bool {
+        !series_for(name, dataset).is_empty()
+    }
+
+    /// The value of gauge `name` for `dataset`, which must carry one series.
+    fn gauge_for(name: &str, dataset: &str) -> f64 {
+        let series = series_for(name, dataset);
+        assert_eq!(
+            series.len(),
+            1,
+            "{name} for '{dataset}' carries {} series",
+            series.len()
+        );
+        series[0].get_gauge().value()
+    }
+
+    /// The `checksum` label of the one series of checksum gauge `name` for `dataset`.
+    fn checksum_for(name: &str, dataset: &str) -> String {
+        let series = series_for(name, dataset);
+        assert_eq!(
+            series.len(),
+            1,
+            "{name} for '{dataset}' carries {} series",
+            series.len()
+        );
+        series[0]
+            .get_label()
+            .iter()
+            .find(|label| label.name() == "checksum")
+            .map(|label| label.value().to_string())
+            .expect("a checksum gauge to carry its checksum label")
+    }
+
+    /// The sample count of histogram `name` for `dataset`.
+    fn histogram_count_for(name: &str, dataset: &str) -> u64 {
+        series_for(name, dataset)
+            .iter()
+            .map(|series| series.get_histogram().get_sample_count())
+            .sum()
+    }
+
+    /// A snapshot location that opens, but where no snapshot archive can be
+    /// written: archives go under a `month=YYYY-MM/` directory, and a regular file
+    /// already holds that name. Tomorrow's month is blocked too, so a run across a
+    /// month boundary still fails the same way.
+    fn unwritable_location(dir: &Path) -> String {
+        let snapshots = dir.join("snapshots");
+        std::fs::create_dir_all(&snapshots).expect("to create the snapshot directory");
+        let now = chrono::Utc::now();
+        for instant in [now, now + chrono::Duration::days(1)] {
+            let partition = snapshots.join(instant.format("month=%Y-%m").to_string());
+            std::fs::write(&partition, b"not a directory")
+                .expect("to block the snapshot partition with a file");
+        }
+        format!("file://{}/", snapshots.display())
+    }
+
+    fn writable_location(dir: &Path) -> String {
+        let snapshots = dir.join("snapshots");
+        std::fs::create_dir_all(&snapshots).expect("to create the snapshot directory");
+        format!("file://{}/", snapshots.display())
+    }
+
+    fn snapshots_config(location: String) -> Snapshots {
+        Snapshots {
+            enabled: true,
+            location: Some(location),
+            ..Snapshots::default()
+        }
+    }
+
+    /// A Cayenne file-mode dataset that publishes a snapshot after each refresh.
+    fn snapshot_writer_dataset(dir: &Path, name: &str) -> Dataset {
+        let csv = fixture_csv(dir, name);
+        write_fixture_csv(&csv, FIXTURE_EPOCH_SECONDS);
+
+        let mut dataset = Dataset::new(format!("file://{}", csv.display()), name);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            snapshots: DatasetSnapshotBehavior::CreateOnly,
+            params: Some(Params::from_string_map(
+                [(
+                    "cayenne_file_path".to_string(),
+                    dir.join(format!("{name}-cayenne")).display().to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            ..Acceleration::default()
+        });
+        dataset
+    }
+
+    async fn load_snapshot_writer(dir: &Path, name: &str, location: String) -> Arc<Runtime> {
+        let app = AppBuilder::new(name)
+            .with_snapshots(snapshots_config(location))
+            .with_dataset(snapshot_writer_dataset(dir, name))
+            .build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+            .await
+            .expect("the dataset to load within a minute");
+        rt
+    }
+
+    fn create_only(rt: &Runtime, location: String) -> SnapshotBehavior {
+        SnapshotBehavior::create_only(
+            Arc::new(snapshots_config(location)),
+            rt.secrets_weak(),
+            rt.tokio_io_runtime(),
+            SnapshotsCompaction::Disabled,
+        )
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+    }
+
+    /// A local acceleration file for the snapshot engine to archive.
+    fn acceleration_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(format!("{name}.db"));
+        std::fs::write(&path, b"acceleration bytes").expect("to write the acceleration file");
+        path
+    }
+
+    /// A checkpointer that records nothing and counts its checkpoint attempts,
+    /// failing each one when `fail` is set.
+    #[derive(Default)]
+    struct StubCheckpointer {
+        fail: bool,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DatasetCheckpointer for StubCheckpointer {
+        async fn exists(&self) -> bool {
+            true
+        }
+
+        async fn checkpoint(
+            &self,
+            _schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
+        ) -> dataset_checkpoint::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err("injected checkpoint failure".into());
+            }
+            Ok(())
+        }
+
+        async fn get_schema(&self) -> dataset_checkpoint::Result<Option<SchemaRef>> {
+            Ok(None)
+        }
+
+        async fn last_checkpoint_time(&self) -> dataset_checkpoint::Result<Option<SystemTime>> {
+            Ok(None)
+        }
+
+        async fn get_refresh_sql(&self) -> dataset_checkpoint::Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn set_schema(&self, _schema: &SchemaRef) -> dataset_checkpoint::Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self) -> dataset_checkpoint::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A published snapshot reports what it wrote and a failure count of zero,
+    /// and a runtime bootstrapping from it reports downloading the same bytes.
+    ///
+    /// The bootstrap is checked against the write rather than on its own: the two
+    /// sizes and checksums can only agree if both describe the same archive.
+    #[tokio::test]
+    async fn a_snapshot_reports_its_write_and_bootstrap_metrics() {
+        // Before anything records: an instrument first touched without it binds to
+        // the no-op provider for the whole process.
+        LazyLock::force(&PROMETHEUS);
+        let dataset = "snapshot_round_trip";
+        let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+        let location = writable_location(dir.path());
+        let started_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_secs();
+
+        let writer = load_snapshot_writer(dir.path(), dataset, location.clone()).await;
+        assert!(
+            wait_until(Duration::from_mins(1), || async {
+                has_series_for(WRITE_TIMESTAMP, dataset)
+            })
+            .await,
+            "dataset '{dataset}' never published a snapshot. Runtime ready: {}",
+            writer.status().is_ready()
+        );
+        let finished_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_secs();
+
+        assert_eq!(
+            failures(dataset),
+            Some(0.0),
+            "a dataset that creates snapshots must report {FAILURE_COUNT} at zero"
+        );
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "epoch seconds fit an f64 exactly"
+        )]
+        let window = (started_secs as f64)..=(finished_secs as f64);
+        let written_at = gauge_for(WRITE_TIMESTAMP, dataset);
+        assert!(
+            window.contains(&written_at),
+            "{WRITE_TIMESTAMP} is {written_at}, outside the test's window {window:?}, so it \
+             is not in epoch seconds"
+        );
+        assert_eq!(
+            histogram_count_for(WRITE_DURATION_MS, dataset),
+            1,
+            "one published snapshot records one write duration"
+        );
+        let written_bytes = gauge_for(WRITE_BYTES, dataset);
+        assert!(written_bytes > 0.0, "a published snapshot cannot be empty");
+        let written_checksum = checksum_for(WRITE_CHECKSUM, dataset);
+        assert!(
+            !written_checksum.is_empty(),
+            "a published snapshot carries its checksum"
+        );
+
+        // A second runtime with no local acceleration of its own restores from the
+        // snapshot the first one wrote.
+        let reader_dir = tempfile::tempdir().expect("a temporary directory for the reader");
+        let mut reader_dataset = snapshot_writer_dataset(reader_dir.path(), dataset);
+        if let Some(acceleration) = reader_dataset.acceleration.as_mut() {
+            acceleration.snapshots = DatasetSnapshotBehavior::BootstrapOnly;
+        }
+        let app = AppBuilder::new("snapshot_round_trip_reader")
+            .with_snapshots(snapshots_config(location))
+            .with_dataset(reader_dataset)
+            .build();
+        let reader = Arc::new(Runtime::builder().with_app(app).build().await);
+        tokio::time::timeout(
+            Duration::from_mins(1),
+            Arc::clone(&reader).load_components(),
+        )
+        .await
+        .expect("the bootstrapping dataset to load within a minute");
+        assert!(
+            wait_until(Duration::from_mins(1), || async {
+                has_series_for(BOOTSTRAP_BYTES, dataset)
+            })
+            .await,
+            "dataset '{dataset}' never bootstrapped from the published snapshot. Runtime ready: {}",
+            reader.status().is_ready()
+        );
+
+        assert!(
+            (gauge_for(BOOTSTRAP_BYTES, dataset) - written_bytes).abs() < f64::EPSILON,
+            "the bootstrap downloaded {} bytes of a snapshot that was written as {written_bytes}",
+            gauge_for(BOOTSTRAP_BYTES, dataset)
+        );
+        assert_eq!(
+            checksum_for(BOOTSTRAP_CHECKSUM, dataset),
+            written_checksum,
+            "the bootstrap must report the checksum of the snapshot it restored"
+        );
+        let bootstrap_ms =
+            counter_value(&PROMETHEUS, BOOTSTRAP_DURATION_MS, &[("dataset", dataset)])
+                .expect("a bootstrap to record its duration");
+        assert!(
+            (0.0..60_000.0).contains(&bootstrap_ms) && bootstrap_ms > 0.0,
+            "{BOOTSTRAP_DURATION_MS} is {bootstrap_ms} for a local restore, so it is not in \
+             milliseconds"
+        );
+    }
+
+    /// Under the default `on_change` policy, a snapshot requested when nothing
+    /// changed since the last one has nothing to publish: it is counted as
+    /// skipped, and neither written nor failed. (The first snapshot of a dataset is
+    /// always written, so one is published first.)
+    #[tokio::test]
+    async fn an_unchanged_snapshot_is_counted_as_skipped() {
+        LazyLock::force(&PROMETHEUS);
+        let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+        let rt = Runtime::builder().build().await;
+
+        let dataset = "snapshot_skipped";
+        let manager = SnapshotManager::try_new(
+            dataset.to_string(),
+            create_only(&rt, writable_location(dir.path())),
+            AccelerationLayout::file(acceleration_file(dir.path(), dataset)),
+            AccelerationEngine::Cayenne,
+        )
+        .await
+        .expect("a snapshot manager for a writable location");
+        let checkpointer: Arc<dyn DatasetCheckpointer> = Arc::new(StubCheckpointer::default());
+
+        let manager = Arc::new(manager);
+        // The data's last change, as of both requests.
+        let last_updated_at = Arc::new(AtomicI64::new(1_700_000_000_000));
+        let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let table = TableReference::bare(dataset);
+        let schema = schema();
+        let request = |force| {
+            runtime_table::accelerated::snapshots::create_checkpoint_and_snapshot(
+                &checkpointer,
+                Some(&manager),
+                &schema,
+                &write_mutex,
+                &table,
+                &last_updated_at,
+                ForceCreate(force),
+                None,
+                None,
+                None,
+            )
+        };
+
+        request(false).await;
+        assert_eq!(
+            histogram_count_for(WRITE_DURATION_MS, dataset),
+            1,
+            "the dataset's first snapshot must be published"
+        );
+        assert_eq!(
+            counter_value(&PROMETHEUS, SKIPPED_COUNT, &[("dataset", dataset)]),
+            None,
+            "a published snapshot is not a skip"
+        );
+
+        request(false).await;
+        assert_eq!(
+            counter_value(&PROMETHEUS, SKIPPED_COUNT, &[("dataset", dataset)]),
+            Some(1.0),
+            "a snapshot with nothing new to publish is one skip"
+        );
+        assert_eq!(
+            histogram_count_for(WRITE_DURATION_MS, dataset),
+            1,
+            "a skipped snapshot must not be reported as written"
+        );
+        assert_eq!(
+            failures(dataset),
+            None,
+            "a skipped snapshot is not a failure"
+        );
+    }
+
+    /// An upload that keeps failing is counted once for the snapshot, not once per
+    /// retried attempt.
+    #[tokio::test]
+    async fn a_failed_snapshot_upload_is_counted() {
+        LazyLock::force(&PROMETHEUS);
+        let dataset = "snapshot_upload_fails";
+        let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+        let rt = load_snapshot_writer(dir.path(), dataset, unwritable_location(dir.path())).await;
+
+        assert!(
+            wait_until(Duration::from_mins(2), || async {
+                failures(dataset).is_some_and(|count| count >= 1.0)
+            })
+            .await,
+            "the failed upload was never counted: {FAILURE_COUNT} is {:?}. Runtime ready: {}",
+            failures(dataset),
+            rt.status().is_ready()
+        );
+        assert_eq!(
+            failures(dataset),
+            Some(1.0),
+            "one snapshot that failed after its retries is one failure"
+        );
+        assert!(
+            !has_series_for(WRITE_TIMESTAMP, dataset),
+            "no snapshot was written, so none may be reported as written"
+        );
+    }
+
+    /// A snapshot whose checkpoint step fails is a failed snapshot. The same
+    /// function without a snapshot manager only checkpoints, so its failure is
+    /// not a snapshot failure.
+    #[tokio::test]
+    async fn a_failed_snapshot_checkpoint_is_counted() {
+        LazyLock::force(&PROMETHEUS);
+        let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+        let rt = Runtime::builder().build().await;
+
+        let dataset = "snapshot_checkpoint_fails";
+        let manager = SnapshotManager::try_new(
+            dataset.to_string(),
+            create_only(&rt, writable_location(dir.path())),
+            AccelerationLayout::file(acceleration_file(dir.path(), dataset)),
+            AccelerationEngine::Cayenne,
+        )
+        .await
+        .expect("a snapshot manager for a writable location");
+        let failing = Arc::new(StubCheckpointer {
+            fail: true,
+            ..StubCheckpointer::default()
+        });
+        let checkpointer: Arc<dyn DatasetCheckpointer> = Arc::<StubCheckpointer>::clone(&failing);
+
+        runtime_table::accelerated::snapshots::create_checkpoint_and_snapshot(
+            &checkpointer,
+            Some(&Arc::new(manager)),
+            &schema(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &TableReference::bare(dataset),
+            &Arc::new(AtomicI64::new(0)),
+            ForceCreate(true),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            failing.attempts.load(Ordering::SeqCst),
+            SNAPSHOT_ATTEMPTS,
+            "the checkpoint must be retried before the snapshot is given up"
+        );
+        assert_eq!(
+            failures(dataset),
+            Some(1.0),
+            "a snapshot given up at its checkpoint step is one failure"
+        );
+
+        let checkpoint_only = "checkpoint_without_snapshots_fails";
+        runtime_table::accelerated::snapshots::create_checkpoint_and_snapshot(
+            &checkpointer,
+            None,
+            &schema(),
+            &Arc::new(tokio::sync::Mutex::new(())),
+            &TableReference::bare(checkpoint_only),
+            &Arc::new(AtomicI64::new(0)),
+            ForceCreate(true),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            failures(checkpoint_only),
+            None,
+            "a dataset without snapshots has no snapshot failure count"
+        );
+    }
+
+    /// The snapshot taken before an acceleration is recreated is counted when it
+    /// fails, though the recreation goes ahead.
+    #[tokio::test]
+    async fn a_failed_pre_recreation_snapshot_is_counted() {
+        LazyLock::force(&PROMETHEUS);
+        let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+        let rt = Runtime::builder().build().await;
+
+        let dataset = "pre_recreation_snapshot_fails";
+        let acceleration = RuntimeAcceleration {
+            snapshot_behavior: create_only(&rt, unwritable_location(dir.path())),
+            ..RuntimeAcceleration::default()
+        };
+
+        data_accelerator_api::snapshots::snapshot_before_recreate(
+            &acceleration,
+            dataset,
+            AccelerationLayout::file(acceleration_file(dir.path(), dataset)),
+            AccelerationEngine::Cayenne,
+            schema(),
+            Some(Arc::new(DefaultSnapshotEngine)),
+            RuntimeRefreshMode::Full,
+        )
+        .await;
+
+        assert_eq!(
+            failures(dataset),
+            Some(1.0),
+            "a pre-recreation snapshot that could not be uploaded is one failure"
+        );
+
+        // A pre-recreation snapshot runs while the acceleration is created, before the
+        // dataset's snapshot creation is set up and its count published at zero. That
+        // publication must keep the failure already counted.
+        snapshot_metrics::publish_snapshot_failure_count_at_zero(dataset);
+        assert_eq!(
+            failures(dataset),
+            Some(1.0),
+            "publishing the count at zero must not reset a failure already counted"
+        );
+    }
+}

@@ -170,6 +170,14 @@ impl QueryBuilder {
         self
     }
 
+    /// Skip query admission for a read that serves a peer scheduler's query;
+    /// see [`QueryRuntimeBinding::QueryRuntimeUngated`].
+    #[must_use]
+    pub(crate) fn for_peer_scheduler_read(mut self) -> Self {
+        self.runtime_binding = QueryRuntimeBinding::QueryRuntimeUngated;
+        self
+    }
+
     /// Run this query on the current Tokio runtime without taking a query
     /// admission permit or emitting query metrics / task-history rows.
     ///

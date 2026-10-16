@@ -1276,6 +1276,7 @@ mod tests {
             schema_version: 1,
             updated_at: 1000,
             partition_expressions: vec!["date".to_string()],
+            unregistered_at_ms: None,
         };
         store
             .write_metadata(&table_ref, metadata)

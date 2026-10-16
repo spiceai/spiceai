@@ -162,6 +162,12 @@ pub struct TablePartitionMetadata {
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
     pub partition_expressions: Vec<String>,
+    /// When a scheduler first found the table not registered (milliseconds since
+    /// UNIX epoch). A scheduler that has the table registered clears it; the entry
+    /// is removed once it has stayed set for
+    /// [`UNREGISTERED_TABLE_RETENTION`](crate::cluster_state::UNREGISTERED_TABLE_RETENTION).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unregistered_at_ms: Option<u64>,
 }
 
 impl TablePartitionMetadata {
@@ -177,6 +183,7 @@ impl TablePartitionMetadata {
             schema_version: 1,
             updated_at,
             partition_expressions,
+            unregistered_at_ms: None,
         }
     }
 
