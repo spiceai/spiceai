@@ -2747,8 +2747,11 @@ mod test {
 #[cfg(test)]
 mod nullability_alignment_tests {
     use super::*;
-    use arrow::array::{ArrayData, Int32Array, MapArray, StringArray, StructArray};
-    use arrow::buffer::NullBuffer;
+    use arrow::array::{
+        Array, ArrayData, Int16Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        StructArray,
+    };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Fields;
 
     fn entry_fields() -> Fields {
@@ -3116,28 +3119,11 @@ mod nullability_alignment_tests {
     /// their storage no longer satisfies (#13456).
     #[test]
     fn a_nullability_change_under_an_extension_type_is_not_relabelled() {
-        let item = |timestamp_nullable: bool| {
-            Arc::new(
-                Field::new(
-                    "item",
-                    DataType::Struct(Fields::from(vec![
-                        Field::new("timestamp", DataType::Int64, timestamp_nullable),
-                        Field::new("offset_minutes", DataType::Int16, false),
-                    ])),
-                    false,
-                )
-                .with_metadata(
-                    [(
-                        "ARROW:extension:name".to_string(),
-                        "arrow.timestamp_with_offset".to_string(),
-                    )]
-                    .into_iter()
-                    .collect(),
-                ),
-            )
-        };
-        let source = DataType::List(item(false));
-        let target = DataType::List(item(true));
+        use crate::type_rewrite::tests::{extension_item, extension_storage};
+
+        let source_item = extension_item(extension_storage("timestamp", false), None);
+        let source = DataType::List(Arc::clone(&source_item));
+        let target = DataType::List(extension_item(extension_storage("timestamp", true), None));
 
         assert!(
             !is_nullability_relaxing_relabel(&source, &target),
@@ -3145,24 +3131,23 @@ mod nullability_alignment_tests {
         );
 
         // The conversion itself is still served, through `arrow_cast`, so the pair is routed
-        // differently rather than refused.
-        let DataType::List(source_item) = &source else {
-            unreachable!("built as a list above")
-        };
+        // differently rather than refused — and the values come through it unchanged.
         let DataType::Struct(fields) = source_item.data_type() else {
             unreachable!("built as a struct above")
         };
+        let timestamps = Int64Array::from(vec![1, 2]);
+        let offsets = Int16Array::from(vec![60, -30]);
         let values = StructArray::new(
             fields.clone(),
             vec![
-                Arc::new(arrow::array::Int64Array::from(vec![1, 2])) as ArrayRef,
-                Arc::new(arrow::array::Int16Array::from(vec![60, -30])) as ArrayRef,
+                Arc::new(timestamps.clone()) as ArrayRef,
+                Arc::new(offsets.clone()) as ArrayRef,
             ],
             None,
         );
-        let list = arrow::array::ListArray::new(
-            Arc::clone(source_item),
-            arrow::buffer::OffsetBuffer::new(vec![0, 2].into()),
+        let list = ListArray::new(
+            source_item,
+            OffsetBuffer::new(vec![0, 2].into()),
             Arc::new(values),
             None,
         );
@@ -3171,6 +3156,26 @@ mod nullability_alignment_tests {
             .expect("relaxing a storage child's nullability is a cast arrow performs");
         assert_eq!(casted.schema().field(0).data_type(), &target);
         assert_eq!(casted.num_rows(), 1);
+        let list = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("the cast column is still a list");
+        let structs = list.values();
+        let structs = structs
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("the list items are still structs");
+        assert_eq!(
+            structs.column(0).as_ref(),
+            &timestamps as &dyn Array,
+            "the `timestamp` child must come through the cast unchanged"
+        );
+        assert_eq!(
+            structs.column(1).as_ref(),
+            &offsets as &dyn Array,
+            "the `offset_minutes` child must come through the cast unchanged"
+        );
     }
 
     /// The relabel path must not swallow the casts that already worked: a genuine type change

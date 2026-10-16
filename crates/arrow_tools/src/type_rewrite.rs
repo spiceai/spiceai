@@ -1141,7 +1141,7 @@ pub(crate) fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow::array::{
         Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, ListArray, RunArray,
@@ -2103,12 +2103,26 @@ mod tests {
     }
 
     /// The storage struct an extension type such as `arrow.timestamp_with_offset` is declared
-    /// over: two non-nullable children, named as the extension defines them.
-    fn extension_storage(first_name: &str, first_nullable: bool) -> DataType {
+    /// over: two non-nullable children, named as the extension defines them. Shared with the
+    /// record-batch cast tests, which route the same shape away from the relabel path.
+    pub(crate) fn extension_storage(first_name: &str, first_nullable: bool) -> DataType {
         DataType::Struct(Fields::from(vec![
             Field::new(first_name, DataType::Int64, first_nullable),
             Field::new("offset_minutes", DataType::Int16, false),
         ]))
+    }
+
+    /// A nullable list item field labelled `arrow.timestamp_with_offset` over `storage`, with a
+    /// descriptive `comment` beside the label when one is given.
+    pub(crate) fn extension_item(storage: DataType, comment: Option<&str>) -> Arc<Field> {
+        let mut metadata = std::collections::HashMap::from([(
+            EXTENSION_TYPE_NAME_KEY.to_owned(),
+            "arrow.timestamp_with_offset".to_owned(),
+        )]);
+        if let Some(comment) = comment {
+            metadata.insert("comment".to_owned(), comment.to_owned());
+        }
+        Arc::new(Field::new("item", storage, true).with_metadata(metadata))
     }
 
     /// A `List<item: Struct<timestamp, offset_minutes>>` whose item field carries an extension
@@ -2119,17 +2133,7 @@ mod tests {
         target_storage: DataType,
         target_comment: Option<&str>,
     ) -> (ArrayData, DataType) {
-        let item = |storage: DataType, comment: Option<&str>| {
-            let mut metadata = std::collections::HashMap::from([(
-                EXTENSION_TYPE_NAME_KEY.to_owned(),
-                "arrow.timestamp_with_offset".to_owned(),
-            )]);
-            if let Some(comment) = comment {
-                metadata.insert("comment".to_owned(), comment.to_owned());
-            }
-            Arc::new(Field::new("item", storage, true).with_metadata(metadata))
-        };
-        let source_item = item(extension_storage("timestamp", false), source_comment);
+        let source_item = extension_item(extension_storage("timestamp", false), source_comment);
         let DataType::Struct(fields) = source_item.data_type() else {
             unreachable!("the storage is built as a struct above")
         };
@@ -2149,7 +2153,7 @@ mod tests {
         );
         (
             list.to_data(),
-            DataType::List(item(target_storage, target_comment)),
+            DataType::List(extension_item(target_storage, target_comment)),
         )
     }
 
