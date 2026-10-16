@@ -153,8 +153,9 @@ pub struct SharedJobState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     /// Locally driven jobs, retained for fast status reads and subscriber delivery.
     local_jobs: DashMap<String, LocalJob>,
     /// The version of each locally driven job's graph that this scheduler last
-    /// wrote or loaded: the condition its next graph write is made on.
-    graph_versions: DashMap<String, UpdateVersion>,
+    /// wrote or loaded, and the generation it held the job under: the
+    /// condition of its next graph write under that generation.
+    graph_versions: DashMap<String, (u64, UpdateVersion)>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T, U> {
@@ -256,7 +257,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
     /// Persists the graph of a job this scheduler owns at `epoch`.
     ///
     /// The write is conditional on the graph this scheduler last wrote or
-    /// loaded. Without one, or after another writer changed the graph, it is
+    /// loaded under `epoch`. Without one, or after another writer changed the graph, it is
     /// conditional on the graph as stored now and made only while this
     /// scheduler still owns the job at `epoch`. Returns `false` when the job
     /// has a new owner, which keeps its own graph.
@@ -266,7 +267,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
             let recorded = self
                 .graph_versions
                 .get(job_id)
-                .map(|version| version.clone());
+                .filter(|recorded| recorded.0 == epoch)
+                .map(|recorded| recorded.1.clone());
             let expected = match recorded.and_then(Expected::at_version) {
                 Some(expected) => expected,
                 None => match self.owned_graph_version(job_id, epoch).await? {
@@ -275,10 +277,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T,
                 },
             };
             if let Some(version) = self.write_graph(job_id, &bytes, &expected).await? {
-                self.graph_versions.insert(job_id.to_string(), version);
+                self.graph_versions
+                    .insert(job_id.to_string(), (epoch, version));
                 return Ok(Attempt::Done(true));
             }
-            self.graph_versions.remove(job_id);
+            self.graph_versions
+                .remove_if(job_id, |_, recorded| recorded.0 == epoch);
             Ok(Attempt::Conflict)
         })
         .await;
@@ -636,7 +640,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> JobState for Shar
 
         let (graph, graph_version) = self.load_graph(job_id.as_str(), &claimed).await?;
         self.graph_versions
-            .insert(job_id.to_string(), graph_version);
+            .insert(job_id.to_string(), (claimed.epoch, graph_version));
         self.local_jobs.insert(
             job_id.to_string(),
             LocalJob {
@@ -1058,7 +1062,7 @@ mod tests {
             .expect("persist the graph");
 
         let (graph, version) = state.load_graph("j", &meta).await.expect("load the graph");
-        state.graph_versions.insert("j".to_string(), version);
+        state.graph_versions.insert("j".to_string(), (0, version));
         let Some(ExecutionStage::Successful(map_stage)) = graph.stages().get(&1) else {
             panic!("the loaded graph lost its successful stage");
         };
@@ -1110,13 +1114,15 @@ mod tests {
     type Race = tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>;
 
     /// Runs `before_write` once, right before the next graph write reaches the
-    /// store, and `before_head` once, right before the next read of the graph's
-    /// version.
+    /// store, `before_head` once, right before the next read of the graph's
+    /// version, `before_meta_read` once, right before the next metadata read,
+    /// and `after_meta_write` once, right after the next metadata write lands.
     struct GraphRace {
         inner: Arc<dyn ObjectStore>,
         before_write: Race,
         before_head: Race,
         before_meta_read: Race,
+        after_meta_write: Race,
     }
 
     impl GraphRace {
@@ -1126,6 +1132,7 @@ mod tests {
                 before_write: tokio::sync::Mutex::new(None),
                 before_head: tokio::sync::Mutex::new(None),
                 before_meta_read: tokio::sync::Mutex::new(None),
+                after_meta_write: tokio::sync::Mutex::new(None),
             })
         }
 
@@ -1160,7 +1167,14 @@ mod tests {
             opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
             Self::run(&self.before_write, location).await;
-            self.inner.put_opts(location, payload, opts).await
+            let written = self.inner.put_opts(location, payload, opts).await;
+            if location.as_ref().contains("scheduler/meta/") {
+                let race = self.after_meta_write.lock().await.take();
+                if let Some(race) = race {
+                    race.await;
+                }
+            }
+            written
         }
         async fn put_multipart_opts(
             &self,
@@ -1503,6 +1517,62 @@ mod tests {
             .expect("the job's metadata");
         assert_eq!(meta.owner_instance_id, Some(owner.owner_instance_id));
         assert_eq!(meta.epoch, 2);
+        assert_eq!(
+            stored_graph_session(&inner, &owner, "j").await,
+            "current",
+            "the stale save must not replace the current generation's graph"
+        );
+        assert_eq!(
+            owner.local_jobs.get("j").map(|local| local.generation),
+            Some(2),
+            "the current generation keeps driving the job"
+        );
+    }
+
+    /// A save whose metadata write lands before another scheduler takes the
+    /// job over and this scheduler takes it back does not write its graph on
+    /// the version the later generation recorded.
+    #[tokio::test]
+    async fn a_save_paused_after_its_metadata_write_does_not_replace_a_later_generations_graph() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let racing = GraphRace::on(&inner);
+        let owner = Arc::new(test_state_on(Arc::clone(&racing) as Arc<dyn ObjectStore>));
+        let other = Arc::new(test_state_on(Arc::clone(&inner)));
+        let job = JobId::new("j");
+
+        owner.accept_job(&job, "test", 0).expect("accept");
+        owner
+            .submit_job(job.clone(), &running_graph(&owner, "first"), None)
+            .await
+            .expect("submit");
+
+        let (taker, retaker, taken) = (Arc::clone(&other), Arc::clone(&owner), job.clone());
+        *racing.after_meta_write.lock().await = Some(Box::pin(async move {
+            taker
+                .try_acquire_job(&taken)
+                .await
+                .expect("acquire")
+                .expect("another scheduler takes the job over");
+            retaker
+                .try_acquire_job(&taken)
+                .await
+                .expect("acquire")
+                .expect("the first owner takes the job back");
+            retaker
+                .save_job(&taken, &running_graph(&retaker, "current"))
+                .await
+                .expect("the current generation saves");
+        }));
+
+        owner
+            .save_job(&job, &running_graph(&owner, "stale"))
+            .await
+            .expect("a stale save yields");
+
+        assert!(
+            racing.after_meta_write.lock().await.is_none(),
+            "the takeovers must have run"
+        );
         assert_eq!(
             stored_graph_session(&inner, &owner, "j").await,
             "current",

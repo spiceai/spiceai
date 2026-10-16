@@ -348,6 +348,17 @@ impl JobExecutor {
             });
         }
 
+        // A driver the job was taken over from can leave chunks past the ones
+        // the result lists; only listed chunks hold the job's results.
+        if let Some(result) = &state.result
+            && !result.chunk_indices.contains(&chunk_index)
+        {
+            return Err(super::error::Error::ChunkNotFound {
+                job_id: job_id.to_string(),
+                chunk_index,
+            });
+        }
+
         self.job_store.read_chunk(job_id, chunk_index).await
     }
 
@@ -675,6 +686,81 @@ mod tests {
         assert!(
             !message.contains("identity that submitted it"),
             "a public job is re-driven, not refused: {message}"
+        );
+    }
+
+    /// A stream of one batch per entry of `batches`, each in an `id` column.
+    fn int_batches(batches: Vec<Vec<i32>>) -> datafusion::execution::SendableRecordBatchStream {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batches: Vec<_> = batches
+            .into_iter()
+            .map(|values| {
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(values))],
+                )
+                .expect("a batch"))
+            })
+            .collect();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ))
+    }
+
+    /// A former driver leaves two chunks; the driver that took the job over
+    /// receives the same rows in one batch and completes the job with one
+    /// chunk. The second chunk is not a result.
+    #[tokio::test]
+    async fn get_chunk_refuses_an_index_the_result_does_not_list() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let former = JobStore::new(Arc::clone(&store), "test", "node-a").with_chunk_size(2);
+        let successor =
+            Arc::new(JobStore::new(Arc::clone(&store), "test", "node-b").with_chunk_size(2));
+        let job_id = seed_job(&former, PUBLIC_JOB_OWNER).await;
+        let started = former.set_job_running(&job_id).await.expect("to start");
+        let left = former
+            .write_result_chunks_from_stream(
+                &job_id,
+                &started.driver().expect("a driver"),
+                int_batches(vec![vec![9, 9], vec![9, 9]]),
+            )
+            .await
+            .expect("the former driver writes while it drives");
+        assert_eq!(left.chunk_indices, vec![0, 1]);
+
+        let taken = successor
+            .take_over_job(&started)
+            .await
+            .expect("to take over")
+            .expect("the job is still driven as observed");
+        let driver = taken.driver().expect("a driver");
+        let result = successor
+            .write_result_chunks_from_stream(&job_id, &driver, int_batches(vec![vec![1, 2, 3, 4]]))
+            .await
+            .expect("the driver writes results");
+        assert_eq!(result.chunk_indices, vec![0]);
+        successor
+            .complete_job(&job_id, &driver, result)
+            .await
+            .expect("the driver completes the job");
+
+        let executor = executor(successor);
+        executor
+            .get_chunk(&job_id, 0, PUBLIC_JOB_OWNER)
+            .await
+            .expect("the listed chunk");
+        let err = executor
+            .get_chunk(&job_id, 1, PUBLIC_JOB_OWNER)
+            .await
+            .expect_err("chunk 1 is not in the result");
+        assert!(
+            matches!(err, Error::ChunkNotFound { chunk_index: 1, .. }),
+            "{err:?}"
         );
     }
 

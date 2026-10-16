@@ -256,9 +256,9 @@ pub async fn start_scheduler_registry(
 
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 
-    // The job-recovery sweep runs as another arm of the runner's select loop (see
-    // `run`), so it shares this already-tracked registry task's lifecycle and
-    // graceful shutdown rather than a separate untracked tokio::spawn.
+    // The job-recovery sweep runs inside the runner's select loop (see `run`), so
+    // it shares this already-tracked registry task's lifecycle and graceful
+    // shutdown rather than a separate untracked tokio::spawn.
     let runner = SchedulerRegistryRunner {
         cluster,
         heartbeats,
@@ -348,9 +348,10 @@ impl SchedulerRegistryRunner {
             tokio::time::Instant::now() + JOB_CLEANUP_INTERVAL,
             JOB_CLEANUP_INTERVAL,
         );
-        // A cleanup pass issues requests for as long as there is something to delete,
-        // so each cleanup runs beside the other arms rather than inside one: a long pass
-        // must not hold up the heartbeat that tells peers this scheduler is alive.
+        // A recovery sweep or cleanup pass issues requests for as long as there is work,
+        // so each runs beside the other arms rather than inside one: a long pass must
+        // not hold up the heartbeat that tells peers this scheduler is alive.
+        let mut recovery = std::pin::pin!(Fuse::terminated());
         let mut cleanup = std::pin::pin!(Fuse::terminated());
         let (heartbeat_cleanup_interval, heartbeat_retention) = heartbeat_cleanup_timing();
         let mut heartbeat_cleanup_due = std::pin::pin!(tokio::time::sleep(heartbeat::jitter(
@@ -393,9 +394,13 @@ impl SchedulerRegistryRunner {
                         Err(err) => tracing::warn!("Reaper tick failed: {err}"),
                     }
                 }
-                _ = recovery_tick.tick() => {
-                    recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id).await;
+                _ = recovery_tick.tick(), if recovery.is_terminated() => {
+                    recovery.set(
+                        recover_orphaned_jobs(&self.job_executor, &self.peers, self.instance_id)
+                            .fuse(),
+                    );
                 }
+                () = &mut recovery => {}
                 _ = cleanup_tick.tick(), if cleanup.is_terminated() => {
                     cleanup.set(self.job_executor.cleanup_expired_jobs().fuse());
                 }
@@ -3206,6 +3211,129 @@ mod tests {
         assert_ne!(
             after, before,
             "the heartbeat keeps changing during the cleanup"
+        );
+        run.abort();
+    }
+
+    /// Object store whose async-query job writes never finish, counting them.
+    #[derive(Debug)]
+    struct StalledJobWrites {
+        inner: Arc<dyn ObjectStore>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl std::fmt::Display for StalledJobWrites {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "StalledJobWrites")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for StalledJobWrites {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().starts_with("jobs/") {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                return futures::future::pending().await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A recovery sweep whose takeover of an orphaned job stalls must not hold
+    /// up the heartbeat that tells peers this scheduler is alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_job_recovery_does_not_hold_up_the_heartbeat() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let lost = crate::jobs::JobStore::new(Arc::clone(&inner), "", "lost-scheduler");
+        let job_id = lost
+            .create_job(
+                crate::http::v1::queries::SubmitQueryRequest {
+                    sql: "SELECT 1".to_string(),
+                    parameters: None,
+                    timeout_seconds: None,
+                    maximum_size: None,
+                },
+                true,
+                crate::jobs::PUBLIC_JOB_OWNER.to_string(),
+            )
+            .await
+            .expect("create the job")
+            .job_id;
+        lost.set_job_running(&job_id)
+            .await
+            .expect("the lost scheduler started the job");
+
+        let jobs = Arc::new(StalledJobWrites {
+            inner: Arc::clone(&inner),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let jobs_store: Arc<dyn ObjectStore> = Arc::clone(&jobs) as Arc<dyn ObjectStore>;
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&inner), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&inner), ""));
+        let runner = runner_over(&cluster, &heartbeats, &jobs_store, Uuid::new_v4());
+        let run = tokio::spawn(runner.run(CancellationToken::new()));
+
+        // Past the first recovery sweep: its takeover write has stalled.
+        tokio::time::sleep(JOB_RECOVERY_INTERVAL + Duration::from_secs(5)).await;
+        assert_eq!(jobs.writes.load(Ordering::SeqCst), 1);
+
+        let path = heartbeats.path_for("test:50051");
+        let before = inner.head(&path).await.expect("heartbeat").e_tag;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let after = inner.head(&path).await.expect("heartbeat").e_tag;
+        assert_ne!(
+            after, before,
+            "the heartbeat keeps changing during the recovery"
         );
         run.abort();
     }
