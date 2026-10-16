@@ -123,11 +123,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut request = request.into_request();
 
     if let Some(api_key) = args.api_key {
-        let metadata_value = match MetadataValue::try_from(api_key) {
+        // The Flight port's authentication reads `authorization: Bearer <key>`.
+        let metadata_value = match MetadataValue::try_from(format!("Bearer {api_key}")) {
             Ok(metadata_value) => metadata_value,
             Err(e) => panic!("Invalid API key: {e}"),
         };
-        request.metadata_mut().insert("x-api-key", metadata_value);
+        request.metadata_mut().insert("authorization", metadata_value);
     }
 
     client.export(request).await?;

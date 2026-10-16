@@ -87,7 +87,8 @@ pub struct LogsLoadArgs {
     #[arg(long)]
     pub gzip: bool,
 
-    /// API key, sent as `x-api-key`.
+    /// API key: `authorization: Bearer <key>` over gRPC, which is what the Flight port's
+    /// authentication reads, and `x-api-key` over HTTP.
     #[arg(long)]
     pub api_key: Option<String>,
 
@@ -202,7 +203,7 @@ async fn grpc_worker(
     let api_key = args
         .api_key
         .as_deref()
-        .map(MetadataValue::try_from)
+        .map(|key| MetadataValue::try_from(format!("Bearer {key}")))
         .transpose()?;
     let mut report = WorkerReport::default();
     let mut sequence = 0_u64;
@@ -210,7 +211,7 @@ async fn grpc_worker(
         sequence += 1;
         let mut request = build_export(&args, worker, sequence).into_request();
         if let Some(key) = &api_key {
-            request.metadata_mut().insert("x-api-key", key.clone());
+            request.metadata_mut().insert("authorization", key.clone());
         }
         let start = Instant::now();
         let result = client.export(request).await;
