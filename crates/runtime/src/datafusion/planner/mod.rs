@@ -64,6 +64,7 @@ use datafusion::sql::sqlparser::tokenizer::{Location, Token, TokenWithSpan, Toke
 use datafusion_dml::CatalogDmlHandler;
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
+use runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings;
 use tokio::runtime::Handle;
 
 use crate::accelerated::AcceleratedTable;
@@ -315,7 +316,18 @@ pub async fn create_logical_plan_from_statement(
         }
     }
 
-    session.statement_to_plan(statement).await
+    plan_retaining_float_spellings(statement, session).await
+}
+
+/// `session.statement_to_plan`, with the spellings of number tokens the planned
+/// `f64` literals lose recorded on them, so a float literal cast to a decimal
+/// takes the decimal the SQL spelled (#14970).
+pub(crate) async fn plan_retaining_float_spellings(
+    statement: Statement,
+    session: &SessionState,
+) -> DFResult<LogicalPlan> {
+    let spellings = FloatLiteralSpellings::collect(&statement);
+    spellings.retain(session.statement_to_plan(statement).await?)
 }
 
 async fn plan_distributed_dml(
@@ -324,7 +336,7 @@ async fn plan_distributed_dml(
     ctx: &PlannerContext,
     expected_op: WriteOp,
 ) -> DFResult<LogicalPlan> {
-    let df_plan = session.statement_to_plan(statement).await?;
+    let df_plan = plan_retaining_float_spellings(statement, session).await?;
 
     if !matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
         return Ok(df_plan);

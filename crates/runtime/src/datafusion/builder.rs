@@ -4349,6 +4349,7 @@ mod tests {
                 "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",
+                "exact_float_literal_decimal_cast",
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"

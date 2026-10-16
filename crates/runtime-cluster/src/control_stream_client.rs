@@ -285,18 +285,22 @@ fn spawn_control_stream(
             tracing::debug!("Control stream established to scheduler {scheduler_address}");
             backoff.reset();
 
-            // Replay cached PartitionsLoaded acks now that the stream is
-            // established and draining the outbound channel. Datasets that
-            // finished loading before this stream existed (fast initial loads
-            // of small datasets) or before a restarted scheduler reconnected
-            // would otherwise never deliver their readiness ack, leaving them
-            // stuck in `Refreshing`. Spawned so a slow scheduler can't delay
-            // inbound message processing.
+            // Replay the Flight endpoint and cached PartitionsLoaded acks now
+            // that the stream is established and draining the outbound channel.
+            // The scheduler drops the executor's endpoint when a stream ends, and
+            // a scheduler this executor did not start against never received it,
+            // so without the endpoint the scheduler cannot send scans here.
+            // Datasets that finished loading before this stream existed (fast
+            // initial loads of small datasets) or before a restarted scheduler
+            // reconnected would otherwise never deliver their readiness ack,
+            // leaving them stuck in `Refreshing`. Spawned so a slow scheduler
+            // can't delay inbound message processing.
             if let Some(b) = broadcaster.as_ref() {
                 let b = b.clone();
                 let address = scheduler_address.clone();
                 let replay_tx = outbound_tx.clone();
                 tokio::spawn(async move {
+                    b.replay_flight_endpoint(&address, &replay_tx).await;
                     b.replay_partitions_loaded(&address, &replay_tx).await;
                 });
             }
