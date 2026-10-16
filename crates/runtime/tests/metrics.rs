@@ -2166,8 +2166,8 @@ mod snapshot_metrics {
         acceleration::{Acceleration as RuntimeAcceleration, RefreshMode as RuntimeRefreshMode},
         dataset_checkpoint::{self, DatasetCheckpointer},
         snapshot::{
-            AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior,
-            SnapshotManager, engine::DefaultSnapshotEngine,
+            AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager,
+            engine::DefaultSnapshotEngine,
         },
     };
     use spicepod::{
@@ -2225,14 +2225,24 @@ mod snapshot_metrics {
     /// The value of gauge `name` for `dataset`, which must carry one series.
     fn gauge_for(name: &str, dataset: &str) -> f64 {
         let series = series_for(name, dataset);
-        assert_eq!(series.len(), 1, "{name} for '{dataset}' carries {} series", series.len());
+        assert_eq!(
+            series.len(),
+            1,
+            "{name} for '{dataset}' carries {} series",
+            series.len()
+        );
         series[0].get_gauge().value()
     }
 
     /// The `checksum` label of the one series of checksum gauge `name` for `dataset`.
     fn checksum_for(name: &str, dataset: &str) -> String {
         let series = series_for(name, dataset);
-        assert_eq!(series.len(), 1, "{name} for '{dataset}' carries {} series", series.len());
+        assert_eq!(
+            series.len(),
+            1,
+            "{name} for '{dataset}' carries {} series",
+            series.len()
+        );
         series[0]
             .get_label()
             .iter()
@@ -2420,7 +2430,10 @@ mod snapshot_metrics {
             Some(0.0),
             "a dataset that creates snapshots must report {FAILURE_COUNT} at zero"
         );
-        #[expect(clippy::cast_precision_loss, reason = "epoch seconds fit an f64 exactly")]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "epoch seconds fit an f64 exactly"
+        )]
         let window = (started_secs as f64)..=(finished_secs as f64);
         let written_at = gauge_for(WRITE_TIMESTAMP, dataset);
         assert!(
@@ -2436,7 +2449,10 @@ mod snapshot_metrics {
         let written_bytes = gauge_for(WRITE_BYTES, dataset);
         assert!(written_bytes > 0.0, "a published snapshot cannot be empty");
         let written_checksum = checksum_for(WRITE_CHECKSUM, dataset);
-        assert!(!written_checksum.is_empty(), "a published snapshot carries its checksum");
+        assert!(
+            !written_checksum.is_empty(),
+            "a published snapshot carries its checksum"
+        );
 
         // A second runtime with no local acceleration of its own restores from the
         // snapshot the first one wrote.
@@ -2450,9 +2466,12 @@ mod snapshot_metrics {
             .with_dataset(reader_dataset)
             .build();
         let reader = Arc::new(Runtime::builder().with_app(app).build().await);
-        tokio::time::timeout(Duration::from_mins(1), Arc::clone(&reader).load_components())
-            .await
-            .expect("the bootstrapping dataset to load within a minute");
+        tokio::time::timeout(
+            Duration::from_mins(1),
+            Arc::clone(&reader).load_components(),
+        )
+        .await
+        .expect("the bootstrapping dataset to load within a minute");
         assert!(
             wait_until(Duration::from_mins(1), || async {
                 has_series_for(BOOTSTRAP_BYTES, dataset)
@@ -2547,7 +2566,11 @@ mod snapshot_metrics {
             1,
             "a skipped snapshot must not be reported as written"
         );
-        assert_eq!(failures(dataset), None, "a skipped snapshot is not a failure");
+        assert_eq!(
+            failures(dataset),
+            None,
+            "a skipped snapshot is not a failure"
+        );
     }
 
     /// An upload that keeps failing is counted once for the snapshot, not once per
