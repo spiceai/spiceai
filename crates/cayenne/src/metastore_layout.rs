@@ -43,18 +43,9 @@ limitations under the License.
 
 use std::path::{Component, Path, PathBuf};
 
-/// Returns true if the path is a local filesystem path (not a remote object store).
-///
-/// Local paths include:
-/// - Absolute paths: `/data/cayenne`
-/// - Relative paths: `./data`
-/// - file:// URIs: `file:///data/cayenne`
-///
-/// Remote paths (S3, etc.) return false.
-#[must_use]
-pub fn is_local_path(path: &str) -> bool {
-    !path.contains("://") || path.starts_with("file://")
-}
+/// Returns true if the path is a local filesystem path (not a remote object store);
+/// shared with the Spicepod validation in `app` through `util`.
+pub use util::spice_paths::is_local_path;
 
 /// Strip a `file:`/`file://` scheme (including an optional authority such as
 /// `localhost`) so on-disk storage detection receives a real filesystem path.

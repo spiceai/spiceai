@@ -1677,23 +1677,18 @@ impl CayenneAccelerator {
     /// 3. `{spice_data_base_path()}/metadata` - Default location
     ///
     /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
+    ///
+    /// The rule itself is [`util::spice_paths::cayenne_metastore_dir`], which the
+    /// Spicepod validation in `app` applies to the same parameters, so a
+    /// configuration that passes validation resolves here to the directory it was
+    /// validated against.
     pub(crate) fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
-        let Some(accel) = acceleration else {
-            return format!("{}/metadata", spice_data_base_path());
-        };
-
-        if let Some(custom_dir) = accel.params.get("cayenne_metadata_dir") {
-            return custom_dir.clone();
-        }
-
-        if let Some(file_path) = accel.params.get("cayenne_file_path")
-            && is_local_path(file_path)
-        {
-            let base = file_path.trim_end_matches('/');
-            return format!("{base}/metadata");
-        }
-
-        format!("{}/metadata", spice_data_base_path())
+        let param =
+            |key: &str| acceleration.and_then(|accel| accel.params.get(key).map(String::as_str));
+        util::spice_paths::cayenne_metastore_dir(
+            param("cayenne_file_path"),
+            param("cayenne_metadata_dir"),
+        )
     }
 
     /// Refuse a configuration whose recreate would delete the shared metastore — see
