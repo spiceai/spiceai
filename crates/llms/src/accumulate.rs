@@ -14,12 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::types::chat::{
-    ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{
+        ChatChoice, ChatChoiceStream, ChatCompletionMessageToolCall,
+        ChatCompletionMessageToolCalls, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FunctionCall,
+    },
 };
-use futures::StreamExt;
+use futures::TryStreamExt;
 
 #[must_use]
 #[expect(deprecated)]
@@ -39,13 +43,18 @@ pub fn empty_completion_response() -> CreateChatCompletionResponse {
 /// Accumulate a [`ChatCompletionResponseStream`] into a single [`CreateChatCompletionResponse`].
 ///
 /// This enables comparing the output from [`super::Chat::chat_stream`] as if it was a [`super::Chat::chat_request`].
-pub async fn accumulate(stream: ChatCompletionResponseStream) -> CreateChatCompletionResponse {
+///
+/// # Errors
+///
+/// Returns the first error the stream yields. A provider can refuse a request inside a stream
+/// that has already started, so a stream error is the request's failure, not a chunk to skip.
+pub async fn accumulate(
+    stream: ChatCompletionResponseStream,
+) -> Result<CreateChatCompletionResponse, OpenAIError> {
     stream
-        .fold(empty_completion_response(), |mut acc, item| async move {
-            if let Ok(stream) = item {
-                fold_completion_stream(&mut acc, &stream);
-            }
-            acc
+        .try_fold(empty_completion_response(), |mut acc, chunk| async move {
+            fold_completion_stream(&mut acc, &chunk);
+            Ok(acc)
         })
         .await
 }
@@ -177,7 +186,6 @@ fn update_chat_choice(acc: &mut ChatChoice, update: &ChatChoiceStream) {
 #[cfg(test)]
 pub mod tests {
 
-    use async_openai::error::OpenAIError;
     use serde_json::json;
 
     use super::*;
@@ -208,7 +216,9 @@ pub mod tests {
                     .map_err(|e| OpenAIError::JSONDeserialize(e, s.to_string()))
             })));
 
-        let resp = accumulate(stream).await;
+        let resp = accumulate(stream)
+            .await
+            .expect("every chunk of the stream is valid");
         assert_eq!(
             serde_json::to_value(&resp)
                 .expect("Output of `accumulate` should be serializable to serde_json::Value"),
