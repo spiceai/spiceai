@@ -406,7 +406,8 @@ pub(crate) struct CompactionPickerConfig {
     pub trigger_files: usize,
     /// Maximum number of file paths retained in the candidate for tracing and
     /// selection. When the candidate is a proper subset of the current snapshot
-    /// (key-delete, no protected snapshots, no sort columns),
+    /// (key-delete, no protected snapshots, no sort columns) — or any candidate of
+    /// an append-only table (no primary key, no position deletes) —
     /// `compact_current_snapshot_small_files` rewrites only those paths and
     /// hard-links the rest; otherwise the runner falls back to a full-snapshot
     /// rewrite.
@@ -529,6 +530,89 @@ fn pick_from_bucket<P: Clone>(
         paths,
         total_bytes: picked_bytes,
     })
+}
+
+/// [`pick_candidates`] for a table with no primary key: when no tier qualifies, the Small tier
+/// still does once it holds a full pick of files (`max_files_per_pick`), whatever their bytes.
+/// Pure function — no IO.
+///
+/// The Small tier's byte threshold lets small files pile up until they hold a full small file
+/// worth of data, so that a slow trickle of writes is not merged over and over. On a table whose
+/// appends are tiny — an exporter sending a few hundred records at a time writes files of a few
+/// KiB — that is thousands of files, and every scan pays for each of them. Merging a full pick of
+/// them costs little, since they are small.
+#[must_use]
+pub(crate) fn pick_append_only_candidates<P: Clone>(
+    files: &[FileEntry<P>],
+    cfg: &CompactionPickerConfig,
+) -> Option<CompactionCandidate<P>> {
+    pick_candidates(files.iter().cloned(), cfg).or_else(|| {
+        let mut small: Vec<FileEntry<P>> = files
+            .iter()
+            .filter(|entry| Tier::classify(entry.size_bytes, &cfg.tiers) == Some(Tier::Small))
+            .cloned()
+            .collect();
+        let pick = cfg.max_files_per_pick.max(cfg.trigger_files);
+        if small.len() < pick {
+            return None;
+        }
+        if pick < small.len() {
+            let _ = small.select_nth_unstable_by_key(pick, |entry| entry.size_bytes);
+        }
+        let picked = &small[..pick];
+        Some(CompactionCandidate {
+            tier: Tier::Small,
+            paths: picked.iter().map(|entry| entry.path.clone()).collect(),
+            total_bytes: picked.iter().map(|entry| entry.size_bytes).sum(),
+        })
+    })
+}
+
+/// Extend `candidate` with the next-smallest files of its tier, each under a quarter of
+/// `budget_bytes`, while its bytes stay within `budget_bytes`. Pure function — no IO.
+///
+/// The picker keeps at most `max_files_per_pick` paths in a candidate. A table with no primary
+/// key merges its candidate by the subset rewrite, which also links every file it does not merge
+/// into the pass's new snapshot, so on a table whose files are tiny — an exporter that sends a
+/// few hundred records at a time writes files of a few KiB — a pass of that many files costs
+/// more in links than in encoding, and files arrive faster than passes take them. Merging the
+/// tier's next-smallest files up to a byte budget keeps each pass's encode bounded while letting
+/// it take as many small files as the budget holds. A file of a quarter of the budget or more is a
+/// merge output already: it waits for its tier's next pass rather than being rewritten with every
+/// batch of new files.
+#[must_use]
+pub(crate) fn extend_candidate_to_bytes<'a>(
+    mut candidate: CompactionCandidate<&'a str>,
+    files: &'a [(String, u64)],
+    tiers: &CompactionTiers,
+    budget_bytes: u64,
+) -> CompactionCandidate<&'a str> {
+    if candidate.total_bytes >= budget_bytes {
+        return candidate;
+    }
+    let picked: std::collections::HashSet<&str> = candidate.paths.iter().copied().collect();
+    let mut rest: Vec<(&str, u64)> = files
+        .iter()
+        .filter(|(path, size)| {
+            !picked.contains(path.as_str())
+                && size.saturating_mul(4) < budget_bytes
+                && Tier::classify(*size, tiers) == Some(candidate.tier)
+        })
+        .map(|(path, size)| (path.as_str(), *size))
+        .collect();
+    rest.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+    for (path, size) in rest {
+        let Some(total) = candidate
+            .total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= budget_bytes)
+        else {
+            break;
+        };
+        candidate.paths.push(path);
+        candidate.total_bytes = total;
+    }
+    candidate
 }
 
 /// Trait the background compactor uses to invoke a per-table compaction pass.
@@ -1088,6 +1172,89 @@ mod tests {
             .await
             .expect("spawned task completes");
         assert_eq!(value, 7, "fallback path should run and return the value");
+    }
+
+    /// A candidate below the budget takes the tier's next-smallest files under a quarter of the
+    /// budget, smallest first, until the next would pass it; files of another tier, and files of a
+    /// quarter of the budget or more, never join it; a candidate at or above the budget is returned
+    /// as it is.
+    #[test]
+    fn extend_candidate_to_bytes_fills_the_budget_with_the_tiers_small_files() {
+        const MIB: u64 = 1024 * 1024;
+        let tiers = CompactionTiers::from_target_file_size_bytes(256 * MIB);
+        // Ten 100 KiB files, six 3 MiB files, one 5 MiB file (all Small), one 100 MiB (Mid).
+        let mut files: Vec<(String, u64)> = (0..10)
+            .map(|i| (format!("tiny_{i}.vortex"), 100 * 1024))
+            .collect();
+        files.extend((0..6).map(|i| (format!("small_{i}.vortex"), 3 * MIB)));
+        files.push(("merged.vortex".to_string(), 5 * MIB));
+        files.push(("mid.vortex".to_string(), 100 * MIB));
+        let two_tiny = || CompactionCandidate {
+            tier: Tier::Small,
+            paths: files[..2].iter().map(|(path, _)| path.as_str()).collect(),
+            total_bytes: 200 * 1024,
+        };
+
+        // 16 MiB: every tiny file, then 3 MiB files until a sixth would pass the budget.
+        let extended = extend_candidate_to_bytes(two_tiny(), &files, &tiers, 16 * MIB);
+        assert_eq!(extended.total_bytes, 1000 * 1024 + 15 * MIB);
+        assert_eq!(
+            extended.paths.len(),
+            15,
+            "ten tiny files and five 3 MiB ones"
+        );
+        assert!(
+            !extended
+                .paths
+                .iter()
+                .any(|path| *path == "merged.vortex" || *path == "mid.vortex"),
+            "never the 5 MiB merge output (over a quarter of the budget) or the Mid file"
+        );
+
+        // 11 MiB: a quarter is under 3 MiB, so only the tiny files join.
+        let extended = extend_candidate_to_bytes(two_tiny(), &files, &tiers, 11 * MIB);
+        assert_eq!(extended.total_bytes, 1000 * 1024);
+        assert_eq!(extended.paths.len(), 10);
+
+        // At or above the budget, unchanged.
+        let candidate = CompactionCandidate {
+            tier: Tier::Small,
+            paths: vec!["small_0.vortex", "small_1.vortex"],
+            total_bytes: 6 * MIB,
+        };
+        let extended = extend_candidate_to_bytes(candidate, &files, &tiers, 6 * MIB);
+        assert_eq!(extended.paths, vec!["small_0.vortex", "small_1.vortex"]);
+    }
+
+    /// A table with no primary key whose Small tier is below its byte threshold still compacts
+    /// once the tier holds a full pick of files, taking the smallest; one file short, it waits.
+    #[test]
+    fn pick_append_only_candidates_qualifies_the_small_tier_by_count() {
+        let cfg = default_cfg();
+        // 32 files of 30 KiB: far below the 64 MiB byte threshold.
+        let files = entries(&[30 * 1024; 32]);
+        assert!(
+            pick_candidates(files.clone(), &cfg).is_none(),
+            "precondition: the byte threshold alone does not qualify the tier"
+        );
+        let candidate =
+            pick_append_only_candidates(&files, &cfg).expect("a full pick of files qualifies");
+        assert_eq!(candidate.tier, Tier::Small);
+        assert_eq!(candidate.paths.len(), 32);
+        assert_eq!(candidate.total_bytes, 32 * 30 * 1024);
+
+        // 40 files: the 32 smallest.
+        let mut sizes = vec![30 * 1024; 40];
+        for size in sizes.iter_mut().skip(32) {
+            *size = 60 * 1024;
+        }
+        let files = entries(&sizes);
+        let candidate = pick_append_only_candidates(&files, &cfg).expect("qualifies");
+        assert_eq!(candidate.paths.len(), 32);
+        assert_eq!(candidate.total_bytes, 32 * 30 * 1024, "the 32 smallest");
+
+        // 31 files: one short of a pick.
+        assert!(pick_append_only_candidates(&entries(&[30 * 1024; 31]), &cfg).is_none());
     }
 
     #[test]
