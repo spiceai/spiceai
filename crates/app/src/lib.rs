@@ -16,11 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{
-    collections::HashMap,
-    path::{Component, Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -385,38 +381,22 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 /// A metastore directory in the form two datasets' directories are compared in: a
 /// `file:` scheme stripped the way the accelerator strips it ([`fs_probe_path`]), a
 /// local path placed against the working directory the way the accelerator places it
-/// ([`absolute_dir`]), and `.` and `..` components folded, so `./.spice/data/metadata`,
-/// `file:///<cwd>/.spice/data/metadata`, `<cwd>/.spice/data/../data/metadata` and the
-/// default `<cwd>/.spice/data/metadata` compare equal. Paths compare by component, so
-/// a trailing separator does not make two directories differ and the root `/` stays
-/// the root. Nothing is read from disk, so two spellings that meet only through a
-/// symlink stay distinct; spell the shared directory the same way on every dataset.
-/// An object-store URL compares as written, by component.
+/// ([`absolute_dir`]), compared by component, so `./.spice/data/metadata`,
+/// `file:///<cwd>/.spice/data/metadata` and the default `<cwd>/.spice/data/metadata`
+/// compare equal, a trailing separator or a `.` component does not make two
+/// directories differ, and the root `/` stays the root. Nothing is read from disk,
+/// so a `..` component is kept as written rather than folded: `<base>/link/../meta`
+/// names a different directory from `<base>/meta` when `link` is a symlink, and a
+/// check that folded it would pass two metastores off as one. Two spellings that
+/// meet only through `..` or a symlink therefore read as two directories; spell the
+/// shared directory the same way on every dataset. An object-store URL compares as
+/// written, by component.
 fn comparable_metastore_dir(dir: &str) -> PathBuf {
     if !is_local_path(dir) {
         return PathBuf::from(dir);
     }
     let path = fs_probe_path(dir);
-    fold_parent_components(&absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path)))
-}
-
-/// `path` with every `.` dropped and every `..` folded into the component before it,
-/// lexically: the directory the operating system opens for the path, as long as no
-/// symlink sits on it. A `..` with nothing to fold into (at the root) is kept.
-fn fold_parent_components(path: &Path) -> PathBuf {
-    let mut folded = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir
-                if matches!(folded.components().next_back(), Some(Component::Normal(_))) =>
-            {
-                folded.pop();
-            }
-            other => folded.push(other),
-        }
-    }
-    folded
+    absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
 pub struct AppBuilder {
@@ -959,26 +939,52 @@ mod tests {
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
     }
 
-    /// A directory spelled through a parent reference is the directory it folds to,
-    /// as the operating system opens it.
+    /// A `.` component and a trailing separator are spellings of one directory. A
+    /// `..` component is not folded: `<base>/link/../meta` names `<base>/target/meta`
+    /// when `link` is a symlink to `<base>/target/child`, so folding it lexically
+    /// would pass two metastores off as one, and the check reads nothing from disk.
+    /// Such a spelling is reported as a different directory, and the message asks
+    /// for one spelling on every dataset.
     #[test]
-    fn cayenne_accepts_a_directory_spelled_through_a_parent_reference() {
+    fn cayenne_folds_self_references_but_not_parent_references() {
         let datasets = vec![
             cayenne_dataset("plain", None, Some("/data/meta")),
-            cayenne_dataset("through_parent", None, Some("/data/meta/../meta")),
             cayenne_dataset("through_self", None, Some("/data/./meta/")),
         ];
-
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
 
         let datasets = vec![
             cayenne_dataset("plain", None, Some("/data/meta")),
-            cayenne_dataset("other", None, Some("/data/meta/../other")),
+            cayenne_dataset("through_parent", None, Some("/data/meta/../meta")),
         ];
         assert_eq!(
             cayenne_metastore_dir_conflict(&datasets).as_deref(),
-            Some("'plain' ('/data/meta'), 'other' ('/data/meta/../other')")
+            Some("'plain' ('/data/meta'), 'through_parent' ('/data/meta/../meta')")
         );
+    }
+
+    /// A `..` after a symlink names a directory under the link's target, not under the
+    /// link's parent: `<base>/link/../meta` is `<base>/target/meta` when `link` points
+    /// to `<base>/target/child`, so it must not pass as `<base>/meta`.
+    #[test]
+    #[cfg(unix)]
+    fn cayenne_keeps_a_parent_reference_through_a_symlink_distinct() {
+        let base = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(base.path().join("target/child")).expect("target dir");
+        std::os::unix::fs::symlink(base.path().join("target/child"), base.path().join("link"))
+            .expect("symlink");
+        let through_link = base.path().join("link/../meta");
+        let plain = base.path().join("meta");
+        // The operating system places them in different directories.
+        std::fs::create_dir_all(&through_link).expect("dir through the link");
+        assert!(base.path().join("target/meta").is_dir());
+        assert!(!plain.exists());
+
+        let datasets = vec![
+            cayenne_dataset("plain", None, Some(&plain.to_string_lossy())),
+            cayenne_dataset("through_link", None, Some(&through_link.to_string_lossy())),
+        ];
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_some());
     }
 
     /// The filesystem root is a directory of its own, not the working directory a

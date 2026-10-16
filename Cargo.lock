@@ -600,6 +600,7 @@ dependencies = [
  "serde",
  "snafu",
  "spicepod",
+ "tempfile",
  "tracing",
  "util",
 ]
