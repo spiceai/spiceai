@@ -16,7 +16,11 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -372,7 +376,7 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
     Some(
         cayenne_datasets
             .iter()
-            .map(|(name, dir)| format!("`{}` (`{}`)", name.escape_debug(), dir.escape_debug()))
+            .map(|(name, dir)| format!("'{}' ('{}')", name.escape_debug(), dir.escape_debug()))
             .collect::<Vec<_>>()
             .join(", "),
     )
@@ -380,18 +384,39 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 
 /// A metastore directory in the form two datasets' directories are compared in:
 /// trailing separators dropped, a `file:` scheme stripped the way the accelerator
-/// strips it ([`fs_probe_path`]), and a local path placed against the working
-/// directory the way the accelerator places it ([`absolute_dir`]), compared as a
-/// path, so `./.spice/data/metadata`, `file:///<cwd>/.spice/data/metadata` and the
-/// default `<cwd>/.spice/data/metadata` compare equal. An object-store URL only loses
-/// its trailing separator.
+/// strips it ([`fs_probe_path`]), a local path placed against the working directory
+/// the way the accelerator places it ([`absolute_dir`]), and `.` and `..` components
+/// folded, so `./.spice/data/metadata`, `file:///<cwd>/.spice/data/metadata`,
+/// `<cwd>/.spice/data/../data/metadata` and the default `<cwd>/.spice/data/metadata`
+/// compare equal. Nothing is read from disk, so two spellings that meet only through
+/// a symlink stay distinct; spell the shared directory the same way on every dataset.
+/// An object-store URL only loses its trailing separator.
 fn comparable_metastore_dir(dir: &str) -> PathBuf {
     let trimmed = dir.trim_end_matches(['/', '\\']);
     if !is_local_path(trimmed) {
         return PathBuf::from(trimmed);
     }
     let path = fs_probe_path(trimmed);
-    absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path))
+    fold_parent_components(&absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path)))
+}
+
+/// `path` with every `.` dropped and every `..` folded into the component before it,
+/// lexically: the directory the operating system opens for the path, as long as no
+/// symlink sits on it. A `..` with nothing to fold into (at the root) is kept.
+fn fold_parent_components(path: &Path) -> PathBuf {
+    let mut folded = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(folded.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                folded.pop();
+            }
+            other => folded.push(other),
+        }
+    }
+    folded
 }
 
 pub struct AppBuilder {
@@ -828,7 +853,7 @@ mod tests {
         let error = Error::InvalidCayenneConfiguration { datasets };
         assert_eq!(
             error.to_string(),
-            "Invalid Cayenne configuration: datasets resolve to different Cayenne metastore directories, but one `spiced` process keeps a single Cayenne catalog: `orders` (`/mnt/a/cayenne/metadata`), `customers` (`/mnt/b/cayenne/metadata`). Set the same `cayenne_metadata_dir` on every Cayenne dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne#metastore-location"
+            "Invalid Cayenne configuration: datasets resolve to different Cayenne metastore directories, but one `spiced` process keeps a single Cayenne catalog: 'orders' ('/mnt/a/cayenne/metadata'), 'customers' ('/mnt/b/cayenne/metadata'). Set the same `cayenne_metadata_dir` on every Cayenne dataset. See: https://spiceai.org/docs/components/data-accelerators/cayenne#metastore-location"
         );
     }
 
@@ -845,7 +870,7 @@ mod tests {
         assert_eq!(
             cayenne_metastore_dir_conflict(&datasets),
             Some(format!(
-                "`explicit_path` (`/abs/custom/metadata`), `default_path` (`{}/metadata`)",
+                "'explicit_path' ('/abs/custom/metadata'), 'default_path' ('{}/metadata')",
                 spice_data_base_path().escape_debug()
             ))
         );
@@ -862,7 +887,7 @@ mod tests {
 
         assert_eq!(
             cayenne_metastore_dir_conflict(&datasets).as_deref(),
-            Some("`meta_a` (`/abs/meta-a/`), `meta_b` (`/abs/meta-b/`)")
+            Some("'meta_a' ('/abs/meta-a/'), 'meta_b' ('/abs/meta-b/')")
         );
     }
 
@@ -934,6 +959,42 @@ mod tests {
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
     }
 
+    /// A directory spelled through a parent reference is the directory it folds to,
+    /// as the operating system opens it.
+    #[test]
+    fn cayenne_accepts_a_directory_spelled_through_a_parent_reference() {
+        let datasets = vec![
+            cayenne_dataset("plain", None, Some("/data/meta")),
+            cayenne_dataset("through_parent", None, Some("/data/meta/../meta")),
+            cayenne_dataset("through_self", None, Some("/data/./meta/")),
+        ];
+
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
+
+        let datasets = vec![
+            cayenne_dataset("plain", None, Some("/data/meta")),
+            cayenne_dataset("other", None, Some("/data/meta/../other")),
+        ];
+        assert_eq!(
+            cayenne_metastore_dir_conflict(&datasets).as_deref(),
+            Some("'plain' ('/data/meta'), 'other' ('/data/meta/../other')")
+        );
+    }
+
+    /// A relative `cayenne_metadata_dir` is placed against the working directory, so
+    /// it is the same metastore as its absolute spelling.
+    #[test]
+    fn cayenne_accepts_a_relative_metadata_dir_beside_its_absolute_spelling() {
+        let cwd = std::env::current_dir().expect("the working directory is readable");
+        let absolute = cwd.join("meta").to_string_lossy().into_owned();
+        let datasets = vec![
+            cayenne_dataset("relative", None, Some("./meta")),
+            cayenne_dataset("absolute", None, Some(&absolute)),
+        ];
+
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
+    }
+
     /// An object-store data path keeps its metastore at the default local
     /// directory, like a dataset that sets no path at all.
     #[test]
@@ -966,7 +1027,7 @@ mod tests {
         // Both spellings must be recognized as Cayenne, so the error names both datasets.
         assert_eq!(
             cayenne_metastore_dir_conflict(&datasets).as_deref(),
-            Some("`orders` (`/mnt/a/cayenne/metadata`), `customers` (`/mnt/b/cayenne/metadata`)")
+            Some("'orders' ('/mnt/a/cayenne/metadata'), 'customers' ('/mnt/b/cayenne/metadata')")
         );
     }
 
