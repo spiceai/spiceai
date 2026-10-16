@@ -552,14 +552,16 @@ pub(crate) fn pick_append_only_candidates<P: Clone>(
             .filter(|entry| Tier::classify(entry.size_bytes, &cfg.tiers) == Some(Tier::Small))
             .cloned()
             .collect();
-        let pick = cfg.max_files_per_pick.max(cfg.trigger_files);
-        if small.len() < pick {
+        // Qualifies at a full pick, or at the trigger when that is larger, and keeps at
+        // most a pick of paths, as `pick_from_bucket` does.
+        if small.len() < cfg.max_files_per_pick.max(cfg.trigger_files) {
             return None;
         }
-        if pick < small.len() {
-            let _ = small.select_nth_unstable_by_key(pick, |entry| entry.size_bytes);
+        let keep = cfg.max_files_per_pick.min(small.len());
+        if keep < small.len() {
+            let _ = small.select_nth_unstable_by_key(keep, |entry| entry.size_bytes);
         }
-        let picked = &small[..pick];
+        let picked = &small[..keep];
         Some(CompactionCandidate {
             tier: Tier::Small,
             paths: picked.iter().map(|entry| entry.path.clone()).collect(),
