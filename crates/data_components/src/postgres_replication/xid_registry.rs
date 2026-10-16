@@ -703,6 +703,11 @@ mod tests {
             *self.upsert_count.lock() += 1;
             Ok(())
         }
+
+        async fn delete(&self) -> Result<(), CheckpointError> {
+            *self.data.lock() = None;
+            Ok(())
+        }
     }
 
     const SOURCE: &str = "localhost:5432/db/public.orders";

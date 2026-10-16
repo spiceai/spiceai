@@ -21,7 +21,7 @@ use super::{
     metrics,
     refresh::RefreshOverrides,
     refresh_completion::RefreshRequestId,
-    refresh_task::{RefreshOutcome, RefreshTask},
+    refresh_task::{RefreshOutcome, RefreshTask, append_cursor::AppendCursorStore},
     synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -75,6 +75,8 @@ pub struct RefreshTaskRunnerBuilder {
     /// Forwarded to the refresh task so the caching stale-row refresh claims
     /// the keys it replaces.
     in_flight_revalidations: Option<crate::accelerated::caching::InFlightRevalidations>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<AppendCursorStore>,
 }
 
 impl RefreshTaskRunnerBuilder {
@@ -113,6 +115,7 @@ impl RefreshTaskRunnerBuilder {
             engine_type_rewrites: &[],
             snapshot_refresh_state: None,
             in_flight_revalidations: None,
+            append_cursor_store: None,
         }
     }
 
@@ -213,6 +216,13 @@ impl RefreshTaskRunnerBuilder {
         self
     }
 
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    #[must_use]
+    pub fn with_append_cursor_store(mut self, store: Option<AppendCursorStore>) -> Self {
+        self.append_cursor_store = store;
+        self
+    }
+
     /// Shares the caching accelerator's claim set with the refresh task, so
     /// its periodic stale-row refresh claims the keys it replaces.
     #[must_use]
@@ -263,6 +273,9 @@ impl RefreshTaskRunnerBuilder {
 
         refresh_task_builder =
             refresh_task_builder.with_snapshot_refresh_state(self.snapshot_refresh_state);
+
+        refresh_task_builder =
+            refresh_task_builder.with_append_cursor_store(self.append_cursor_store);
 
         if let Some(flag) = self.initial_load_completed {
             refresh_task_builder = refresh_task_builder.with_initial_load_completed(flag);
