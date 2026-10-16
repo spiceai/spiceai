@@ -18620,6 +18620,7 @@ dependencies = [
  "rand 0.10.1",
  "runtime-acceleration",
  "runtime-async",
+ "runtime-checkpoint-api",
  "runtime-component",
  "runtime-datafusion",
  "runtime-datafusion-index",
