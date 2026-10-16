@@ -24,6 +24,7 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
+use crate::opentelemetry_logs::create_logs_service;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -1216,6 +1217,8 @@ pub async fn start(
     // Create the OpenTelemetry MetricsService. Pass a weak runtime handle so ingest can
     // evolve an accelerated metric table's schema in place when new dimensions arrive.
     let query_engine: Arc<dyn runtime_query_engine::query_engine::QueryEngine> = rt.datafusion();
+    let otel_logs_service =
+        create_logs_service(Arc::clone(&query_engine), Some(Arc::downgrade(&rt)));
     let otel_service = create_metrics_service(query_engine, Some(Arc::downgrade(&rt)));
 
     // Get job executor if available (cluster mode)
@@ -1245,7 +1248,8 @@ pub async fn start(
 
     let server = server
         .add_service(spice_flight_service)
-        .add_service(otel_service);
+        .add_service(otel_service)
+        .add_service(otel_logs_service);
 
     let serve_result = if let Some(ref tls_config) = tls_config {
         // TLS path: bind a TCP listener ourselves, run tokio-rustls per

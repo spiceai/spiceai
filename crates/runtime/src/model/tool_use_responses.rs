@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
-use crate::model::responses_tool_history::{ToolOutcome, mcp_call};
+use crate::model::responses_tool_history::{ToolOutcome, mcp_call, replayed_call};
 use crate::model::tool_use::encode_tool_name;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -279,10 +279,15 @@ impl ToolUsingResponses {
                 Some(Item::Message(MessageItem::Output(message.clone())))
             }
             OutputItem::Reasoning(reasoning) => Some(Item::Reasoning(reasoning.clone())),
-            OutputItem::FunctionCall(call) => self
-                .as_spiced_tool(&call.name)
-                .is_some()
-                .then(|| Item::FunctionCall(call.clone())),
+            OutputItem::FunctionCall(call) => {
+                self.as_spiced_tool(&call.name).is_some().then(|| {
+                    Item::FunctionCall(replayed_call(
+                        call.call_id.clone(),
+                        call.name.clone(),
+                        call.arguments.clone(),
+                    ))
+                })
+            }
             OutputItem::WebSearchCall(call) => Some(Item::WebSearchCall(call.clone())),
             OutputItem::FileSearchCall(call) => Some(Item::FileSearchCall(call.clone())),
             OutputItem::CodeInterpreterCall(call) => Some(Item::CodeInterpreterCall(call.clone())),
@@ -312,9 +317,10 @@ impl ToolUsingResponses {
     /// then `output`, then the calls' results, from `outcomes` by `call_id`, paired with the calls
     /// by `call_id`.
     ///
-    /// The round's output is replayed as is, item IDs included: a reasoning model pairs each tool
-    /// call with a reasoning item, and `OpenAI` rejects one replayed without the other. The next
-    /// round also gets the round's hosted tool results, such as a web search's.
+    /// The round's output is replayed as is, item IDs included, so that a reasoning model gets
+    /// each reasoning item back. Each Spice tool call is replayed as each later turn replays it
+    /// (see [`replayed_call`]). The next round also gets the round's hosted tool results, such as a
+    /// web search's.
     async fn next_input(
         &self,
         mut input: Vec<InputItem>,
@@ -1229,6 +1235,15 @@ mod tests {
         }
     }
 
+    /// The call at `index` of round `round`, as Spice replays it to the provider: without its `id`.
+    fn replayed_item(round: usize, index: usize, name: &str) -> Value {
+        let mut call = item(round, index, name, "completed");
+        if let Some(call) = call.as_object_mut() {
+            call.remove("id");
+        }
+        call
+    }
+
     fn output(round: usize, items: &[&str]) -> Vec<Value> {
         items
             .iter()
@@ -1475,7 +1490,7 @@ mod tests {
             provider.input(1),
             json!([
                 user_message(),
-                item(0, 0, "list_datasets", "completed"),
+                replayed_item(0, 0, "list_datasets"),
                 tool_result(0, 0)
             ])
         );
@@ -1520,7 +1535,7 @@ mod tests {
             provider.input(1),
             json!([
                 user_message(),
-                item(0, 1, "list_datasets", "completed"),
+                replayed_item(0, 1, "list_datasets"),
                 tool_result(0, 1)
             ])
         );
@@ -1571,7 +1586,7 @@ mod tests {
             json!([
                 user_message(),
                 item(0, 0, "message", "completed"),
-                item(0, 1, "list_datasets", "completed"),
+                replayed_item(0, 1, "list_datasets"),
                 tool_result(0, 1)
             ])
         );
@@ -1613,9 +1628,9 @@ mod tests {
             provider.input(1),
             json!([
                 user_message(),
-                item(0, 0, "list_datasets", "completed"),
+                replayed_item(0, 0, "list_datasets"),
                 item(0, 1, "message", "completed"),
-                item(0, 2, "list_datasets", "completed"),
+                replayed_item(0, 2, "list_datasets"),
                 tool_result(0, 0),
                 tool_result(0, 2)
             ])
@@ -1651,7 +1666,7 @@ mod tests {
             json!([
                 user_message(),
                 item(0, 0, "message", "completed"),
-                item(0, 1, "list_datasets", "completed"),
+                replayed_item(0, 1, "list_datasets"),
                 tool_result(0, 1)
             ])
         );
@@ -1733,12 +1748,9 @@ mod tests {
             )
             .await;
 
-            // Turn 1's second round shows what the model saw. The replayed call has no `id`.
-            let mut seen = provider.input(1);
-            if let Some(call) = seen[2].as_object_mut() {
-                call.remove("id");
-            }
-            let mut expected = seen.as_array().cloned().unwrap_or_default();
+            // Turn 2 starts with all of turn 1's second round, item for item, so that the
+            // provider's prompt cache serves it.
+            let mut expected = provider.input(1).as_array().cloned().unwrap_or_default();
             expected.extend([item(1, 0, "message", "completed"), follow_up]);
             assert_eq!(
                 provider.input(2),

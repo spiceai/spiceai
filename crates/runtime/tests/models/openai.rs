@@ -686,7 +686,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 
 /// The text of the first message in `response`. A reasoning model's output starts with a
 /// reasoning item, so the message is not always the first item.
-fn extract_text(response: &OpenAIResponse) -> Option<String> {
+pub(crate) fn extract_text(response: &OpenAIResponse) -> Option<String> {
     response.output.iter().find_map(|out| {
         if let OutputItem::Message(OutputMessage { content, .. }) = out {
             match content.first() {
@@ -1154,7 +1154,7 @@ const ORDERS_CSV: &str = "order_id,region,product,quantity,unit_price
 
 /// Sends `request` to `/v1/responses` and returns the response, and, for a streamed request, the
 /// events the client received.
-async fn create_response(
+pub(crate) async fn create_response(
     client: &OpenAIClient<OpenAIConfig>,
     request: Value,
 ) -> Result<(OpenAIResponse, Option<Vec<Value>>), anyhow::Error> {
@@ -1223,7 +1223,7 @@ async fn responses_task_inputs(
 
 /// `sql` lowercased, with its whitespace collapsed, no trailing semicolon, and unescaped quotes, to
 /// find a query a model quotes in its own layout or as it appears in the call's JSON arguments.
-fn normalized_sql(sql: &str) -> String {
+pub(crate) fn normalized_sql(sql: &str) -> String {
     sql.replace("\\\"", "\"")
         .to_lowercase()
         .split_whitespace()

@@ -4104,7 +4104,13 @@ impl DataFusion {
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
         // For caching mode, we always start ready since it fetches data on-demand.
-        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        // A `sink` has nothing to load either: its rows arrive only by write, so its
+        // acceleration — empty on a first start — already holds the whole dataset, and a scan
+        // must not fail while a refresh that reads no rows runs. A snapshot refresh is the
+        // exception, since its rows do arrive by refresh.
+        let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching)
+            || (source.as_any().is::<SinkConnector>()
+                && !matches!(refresh_mode, RefreshMode::Snapshot));
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
@@ -4528,6 +4534,14 @@ impl DataFusion {
             .await
             .ok(),
         );
+
+        // An append refresh of a source that records its commits (Iceberg) follows
+        // them from the snapshot it last loaded.
+        if matches!(refresh_mode, RefreshMode::Append) {
+            accelerated_table_builder.append_cursor_store(
+                crate::dataaccelerator::spice_sys::append_cursor_store(dataset).await,
+            );
+        }
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
@@ -5323,6 +5337,16 @@ impl DataFusion {
         if let Some(checkpoint) = checkpoint {
             let _ = checkpoint.delete().await;
         }
+        // And the source commit an append refresh last loaded, for the same reason: the
+        // recreated table holds none of it.
+        let _ = crate::dataaccelerator::spice_sys::append_cursor_store_for(
+            source,
+            Arc::clone(&self.accelerator_engine_registry),
+            OpenOption::OpenExisting,
+        )
+        .await
+        .clear()
+        .await;
 
         // Cached logical plans reference the dropped table.
         self.clear_cached_plans().await;
@@ -6812,7 +6836,11 @@ impl DataFusion {
         let statement = session.sql_to_statement(sql, &dialect)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
-        session.statement_to_plan(statement).await
+        let spellings =
+            runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
+                &statement,
+            );
+        spellings.retain(session.statement_to_plan(statement).await?)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {

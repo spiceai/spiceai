@@ -30,7 +30,7 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
@@ -48,6 +48,10 @@ use crate::metadata::TablePartitionMetadata;
 /// Current schema version for `cluster.json`. Bump if the on-disk shape
 /// changes; readers reject unknown versions.
 pub const CLUSTER_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// How long the entry of a table no scheduler has registered stays in the cluster
+/// document, counted from when a scheduler first found the table unregistered.
+pub const UNREGISTERED_TABLE_RETENTION: Duration = Duration::from_hours(24);
 
 /// Logical scheduler identifier (`host:port` style, stable across restarts).
 pub type SchedulerId = String;
@@ -85,6 +89,62 @@ impl ClusterState {
             accelerations: HashMap::new(),
             catalog: HashMap::new(),
         }
+    }
+
+    /// Applies one scheduler's view of which tables it has registered to the table
+    /// entries: an entry whose table is registered loses its unregistered time, an
+    /// entry whose table is not registered gets one, and an entry whose
+    /// unregistered time is at least `retention` before `now_ms` is removed.
+    /// Entries `registered` does not name are left as they are.
+    pub fn reconcile_table_entries(
+        &mut self,
+        registered: &HashMap<NormalizedTableName, bool>,
+        now_ms: u64,
+        retention: Duration,
+    ) -> TableEntryChanges {
+        let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        let mut changes = TableEntryChanges::default();
+        for map in [&mut self.accelerations, &mut self.catalog] {
+            map.retain(|table, entry| {
+                match (registered.get(table), entry.unregistered_at_ms) {
+                    (Some(true), Some(_)) => {
+                        entry.unregistered_at_ms = None;
+                        changes.cleared += 1;
+                    }
+                    (Some(false), None) => {
+                        entry.unregistered_at_ms = Some(now_ms);
+                        changes.marked += 1;
+                    }
+                    (Some(false), Some(unregistered_at))
+                        if now_ms >= unregistered_at.saturating_add(retention_ms) =>
+                    {
+                        changes.removed.push(table.clone());
+                        return false;
+                    }
+                    (None, _) | (Some(true), None) | (Some(false), Some(_)) => {}
+                }
+                true
+            });
+        }
+        changes.removed.sort_unstable();
+        changes
+    }
+}
+
+/// What [`ClusterState::reconcile_table_entries`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableEntryChanges {
+    /// Entries that got an unregistered time.
+    pub marked: usize,
+    /// Entries whose unregistered time was cleared.
+    pub cleared: usize,
+    /// The tables whose entries were removed, sorted.
+    pub removed: Vec<NormalizedTableName>,
+}
+
+impl TableEntryChanges {
+    fn is_empty(&self) -> bool {
+        self.marked == 0 && self.cleared == 0 && self.removed.is_empty()
     }
 }
 
@@ -383,6 +443,34 @@ impl ClusterStateStore {
         })
     }
 
+    /// Applies [`ClusterState::reconcile_table_entries`] to the stored document,
+    /// with [`UNREGISTERED_TABLE_RETENTION`], and returns what it changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the mutation fails (see [`Self::mutate`]).
+    pub async fn reconcile_table_entries(
+        &self,
+        registered: &HashMap<NormalizedTableName, bool>,
+    ) -> Result<TableEntryChanges> {
+        let retention = object_store_occ::cleanup::age(UNREGISTERED_TABLE_RETENTION);
+        let mut changes = TableEntryChanges::default();
+        self.mutate(|state| {
+            let now_ms = match now_ms() {
+                Ok(now_ms) => now_ms,
+                Err(err) => return MutationOutcome::Abort(err),
+            };
+            changes = state.reconcile_table_entries(registered, now_ms, retention);
+            if changes.is_empty() {
+                MutationOutcome::NoChange
+            } else {
+                MutationOutcome::Apply
+            }
+        })
+        .await?;
+        Ok(changes)
+    }
+
     /// Writes `state` if the document is still at `version`, and caches it.
     async fn write(
         &self,
@@ -483,6 +571,7 @@ pub fn now_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::TablePartitionMetadata;
     use object_store::memory::InMemory;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -689,5 +778,151 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(read.schedulers.len(), writers * per_writer);
+    }
+
+    fn table_entry(table: &str, unregistered_at_ms: Option<u64>) -> TablePartitionMetadata {
+        TablePartitionMetadata {
+            table_name: table.to_string(),
+            partitions: Vec::new(),
+            schema_version: 1,
+            updated_at: 1,
+            partition_expressions: vec!["date".to_string()],
+            unregistered_at_ms,
+        }
+    }
+
+    fn entries(
+        map: &HashMap<NormalizedTableName, TablePartitionMetadata>,
+    ) -> Vec<(String, Option<u64>)> {
+        let mut entries: Vec<_> = map
+            .iter()
+            .map(|(table, entry)| (table.clone(), entry.unregistered_at_ms))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// An entry goes once its table has been unregistered for 24 hours, counted
+    /// from when a scheduler first found it unregistered; a scheduler that has the
+    /// table registered resets that count.
+    #[test]
+    fn a_table_entry_is_removed_24_hours_after_its_table_was_found_unregistered() {
+        let day_ms = 24 * 60 * 60 * 1000;
+        let now = 10 * day_ms;
+        let mut state = ClusterState::new(0);
+        for (table, unregistered_at) in [
+            ("spice.public.registered", None),
+            ("spice.public.reregistered", Some(now - day_ms - 1)),
+            ("spice.public.newly_unregistered", None),
+            ("spice.public.just_under_a_day", Some(now - day_ms + 1)),
+            ("spice.public.exactly_a_day", Some(now - day_ms)),
+            (
+                "spice.public.unknown_to_this_scheduler",
+                Some(now - 2 * day_ms),
+            ),
+        ] {
+            state
+                .accelerations
+                .insert(table.to_string(), table_entry(table, unregistered_at));
+        }
+        state.catalog.insert(
+            "cayenne.sales.orders".to_string(),
+            table_entry("cayenne.sales.orders", Some(now - 2 * day_ms)),
+        );
+        let registered: HashMap<String, bool> = [
+            ("spice.public.registered", true),
+            ("spice.public.reregistered", true),
+            ("spice.public.newly_unregistered", false),
+            ("spice.public.just_under_a_day", false),
+            ("spice.public.exactly_a_day", false),
+            ("cayenne.sales.orders", false),
+        ]
+        .into_iter()
+        .map(|(table, registered)| (table.to_string(), registered))
+        .collect();
+
+        let changes = state.reconcile_table_entries(&registered, now, UNREGISTERED_TABLE_RETENTION);
+
+        assert_eq!(
+            changes,
+            TableEntryChanges {
+                marked: 1,
+                cleared: 1,
+                removed: vec![
+                    "cayenne.sales.orders".to_string(),
+                    "spice.public.exactly_a_day".to_string()
+                ],
+            }
+        );
+        assert_eq!(
+            entries(&state.accelerations),
+            vec![
+                (
+                    "spice.public.just_under_a_day".to_string(),
+                    Some(now - day_ms + 1)
+                ),
+                ("spice.public.newly_unregistered".to_string(), Some(now)),
+                ("spice.public.registered".to_string(), None),
+                ("spice.public.reregistered".to_string(), None),
+                (
+                    "spice.public.unknown_to_this_scheduler".to_string(),
+                    Some(now - 2 * day_ms)
+                ),
+            ]
+        );
+        assert!(state.catalog.is_empty());
+    }
+
+    /// Two schedulers that reconcile the same document at once both succeed. A
+    /// table one of them still has registered is never removed, and an expired
+    /// entry is removed whichever scheduler gets there first.
+    #[tokio::test]
+    async fn two_schedulers_reconciling_table_entries_at_once_both_succeed() {
+        let store = store();
+        let first = ClusterStateStore::new(Arc::clone(&store), "");
+        let second = ClusterStateStore::new(Arc::clone(&store), "");
+        first.bootstrap().await.expect("bootstrap");
+        let long_ago = now_ms().expect("clock") - 2 * 24 * 60 * 60 * 1000;
+        first
+            .mutate(|state| {
+                for (table, unregistered_at) in [
+                    ("spice.public.shared", None),
+                    ("spice.public.dropped", Some(long_ago)),
+                ] {
+                    state
+                        .accelerations
+                        .insert(table.to_string(), table_entry(table, unregistered_at));
+                }
+                MutationOutcome::Apply
+            })
+            .await
+            .expect("seed the table entries");
+
+        let has_shared: HashMap<String, bool> = [
+            ("spice.public.shared".to_string(), true),
+            ("spice.public.dropped".to_string(), false),
+        ]
+        .into();
+        let lacks_shared: HashMap<String, bool> = [
+            ("spice.public.shared".to_string(), false),
+            ("spice.public.dropped".to_string(), false),
+        ]
+        .into();
+        let (first_pass, second_pass) = tokio::join!(
+            first.reconcile_table_entries(&has_shared),
+            second.reconcile_table_entries(&lacks_shared)
+        );
+        first_pass.expect("the first scheduler's pass succeeds");
+        second_pass.expect("the second scheduler's pass succeeds");
+
+        let state = ClusterStateStore::new(store, "")
+            .read()
+            .await
+            .expect("read");
+        assert_eq!(
+            state.accelerations.keys().collect::<Vec<_>>(),
+            vec!["spice.public.shared"],
+            "the entry a scheduler still has registered stays, the expired one goes"
+        );
     }
 }
