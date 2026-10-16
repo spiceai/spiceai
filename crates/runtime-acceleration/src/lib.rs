@@ -19,6 +19,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 pub mod acceleration;
 pub mod acceleration_source;
+pub mod cayenne_workload;
 pub mod change_sink;
 pub mod dataset_checkpoint;
 mod engine;
@@ -34,6 +35,7 @@ pub mod testing;
 pub use acceleration::Acceleration;
 pub use acceleration::ParseError as AccelerationParseError;
 pub use acceleration_source::AccelerationSource;
+pub use cayenne_workload::{CayenneAccelerationDemand, CayenneWorkload};
 pub use engine::Engine;
 pub use schema_change::OnSchemaChange;
 pub use sidecar::{AcceleratorSidecar, OpenOption};

@@ -154,6 +154,7 @@ pub struct SharedJobState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SharedJobState<T, U> {
+    #[must_use]
     pub fn new(
         scheduler: impl Into<String>,
         store: Arc<dyn ObjectStore>,
