@@ -48,26 +48,9 @@ use std::path::{Component, Path, PathBuf};
 pub use util::spice_paths::is_local_path;
 
 /// Strip a `file:`/`file://` scheme (including an optional authority such as
-/// `localhost`) so on-disk storage detection receives a real filesystem path.
-///
-/// A configured Cayenne directory may be spelled as such a URI, and feeding
-/// `file:///x` or `file://localhost/x` into `Path::new` would make `Auto` storage
-/// detection misclassify it as `Unknown`. Returns a borrowed slice (no owned path), so
-/// callers can pass the result directly as `&str`.
-#[must_use]
-pub fn fs_probe_path(path: &str) -> &str {
-    if let Some(rest) = path.strip_prefix("file://") {
-        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
-        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
-        // begins at the first '/'.
-        match rest.find('/') {
-            Some(slash) => &rest[slash..],
-            None => rest,
-        }
-    } else {
-        path.strip_prefix("file:").unwrap_or(path)
-    }
-}
+/// `localhost`) so on-disk storage detection receives a real filesystem path;
+/// shared with the Spicepod validation in `app` through `util`.
+pub use util::spice_paths::fs_probe_path;
 
 /// How a configured directory string becomes the filesystem path it names.
 ///

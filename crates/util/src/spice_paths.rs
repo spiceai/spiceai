@@ -47,6 +47,28 @@ pub fn is_local_path(path: &str) -> bool {
     !path.contains("://") || path.starts_with("file://")
 }
 
+/// Strip a `file:`/`file://` scheme (including an optional authority such as
+/// `localhost`) so on-disk storage detection receives a real filesystem path.
+///
+/// A configured Cayenne directory may be spelled as such a URI, and feeding
+/// `file:///x` or `file://localhost/x` into `Path::new` would make `Auto` storage
+/// detection misclassify it as `Unknown`. Returns a borrowed slice (no owned path), so
+/// callers can pass the result directly as `&str`.
+#[must_use]
+pub fn fs_probe_path(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix("file://") {
+        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
+        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
+        // begins at the first '/'.
+        match rest.find('/') {
+            Some(slash) => &rest[slash..],
+            None => rest,
+        }
+    } else {
+        path.strip_prefix("file:").unwrap_or(path)
+    }
+}
+
 /// The directory a Cayenne acceleration keeps its metastore in, from the raw
 /// `cayenne_file_path` and `cayenne_metadata_dir` parameters.
 ///
@@ -94,6 +116,25 @@ mod tests {
         assert!(!is_local_path("s3://bucket-usw2-az1-x-s3/prefix"));
         assert!(!is_local_path("gs://bucket/prefix"));
         assert!(!is_local_path("az://container/blob"));
+    }
+
+    #[test]
+    fn fs_probe_path_strips_every_file_scheme_spelling() {
+        assert_eq!(
+            fs_probe_path("file:///data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
+        assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
+        assert_eq!(
+            fs_probe_path("file://localhost/data/cayenne"),
+            "/data/cayenne"
+        );
+        assert_eq!(
+            fs_probe_path("/data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
+        assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
+        assert_eq!(fs_probe_path("s3://bucket/prefix"), "s3://bucket/prefix");
     }
 
     #[test]

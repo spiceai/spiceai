@@ -44,7 +44,7 @@ use spicepod::{
     param::Params,
 };
 use util::in_tracing_context;
-use util::spice_paths::{cayenne_metastore_dir, is_local_path};
+use util::spice_paths::{cayenne_metastore_dir, fs_probe_path, is_local_path};
 
 pub mod runtime;
 
@@ -340,12 +340,10 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
                 return None;
             }
 
-            let param = |key: &str| -> Option<String> {
-                acceleration
-                    .params
-                    .as_ref()?
-                    .data
-                    .get(key)
+            let params = acceleration.params.as_ref().map(|params| &params.data);
+            let param = |key: &str| {
+                params
+                    .and_then(|params| params.get(key))
                     .map(spicepod::param::ParamValue::as_string)
             };
             let file_path = param("cayenne_file_path");
@@ -381,17 +379,19 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 }
 
 /// A metastore directory in the form two datasets' directories are compared in:
-/// trailing separators dropped, and a local path made absolute against the working
-/// directory (lexically; nothing is read from disk), so `./.spice/data/metadata` and
-/// the default `<cwd>/.spice/data/metadata` compare equal. A `file:` URI and an
-/// object-store URL only lose their trailing separator.
+/// trailing separators dropped, a `file:` scheme stripped the way the accelerator
+/// strips it ([`fs_probe_path`]), and a local path made absolute against the working
+/// directory (lexically; nothing is read from disk), so `./.spice/data/metadata`,
+/// `file:///<cwd>/.spice/data/metadata` and the default `<cwd>/.spice/data/metadata`
+/// compare equal. An object-store URL only loses its trailing separator.
 fn comparable_metastore_dir(dir: &str) -> String {
     let trimmed = dir.trim_end_matches(['/', '\\']);
-    if !is_local_path(trimmed) || trimmed.starts_with("file:") {
+    if !is_local_path(trimmed) {
         return trimmed.to_string();
     }
-    std::path::absolute(trimmed).map_or_else(
-        |_| trimmed.to_string(),
+    let path = fs_probe_path(trimmed);
+    std::path::absolute(path).map_or_else(
+        |_| path.to_string(),
         |path| path.to_string_lossy().into_owned(),
     )
 }
@@ -917,6 +917,23 @@ mod tests {
         let datasets = vec![
             cayenne_dataset("spelled_out", Some("./.spice/data"), None),
             cayenne_dataset("default_path", None, None),
+        ];
+
+        assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
+    }
+
+    /// A `file:` URI names the same directory as the plain path, as it does for the
+    /// accelerator, so the two spellings are one metastore.
+    #[test]
+    fn cayenne_accepts_a_file_uri_spelling_of_the_same_directory() {
+        let datasets = vec![
+            cayenne_dataset("as_uri", Some("file:///mnt/a/cayenne"), None),
+            cayenne_dataset("as_path", Some("/mnt/a/cayenne/"), None),
+            cayenne_dataset(
+                "explicit",
+                None,
+                Some("file://localhost/mnt/a/cayenne/metadata"),
+            ),
         ];
 
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());

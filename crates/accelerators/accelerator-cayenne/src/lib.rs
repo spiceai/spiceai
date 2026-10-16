@@ -1683,8 +1683,12 @@ impl CayenneAccelerator {
     /// configuration that passes validation resolves here to the directory it was
     /// validated against.
     pub(crate) fn resolve_metadata_dir(acceleration: Option<&Acceleration>) -> String {
-        let param =
-            |key: &str| acceleration.and_then(|accel| accel.params.get(key).map(String::as_str));
+        let params = acceleration.map(|accel| &accel.params);
+        let param = |key: &str| {
+            params
+                .and_then(|params| params.get(key))
+                .map(String::as_str)
+        };
         util::spice_paths::cayenne_metastore_dir(
             param("cayenne_file_path"),
             param("cayenne_metadata_dir"),
