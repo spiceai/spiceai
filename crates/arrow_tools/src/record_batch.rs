@@ -236,6 +236,11 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// Field names and metadata have to match. A rename is a different question from a nullability
 /// flag, and admitting one here would make a reorder of same-typed sibling fields indistinguishable
 /// from a pair of renames, which positional pairing would then carry across transposed.
+///
+/// Under a field that carries an extension type, nothing may differ at all: the extension is
+/// declared over one storage layout, nullability included, so [`relabel_array_data`] refuses a
+/// storage change beneath a kept label. Such a pair keeps its cast path, which converts the
+/// values rather than republishing them under a label their storage no longer satisfies.
 fn is_nullability_relaxing_relabel(source: &DataType, target: &DataType) -> bool {
     match (source, target) {
         (DataType::List(source_item), DataType::List(target_item))
@@ -277,6 +282,8 @@ fn is_field_nullability_relaxing_relabel(source: &FieldRef, target: &FieldRef) -
         && source.dict_is_ordered() == target.dict_is_ordered()
         // At least as permissive: a nullable source under a non-nullable target is a narrowing.
         && (target.is_nullable() || !source.is_nullable())
+        // Metadata already matches above, so one side naming an extension type means both do.
+        && (source.extension_type_name().is_none() || source.data_type() == target.data_type())
         && is_nullability_relaxing_relabel(source.data_type(), target.data_type())
 }
 

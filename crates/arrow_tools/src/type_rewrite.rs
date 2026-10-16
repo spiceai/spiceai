@@ -371,8 +371,9 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
 /// `ARROW:extension:*` keys are permitted, since none of them changes how a value is read — except
 /// that a nested field going nullable → non-nullable is refused unless the child it describes
 /// provably holds no logical null, since a schema that understates its nulls is read as fact by
-/// the planner. Also returns an `ArrowError` when `target_type` does not describe the layout
-/// `data` holds.
+/// the planner, and except beneath a nested field that carries an extension type, whose storage
+/// layout is part of the extension's definition and so has to match exactly. Also returns an
+/// `ArrowError` when `target_type` does not describe the layout `data` holds.
 pub fn relabel_array_data(
     data: ArrayData,
     target_type: &DataType,
@@ -962,6 +963,11 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
 /// across schemas whose fields differ in exactly that way — rejecting all metadata differences
 /// would refuse a correct relabel to guard something that is not a reinterpretation.
 ///
+/// A field that carries an extension type also owns the storage type beneath it: the extension
+/// is declared over one layout, nested field names and nullability included, so under a kept
+/// label the storage has to match exactly — the renames and nullability changes the walk admits
+/// for a bare type are refused there (#13456).
+///
 /// A field's `dict_is_ordered` is checked here for the same reason and needs checking *here*
 /// specifically: it claims the dictionary's values carry an order, which is a statement about what
 /// the same key buffer means, exactly as `Map`'s `sorted` flag is. It lives on the field rather
@@ -1010,7 +1016,44 @@ fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Resu
             ));
         }
     }
+
+    // The walk above admits renames, nullability flips and descriptive metadata at every level
+    // below this field, which is right for a bare type and wrong under an extension label: an
+    // extension type is declared over one storage layout, child names and nullability included,
+    // so a field that keeps the label while its storage changes would publish an array still
+    // labelled as the extension over a layout the extension no longer describes. No caller
+    // relabels under an extension type today, so no storage change is admitted rather than
+    // some registry of per-extension exceptions. `DataType`'s `PartialEq` compares nested
+    // fields whole (name, type, nullability, metadata), which is exactly the comparison wanted.
+    if let Some(extension) = source.extension_type_name()
+        && source.data_type() != target.data_type()
+    {
+        return Err(relabel_changes_extension_storage(source, target, extension));
+    }
     Ok(())
+}
+
+/// The error [`ensure_field_relabel_is_metadata_only`] reports when a field keeps its extension
+/// type while the storage type under it changes.
+fn relabel_changes_extension_storage(
+    source: &Field,
+    target: &Field,
+    extension: &str,
+) -> ArrowError {
+    // Field names, the extension name and the rendered storage types (which embed nested field
+    // names) all come from the schema, so escape them: an embedded newline would break the
+    // one-line contract this error is read under, and split one log record into two.
+    ArrowError::InvalidArgumentError(format!(
+        "Cannot relabel the Arrow field '{}' as '{}': both carry the extension type `{}`, but the \
+         storage type under it differs ({} vs {}), which would republish the same values as that \
+         extension over a storage layout it does not define. Convert the values instead of \
+         relabelling them.",
+        source.name().escape_debug(),
+        target.name().escape_debug(),
+        extension.escape_debug(),
+        source.data_type().to_string().escape_debug(),
+        target.data_type().to_string().escape_debug(),
+    ))
 }
 
 /// The error [`ensure_field_relabel_is_metadata_only`] reports for a changed `dict_is_ordered`.
@@ -2107,7 +2150,10 @@ mod tests {
             Arc::new(values),
             None,
         );
-        (list.to_data(), DataType::List(item(target_storage, target_comment)))
+        (
+            list.to_data(),
+            DataType::List(item(target_storage, target_comment)),
+        )
     }
 
     /// An extension type's storage layout is part of its definition, so a field that keeps its
@@ -2307,6 +2353,18 @@ mod tests {
         assert!(
             !err.contains('\n'),
             "the field name, the metadata key and the value are all schema-controlled, got: {err}"
+        );
+
+        let err = relabel_changes_extension_storage(
+            &Field::new(hostile, nested(hostile), true),
+            &Field::new("item", nested("item"), true),
+            "arrow.json\nvalue",
+        )
+        .to_string();
+        assert!(
+            !err.contains('\n'),
+            "the field name, the extension name and the rendered storage types are all \
+             schema-controlled, got: {err}"
         );
     }
 
