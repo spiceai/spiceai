@@ -169,6 +169,10 @@ fn main() {
     // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");
+    // Last, so the fatal error above and `Goodbye!` reach the OpenTelemetry
+    // endpoint too: log export runs on its own runtime, which outlives the
+    // query runtime that `load_and_run` has already dropped.
+    spiced::otel_logs::shutdown();
     if runtime_failed {
         // Preserve startup and runtime failures in the process status observed
         // by the foreground launcher or supervisor.

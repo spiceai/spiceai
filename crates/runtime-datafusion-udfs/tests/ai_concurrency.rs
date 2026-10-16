@@ -99,7 +99,12 @@ fn setup_ctx(
     let ctx = SessionContext::new();
 
     // Register UDF
-    let udf = Ai::new(model_store, rate_controllers, RuntimeStatus::new());
+    let udf = Ai::new(
+        model_store,
+        Arc::default(),
+        rate_controllers,
+        RuntimeStatus::new(),
+    );
     ctx.register_udf(udf.into_async_udf().into_scalar_udf());
 
     // Create in-memory table
@@ -331,6 +336,7 @@ async fn more_rows_than_one_call_takes_are_all_answered() {
     ctx.register_udf(
         Ai::new(
             Arc::new(RwLock::new(model_store)),
+            Arc::default(),
             Arc::new(RwLock::new(HashMap::new())),
             RuntimeStatus::new(),
         )

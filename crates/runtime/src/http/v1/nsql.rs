@@ -580,8 +580,17 @@ async fn resolve_nsql_target(
 
     crate::task_history::correlation::record_task_history_trace_id(&span, context);
 
-    let nql_model = llms.read().await.get(&model).cloned();
-    let Some(nql_model) = nql_model else {
+    let nql_model = {
+        let capabilities = rt.model_capabilities();
+        let capabilities = capabilities.read().await;
+        model_capabilities::require(
+            &capabilities,
+            &*llms.read().await,
+            &model,
+            model_capabilities::Capability::Chat,
+        )
+    };
+    let Ok(nql_model) = nql_model else {
         let message = rt
             .status()
             .unavailable_model_reason(&model)

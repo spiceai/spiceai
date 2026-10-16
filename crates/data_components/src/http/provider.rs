@@ -29,7 +29,7 @@ use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, TableReference, project_schema},
+    common::{Constraints, TableReference, project_schema, runtime::IoWaitExt},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -1856,7 +1856,8 @@ impl HttpTableProvider {
             request_builder = auth.apply(request_builder);
         }
 
-        let response = request_builder.send().await.map_err(|e| {
+        // Waiting on the origin: a distributed task can lend its slot meanwhile.
+        let response = request_builder.send().io_wait().await.map_err(|e| {
             let err = Error::http_request(&self.base_url, e);
             tracing::debug!("{err}");
             // A timeout or connection error is a failure signal for adaptive
@@ -2062,6 +2063,7 @@ impl HttpTableProvider {
         // is_timeout/is_connect/is_body/is_decode together as transient.
         let content = response
             .text()
+            .io_wait()
             .await
             .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
