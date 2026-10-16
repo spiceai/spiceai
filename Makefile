@@ -528,7 +528,10 @@ dep-licenses:
 .PHONY: display-deps
 display-deps:
 	@cargo install cargo-license --quiet
-	@cargo license -d  --tsv --direct-deps-only --all-features | grep -v "github.com/spiceai"
+	@# Drop Spice's own workspace crates (matched by name and version); vendored third-party crates in crates/vendor/ stay.
+	@own=$$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; [print(p["name"] + "\t" + p["version"]) for p in json.load(sys.stdin)["packages"] if "/crates/vendor/" not in p["manifest_path"]]'); \
+	cargo license -d  --tsv --direct-deps-only --all-features | grep -v "github.com/spiceai" | \
+		OWN="$$own" awk -F'\t' 'BEGIN { n = split(ENVIRON["OWN"], own, "\n"); for (i = 1; i <= n; i++) skip[own[i]] = 1 } !(($$1 FS $$2) in skip)'
 
 
 ################################################################################
