@@ -54,7 +54,7 @@ use runtime_request_context::{
 use runtime_status as status;
 
 use object_store::ObjectStore;
-use object_store_occ::{InsertResult, ObjectState, UpdateResult};
+use object_store_occ::{Change, ConflictRetry, ObjectState};
 use runtime_secrets::Secrets;
 use spicepod::component::runtime::RuntimeState;
 use tokio::runtime::Handle;
@@ -80,8 +80,6 @@ const WARMUP_STORE_RELATIVE: &str = ".spice/data/results_cache_warmup.json";
 /// Object-store key; [`ObjectState`] writes `{prefix}{key}.json`.
 const WARMUP_STATE_KEY: &str = "results_cache_warmup";
 
-const MAX_REMOTE_PERSIST_ATTEMPTS: usize = 8;
-
 /// Per-replay wall-clock bound. Warmup uses [`Protocol::Internal`], which does
 /// not inherit `runtime.query.timeout`; without an explicit bound a stalled
 /// DISTINCT or drain can hold `/v1/ready` forever.
@@ -101,9 +99,8 @@ pub(crate) struct ResultsCacheWarmer {
     enabled: bool,
     catalog: Arc<parking_lot::Mutex<WarmupCatalog>>,
     persist_lock: Arc<parking_lot::Mutex<()>>,
-    /// Serializes remote `ObjectState` persists. Concurrent `update` calls share
-    /// one cached version, so a stale task can overwrite a newer catalog without
-    /// a conflict; one writer at a time keeps recorded shapes.
+    /// Serializes this process's remote persists so they do not conflict with
+    /// each other.
     remote_persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// Template ids dropped locally but not yet confirmed removed from the remote
     /// catalog. Every remote persist unions this set into its exclude filter so an
@@ -416,7 +413,7 @@ async fn persist_remote_excluding(
     // A queued prune may still carry an id that was re-observed after
     // `drop_and_persist`. Dropping a live shape here would leave it only
     // in memory; the next process start would not warm it.
-    let (mut local, exclude) = {
+    let (local, exclude) = {
         let catalog = catalog.lock();
         let exclude: HashSet<u64> = exclude
             .into_iter()
@@ -424,68 +421,38 @@ async fn persist_remote_excluding(
             .collect();
         (without_ids(&catalog.templates, &exclude), exclude)
     };
-    for _ in 0..MAX_REMOTE_PERSIST_ATTEMPTS {
-        // Compare `merged` to the stored catalog, not the already-filtered
-        // remote. Filtering stale ids in memory and then returning because
-        // `merged == remote` would leave those ids on the object store.
-        let (stored, version) = match state.get_with_version(WARMUP_STATE_KEY).await {
-            Ok(Some((templates, version))) => (templates, Some(version)),
-            Ok(None) => (Vec::new(), None),
-            Err(e) => {
-                tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                return false;
-            }
-        };
-        let remote = without_ids(&stored, &exclude);
-        let merged = merge_templates(&remote, &local);
-        if merged == stored {
+    let result = state
+        .modify(WARMUP_STATE_KEY, &ConflictRetry::default(), |stored| {
+            // Compare `merged` to the stored catalog, not the already-filtered
+            // remote. Filtering stale ids in memory and then keeping the object
+            // because `merged == remote` would leave those ids on the object store.
+            let stored = stored.unwrap_or_default();
+            let remote = without_ids(&stored, &exclude);
+            let merged = merge_templates(&remote, &local);
+            Ok::<_, std::convert::Infallible>(if merged == stored {
+                Change::Keep(merged)
+            } else {
+                Change::Write(merged.clone(), merged)
+            })
+        })
+        .await;
+    match result {
+        Ok(merged) => {
             apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-            return true;
+            true
         }
-        if let Some(version) = version {
-            match state
-                .update_with_version(WARMUP_STATE_KEY, &merged, version)
-                .await
-            {
-                Ok(UpdateResult::Ok) => {
-                    apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-                    return true;
-                }
-                Ok(UpdateResult::NotFound) => {
-                    local = merged;
-                }
-                Ok(UpdateResult::Conflict { current }) => {
-                    local = merge_templates(&without_ids(&current, &exclude), &merged);
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                    return false;
-                }
-            }
-        } else {
-            match state.insert(WARMUP_STATE_KEY, &merged).await {
-                Ok(InsertResult::Ok) => {
-                    apply_catalog(catalog.as_ref(), count.as_ref(), &merged);
-                    return true;
-                }
-                Ok(InsertResult::AlreadyExists) => {
-                    local = merged;
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
-                    return false;
-                }
-            }
+        Err(e) => {
+            tracing::debug!("Failed to persist SQL results cache warmup catalog: {e}");
+            false
         }
     }
-    tracing::debug!("Failed to persist SQL results cache warmup catalog after retries");
-    false
 }
 
 /// Build the warmer, loading from `runtime.state` when that is set.
 pub(crate) async fn build_results_cache_warmer(
     enabled: bool,
     runtime_state: Option<&RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> ResultsCacheWarmer {
@@ -493,15 +460,22 @@ pub(crate) async fn build_results_cache_warmer(
         return ResultsCacheWarmer::new(default_warmup_store_path(), enabled).await;
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
         &state.into(),
-        crate::object_store_state::StateFeature::ResultsCacheWarmup,
+        runtime_state_location::StateFeature::ResultsCacheWarmup,
     )
     .await
     {
         Ok((store, prefix)) => {
+            let store = match state_location_check {
+                Some(check) => check.guard(
+                    runtime_state_location::StateFeature::ResultsCacheWarmup,
+                    store,
+                ),
+                None => store,
+            };
             tracing::info!(
                 "SQL results cache warmup will store query plans at '{}'",
                 state.location
@@ -1158,6 +1132,7 @@ pub(crate) fn default_warmup_store_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store_occ::UpdateResult;
     use std::time::Duration;
 
     use arrow::array::Int64Array;
@@ -1804,10 +1779,51 @@ mod tests {
             .collect()
     }
 
-    /// Regression for Copilot on #14178: `ObjectState::update` reads the shared
-    /// cached etag, so a stale persist that `get`s `[seed]` and later
-    /// `update`s `[seed, A]` can overwrite a newer `[seed, A, B]` without a
-    /// conflict. Persist now binds If-Match to the `get` version.
+    /// Warmers persisting different shapes at the same time on one local
+    /// directory keep every shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_persists_on_a_local_directory_keep_every_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"));
+        let writers = 4;
+        let mut tasks = Vec::new();
+        let mut expected = Vec::new();
+        for writer in 0..writers {
+            let templates = vec![
+                warmup_tpl(&format!("SELECT {writer}, 1")),
+                warmup_tpl(&format!("SELECT {writer}, 2")),
+            ];
+            expected.extend(templates.iter().map(|t| t.sql.clone()));
+            let state = Arc::new(ObjectState::new(Arc::clone(&store)));
+            tasks.push(tokio::spawn(async move {
+                let count = templates.len();
+                persist_remote_excluding(
+                    state,
+                    catalog_mutex(templates),
+                    Arc::new(AtomicUsize::new(count)),
+                    HashSet::new(),
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.expect("persist task"), "every persist lands");
+        }
+
+        let persisted: Vec<WarmupTemplate> = ObjectState::new(store)
+            .get(WARMUP_STATE_KEY)
+            .await
+            .expect("read the catalog")
+            .expect("the catalog exists");
+        let mut persisted: Vec<String> = persisted.into_iter().map(|t| t.sql).collect();
+        persisted.sort();
+        expected.sort();
+        assert_eq!(persisted, expected);
+    }
+
+    /// A write bound to a stale read of `[seed]` cannot overwrite the newer
+    /// `[seed, A, B]` a persist wrote since, and a later persist keeps B.
     #[tokio::test]
     async fn persist_remote_keeps_newer_templates_when_object_state_cache_advances() {
         let store: Arc<dyn object_store::ObjectStore> =
@@ -2185,6 +2201,7 @@ mod tests {
         let warmer = build_results_cache_warmer(
             true,
             Some(&runtime_state),
+            None,
             Arc::clone(&secrets),
             Handle::current(),
         )
@@ -2226,9 +2243,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let reloaded =
-            build_results_cache_warmer(true, Some(&runtime_state), secrets, Handle::current())
-                .await;
+        let reloaded = build_results_cache_warmer(
+            true,
+            Some(&runtime_state),
+            None,
+            secrets,
+            Handle::current(),
+        )
+        .await;
         assert_eq!(
             reloaded.templates_snapshot().len(),
             1,

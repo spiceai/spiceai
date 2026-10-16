@@ -47,7 +47,9 @@ pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
 pub(crate) mod search;
+mod spice_tool_turns;
 mod tools;
+mod vector_search_top_k;
 
 mod nsql {
     use chrono::{DateTime, Utc};

@@ -22,8 +22,9 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerInfo, Tool,
+        Implementation, ListResourceTemplatesRequestMethod, ListResourceTemplatesResult,
+        ListResourcesRequestMethod, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -495,7 +496,12 @@ impl RuntimeServer {
             tools
                 .values()
                 .filter_map(|tooling| match tooling {
-                    Tooling::Catalog { tools: catalog, .. } => Some(Arc::clone(catalog)),
+                    Tooling::Catalog {
+                        tools: catalog,
+                        default_catalog_names,
+                    } if !is_default_catalog(catalog.name(), default_catalog_names) => {
+                        Some(Arc::clone(catalog))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -701,10 +707,13 @@ impl RuntimeServer {
                     None,
                 ));
             }
+            // MCP reports an unknown tool as invalid params: the method exists, its
+            // `name` does not.
             ResolveOutcome::Missing => {
-                return Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >());
+                return Err(McpError::invalid_params(
+                    format!("Unknown tool: {tool_name}"),
+                    None,
+                ));
             }
         };
 
@@ -769,14 +778,22 @@ impl RuntimeServer {
             ));
         }
 
-        let result = resolved
-            .tool
-            .call(args.as_str())
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Tool execution failures are reported in-band (`isError: true`) so the
+        // model can see and react to them; only protocol errors are JSON-RPC errors.
+        let result = match resolved.tool.call(args.as_str()).await {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(e.to_string())]).into());
+            }
+        };
 
-        let text = serde_json::to_string(&result)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Tools such as `sql` already return JSON as a string; re-encoding it
+        // would make clients parse the text into a string instead of the data.
+        let text = match result {
+            Value::String(text) => text,
+            other => serde_json::to_string(&other)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        };
 
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
@@ -829,6 +846,28 @@ impl ServerHandler for RuntimeServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         Box::pin(async move { Ok(listed_tools_result(self.publish_listed_tools().await)) })
+    }
+
+    // The resources capability is not advertised, so reject these rather than
+    // rmcp's default of returning an empty list.
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        std::future::ready(Err(
+            McpError::method_not_found::<ListResourcesRequestMethod>(),
+        ))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        std::future::ready(Err(McpError::method_not_found::<
+            ListResourceTemplatesRequestMethod,
+        >()))
     }
 }
 
@@ -898,10 +937,19 @@ fn mcp_schemas_from_map_with_warm(
     warm: &[Arc<dyn SpiceModelTool>],
 ) -> HashMap<String, Tool> {
     let mut schemas = mcp_direct_schemas_from_map(tools);
+    // Default-catalog tools are already listed as top-level tools; listing
+    // the catalog too would advertise each one twice (`X` and `catalog__X`).
     let mut async_only = HashSet::new();
     for tooling in tools.values() {
-        if let Tooling::Catalog { tools: catalog, .. } = tooling {
+        if let Tooling::Catalog {
+            tools: catalog,
+            default_catalog_names,
+        } = tooling
+        {
             let catalog_name = catalog.name();
+            if is_default_catalog(catalog_name, default_catalog_names) {
+                continue;
+            }
             let listed = catalog.try_all();
             if listed.is_empty() {
                 async_only.insert(catalog_name.to_string());
@@ -938,6 +986,12 @@ fn mcp_schemas_from_map_with_warm(
         schemas.insert(name, fetched);
     }
     schemas
+}
+
+fn is_default_catalog(catalog_name: &str, default_catalog_names: &[String]) -> bool {
+    default_catalog_names
+        .iter()
+        .any(|name| name == catalog_name)
 }
 
 fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModelTool) -> Tool {
@@ -4577,12 +4631,16 @@ mod tests {
             http::StatusCode::OK,
             "MCP returns 200 with error payload: {json}"
         );
-        // Tool error becomes MCP internal_error or isError result depending on path.
-        let is_error = json.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
-            || json.get("error").is_some();
-        let text = json.to_string();
+        // A refused write is the tool's own failure, reported in its result.
+        assert_eq!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RO key must reject write_gated tool; got {json}"
+        );
         assert!(
-            is_error && text.contains("read-only"),
+            json.pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("read-only")),
             "RO key must reject write_gated tool; got {json}"
         );
     }
@@ -4602,6 +4660,104 @@ mod tests {
         let payload: Value =
             serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
         assert_eq!(payload.get("wrote"), Some(&Value::Bool(true)));
+    }
+
+    /// Tool that reads a required `query` argument, as `sql` does.
+    struct QueryArgTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for QueryArgTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("query_arg")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("reads a required query argument"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }))
+        }
+        async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            #[derive(serde::Deserialize)]
+            struct Args {
+                query: String,
+            }
+            let Args { query } = serde_json::from_str(arg)?;
+            Ok(json!({ "query": query }))
+        }
+    }
+
+    fn query_arg_server() -> RuntimeServer {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "query_arg".to_string(),
+            Tooling::Tool(Arc::new(QueryArgTool) as Arc<dyn SpiceModelTool>),
+        );
+        RuntimeServer::new(Arc::new(RwLock::new(tools)))
+    }
+
+    // regression test for #14901: an unknown tool was `-32601` with the message
+    // "tools/call", which names neither the tool nor the problem.
+    #[tokio::test]
+    async fn an_unknown_tool_is_invalid_params_naming_the_tool() {
+        let service = mcp_http_service(query_arg_server());
+        let expected = json!({
+            "code": -32602,
+            "message": "Unknown tool: no_such_tool"
+        });
+
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "no_such_tool",
+            Some(spice_ctx_with_api_key("test-key:rw")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json.get("error"), Some(&expected), "{json}");
+
+        // A legacy session reports the same error, in an HTTP 200.
+        let session_id = initialize_legacy_mcp_session(&service).await;
+        let (status, json) = post_legacy_tools_call_with_session(
+            &service,
+            &session_id,
+            "no_such_tool",
+            Some(spice_ctx_with_api_key("test-key:rw")),
+            2,
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{json}");
+        assert_eq!(json.get("error"), Some(&expected), "{json}");
+    }
+
+    // regression test for #14902: a tool that failed on its arguments was a JSON-RPC
+    // internal error, which MCP clients do not show the model.
+    #[tokio::test]
+    async fn a_tool_that_fails_on_its_arguments_reports_it_in_its_result() {
+        let service = mcp_http_service(query_arg_server());
+        let (status, json) = post_tools_call_with_spice_ctx(
+            &service,
+            "query_arg",
+            Some(spice_ctx_with_api_key("test-key:rw")),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{json}");
+        assert_eq!(json.get("error"), None, "{json}");
+        assert_eq!(
+            json.pointer("/result/isError"),
+            Some(&Value::Bool(true)),
+            "{json}"
+        );
+        assert_eq!(
+            json.pointer("/result/content"),
+            Some(&json!([{
+                "type": "text",
+                "text": "missing field `query` at line 1 column 2"
+            }])),
+            "{json}"
+        );
     }
 
     /// Initialize a legacy-era MCP session and return its `Mcp-Session-Id`.

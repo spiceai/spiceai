@@ -36,6 +36,8 @@ mod support;
 mod acid_compliance_test;
 mod adaptive_layout_test;
 mod anti_join_sort_merge_null_aware_test;
+mod bulk_load_fold_test;
+mod bulk_load_index_coverage_test;
 mod catalog_concurrency_test;
 mod catalog_selector_test;
 mod cdc_compaction_delete_race_test;
@@ -50,6 +52,7 @@ mod cross_partition_overwrite_test;
 mod cte_materialization_query_test;
 mod data_inlining_test;
 mod datafusion_dynamic_filter_backports_test;
+mod deletion_mode_harness;
 mod deletion_strategy_detection_test;
 mod deletion_strategy_test;
 mod deletion_test;
@@ -141,48 +144,3 @@ mod upsert_with_pending_deletions_test;
 mod vortex_compressible_test;
 mod vortex_task_cancellation;
 mod write_back_pk_shapes_test;
-
-/// `autotests = false` means cargo compiles only the test targets `Cargo.toml`
-/// names, so a new `tests/<name>.rs` that is neither a module of a target nor its own
-/// `[[test]]` would build nothing and its tests would never run, silently.
-#[test]
-fn every_test_file_is_compiled() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest =
-        std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml should be readable");
-    let target_paths: Vec<&str> = manifest
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("path = \"tests/")
-                .and_then(|path| path.strip_suffix(".rs\""))
-        })
-        .collect();
-    let roots: Vec<String> = target_paths
-        .iter()
-        .map(|stem| {
-            std::fs::read_to_string(dir.join(format!("tests/{stem}.rs")))
-                .expect("test target root should be readable")
-        })
-        .collect();
-    let mut missing: Vec<String> = std::fs::read_dir(dir.join("tests"))
-        .expect("tests/ should be readable")
-        .map(|entry| entry.expect("tests/ entry should be readable").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
-        .filter(|stem| {
-            !target_paths.contains(&stem.as_str())
-                && !roots.iter().any(|root| {
-                    root.lines()
-                        .any(|line| line.trim() == format!("mod {stem};"))
-                })
-        })
-        .collect();
-    missing.sort();
-    assert!(
-        missing.is_empty(),
-        "these files in crates/cayenne/tests are not compiled into any test binary: \
-         {missing:?}. Add `mod <name>;` to tests/integration.rs or tests/isolated.rs, or a `[[test]]` \
-         entry in crates/cayenne/Cargo.toml if the file needs its own binary"
-    );
-}

@@ -18,6 +18,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+mod error;
 mod list_models;
 mod responses;
 
@@ -33,11 +34,12 @@ use async_openai::{
     types::chat::{
         ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
-        ChatCompletionResponseStream, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionResponse,
+        ChatCompletionResponseStream, ChatCompletionTools, CompletionUsage,
+        CreateChatCompletionRequest, CreateChatCompletionResponse,
     },
 };
 use async_trait::async_trait;
+use futures::StreamExt;
 use runtime_rate_control::RateController;
 use serde_json::json;
 
@@ -60,13 +62,25 @@ pub struct Xai {
 impl Xai {
     #[must_use]
     pub fn new(model: Option<&str>, api_key: &str) -> Self {
+        Self::with_endpoint(model, api_key, DEFAULT_ENDPOINT)
+    }
+
+    /// An xAI model served from `endpoint` rather than `https://api.x.ai/v1`.
+    #[must_use]
+    pub fn with_endpoint(model: Option<&str>, api_key: &str, endpoint: &str) -> Self {
         let cfg = OpenAIConfig::default()
-            .with_api_base(DEFAULT_ENDPOINT)
+            .with_api_base(endpoint)
             .with_api_key(api_key);
+
+        // No retries, as `crate::provider::client_without_retry`. The service also reads xAI's
+        // error bodies, which `async-openai` cannot.
+        let http_client = reqwest::Client::new();
+        let client = Client::build(http_client.clone(), cfg)
+            .with_http_service(error::XaiErrorService::new(http_client));
 
         Self {
             model: model.unwrap_or(DEFAULT_MODEL).to_string(),
-            client: Client::with_config(cfg),
+            client,
             rate_controller: default_rate_controller(),
         }
     }
@@ -132,6 +146,33 @@ impl Xai {
     }
 }
 
+/// Counts xAI's reasoning tokens as completion tokens, as `OpenAI` does.
+///
+/// xAI's Chat Completions API reports `reasoning_tokens` outside `completion_tokens` but
+/// inside `total_tokens`, and bills them as output. Spice reads `completion_tokens` as every
+/// token the model generated, in `/v1/chat/completions`, `/v1/decisions` and the
+/// `llm_completion_tokens_total` metric. Usage changes only when xAI's own total shows the
+/// reasoning outside the completion, so usage already in the `OpenAI` shape is not counted
+/// twice.
+fn count_reasoning_as_completion(usage: &mut CompletionUsage) {
+    let Some(reasoning) = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+        .filter(|reasoning| *reasoning > 0)
+    else {
+        return;
+    };
+    let reasoning_outside_completion = usage
+        .prompt_tokens
+        .checked_add(usage.completion_tokens)
+        .and_then(|tokens| tokens.checked_add(reasoning))
+        == Some(usage.total_tokens);
+    if reasoning_outside_completion {
+        usage.completion_tokens += reasoning;
+    }
+}
+
 #[async_trait]
 impl Chat for Xai {
     async fn health(&self) -> Result<(), Error> {
@@ -171,7 +212,14 @@ impl Chat for Xai {
         let stream = chat.create_stream(req).await?;
 
         drop(permit);
-        Ok(Box::pin(stream))
+        Ok(Box::pin(stream.map(|chunk| {
+            chunk.map(|mut chunk| {
+                if let Some(usage) = chunk.usage.as_mut() {
+                    count_reasoning_as_completion(usage);
+                }
+                chunk
+            })
+        })))
     }
 
     async fn chat_request(
@@ -190,9 +238,12 @@ impl Chat for Xai {
             chat = chat.header("x-grok-conv-id", prompt_cache_key)?;
         }
 
-        let resp = chat.create(req).await?;
+        let mut resp = chat.create(req).await?;
 
         drop(permit);
+        if let Some(usage) = resp.usage.as_mut() {
+            count_reasoning_as_completion(usage);
+        }
         Ok(resp)
     }
 }
@@ -213,5 +264,52 @@ mod tests {
 
         assert_eq!(prompt_cache_key.as_deref(), Some("conversation-123"));
         assert!(req.prompt_cache_key.is_none());
+    }
+
+    /// Usage after [`count_reasoning_as_completion`], for the `usage` block a provider sent.
+    fn counted(reported: serde_json::Value) -> serde_json::Value {
+        let mut usage: CompletionUsage =
+            serde_json::from_value(reported).expect("usage block as CompletionUsage");
+        count_reasoning_as_completion(&mut usage);
+        serde_json::to_value(usage).expect("usage as JSON")
+    }
+
+    #[test]
+    fn reasoning_tokens_count_as_completion_tokens() {
+        // The `usage` block xAI's Chat Completions API returned for one grok-4.7 call.
+        let xai = json!({
+            "prompt_tokens": 1891,
+            "completion_tokens": 4,
+            "total_tokens": 4636,
+            "prompt_tokens_details": {"text_tokens": 1891, "audio_tokens": 0, "image_tokens": 0, "cached_tokens": 1792},
+            "completion_tokens_details": {"reasoning_tokens": 2741, "audio_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0},
+            "num_sources_used": 0,
+            "cost_in_usd_ticks": 175_640_000
+        });
+        assert_eq!(
+            counted(xai),
+            json!({
+                "prompt_tokens": 1891,
+                "completion_tokens": 2745,
+                "total_tokens": 4636,
+                "prompt_tokens_details": {"audio_tokens": 0, "cached_tokens": 1792},
+                "completion_tokens_details": {"reasoning_tokens": 2741, "audio_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0}
+            })
+        );
+
+        // Usage in the `OpenAI` shape, as gpt-5-mini returned it: its reasoning is already
+        // part of `completion_tokens`.
+        let openai_shape = json!({
+            "prompt_tokens": 618,
+            "completion_tokens": 77,
+            "total_tokens": 695,
+            "prompt_tokens_details": {"audio_tokens": 0, "cached_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 64, "audio_tokens": 0, "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0}
+        });
+        assert_eq!(counted(openai_shape.clone()), openai_shape);
+
+        // No reasoning reported: nothing to count.
+        let no_reasoning = json!({"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15});
+        assert_eq!(counted(no_reasoning.clone()), no_reasoning);
     }
 }

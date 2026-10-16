@@ -40,8 +40,10 @@ use std::{
     time::Duration,
 };
 
-use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
+use opentelemetry::{InstrumentationScope, global, trace::TracerProvider as _};
 use opentelemetry_sdk::{
+    Resource,
+    metrics::SdkMeterProvider,
     runtime::TokioCurrentThread,
     trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
 };
@@ -56,6 +58,58 @@ use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
+
+/// The one `MeterProvider` for the test process, installed before any instrument
+/// exists: instruments bind to the provider installed when they are first used, so
+/// force this before building a runtime whose metrics a test reads.
+pub(crate) static PROMETHEUS: LazyLock<prometheus::Registry> =
+    LazyLock::new(install_prometheus_meter_provider);
+
+/// Installs a `MeterProvider` backed by a scrapable Prometheus registry, as
+/// `spiced` does for the `--metrics` endpoint.
+fn install_prometheus_meter_provider() -> prometheus::Registry {
+    let registry = prometheus::Registry::new();
+
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()
+        .expect("to build the prometheus exporter");
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(Resource::builder().build())
+        .with_reader(exporter)
+        .build();
+    global::set_meter_provider(provider);
+
+    registry
+}
+
+/// The summed value of counter `name` over the series whose `label` is `value`; `0`
+/// before any is recorded.
+pub(crate) fn counter_with_label(
+    registry: &prometheus::Registry,
+    name: &str,
+    label: &str,
+    value: &str,
+) -> f64 {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .any(|pair| pair.name() == label && pair.value() == value)
+        })
+        .map(|metric| metric.get_counter().value())
+        .sum()
+}
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(
@@ -839,4 +893,20 @@ async fn do_register_test_connectors() {
     .await;
 
     tracing::debug!("Completed connector registration for tests");
+}
+
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+pub fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p runtime --test integration <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
 }

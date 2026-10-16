@@ -24,6 +24,7 @@ use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::dataupdate::DataUpdateBroadcaster;
 use crate::egress::EgressAccount;
 use crate::opentelemetry::create_metrics_service;
+use crate::opentelemetry_logs::create_logs_service;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
@@ -53,7 +54,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::{RequestContextLayer, WriteRateLimitLayer};
+use middleware::{FlightSessionLayer, RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use runtime_tls::TlsConfig;
@@ -233,8 +234,19 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
+        Self::get_arrow_schema_with_params(datafusion, sql, None).await
+    }
+
+    /// Like [`Self::get_arrow_schema`], but binds `parameters` before deriving
+    /// the schema so it matches what `do_get` streams for the same values.
+    async fn get_arrow_schema_with_params(
+        datafusion: Arc<DataFusion>,
+        sql: &str,
+        parameters: Option<datafusion::common::ParamValues>,
+    ) -> Result<(Schema, Option<Schema>), Status> {
         let read_only = crate::http::v1::current_principal_requires_read_only().await;
         let query = QueryBuilder::new(sql, datafusion)
+            .parameters(parameters)
             .read_only(read_only)
             .build();
 
@@ -1192,6 +1204,7 @@ pub async fn start(
         );
 
     let server = configure_flight_server_transport(Server::builder());
+    let auth_configured = endpoint_auth.flight_basic_auth.is_some();
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
@@ -1204,6 +1217,8 @@ pub async fn start(
     // Create the OpenTelemetry MetricsService. Pass a weak runtime handle so ingest can
     // evolve an accelerated metric table's schema in place when new dimensions arrive.
     let query_engine: Arc<dyn runtime_query_engine::query_engine::QueryEngine> = rt.datafusion();
+    let otel_logs_service =
+        create_logs_service(Arc::clone(&query_engine), Some(Arc::downgrade(&rt)));
     let otel_service = create_metrics_service(query_engine, Some(Arc::downgrade(&rt)));
 
     // Get job executor if available (cluster mode)
@@ -1212,7 +1227,7 @@ pub async fn start(
 
     let mut server = server
         .layer(
-            RequestContextLayer::new(rt.app(), rt.datafusion(), session_store, rt.secrets())
+            RequestContextLayer::new(rt.app(), rt.datafusion(), rt.secrets())
                 .with_job_executor(job_executor),
         )
         // mTLS principal injection runs *after* RequestContextLayer
@@ -1221,6 +1236,11 @@ pub async fn start(
         // principal is already present).
         .layer(mtls::MtlsLayer::new(identity_source))
         .layer(auth_layer)
+        .layer(FlightSessionLayer::new(
+            rt.datafusion(),
+            session_store,
+            auth_configured,
+        ))
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
             flight_write_rate_limit_enabled,
@@ -1228,7 +1248,8 @@ pub async fn start(
 
     let server = server
         .add_service(spice_flight_service)
-        .add_service(otel_service);
+        .add_service(otel_service)
+        .add_service(otel_logs_service);
 
     let serve_result = if let Some(ref tls_config) = tls_config {
         // TLS path: bind a TCP listener ourselves, run tokio-rustls per

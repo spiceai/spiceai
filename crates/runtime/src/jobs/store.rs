@@ -24,9 +24,12 @@ use arrow_ipc::writer::StreamWriter;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
+use object_store_occ::{
+    Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError, conditional_put,
+    retry_on_conflict,
 };
+use parking_lot::Mutex;
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -39,7 +42,7 @@ use super::error::{
 };
 use super::state::{
     ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobResult, JobResultManifest, JobSchema,
-    JobState, JobStatus,
+    JobState, JobStatus, now_ms_or_zero,
 };
 
 /// Stores job state and results in the shared object store.
@@ -85,7 +88,7 @@ impl JobStore {
             store,
             base_prefix: base_prefix.into(),
             node_id: node_id.into(),
-            result_ttl: DEFAULT_RESULT_TTL,
+            result_ttl: object_store_occ::cleanup::age(DEFAULT_RESULT_TTL),
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
@@ -213,47 +216,16 @@ impl JobStore {
         Ok(state)
     }
 
-    /// Marks a job as cancelled.
-    ///
-    /// Retries with fibonacci backoff on concurrent modification errors (e.g.,
-    /// background task updated the state between our read and write). On retry,
-    /// re-reads the state and returns early if the job already reached a terminal
-    /// state.
+    /// Marks a job as cancelled. A job that already finished keeps its status.
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobState> {
-        use util::fibonacci_backoff::FibonacciBackoffBuilder;
-
-        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
-
-        loop {
-            let mut state = self.get_job(job_id).await?;
+        self.modify_job(job_id, |state| {
             if state.is_terminal() {
-                return Ok(state);
+                return false;
             }
             state.set_cancelled();
-            match self.write_job_state(&mut state).await {
-                Ok(()) => return Ok(state),
-                Err(super::error::Error::ConcurrentModification { .. }) => {
-                    if let Some(duration) = backoff.next_duration() {
-                        tracing::debug!(
-                            job_id = %job_id,
-                            "Concurrent modification on cancel, retrying"
-                        );
-                        tokio::time::sleep(duration).await;
-                    } else {
-                        // Max retries exhausted — re-read state in case another
-                        // writer already cancelled the job.
-                        let state = self.get_job(job_id).await?;
-                        if state.is_terminal() {
-                            return Ok(state);
-                        }
-                        return Err(super::error::Error::ConcurrentModification {
-                            job_id: job_id.to_string(),
-                        });
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
+            true
+        })
+        .await
     }
 
     /// Writes result chunks for a completed job from a stream of record batches.
@@ -460,17 +432,15 @@ impl JobStore {
         let path = self.chunk_path(job_id, chunk_index);
         let bytes_len = buffer.len();
 
-        // Use PutMode::Create to ensure chunks are only written once.
-        // If another scheduler already wrote this chunk, we'll get an AlreadyExists error.
-        self.store
-            .put_opts(&path, buffer.into(), PutOptions::from(PutMode::Create))
+        // A chunk is written once: another scheduler that already wrote it wins.
+        conditional_put(self.store.as_ref(), &path, buffer.into(), &Expected::Absent)
             .await
             .map_err(|e| match e {
-                ObjectStoreError::AlreadyExists { .. } => super::error::Error::ChunkAlreadyExists {
+                ConditionalWriteError::Conflict { .. } => super::error::Error::ChunkAlreadyExists {
                     job_id: job_id.to_string(),
                     chunk_index,
                 },
-                other => super::error::Error::ObjectStoreWrite { source: other },
+                source => super::error::Error::ObjectStoreWrite { source },
             })?;
 
         Ok(bytes_len)
@@ -505,18 +475,19 @@ impl JobStore {
     /// The first terminal state wins: a job that was cancelled or failed while its
     /// results were being written stays that way.
     pub async fn complete_job(&self, job_id: &str, result: JobResult) -> Result<JobState> {
-        let mut state = self.get_job(job_id).await?;
-        if state.is_terminal() {
-            tracing::debug!(
-                job_id,
-                status = %state.status,
-                "Job already finished; not marking it succeeded"
-            );
-            return Ok(state);
-        }
-        state.set_succeeded(result, self.result_ttl);
-        self.write_job_state(&mut state).await?;
-        Ok(state)
+        self.modify_job(job_id, |state| {
+            if state.is_terminal() {
+                tracing::debug!(
+                    job_id,
+                    status = %state.status,
+                    "Job already finished; not marking it succeeded"
+                );
+                return false;
+            }
+            state.set_succeeded(result.clone(), self.result_ttl);
+            true
+        })
+        .await
     }
 
     /// Marks a job as failed with the given error.
@@ -529,22 +500,24 @@ impl JobStore {
         error_code: JobErrorCode,
         message: impl Into<String>,
     ) -> Result<JobState> {
-        let mut state = self.get_job(job_id).await?;
-        if state.is_terminal() {
-            tracing::debug!(
-                job_id,
-                status = %state.status,
-                "Job already finished; not marking it failed"
-            );
-            return Ok(state);
-        }
-        state.set_failed(super::state::JobError {
+        let error = super::state::JobError {
             error_code,
             message: message.into(),
             sql_state: None,
-        });
-        self.write_job_state(&mut state).await?;
-        Ok(state)
+        };
+        self.modify_job(job_id, |state| {
+            if state.is_terminal() {
+                tracing::debug!(
+                    job_id,
+                    status = %state.status,
+                    "Job already finished; not marking it failed"
+                );
+                return false;
+            }
+            state.set_failed(error.clone());
+            true
+        })
+        .await
     }
 
     /// Deletes a job and all its result chunks.
@@ -640,7 +613,8 @@ impl JobStore {
         Ok(jobs)
     }
 
-    /// Cleans up expired jobs and their results.
+    /// Deletes, with their result chunks, the jobs whose results expired and the
+    /// jobs that failed or were cancelled at least the result TTL ago.
     ///
     /// This method uses best-effort cleanup. For listing errors, individual job state
     /// retrieval errors, and deletion errors, the operation logs warnings and continues
@@ -648,6 +622,7 @@ impl JobStore {
     ///
     /// Returns the count of successfully deleted jobs.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
+        let now_ms = now_ms_or_zero();
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut deleted_count = 0usize;
@@ -710,7 +685,7 @@ impl JobStore {
                 }
             };
 
-            if state.is_expired() {
+            if state.is_reclaimable(now_ms, self.result_ttl) {
                 match self.delete_job(&state.job_id).await {
                     Ok(()) => {
                         // Saturate at MAX on overflow - cleanup count is informational only
@@ -748,26 +723,66 @@ impl JobStore {
         )
     }
 
+    /// Applies `change` to the job's current state and writes it back, starting
+    /// again from a fresh read when another writer changed the job first.
+    /// `change` returns `false` to leave the job as it is.
+    async fn modify_job(
+        &self,
+        job_id: &str,
+        change: impl FnMut(&mut JobState) -> bool + Send,
+    ) -> Result<JobState> {
+        let change = Mutex::new(change);
+        retry_on_conflict(&ConflictRetry::default(), || async {
+            let mut state = self.get_job(job_id).await?;
+            if !(*change.lock())(&mut state) {
+                return Ok(Attempt::Done(state));
+            }
+            match self.write_job_state(&mut state).await {
+                Ok(()) => Ok(Attempt::Done(state)),
+                Err(super::error::Error::ConcurrentModification { .. }) => Ok(Attempt::Conflict),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|err| match err {
+            RetryOnConflictError::ConflictsExhausted { .. } => {
+                super::error::Error::ConcurrentModification {
+                    job_id: job_id.to_string(),
+                }
+            }
+            RetryOnConflictError::Failed(err) => err,
+        })
+    }
+
+    /// Writes the job's state if it is still at the version it was read at, or
+    /// creates it when it has no version yet.
     async fn write_job_state(&self, state: &mut JobState) -> Result<()> {
         let path = self.job_state_path(&state.job_id);
         let payload = serde_json::to_vec(state).context(SerializeStateSnafu)?;
 
-        let put_mode = match &state.version {
-            Some(version) => PutMode::Update(version.clone()),
-            None => PutMode::Create,
+        let expected = match &state.version {
+            Some(version) => Expected::at_version(version.clone()).ok_or_else(|| {
+                super::error::Error::ObjectStoreWrite {
+                    source: ConditionalWriteError::Unsupported {
+                        path: path.to_string(),
+                        source: ObjectStoreError::NotSupported {
+                            source: "the store reported neither an ETag nor a version".into(),
+                        },
+                    },
+                }
+            })?,
+            None => Expected::Absent,
         };
 
-        let result = self
-            .store
-            .put_opts(&path, payload.into(), PutOptions::from(put_mode))
+        let result = conditional_put(self.store.as_ref(), &path, payload.into(), &expected)
             .await
             .map_err(|e| match e {
-                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                ConditionalWriteError::Conflict { .. } => {
                     super::error::Error::ConcurrentModification {
                         job_id: state.job_id.clone(),
                     }
                 }
-                other => super::error::Error::ObjectStoreWrite { source: other },
+                source => super::error::Error::ObjectStoreWrite { source },
             })?;
 
         // Update the version for future writes
@@ -939,6 +954,69 @@ mod tests {
         assert!(state.error.is_none());
     }
 
+    /// Schedulers that finish one job at the same time on one local directory
+    /// all succeed and agree on the one terminal state that landed first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_finishers_agree_on_the_first_terminal_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store_occ::LocalConditionalPut::new(dir.path()).expect("local store"));
+        let stores: Vec<_> = (0..3)
+            .map(|n| {
+                Arc::new(JobStore::new(
+                    Arc::clone(&store),
+                    "test",
+                    format!("node-{n}"),
+                ))
+            })
+            .collect();
+        for round in 0..10 {
+            let job_id = stores[0]
+                .create_job(make_request(format!("SELECT {round}")), false, test_owner())
+                .await
+                .expect("to create job")
+                .job_id;
+            stores[0].set_job_running(&job_id).await.expect("running");
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let finishers: Vec<_> = stores
+                .iter()
+                .enumerate()
+                .map(|(n, job_store)| {
+                    let (job_store, job_id, barrier) =
+                        (Arc::clone(job_store), job_id.clone(), Arc::clone(&barrier));
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        match n {
+                            0 => job_store.complete_job(&job_id, empty_result()).await,
+                            1 => {
+                                job_store
+                                    .fail_job(&job_id, JobErrorCode::Internal, "failed")
+                                    .await
+                            }
+                            _ => job_store.cancel_job(&job_id).await,
+                        }
+                    })
+                })
+                .collect();
+            let mut statuses = Vec::new();
+            for finisher in finishers {
+                statuses.push(
+                    finisher
+                        .await
+                        .expect("finisher task")
+                        .expect("a lost race is not an error")
+                        .status,
+                );
+            }
+            let landed = stores[0].get_job(&job_id).await.expect("to get job").status;
+            assert!(
+                statuses.iter().all(|status| *status == landed),
+                "round {round}: every finisher must report the stored status {landed:?}: {statuses:?}"
+            );
+        }
+    }
+
     /// Expired jobs are deleted together with their result chunks; live jobs stay.
     #[tokio::test]
     async fn cleanup_deletes_expired_jobs_and_their_chunks() {
@@ -1001,6 +1079,134 @@ mod tests {
             remaining.iter().any(|path| path.contains(live.as_str())),
             "the live job stays: {remaining:?}"
         );
+    }
+
+    /// Creates a job, writes a result chunk for it, finishes it with `finish`, and
+    /// moves its completion time to `finished_ago` before now.
+    async fn finished_job(
+        job_store: &JobStore,
+        finish: JobStatus,
+        finished_ago: Duration,
+    ) -> String {
+        let job_id = job_store
+            .create_job(make_request("SELECT 1"), false, test_owner())
+            .await
+            .expect("to create job")
+            .job_id;
+        job_store.set_job_running(&job_id).await.expect("running");
+        job_store
+            .store
+            .put(&job_store.chunk_path(&job_id, 0), b"chunk".to_vec().into())
+            .await
+            .expect("write a chunk");
+        match finish {
+            JobStatus::Failed => {
+                job_store
+                    .fail_job(&job_id, JobErrorCode::ExecutionFailed, "failed")
+                    .await
+                    .expect("to fail");
+            }
+            JobStatus::Cancelled => {
+                job_store.cancel_job(&job_id).await.expect("to cancel");
+            }
+            JobStatus::Succeeded => {
+                job_store
+                    .complete_job(&job_id, empty_result())
+                    .await
+                    .expect("to complete");
+            }
+            other => panic!("{other} is not a finished status"),
+        }
+        let finished_ago_ms = u64::try_from(finished_ago.as_millis()).expect("fits in u64");
+        job_store
+            .modify_job(&job_id, |state| {
+                let completed_at = now_ms_or_zero() - finished_ago_ms;
+                state.completed_at_ms = Some(completed_at);
+                if let Some(expires_at) = state.expires_at_ms.as_mut() {
+                    *expires_at = completed_at + 12 * 60 * 60 * 1000;
+                }
+                true
+            })
+            .await
+            .expect("to backdate the job");
+        job_id
+    }
+
+    async fn stored_paths(store: &InMemory) -> Vec<String> {
+        let objects: Vec<_> = futures::TryStreamExt::try_collect(store.list(None))
+            .await
+            .expect("list");
+        objects.iter().map(|m| m.location.to_string()).collect()
+    }
+
+    /// Failed and cancelled jobs, with their chunks, go 12 hours after they
+    /// finished; until then they stay, as does a running job of any age.
+    #[tokio::test]
+    async fn failed_and_cancelled_jobs_are_deleted_twelve_hours_after_they_finished() {
+        let store = Arc::new(InMemory::new());
+        let job_store = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
+        let minute = Duration::from_mins(1);
+        let twelve_hours = Duration::from_hours(12);
+
+        let mut deleted = Vec::new();
+        let mut kept = Vec::new();
+        for status in [
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+            JobStatus::Succeeded,
+        ] {
+            deleted.push(finished_job(&job_store, status, twelve_hours + minute).await);
+            kept.push(finished_job(&job_store, status, twelve_hours.saturating_sub(minute)).await);
+        }
+        let running = job_store
+            .create_job(make_request("SELECT 2"), false, test_owner())
+            .await
+            .expect("to create job")
+            .job_id;
+        job_store.set_job_running(&running).await.expect("running");
+        kept.push(running);
+
+        let count = job_store
+            .cleanup_expired_jobs()
+            .await
+            .expect("cleanup succeeds");
+        assert_eq!(count, deleted.len());
+
+        let remaining = stored_paths(&store).await;
+        for job_id in &deleted {
+            assert!(
+                remaining.iter().all(|path| !path.contains(job_id.as_str())),
+                "job {job_id} and its chunk are deleted: {remaining:?}"
+            );
+        }
+        for job_id in &kept {
+            assert!(
+                remaining.contains(&format!("test/jobs/{job_id}.json")),
+                "job {job_id} stays: {remaining:?}"
+            );
+        }
+    }
+
+    /// Two schedulers that clean the same location at once both succeed and
+    /// leave nothing of the reclaimable jobs behind.
+    #[tokio::test]
+    async fn two_schedulers_cleaning_at_once_both_succeed() {
+        let store = Arc::new(InMemory::new());
+        let first = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
+        let second = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-2");
+        for _ in 0..20 {
+            finished_job(&first, JobStatus::Failed, Duration::from_hours(13)).await;
+        }
+
+        let (first_pass, second_pass) =
+            tokio::join!(first.cleanup_expired_jobs(), second.cleanup_expired_jobs());
+        let first_count = first_pass.expect("the first scheduler's cleanup succeeds");
+        let second_count = second_pass.expect("the second scheduler's cleanup succeeds");
+        assert!(
+            first_count + second_count >= 20,
+            "every job is deleted by one cleanup or the other: {first_count} + {second_count}"
+        );
+        assert_eq!(stored_paths(&store).await, Vec::<String>::new());
     }
 
     /// Two schedulers' cleanups can both try to delete the same job.

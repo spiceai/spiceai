@@ -446,6 +446,8 @@ impl OtelToArrowConverter {
         let Some(attributes) = self.attributes_builder.finish() else {
             return Err(ConversionError("Could not convert attributes".into()));
         };
+        let series_id = crate::series_ids(&attributes)
+            .map_err(|e| ConversionError(format!("Could not derive series_id: {e}")))?;
         let Some(data_number) = self.data_number_builder.finish() else {
             return Err(ConversionError("Could not convert data number".into()));
         };
@@ -467,6 +469,7 @@ impl OtelToArrowConverter {
             Arc::new(self.is_monotonic_builder.finish()),
             Arc::new(self.flags_builder.finish()),
             Arc::new(attributes),
+            Arc::new(series_id),
             Arc::new(data_number),
             Arc::new(data_histogram),
         ];
@@ -770,16 +773,19 @@ impl OtelToArrowConverter {
                     builder.bytes_builder.append_null();
                     builder.ser_builder.append_null();
                 }
-                opentelemetry::Value::Array(_arr) => {
+                opentelemetry::Value::Array(arr) => {
                     builder
                         .type_builder
-                        .append_value(crate::schema::AttributeValueType::Bytes.to_u8());
+                        .append_value(crate::schema::AttributeValueType::Slice.to_u8());
                     builder.str_builder.append_null();
                     builder.int_builder.append_null();
                     builder.double_builder.append_null();
                     builder.bool_builder.append_null();
-                    // TODO: serialize the value to bytes
-                    builder.bytes_builder.append_value([]);
+                    // Length-prefixed encoding so distinct arrays hash to
+                    // distinct series_id values (empty bytes collided before).
+                    builder
+                        .bytes_builder
+                        .append_value(encode_array_attribute(arr));
                     builder.ser_builder.append_null();
                 }
                 _ => {
@@ -879,6 +885,61 @@ impl AppendDataNumber for f64 {
         builder.append(true);
         Ok(())
     }
+}
+
+/// Stable bytes for an `OTel` array attribute, used as the `bytes` payload when
+/// the attribute type is [`crate::schema::AttributeValueType::Slice`].
+///
+/// Framing is tag + length + elements so `[1]` and `[2]` cannot collide, and
+/// string elements cannot forge element boundaries.
+fn encode_array_attribute(arr: &opentelemetry::Array) -> Vec<u8> {
+    let mut out = Vec::new();
+    match arr {
+        opentelemetry::Array::Bool(values) => {
+            out.push(1);
+            out.extend_from_slice(&len_prefix(values.len()));
+            for value in values {
+                out.push(u8::from(*value));
+            }
+        }
+        opentelemetry::Array::I64(values) => {
+            out.push(2);
+            out.extend_from_slice(&len_prefix(values.len()));
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        opentelemetry::Array::F64(values) => {
+            out.push(3);
+            out.extend_from_slice(&len_prefix(values.len()));
+            for value in values {
+                out.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        opentelemetry::Array::String(values) => {
+            out.push(4);
+            out.extend_from_slice(&len_prefix(values.len()));
+            for value in values {
+                let bytes = value.as_str().as_bytes();
+                out.extend_from_slice(&len_prefix(bytes.len()));
+                out.extend_from_slice(bytes);
+            }
+        }
+        // `Array` is non-exhaustive; unknown variants still need a distinct,
+        // stable encoding so they do not collide with empty payloads.
+        other => {
+            out.push(255);
+            let rendered = other.to_string();
+            let bytes = rendered.as_bytes();
+            out.extend_from_slice(&len_prefix(bytes.len()));
+            out.extend_from_slice(bytes);
+        }
+    }
+    out
+}
+
+fn len_prefix(len: usize) -> [u8; 8] {
+    u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes()
 }
 
 fn system_time_to_nanos(time: SystemTime) -> Result<i64, ConversionError> {

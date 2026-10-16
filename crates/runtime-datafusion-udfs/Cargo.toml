@@ -25,6 +25,7 @@ futures.workspace = true
 half = "2"
 blake3 = { workspace = true, optional = true }
 llms = { path = "../llms", default-features = false, optional = true }
+model-capabilities = { path = "../model-capabilities", optional = true }
 reqwest = { workspace = true, optional = true }
 runtime-auth = { path = "../runtime-auth", optional = true }
 runtime-rate-control = { path = "../runtime-rate-control" }
@@ -65,7 +66,7 @@ harness = false
 [features]
 default = []
 http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
-models = ["dep:llms", "dep:runtime-status"]
+models = ["dep:llms", "dep:model-capabilities", "dep:runtime-status"]
 wasm-functions = ["dep:arrow-ipc", "dep:arrow_tools", "dep:wasmtime"]
 wasm-functions-compile = ["wasm-functions", "dep:blake3"]
 

@@ -58,7 +58,11 @@ fn u64_to_i64_telemetry(value: u64, metric_name: &str) -> i64 {
     })
 }
 
-async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
+async fn resource(
+    spicepod_name: &str,
+    telemetry_properties: Vec<KeyValue>,
+    configured_cpu_cores: Option<usize>,
+) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
@@ -84,6 +88,10 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
         HardwareInfo::default()
     });
 
+    // A configured CPU count is what the runtime sizes itself for, so it is
+    // reported in place of the detected one.
+    let cpu_count = configured_cpu_cores.unwrap_or(hardware_info.vcpu_count);
+
     Resource::builder_empty()
         .with_attributes(telemetry_properties.into_iter().chain(vec![
             KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
@@ -93,7 +101,7 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
             KeyValue::new("spicepod.id", spicepod_id),
             KeyValue::new(
                 "host.cpu.count",
-                usize_to_i64_telemetry(hardware_info.vcpu_count, "host.cpu.count"),
+                usize_to_i64_telemetry(cpu_count, "host.cpu.count"),
             ),
             KeyValue::new(
                 "host.gpu.count",
@@ -107,8 +115,18 @@ async fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> R
         .build()
 }
 
-pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
-    let resource = resource(spicepod_name, telemetry_properties).await;
+/// Starts anonymous telemetry.
+///
+/// `configured_cpu_cores` is the CPU count set by `runtime.cpu.cores`,
+/// `SPICE_CPU_CORES` or `--cpu-cores`, reported as `host.cpu.count` in place of
+/// the detected count. It is a plain scalar because `telemetry` is a foundation
+/// crate and does not depend on `cpu-budget`.
+pub async fn start(
+    spicepod_name: &str,
+    telemetry_properties: Vec<KeyValue>,
+    configured_cpu_cores: Option<usize>,
+) {
+    let resource = resource(spicepod_name, telemetry_properties, configured_cpu_cores).await;
 
     let Ok(exporter) = TelemetryExporterBuilder::new()
         .with_endpoint(Arc::clone(&ENDPOINT))
@@ -228,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_hashes_hostname_and_spicepod_name() {
-        let resource = resource("test-spicepod", vec![]).await;
+        let resource = resource("test-spicepod", vec![], None).await;
 
         // Verify instance_id is a SHA256 hash (64 hex chars)
         let instance_id = resource
@@ -263,7 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_does_not_contain_raw_spicepod_name() {
-        let resource = resource("my-secret-project", vec![]).await;
+        let resource = resource("my-secret-project", vec![], None).await;
 
         // Verify the raw spicepod name doesn't appear in any attribute value
         for (key, value) in &resource {
@@ -277,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_contains_required_attributes() {
-        let resource = resource("test", vec![]).await;
+        let resource = resource("test", vec![], None).await;
 
         let keys: Vec<&str> = resource.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"service.name"), "Missing service.name");
@@ -296,12 +314,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resource_reports_configured_cpu_cores_in_place_of_detected() {
+        let detected = HardwareInfo::detect_async()
+            .await
+            .expect("hardware detection should run")
+            .vcpu_count;
+        // One more than detected, so the assertion fails if the configured value is ignored.
+        let configured = detected + 1;
+        let host_cpu_count = |res: &Resource| {
+            res.iter()
+                .find(|(k, _)| k.as_str() == "host.cpu.count")
+                .map(|(_, v)| v.to_string())
+                .expect("resource should have host.cpu.count")
+        };
+
+        let reported = resource("test", vec![], Some(configured)).await;
+        assert_eq!(host_cpu_count(&reported), configured.to_string());
+
+        let reported = resource("test", vec![], None).await;
+        assert_eq!(host_cpu_count(&reported), detected.to_string());
+    }
+
+    #[tokio::test]
     async fn test_resource_includes_custom_properties() {
         let properties = vec![
             KeyValue::new("custom.key", "custom_value"),
             KeyValue::new("env", "staging"),
         ];
-        let resource = resource("test", properties).await;
+        let resource = resource("test", properties, None).await;
 
         let custom = resource
             .iter()
@@ -316,8 +356,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_deterministic_for_same_inputs() {
-        let r1 = resource("deterministic-test", vec![]).await;
-        let r2 = resource("deterministic-test", vec![]).await;
+        let r1 = resource("deterministic-test", vec![], None).await;
+        let r2 = resource("deterministic-test", vec![], None).await;
 
         let spicepod_id_1 = r1
             .iter()
@@ -352,8 +392,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resource_different_names_produce_different_ids() {
-        let r1 = resource("project-a", vec![]).await;
-        let r2 = resource("project-b", vec![]).await;
+        let r1 = resource("project-a", vec![], None).await;
+        let r2 = resource("project-b", vec![], None).await;
 
         let id1 = r1
             .iter()

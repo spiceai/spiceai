@@ -55,6 +55,15 @@ pub static REFRESH_DATA_FETCHES_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(
         .build()
 });
 
+pub static REFRESH_FALLBACKS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_fallbacks")
+        .with_description(
+            "Number of append refreshes that read by time instead of following the source's commits, by reason.",
+        )
+        .build()
+});
+
 pub static REFRESH_PROCESSED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("dataset_acceleration_refresh_processed_rows")

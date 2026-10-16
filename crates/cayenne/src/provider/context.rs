@@ -26,9 +26,7 @@ use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, Wr
 use vortex_session::VortexSession;
 
 use super::tuning::{self, ActuatorValues, IngestStats, LiveActuators, TuningBounds};
-use crate::metadata::{
-    DeletionMode, DeltaEncoding, PkConflictDetection, StorageClass, VortexConfig,
-};
+use crate::metadata::{DeletionMode, DeltaEncoding, StorageClass, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -111,6 +109,12 @@ pub struct CayenneContext {
     /// that gate's own fresh-sample test (independent of the controller's
     /// `last_adjust_samples`). `0` until the first check.
     bake_gate_last_samples: std::sync::atomic::AtomicU64,
+    /// Recorded-batch count at the last whole-table deletion-index reclaim
+    /// back-pressure check: that gate's own fresh-sample cursor. An `auto` table on
+    /// key deletes runs the bake's gate and this one in the same pass, and on a
+    /// shared cursor this gate would read the sample the bake just took as stale.
+    /// `0` until the first check.
+    reclaim_gate_last_samples: std::sync::atomic::AtomicU64,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
     /// controller had no move left — no eligible adjustment, whether because every
     /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
@@ -317,6 +321,7 @@ impl CayenneContext {
             last_adjust: parking_lot::Mutex::new(None),
             last_adjust_samples: std::sync::atomic::AtomicU64::new(0),
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
+            reclaim_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
@@ -488,6 +493,14 @@ impl CayenneContext {
             && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
     }
 
+    /// Whether the operator asked for a file layout: explicit `cluster_by`
+    /// columns or a user-configured sort order. An inferred sort order is not a
+    /// request, since observed filter columns outrank it.
+    #[must_use]
+    pub fn has_requested_layout(&self) -> bool {
+        self.has_cluster_by() || self.sort_columns_are_authoritative()
+    }
+
     /// Sort columns that schema inference supplied, if any — the lowest-priority
     /// rung of the layout precedence chain (below observed filter columns).
     /// Empty when the sort order is user-configured or absent.
@@ -580,19 +593,20 @@ impl CayenneContext {
         self.live_actuators.inline_flush_max_bytes().max(0)
     }
 
-    /// Primary-key conflict detection behavior for inserts.
-    #[must_use]
-    pub(crate) fn pk_conflict_detection(&self) -> PkConflictDetection {
-        self.config.pk_conflict_detection
-    }
-
-    /// How primary-key deletions are recorded and applied for PK tables.
-    /// The default `auto` resolves to `key` for PK tables (key-based tombstones
-    /// pruned by seq-prefix bake) and to `position` for PK-less tables; `key`
-    /// or `position` can be pinned explicitly.
+    /// How primary-key deletions are recorded and applied for PK tables, as
+    /// configured. The default `auto` lets each PK table choose as it grows (see
+    /// `PkDeletionMode`); a PK-less table always uses position deletes; `key` or
+    /// `position` can be pinned explicitly.
     #[must_use]
     pub(crate) fn deletion_mode(&self) -> DeletionMode {
         self.config.deletion_mode
+    }
+
+    /// Whether `auto` keeps key deletes from the start on this runtime (see
+    /// [`VortexConfig::auto_keeps_key_deletes`]).
+    #[must_use]
+    pub(crate) fn auto_keeps_key_deletes(&self) -> bool {
+        self.config.auto_keeps_key_deletes
     }
 
     /// Byte budget for the in-memory PK keyset cache used during upsert conflict
@@ -665,11 +679,23 @@ impl CayenneContext {
     /// baking is free.
     #[must_use]
     pub(crate) fn bake_should_defer_for_apply(&self) -> bool {
+        self.should_defer_for_apply(&self.bake_gate_last_samples)
+    }
+
+    /// [`Self::bake_should_defer_for_apply`] for the whole-table deletion-index
+    /// reclaim, read through its own fresh-sample cursor. The reclaim re-encodes the
+    /// whole current snapshot, so it competes with the apply harder than the bake
+    /// and defers whenever the bake would — including in a pass whose bake read the
+    /// same sample first.
+    #[must_use]
+    pub(crate) fn whole_table_reclaim_should_defer_for_apply(&self) -> bool {
+        self.should_defer_for_apply(&self.reclaim_gate_last_samples)
+    }
+
+    fn should_defer_for_apply(&self, last_samples: &std::sync::atomic::AtomicU64) -> bool {
         use std::sync::atomic::Ordering;
         let snapshot = self.ingest_snapshot();
-        let last = self
-            .bake_gate_last_samples
-            .swap(snapshot.samples, Ordering::Relaxed);
+        let last = last_samples.swap(snapshot.samples, Ordering::Relaxed);
         let ingest_fresh = snapshot.samples > last;
         ingest_fresh
             && snapshot.samples >= tuning::WARMUP_BATCHES

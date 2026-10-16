@@ -36,6 +36,7 @@ pub mod json_tree;
 pub mod l2_distance;
 pub mod l2_norm;
 pub mod primitive_json_codec;
+pub mod timeseries;
 pub mod truncate;
 pub mod user_functions;
 pub(crate) mod vector_simd;

@@ -211,7 +211,7 @@ async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightI
 async fn get_flight_info_simple(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    tracing::trace!("get_flight_info_simple: {request:?}");
+    tracing::trace!("get_flight_info_simple: {:?}", request.get_ref());
     let _start = metrics::track_flight_request("get_flight_info", Some("sql_query")).await;
 
     let fd = request.into_inner();

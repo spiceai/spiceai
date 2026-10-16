@@ -17,8 +17,8 @@ limitations under the License.
 //! `OpenAI` decision models (`gpt-6-luna`), answering the System One evaluation contract
 //! through `OpenAI`'s Decisions API: `POST {endpoint}/decisions`.
 //!
-//! A decision model is not a chat model: it returns a probability, a choice, or a
-//! score for each question, not text. See
+//! The Decisions API returns a probability, a choice, or a score for each question.
+//! Models may also support chat through a separate API. See
 //! <https://developers.openai.com/api/docs/guides/decisions>.
 
 use std::fmt::Debug;
@@ -35,19 +35,6 @@ use reqwest::{Client, RequestBuilder, StatusCode};
 use runtime_rate_control::RateController;
 
 use crate::provider::create_http_client;
-
-/// The model id of `OpenAI`'s decision model; a dated snapshot appends `-<suffix>`.
-const DECISION_MODEL_ID: &str = "gpt-6-luna";
-
-/// Whether an `OpenAI` model id names a decision model, which answers decisions and not
-/// chat completions: `gpt-6-luna`, or a snapshot such as `gpt-6-luna-2026-10-01`, but
-/// not an unrelated id that merely starts the same way, such as `gpt-6-lunar`.
-#[must_use]
-pub fn is_decision_model_id(model_id: &str) -> bool {
-    model_id
-        .strip_prefix(DECISION_MODEL_ID)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
-}
 
 /// Whether `endpoint` is `OpenAI`'s own API, which needs an API key. An
 /// OpenAI-compatible endpoint, such as a gateway, may not, as with `OpenAI` chat models.
@@ -216,15 +203,18 @@ impl Evaluate for OpenAiDecisions {
         } else {
             self.ask(&body).await?
         };
-        let answered = decision_response_to_system_one(&request, decision).map_err(|detail| {
-            evaluate_api::Error::UnparseableResponse {
-                model: self.name.clone(),
-                response: detail,
-            }
-        })?;
+        let mut answered =
+            decision_response_to_system_one(&request, decision).map_err(|detail| {
+                evaluate_api::Error::UnparseableResponse {
+                    model: self.name.clone(),
+                    response: detail,
+                }
+            })?;
         // A 200 that drops, re-types, or answers outside its own options is a wrong
         // result, not a success.
         evaluate_api::check_answers(&self.name, &request.questions, &answered)?;
+        // Responses name the model the caller asked for, as chat completions do.
+        answered.model.clone_from(&self.name);
         Ok(answered)
     }
 
@@ -252,10 +242,6 @@ impl Evaluate for OpenAiDecisions {
             )
             .into(),
         })
-    }
-
-    fn is_decision_model(&self) -> bool {
-        true
     }
 }
 
@@ -361,7 +347,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&answered).expect("serializes"),
             json!({
-                "model": "gpt-6-luna",
+                "model": "luna",
                 "answers": {
                     "damaged": {"type": "noul", "noul": 0.95},
                     "team": {"type": "choice", "choice": "support", "probabilities": {"billing": 0.1, "support": 0.9}, "confidence": 0.8}
@@ -450,7 +436,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&answered).expect("serializes"),
             json!({
-                "model": "gpt-6-luna",
+                "model": "luna",
                 "answers": {"only": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.0}}
             })
         );
@@ -539,7 +525,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&response).expect("serializes"),
             json!({
-                "model": "gpt-6-luna",
+                "model": "luna",
                 "answers": [
                     {"type": "choice", "name": "valid", "choice": false, "probabilities": [{"value": true, "probability": 0.25}, {"value": false, "probability": 0.75}], "confidence": 0.5},
                     {"type": "choice", "name": null, "choice": "true", "probabilities": [{"value": true, "probability": 0.25}, {"value": "true", "probability": 0.625}, {"value": "maybe", "probability": 0.125}], "confidence": 0.4}
@@ -572,14 +558,5 @@ mod tests {
             matches!(err, evaluate_api::Error::UnparseableResponse { .. }),
             "{err}"
         );
-    }
-
-    #[test]
-    fn decision_model_ids() {
-        assert!(is_decision_model_id("gpt-6-luna"));
-        assert!(is_decision_model_id("gpt-6-luna-2026-10-01"));
-        assert!(!is_decision_model_id("gpt-4o-mini"));
-        assert!(!is_decision_model_id("gpt-6-lunar"));
-        assert!(!is_decision_model_id("gpt-6-lunatic-preview"));
     }
 }

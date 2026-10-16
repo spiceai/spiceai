@@ -389,6 +389,14 @@ async fn compound_delete_by_keys(
     primary_result.and(secondary_result)
 }
 
+/// Truncate both indexes, like [`compound_delete_by_keys`]: both run to completion and the
+/// primary's error is surfaced first.
+async fn compound_truncate(primary: &dyn Index, secondary: &dyn Index) -> DataFusionResult<()> {
+    let (primary_result, secondary_result) =
+        futures::join!(primary.truncate(), secondary.truncate());
+    primary_result.and(secondary_result)
+}
+
 /// Fan a group-remainder delete out to the halves that can prune, like
 /// [`compound_delete_by_keys`]: both run, and the primary's error is surfaced first. A half that
 /// reports [`GroupPruning::Unsupported`] is not asked, which is the contract
