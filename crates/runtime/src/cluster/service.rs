@@ -533,6 +533,7 @@ impl ClusterService for ClusterServiceImpl {
             .datafusion
             .query_builder(&local_sql)
             .read_only(true)
+            .for_peer_scheduler_read()
             .build()
             .run()
             .await
@@ -1754,6 +1755,7 @@ mod tests {
                 runtime.accelerator_engine_registry(),
                 tokio::runtime::Handle::current(),
             )
+            .max_concurrent_queries(None)
             .build(),
         );
         let task_history_schema = Arc::new(Schema::new(vec![Field::new(
@@ -2269,6 +2271,45 @@ mod tests {
             .expect("SELECT against task_history must succeed under read-only");
         // The query named `task_history`; the row can only have come from the
         // seeded `local_task_history`, so the rewrite ran under the read-only gate.
+        assert_eq!(
+            render_task_history(response.into_inner().arrow_ipc),
+            "+----------+\n\
+             | trace_id |\n\
+             +----------+\n\
+             | trace-a  |\n\
+             +----------+"
+        );
+    }
+
+    /// `GetTaskHistory` serves a peer scheduler's `runtime.task_history` query,
+    /// which holds an admission permit on that peer while it waits. With every
+    /// permit here held by this scheduler's own such queries, the read must
+    /// still run, or the two schedulers wait on each other forever.
+    #[tokio::test]
+    async fn get_task_history_runs_while_every_admission_permit_is_held() {
+        let service = make_test_service_with_task_history(&["trace-a"]).await;
+        let semaphore = service
+            .datafusion
+            .query_admission_semaphore()
+            .expect("the scheduler gates queries");
+        let permits =
+            u32::try_from(semaphore.available_permits()).expect("permit count fits in u32");
+        let _held = semaphore
+            .acquire_many_owned(permits)
+            .await
+            .expect("the semaphore is open");
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            })),
+        )
+        .await
+        .expect("GetTaskHistory must not wait for an admission permit")
+        .expect("GetTaskHistory should succeed");
         assert_eq!(
             render_task_history(response.into_inner().arrow_ipc),
             "+----------+\n\
