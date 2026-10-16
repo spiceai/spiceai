@@ -39,6 +39,7 @@ use tokio::sync::oneshot;
 use crate::{TEST_ARGS, init_tracing};
 
 mod create;
+mod responses;
 mod streaming_tests;
 
 /// Async function that creates a model instance
@@ -128,6 +129,12 @@ static DOTENV: LazyLock<()> = LazyLock::new(|| {
 /// share, which is what their [`TestModel::fetch_repo`] serialization keys on.
 const PHI3_REPO: &str = "microsoft/Phi-3-mini-4k-instruct";
 
+/// The `OpenAI` model the chat and Responses tests run against.
+const OPENAI_MODEL: &str = "gpt-4o-mini";
+
+/// The xAI model the chat and Responses tests run against.
+const XAI_MODEL: &str = "grok-4.3";
+
 static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
     vec![
         TestModel {
@@ -165,15 +172,16 @@ static TEST_MODELS: LazyLock<Vec<TestModel>> = LazyLock::new(|| {
         TestModel {
             name: "openai",
             fetch_repo: None,
-            create: Box::new(|| Box::pin(async { Ok(create::create_openai("gpt-4o-mini")) })),
+            create: Box::new(|| Box::pin(async { Ok(create::create_openai(OPENAI_MODEL)) })),
         },
         TestModel {
             name: "xai",
             fetch_repo: None,
             create: Box::new(|| {
                 Box::pin(async {
-                    create::create_xai("grok-4.3")
-                        .map_err(|e| anyhow::anyhow!("failed to create 'grok-4.3' from xAI: {e}"))
+                    create::create_xai(XAI_MODEL).map_err(|e| {
+                        anyhow::anyhow!("failed to create '{XAI_MODEL}' from xAI: {e}")
+                    })
                 })
             }),
         },
@@ -596,6 +604,55 @@ async fn test_usage(
     )
     .await
     .expect("test failed");
+}
+
+/// A reasoning model's usage counts its reasoning inside `completion_tokens`, as `OpenAI`
+/// does, so `total_tokens` is `prompt_tokens + completion_tokens`. xAI reports reasoning
+/// outside `completion_tokens`; the provider has to count it in.
+#[rstest]
+#[tokio::test]
+async fn test_reasoning_usage(
+    #[values("xai")] model_name: &str,
+    #[values(false, true)] as_stream: bool,
+) {
+    let req: CreateChatCompletionRequest = serde_json::from_value(json!({
+        "model": "not_needed",
+        "messages": [
+            {
+                "role": "user",
+                "content": "What is 1234 * 5678? Answer with the number only."
+            }
+        ]
+    }))
+    .expect("failed to create request");
+
+    let Some(resp) = run_test(model_name, "reasoning_usage", req, as_stream, vec![])
+        .await
+        .expect("test failed")
+    else {
+        return;
+    };
+    let usage = resp
+        .usage
+        .unwrap_or_else(|| panic!("{model_name} (stream: {as_stream}) returned no usage"));
+    let reasoning = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+        .unwrap_or_default();
+    assert!(
+        reasoning > 0,
+        "{model_name} (stream: {as_stream}) reported no reasoning, so the check below proves nothing: {usage:?}"
+    );
+    assert!(
+        reasoning <= usage.completion_tokens,
+        "{model_name} (stream: {as_stream}) reported more reasoning tokens than completion tokens: {usage:?}"
+    );
+    assert_eq!(
+        usage.total_tokens,
+        usage.prompt_tokens + usage.completion_tokens,
+        "{model_name} (stream: {as_stream}) total is not prompt + completion: {usage:?}"
+    );
 }
 
 #[rstest]

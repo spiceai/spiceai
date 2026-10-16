@@ -165,6 +165,7 @@ pub struct SnapshotCreationConfig {
 impl SnapshotCreationConfig {
     #[must_use]
     pub fn new(manager: Arc<SnapshotManager>, create_trigger: SnapshotCreateTrigger) -> Self {
+        snapshot_metrics::publish_snapshot_failure_count_at_zero(manager.dataset_name());
         Self {
             manager,
             create_trigger,
@@ -601,7 +602,14 @@ pub async fn create_checkpoint_and_snapshot(
         Err(e) if is_shutdown_cancellation(&e) => {
             tracing::debug!(dataset = %dataset_name, error = %e, "Did not create snapshot: the runtime is shutting down");
         }
-        Err(e @ SnapshotAttemptError::Checkpoint { .. }) => tracing::warn!("{e}"),
+        // Without a snapshot manager this is a plain checkpoint, which is no snapshot
+        // to count as failed.
+        Err(e @ SnapshotAttemptError::Checkpoint { .. }) => {
+            if snapshot_manager.is_some() {
+                snapshot_metrics::record_snapshot_failure(&dataset_name.to_string());
+            }
+            tracing::warn!("{e}");
+        }
         Err(e) => {
             snapshot_metrics::record_snapshot_failure(&dataset_name.to_string());
             tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create snapshot");

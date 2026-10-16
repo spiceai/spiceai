@@ -16,6 +16,9 @@ limitations under the License.
 pub mod duplicate_plan_node;
 pub use duplicate_plan_node::*;
 
+pub mod exact_float_decimal_cast;
+pub use exact_float_decimal_cast::ExactFloatLiteralDecimalCast;
+
 pub mod partitioned_table_scan_rewrite;
 pub use partitioned_table_scan_rewrite::*;
 
@@ -70,6 +73,9 @@ impl AnalyzerRulesBuilder {
         rules.extend([
             Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
+            // After coercion has placed the float-literal-to-decimal casts, and
+            // before the optimizer folds them inexactly (#14970).
+            Arc::new(ExactFloatLiteralDecimalCast::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
         ]);
         rules.into_iter().chain(self.extra_rules).collect()
     }
