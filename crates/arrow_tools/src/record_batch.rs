@@ -3103,6 +3103,69 @@ mod nullability_alignment_tests {
         ));
     }
 
+    /// A field that carries an extension type owns the storage layout under it, so relaxing a
+    /// storage child's nullability beneath the label is not a nullability-only relabel: the pair
+    /// keeps its cast path, which converts the values rather than republishing them under a label
+    /// their storage no longer satisfies (#13456).
+    #[test]
+    fn a_nullability_change_under_an_extension_type_is_not_relabelled() {
+        let item = |timestamp_nullable: bool| {
+            Arc::new(
+                Field::new(
+                    "item",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("timestamp", DataType::Int64, timestamp_nullable),
+                        Field::new("offset_minutes", DataType::Int16, false),
+                    ])),
+                    false,
+                )
+                .with_metadata(
+                    [(
+                        "ARROW:extension:name".to_string(),
+                        "arrow.timestamp_with_offset".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            )
+        };
+        let source = DataType::List(item(false));
+        let target = DataType::List(item(true));
+
+        assert!(
+            !is_nullability_relaxing_relabel(&source, &target),
+            "a storage change under an extension type must not take the relabel path"
+        );
+
+        // The conversion itself is still served, through `arrow_cast`, so the pair is routed
+        // differently rather than refused.
+        let DataType::List(source_item) = &source else {
+            unreachable!("built as a list above")
+        };
+        let DataType::Struct(fields) = source_item.data_type() else {
+            unreachable!("built as a struct above")
+        };
+        let values = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(arrow::array::Int16Array::from(vec![60, -30])) as ArrayRef,
+            ],
+            None,
+        );
+        let list = arrow::array::ListArray::new(
+            Arc::clone(source_item),
+            arrow::buffer::OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        let batch = batch_of("stamps", Arc::new(list) as ArrayRef);
+        let casted = try_cast_to(batch, schema_of("stamps", target.clone()))
+            .expect("relaxing a storage child's nullability is a cast arrow performs");
+        assert_eq!(casted.schema().field(0).data_type(), &target);
+        assert_eq!(casted.num_rows(), 1);
+    }
+
     /// The relabel path must not swallow the casts that already worked: a genuine type change
     /// still goes through `arrow_cast`.
     #[test]

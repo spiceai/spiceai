@@ -1104,8 +1104,8 @@ pub(crate) fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
 mod tests {
     use super::*;
     use arrow::array::{
-        Array, ArrayRef, DictionaryArray, Int32Array, ListArray, RunArray, StringArray,
-        StructArray, UnionArray,
+        Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, ListArray, RunArray,
+        StringArray, StructArray, UnionArray,
     };
     use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
     use arrow::datatypes::Int32Type;
@@ -2059,6 +2059,99 @@ mod tests {
         assert!(
             err.to_string().contains("unset"),
             "the error must say the source had no extension type, got: {err}"
+        );
+    }
+
+    /// The storage struct an extension type such as `arrow.timestamp_with_offset` is declared
+    /// over: two non-nullable children, named as the extension defines them.
+    fn extension_storage(first_name: &str, first_nullable: bool) -> DataType {
+        DataType::Struct(Fields::from(vec![
+            Field::new(first_name, DataType::Int64, first_nullable),
+            Field::new("offset_minutes", DataType::Int16, false),
+        ]))
+    }
+
+    /// A `List<item: Struct<timestamp, offset_minutes>>` whose item field carries an extension
+    /// type over that struct, plus a target that keeps the extension type and `comment` metadata
+    /// as given over `target_storage`.
+    fn list_of_extension_structs(
+        source_comment: Option<&str>,
+        target_storage: DataType,
+        target_comment: Option<&str>,
+    ) -> (ArrayData, DataType) {
+        let item = |storage: DataType, comment: Option<&str>| {
+            let mut metadata = std::collections::HashMap::from([(
+                EXTENSION_TYPE_NAME_KEY.to_owned(),
+                "arrow.timestamp_with_offset".to_owned(),
+            )]);
+            if let Some(comment) = comment {
+                metadata.insert("comment".to_owned(), comment.to_owned());
+            }
+            Arc::new(Field::new("item", storage, true).with_metadata(metadata))
+        };
+        let source_item = item(extension_storage("timestamp", false), source_comment);
+        let DataType::Struct(fields) = source_item.data_type() else {
+            unreachable!("the storage is built as a struct above")
+        };
+        let values = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int16Array::from(vec![60, -30])) as ArrayRef,
+            ],
+            None,
+        );
+        let list = ListArray::new(
+            source_item,
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        (list.to_data(), DataType::List(item(target_storage, target_comment)))
+    }
+
+    /// An extension type's storage layout is part of its definition, so a field that keeps its
+    /// extension label cannot have the storage under it renamed or loosened: the array would still
+    /// be labelled as the extension while its storage no longer satisfies it (#13456). The
+    /// data-type walk alone admits both changes — they are metadata-only for a bare struct.
+    #[test]
+    fn relabel_refuses_a_storage_change_under_an_extension_type() {
+        for (change, target_storage) in [
+            ("renamed child", extension_storage("ts", false)),
+            ("loosened child", extension_storage("timestamp", true)),
+        ] {
+            let (data, target) = list_of_extension_structs(None, target_storage, None);
+            let err = relabel_array_data(data, &target).expect_err(&format!(
+                "a {change} under a field that keeps its extension type must be refused: the \
+                 extension's storage layout is part of what the label claims"
+            ));
+            let message = err.to_string();
+            assert!(
+                message.contains("arrow.timestamp_with_offset")
+                    && message.contains("'item'")
+                    && message.contains("storage"),
+                "the error for a {change} must name the field, the extension type and the \
+                 storage disagreement, got: {message}"
+            );
+        }
+    }
+
+    /// The guard above must not over-reject: with the storage identical, a change to the
+    /// extension-typed field's own descriptive metadata is still carried, as it is for any field.
+    #[test]
+    fn relabel_still_carries_descriptive_metadata_on_an_extension_typed_field() {
+        let (data, target) = list_of_extension_structs(
+            Some("physical"),
+            extension_storage("timestamp", false),
+            Some("logical"),
+        );
+        let relabelled = relabel_array_data(data, &target)
+            .expect("identical storage under the same extension type is metadata-only");
+        assert_eq!(relabelled.data_type(), &target);
+        assert_eq!(
+            relabelled.child_data()[0].child_data()[0].buffers(),
+            Int64Array::from(vec![1, 2]).to_data().buffers(),
+            "the storage buffers must be carried over untouched"
         );
     }
 
