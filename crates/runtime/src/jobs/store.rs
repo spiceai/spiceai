@@ -42,7 +42,7 @@ use super::error::{
 };
 use super::state::{
     ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobResult, JobResultManifest, JobSchema,
-    JobState, JobStatus,
+    JobState, JobStatus, now_ms_or_zero,
 };
 
 /// Stores job state and results in the shared object store.
@@ -88,7 +88,7 @@ impl JobStore {
             store,
             base_prefix: base_prefix.into(),
             node_id: node_id.into(),
-            result_ttl: DEFAULT_RESULT_TTL,
+            result_ttl: object_store_occ::cleanup::age(DEFAULT_RESULT_TTL),
             chunk_size: DEFAULT_CHUNK_SIZE,
         }
     }
@@ -613,7 +613,8 @@ impl JobStore {
         Ok(jobs)
     }
 
-    /// Cleans up expired jobs and their results.
+    /// Deletes, with their result chunks, the jobs whose results expired and the
+    /// jobs that failed or were cancelled at least the result TTL ago.
     ///
     /// This method uses best-effort cleanup. For listing errors, individual job state
     /// retrieval errors, and deletion errors, the operation logs warnings and continues
@@ -621,6 +622,7 @@ impl JobStore {
     ///
     /// Returns the count of successfully deleted jobs.
     pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
+        let now_ms = now_ms_or_zero();
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut deleted_count = 0usize;
@@ -683,7 +685,7 @@ impl JobStore {
                 }
             };
 
-            if state.is_expired() {
+            if state.is_reclaimable(now_ms, self.result_ttl) {
                 match self.delete_job(&state.job_id).await {
                     Ok(()) => {
                         // Saturate at MAX on overflow - cleanup count is informational only
@@ -1077,6 +1079,134 @@ mod tests {
             remaining.iter().any(|path| path.contains(live.as_str())),
             "the live job stays: {remaining:?}"
         );
+    }
+
+    /// Creates a job, writes a result chunk for it, finishes it with `finish`, and
+    /// moves its completion time to `finished_ago` before now.
+    async fn finished_job(
+        job_store: &JobStore,
+        finish: JobStatus,
+        finished_ago: Duration,
+    ) -> String {
+        let job_id = job_store
+            .create_job(make_request("SELECT 1"), false, test_owner())
+            .await
+            .expect("to create job")
+            .job_id;
+        job_store.set_job_running(&job_id).await.expect("running");
+        job_store
+            .store
+            .put(&job_store.chunk_path(&job_id, 0), b"chunk".to_vec().into())
+            .await
+            .expect("write a chunk");
+        match finish {
+            JobStatus::Failed => {
+                job_store
+                    .fail_job(&job_id, JobErrorCode::ExecutionFailed, "failed")
+                    .await
+                    .expect("to fail");
+            }
+            JobStatus::Cancelled => {
+                job_store.cancel_job(&job_id).await.expect("to cancel");
+            }
+            JobStatus::Succeeded => {
+                job_store
+                    .complete_job(&job_id, empty_result())
+                    .await
+                    .expect("to complete");
+            }
+            other => panic!("{other} is not a finished status"),
+        }
+        let finished_ago_ms = u64::try_from(finished_ago.as_millis()).expect("fits in u64");
+        job_store
+            .modify_job(&job_id, |state| {
+                let completed_at = now_ms_or_zero() - finished_ago_ms;
+                state.completed_at_ms = Some(completed_at);
+                if let Some(expires_at) = state.expires_at_ms.as_mut() {
+                    *expires_at = completed_at + 12 * 60 * 60 * 1000;
+                }
+                true
+            })
+            .await
+            .expect("to backdate the job");
+        job_id
+    }
+
+    async fn stored_paths(store: &InMemory) -> Vec<String> {
+        let objects: Vec<_> = futures::TryStreamExt::try_collect(store.list(None))
+            .await
+            .expect("list");
+        objects.iter().map(|m| m.location.to_string()).collect()
+    }
+
+    /// Failed and cancelled jobs, with their chunks, go 12 hours after they
+    /// finished; until then they stay, as does a running job of any age.
+    #[tokio::test]
+    async fn failed_and_cancelled_jobs_are_deleted_twelve_hours_after_they_finished() {
+        let store = Arc::new(InMemory::new());
+        let job_store = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
+        let minute = Duration::from_mins(1);
+        let twelve_hours = Duration::from_hours(12);
+
+        let mut deleted = Vec::new();
+        let mut kept = Vec::new();
+        for status in [
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+            JobStatus::Succeeded,
+        ] {
+            deleted.push(finished_job(&job_store, status, twelve_hours + minute).await);
+            kept.push(finished_job(&job_store, status, twelve_hours.saturating_sub(minute)).await);
+        }
+        let running = job_store
+            .create_job(make_request("SELECT 2"), false, test_owner())
+            .await
+            .expect("to create job")
+            .job_id;
+        job_store.set_job_running(&running).await.expect("running");
+        kept.push(running);
+
+        let count = job_store
+            .cleanup_expired_jobs()
+            .await
+            .expect("cleanup succeeds");
+        assert_eq!(count, deleted.len());
+
+        let remaining = stored_paths(&store).await;
+        for job_id in &deleted {
+            assert!(
+                remaining.iter().all(|path| !path.contains(job_id.as_str())),
+                "job {job_id} and its chunk are deleted: {remaining:?}"
+            );
+        }
+        for job_id in &kept {
+            assert!(
+                remaining.contains(&format!("test/jobs/{job_id}.json")),
+                "job {job_id} stays: {remaining:?}"
+            );
+        }
+    }
+
+    /// Two schedulers that clean the same location at once both succeed and
+    /// leave nothing of the reclaimable jobs behind.
+    #[tokio::test]
+    async fn two_schedulers_cleaning_at_once_both_succeed() {
+        let store = Arc::new(InMemory::new());
+        let first = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-1");
+        let second = JobStore::new(Arc::clone(&store) as Arc<dyn ObjectStore>, "test", "node-2");
+        for _ in 0..20 {
+            finished_job(&first, JobStatus::Failed, Duration::from_hours(13)).await;
+        }
+
+        let (first_pass, second_pass) =
+            tokio::join!(first.cleanup_expired_jobs(), second.cleanup_expired_jobs());
+        let first_count = first_pass.expect("the first scheduler's cleanup succeeds");
+        let second_count = second_pass.expect("the second scheduler's cleanup succeeds");
+        assert!(
+            first_count + second_count >= 20,
+            "every job is deleted by one cleanup or the other: {first_count} + {second_count}"
+        );
+        assert_eq!(stored_paths(&store).await, Vec::<String>::new());
     }
 
     /// Two schedulers' cleanups can both try to delete the same job.
