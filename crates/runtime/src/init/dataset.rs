@@ -69,13 +69,15 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
-use datafusion::common::{ResolvedTableReference, TableReference};
+use datafusion::common::{DFSchema, ResolvedTableReference, TableReference};
+use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
 use futures::future::join_all;
 use opentelemetry::KeyValue;
 use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
 use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
+use runtime_table_partition::expression::partition_by_expressions;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -1585,32 +1587,6 @@ impl Runtime {
             return Err(err);
         }
 
-        if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
-            let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
-            let dataset_name = ds.name.to_string();
-            let rule = cayenne_key_rule(&ds, acceleration, refresh_mode);
-            if let (Some(rule), Some(key)) = (rule, acceleration.primary_key.as_ref()) {
-                tracing::info!("{}", key_rule_line(&dataset_name, key, rule));
-            }
-            if !acceleration.on_conflict.is_empty() {
-                let warning = if acceleration.engine == Engine::Cayenne {
-                    cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
-                } else {
-                    deprecated_on_conflict_warning(&dataset_name, acceleration, refresh_mode)
-                };
-                tracing::warn!("{warning}");
-            }
-            if let Some(KeyRule::NewestByTime(time_column)) = rule
-                && refresh_mode == RefreshMode::Append
-                && acceleration.refresh_append_overlap.is_none()
-            {
-                tracing::warn!(
-                    "{}",
-                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
-                );
-            }
-        }
-
         // A `drasi` block only takes effect through the change stream, so a
         // dataset without one forwards nothing. Silently publishing no changes
         // to a configured Drasi source is worse than refusing the dataset: the
@@ -1722,6 +1698,49 @@ impl Runtime {
         // must override. The deferred retry keeps serving the existing acceleration
         // and self-heals (a later refresh restores Ready) if the source reverts.
         let schema_change_failure = federated_table.schema_change_failure().map(str::to_string);
+
+        // The dataset's key rule, stated once its schema is known: a partitioned
+        // dataset's line depends on which columns `partition_by` reads, which the
+        // schema resolves (#15230).
+        if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
+            let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
+            let dataset_name = ds.name.to_string();
+            let rule = cayenne_key_rule(&ds, acceleration, refresh_mode);
+            if let (Some(rule), Some(key)) = (rule, acceleration.primary_key.as_ref()) {
+                let outside_key = partition_columns_outside_key(
+                    &dataset_name,
+                    acceleration,
+                    key,
+                    &self.df.ctx,
+                    &federated_table.schema(),
+                );
+                if outside_key.is_empty() {
+                    tracing::info!("{}", key_rule_line(&dataset_name, key, rule));
+                } else {
+                    tracing::warn!(
+                        "{}",
+                        partitioned_key_warning(&dataset_name, key, &outside_key, rule)
+                    );
+                }
+            }
+            if !acceleration.on_conflict.is_empty() {
+                let warning = if acceleration.engine == Engine::Cayenne {
+                    cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
+                } else {
+                    deprecated_on_conflict_warning(&dataset_name, acceleration, refresh_mode)
+                };
+                tracing::warn!("{warning}");
+            }
+            if let Some(KeyRule::NewestByTime(time_column)) = rule
+                && refresh_mode == RefreshMode::Append
+                && acceleration.refresh_append_overlap.is_none()
+            {
+                tracing::warn!(
+                    "{}",
+                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
+                );
+            }
+        }
 
         let register_start = Instant::now();
         match Arc::clone(&self)
@@ -3305,6 +3324,115 @@ fn key_rule_line(
     }
 }
 
+/// The columns `partition_by` reads that `key` does not include, in `partition_by`
+/// order, each named once; empty for an unpartitioned dataset or one whose every
+/// partition expression reads key columns only.
+///
+/// Each partition is its own Cayenne table, which resolves a repeated key on its
+/// own. A key lands in one partition only when every partition expression is a
+/// function of the key, so a column outside it is what makes the table keep a key
+/// once per partition (#14802). The expressions are parsed the way the accelerator
+/// parses them, against the dataset's schema; the accelerator has already parsed
+/// the same expressions against the same schema by the time the dataset registers,
+/// so a failure here is logged at debug and leaves the plain rule line in place.
+fn partition_columns_outside_key(
+    dataset_name: &str,
+    acceleration: &Acceleration,
+    key: &datafusion_table_providers::util::column_reference::ColumnReference,
+    ctx: &SessionContext,
+    schema: &arrow_schema::SchemaRef,
+) -> Vec<String> {
+    if acceleration.partition_by.is_empty() {
+        return Vec::new();
+    }
+    let parsed = DFSchema::try_from(Arc::clone(schema))
+        .map_err(|e| e.to_string())
+        .and_then(|df_schema| {
+            partition_by_expressions(&acceleration.partition_by, ctx, &df_schema)
+                .map_err(|e| e.to_string())
+        });
+    match parsed {
+        Ok(partition_by) => partition_columns_outside(&partition_by, key),
+        Err(cause) => {
+            tracing::debug!(
+                "Dataset '{dataset_name}': could not read the columns its `partition_by` expressions reference, so its key rule is stated as for an unpartitioned table. Cause: {cause}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// The columns the parsed `partition_by` expressions read that `key` does not
+/// include, in `partition_by` order and, within one expression, by name; each once.
+fn partition_columns_outside(
+    partition_by: &[runtime_table_partition::expression::PartitionedBy],
+    key: &datafusion_table_providers::util::column_reference::ColumnReference,
+) -> Vec<String> {
+    let mut outside: Vec<String> = Vec::new();
+    for partition in partition_by {
+        let mut columns: Vec<&str> = partition
+            .expression
+            .column_refs()
+            .into_iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        columns.sort_unstable();
+        for column in columns {
+            if !key.iter().any(|k| k == column) && !outside.iter().any(|o| o == column) {
+                outside.push(column.to_string());
+            }
+        }
+    }
+    outside
+}
+
+/// The line a partitioned Cayenne dataset logs at load in place of
+/// [`key_rule_line`] when `partition_by` reads columns its primary key does not
+/// include (#15230): the cause, what the user will observe, the rule each
+/// partition applies, and the fix, which is a no-op for a partition column that
+/// never changes for a key.
+fn partitioned_key_warning(
+    dataset_name: &str,
+    key: &datafusion_table_providers::util::column_reference::ColumnReference,
+    outside_key: &[String],
+    rule: KeyRule<'_>,
+) -> String {
+    let columns = quoted_list(outside_key, "and");
+    let differing = quoted_list(outside_key, "or");
+    let (never_change, them) = if outside_key.len() == 1 {
+        ("never changes", "it")
+    } else {
+        ("never change", "them")
+    };
+    let within = match rule {
+        KeyRule::NewestByTime(time_column) => format!(
+            "Within a partition it keeps the newest by '{time_column}', or the version that arrived last when times are equal."
+        ),
+        KeyRule::LastArrival => "Within a partition it keeps the version that arrived last, which can differ between refreshes; set `time_column` for a reproducible result.".to_string(),
+        KeyRule::ChangeOrder => {
+            "Within a partition it applies each source change in order.".to_string()
+        }
+    };
+    format!(
+        "Dataset '{dataset_name}' partitions by {columns}, which its primary key '{key}' does not include, so it keeps one row per '{key}' within each partition, not across the table: a key whose {differing} differs between rows is stored once per partition. {within} If {columns} {never_change} for a key, add {them} to `primary_key` to declare that; otherwise partition by a column the key includes. See: https://spiceai.org/docs/features/data-acceleration/partitioning#partitions-and-primary-keys"
+    )
+}
+
+/// `'a'`; `'a' and 'b'`; `'a', 'b' and 'c'`, with `conjunction` before the last.
+fn quoted_list(items: &[String], conjunction: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => format!("'{one}'"),
+        [head @ .., last] => format!(
+            "{} {conjunction} '{last}'",
+            head.iter()
+                .map(|item| format!("'{item}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// The `on_conflict` upsert value `options` stand for, as a Spicepod spells it.
 fn upsert_name(
     options: &datafusion_table_providers::util::constraints::UpsertOptions,
@@ -3990,6 +4118,81 @@ mod tests {
             assert_eq!(
                 key_rule_line("orders", &composite, KeyRule::LastArrival),
                 "Dataset 'orders' keeps one row per '(id, region)': the version that arrived last, which can differ between refreshes; set `time_column` for a reproducible result."
+            );
+        }
+
+        /// The columns a partitioned dataset reads outside its key, each once, in
+        /// `partition_by` order; a partition expression over key columns only reads
+        /// nothing outside it.
+        #[test]
+        fn the_partition_columns_outside_the_key_are_named_once_in_partition_order() {
+            use datafusion_expr::{col, lit};
+            use runtime_table_partition::expression::PartitionedBy;
+
+            let partition_by = vec![
+                PartitionedBy {
+                    name: "region".to_string(),
+                    expression: col("region"),
+                },
+                PartitionedBy {
+                    name: "year".to_string(),
+                    expression: col("created_at") + lit(1),
+                },
+                PartitionedBy {
+                    name: "month".to_string(),
+                    expression: col("created_at") + lit(2),
+                },
+                PartitionedBy {
+                    name: "bucket".to_string(),
+                    expression: col("id") % lit(4),
+                },
+            ];
+
+            assert_eq!(
+                partition_columns_outside(&partition_by, &id()),
+                vec!["region".to_string(), "created_at".to_string()]
+            );
+            let keyed_on_region =
+                ColumnReference::new(vec!["id".to_string(), "region".to_string()]);
+            assert_eq!(
+                partition_columns_outside(&partition_by, &keyed_on_region),
+                vec!["created_at".to_string()]
+            );
+            let keyed_on_all = ColumnReference::new(vec![
+                "id".to_string(),
+                "region".to_string(),
+                "created_at".to_string(),
+            ]);
+            assert!(partition_columns_outside(&partition_by, &keyed_on_all).is_empty());
+            assert!(partition_columns_outside(&partition_by[3..], &id()).is_empty());
+        }
+
+        /// The partitioned load line states the cause, what the user will observe,
+        /// the rule each partition applies, and the fix.
+        #[test]
+        fn the_partitioned_load_line_states_the_cause_the_rule_and_the_fix() {
+            assert_eq!(
+                partitioned_key_warning("t", &id(), &["region".to_string()], KeyRule::LastArrival),
+                "Dataset 't' partitions by 'region', which its primary key 'id' does not include, so it keeps one row per 'id' within each partition, not across the table: a key whose 'region' differs between rows is stored once per partition. Within a partition it keeps the version that arrived last, which can differ between refreshes; set `time_column` for a reproducible result. If 'region' never changes for a key, add it to `primary_key` to declare that; otherwise partition by a column the key includes. See: https://spiceai.org/docs/features/data-acceleration/partitioning#partitions-and-primary-keys"
+            );
+            assert_eq!(
+                partitioned_key_warning(
+                    "events",
+                    &id(),
+                    &["region".to_string(), "tenant".to_string()],
+                    KeyRule::NewestByTime("updated_at")
+                ),
+                "Dataset 'events' partitions by 'region' and 'tenant', which its primary key 'id' does not include, so it keeps one row per 'id' within each partition, not across the table: a key whose 'region' or 'tenant' differs between rows is stored once per partition. Within a partition it keeps the newest by 'updated_at', or the version that arrived last when times are equal. If 'region' and 'tenant' never change for a key, add them to `primary_key` to declare that; otherwise partition by a column the key includes. See: https://spiceai.org/docs/features/data-acceleration/partitioning#partitions-and-primary-keys"
+            );
+            let composite = ColumnReference::new(vec!["id".to_string(), "ts".to_string()]);
+            assert_eq!(
+                partitioned_key_warning(
+                    "orders",
+                    &composite,
+                    &["region".to_string()],
+                    KeyRule::ChangeOrder
+                ),
+                "Dataset 'orders' partitions by 'region', which its primary key '(id, ts)' does not include, so it keeps one row per '(id, ts)' within each partition, not across the table: a key whose 'region' differs between rows is stored once per partition. Within a partition it applies each source change in order. If 'region' never changes for a key, add it to `primary_key` to declare that; otherwise partition by a column the key includes. See: https://spiceai.org/docs/features/data-acceleration/partitioning#partitions-and-primary-keys"
             );
         }
 
