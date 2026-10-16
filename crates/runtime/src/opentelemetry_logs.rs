@@ -653,10 +653,10 @@ mod tests {
         kv(key, any_value::Value::StringValue(value.to_string()))
     }
 
-    fn string_body(body: &str) -> Option<AnyValue> {
-        Some(AnyValue {
+    fn string_body(body: &str) -> AnyValue {
+        AnyValue {
             value: Some(any_value::Value::StringValue(body.to_string())),
-        })
+        }
     }
 
     fn request_with(
@@ -716,7 +716,7 @@ mod tests {
             observed_time_unix_nano: 2_000,
             severity_number: 17,
             severity_text: "ERROR".to_string(),
-            body: string_body("connection reset by peer"),
+            body: Some(string_body("connection reset by peer")),
             attributes: vec![
                 s("http.route", "/checkout"),
                 kv("attempt", any_value::Value::IntValue(3)),
