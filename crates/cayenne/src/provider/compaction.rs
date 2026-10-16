@@ -1257,6 +1257,22 @@ mod tests {
         assert!(pick_append_only_candidates(&entries(&[30 * 1024; 31]), &cfg).is_none());
     }
 
+    /// With a trigger above the pick width, the Small tier qualifies by count at the trigger,
+    /// and its candidate still keeps at most `max_files_per_pick` paths, as
+    /// [`pick_candidates`] does.
+    #[test]
+    fn pick_append_only_candidates_keeps_at_most_a_pick_of_paths() {
+        let cfg = CompactionPickerConfig::new(8, 4, 256 * 1024 * 1024);
+        assert!(
+            pick_append_only_candidates(&entries(&[1024; 7]), &cfg).is_none(),
+            "below the trigger"
+        );
+        let candidate = pick_append_only_candidates(&entries(&[1024; 8]), &cfg)
+            .expect("the trigger's count qualifies");
+        assert_eq!(candidate.paths.len(), 4, "at most a pick of paths");
+        assert_eq!(candidate.total_bytes, 4 * 1024);
+    }
+
     #[test]
     fn tiers_derived_from_target_size() {
         let tiers = CompactionTiers::from_target_file_size_bytes(128 * 1024 * 1024);
