@@ -10,13 +10,19 @@ version.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+flate2 = "1.1"
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
   "gen-tonic-messages",
   "gen-tonic",
+  "logs",
   "metrics",
 ] }
-tokio.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tonic = { workspace = true, features = [
+  "gzip",
   "transport",
   "tls-ring",
   "tls-native-roots",

@@ -14810,7 +14810,11 @@ name = "otelpublisher"
 version = "2.4.0-unstable"
 dependencies = [
  "clap",
+ "flate2",
  "opentelemetry-proto 0.32.0",
+ "prost 0.14.3",
+ "reqwest 0.13.4",
+ "serde_json",
  "tokio",
  "tonic",
 ]
