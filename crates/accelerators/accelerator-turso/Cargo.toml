@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Turso data accelerator: implements data-accelerator-api::DataAccelerator over a Turso table provider."
 
 [dependencies]
