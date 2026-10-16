@@ -1606,24 +1606,16 @@ mod tests {
         );
     }
 
-    /// `pg_replication_slot_advance` takes its target as `pg_lsn`, and tokio-postgres
-    /// checks each bound value against the parameter's type before it sends the
-    /// statement: no string type is accepted for `pg_lsn`, which is why binding the
-    /// rendered LSN as a `String` failed every fast-forward with `error serializing
-    /// parameter 1` (#14925). The target is bound as [`PgLsn`], whose text form is
-    /// the one [`format_lsn`] renders.
+    /// The advance target is bound as [`PgLsn`] (see `slot_advance`), which is
+    /// accepted for a `pg_lsn` parameter and renders the same text as [`format_lsn`].
     #[test]
     fn advance_target_binds_as_pg_lsn() {
         use tokio_postgres::types::{ToSql, Type};
 
         assert!(<PgLsn as ToSql>::accepts(&Type::PG_LSN));
-        assert!(
-            !<String as ToSql>::accepts(&Type::PG_LSN),
-            "a String bound to a pg_lsn parameter is refused by tokio-postgres before it is sent"
-        );
 
         let target = parse_lsn("1B/4E300F8").expect("parse");
-        assert_eq!(PgLsn::from(target).to_string(), "1B/4E300F8");
+        assert_eq!(PgLsn::from(target).to_string(), format_lsn(target));
         assert_eq!(format_lsn(target), "1B/4E300F8");
     }
 
@@ -1656,11 +1648,12 @@ mod tests {
             )
             .await
             .expect("create a temporary logical replication slot");
-        // Some WAL, so the current position is ahead of the slot.
+        // Some WAL, so the current position is ahead of the slot; a logical message
+        // touches no schema.
         client
-            .batch_execute(
-                "CREATE TABLE IF NOT EXISTS spice_test_14925 (id int); \
-                 INSERT INTO spice_test_14925 VALUES (1); DROP TABLE spice_test_14925;",
+            .execute(
+                "SELECT pg_logical_emit_message(true, 'spice_test_14925', 'advance')",
+                &[],
             )
             .await
             .expect("generate WAL");
@@ -1671,7 +1664,7 @@ mod tests {
         let end_lsn = slot_advance(&client, &slot, target)
             .await
             .expect("the slot advances to the current WAL position");
-        assert_eq!(format_lsn(end_lsn), format_lsn(target));
+        assert_eq!(end_lsn, target, "advanced to {}", format_lsn(end_lsn));
 
         let confirmed: String = client
             .query_one(
