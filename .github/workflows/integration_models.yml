@@ -169,7 +169,14 @@ jobs:
   test-models:
     name: Test Models, AI & Search
     needs: build
-    runs-on: spiceai-macos
+    # `spiceai-macos-large`, like every other job that runs this archive: the
+    # Mac minis behind `spiceai-macos` cannot reliably start the debug
+    # `integration_models` binary. dyld fails to map the shared cache into it
+    # (`dyld cache '(null)' not loaded: syscall to map cache into shared region
+    # failed`, then `Library not loaded: /usr/lib/libiconv.2.dylib`), so
+    # `nextest --list` and every test process abort with SIGABRT before any
+    # test code runs, while the same archive starts cleanly on the MacBook Pros.
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       HAS_OPENAI_SECRET: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
@@ -466,7 +473,9 @@ jobs:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: spiceai-macos
+    # The large pool for the same reason as `test-models`: a Mac mini cannot
+    # reliably start this archive's test binary.
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
