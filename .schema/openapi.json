@@ -584,7 +584,7 @@
             "description": "The model provider denied access"
           },
           "404": {
-            "description": "No model with this name"
+            "description": "No model with this name, or the model failed to load or is still loading"
           },
           "429": {
             "description": "Rate limited"
