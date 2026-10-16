@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
+repository.workspace = true
 description = "Minimal .env file parsing and loading for Spice.ai"
 
 [dependencies]

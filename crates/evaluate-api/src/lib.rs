@@ -637,14 +637,6 @@ pub trait Evaluate: Send + Sync + Debug {
     /// No default: a wrapper that inherited one would silently skip the check of the
     /// model it wraps, so every implementation says what its health is.
     async fn health(&self) -> Result<()>;
-
-    /// Whether this is a dedicated decision model — one trained to answer typed
-    /// questions, such as `TypeSafe` Jev or an `OpenAI` decision model — rather than a chat
-    /// model answering through a prompt.
-    ///
-    /// SQL decision functions prefer the only decision model when no model is named.
-    /// No default: a wrapper must report the kind of the model it wraps.
-    fn is_decision_model(&self) -> bool;
 }
 
 #[cfg(test)]
