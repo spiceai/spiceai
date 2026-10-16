@@ -18354,10 +18354,12 @@ name = "runtime-otel-push"
 version = "2.4.0-unstable"
 dependencies = [
  "axum",
+ "futures",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
  "opentelemetry-proto 0.32.0",
  "opentelemetry_sdk 0.32.1",
+ "parking_lot",
  "reqwest 0.13.4",
  "snafu",
  "spicepod",
@@ -18366,6 +18368,8 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-subscriber",
+ "util",
 ]
 
 [[package]]
