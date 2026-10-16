@@ -18,6 +18,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Forwards Spice.ai change-data-capture events to a Drasi source"
 
 [dependencies]
