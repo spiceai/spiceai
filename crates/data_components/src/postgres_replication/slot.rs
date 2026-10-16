@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use snafu::ResultExt;
 use tokio_postgres::NoTls;
+use tokio_postgres::types::PgLsn;
 
 use super::{
     MissingPrimaryKeySnafu, Result, SetupConnectSnafu, SetupExecSnafu, SourceTableNotFoundSnafu,
@@ -914,14 +915,14 @@ async fn slot_advance(
     slot_name: &str,
     target: u64,
 ) -> Result<u64> {
-    let target_lsn = format_lsn(target);
-    // Both arguments are cast explicitly: the function takes (name, pg_lsn), and
-    // binding Rust `String`s without the casts leaves parameter-type inference to
-    // resolve `text` against those, which fails.
+    // The function takes (name, pg_lsn), and tokio-postgres checks every bound value
+    // against the parameter type the server infers before it sends the statement.
+    // A Rust `&str` is accepted for `name`, but no string type is accepted for
+    // `pg_lsn`, so the target is bound as `PgLsn` (#14925).
     let row = client
         .query_one(
             "SELECT end_lsn::text FROM pg_replication_slot_advance($1::name, $2::pg_lsn)",
-            &[&slot_name, &target_lsn],
+            &[&slot_name, &PgLsn::from(target)],
         )
         .await
         .context(SetupExecSnafu)?;
@@ -1562,8 +1563,6 @@ mod tests {
         assert!(cause.contains("no wal_status"), "{cause}");
     }
 
-    /// The advance target is bound as `pg_lsn`, so it must round-trip through
-    /// the exact textual form Postgres accepts.
     /// Setup is retried as a whole, and an attempt that replaced the slot has
     /// already changed the source when it fails. The attempt that follows finds an
     /// ordinary slot, and reporting *its* view would leave the members already
@@ -1607,10 +1606,89 @@ mod tests {
         );
     }
 
+    /// `pg_replication_slot_advance` takes its target as `pg_lsn`, and tokio-postgres
+    /// checks each bound value against the parameter's type before it sends the
+    /// statement: no string type is accepted for `pg_lsn`, which is why binding the
+    /// rendered LSN as a `String` failed every fast-forward with `error serializing
+    /// parameter 1` (#14925). The target is bound as [`PgLsn`], whose text form is
+    /// the one [`format_lsn`] renders.
     #[test]
-    fn advance_target_renders_as_a_pg_lsn_literal() {
+    fn advance_target_binds_as_pg_lsn() {
+        use tokio_postgres::types::{ToSql, Type};
+
+        assert!(<PgLsn as ToSql>::accepts(&Type::PG_LSN));
+        assert!(
+            !<String as ToSql>::accepts(&Type::PG_LSN),
+            "a String bound to a pg_lsn parameter is refused by tokio-postgres before it is sent"
+        );
+
         let target = parse_lsn("1B/4E300F8").expect("parse");
+        assert_eq!(PgLsn::from(target).to_string(), "1B/4E300F8");
         assert_eq!(format_lsn(target), "1B/4E300F8");
+    }
+
+    /// The fast-forward moves a logical slot to the requested position on a live
+    /// server (#14925). Run against a `PostgreSQL` with `wal_level = logical`:
+    ///
+    /// ```text
+    /// SPICE_TEST_PG_CONNINFO='host=localhost user=postgres dbname=postgres' \
+    ///   cargo test -p data_components --features postgres -- --ignored slot_advance_moves
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires a running PostgreSQL with wal_level=logical, named by SPICE_TEST_PG_CONNINFO"]
+    async fn slot_advance_moves_a_logical_slot_to_the_current_wal_position() {
+        let conninfo = std::env::var("SPICE_TEST_PG_CONNINFO")
+            .expect("SPICE_TEST_PG_CONNINFO names the PostgreSQL server to test against");
+        let (client, connection) = tokio_postgres::connect(&conninfo, NoTls)
+            .await
+            .expect("connect to PostgreSQL");
+        let connection = tokio::spawn(connection);
+
+        let slot = "spice_test_14925";
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                &[&slot],
+            )
+            .await
+            .expect("query pg_replication_slots")
+            .get(0);
+        if !exists {
+            client
+                .execute(
+                    "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+                    &[&slot],
+                )
+                .await
+                .expect("create the logical replication slot");
+        }
+        // Some WAL, so the current position is ahead of the slot.
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS spice_test_14925 (id int); \
+                 INSERT INTO spice_test_14925 VALUES (1); DROP TABLE spice_test_14925;",
+            )
+            .await
+            .expect("generate WAL");
+        let target = current_wal_lsn(&client)
+            .await
+            .expect("current WAL position");
+
+        let end_lsn = slot_advance(&client, slot, target)
+            .await
+            .expect("the slot advances to the current WAL position");
+        assert_eq!(format_lsn(end_lsn), format_lsn(target));
+
+        let confirmed: String = client
+            .query_one(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .expect("read the slot's confirmed_flush_lsn")
+            .get(0);
+        assert_eq!(confirmed, format_lsn(target));
+        connection.abort();
     }
 
     #[test]
