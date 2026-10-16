@@ -175,6 +175,7 @@ mod tests {
     fn openai_body_is_not_an_xai_body() {
         let openai =
             r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":null}}"#;
-        assert!(serde_json::from_str::<XaiErrorBody>(openai).is_err());
+        serde_json::from_str::<XaiErrorBody>(openai)
+            .expect_err("an OpenAI error body must not parse as an xAI body");
     }
 }
