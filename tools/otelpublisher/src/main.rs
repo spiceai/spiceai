@@ -128,7 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(metadata_value) => metadata_value,
             Err(e) => panic!("Invalid API key: {e}"),
         };
-        request.metadata_mut().insert("authorization", metadata_value);
+        request
+            .metadata_mut()
+            .insert("authorization", metadata_value);
     }
 
     client.export(request).await?;

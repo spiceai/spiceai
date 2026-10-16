@@ -29,10 +29,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
-use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, InstrumentationScope, KeyValue, any_value::Value,
 };
@@ -194,11 +194,15 @@ struct WorkerReport {
 
 impl WorkerReport {
     /// Counts an acknowledged export of `batch` records whose response is `response`.
-    fn acknowledged(&mut self, elapsed_us: u64, batch: usize, response: &ExportLogsServiceResponse) {
-        let rejected = response
-            .partial_success
-            .as_ref()
-            .map_or(0, |partial| u64::try_from(partial.rejected_log_records).unwrap_or(0));
+    fn acknowledged(
+        &mut self,
+        elapsed_us: u64,
+        batch: usize,
+        response: &ExportLogsServiceResponse,
+    ) {
+        let rejected = response.partial_success.as_ref().map_or(0, |partial| {
+            u64::try_from(partial.rejected_log_records).unwrap_or(0)
+        });
         self.latencies_us.push(elapsed_us);
         self.records += (batch as u64).saturating_sub(rejected);
         self.rejected += rejected;
