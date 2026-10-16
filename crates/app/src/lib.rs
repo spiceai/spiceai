@@ -44,7 +44,7 @@ use spicepod::{
     param::Params,
 };
 use util::in_tracing_context;
-use util::spice_paths::{cayenne_metastore_dir, fs_probe_path, is_local_path};
+use util::spice_paths::{absolute_dir, cayenne_metastore_dir, fs_probe_path, is_local_path};
 
 pub mod runtime;
 
@@ -361,11 +361,11 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
         })
         .collect();
 
-    let first = comparable_metastore_dir(&cayenne_datasets.first()?.1);
-    if cayenne_datasets
+    let mut comparable = cayenne_datasets
         .iter()
-        .all(|(_, dir)| comparable_metastore_dir(dir) == first)
-    {
+        .map(|(_, dir)| comparable_metastore_dir(dir));
+    let first = comparable.next()?;
+    if comparable.all(|dir| dir == first) {
         return None;
     }
 
@@ -380,20 +380,18 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 
 /// A metastore directory in the form two datasets' directories are compared in:
 /// trailing separators dropped, a `file:` scheme stripped the way the accelerator
-/// strips it ([`fs_probe_path`]), and a local path made absolute against the working
-/// directory (lexically; nothing is read from disk), so `./.spice/data/metadata`,
-/// `file:///<cwd>/.spice/data/metadata` and the default `<cwd>/.spice/data/metadata`
-/// compare equal. An object-store URL only loses its trailing separator.
-fn comparable_metastore_dir(dir: &str) -> String {
+/// strips it ([`fs_probe_path`]), and a local path placed against the working
+/// directory the way the accelerator places it ([`absolute_dir`]), compared as a
+/// path, so `./.spice/data/metadata`, `file:///<cwd>/.spice/data/metadata` and the
+/// default `<cwd>/.spice/data/metadata` compare equal. An object-store URL only loses
+/// its trailing separator.
+fn comparable_metastore_dir(dir: &str) -> PathBuf {
     let trimmed = dir.trim_end_matches(['/', '\\']);
     if !is_local_path(trimmed) {
-        return trimmed.to_string();
+        return PathBuf::from(trimmed);
     }
     let path = fs_probe_path(trimmed);
-    std::path::absolute(path).map_or_else(
-        |_| path.to_string(),
-        |path| path.to_string_lossy().into_owned(),
-    )
+    absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path))
 }
 
 pub struct AppBuilder {
@@ -845,14 +843,11 @@ mod tests {
         ];
 
         assert_eq!(
-            cayenne_metastore_dir_conflict(&datasets).as_deref(),
-            Some(
-                format!(
-                    "`explicit_path` (`/abs/custom/metadata`), `default_path` (`{}/metadata`)",
-                    spice_data_base_path().escape_debug()
-                )
-                .as_str()
-            )
+            cayenne_metastore_dir_conflict(&datasets),
+            Some(format!(
+                "`explicit_path` (`/abs/custom/metadata`), `default_path` (`{}/metadata`)",
+                spice_data_base_path().escape_debug()
+            ))
         );
     }
 
@@ -991,8 +986,8 @@ mod tests {
 
     #[test]
     fn cayenne_rejects_conflicts_for_snapshot_datasets() {
-        let snapshot_dataset = |name: &str, file_path: &str, metadata_dir: Option<&str>| {
-            let mut dataset = cayenne_dataset(name, Some(file_path), metadata_dir);
+        let snapshot_dataset = |name: &str, file_path: Option<&str>, metadata_dir: Option<&str>| {
+            let mut dataset = cayenne_dataset(name, file_path, metadata_dir);
             dataset.from = "s3://bucket/snapshots/".to_string();
             dataset.params = Some(Params::from_string_map(HashMap::from([(
                 "file_format".to_string(),
@@ -1005,29 +1000,23 @@ mod tests {
         };
 
         let datasets = vec![
-            snapshot_dataset("orders", "/data/orders", None),
-            snapshot_dataset("customers", "/data/customers", None),
+            snapshot_dataset("orders", Some("/data/orders"), None),
+            snapshot_dataset("customers", Some("/data/customers"), None),
         ];
         assert!(cayenne_metastore_dir_conflict(&datasets).is_some());
 
         let datasets = vec![
-            snapshot_dataset("orders", "/data/orders", Some("/data/metadata")),
-            snapshot_dataset("customers", "/data/customers", Some("/data/metadata")),
+            snapshot_dataset("orders", Some("/data/orders"), Some("/data/metadata")),
+            snapshot_dataset("customers", Some("/data/customers"), Some("/data/metadata")),
         ];
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
 
         // A snapshot dataset that names no Cayenne path may not be a Cayenne dataset
         // at all (its engine comes from the snapshots), so it is not held to the
         // default metastore directory.
-        let mut without_paths = snapshot_dataset("orders", "/data/orders", None);
-        without_paths
-            .acceleration
-            .as_mut()
-            .expect("acceleration")
-            .params = None;
         let datasets = vec![
-            without_paths,
-            snapshot_dataset("customers", "/data/customers", None),
+            snapshot_dataset("orders", None, None),
+            snapshot_dataset("customers", Some("/data/customers"), None),
         ];
         assert!(cayenne_metastore_dir_conflict(&datasets).is_none());
     }

@@ -23,6 +23,8 @@ limitations under the License.
 //! from the same parameters: a check that reasons about a default the engine
 //! computes elsewhere drifts the moment either side changes.
 
+use std::path::{Path, PathBuf};
+
 /// Base directory Spice stores accelerator data under (`<cwd>/.spice/data`).
 #[must_use]
 pub fn spice_data_base_path() -> String {
@@ -69,6 +71,24 @@ pub fn fs_probe_path(path: &str) -> &str {
     }
 }
 
+/// A configured local directory as the absolute filesystem path it names: a relative
+/// path is placed against the working directory, lexically — nothing is read from
+/// disk, so a symlink or `..` stays as written. `path` is the filesystem path itself;
+/// strip a `file:` scheme first with [`fs_probe_path`] where the value may carry one.
+///
+/// # Errors
+///
+/// Returns an error when a relative path cannot be placed because the working
+/// directory cannot be read.
+pub fn absolute_dir(path: &str) -> std::io::Result<PathBuf> {
+    let raw = Path::new(path);
+    if raw.is_absolute() {
+        Ok(raw.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(raw))
+    }
+}
+
 /// The directory a Cayenne acceleration keeps its metastore in, from the raw
 /// `cayenne_file_path` and `cayenne_metadata_dir` parameters.
 ///
@@ -107,6 +127,7 @@ mod tests {
     #[test]
     fn is_local_path_admits_local_spellings_and_refuses_object_stores() {
         assert!(is_local_path("/data/cayenne"));
+        assert!(is_local_path("/var/spice/data"));
         assert!(is_local_path("./data"));
         assert!(is_local_path("data/cayenne"));
         assert!(is_local_path("file:///data/cayenne"));
@@ -135,6 +156,20 @@ mod tests {
         );
         assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
         assert_eq!(fs_probe_path("s3://bucket/prefix"), "s3://bucket/prefix");
+    }
+
+    #[test]
+    fn absolute_dir_places_a_relative_path_against_the_working_directory() {
+        let cwd = std::env::current_dir().expect("the working directory is readable");
+        assert_eq!(
+            absolute_dir("relative/metadata").expect("a relative path is placed"),
+            cwd.join("relative/metadata")
+        );
+        let absolute = cwd.join("abs/metadata");
+        assert_eq!(
+            absolute_dir(&absolute.to_string_lossy()).expect("an absolute path stays"),
+            absolute
+        );
     }
 
     #[test]

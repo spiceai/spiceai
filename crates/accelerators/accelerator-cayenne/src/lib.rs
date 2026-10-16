@@ -1669,16 +1669,9 @@ impl CayenneAccelerator {
         format!("{}/{dataset_name}/", spice_data_base_path())
     }
 
-    /// Resolves the metadata directory for Cayenne catalog storage.
+    /// The directory the Cayenne catalog is stored in for `acceleration`.
     ///
-    /// Priority order:
-    /// 1. `cayenne_metadata_dir` - Explicit custom metadata directory
-    /// 2. `{cayenne_file_path}/metadata` - When `cayenne_file_path` is a local path (not S3)
-    /// 3. `{spice_data_base_path()}/metadata` - Default location
-    ///
-    /// Note: S3 paths are excluded because `SQLite` (used for metadata catalog) cannot run on object storage.
-    ///
-    /// The rule itself is [`util::spice_paths::cayenne_metastore_dir`], which the
+    /// The rule is [`util::spice_paths::cayenne_metastore_dir`], which the
     /// Spicepod validation in `app` applies to the same parameters, so a
     /// configuration that passes validation resolves here to the directory it was
     /// validated against.
@@ -7823,7 +7816,7 @@ mod tests {
     /// still what `remove_dir_all` walks.
     #[tokio::test]
     async fn a_local_data_directory_whose_name_contains_a_scheme_separator_is_still_read() {
-        use cayenne::metastore_layout::is_local_path;
+        use util::spice_paths::is_local_path;
 
         let app = Arc::new(AppBuilder::new("test").build());
         let base = tempfile::tempdir().expect("temp dir");
