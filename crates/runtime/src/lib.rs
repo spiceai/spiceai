@@ -1476,6 +1476,7 @@ impl Runtime {
     /// [`Runtime::init_cache_metrics`].
     pub fn init_component_metrics(&self) {
         runtime_metrics::publish_component_counters_at_zero();
+        runtime_state_location::metrics::init();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
