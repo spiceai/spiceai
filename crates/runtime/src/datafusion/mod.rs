@@ -132,6 +132,7 @@ use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
+use spicepod::component::runtime::QueryErrorLogging;
 use spicepod::metric::Metrics;
 use tokio::runtime::Handle;
 use tokio::spawn;
@@ -1493,6 +1494,8 @@ pub struct DataFusion {
     // control; `None` = unbounded. Sized from `runtime.query.max_concurrent_queries`.
     query_admission_semaphore: Option<Arc<Semaphore>>,
     pub(crate) task_history_enabled: bool,
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    pub(crate) query_error_logging: QueryErrorLogging,
     /// Whether a query's output preview is recorded: task history is enabled and the
     /// `captured_output` column of `runtime.task_history` is not `none`. When nothing
     /// records it, queries do not build it.
@@ -4526,6 +4529,14 @@ impl DataFusion {
             .ok(),
         );
 
+        // An append refresh of a source that records its commits (Iceberg) follows
+        // them from the snapshot it last loaded.
+        if matches!(refresh_mode, RefreshMode::Append) {
+            accelerated_table_builder.append_cursor_store(
+                crate::dataaccelerator::spice_sys::append_cursor_store(dataset).await,
+            );
+        }
+
         accelerated_table_builder.initial_load_complete(initial_load_complete);
 
         // Caching mode requires federation to be disabled so that queries go through
@@ -5320,6 +5331,16 @@ impl DataFusion {
         if let Some(checkpoint) = checkpoint {
             let _ = checkpoint.delete().await;
         }
+        // And the source commit an append refresh last loaded, for the same reason: the
+        // recreated table holds none of it.
+        let _ = crate::dataaccelerator::spice_sys::append_cursor_store_for(
+            source,
+            Arc::clone(&self.accelerator_engine_registry),
+            OpenOption::OpenExisting,
+        )
+        .await
+        .clear()
+        .await;
 
         // Cached logical plans reference the dropped table.
         self.clear_cached_plans().await;
@@ -6809,7 +6830,11 @@ impl DataFusion {
         let statement = session.sql_to_statement(sql, &dialect)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
-        session.statement_to_plan(statement).await
+        let spellings =
+            runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FloatLiteralSpellings::collect(
+                &statement,
+            );
+        spellings.retain(session.statement_to_plan(statement).await?)
     }
 
     pub(crate) async fn clear_cached_plans(&self) {

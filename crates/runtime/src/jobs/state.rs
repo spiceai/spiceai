@@ -327,6 +327,23 @@ impl JobState {
         }
     }
 
+    /// Whether cleanup may delete this job and its result chunks at `now_ms`: its
+    /// results expired, or it failed or was cancelled at least `retention` ago.
+    #[must_use]
+    pub fn is_reclaimable(&self, now_ms: u64, retention: Duration) -> bool {
+        if self
+            .expires_at_ms
+            .is_some_and(|expires_at| now_ms >= expires_at)
+        {
+            return true;
+        }
+        let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        matches!(self.status, JobStatus::Failed | JobStatus::Cancelled)
+            && self
+                .completed_at_ms
+                .is_some_and(|completed_at| now_ms >= completed_at.saturating_add(retention_ms))
+    }
+
     /// Checks if the job is in a terminal state.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
@@ -371,7 +388,7 @@ pub struct JobDriver {
 
 /// Gets the current Unix timestamp in milliseconds, logging a warning if the system
 /// clock is before the Unix epoch and returning 0 as a fallback.
-fn now_ms_or_zero() -> u64 {
+pub(crate) fn now_ms_or_zero() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
         Err(e) => {

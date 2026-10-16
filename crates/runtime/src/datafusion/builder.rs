@@ -104,7 +104,9 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use spicepod::component::runtime::{CteMaterialization, SpillCompression as SpiceSpillCompression};
+use spicepod::component::runtime::{
+    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
+};
 use spicepod::metric::Metrics;
 use tokio::{
     runtime::Handle,
@@ -357,6 +359,7 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
     caching: Option<Arc<Caching>>,
     results_cache_warmup_store: Option<std::path::PathBuf>,
@@ -489,6 +492,7 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
             task_history_enabled: true,
+            query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
             caching: None,
             results_cache_warmup_store: None,
@@ -520,6 +524,13 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_task_history(mut self, task_history: bool) -> Self {
         self.task_history_enabled = task_history;
+        self
+    }
+
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    #[must_use]
+    pub fn with_query_error_logging(mut self, query_error_logging: QueryErrorLogging) -> Self {
+        self.query_error_logging = query_error_logging;
         self
     }
 
@@ -1464,6 +1475,7 @@ impl DataFusionBuilder {
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
+            query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
@@ -4337,6 +4349,7 @@ mod tests {
                 "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",
+                "exact_float_literal_decimal_cast",
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"

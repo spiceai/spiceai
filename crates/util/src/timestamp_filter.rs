@@ -279,6 +279,21 @@ impl TimestampFilterConvert {
         )
     }
 
+    /// Build a filter expression selecting rows *at or after* a mark that is a value
+    /// incoming rows can hold, rather than one read out of these columns.
+    ///
+    /// The lowest `time_column` bound of a set of source files is such a mark: a row
+    /// exactly at it is among the incoming rows, so the stored rows it must be compared
+    /// with start at it, inclusive. The day-granular handling is the same as
+    /// [`convert_high_water_mark`](TimestampFilterConvert::convert_high_water_mark).
+    #[must_use]
+    pub fn convert_at_or_after_mark(&self, timestamp_in_nanos: u128) -> Expr {
+        self.convert_with_bounds(
+            at_or_after_mark_bound(timestamp_in_nanos, self.time_is_day_granular),
+            at_or_after_mark_bound(timestamp_in_nanos, self.time_partition_is_day_granular),
+        )
+    }
+
     /// Build the filter expression, applying a separate comparison to the time column
     /// and to the partition column.
     fn convert_with_bounds(&self, time: Bound, time_partition: Bound) -> Expr {
@@ -339,6 +354,19 @@ fn floor_to_day(timestamp_in_nanos: u128) -> u128 {
 /// else compares `>` against the mark itself. See
 /// [`convert_high_water_mark`](TimestampFilterConvert::convert_high_water_mark).
 fn high_water_mark_bound(timestamp_in_nanos: u128, is_day_granular: bool) -> Bound {
+    mark_bound(timestamp_in_nanos, is_day_granular, Operator::Gt)
+}
+
+/// The comparison an inclusive mark implies for one column: `>=` the mark, floored to
+/// midnight for a day-granular column. See
+/// [`convert_at_or_after_mark`](TimestampFilterConvert::convert_at_or_after_mark).
+fn at_or_after_mark_bound(timestamp_in_nanos: u128, is_day_granular: bool) -> Bound {
+    mark_bound(timestamp_in_nanos, is_day_granular, Operator::GtEq)
+}
+
+/// A day-granular column compares `>=` against midnight of the mark's day; any other
+/// column compares with `exact_op` against the mark itself.
+fn mark_bound(timestamp_in_nanos: u128, is_day_granular: bool, exact_op: Operator) -> Bound {
     if is_day_granular {
         Bound {
             timestamp_in_nanos: floor_to_day(timestamp_in_nanos),
@@ -347,7 +375,7 @@ fn high_water_mark_bound(timestamp_in_nanos: u128, is_day_granular: bool) -> Bou
     } else {
         Bound {
             timestamp_in_nanos,
-            op: Operator::Gt,
+            op: exact_op,
         }
     }
 }

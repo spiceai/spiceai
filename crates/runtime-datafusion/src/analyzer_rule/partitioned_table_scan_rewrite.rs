@@ -52,18 +52,28 @@ use parking_lot::RwLock;
 /// ```
 pub type PartitionValue = HashMap<String, Option<String>>;
 
+/// The [`TableProvider`]s that read a table's partitions, each with the partition values it
+/// serves.
+pub type PartitionProviders = Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)>;
+
 /// Define how to get partitions for a given table, and how they are partitioned.
 pub trait TablePartitionProvider: Send + Sync + Debug {
     /// Get partitions for a given [`TableReference`].
     ///
     /// `schema`: The schema of the table locally. Expect all returned [`TableProvider`] to conform to this schema.
     /// Returns pairs of [`TableProvider`] and the partition values (as string key-value maps) that
-    /// they are responsible for. The analyzer rule converts these into filter [`Expr`]s.
+    /// they are responsible for. The analyzer rule converts these into filter [`Expr`]s. An empty
+    /// list means the table has no partitions to read, and the scan becomes an empty relation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the partitions cannot be resolved, for example when no source
+    /// is available for one of them.
     fn get_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)>;
+    ) -> Result<PartitionProviders>;
 
     /// Whether partitioning should be applied to the given table.
     fn should_partition(&self, tbl: &TableScan) -> bool;
@@ -155,7 +165,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             let schema = scan.source.schema();
             let providers = self
                 .partition_provider
-                .get_partitions(&scan.table_name, &schema);
+                .get_partitions(&scan.table_name, &schema)?;
 
             tracing::debug!(
                 "PartitionedTableScanRewrite: {} partitions for '{}' table.",
@@ -193,7 +203,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 sub_scans.push(Arc::new(plan));
             }
 
-            // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
+            // The table has no partitions to read.
             if sub_scans.is_empty() {
                 return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                     EmptyRelation {
@@ -421,10 +431,10 @@ mod tests {
             &self,
             _table: &TableReference,
             _schema: &SchemaRef,
-        ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
+        ) -> Result<PartitionProviders> {
             let p1: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::clone(&self.schema)));
             let p2: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::clone(&self.schema)));
-            vec![
+            Ok(vec![
                 (
                     p1,
                     vec![HashMap::from([(
@@ -439,7 +449,27 @@ mod tests {
                         Some("1".to_string()),
                     )])],
                 ),
-            ]
+            ])
+        }
+
+        fn should_partition(&self, _tbl: &TableScan) -> bool {
+            true
+        }
+    }
+
+    /// A test partition provider that cannot resolve any table's partitions.
+    #[derive(Debug)]
+    struct UnavailablePartitionProvider;
+
+    impl TablePartitionProvider for UnavailablePartitionProvider {
+        fn get_partitions(
+            &self,
+            table: &TableReference,
+            _schema: &SchemaRef,
+        ) -> Result<PartitionProviders> {
+            Err(DataFusionError::Plan(format!(
+                "no source is available for {table}"
+            )))
         }
 
         fn should_partition(&self, _tbl: &TableScan) -> bool {
@@ -488,6 +518,24 @@ mod tests {
             .expect("analyze failed");
 
         insta::assert_snapshot!("table_scan_rewritten_to_union", result.display_indent());
+    }
+
+    #[test]
+    fn unresolved_partitions_fail_the_plan() {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let rule = PartitionedTableScanRewrite::new(Arc::new(UnavailablePartitionProvider), &ctx);
+        let plan = make_table_scan(&schema);
+
+        let error = rule
+            .analyze(plan, &ConfigOptions::default())
+            .expect_err("a scan whose partitions cannot be resolved must not plan");
+        assert!(
+            error
+                .to_string()
+                .contains("no source is available for test_table"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
