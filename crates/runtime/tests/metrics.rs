@@ -2167,7 +2167,7 @@ mod snapshot_metrics {
         dataset_checkpoint::{self, DatasetCheckpointer},
         snapshot::{
             AccelerationEngine, AccelerationLayout, ForceCreate, SnapshotBehavior, SnapshotManager,
-            engine::DefaultSnapshotEngine,
+            engine::DefaultSnapshotEngine, metrics as snapshot_metrics,
         },
     };
     use spicepod::{
@@ -2701,6 +2701,16 @@ mod snapshot_metrics {
             failures(dataset),
             Some(1.0),
             "a pre-recreation snapshot that could not be uploaded is one failure"
+        );
+
+        // A pre-recreation snapshot runs while the acceleration is created, before the
+        // dataset's snapshot creation is set up and its count published at zero. That
+        // publication must keep the failure already counted.
+        snapshot_metrics::publish_snapshot_failure_count_at_zero(dataset);
+        assert_eq!(
+            failures(dataset),
+            Some(1.0),
+            "publishing the count at zero must not reset a failure already counted"
         );
     }
 }

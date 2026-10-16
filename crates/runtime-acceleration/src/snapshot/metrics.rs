@@ -133,6 +133,9 @@ pub fn record_snapshot_failure(dataset: &str) {
 /// snapshots reports the series before its first failure and an alert can fire on
 /// the rise. Call it only for a dataset that creates snapshots: one that does not
 /// has no failure count to report.
+///
+/// This adds zero to the cumulative count, so failures already counted for the
+/// dataset are kept: it creates the series, it never resets it.
 pub fn publish_snapshot_failure_count_at_zero(dataset: &str) {
     SNAPSHOT_FAILURE_COUNT.add(0, &[dataset_label(dataset)]);
 }
