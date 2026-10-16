@@ -681,6 +681,61 @@
         }
       }
     },
+    "/v1/logs": {
+      "post": {
+        "tags": [
+          "Datasets"
+        ],
+        "summary": "Ingest OTLP logs over HTTP",
+        "description": "OpenTelemetry Protocol (OTLP/HTTP) logs receiver. Accepts protobuf or JSON\n`ExportLogsServiceRequest` bodies, optionally gzip-compressed, and stores every log record\nin the datasets with `otlp_logs: all`, like the gRPC receiver on the Flight port.",
+        "operationId": "post_otlp_logs",
+        "requestBody": {
+          "description": "OTLP ExportLogsServiceRequest",
+          "content": {
+            "application/json": {
+              "schema": {}
+            },
+            "application/x-protobuf": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every log record was stored"
+          },
+          "400": {
+            "description": "Invalid body"
+          },
+          "401": {
+            "description": "Missing or invalid API key"
+          },
+          "403": {
+            "description": "Write access required"
+          },
+          "413": {
+            "description": "Body too large"
+          },
+          "415": {
+            "description": "Unsupported Content-Type or Content-Encoding"
+          },
+          "501": {
+            "description": "No dataset stores OpenTelemetry logs (`otlp_logs: all`)"
+          },
+          "503": {
+            "description": "Failed to write to a logs dataset; retry the export"
+          }
+        }
+      }
+    },
     "/v1/mcp": {
       "get": {
         "tags": [
