@@ -46,6 +46,17 @@ use crate::context::PartitionExprResolver;
 /// ```
 pub type PartitionValue = HashMap<String, Option<String>>;
 
+/// A [`PartitionValue`] in a canonical, hashable form: its entries sorted by key.
+pub type PartitionKey = Vec<(String, Option<String>)>;
+
+/// Returns the [`PartitionKey`] of `value`.
+#[must_use]
+pub fn partition_key(value: &PartitionValue) -> PartitionKey {
+    let mut key: PartitionKey = value.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    key.sort();
+    key
+}
+
 /// Encodes `DataFusion` [`Statistics`] to the `datafusion-proto` prost bytes
 /// carried on the `PartitionsLoaded` wire. This is the executor → scheduler
 /// encoding for the per-executor table statistics the scheduler then holds in
