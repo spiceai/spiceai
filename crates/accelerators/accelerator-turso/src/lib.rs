@@ -564,6 +564,21 @@ impl DataAccelerator for TursoAccelerator {
             })
     }
 
+    fn relocated(
+        &self,
+        source: &dyn AccelerationSource,
+        dir: &std::path::Path,
+    ) -> Option<runtime_acceleration::acceleration::Acceleration> {
+        let live_file = self.turso_file_path(source).ok()?;
+        data_accelerator_api::relocated_file(source, &live_file, "turso_file", &[], dir)
+    }
+
+    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+        if let Ok(path) = self.turso_file_path(source) {
+            self.pools.lock().await.remove(&path);
+        }
+    }
+
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
         if !source.is_file_accelerated() {
             // Memory mode is never pre-initialized (always starts fresh)

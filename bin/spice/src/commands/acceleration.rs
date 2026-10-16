@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
     long_about = r#"Commands for managing accelerated datasets including snapshots.
 
 Use subcommands to list snapshots, view snapshot details, pin a dataset to
-a snapshot (rollback), and unpin it.
+a snapshot, and unpin it.
 
 Examples:
   # List all snapshots for a dataset
@@ -38,10 +38,10 @@ Examples:
   # Get details of a specific snapshot
   spice acceleration snapshot taxi_trips 3
 
-  # Pin the dataset to snapshot 2 (rollback)
-  spice acceleration set-snapshot taxi_trips 2
+  # Pin the dataset to snapshot 41: every instance serves it
+  spice acceleration pin taxi_trips 41
 
-  # Unpin the dataset: its newest snapshot becomes current
+  # Unpin the dataset: every instance serves the newest snapshot again
   spice acceleration unpin taxi_trips"#
 )]
 pub struct AccelerationArgs {
@@ -57,12 +57,15 @@ pub enum AccelerationCommand {
     /// Get details of a specific acceleration snapshot
     Snapshot(SnapshotArgs),
 
-    /// Pin the dataset to a snapshot (rollback): it stays current while newer
-    /// snapshots are published, until the dataset is unpinned
-    SetSnapshot(SetSnapshotArgs),
+    /// Pin the dataset to a snapshot: every instance serves it, and newer
+    /// snapshots are published but not served, until the dataset is unpinned
+    Pin(PinArgs),
 
-    /// Unpin the dataset: its newest snapshot becomes current
+    /// Unpin the dataset: every instance serves the newest snapshot again
     Unpin(UnpinArgs),
+
+    /// Pin the dataset to a snapshot, as `pin` does
+    SetSnapshot(PinArgs),
 }
 
 /// Arguments for the snapshots subcommand.
@@ -94,9 +97,9 @@ pub struct SnapshotArgs {
     pub output: OutputFormat,
 }
 
-/// Arguments for the set-snapshot subcommand.
+/// Arguments for the pin and set-snapshot subcommands.
 #[derive(Args, Debug)]
-pub struct SetSnapshotArgs {
+pub struct PinArgs {
     /// The dataset name
     pub dataset: String,
 
@@ -147,9 +150,9 @@ pub struct SnapshotSummary {
     pub snapshots: Vec<SnapshotInfo>,
 }
 
-/// Request to set the current snapshot.
+/// Request to pin a dataset to a snapshot.
 #[derive(Debug, Serialize)]
-struct SetCurrentSnapshotRequest {
+struct PinSnapshotRequest {
     snapshot_id: u64,
 }
 
@@ -206,8 +209,9 @@ pub async fn execute(ctx: &RuntimeContext, args: &AccelerationArgs) -> Result<()
     match &args.command {
         AccelerationCommand::Snapshots(snap_args) => execute_snapshots(ctx, snap_args).await,
         AccelerationCommand::Snapshot(snap_args) => execute_snapshot(ctx, snap_args).await,
-        AccelerationCommand::SetSnapshot(snap_args) => execute_set_snapshot(ctx, snap_args).await,
+        AccelerationCommand::Pin(pin_args) => execute_pin(ctx, pin_args).await,
         AccelerationCommand::Unpin(unpin_args) => execute_unpin(ctx, unpin_args).await,
+        AccelerationCommand::SetSnapshot(pin_args) => execute_set_snapshot(ctx, pin_args).await,
     }
 }
 
@@ -334,50 +338,40 @@ async fn execute_snapshot(ctx: &RuntimeContext, args: &SnapshotArgs) -> Result<(
     Ok(())
 }
 
+/// Execute the pin subcommand.
+async fn execute_pin(ctx: &RuntimeContext, args: &PinArgs) -> Result<()> {
+    let url = format!("/v1/datasets/{}/acceleration/snapshots/pin", args.dataset);
+    let request = PinSnapshotRequest {
+        snapshot_id: args.snapshot_id,
+    };
+    print_message(ctx, ctx.put_json(&url, &request).await, args.output).await
+}
+
 /// Execute the set-snapshot subcommand.
-async fn execute_set_snapshot(ctx: &RuntimeContext, args: &SetSnapshotArgs) -> Result<()> {
+async fn execute_set_snapshot(ctx: &RuntimeContext, args: &PinArgs) -> Result<()> {
     let url = format!(
         "/v1/datasets/{}/acceleration/snapshots/current",
         args.dataset
     );
-
-    let request = SetCurrentSnapshotRequest {
+    let request = PinSnapshotRequest {
         snapshot_id: args.snapshot_id,
     };
-
-    let response = ctx.post_json(&url, &request).await.map_err(|_| {
-        RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build()
-    })?;
-
-    let response = error::check_response(response, ctx.http_endpoint()).await?;
-
-    let result: MessageResponse = response.json().await.map_err(|e| {
-        InvalidResponseSnafu {
-            message: format!("Failed to parse response: {e}"),
-        }
-        .build()
-    })?;
-
-    if matches!(args.output, OutputFormat::Json) {
-        return write_json(&result);
-    }
-
-    tracing::info!("{}", result.message);
-
-    Ok(())
+    print_message(ctx, ctx.post_json(&url, &request).await, args.output).await
 }
 
 /// Execute the unpin subcommand.
 async fn execute_unpin(ctx: &RuntimeContext, args: &UnpinArgs) -> Result<()> {
-    let url = format!(
-        "/v1/datasets/{}/acceleration/snapshots/current",
-        args.dataset
-    );
+    let url = format!("/v1/datasets/{}/acceleration/snapshots/pin", args.dataset);
+    print_message(ctx, ctx.delete(&url).await, args.output).await
+}
 
-    let response = ctx.delete(&url).await.map_err(|_| {
+/// Prints the message the runtime answered `response` with.
+async fn print_message(
+    ctx: &RuntimeContext,
+    response: Result<reqwest::Response>,
+    output: OutputFormat,
+) -> Result<()> {
+    let response = response.map_err(|_| {
         RuntimeUnavailableSnafu {
             endpoint: ctx.http_endpoint().to_string(),
         }
@@ -393,7 +387,7 @@ async fn execute_unpin(ctx: &RuntimeContext, args: &UnpinArgs) -> Result<()> {
         .build()
     })?;
 
-    if matches!(args.output, OutputFormat::Json) {
+    if matches!(output, OutputFormat::Json) {
         return write_json(&result);
     }
 

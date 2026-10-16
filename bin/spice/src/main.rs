@@ -743,7 +743,8 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
     match &mut args.command {
         acceleration::AccelerationCommand::Snapshots(args) => args.output = OutputFormat::Json,
         acceleration::AccelerationCommand::Snapshot(args) => args.output = OutputFormat::Json,
-        acceleration::AccelerationCommand::SetSnapshot(args) => args.output = OutputFormat::Json,
+        acceleration::AccelerationCommand::Pin(args)
+        | acceleration::AccelerationCommand::SetSnapshot(args) => args.output = OutputFormat::Json,
         acceleration::AccelerationCommand::Unpin(args) => args.output = OutputFormat::Json,
     }
 }
@@ -880,10 +881,8 @@ fn is_json_output(cmd: &mut Commands) -> bool {
             command:
                 acceleration::AccelerationCommand::Snapshots(SnapshotsArgs { output, .. })
                 | acceleration::AccelerationCommand::Snapshot(SnapshotArgs { output, .. })
-                | acceleration::AccelerationCommand::SetSnapshot(acceleration::SetSnapshotArgs {
-                    output,
-                    ..
-                })
+                | acceleration::AccelerationCommand::Pin(acceleration::PinArgs { output, .. })
+                | acceleration::AccelerationCommand::SetSnapshot(acceleration::PinArgs { output, .. })
                 | acceleration::AccelerationCommand::Unpin(acceleration::UnpinArgs { output, .. }),
         }) => *output == OutputFormat::Json,
         // Cloud commands answer for themselves, from the one match in cloud::mod.
@@ -1214,6 +1213,22 @@ mod tests {
             panic!("expected acceleration set-snapshot command");
         };
         assert_eq!(args.output, OutputFormat::Json);
+
+        let cli = parse_with_machine_mode(&[
+            "spice",
+            "--machine",
+            "acceleration",
+            "pin",
+            "taxi_trips",
+            "41",
+        ]);
+        let Commands::Acceleration(AccelerationArgs {
+            command: acceleration::AccelerationCommand::Pin(args),
+        }) = cli.command
+        else {
+            panic!("expected acceleration pin command");
+        };
+        assert_eq!((args.snapshot_id, args.output), (41, OutputFormat::Json));
     }
 
     #[test]

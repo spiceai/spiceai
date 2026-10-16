@@ -468,8 +468,14 @@ pub(crate) fn transform_schema_for_vortex(
     }
 }
 
+type CatalogCell = Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>;
+
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// The catalogs of the copies made with `relocated`, keyed by their metadata
+    /// directory. A copy holds the same table as the dataset it copies, so it cannot
+    /// share `catalog`, where every other file-mode table lives.
+    relocated_catalogs: parking_lot::Mutex<HashMap<String, CatalogCell>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
@@ -1541,6 +1547,7 @@ impl CayenneAccelerator {
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         Self {
             catalog: Arc::new(OnceCell::new()),
+            relocated_catalogs: parking_lot::Mutex::new(HashMap::new()),
             memory_catalog: Arc::new(OnceCell::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2822,7 +2829,13 @@ impl CayenneAccelerator {
             "turso" => format!("libsql://{metadata_dir}/cayenne.db"),
             _ => format!("sqlite://{metadata_dir}/cayenne.db"), // Default to SQLite
         };
-        Self::init_cayenne_catalog(&self.catalog, connection_string).await
+        let relocated = self
+            .relocated_catalogs
+            .lock()
+            .get(metadata_dir)
+            .map(Arc::clone);
+        let cell = relocated.unwrap_or_else(|| Arc::clone(&self.catalog));
+        Self::init_cayenne_catalog(&cell, connection_string).await
     }
 
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
@@ -3755,6 +3768,32 @@ impl DataAccelerator for CayenneAccelerator {
                 engine: Engine::Cayenne,
                 source: err.into(),
             })
+    }
+
+    fn relocated(&self, source: &dyn AccelerationSource, dir: &Path) -> Option<Acceleration> {
+        if !source.is_file_accelerated() {
+            return None;
+        }
+        let mut acceleration = source.acceleration()?.clone();
+        acceleration.params.remove("cayenne_s3_zone_ids");
+        acceleration.params.insert(
+            "cayenne_file_path".to_string(),
+            dir.join("data").to_string_lossy().into_owned(),
+        );
+        let metadata_dir = dir.join("metadata").to_string_lossy().into_owned();
+        acceleration
+            .params
+            .insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
+        self.relocated_catalogs
+            .lock()
+            .entry(metadata_dir)
+            .or_default();
+        Some(acceleration)
+    }
+
+    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+        let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
+        self.relocated_catalogs.lock().remove(&metadata_dir);
     }
 
     fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {

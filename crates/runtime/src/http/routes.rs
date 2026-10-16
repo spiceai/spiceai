@@ -35,7 +35,10 @@ use runtime_request_context::{Protocol, RequestContext};
 #[cfg(feature = "mcp")]
 use super::mcp_transport::{McpOriginPolicy, McpResponse, McpTransport};
 use app::App;
-use axum::{extract::State, routing::patch};
+use axum::{
+    extract::State,
+    routing::{patch, put},
+};
 use http::{
     HeaderValue,
     header::{ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, HeaderName},
@@ -104,6 +107,10 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::get,
         v1::datasets::acceleration,
         v1::datasets::refresh,
+        v1::snapshots::list_snapshots,
+        v1::snapshots::get_snapshot,
+        v1::snapshots::pin_snapshot,
+        v1::snapshots::unpin_snapshot,
         v1::cdc::post,
         v1::otlp::post,
         v1::catalogs::get,
@@ -443,7 +450,11 @@ pub(crate) fn routes(
         )
         .route(
             "/v1/datasets/{name}/acceleration/snapshots/current",
-            post(v1::snapshots::set_current_snapshot).delete(v1::snapshots::unpin_current_snapshot),
+            post(v1::snapshots::pin_snapshot),
+        )
+        .route(
+            "/v1/datasets/{name}/acceleration/snapshots/pin",
+            put(v1::snapshots::pin_snapshot).delete(v1::snapshots::unpin_snapshot),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));

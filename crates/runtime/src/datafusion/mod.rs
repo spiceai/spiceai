@@ -168,6 +168,7 @@ pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
 pub use runtime_datafusion::pg_catalog;
+mod pinned_copies;
 #[cfg(not(windows))]
 pub mod planner;
 pub(crate) mod point_lookup;
@@ -4472,6 +4473,7 @@ impl DataFusion {
                 .await
                 .ok();
 
+        let mut snapshot_publisher = None;
         if acceleration_settings.snapshot_behavior.create_enabled() {
             if let Some(ref layout) = acceleration_layout {
                 if layout.is_enabled() {
@@ -4495,6 +4497,7 @@ impl DataFusion {
                     )
                     .await?
                     {
+                        snapshot_publisher = Some(Arc::clone(&snapshot_config.manager));
                         accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                     }
                 } else {
@@ -4509,6 +4512,38 @@ impl DataFusion {
                     dataset.name
                 );
             }
+        }
+
+        // An instance that publishes the dataset's snapshots serves its pinned snapshot
+        // from a second copy while it keeps refreshing the live one.
+        if let Some(publisher) = snapshot_publisher
+            && refresh_mode != RefreshMode::Caching
+            && let Some(acceleration_engine) =
+                engine_to_acceleration_engine(acceleration_settings.engine)
+            && let Some(accelerator) = self
+                .accelerator_engine_registry
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+            && let Some(copies) = pinned_copies::PinnedSnapshotCopies::new(
+                dataset,
+                accelerator,
+                Arc::clone(&self.accelerator_engine_registry),
+                acceleration_engine,
+                publisher,
+                Arc::clone(&storage_schema),
+                constraints.clone(),
+                Arc::clone(&secrets),
+                Arc::clone(&self.ctx),
+            )
+            .await
+        {
+            // A refresh that streams never completes, and a dataset without a refresh
+            // schedule may not refresh again, so those check for a pin on a timer too.
+            let streams = matches!(refresh_mode, RefreshMode::Changes)
+                || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
+            let period = (streams || dataset.refresh_check_interval().is_none())
+                .then_some(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL);
+            accelerated_table_builder.pinned_copy_loader(Arc::new(copies), period);
         }
 
         accelerated_table_builder.snapshot_refresh_state(snapshot_refresh_state);

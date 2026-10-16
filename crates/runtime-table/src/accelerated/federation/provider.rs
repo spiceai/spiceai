@@ -28,25 +28,32 @@ use datafusion_federation::{FederationAnalyzerForLogicalPlan, FederationProvider
 pub struct AcceleratedTableFederationProvider {
     provider: Arc<dyn FederationProvider>,
     refresher: Arc<crate::accelerated::refresh::Refresher>,
+    pinned: Option<Arc<crate::accelerated::pinned::PinnedServing>>,
 }
 
 impl AcceleratedTableFederationProvider {
     pub fn new(
         provider: Arc<dyn FederationProvider>,
         refresher: Arc<crate::accelerated::refresh::Refresher>,
+        pinned: Option<Arc<crate::accelerated::pinned::PinnedServing>>,
     ) -> Self {
         Self {
             provider,
             refresher,
+            pinned,
         }
     }
 
     /// The accelerator can only answer a federated sub-plan once its initial
-    /// load has completed; until then the source must serve the query.
+    /// load has completed; until then the source must serve the query. While a
+    /// pinned snapshot is served, the scan reads it, so nothing federates to the
+    /// live acceleration.
     fn federation_provider(&self) -> Option<&Arc<dyn FederationProvider>> {
-        self.refresher
-            .initial_load_completed()
-            .then_some(&self.provider)
+        let serving_pin = self
+            .pinned
+            .as_ref()
+            .is_some_and(|pinned| pinned.snapshot_id().is_some());
+        (self.refresher.initial_load_completed() && !serving_pin).then_some(&self.provider)
     }
 }
 

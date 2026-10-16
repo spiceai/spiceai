@@ -407,6 +407,21 @@ impl DataAccelerator for SqliteAccelerator {
             })
     }
 
+    fn relocated(
+        &self,
+        source: &dyn AccelerationSource,
+        dir: &std::path::Path,
+    ) -> Option<runtime_acceleration::acceleration::Acceleration> {
+        let live_file = self.sqlite_file_path(source).ok()?;
+        data_accelerator_api::relocated_file(source, &live_file, "sqlite_file", &[], dir)
+    }
+
+    async fn release_relocated(&self, source: &dyn AccelerationSource) {
+        if let Ok(path) = self.sqlite_file_path(source) {
+            self.sqlite_factory.invalidate_file_instance(path).await;
+        }
+    }
+
     fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
         if !source.is_file_accelerated() {
             return true; // memory mode SQLite is always initialized

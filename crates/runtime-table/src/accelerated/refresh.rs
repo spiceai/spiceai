@@ -54,7 +54,7 @@ use tokio::runtime::Handle;
 use tokio::select;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
@@ -759,6 +759,9 @@ pub struct Refresher {
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<AppendCursorStore>,
+    /// Notified when a refresh completes, so the table checks whether its dataset is
+    /// pinned.
+    pin_check: Option<Arc<Notify>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -823,7 +826,14 @@ impl Refresher {
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
             append_cursor_store: None,
+            pin_check: None,
         }
+    }
+
+    /// Notify `pin_check` each time a refresh completes.
+    pub fn with_pin_check(&mut self, pin_check: Option<Arc<Notify>>) -> &mut Self {
+        self.pin_check = pin_check;
+        self
     }
 
     /// Where an append refresh keeps the source snapshot it last loaded.
@@ -1242,6 +1252,7 @@ impl Refresher {
         let accelerator = Arc::clone(&self.accelerator);
 
         let synchronize_with = self.synchronize_with.clone();
+        let pin_check = self.pin_check.clone();
 
         let (snapshot_task, create_checkpoint_snapshot_after_refresh) = match snapshot_trigger {
             // This will only create checkpoint - default behavior when snapshots are not configured
@@ -1459,6 +1470,10 @@ impl Refresher {
                                 synchronize_with.is_none(),
                             ),
                         ).await;
+
+                        if let Some(pin_check) = &pin_check {
+                            pin_check.notify_one();
+                        }
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                             let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);

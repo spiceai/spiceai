@@ -27,14 +27,17 @@ use axum::{
 };
 #[cfg(not(feature = "snapshots"))]
 use runtime_acceleration::snapshot::SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE;
-use runtime_acceleration::snapshot::{SnapshotApiError, SnapshotBehavior, SnapshotManager, api};
-use serde::{Deserialize, Serialize};
+use runtime_acceleration::snapshot::{
+    SnapshotApiError, SnapshotBehavior, SnapshotManager, Unpinned, api,
+};
+use serde::Deserialize;
 use spicepod::component::snapshot::Snapshots;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::component::dataset::snapshot_source::SnapshotSource;
 
+use super::datasets::MessageResponse;
 use super::require_write_access;
 
 const DEFAULT_SNAPSHOTS_LIMIT: usize = 10;
@@ -62,18 +65,59 @@ fn snapshots_feature_response() -> Option<Response> {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 pub struct ListSnapshotsQuery {
+    /// The number of most recent snapshots to return. Defaults to 10.
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MessageResponse {
-    pub message: String,
-}
-
-/// List all snapshots for a dataset.
+/// List Dataset Snapshots
 ///
-/// `GET /v1/datasets/{name}/acceleration/snapshots`
+/// List the most recent acceleration snapshots of a dataset, with the snapshot that
+/// instances load and the snapshot the dataset is pinned to.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/datasets/{name}/acceleration/snapshots",
+    operation_id = "get_dataset_snapshots",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset."),
+        ListSnapshotsQuery
+    ),
+    responses(
+        (status = 200, description = "The dataset's snapshots", content((
+            api::SnapshotSummary = "application/json",
+            example = json!({
+                "dataset_name": "taxi_trips",
+                "location": "s3://my-bucket/spice/snapshots",
+                "last_updated_ms": 1_792_147_320_000_i64,
+                "engine": "duckdb",
+                "current_snapshot_id": 41,
+                "pinned_snapshot_id": 41,
+                "snapshots": [{
+                    "snapshot_id": 41,
+                    "timestamp_ms": 1_792_139_520_000_i64,
+                    "location": "s3://my-bucket/spice/snapshots/month=2026-10/day=2026-10-16/dataset=taxi_trips/taxi_trips_20261016T084520Z_0199f2b4d1e87c2a9d3e5f60718293a4.duckdb",
+                    "checksum": "9f2c4e1b7a5d3c8e6f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60",
+                    "checksum_algorithm": "SHA256",
+                    "size_bytes": 52_428_800,
+                    "engine": "duckdb",
+                    "row_count": 1_198_004,
+                    "is_current": true,
+                    "status": "verified"
+                }]
+            })
+        ))),
+        (status = 404, description = "Dataset not found", content((
+            MessageResponse = "application/json",
+            example = json!({ "message": "Dataset taxi_trips not found" })
+        ))),
+        (status = 400, description = "The dataset has no snapshots configured", content((
+            MessageResponse = "application/json",
+            example = json!({ "message": "Dataset taxi_trips does not have snapshots configured" })
+        )))
+    )
+))]
 pub async fn list_snapshots(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -170,9 +214,32 @@ pub async fn list_snapshots(
     }
 }
 
-/// Get details of a specific snapshot.
+/// Get Dataset Snapshot
 ///
-/// `GET /v1/datasets/{name}/acceleration/snapshots/{snapshot_id}`
+/// Get one acceleration snapshot of a dataset.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/datasets/{name}/acceleration/snapshots/{snapshot_id}",
+    operation_id = "get_dataset_snapshot",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset."),
+        ("snapshot_id" = u64, Path, description = "The id of the snapshot.")
+    ),
+    responses(
+        (status = 200, description = "The snapshot", content((
+            api::SnapshotInfo = "application/json"
+        ))),
+        (status = 404, description = "Dataset or snapshot not found", content((
+            MessageResponse = "application/json",
+            example = json!({ "message": "Snapshot 7 not found for dataset taxi_trips" })
+        ))),
+        (status = 400, description = "The dataset has no snapshots configured", content((
+            MessageResponse = "application/json",
+            example = json!({ "message": "Dataset taxi_trips does not have snapshots configured" })
+        )))
+    )
+))]
 pub async fn get_snapshot(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
@@ -265,28 +332,65 @@ pub async fn get_snapshot(
     }
 }
 
-/// Pin a dataset to a snapshot: make it current, and keep it current while newer
-/// snapshots are published, until the dataset is unpinned.
+/// Pin Dataset Snapshot
 ///
-/// `POST /v1/datasets/{name}/acceleration/snapshots/current`
-pub async fn set_current_snapshot(
+/// Pin an accelerated dataset to a snapshot. Every Spice instance that uses the dataset
+/// serves the pinned snapshot: readers load it at their next check, and instances that
+/// refresh the dataset from its source serve it from a second local copy at their next
+/// refresh while they keep refreshing and publishing. Newer snapshots are published but
+/// not served until the dataset is unpinned. A pin while pinned replaces the pin.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    put,
+    path = "/v1/datasets/{name}/acceleration/snapshots/pin",
+    operation_id = "put_dataset_snapshot_pin",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset.")
+    ),
+    request_body(
+        description = "The snapshot to pin the dataset to.",
+        content((
+            api::PinSnapshotRequest = "application/json",
+            example = json!({ "snapshot_id": 41 })
+        ))
+    ),
+    responses(
+        (status = 200, description = "The dataset is pinned", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset taxi_trips is pinned to snapshot 41. Every instance serves it once loaded; readers load it at their next check. Newer snapshots are published but not served until you unpin with DELETE /v1/datasets/taxi_trips/acceleration/snapshots/pin."
+            })
+        ))),
+        (status = 404, description = "Dataset or snapshot not found", content((
+            MessageResponse = "application/json",
+            example = json!({ "message": "Snapshot 41 not found for dataset taxi_trips" })
+        ))),
+        (status = 409, description = "The snapshot's file is gone from the snapshot location", content((
+            MessageResponse = "application/json"
+        ))),
+        (status = 400, description = "The dataset reads snapshots, or has no snapshots configured", content((
+            MessageResponse = "application/json"
+        )))
+    )
+))]
+pub async fn pin_snapshot(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Path(dataset_name): Path<String>,
-    Json(request): Json<api::SetCurrentSnapshotRequest>,
+    Json(request): Json<api::PinSnapshotRequest>,
 ) -> Response {
     let snapshot_manager = match writable_snapshot_manager(&app, &rt, &dataset_name).await {
         Ok(manager) => manager,
         Err(response) => return *response,
     };
-    match snapshot_manager.set_current_snapshot(request.snapshot_id).await {
+    match snapshot_manager
+        .set_current_snapshot(request.snapshot_id)
+        .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(MessageResponse {
-                message: format!(
-                    "Dataset {dataset_name} is pinned to snapshot {}. Readers load it at their next check. Newer snapshots are published but not made current until the dataset is unpinned with DELETE /v1/datasets/{dataset_name}/acceleration/snapshots/current.",
-                    request.snapshot_id
-                ),
+                message: pinned_message(&dataset_name, request.snapshot_id),
             }),
         )
             .into_response(),
@@ -294,11 +398,36 @@ pub async fn set_current_snapshot(
     }
 }
 
-/// Unpin a dataset: make its newest snapshot current, and newer snapshots current as
-/// they are published. Deletes no snapshot.
+/// Unpin Dataset Snapshot
 ///
-/// `DELETE /v1/datasets/{name}/acceleration/snapshots/current`
-pub async fn unpin_current_snapshot(
+/// Unpin an accelerated dataset: its newest snapshot becomes current, and every Spice
+/// instance serves the newest data again. Deletes no snapshot. Unpinning a dataset that
+/// is not pinned changes nothing.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    delete,
+    path = "/v1/datasets/{name}/acceleration/snapshots/pin",
+    operation_id = "delete_dataset_snapshot_pin",
+    tag = "Datasets",
+    params(
+        ("name" = String, Path, description = "The name of the dataset.")
+    ),
+    responses(
+        (status = 200, description = "The dataset is not pinned", content((
+            MessageResponse = "application/json",
+            example = json!({
+                "message": "Dataset taxi_trips is no longer pinned. Serving snapshot 44 (published 2026-10-16 10:42 UTC, 1,204,331 rows)."
+            })
+        ))),
+        (status = 404, description = "Dataset not found, or it has no snapshots", content((
+            MessageResponse = "application/json",
+            example = json!({ "message": "Dataset taxi_trips not found" })
+        ))),
+        (status = 400, description = "The dataset reads snapshots, or has no snapshots configured", content((
+            MessageResponse = "application/json"
+        )))
+    )
+))]
+pub async fn unpin_snapshot(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Path(dataset_name): Path<String>,
@@ -308,25 +437,55 @@ pub async fn unpin_current_snapshot(
         Err(response) => return *response,
     };
     match snapshot_manager.unpin_current_snapshot().await {
-        Ok(unpinned) => {
-            let state = if unpinned.was_pinned {
-                "is no longer pinned"
-            } else {
-                "is not pinned"
-            };
-            (
-                StatusCode::OK,
-                Json(MessageResponse {
-                    message: format!(
-                        "Dataset {dataset_name} {state}. Its current snapshot is {}, the newest.",
-                        unpinned.current_snapshot_id
-                    ),
-                }),
-            )
-                .into_response()
-        }
+        Ok(unpinned) => (
+            StatusCode::OK,
+            Json(MessageResponse {
+                message: unpinned_message(&dataset_name, &unpinned),
+            }),
+        )
+            .into_response(),
         Err(e) => snapshot_api_error_to_response(&e),
     }
+}
+
+fn pinned_message(dataset_name: &str, snapshot_id: u64) -> String {
+    format!(
+        "Dataset {dataset_name} is pinned to snapshot {snapshot_id}. Every instance serves it once loaded; readers load it at their next check. Newer snapshots are published but not served until you unpin with DELETE /v1/datasets/{dataset_name}/acceleration/snapshots/pin."
+    )
+}
+
+fn unpinned_message(dataset_name: &str, unpinned: &Unpinned) -> String {
+    let state = if unpinned.was_pinned {
+        "is no longer pinned"
+    } else {
+        "is not pinned"
+    };
+    let published = chrono::DateTime::from_timestamp_millis(unpinned.published_ms).map_or_else(
+        || unpinned.published_ms.to_string(),
+        |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
+    );
+    let rows = match unpinned.row_count {
+        Some(1) => ", 1 row".to_string(),
+        Some(rows) => format!(", {} rows", group_thousands(rows)),
+        None => String::new(),
+    };
+    format!(
+        "Dataset {dataset_name} {state}. Serving snapshot {} (published {published}{rows}).",
+        unpinned.current_snapshot_id
+    )
+}
+
+/// `1204331` as `1,204,331`.
+fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 /// The `SnapshotManager` that changes which snapshot of `dataset_name` is current, or
@@ -380,7 +539,7 @@ async fn writable_snapshot_manager(
     // the publishing instance names in the metadata this dataset reads.
     if SnapshotSource::from_spicepod(dataset).is_ok_and(|source| source.is_some()) {
         return Err(bad_request(format!(
-            "Dataset {dataset_name} reads snapshots (`file_format: snapshot`) and never changes them. Set the current snapshot on the Spice instance that publishes them."
+            "Dataset {dataset_name} reads snapshots (`file_format: snapshot`) and never changes them. Pin or unpin it on the Spice instance that publishes them."
         )));
     }
 
@@ -552,18 +711,18 @@ mod tests {
         .await;
 
         assert_enterprise_only_response(
-            set_current_snapshot(
+            pin_snapshot(
                 Extension(Arc::clone(&app)),
                 Extension(Arc::clone(&runtime)),
                 Path("test_dataset".to_string()),
-                Json(api::SetCurrentSnapshotRequest { snapshot_id: 1 }),
+                Json(api::PinSnapshotRequest { snapshot_id: 1 }),
             )
             .await,
         )
         .await;
 
         assert_enterprise_only_response(
-            unpin_current_snapshot(
+            unpin_snapshot(
                 Extension(app),
                 Extension(runtime),
                 Path("test_dataset".to_string()),
@@ -571,5 +730,57 @@ mod tests {
             .await,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    /// 2026-10-16 10:42 UTC.
+    const PUBLISHED_MS: i64 = 1_792_147_320_000;
+
+    #[test]
+    fn the_pin_reply_names_the_snapshot_and_how_to_unpin() {
+        assert_eq!(
+            pinned_message("taxi_trips", 41),
+            "Dataset taxi_trips is pinned to snapshot 41. Every instance serves it once loaded; readers load it at their next check. Newer snapshots are published but not served until you unpin with DELETE /v1/datasets/taxi_trips/acceleration/snapshots/pin."
+        );
+    }
+
+    #[test]
+    fn the_unpin_reply_names_the_snapshot_served_with_its_publish_time_and_rows() {
+        let unpinned = Unpinned {
+            was_pinned: true,
+            current_snapshot_id: 44,
+            published_ms: PUBLISHED_MS,
+            row_count: Some(1_204_331),
+        };
+        assert_eq!(
+            unpinned_message("taxi_trips", &unpinned),
+            "Dataset taxi_trips is no longer pinned. Serving snapshot 44 (published 2026-10-16 10:42 UTC, 1,204,331 rows)."
+        );
+    }
+
+    #[test]
+    fn the_unpin_reply_leaves_out_a_row_count_the_snapshot_does_not_record() {
+        let unpinned = Unpinned {
+            was_pinned: false,
+            current_snapshot_id: 44,
+            published_ms: PUBLISHED_MS,
+            row_count: None,
+        };
+        assert_eq!(
+            unpinned_message("taxi_trips", &unpinned),
+            "Dataset taxi_trips is not pinned. Serving snapshot 44 (published 2026-10-16 10:42 UTC)."
+        );
+    }
+
+    #[test]
+    fn row_counts_are_grouped_in_thousands() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(1_204_331), "1,204,331");
     }
 }

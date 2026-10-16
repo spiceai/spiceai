@@ -53,6 +53,7 @@ impl AcceleratedTable {
         let fed_provider = Arc::new(AcceleratedTableFederationProvider::new(
             accelerated_table_federation_provider,
             self.refresher(),
+            self.pinned.clone(),
         ));
 
         Some(Arc::new(SQLTableSource::new_with_schema(

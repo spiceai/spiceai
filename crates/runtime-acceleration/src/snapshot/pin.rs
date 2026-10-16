@@ -35,6 +35,16 @@ pub(super) fn pinned_snapshot_id(dataset: &DatasetMetadata) -> Option<u64> {
         .and_then(|id| id.parse().ok())
 }
 
+/// The snapshot `dataset` is pinned to while its snapshot list has it.
+pub(super) fn listed_pin(dataset: &DatasetMetadata) -> Option<u64> {
+    pinned_snapshot_id(dataset).filter(|pinned| {
+        dataset
+            .snapshots
+            .iter()
+            .any(|entry| entry.snapshot_id == *pinned)
+    })
+}
+
 /// The snapshot `dataset` is pinned to while it is also the current one. A
 /// reader treats only such a pin as a reason to load an older snapshot.
 pub(super) fn current_pin(dataset: &DatasetMetadata) -> Option<u64> {
@@ -149,6 +159,7 @@ mod tests {
         assert!(pin(&mut dataset, 1));
         assert_eq!(dataset.current_snapshot_id, Some(1));
         assert!(!pin(&mut dataset, 1), "pinning again writes nothing");
+        assert_eq!(listed_pin(&dataset), Some(1));
 
         dataset.snapshots.push(entry(4));
         assert_eq!(
@@ -177,6 +188,7 @@ mod tests {
         let mut dataset: DatasetMetadata = serde_json::from_value(written).expect("deserialize");
         assert_eq!(pinned_snapshot_id(&dataset), Some(1));
         assert_eq!(current_pin(&dataset), None, "a moved pin is not current");
+        assert_eq!(listed_pin(&dataset), Some(1), "a moved pin is still listed");
 
         dataset.snapshots.push(entry(5));
         assert_eq!(
@@ -195,6 +207,7 @@ mod tests {
         dataset
             .properties
             .insert(PINNED_PROPERTY.to_string(), "1".to_string());
+        assert_eq!(listed_pin(&dataset), None);
 
         assert_eq!(
             make_current_after_publish(&mut dataset, 3),

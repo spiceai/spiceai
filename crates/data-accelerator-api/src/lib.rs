@@ -78,6 +78,33 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
+/// `source`'s acceleration with `file_param` naming a file under `dir` that has the name
+/// of `live_file`, the file the acceleration stores its data in, for
+/// [`DataAccelerator::relocated`] of an engine that keeps one database file per dataset.
+/// `removed_params` are dropped because they would place the file elsewhere.
+#[must_use]
+pub fn relocated_file(
+    source: &dyn AccelerationSource,
+    live_file: &str,
+    file_param: &str,
+    removed_params: &[&str],
+    dir: &std::path::Path,
+) -> Option<Acceleration> {
+    if !source.is_file_accelerated() {
+        return None;
+    }
+    let file_name = std::path::Path::new(live_file).file_name()?;
+    let mut acceleration = source.acceleration()?.clone();
+    for param in removed_params {
+        acceleration.params.remove(*param);
+    }
+    acceleration.params.insert(
+        file_param.to_string(),
+        dir.join(file_name).to_string_lossy().into_owned(),
+    );
+    Some(acceleration)
+}
+
 /// Creates [`spice_data_base_path`] if it does not already exist, so a file-mode
 /// engine can open its database under it.
 ///
@@ -974,6 +1001,22 @@ pub trait DataAccelerator: Send + Sync {
         _provider: &Arc<dyn TableProvider>,
     ) {
     }
+
+    /// The acceleration settings for a second copy of `source`'s acceleration that
+    /// stores its files under `dir` instead, with every other setting unchanged. An
+    /// instance that refreshes a pinned dataset serves the pinned snapshot from such a
+    /// copy. `None` when this engine cannot hold a second copy.
+    fn relocated(
+        &self,
+        _source: &dyn AccelerationSource,
+        _dir: &std::path::Path,
+    ) -> Option<Acceleration> {
+        None
+    }
+
+    /// Closes what this engine holds open for a copy made with [`Self::relocated`], so
+    /// the copy's files can be deleted. `source` carries the relocated settings.
+    async fn release_relocated(&self, _source: &dyn AccelerationSource) {}
 
     /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
     ///

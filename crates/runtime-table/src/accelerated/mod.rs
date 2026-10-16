@@ -76,6 +76,7 @@ pub mod checkpoint_primary_key;
 pub mod fallback_retention;
 pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
 pub mod federation;
+pub mod pinned;
 pub mod refresh;
 pub mod refresh_completion;
 pub mod refresh_task;
@@ -359,6 +360,9 @@ pub struct AcceleratedTable {
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
     /// See [`Builder::node_local`].
     node_local: bool,
+    /// The copy of the pinned snapshot scans read instead of `accelerator`, for a
+    /// table with [`Builder::pinned_copy_loader`].
+    pinned: Option<Arc<pinned::PinnedServing>>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -508,6 +512,7 @@ pub struct Builder {
     /// Where an append refresh keeps the source snapshot it last loaded.
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
+    pinned_copy_loader: Option<(Arc<dyn pinned::PinnedCopyLoader>, Option<Duration>)>,
 }
 
 impl Builder {
@@ -569,7 +574,19 @@ impl Builder {
             fallback_retention_keep: None,
             append_cursor_store: None,
             node_local: false,
+            pinned_copy_loader: None,
         }
+    }
+
+    /// Serve the dataset's pinned snapshot from copies `loader` makes, checking for a
+    /// pin after each refresh and, when `period` is set, at least that often.
+    pub fn pinned_copy_loader(
+        &mut self,
+        loader: Arc<dyn pinned::PinnedCopyLoader>,
+        period: Option<Duration>,
+    ) -> &mut Self {
+        self.pinned_copy_loader = Some((loader, period));
+        self
     }
 
     /// Override the schema reported by the resulting [`AcceleratedTable`] to
@@ -1180,6 +1197,12 @@ impl Builder {
         refresher.with_engine_type_rewrites(self.engine_type_rewrites);
         refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
+        let pin_check = self
+            .pinned_copy_loader
+            .as_ref()
+            .map(|_| Arc::new(tokio::sync::Notify::new()));
+        refresher.with_pin_check(pin_check.clone());
+
         // Durable federated write-back (#11838): a WriteBack Cayenne table whose
         // commit path marks dirty keys gets a per-table delivery worker that
         // reconciles those keys to the federated source.
@@ -1462,6 +1485,39 @@ impl Builder {
             handlers.push(worker.start());
         }
 
+        let pinned = match (self.pinned_copy_loader, pin_check) {
+            (Some((loader, period)), Some(pin_check)) => {
+                let serving = Arc::new(pinned::PinnedServing::default());
+                let caching = self.caching.as_ref().map(Arc::downgrade);
+                let dataset_name = self.dataset_name.clone();
+                let watcher = pinned::PinWatcher::new(
+                    self.dataset_name.to_string(),
+                    loader,
+                    Arc::clone(&serving),
+                    Box::new(move || {
+                        let caching = caching.clone();
+                        let dataset_name = dataset_name.clone();
+                        Box::pin(async move {
+                            let Some(caching) = caching.and_then(|caching| caching.upgrade())
+                            else {
+                                return;
+                            };
+                            if let Err(e) =
+                                caching.invalidate_for_refresh(dataset_name.clone()).await
+                            {
+                                tracing::warn!(
+                                    "Failed to invalidate cached query plans and search results for dataset {dataset_name} after it switched between its pinned snapshot and its live data, so they may reflect the other data until they expire: {e}"
+                                );
+                            }
+                        })
+                    }),
+                );
+                handlers.push(self.io_runtime.spawn(watcher.run(pin_check, period)));
+                Some(serving)
+            }
+            _ => None,
+        };
+
         let table = AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
@@ -1493,6 +1549,7 @@ impl Builder {
             user_facing_schema: self.user_facing_schema,
             fallback_retention_keep,
             node_local: self.node_local,
+            pinned,
         };
         if let Some(prepared_child) = prepared_child {
             let rows = prepared_child.publish().map_err(|source| {
@@ -1822,6 +1879,15 @@ impl AcceleratedTable {
         &self.accelerator
     }
 
+    /// The provider queries read: the copy of the pinned snapshot while one is
+    /// served, else the live acceleration.
+    fn serving_accelerator(&self) -> Arc<dyn TableProvider> {
+        self.pinned
+            .as_ref()
+            .and_then(|pinned| pinned.provider())
+            .unwrap_or_else(|| Arc::clone(&self.accelerator))
+    }
+
     /// Get the list of synchronized child accelerators for caching mode.
     #[must_use]
     pub fn synchronized_children(&self) -> caching::SynchronizedChildren {
@@ -2111,12 +2177,15 @@ impl AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
+        // While the dataset is pinned, queries read the pinned snapshot's copy. Caching
+        // mode never has one.
+        let serving = self.serving_accelerator();
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
             (false, ZeroResultsAction::ReturnEmpty)
         ) {
             Some(
-                self.accelerator
+                serving
                     .scan(state, scan_projection, scan_filters, limit)
                     .await?,
             )
@@ -2198,7 +2267,7 @@ impl AcceleratedTable {
             })?,
             (false, ZeroResultsAction::UseSource) => {
                 let filter_refs: Vec<&Expr> = filters.iter().collect();
-                let pushdown_support = self.accelerator.supports_filters_pushdown(&filter_refs)?;
+                let pushdown_support = serving.supports_filters_pushdown(&filter_refs)?;
                 let accelerator_filters = filters_for_accelerator_scan(filters, &pushdown_support)?;
 
                 let accelerator_limit = if accelerator_filters.len() == filters.len() {
@@ -2206,8 +2275,7 @@ impl AcceleratedTable {
                 } else {
                     None
                 };
-                let input = self
-                    .accelerator
+                let input = serving
                     .scan(
                         state,
                         scan_projection,

@@ -94,41 +94,63 @@ pub mod api {
 
     /// Summary of all snapshots for a dataset, returned by the list snapshots API.
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     pub struct SnapshotSummary {
+        /// The dataset's name.
         pub dataset_name: String,
+        /// The snapshot location.
         pub location: String,
+        /// When the snapshot metadata last changed, in milliseconds since the UNIX epoch.
         pub last_updated_ms: i64,
+        /// The acceleration engine that creates the snapshots.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub engine: Option<String>,
+        /// The snapshot that instances load.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub current_snapshot_id: Option<u64>,
-        /// The snapshot the dataset is pinned to: it stays current while newer
-        /// snapshots are published, until the dataset is unpinned.
+        /// The snapshot the dataset is pinned to: every instance serves it, and newer
+        /// snapshots are published but not served, until the dataset is unpinned.
+        /// Absent when the dataset is not pinned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pinned_snapshot_id: Option<u64>,
+        /// The most recent snapshots, oldest first.
         pub snapshots: Vec<SnapshotInfo>,
     }
 
     /// Information about a single snapshot.
     #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
     pub struct SnapshotInfo {
+        /// The snapshot's id.
         pub snapshot_id: u64,
+        /// When the snapshot was published, in milliseconds since the UNIX epoch.
         pub timestamp_ms: i64,
+        /// The snapshot file.
         pub location: String,
+        /// The checksum of the snapshot file.
         pub checksum: String,
+        /// The algorithm of `checksum`.
         pub checksum_algorithm: String,
+        /// The size of the snapshot file in bytes.
         pub size_bytes: u64,
+        /// The acceleration engine that created the snapshot.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub engine: Option<String>,
+        /// The number of rows in the snapshot, when it records one.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub row_count: Option<u64>,
+        /// Whether this is the snapshot that instances load.
         pub is_current: bool,
+        /// `verified` when the file exists with the recorded size, `unverified` when
+        /// its size differs, and empty when the file is gone.
         pub status: String,
     }
 
-    /// Request body for setting the current snapshot.
+    /// Request body for pinning a dataset to a snapshot.
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct SetCurrentSnapshotRequest {
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    pub struct PinSnapshotRequest {
+        /// The snapshot to pin the dataset to.
         pub snapshot_id: u64,
     }
 }
@@ -2698,6 +2720,61 @@ impl SnapshotManager {
         self.download_latest(None, None).await
     }
 
+    /// The snapshot this dataset is pinned to, while its snapshot list has it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or parsing the metadata fails.
+    pub async fn pinned_snapshot(&self) -> Result<Option<u64>, SnapshotDownloadError> {
+        Ok(self.load_metadata().await?.and_then(|handle| {
+            handle
+                .metadata
+                .datasets
+                .get(&self.dataset_name)
+                .and_then(pin::listed_pin)
+        }))
+    }
+
+    /// Downloads snapshot `snapshot_id` to this manager's acceleration layout, whether
+    /// or not it is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset's snapshot list does not have the snapshot, or if
+    /// downloading or restoring it fails.
+    pub async fn download_snapshot(
+        &self,
+        snapshot_id: u64,
+    ) -> Result<SnapshotDownloadInfo, SnapshotDownloadError> {
+        let checkpointer_factory = Arc::clone(
+            self.checkpointer_factory
+                .as_ref()
+                .context(CheckpointerFactoryNotSetSnafu)?,
+        );
+        let not_found = || SnapshotDownloadError::SnapshotNotFound {
+            dataset: self.dataset_name.clone(),
+            snapshot_id,
+        };
+        let handle = self.load_metadata().await?.ok_or_else(not_found)?;
+        let dataset_metadata = handle
+            .metadata
+            .datasets
+            .get(&self.dataset_name)
+            .ok_or_else(not_found)?;
+        let entry = dataset_metadata
+            .snapshots
+            .iter()
+            .find(|entry| entry.snapshot_id == snapshot_id)
+            .ok_or_else(not_found)?;
+        self.download_snapshot_entry(
+            entry,
+            dataset_metadata,
+            &handle.metadata.location,
+            checkpointer_factory,
+        )
+        .await
+    }
+
     /// Downloads the current snapshot described by `pinned`, or by a fresh metadata read
     /// on each attempt when `pinned` is `None`. Under `fallback`, only snapshots with an
     /// id above `newer_than` are tried after the current one fails.
@@ -4312,10 +4389,12 @@ impl SnapshotManager {
                 .ok_or_else(no_snapshots)?;
             let was_pinned = pin::pinned_snapshot_id(dataset_entry).is_some();
             let changed = pin::unpin(dataset_entry);
-            let current_snapshot_id = dataset_entry.current_snapshot_id.ok_or_else(no_snapshots)?;
+            let current = dataset_entry.current_snapshot().ok_or_else(no_snapshots)?;
             *outcome.lock() = Some(Unpinned {
                 was_pinned,
-                current_snapshot_id,
+                current_snapshot_id: current.snapshot_id,
+                published_ms: current.timestamp_ms,
+                row_count: current.snapshot_row_count,
             });
             if !changed {
                 return Ok(None);
@@ -4403,6 +4482,10 @@ pub struct Unpinned {
     pub was_pinned: bool,
     /// The snapshot that is current now: the newest.
     pub current_snapshot_id: u64,
+    /// When the current snapshot was published, in milliseconds since the UNIX epoch.
+    pub published_ms: i64,
+    /// The current snapshot's row count, when it records one.
+    pub row_count: Option<u64>,
 }
 
 /// Errors that can occur when using the snapshot API.
@@ -10714,6 +10797,15 @@ mod tests {
         entries.iter().map(|entry| entry.snapshot_id).collect()
     }
 
+    async fn published_ms(store: &dyn ObjectStore, metadata_path: &Path, snapshot_id: u64) -> i64 {
+        dataset_entries(store, metadata_path)
+            .await
+            .into_iter()
+            .find(|entry| entry.snapshot_id == snapshot_id)
+            .expect("snapshot listed")
+            .timestamp_ms
+    }
+
     async fn object_exists(store: &dyn ObjectStore, path: &ObjectPath) -> bool {
         match store.head(path).await {
             Ok(_) => true,
@@ -10811,7 +10903,9 @@ mod tests {
             writer.unpin_current_snapshot().await.expect("unpin"),
             Unpinned {
                 was_pinned: true,
-                current_snapshot_id: 3
+                current_snapshot_id: 3,
+                published_ms: published_ms(store.as_ref(), &metadata_path, 3).await,
+                row_count: None,
             }
         );
         assert_eq!(
@@ -10822,7 +10916,9 @@ mod tests {
             writer.unpin_current_snapshot().await.expect("unpin again"),
             Unpinned {
                 was_pinned: false,
-                current_snapshot_id: 3
+                current_snapshot_id: 3,
+                published_ms: published_ms(store.as_ref(), &metadata_path, 3).await,
+                row_count: None,
             }
         );
         publish_contents(&writer, &local_path, "publish 4", &schema).await;
@@ -10963,6 +11059,61 @@ mod tests {
             .await
             .expect("poll");
         assert_eq!(poll.download.map(|info| info.snapshot_id), Some(0));
+    }
+
+    /// A writer serving its pin downloads the pinned snapshot by id into a second copy,
+    /// whatever snapshot its own acceleration holds.
+    #[tokio::test]
+    async fn the_pinned_snapshot_downloads_by_id_into_another_copy() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        let copy_path = dir.path().join("pinned").join("accelerated.db");
+        let copy = build_manager_for_engine(
+            Arc::clone(&store),
+            copy_path.clone(),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        assert_eq!(copy.pinned_snapshot().await.expect("read pin"), None);
+
+        writer
+            .set_current_snapshot(1)
+            .await
+            .expect("pin snapshot 1");
+        assert_eq!(copy.pinned_snapshot().await.expect("read pin"), Some(1));
+        let restored = copy.download_snapshot(1).await.expect("download");
+        assert_eq!(restored.snapshot_id, 1);
+        assert_eq!(
+            std::fs::read_to_string(&copy_path).expect("read copy"),
+            "publish 1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&local_path).expect("read live"),
+            "publish 2",
+            "the live copy is untouched"
+        );
+        assert!(matches!(
+            copy.download_snapshot(7).await,
+            Err(SnapshotDownloadError::SnapshotNotFound { snapshot_id: 7, .. })
+        ));
     }
 
     /// Under a pin, `fallback` tries only snapshots older than the pinned one, never the

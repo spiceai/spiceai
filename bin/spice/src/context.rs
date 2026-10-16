@@ -806,6 +806,31 @@ impl RuntimeContext {
             .context(crate::error::ConnectionFailedSnafu { endpoint: url })
     }
 
+    /// Make an HTTP PUT request to the runtime with a JSON body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn put_json<T: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.http_endpoint, path);
+        let mut request = self.http_client.put(&url);
+
+        for (key, value) in self.get_headers() {
+            request = request.header(&key, &value);
+        }
+
+        request = request.json(body);
+
+        request
+            .send()
+            .await
+            .context(crate::error::ConnectionFailedSnafu { endpoint: url })
+    }
+
     /// Make an HTTP POST request to the runtime with a JSON body.
     ///
     /// # Errors
