@@ -21,12 +21,14 @@ limitations under the License.
 //! connection, each managed by a background thread — avoiding the overhead of opening a
 //! new connection per operation and lifting read-side concurrency for metadata-heavy scans.
 
+use super::durable::{self, Durability, log::DurableLog};
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
     MetastoreValue, QueryParams, QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -433,6 +435,10 @@ async fn configure_sqlite_connection(
 /// Reads never queue here: in WAL mode they neither wait for nor block a writer.
 struct Writer {
     conn: tokio_rusqlite::Connection,
+    /// Set once the catalog's authoritative copy is in object storage
+    /// (`mode: datalake`): every write is then made durable there before it
+    /// commits on this connection.
+    durability: OnceLock<Arc<Durability>>,
 }
 
 /// Writer connections by metastore file, shared by every [`SqliteMetastore`]
@@ -1232,9 +1238,103 @@ impl SqliteMetastore {
         }
         let opened = Arc::new(Writer {
             conn: self.open_connection().await?,
+            durability: OnceLock::new(),
         });
         *writer = Arc::downgrade(&opened);
         Ok(opened)
+    }
+
+    /// Run the write `job` on the writer connection, made durable in object
+    /// storage before it commits when the catalog is durable there.
+    async fn write<F, R>(
+        &self,
+        pool: &Arc<SqliteConnectionPool>,
+        job: F,
+        map_err: impl Fn(tokio_rusqlite::Error<rusqlite::Error>) -> CatalogError,
+    ) -> CatalogResult<R>
+    where
+        F: FnOnce(&mut rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let Some(durable) = self.durable_commit(pool) else {
+            return pool.writer.run(job).await.map_err(map_err);
+        };
+        // An autocommit statement would commit before it is durable, so a
+        // durable write runs as a transaction of its own.
+        let session = pool
+            .writer
+            .session(begin_immediate, roll_back)
+            .await
+            .map_err(&map_err)?;
+        durable.durability.begin();
+        let held_start = std::time::Instant::now();
+        let value = session.call(job).await.map_err(&map_err)?;
+        durable.commit(session, held_start).await?;
+        Ok(value)
+    }
+
+    fn durable_commit(&self, pool: &Arc<SqliteConnectionPool>) -> Option<DurableCommit> {
+        pool.writer
+            .durability
+            .get()
+            .map(|durability| DurableCommit {
+                durability: Arc::clone(durability),
+                pool: Arc::clone(pool),
+                db: PathBuf::from(self.db_path()),
+            })
+    }
+
+    /// Make every later write to this catalog file durable in `log` before it
+    /// commits locally. The file must already hold `log`'s latest state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if change capture cannot be installed or durability is
+    /// already enabled.
+    pub(crate) async fn enable_durability(&self, log: Arc<DurableLog>) -> CatalogResult<()> {
+        let pool = self.pool().await?;
+        let durability = pool
+            .writer
+            .run(move |conn| Ok(Durability::install(conn, log)))
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to enable catalog durability: {e}"),
+            })??;
+        pool.writer
+            .durability
+            .set(Arc::new(durability))
+            .map_err(|_| CatalogError::Database {
+                message: "Catalog durability is already enabled".to_string(),
+            })
+    }
+
+    /// Record `position` as the durable position this file holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the position cannot be written.
+    pub(crate) async fn write_durable_position(
+        &self,
+        position: durable::Position,
+    ) -> CatalogResult<()> {
+        let pool = self.pool().await?;
+        pool.writer
+            .run(move |conn| durable::write_position(conn, position))
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to record the catalog position: {e}"),
+            })
+    }
+
+    /// A consistent image of the catalog file and the durable position it
+    /// holds, read without blocking writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image cannot be written or read back.
+    pub(crate) async fn image(&self) -> CatalogResult<(Bytes, durable::Position)> {
+        let pool = self.pool().await?;
+        image_on(pool, Path::new(self.db_path())).await
     }
 
     /// Return the connection pool, initialising it lazily on first call.
@@ -2003,17 +2103,19 @@ impl MetastoreBackend for SqliteMetastore {
             params.params.into_iter().map(to_sqlite_value).collect();
 
         let held_start = std::time::Instant::now();
-        pool.writer
-            .run(move |conn| {
+        self.write(
+            pool,
+            move |conn| {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
                     .iter()
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
                 conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
                 Ok(())
-            })
-            .await
-            .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+            },
+            |e| convert_tokio_rusqlite_error(e, "Failed to execute statement"),
+        )
+        .await?;
         telemetry::cayenne::track_metastore_writer_held(
             held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
@@ -2026,18 +2128,28 @@ impl MetastoreBackend for SqliteMetastore {
         let pool = self.pool().await?;
         let sql_owned = sql.to_string();
 
-        pool.writer
-            .run(move |conn| conn.execute_batch(&sql_owned))
-            .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to execute batch: {e}"),
-                },
-            )
+        self.write(
+            pool,
+            move |conn| conn.execute_batch(&sql_owned),
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to execute batch: {e}"),
+            },
+        )
+        .await
     }
 
     async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()> {
         let pool = self.pool().await?;
+        let map_err = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to execute transaction batch: {e}"),
+        };
+        // A durable write is already one transaction.
+        if pool.writer.durability.get().is_some() {
+            let sql = sql.to_string();
+            return self
+                .write(pool, move |conn| conn.execute_batch(&sql), map_err)
+                .await;
+        }
         let batch_sql = format!("BEGIN TRANSACTION; {sql}; COMMIT;");
 
         pool.writer
@@ -2070,9 +2182,12 @@ impl MetastoreBackend for SqliteMetastore {
         // A write runs on the writer connection in its turn; a read on a pooled
         // connection. See `statement_writes`.
         let row_values = if statement_writes(&sql) {
-            pool.writer
-                .run(move |conn| fetch_row(conn, &sql, &param_values))
-                .await
+            self.write(
+                pool,
+                move |conn| fetch_row(conn, &sql, &param_values),
+                query_error,
+            )
+            .await?
         } else {
             let attempt = pool
                 .acquire()
@@ -2085,16 +2200,18 @@ impl MetastoreBackend for SqliteMetastore {
                 })
                 .await;
             match attempt {
-                Ok(ReadAttempt::Ran(values)) => Ok(values),
+                Ok(ReadAttempt::Ran(values)) => values,
                 Ok(ReadAttempt::Writes(sql, param_values)) => {
-                    pool.writer
-                        .run(move |conn| fetch_row(conn, &sql, &param_values))
-                        .await
+                    self.write(
+                        pool,
+                        move |conn| fetch_row(conn, &sql, &param_values),
+                        query_error,
+                    )
+                    .await?
                 }
-                Err(e) => Err(e),
+                Err(e) => return Err(query_error(e)),
             }
-        }
-        .map_err(query_error)?;
+        };
 
         // Apply the callback outside the rusqlite closure to preserve CatalogError
         let sqlite_row = SqliteRow { values: row_values };
@@ -2117,9 +2234,12 @@ impl MetastoreBackend for SqliteMetastore {
         // A write runs on the writer connection in its turn; a read on a pooled
         // connection. See `statement_writes`.
         let all_row_values = if statement_writes(&sql) {
-            pool.writer
-                .run(move |conn| fetch_rows(conn, &sql, &param_values))
-                .await
+            self.write(
+                pool,
+                move |conn| fetch_rows(conn, &sql, &param_values),
+                query_error,
+            )
+            .await?
         } else {
             let attempt = pool
                 .acquire()
@@ -2132,16 +2252,18 @@ impl MetastoreBackend for SqliteMetastore {
                 })
                 .await;
             match attempt {
-                Ok(ReadAttempt::Ran(rows)) => Ok(rows),
+                Ok(ReadAttempt::Ran(rows)) => rows,
                 Ok(ReadAttempt::Writes(sql, param_values)) => {
-                    pool.writer
-                        .run(move |conn| fetch_rows(conn, &sql, &param_values))
-                        .await
+                    self.write(
+                        pool,
+                        move |conn| fetch_rows(conn, &sql, &param_values),
+                        query_error,
+                    )
+                    .await?
                 }
-                Err(e) => Err(e),
+                Err(e) => return Err(query_error(e)),
             }
-        }
-        .map_err(query_error)?;
+        };
 
         // Apply the callback outside the rusqlite closure to preserve CatalogError
         let mut results = Vec::with_capacity(all_row_values.len());
@@ -2177,12 +2299,18 @@ impl MetastoreBackend for SqliteMetastore {
             &[telemetry::KeyValue::new("txn", "other")],
         );
 
+        let durable = self.durable_commit(pool);
+        if let Some(durable) = &durable {
+            durable.durability.begin();
+        }
+
         // METRIC 1 (writer held): the reserved write lock is held from this BEGIN
         // until commit/rollback/drop. Stamp the start so `SqliteTransaction` can
         // record the hold duration when it ends.
         Ok(Box::new(SqliteTransaction {
             session: Some(session),
             held_start: std::time::Instant::now(),
+            durable,
         }))
     }
 
@@ -2190,6 +2318,17 @@ impl MetastoreBackend for SqliteMetastore {
         // WAL checkpoint and optimize on the writer connection, in its turn like
         // any write: the TRUNCATE checkpoint and `PRAGMA optimize` write, and a
         // single checkpoint covers the shared file.
+        // A rotation in progress uploads an image and moves the catalog to a
+        // new epoch; let it finish rather than leave its upload orphaned.
+        if let Some(durability) = self
+            .pool
+            .get()
+            .and_then(|pool| pool.writer.durability.get())
+        {
+            durability
+                .wait_for_rotation(std::time::Duration::from_secs(30))
+                .await;
+        }
         if let Some(pool) = self.pool.get() {
             pool.writer
                 .run(|conn| {
@@ -2470,6 +2609,119 @@ fn measure_file_footprint(db_path: &str, wal_path: &str) -> (Option<u64>, Option
     (db, wal)
 }
 
+/// What a transaction on a durable catalog needs to commit.
+#[derive(Clone)]
+struct DurableCommit {
+    durability: Arc<Durability>,
+    pool: Arc<SqliteConnectionPool>,
+    db: PathBuf,
+}
+
+impl DurableCommit {
+    /// Make the session's changes durable, then commit them locally.
+    ///
+    /// Runs to its end even when the caller stops waiting: a change object
+    /// storage has accepted must commit locally too, or the replica falls
+    /// behind the state later writes are computed from.
+    async fn commit(self, session: Session, held_start: std::time::Instant) -> CatalogResult<()> {
+        tokio::spawn(async move { self.publish_and_commit(session, held_start).await })
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to commit transaction: {e}"),
+            })?
+    }
+
+    async fn publish_and_commit(
+        self,
+        session: Session,
+        held_start: std::time::Instant,
+    ) -> CatalogResult<()> {
+        let durability = Arc::clone(&self.durability);
+        let schema_covered = session
+            .call(move |conn| durability.covers(conn))
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to commit transaction: {e}"),
+                },
+            )?;
+        let sequence = match self.durability.publish(schema_covered).await {
+            Ok(sequence) => sequence,
+            // Dropping the session rolls the transaction back.
+            Err(error) => return Err(error.into()),
+        };
+        let committed = session
+            .finish(move |conn| {
+                let committed = sequence
+                    .map_or(Ok(()), |sequence| durable::set_sequence(conn, sequence))
+                    .and_then(|()| conn.execute_batch("COMMIT"))
+                    .inspect_err(|_| {
+                        let _ = conn.execute_batch("ROLLBACK");
+                    });
+                telemetry::cayenne::track_metastore_writer_held(
+                    held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                committed
+            })
+            .await;
+        match (committed, sequence) {
+            (Ok(()), Some(_)) => {
+                self.maybe_rotate().await;
+                Ok(())
+            }
+            (Ok(()), None) => Ok(()),
+            (Err(error), Some(_)) => Err(self.durability.halt(error).into()),
+            (Err(error), None) => Err(CatalogError::Database {
+                message: format!("Failed to commit transaction: {error}"),
+            }),
+        }
+    }
+
+    async fn maybe_rotate(&self) {
+        if !self.durability.claim_rotation().await {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let rotated = match image_on(&this.pool, &this.db).await {
+                Ok((image, position)) => this
+                    .durability
+                    .log()
+                    .rotate(image, position.sequence)
+                    .await
+                    .map_err(|e| CatalogError::from(durable::Error::from(e))),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = rotated {
+                tracing::warn!(
+                    "Failed to compact the catalog log in {}; writes continue, and fail if compaction keeps failing. Cause: {error}",
+                    this.durability.log().location().url()
+                );
+            }
+            this.durability.release_rotation();
+        });
+    }
+}
+
+/// [`durable::image`] on a read connection of `pool`.
+async fn image_on(
+    pool: &Arc<SqliteConnectionPool>,
+    db: &Path,
+) -> CatalogResult<(Bytes, durable::Position)> {
+    let db = db.to_path_buf();
+    pool.acquire()
+        .await
+        .call(move |conn| Ok::<_, rusqlite::Error>(durable::image(conn, &db)))
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to image the catalog: {e}"),
+            },
+        )?
+        .map_err(Into::into)
+}
+
 /// A transaction on the metastore's [`Writer`] connection: a [`Session`] from
 /// `BEGIN IMMEDIATE` until [`commit`](MetastoreTransaction::commit) or
 /// [`rollback`](MetastoreTransaction::rollback), while the writes queued behind
@@ -2482,6 +2734,8 @@ pub struct SqliteTransaction {
     /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned),
     /// for the hold commit and rollback record.
     held_start: std::time::Instant,
+    /// Set when the catalog is durable in object storage.
+    durable: Option<DurableCommit>,
 }
 
 impl SqliteTransaction {
@@ -2615,6 +2869,9 @@ impl MetastoreTransaction for SqliteTransaction {
 
     async fn commit(mut self: Box<Self>) -> CatalogResult<()> {
         let session = self.take_session()?;
+        if let Some(durable) = self.durable.take() {
+            return durable.commit(session, self.held_start).await;
+        }
 
         // COMMIT, and on a failed COMMIT the best-effort ROLLBACK that leaves the
         // writer connection clean, run as the session's last statement: the

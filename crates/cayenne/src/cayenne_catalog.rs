@@ -266,6 +266,9 @@ impl MetastoreImpl {
 pub struct CayenneCatalog {
     connection_string: String,
     metastore: MetastoreImpl,
+    /// Where the catalog's authoritative copy lives when it is durable in
+    /// object storage (`mode: datalake`); the local file is then a replica.
+    durable: Option<crate::metastore::durable::CatalogLocation>,
 }
 
 impl CayenneCatalog {
@@ -297,7 +300,103 @@ impl CayenneCatalog {
         Ok(Self {
             connection_string,
             metastore,
+            durable: None,
         })
+    }
+
+    /// Create a catalog whose authoritative copy is in object storage at
+    /// `location`, kept in a local `SQLite` replica at `connection_string`.
+    ///
+    /// Every write is durable at `location` before it commits locally, and
+    /// [`MetadataCatalog::init`] restores the replica from `location`, so a
+    /// catalog survives the loss of its local disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperationNoSource`] unless
+    /// `connection_string` names a local `SQLite` file.
+    pub fn new_durable(
+        connection_string: impl Into<String>,
+        location: crate::metastore::durable::CatalogLocation,
+    ) -> CatalogResult<Self> {
+        let connection_string = connection_string.into();
+        let local_file = connection_string
+            .strip_prefix("sqlite://")
+            .is_some_and(|path| !is_memory_db_path(path));
+        if !local_file {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "A catalog durable in object storage needs a local SQLite replica file, not '{connection_string}'"
+                ),
+            });
+        }
+        let mut catalog = Self::new(connection_string)?;
+        catalog.durable = Some(location);
+        Ok(catalog)
+    }
+
+    /// Bring the local replica to the latest durable state before the schema
+    /// is opened, returning the catalog log when one exists.
+    async fn recover_durable(&self) -> CatalogResult<Option<crate::metastore::durable::Recovered>> {
+        let Some(location) = &self.durable else {
+            return Ok(None);
+        };
+        let recovered = crate::metastore::durable::recover(
+            location.clone(),
+            std::path::PathBuf::from(self.db_path()),
+        )
+        .await?;
+        Ok(Some(recovered))
+    }
+
+    /// Once the schema is open: create the durable catalog, or rotate to an
+    /// image of the opened schema, then make every later write durable.
+    async fn attach_durable(
+        &self,
+        recovered: crate::metastore::durable::Recovered,
+    ) -> CatalogResult<()> {
+        use crate::metastore::durable::{self, Position, Recovered};
+        #[cfg_attr(not(feature = "turso"), expect(irrefutable_let_patterns))]
+        let MetastoreBackendImpl::Sqlite(metastore) = &self.metastore.backend else {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "A catalog durable in object storage requires the SQLite metastore"
+                    .to_string(),
+            });
+        };
+        let log = match recovered {
+            Recovered::Empty(location) => {
+                let catalog_id = uuid::Uuid::now_v7();
+                metastore
+                    .write_durable_position(Position {
+                        catalog_id,
+                        sequence: 0,
+                    })
+                    .await?;
+                let (image, _) = metastore.image().await?;
+                durable::create(location, image, catalog_id).await?
+            }
+            Recovered::Current(log) => {
+                // The image is of the schema this build opened, so no change
+                // set made from here on is replayed onto an older schema.
+                let (image, position) = metastore.image().await?;
+                if position.catalog_id != log.catalog_id()
+                    || position.sequence != log.last_sequence().await
+                {
+                    return Err(CatalogError::InvalidOperationNoSource {
+                        message: format!(
+                            "The local catalog replica '{}' does not match the catalog in {}",
+                            self.db_path(),
+                            log.location().url()
+                        ),
+                    });
+                }
+                log.rotate(image, position.sequence)
+                    .await
+                    .map_err(durable::Error::from)?;
+                log
+            }
+        };
+        metastore.enable_durability(log).await
     }
 
     /// Number of metastore query / execute / begin operations this catalog has
@@ -2514,6 +2613,8 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
+        let recovered = self.recover_durable().await?;
+
         // Initialize schema using the appropriate metastore backend
         match &self.metastore.backend {
             MetastoreBackendImpl::Sqlite(metastore) => metastore.init_schema().await?,
@@ -2521,6 +2622,9 @@ impl MetadataCatalog for CayenneCatalog {
             MetastoreBackendImpl::Turso(metastore) => metastore.init_schema().await?,
         }
 
+        if let Some(recovered) = recovered {
+            self.attach_durable(recovered).await?;
+        }
         Ok(())
     }
 

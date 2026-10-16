@@ -159,7 +159,7 @@ impl AccelerationSource for TestAccelerationSource {
         acceleration.enabled
             && matches!(
                 acceleration.mode,
-                Mode::File | Mode::FileCreate | Mode::FileUpdate
+                Mode::File | Mode::FileCreate | Mode::FileUpdate | Mode::Datalake
             )
     }
 

@@ -44,7 +44,7 @@ impl CatalogAcceleration {
     /// initial snapshot instead of resuming from the replication slot.
     #[must_use]
     pub fn is_durable(&self) -> bool {
-        matches!(self.mode, Mode::File | Mode::FileUpdate)
+        matches!(self.mode, Mode::File | Mode::FileUpdate | Mode::Datalake)
     }
 
     /// Convert this catalog acceleration into the dataset-level acceleration every

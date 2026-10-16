@@ -323,6 +323,7 @@ fn cayenne_file_path_conflict(datasets: &[Dataset]) -> Option<String> {
                     AccelerationMode::File
                         | AccelerationMode::FileCreate
                         | AccelerationMode::FileUpdate
+                        | AccelerationMode::Datalake
                 );
             // A snapshot dataset names neither: its engine comes from the snapshots and
             // its mode is always file, so a `cayenne_file_path` on it is a Cayenne file path.

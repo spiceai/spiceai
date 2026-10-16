@@ -295,6 +295,7 @@ impl Transaction {
                 }
             );
             let id = *WriteId::new().as_bytes();
+            let changes = self.changes.clone();
             let record = LogRecord {
                 format: FORMAT,
                 incarnation: base.incarnation,
@@ -326,6 +327,7 @@ impl Transaction {
                 receipt,
                 bytes,
                 head_bytes: encode(&head)?,
+                changes: Arc::new(changes),
             })
         })
         .await
@@ -339,6 +341,7 @@ pub struct PreparedCommit {
     receipt: CommitReceipt,
     bytes: Bytes,
     head_bytes: Bytes,
+    changes: Arc<BTreeMap<String, Option<Bytes>>>,
 }
 
 impl PreparedCommit {
@@ -492,6 +495,67 @@ impl WalStateStore {
                 source: Some(source),
             },
         })
+    }
+
+    /// Commits like [`Self::commit`], and on `Committed` also returns the snapshot
+    /// of the version this attempt published, so a sole writer can prepare its
+    /// next transaction without recovering the domain again.
+    ///
+    /// The successor is built from the attempt's base snapshot and its own batch,
+    /// once a fresh head read confirms that the head is still exactly this
+    /// attempt's publication. When a later publication has already replaced it,
+    /// the successor is recovered from storage instead, like [`Self::snapshot`].
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::commit`]. A failure to read the successor
+    /// after a confirmed commit is returned as an error too: the commit stands,
+    /// and the caller recovers with [`Self::snapshot`].
+    pub async fn commit_and_advance(
+        &self,
+        attempt: &PreparedCommit,
+    ) -> Result<(CommitOutcome, Option<Snapshot>)> {
+        let outcome = self.commit(attempt).await?;
+        let CommitOutcome::Committed { sequence } = outcome else {
+            return Ok((outcome, None));
+        };
+        let version = self.head().await?;
+        let ours = version.write_id == attempt.receipt.record.id
+            && version.head.sequence == sequence
+            && version.head.commit.as_ref() == Some(&attempt.receipt.record);
+        if !ours {
+            let snapshot = self.snapshot().await?;
+            return Ok((outcome, Some(snapshot)));
+        }
+        let base = Arc::clone(&attempt.snapshot.values);
+        let changes = Arc::clone(&attempt.changes);
+        let head = version.head.clone();
+        let values = cpu(move || {
+            let mut values = (*base).clone();
+            for (key, value) in changes.iter() {
+                match value {
+                    Some(value) => {
+                        values.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        values.remove(key);
+                    }
+                }
+            }
+            ensure!(
+                state_size(&values, head.limits)? == head.state_bytes && values.len() == head.keys,
+                InvalidRecordSnafu {
+                    reason: "head state totals"
+                }
+            );
+            Ok(values)
+        })
+        .await?;
+        let snapshot = Snapshot {
+            domain: Arc::clone(&self.domain),
+            version: Arc::new(version),
+            values: Arc::new(values),
+        };
+        Ok((outcome, Some(snapshot)))
     }
 
     /// Resolves a saved receipt, including after reopening with an independent client.
