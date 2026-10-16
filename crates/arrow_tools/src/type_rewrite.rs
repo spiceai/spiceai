@@ -1017,14 +1017,11 @@ fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Resu
         }
     }
 
-    // The walk above admits renames, nullability flips and descriptive metadata at every level
-    // below this field, which is right for a bare type and wrong under an extension label: an
-    // extension type is declared over one storage layout, child names and nullability included,
-    // so a field that keeps the label while its storage changes would publish an array still
-    // labelled as the extension over a layout the extension no longer describes. No caller
-    // relabels under an extension type today, so no storage change is admitted rather than
-    // some registry of per-extension exceptions. `DataType`'s `PartialEq` compares nested
-    // fields whole (name, type, nullability, metadata), which is exactly the comparison wanted.
+    // The walk above admits renames, nullability flips and descriptive metadata below this field,
+    // which is wrong under a kept extension label (see the doc comment). No caller relabels under
+    // an extension type today, so every storage change is refused rather than some registry of
+    // per-extension exceptions; `DataType`'s `PartialEq` compares nested fields whole (name,
+    // type, nullability, metadata), which is exactly the comparison that needs to hold.
     if let Some(extension) = source.extension_type_name()
         && source.data_type() != target.data_type()
     {
@@ -2167,10 +2164,10 @@ mod tests {
             ("loosened child", extension_storage("timestamp", true)),
         ] {
             let (data, target) = list_of_extension_structs(None, target_storage, None);
-            let err = relabel_array_data(data, &target).expect_err(&format!(
-                "a {change} under a field that keeps its extension type must be refused: the \
-                 extension's storage layout is part of what the label claims"
-            ));
+            let err = relabel_array_data(data, &target).expect_err(
+                "a storage change under a field that keeps its extension type must be refused: \
+                 the extension's storage layout is part of what the label claims",
+            );
             let message = err.to_string();
             assert!(
                 message.contains("arrow.timestamp_with_offset")
