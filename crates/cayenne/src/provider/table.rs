@@ -20805,6 +20805,7 @@ impl CayenneTableProvider {
         // guard, which then aborts instead of dropping the appended file.
         let (snapshot_id, generation_before, _source_pin) =
             self.pin_current_snapshot_for_compaction();
+        let credits_seen = self.new_files_since_last_compaction.load(Ordering::Acquire);
         // Recorded rather than propagated bare: this pass has no wrapper to
         // catch its errors (unlike the protected-snapshot merge and the bake), so
         // a listing failure would be the one exit that leaves no outcome — and
@@ -20838,8 +20839,8 @@ impl CayenneTableProvider {
             // Nothing a table with no primary key holds can merge until new files
             // arrive; stop listing it on every trigger until they do.
             if self.pk_deletion_strategy.is_position_based() {
-                self.new_files_since_last_compaction
-                    .store(0, Ordering::Release);
+                self.retire_listed_small_file_credits(&snapshot_id, credits_seen)
+                    .await;
             }
             return Ok(false);
         };
@@ -20979,6 +20980,27 @@ impl CayenneTableProvider {
             }
             drop(pin);
         }
+    }
+
+    /// Retire the small-file trigger credits a declined pass over `snapshot_id` covered.
+    ///
+    /// `credits_seen` was sampled before the pass listed the snapshot, and a write counts its
+    /// files only once they are in the snapshot directory, so each of those credits is a file
+    /// the listing saw and found nothing to merge with. A write that counted its files after the
+    /// sample keeps its credits, so its files are still owed a pass — resetting the count to
+    /// zero would leave them unmerged until as many new files arrive as the trigger asks for, or
+    /// for good on a table that goes idle. A replacement restarts the count, so nothing is
+    /// retired once the snapshot changed; the listing fence keeps one from landing in between.
+    async fn retire_listed_small_file_credits(&self, snapshot_id: &str, credits_seen: usize) {
+        let _fence = self.listing_fence.read().await;
+        if self.get_current_snapshot_id() != snapshot_id {
+            return;
+        }
+        let _ = self.new_files_since_last_compaction.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |credits| Some(credits.saturating_sub(credits_seen)),
+        );
     }
 
     /// The picker's candidate for a small-file pass over `files`. A table with no primary key
@@ -23097,6 +23119,7 @@ impl CayenneTableProvider {
         // commit guard — see `compact_current_snapshot_small_files`.
         let (snapshot_id, generation_before, _source_pin) =
             self.pin_current_snapshot_for_compaction();
+        let credits_seen = self.new_files_since_last_compaction.load(Ordering::Acquire);
         // Recorded rather than propagated bare, for the reason
         // `compact_current_snapshot_small_files` documents at the same call: this
         // pass has no wrapper to catch its errors, so a listing failure would be
@@ -23130,8 +23153,8 @@ impl CayenneTableProvider {
             // Nothing a table with no primary key holds can merge until new files
             // arrive; stop listing it on every trigger until they do.
             if self.pk_deletion_strategy.is_position_based() {
-                self.new_files_since_last_compaction
-                    .store(0, Ordering::Release);
+                self.retire_listed_small_file_credits(&snapshot_id, credits_seen)
+                    .await;
             }
             return Ok(false);
         };

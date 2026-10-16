@@ -629,3 +629,51 @@ async fn pk_less_subset_rewrite_waits_out_a_pipelined_append() {
         "after a restart the table holds the same rows"
     );
 }
+
+/// A pass that found nothing to merge retires only the trigger credits its listing covered:
+/// credits an append added after the pass sampled them stay, so the appended files are still
+/// owed a pass, and nothing is retired once the snapshot was replaced.
+#[tokio::test]
+async fn a_declined_pass_keeps_the_credits_of_appends_that_landed_during_it() {
+    let schema = id_value_schema();
+    let ctx = SessionContext::new();
+    let (provider, _temp_dir) = create_cayenne_table_with_config(
+        "pk_less_declined_credits",
+        Arc::clone(&schema),
+        one_file_per_append(),
+        Vec::new(),
+        ctx.runtime_env(),
+    )
+    .await;
+    insert_batch(&provider, id_value_rows(&schema, 0, 50)).await;
+    let snapshot_id = provider.get_current_snapshot_id();
+    let counter = &provider.new_files_since_last_compaction;
+
+    // Five credits when the pass sampled them, two appends' worth more by the time it declined.
+    counter.store(7, Ordering::Release);
+    provider
+        .retire_listed_small_file_credits(&snapshot_id, 5)
+        .await;
+    assert_eq!(
+        counter.load(Ordering::Acquire),
+        2,
+        "the credits counted after the sample stay"
+    );
+
+    // Fewer credits than sampled (another pass retired some): none go negative.
+    provider
+        .retire_listed_small_file_credits(&snapshot_id, 5)
+        .await;
+    assert_eq!(counter.load(Ordering::Acquire), 0);
+
+    // A replacement restarts the count: a pass over the replaced snapshot retires nothing.
+    counter.store(3, Ordering::Release);
+    provider
+        .retire_listed_small_file_credits("a-replaced-snapshot", 3)
+        .await;
+    assert_eq!(
+        counter.load(Ordering::Acquire),
+        3,
+        "nothing is retired once the snapshot changed"
+    );
+}
