@@ -165,9 +165,10 @@ impl JobExecutor {
     /// already driving the job locally.
     ///
     /// `job` is the state in which the recovery sweep found the job orphaned.
-    /// The takeover lands only while the job is still in that state, so of the
-    /// schedulers that recover the same job only one drives it, and the driver
-    /// it was taken from is refused at its next write.
+    /// The takeover, or the failure of a principal's job, lands only while the
+    /// job is still in that state, so of the schedulers that recover the same
+    /// job only one acts on it, and the driver it was taken from is refused at
+    /// its next write.
     ///
     /// Resuming re-plans the job's SQL on this scheduler, and planning is where a
     /// principal's table access and masking apply. The job records only its
@@ -176,6 +177,33 @@ impl JobExecutor {
     /// request to resubmit rather than re-planned without that principal.
     pub async fn resume(&self, job: &JobState) {
         let job_id = job.job_id.as_str();
+        if !job.is_owned_by(super::PUBLIC_JOB_OWNER) {
+            tracing::warn!(
+                job_id,
+                "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
+            );
+            match self
+                .job_store
+                .fail_orphaned_job(
+                    job,
+                    JobErrorCode::SchedulerUnavailable,
+                    "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
+                )
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::debug!(
+                    job_id,
+                    "Not recovering the job: another scheduler took it over first, or it finished"
+                ),
+                Err(e) => tracing::warn!(
+                    job_id,
+                    "Failed to mark async query job '{job_id}' failed after its scheduler stopped: {e}"
+                ),
+            }
+            return;
+        }
+
         let cancel_token = CancellationToken::new();
         {
             let mut active = self.active_jobs.write().await;
@@ -209,36 +237,6 @@ impl JobExecutor {
             self.active_jobs.write().await.remove(job_id);
             return;
         };
-
-        if !taken.is_owned_by(super::PUBLIC_JOB_OWNER) {
-            self.active_jobs.write().await.remove(job_id);
-            tracing::warn!(
-                job_id,
-                "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
-            );
-            let failed = match taken.driver() {
-                Some(driver) => {
-                    self.job_store
-                        .fail_job(
-                            job_id,
-                            &driver,
-                            JobErrorCode::SchedulerUnavailable,
-                            "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
-                        )
-                        .await
-                }
-                None => Err(Error::JobTakenOver {
-                    job_id: job_id.to_string(),
-                }),
-            };
-            if let Err(e) = failed {
-                tracing::warn!(
-                    job_id,
-                    "Failed to mark async query job '{job_id}' failed after its scheduler stopped: {e}"
-                );
-            }
-            return;
-        }
 
         let job_store = Arc::clone(&self.job_store);
         let df = Arc::clone(&self.df);
@@ -762,6 +760,118 @@ mod tests {
             matches!(err, Error::ChunkNotFound { chunk_index: 1, .. }),
             "{err:?}"
         );
+    }
+
+    /// Object store that fails the first write marking an async-query job
+    /// failed.
+    #[derive(Debug)]
+    struct FailFirstFailedWrite {
+        inner: Arc<dyn object_store::ObjectStore>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for FailFirstFailedWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailFirstFailedWrite")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailFirstFailedWrite {
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let marks_failed = payload
+                .iter()
+                .any(|chunk| chunk.windows(8).any(|w| w == b"\"FAILED\""));
+            if marks_failed && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "the write did not land".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A principal's orphaned job whose failure write does not land stays
+    /// orphaned, so the next recovery sweep fails it.
+    #[tokio::test]
+    async fn resume_fails_a_principals_job_on_a_later_sweep_after_a_failed_write() {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let lost = JobStore::new(Arc::clone(&inner), "test", "node-lost");
+        let job_id = seed_job(&lost, OWNER).await;
+        let running = lost
+            .set_job_running(&job_id)
+            .await
+            .expect("the lost scheduler had started the job");
+        let flaky: Arc<dyn object_store::ObjectStore> = Arc::new(FailFirstFailedWrite {
+            inner: Arc::clone(&inner),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let recoverer = Arc::new(JobStore::new(flaky, "test", "node-b"));
+        let executor = executor(Arc::clone(&recoverer));
+
+        executor.resume(&running).await;
+        let orphaned = recoverer.get_job(&job_id).await.expect("job exists");
+        assert_eq!(orphaned.status, JobStatus::Running);
+        assert_eq!(
+            orphaned.scheduler_node.as_deref(),
+            Some("node-lost"),
+            "the job is still orphaned for the next sweep"
+        );
+
+        executor.resume(&orphaned).await;
+        let state = recoverer.get_job(&job_id).await.expect("job exists");
+        assert_eq!(state.status, JobStatus::Failed);
     }
 
     #[tokio::test]

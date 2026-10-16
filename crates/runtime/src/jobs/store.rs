@@ -225,10 +225,7 @@ impl JobStore {
     pub async fn take_over_job(&self, observed: &JobState) -> Result<Option<JobState>> {
         let (state, taken) = self
             .modify_job(&observed.job_id, |state| {
-                if state.status != JobStatus::Running
-                    || state.scheduler_node != observed.scheduler_node
-                    || state.generation != observed.generation
-                {
+                if !still_driven_as(state, observed) {
                     return Ok(false);
                 }
                 state.set_running(self.node_id.clone());
@@ -236,6 +233,33 @@ impl JobStore {
             })
             .await?;
         Ok(taken.then_some(state))
+    }
+
+    /// Marks a running job whose driver is gone as failed, without driving it.
+    /// The failure lands only while the job is still running and driven as in
+    /// `observed`; otherwise this returns `None`. A job left as it was stays
+    /// orphaned, so the next recovery sweep tries again.
+    pub async fn fail_orphaned_job(
+        &self,
+        observed: &JobState,
+        error_code: JobErrorCode,
+        message: impl Into<String>,
+    ) -> Result<Option<JobState>> {
+        let error = super::state::JobError {
+            error_code,
+            message: message.into(),
+            sql_state: None,
+        };
+        let (state, failed) = self
+            .modify_job(&observed.job_id, |state| {
+                if !still_driven_as(state, observed) {
+                    return Ok(false);
+                }
+                state.set_failed(error.clone());
+                Ok(true)
+            })
+            .await?;
+        Ok(failed.then_some(state))
     }
 
     /// Marks a job as cancelled. A job that already finished keeps its status.
@@ -844,6 +868,13 @@ impl JobStore {
 }
 
 /// Refuses a write by `driver` to a job that another scheduler took over.
+/// Whether `state` is still running and driven as in `observed`.
+fn still_driven_as(state: &JobState, observed: &JobState) -> bool {
+    state.status == JobStatus::Running
+        && state.scheduler_node == observed.scheduler_node
+        && state.generation == observed.generation
+}
+
 fn ensure_driven_by(state: &JobState, driver: &JobDriver) -> Result<()> {
     if state.is_driven_by(driver) {
         Ok(())
