@@ -20,7 +20,7 @@ use async_openai::{
     types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionResponseStream, ChatCompletionStreamOptions, ChatCompletionToolChoiceOption,
-        CreateChatCompletionRequest, CreateChatCompletionResponse,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionResponse,
         CreateChatCompletionStreamResponse,
     },
 };
@@ -378,7 +378,7 @@ impl Chat for ChatWrapper {
         let result = match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
-                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, id=resp.id, "labels");
+                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, cached_tokens = %cached_tokens(&usage), id=resp.id, "labels");
                     handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &labels);
                 }
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
@@ -414,6 +414,16 @@ impl Chat for ChatWrapper {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         self.chat.as_sql()
     }
+}
+
+/// The prompt tokens of `usage` that the provider read from its prompt cache: 0 when it reports
+/// none.
+fn cached_tokens(usage: &CompletionUsage) -> u32 {
+    usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or_default()
 }
 
 /// [`TracedChatCompletionStream`] wraps a [`ChatCompletionResponseStream`]-like stream and provides metrics and `task_history` tracing. Importantly, when aggregrating the output, it does not need to block until the full stream is consumed.
@@ -461,14 +471,16 @@ where
                     fold_completion_stream(&mut acc, &item);
                 }
 
-                // Log usage info if available.
+                // Record usage, if available, as labels of the completion's task.
                 if let Some(usage) = item.usage.clone() {
                     tracing::info!(
                         target: "task_history",
+                        parent: &self.span,
                         completion_tokens = %usage.completion_tokens,
                         total_tokens = %usage.total_tokens,
                         prompt_tokens = %usage.prompt_tokens,
-                        "Usage info"
+                        cached_tokens = %cached_tokens(&usage),
+                        "labels"
                     );
 
                     // Usage should be on last message, so we can add latency metrics here.
