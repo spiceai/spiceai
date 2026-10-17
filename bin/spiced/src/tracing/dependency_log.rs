@@ -302,12 +302,21 @@ fn io_timeout_message(attempt: u32, delay: &str, error: &str) -> Option<String> 
 const COLLAPSE_WINDOW: Duration = Duration::from_secs(60);
 const COLLAPSE_EMIT_AT: [u64; 4] = [1, 100, 1_000, 10_000];
 
+/// Distinct retry classes remembered at once. A repeated class updates its
+/// one entry and does not walk the map. A class this build has not recognized
+/// is keyed by its whole diagnostic, so a storm of different objects would
+/// otherwise keep one entry each. Past the cap, the class that has been quiet
+/// the longest is dropped. Its unreported count goes with it: the next time
+/// that class appears, it logs as a new one.
+const COLLAPSE_MAX_WINDOWS: usize = 64;
+
 struct CollapseGate {
     windows: HashMap<String, CollapseWindow>,
 }
 
 struct CollapseWindow {
     start: Instant,
+    last_seen: Instant,
     seen: u64,
     suppressed: u64,
 }
@@ -325,42 +334,59 @@ impl Default for CollapseGate {
     }
 }
 
-impl CollapseGate {
-    fn decide(&mut self, key: &str, now: Instant) -> Collapse {
-        self.prune(now);
-        let window = self
-            .windows
-            .entry(key.to_string())
-            .or_insert_with(|| CollapseWindow {
-                start: now,
-                seen: 0,
-                suppressed: 0,
-            });
-        if window.seen > 0 && now.duration_since(window.start) >= COLLAPSE_WINDOW {
-            let skipped = window.suppressed;
-            *window = CollapseWindow {
-                start: now,
-                seen: 1,
-                suppressed: 0,
-            };
+impl CollapseWindow {
+    fn advance(&mut self, now: Instant) -> Collapse {
+        self.last_seen = now;
+        if self.seen > 0 && now.duration_since(self.start) >= COLLAPSE_WINDOW {
+            let skipped = self.suppressed;
+            self.start = now;
+            self.seen = 1;
+            self.suppressed = 0;
             return Collapse::Emit { skipped };
         }
-        window.seen += 1;
-        if COLLAPSE_EMIT_AT.contains(&window.seen) {
-            let skipped = window.suppressed;
-            window.suppressed = 0;
+        self.seen += 1;
+        if COLLAPSE_EMIT_AT.contains(&self.seen) {
+            let skipped = self.suppressed;
+            self.suppressed = 0;
             return Collapse::Emit { skipped };
         }
-        window.suppressed += 1;
+        self.suppressed += 1;
         Collapse::Suppress
     }
+}
 
-    fn prune(&mut self, now: Instant) {
-        if self.windows.len() <= 32 {
+impl CollapseGate {
+    fn decide(&mut self, key: &str, now: Instant) -> Collapse {
+        if let Some(window) = self.windows.get_mut(key) {
+            return window.advance(now);
+        }
+        self.evict_least_recent();
+        let mut window = CollapseWindow {
+            start: now,
+            last_seen: now,
+            seen: 0,
+            suppressed: 0,
+        };
+        let decision = window.advance(now);
+        self.windows.insert(key.to_string(), window);
+        decision
+    }
+
+    /// Called only when admitting a class the map does not already hold, and
+    /// only once the map is full. The repeated-class path never scans.
+    fn evict_least_recent(&mut self) {
+        if self.windows.len() < COLLAPSE_MAX_WINDOWS {
             return;
         }
-        self.windows
-            .retain(|_, window| now.duration_since(window.start) < Duration::from_secs(600));
+        let Some(oldest) = self
+            .windows
+            .iter()
+            .min_by_key(|(_, window)| window.last_seen)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        self.windows.remove(&oldest);
     }
 }
 
@@ -538,6 +564,60 @@ mod tests {
         );
         assert!(again.contains("attempt 2"), "{again}");
         assert!(!again.contains("similar retries"), "{again}");
+    }
+
+    #[test]
+    fn collapse_gate_retains_at_most_64_classes() {
+        let mut gate = CollapseGate::default();
+        let start = Instant::now();
+        for index in 0_u32..80 {
+            let at = start + Duration::from_secs(u64::from(index));
+            let decision = gate.decide(&format!("class-{index}"), at);
+            assert!(
+                matches!(decision, Collapse::Emit { skipped: 0 }),
+                "first sight of class-{index} should log"
+            );
+        }
+        assert_eq!(gate.windows.len(), COLLAPSE_MAX_WINDOWS);
+        assert!(!gate.windows.contains_key("class-0"));
+        assert!(!gate.windows.contains_key("class-15"));
+        assert!(gate.windows.contains_key("class-16"));
+        assert!(gate.windows.contains_key("class-79"));
+
+        // Repeating a class the map still holds must not drop another class.
+        let repeat_at = start + Duration::from_secs(80);
+        for _ in 0..50 {
+            let decision = gate.decide("class-79", repeat_at);
+            assert!(
+                matches!(decision, Collapse::Suppress),
+                "class-79 is inside its first window"
+            );
+        }
+        assert_eq!(gate.windows.len(), COLLAPSE_MAX_WINDOWS);
+        assert!(gate.windows.contains_key("class-16"));
+        assert!(gate.windows.contains_key("class-79"));
+
+        let decision = gate.decide("class-new", repeat_at + Duration::from_secs(1));
+        assert!(matches!(decision, Collapse::Emit { skipped: 0 }));
+        assert_eq!(gate.windows.len(), COLLAPSE_MAX_WINDOWS);
+        assert!(!gate.windows.contains_key("class-16"));
+        assert!(gate.windows.contains_key("class-new"));
+        assert!(gate.windows.contains_key("class-79"));
+    }
+
+    #[test]
+    fn collapse_gate_reports_the_quiet_gap_on_the_next_event() {
+        let mut gate = CollapseGate::default();
+        let start = Instant::now();
+        assert!(matches!(
+            gate.decide("k", start),
+            Collapse::Emit { skipped: 0 }
+        ));
+        assert!(matches!(gate.decide("k", start), Collapse::Suppress));
+        assert!(matches!(
+            gate.decide("k", start + COLLAPSE_WINDOW),
+            Collapse::Emit { skipped: 1 }
+        ));
     }
 
     #[test]
