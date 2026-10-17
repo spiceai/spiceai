@@ -102,6 +102,18 @@ impl ConditionalWriteSupport {
     }
 }
 
+/// The start of the name of the object [`probe_conditional_writes`] writes.
+const PROBE_OBJECT_PREFIX: &str = ".spice-conditional-write-probe-";
+
+/// Whether `path` names an object [`probe_conditional_writes`] writes. The probe
+/// expects some of its writes to be refused, so their refusals are not conflicts
+/// with another writer.
+#[must_use]
+pub fn is_probe_object(path: &Path) -> bool {
+    path.filename()
+        .is_some_and(|name| name.starts_with(PROBE_OBJECT_PREFIX))
+}
+
 /// Probes `store` by writing, rewriting and deleting one object under
 /// `prefix`, named `.spice-conditional-write-probe-<uuid>`.
 ///
@@ -113,7 +125,7 @@ pub async fn probe_conditional_writes(
     prefix: &Path,
 ) -> ConditionalWriteSupport {
     let location = prefix.clone().join(format!(
-        ".spice-conditional-write-probe-{}",
+        "{PROBE_OBJECT_PREFIX}{}",
         uuid::Uuid::now_v7().simple()
     ));
     let support = run_probe(store, &location).await;

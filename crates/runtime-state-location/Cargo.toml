@@ -17,6 +17,7 @@ datafusion.workspace = true
 futures.workspace = true
 object_store.workspace = true
 object_store_occ = { path = "../object_store_occ" }
+opentelemetry.workspace = true
 parking_lot.workspace = true
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-parameters = { path = "../runtime-parameters" }
@@ -26,10 +27,12 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
+telemetry = { path = "../telemetry" }
 tokio = { workspace = true, features = ["fs", "sync"] }
 url.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync"] }
 
