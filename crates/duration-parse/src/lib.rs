@@ -138,8 +138,19 @@ fn parse_compound_duration(input: &str) -> Result<Duration, ParseError> {
             break;
         }
 
-        // Parse numeric part
-        let (number, rest) = parse_number(remaining)?;
+        // `remaining` is a suffix of `input`: each iteration only drops a prefix,
+        // via `trim_start` and the slice returned by `parse_number`.
+        let segment_offset = input.len() - remaining.len();
+
+        // Parse numeric part. `parse_number` reports `Syntax` positions relative
+        // to this segment; shift them so they are byte offsets into `input`.
+        let (number, rest) = parse_number(remaining).map_err(|error| match error {
+            ParseError::Syntax { position, message } => ParseError::Syntax {
+                position: segment_offset + position,
+                message,
+            },
+            other @ ParseError::InvalidInput { .. } => other,
+        })?;
         // Parse unit suffix
         let (unit_nanos, rest) = parse_time_unit(rest);
 
@@ -211,7 +222,8 @@ fn parse_number(input: &str) -> Result<(ParsedNumber, &str), ParseError> {
             position: 0,
             message: format!(
                 "Expected a number, found '{}'",
-                &input[..1.min(input.len())]
+                // The first scalar may occupy more than one byte.
+                &input[..input.ceil_char_boundary(1)]
             ),
         });
     }
@@ -780,6 +792,78 @@ mod tests {
                 .unwrap_or_else(|e| panic!("Failed to parse formatted '{formatted}': {e}"));
             assert_eq!(d, reparsed, "Roundtrip failed for '{formatted}'");
         }
+    }
+
+    #[test]
+    fn test_compound_syntax_position_is_byte_offset() {
+        // regression test for #15225
+        let first = parse_duration("秒").expect_err("first segment");
+        assert_eq!(
+            first,
+            ParseError::Syntax {
+                position: 0,
+                message: "Expected a number, found '秒'".to_string(),
+            }
+        );
+        assert_eq!(
+            first.to_string(),
+            "at position 0: Expected a number, found '秒'"
+        );
+
+        let compact = "1h30秒";
+        let compact_at = compact.find('秒').expect("秒");
+        let compact_err = parse_duration(compact).expect_err("compact later segment");
+        assert_eq!(
+            compact_err,
+            ParseError::Syntax {
+                position: compact_at,
+                message: "Expected a number, found '秒'".to_string(),
+            }
+        );
+        assert_eq!(
+            compact_err.to_string(),
+            format!("at position {compact_at}: Expected a number, found '秒'")
+        );
+
+        let spaced = "1h 30秒";
+        let spaced_at = spaced.find('秒').expect("秒");
+        let spaced_err = parse_duration(spaced).expect_err("spaced later segment");
+        assert_eq!(
+            spaced_err,
+            ParseError::Syntax {
+                position: spaced_at,
+                message: "Expected a number, found '秒'".to_string(),
+            }
+        );
+
+        // Ideographic space is three bytes, so 秒's byte offset is not its scalar index.
+        let wide = "1h\u{3000}30秒";
+        let byte_at = wide.find('秒').expect("秒");
+        let scalar_at = wide.chars().position(|c| c == '秒').expect("秒");
+        assert_ne!(byte_at, scalar_at);
+        let wide_err = parse_duration(wide).expect_err("multibyte separator");
+        assert_eq!(
+            wide_err,
+            ParseError::Syntax {
+                position: byte_at,
+                message: "Expected a number, found '秒'".to_string(),
+            }
+        );
+
+        let fractional = "1h1.99999999999999999999";
+        let fractional_at = fractional.find('.').expect("decimal point") + 1;
+        let fractional_err = parse_duration(fractional).expect_err("fractional part");
+        assert_eq!(
+            fractional_err,
+            ParseError::Syntax {
+                position: fractional_at,
+                message: "Invalid fractional part".to_string(),
+            }
+        );
+        assert_eq!(
+            fractional_err.to_string(),
+            format!("at position {fractional_at}: Invalid fractional part")
+        );
     }
 
     #[test]
