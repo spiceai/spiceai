@@ -13,7 +13,7 @@ The same notification loads the first snapshot. A reader that starts before any 
    - A dataset whose announced id is newer than the snapshot it has loaded or last asked for requests a refresh. It is the same request `POST /v1/datasets/{name}/acceleration/refresh` makes. One dataset's publish does not refresh the others.
    - A dataset waiting out its retry backoff, for example because no snapshot existed when it started, retries immediately.
    - A dataset waits for the reload it asked for before asking for the next one, so a newer snapshot never restarts a download in progress. Announcements that arrive meanwhile are coalesced, and the latest is loaded once the reload finishes.
-5. **What gets loaded.** The refresh loads the current snapshot only if it is strictly newer than the one loaded, with the same schema check and checksum verification as a scheduled refresh. Snapshot mode never moves back to an older snapshot.
+5. **What gets loaded.** The refresh loads the current snapshot only if it is strictly newer than the one loaded, or if the dataset is pinned to it, with the same schema check and checksum verification as a scheduled refresh. Snapshot mode moves back to an older snapshot only when the dataset is pinned to it.
 6. **Other objects under the location.** Notifications for the snapshot files themselves, for [writer leases](acceleration-snapshot-writer-lease.md), and for removals are deleted without a refresh: a snapshot is not current until `metadata.json` names it.
 7. **Objects outside the location.** A notification that names an object outside the snapshot location is **left on the queue** (not deleted) and logged as an error. The queue must receive only this location's notifications.
 8. **Invalid messages.** A message that is not an S3 event notification is logged and deleted.
@@ -74,4 +74,3 @@ A snapshot-mode dataset fails to register with an error that names `s3_queue_url
 
 - One queue per reader process, set up by the user.
 - GCS Pub/Sub and Azure Event Grid notifications are not supported.
-- A rollback through `POST /v1/datasets/{name}/acceleration/snapshots/current` does not reach readers: snapshot mode never moves back to an older snapshot.

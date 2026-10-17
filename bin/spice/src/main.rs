@@ -744,6 +744,7 @@ fn apply_machine_acceleration_mode(args: &mut AccelerationArgs) {
         acceleration::AccelerationCommand::Snapshots(args) => args.output = OutputFormat::Json,
         acceleration::AccelerationCommand::Snapshot(args) => args.output = OutputFormat::Json,
         acceleration::AccelerationCommand::SetSnapshot(args) => args.output = OutputFormat::Json,
+        acceleration::AccelerationCommand::Unpin(args) => args.output = OutputFormat::Json,
     }
 }
 
@@ -882,7 +883,8 @@ fn is_json_output(cmd: &mut Commands) -> bool {
                 | acceleration::AccelerationCommand::SetSnapshot(acceleration::SetSnapshotArgs {
                     output,
                     ..
-                }),
+                })
+                | acceleration::AccelerationCommand::Unpin(acceleration::UnpinArgs { output, .. }),
         }) => *output == OutputFormat::Json,
         // Cloud commands answer for themselves, from the one match in cloud::mod.
         Commands::Cloud(a) => a.command.produces_json(),

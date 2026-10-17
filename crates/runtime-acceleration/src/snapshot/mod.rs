@@ -71,6 +71,7 @@ pub mod directory_archive;
 pub mod engine;
 pub mod metrics;
 pub mod notifications;
+mod pin;
 mod retention;
 pub mod section_deprecation;
 mod writer_lease;
@@ -101,6 +102,10 @@ pub mod api {
         pub engine: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub current_snapshot_id: Option<u64>,
+        /// The snapshot the dataset is pinned to: it stays current while newer
+        /// snapshots are published, until the dataset is unpinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pinned_snapshot_id: Option<u64>,
         pub snapshots: Vec<SnapshotInfo>,
     }
 
@@ -1060,6 +1065,8 @@ struct Committed {
     /// The `location` recorded in the `metadata.json` written, which its snapshot
     /// URIs resolve against.
     metadata_location: String,
+    /// What the write made current.
+    after_publish: pin::AfterPublish,
 }
 
 /// This dataset's snapshot files as one listing of the snapshot location found
@@ -1807,8 +1814,22 @@ impl SnapshotManager {
         let Some(remote_id) = dataset_metadata.current_snapshot_id else {
             return Ok(nothing_newer);
         };
+        // A dataset pinned to an older snapshot is the one case where a reader loads a
+        // snapshot older than the one it holds.
+        let pinned_older = current_local_id.is_some_and(|local_id| {
+            remote_id < local_id && pin::current_pin(dataset_metadata) == Some(remote_id)
+        });
+        if pinned_older {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                "Loading snapshot {remote_id} of dataset '{}', which is pinned and older than the loaded snapshot {}.",
+                self.dataset_name,
+                current_local_id.unwrap_or_default()
+            );
+        }
         if let Some(local_id) = current_local_id
             && remote_id <= local_id
+            && !pinned_older
         {
             if remote_id < local_id {
                 tracing::warn!(
@@ -2063,16 +2084,46 @@ impl SnapshotManager {
             &checksum,
         );
 
-        tracing::info!(
-            dataset = %self.dataset_name,
-            snapshot = %destination_location,
-            size_bytes = total_bytes,
-            duration_ms = format_args!("{duration_ms:.1}"),
-            sha = %checksum,
-            "Snapshot created"
-        );
+        let committed = committed.into_inner();
+        let after_publish = committed.as_ref().map(|committed| committed.after_publish);
+        if let Some(pin::AfterPublish::Pinned { snapshot_id, .. }) = after_publish {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                snapshot = %destination_location,
+                size_bytes = total_bytes,
+                duration_ms = format_args!("{duration_ms:.1}"),
+                sha = %checksum,
+                pinned_snapshot_id = snapshot_id,
+                "Snapshot created; not made current, as the dataset is pinned to snapshot {snapshot_id}"
+            );
+        } else {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                snapshot = %destination_location,
+                size_bytes = total_bytes,
+                duration_ms = format_args!("{duration_ms:.1}"),
+                sha = %checksum,
+                "Snapshot created"
+            );
+        }
+        match after_publish {
+            Some(pin::AfterPublish::Pinned {
+                snapshot_id,
+                restored_from: Some(restored_from),
+            }) => tracing::warn!(
+                dataset = %self.dataset_name,
+                "Dataset '{}' is pinned to snapshot {snapshot_id}, but snapshot {restored_from} was current, made current by a version of Spice without pins. Made snapshot {snapshot_id} current again. Upgrade every instance that publishes this dataset's snapshots.",
+                self.dataset_name
+            ),
+            Some(pin::AfterPublish::PinRemoved { snapshot_id }) => tracing::warn!(
+                dataset = %self.dataset_name,
+                "Dataset '{}' was pinned to snapshot {snapshot_id}, which its snapshot list no longer has, so the pin was removed and the published snapshot is current.",
+                self.dataset_name
+            ),
+            _ => {}
+        }
 
-        if let Some(committed) = committed.into_inner() {
+        if let Some(committed) = committed {
             self.clean_up_after_publish(&committed, sweep.as_ref())
                 .await;
         }
@@ -2220,6 +2271,15 @@ impl SnapshotManager {
                 dataset = %self.dataset_name,
                 "{}",
                 lost_snapshot_message(&self.dataset_name, entry.snapshot_id, &entry.snapshot)
+            );
+        }
+        if let Some(entry) = &committed.retention.pinned_gone {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Dataset '{}' is pinned to snapshot {}, whose file '{}' is gone from the snapshot location, for example deleted by a bucket lifecycle rule. Instances that start fall back only to older snapshots, and serving readers keep the data they hold. Pin another snapshot or unpin the dataset.",
+                self.dataset_name,
+                entry.snapshot_id,
+                entry.snapshot
             );
         }
         runtime_state_location::metrics::record_cleanup_deleted(StateFeature::Snapshots, deleted);
@@ -2812,8 +2872,17 @@ impl SnapshotManager {
             .collect();
         remaining.sort_by_key(|b| std::cmp::Reverse(b.snapshot_id));
         ordered_snapshots.extend(remaining);
-        ordered_snapshots
-            .retain(|snapshot| newer_than.is_none_or(|loaded| snapshot.snapshot_id > loaded));
+        let newer_than_loaded = |snapshot: &SnapshotEntry| {
+            newer_than.is_none_or(|loaded| snapshot.snapshot_id > loaded)
+        };
+        match pin::current_pin(&dataset_metadata) {
+            // Never past the pin: the pinned snapshot, then only older ones.
+            Some(pinned) => ordered_snapshots.retain(|snapshot| {
+                snapshot.snapshot_id == pinned
+                    || (snapshot.snapshot_id < pinned && newer_than_loaded(snapshot))
+            }),
+            None => ordered_snapshots.retain(newer_than_loaded),
+        }
 
         let current_engine = self.engine.to_string();
         for snapshot in ordered_snapshots {
@@ -3781,7 +3850,7 @@ impl SnapshotManager {
                 snapshot_row_count: row_count,
                 snapshot_last_updated_at_ms: last_updated_at,
             });
-            dataset_entry.current_snapshot_id = Some(next_snapshot_id);
+            let after_publish = pin::make_current_after_publish(dataset_entry, next_snapshot_id);
 
             // Retention is applied in the write that publishes, so an entry and the record
             // of its drop are written together.
@@ -3798,6 +3867,7 @@ impl SnapshotManager {
                     .map(str::to_string)
                     .collect(),
                 metadata_location,
+                after_publish,
             });
 
             Ok(Some(metadata))
@@ -3942,6 +4012,7 @@ impl SnapshotManager {
         });
 
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
+        let pinned_snapshot_id = pin::pinned_snapshot_id(&dataset_metadata);
         let dataset_engine = dataset_metadata.engine.clone();
 
         // Take only the last `limit` entries (most recent) to avoid unnecessary
@@ -4004,6 +4075,7 @@ impl SnapshotManager {
             last_updated_ms,
             engine: dataset_engine,
             current_snapshot_id,
+            pinned_snapshot_id,
             snapshots,
         })
     }
@@ -4142,24 +4214,18 @@ impl SnapshotManager {
         })
     }
 
-    /// Sets the current snapshot ID for this dataset.
-    ///
-    /// This updates the metadata to point to the specified snapshot, which will be used
-    /// for bootstrapping on the next runtime restart.
+    /// Pins this dataset to `snapshot_id`: makes it current, and keeps it current
+    /// while newer snapshots are published, until [`Self::unpin_current_snapshot`].
     ///
     /// # Errors
     ///
-    /// Returns an error if reading/writing the metadata fails or the snapshot is not found.
+    /// Returns an error if reading/writing the metadata fails, the snapshot is not found,
+    /// or its file is gone.
     pub async fn set_current_snapshot(&self, snapshot_id: u64) -> Result<(), SnapshotApiError> {
-        let write_error = |reason: String| SnapshotApiError::WriteMetadata {
-            path: self.metadata_path().to_string(),
-            reason,
-        };
-
         // Selecting a snapshot rewrites the shared metadata document too.
         self.ensure_conditional_writes()
             .await
-            .map_err(|err| write_error(err.to_string()))?;
+            .map_err(|err| self.metadata_write_error(err.to_string()))?;
 
         // A snapshot whose file is gone cannot be restored, so it is never made current.
         if let Some(handle) = self.load_metadata().await?
@@ -4202,24 +4268,98 @@ impl SnapshotManager {
             {
                 return Err(not_found());
             }
-            // Already current: nothing to write. This also recognizes an earlier attempt
-            // whose write landed but whose response was lost.
-            if dataset_entry.current_snapshot_id == Some(snapshot_id) {
+            // Already pinned there: nothing to write. This also recognizes an earlier
+            // attempt whose write landed but whose response was lost.
+            if !pin::pin(dataset_entry, snapshot_id) {
                 return Ok(None);
             }
-            dataset_entry.current_snapshot_id = Some(snapshot_id);
             metadata.last_updated_ms = Utc::now().timestamp_millis();
             Ok(Some(metadata))
         };
 
-        let err = match self.update_metadata(select).await {
+        let pinned = |dataset: &DatasetMetadata| pin::current_pin(dataset) == Some(snapshot_id);
+        self.update_metadata_reporting(select, pinned).await?;
+        tracing::info!(
+            dataset = %self.dataset_name,
+            "Pinned dataset '{}' to snapshot {snapshot_id}: newer snapshots are published but not made current until the dataset is unpinned.",
+            self.dataset_name
+        );
+        Ok(())
+    }
+
+    /// Unpins this dataset and makes its newest snapshot current. Returns whether it was
+    /// pinned and the snapshot that is now current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading/writing the metadata fails or the dataset has no
+    /// snapshots.
+    pub async fn unpin_current_snapshot(&self) -> Result<Unpinned, SnapshotApiError> {
+        self.ensure_conditional_writes()
+            .await
+            .map_err(|err| self.metadata_write_error(err.to_string()))?;
+
+        let no_snapshots = || SnapshotApiError::NoSnapshots {
+            dataset: self.dataset_name.clone(),
+        };
+        // The outcome of the attempt whose write landed, or that found nothing to write.
+        let outcome = parking_lot::Mutex::new(None);
+        let release = |current: Option<SnapshotMetadata>| {
+            let mut metadata = current.ok_or_else(no_snapshots)?;
+            let dataset_entry = metadata
+                .datasets
+                .get_mut(&self.dataset_name)
+                .ok_or_else(no_snapshots)?;
+            let was_pinned = pin::pinned_snapshot_id(dataset_entry).is_some();
+            let changed = pin::unpin(dataset_entry);
+            let current_snapshot_id = dataset_entry.current_snapshot_id.ok_or_else(no_snapshots)?;
+            *outcome.lock() = Some(Unpinned {
+                was_pinned,
+                current_snapshot_id,
+            });
+            if !changed {
+                return Ok(None);
+            }
+            metadata.last_updated_ms = Utc::now().timestamp_millis();
+            Ok(Some(metadata))
+        };
+
+        let unpinned = |dataset: &DatasetMetadata| {
+            pin::pinned_snapshot_id(dataset).is_none()
+                && dataset.current_snapshot_id
+                    == dataset
+                        .snapshots
+                        .iter()
+                        .map(|entry| entry.snapshot_id)
+                        .max()
+        };
+        self.update_metadata_reporting(release, unpinned).await?;
+        let unpinned = outcome.into_inner().ok_or_else(no_snapshots)?;
+        if unpinned.was_pinned {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                "Unpinned dataset '{}': its current snapshot is {}, the newest.",
+                self.dataset_name,
+                unpinned.current_snapshot_id
+            );
+        }
+        Ok(unpinned)
+    }
+
+    /// Updates the metadata with `update` for the snapshot API. When the last attempt's
+    /// write may have landed with its response lost, whether the loop ran out of conflict
+    /// attempts or of network retries, reads once more and reports success if `in_place`
+    /// holds for the dataset.
+    async fn update_metadata_reporting(
+        &self,
+        update: impl Fn(Option<SnapshotMetadata>) -> Result<Option<SnapshotMetadata>, SnapshotApiError>,
+        in_place: impl Fn(&DatasetMetadata) -> bool,
+    ) -> Result<(), SnapshotApiError> {
+        let err = match self.update_metadata(update).await {
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
 
-        // The last attempt's write may have landed with its response lost, whether the
-        // loop ran out of conflict attempts or of network retries. Read once more before
-        // reporting a selection that is in place as failed.
         if matches!(
             err,
             MetadataUpdateError::Contention { .. }
@@ -4229,7 +4369,7 @@ impl SnapshotManager {
                 .metadata
                 .datasets
                 .get(&self.dataset_name)
-                .is_some_and(|dataset| dataset.current_snapshot_id == Some(snapshot_id))
+                .is_some_and(in_place)
         {
             return Ok(());
         }
@@ -4237,16 +4377,32 @@ impl SnapshotManager {
         Err(match err {
             MetadataUpdateError::Load(err) => err.into(),
             MetadataUpdateError::Update(err) => err,
-            MetadataUpdateError::Serialize(err) => write_error(err.to_string()),
-            MetadataUpdateError::Unversioned => write_error(
+            MetadataUpdateError::Serialize(err) => self.metadata_write_error(err.to_string()),
+            MetadataUpdateError::Unversioned => self.metadata_write_error(
                 "the object store returned neither an ETag nor a version for the snapshot metadata, so it cannot be updated without risking a concurrent writer's changes".to_string(),
             ),
-            MetadataUpdateError::Write(err) => write_error(err.to_string()),
-            MetadataUpdateError::Contention { attempts } => write_error(format!(
+            MetadataUpdateError::Write(err) => self.metadata_write_error(err.to_string()),
+            MetadataUpdateError::Contention { attempts } => self.metadata_write_error(format!(
                 "another writer changed the snapshot metadata before each of {attempts} attempts"
             )),
         })
     }
+
+    fn metadata_write_error(&self, reason: String) -> SnapshotApiError {
+        SnapshotApiError::WriteMetadata {
+            path: self.metadata_path().to_string(),
+            reason,
+        }
+    }
+}
+
+/// The outcome of [`SnapshotManager::unpin_current_snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unpinned {
+    /// Whether the dataset was pinned.
+    pub was_pinned: bool,
+    /// The snapshot that is current now: the newest.
+    pub current_snapshot_id: u64,
 }
 
 /// Errors that can occur when using the snapshot API.
@@ -4264,6 +4420,9 @@ pub enum SnapshotApiError {
 
     #[snafu(display("Snapshot {snapshot_id} not found for dataset {dataset}"))]
     SnapshotNotFound { dataset: String, snapshot_id: u64 },
+
+    #[snafu(display("Dataset {dataset} has no snapshots"))]
+    NoSnapshots { dataset: String },
 
     #[snafu(display(
         "Snapshot {snapshot_id} of dataset '{dataset}' cannot be made current: its file '{location}' is gone from the snapshot location, for example deleted by a bucket lifecycle rule. Choose a snapshot whose file exists."
@@ -5665,15 +5824,28 @@ mod tests {
         LoseFirstMetadataResponse,
         /// The first write of a conditional-write probe object fails transiently.
         FailFirstProbeWrite,
+        /// Before the first conditional write of `metadata.json`, runs the write set in
+        /// [`ScriptedStore::other_write`], as another writer would between this writer's
+        /// read and its write.
+        OtherWriteFirst,
     }
 
     /// An in-memory store that misbehaves in one scripted way.
-    #[derive(Debug)]
     struct ScriptedStore {
         inner: Arc<InMemory>,
         script: Script,
         /// The writes the script has applied to so far.
         scripted_writes: std::sync::atomic::AtomicUsize,
+        /// The write [`Script::OtherWriteFirst`] runs, taken when it runs.
+        other_write: tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+    }
+
+    impl std::fmt::Debug for ScriptedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ScriptedStore")
+                .field("script", &self.script)
+                .finish_non_exhaustive()
+        }
     }
 
     impl ScriptedStore {
@@ -5682,6 +5854,7 @@ mod tests {
                 inner: Arc::new(InMemory::new()),
                 script,
                 scripted_writes: std::sync::atomic::AtomicUsize::new(0),
+                other_write: tokio::sync::Mutex::new(None),
             }
         }
 
@@ -5738,6 +5911,13 @@ mod tests {
                         store: "ScriptedStore",
                         source: "connection reset after the write landed".into(),
                     })
+                }
+                Script::OtherWriteFirst if is_metadata && conditional => {
+                    let other_write = self.other_write.lock().await.take();
+                    if let Some(other_write) = other_write {
+                        other_write.await;
+                    }
+                    self.inner.put_opts(location, payload, opts).await
                 }
                 Script::FailFirstProbeWrite
                     if location.as_ref().contains(".spice-conditional-write-probe")
@@ -9338,6 +9518,7 @@ mod tests {
             .expect("get_snapshot_summary should succeed");
 
         assert_eq!(summary.current_snapshot_id, Some(100));
+        assert_eq!(summary.pinned_snapshot_id, Some(100));
 
         // Verify is_current flags are correct
         let snapshot_100 = summary
@@ -10558,6 +10739,284 @@ mod tests {
             .get(DATASET_NAME)
             .map(|dataset| dataset.properties.clone())
             .unwrap_or_default()
+    }
+
+    /// Writes `metadata.json` with `edit` applied to the dataset's entry.
+    async fn edit_dataset(
+        store: &InMemory,
+        metadata_path: &Path,
+        edit: impl FnOnce(&mut DatasetMetadata),
+    ) {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let mut metadata: SnapshotMetadata =
+            serde_json::from_slice(&bytes).expect("parse metadata");
+        edit(
+            metadata
+                .datasets
+                .get_mut(DATASET_NAME)
+                .expect("dataset in metadata"),
+        );
+        write_metadata(store, metadata_path, &metadata).await;
+    }
+
+    /// A rollback pins the dataset: a newer publish does not become current, the pinned
+    /// snapshot outlives the retention, and unpinning makes the newest one current.
+    #[tokio::test]
+    async fn a_pinned_snapshot_stays_current_until_the_dataset_is_unpinned() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let mut writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+
+        writer
+            .set_current_snapshot(0)
+            .await
+            .expect("pin snapshot 0");
+        writer.cleanup_clock = CleanupClock::ahead_by(15 * DAY);
+        publish_contents(&writer, &local_path, "publish 3", &schema).await;
+        assert_eq!(
+            current_snapshot_id(store.as_ref(), &metadata_path).await,
+            Some(0)
+        );
+        assert_eq!(
+            entry_ids(&dataset_entries(store.as_ref(), &metadata_path).await),
+            vec![0, 3],
+            "the pinned snapshot outlives the retention"
+        );
+        let summary = writer.get_snapshot_summary(10).await.expect("summary");
+        assert_eq!(summary.pinned_snapshot_id, Some(0));
+
+        assert_eq!(
+            writer.unpin_current_snapshot().await.expect("unpin"),
+            Unpinned {
+                was_pinned: true,
+                current_snapshot_id: 3
+            }
+        );
+        assert_eq!(
+            current_snapshot_id(store.as_ref(), &metadata_path).await,
+            Some(3)
+        );
+        assert_eq!(
+            writer.unpin_current_snapshot().await.expect("unpin again"),
+            Unpinned {
+                was_pinned: false,
+                current_snapshot_id: 3
+            }
+        );
+        publish_contents(&writer, &local_path, "publish 4", &schema).await;
+        assert_eq!(
+            current_snapshot_id(store.as_ref(), &metadata_path).await,
+            Some(4)
+        );
+    }
+
+    /// A publish and a pin that race on `metadata.json` both land: the one that writes
+    /// second reads the other's change and applies its own on top of it.
+    #[tokio::test]
+    async fn a_publish_and_a_pin_that_race_both_land() {
+        let schema = sample_schema();
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for pin_writes_first in [true, false] {
+            let store = Arc::new(ScriptedStore::new(Script::OtherWriteFirst));
+            let dir = TempDir::new().expect("tempdir");
+            let local_path = dir.path().join("accelerated.db");
+            let writer = build_manager_over(
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                local_path.clone(),
+                &schema,
+            );
+            for publish_number in 0..2 {
+                publish_contents(
+                    &writer,
+                    &local_path,
+                    &format!("publish {publish_number}"),
+                    &schema,
+                )
+                .await;
+            }
+
+            if pin_writes_first {
+                let other = build_manager_over(
+                    Arc::clone(&store.inner) as Arc<dyn ObjectStore>,
+                    dir.path().join("other.db"),
+                    &schema,
+                );
+                *store.other_write.lock().await = Some(Box::pin(async move {
+                    other.set_current_snapshot(0).await.expect("pin snapshot 0");
+                }));
+                publish_contents(&writer, &local_path, "publish 2", &schema).await;
+            } else {
+                // What a publish of snapshot 2 writes.
+                let (inner, path) = (Arc::clone(&store.inner), metadata_path.clone());
+                *store.other_write.lock().await = Some(Box::pin(async move {
+                    edit_dataset(&inner, &path, |dataset| {
+                        let mut entry = dataset.snapshots[1].clone();
+                        entry.snapshot_id = 2;
+                        dataset.snapshots.push(entry);
+                        dataset.current_snapshot_id = Some(2);
+                    })
+                    .await;
+                }));
+                writer
+                    .set_current_snapshot(0)
+                    .await
+                    .expect("pin snapshot 0");
+            }
+
+            assert!(store.other_write.lock().await.is_none(), "the race ran");
+            assert_eq!(
+                entry_ids(&dataset_entries(store.inner.as_ref(), &metadata_path).await),
+                vec![0, 1, 2],
+                "pin_writes_first: {pin_writes_first}"
+            );
+            assert_eq!(
+                current_snapshot_id(store.inner.as_ref(), &metadata_path).await,
+                Some(0),
+                "pin_writes_first: {pin_writes_first}"
+            );
+            assert_eq!(
+                dataset_properties(store.inner.as_ref(), &metadata_path)
+                    .await
+                    .get("pinned-snapshot-id")
+                    .map(String::as_str),
+                Some("0"),
+                "pin_writes_first: {pin_writes_first}"
+            );
+        }
+    }
+
+    /// A serving reader moves back to an older snapshot only when the dataset is pinned
+    /// to it; an older current snapshot without a pin is skipped.
+    #[tokio::test]
+    async fn a_serving_reader_loads_an_older_snapshot_only_when_it_is_pinned() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        let reader_dir = TempDir::new().expect("tempdir");
+        let reader = build_manager_for_engine(
+            Arc::clone(&store),
+            reader_dir.path().join("restored.db"),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+
+        // A version of Spice without pins rolled back to snapshot 0.
+        edit_dataset(store.as_ref(), &metadata_path, |dataset| {
+            dataset.current_snapshot_id = Some(0);
+        })
+        .await;
+        let poll = reader
+            .download_if_newer(Some(2), None, None)
+            .await
+            .expect("poll");
+        assert!(
+            poll.download.is_none(),
+            "an unpinned older snapshot is skipped"
+        );
+
+        writer
+            .set_current_snapshot(0)
+            .await
+            .expect("pin snapshot 0");
+        let poll = reader
+            .download_if_newer(Some(2), None, None)
+            .await
+            .expect("poll");
+        assert_eq!(poll.download.map(|info| info.snapshot_id), Some(0));
+    }
+
+    /// Under a pin, `fallback` tries only snapshots older than the pinned one, never the
+    /// newer snapshots published since.
+    #[tokio::test]
+    async fn fallback_under_a_pin_tries_only_older_snapshots() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        writer
+            .set_current_snapshot(1)
+            .await
+            .expect("pin snapshot 1");
+        let pinned = dataset_entries(store.as_ref(), &metadata_path).await[1].clone();
+        store
+            .delete(
+                &writer
+                    .snapshot_uri_to_object_path(&pinned.snapshot, None)
+                    .expect("snapshot path"),
+            )
+            .await
+            .expect("delete the pinned snapshot's file");
+
+        let reader_dir = TempDir::new().expect("tempdir");
+        let reader = build_manager_for_engine(
+            Arc::clone(&store),
+            reader_dir.path().join("restored.db"),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        let restored = reader
+            .download_latest_snapshot()
+            .await
+            .expect("bootstrap")
+            .expect("an older snapshot restored");
+        assert_eq!(restored.snapshot_id, 0);
     }
 
     /// A publish drops the snapshots older than 14 days but keeps their files for a day,
