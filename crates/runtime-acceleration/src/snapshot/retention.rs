@@ -32,7 +32,7 @@ use chrono::Utc;
 use super::{DatasetMetadata, SnapshotEntry};
 
 /// How long a dataset keeps a snapshot that is neither its current nor its newest.
-pub(super) const SNAPSHOT_RETENTION: Duration = Duration::from_hours(14 * 24);
+pub(super) const SNAPSHOT_RETENTION: Duration = Duration::from_hours(28 * 24);
 
 /// How long a dropped snapshot's file stays, so a reader that is still
 /// downloading it finishes. A file no entry names is deleted only once it is
@@ -204,23 +204,25 @@ mod tests {
         apply(dataset, NOW, gone, SNAPSHOT_RETENTION, FILE_GRACE)
     }
 
-    /// A snapshot exactly 14 days old stays; one a millisecond older is dropped,
-    /// and its drop time is recorded beside the properties already there.
+    /// A snapshot exactly 28 days old stays, as does a younger one; one a
+    /// millisecond older is dropped, and its drop time is recorded beside the
+    /// properties already there.
     #[test]
-    fn a_snapshot_older_than_fourteen_days_is_dropped_and_its_drop_recorded() {
+    fn a_snapshot_older_than_twenty_eight_days_is_dropped_and_its_drop_recorded() {
         let mut dataset = dataset(
             vec![
-                entry(1, 14 * DAY_MS + 1),
-                entry(2, 14 * DAY_MS),
-                entry(3, 0),
+                entry(1, 28 * DAY_MS + 1),
+                entry(2, 28 * DAY_MS),
+                entry(3, 20 * DAY_MS),
+                entry(4, 0),
             ],
-            3,
+            4,
         );
 
         let retention = apply_now(&mut dataset, &HashSet::new());
 
         assert_eq!(ids(&retention.aged_out), vec![1]);
-        assert_eq!(ids(&dataset.snapshots), vec![2, 3]);
+        assert_eq!(ids(&dataset.snapshots), vec![2, 3, 4]);
         assert_eq!(
             dataset.properties,
             HashMap::from([

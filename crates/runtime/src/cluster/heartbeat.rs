@@ -25,25 +25,37 @@ limitations under the License.
 //! `cluster.json` is treated as orphan and ignored — this lets a fresh
 //! process safely take over a crashed predecessor's `scheduler_id` even
 //! though the underlying object store has no conditional-delete primitive.
+//!
+//! A scheduler is gone once its heartbeat has lapsed: the reading process has
+//! seen the same version of the heartbeat object for the TTL the heartbeat
+//! carries, on its own monotonic clock ([`object_store_occ::lease::LapseClock`]).
+//! `last_heartbeat_ms` is the writer's wall clock and is never compared with
+//! the reader's, so clock skew between schedulers cannot make a live one look
+//! gone. A process that has just started has seen no version yet, so it judges
+//! no scheduler gone for its first TTL.
+//!
+//! A registered scheduler whose heartbeat file is missing counts as alive until
+//! the reader has seen the file missing for its TTL: the file of a scheduler
+//! that restarts under its name can be deleted by another scheduler's cleanup,
+//! and the scheduler writes it again at its next beat.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::UpdateVersion;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
+use object_store_occ::lease::{LapseClock, RenewClock};
 use object_store_occ::{ConditionalWriteError, Expected, conditional_put};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::cluster::cluster_state::{ClusterState, SchedulerId};
-
-/// Tolerated clock skew between schedulers when judging heartbeat
-/// freshness, in milliseconds.
-pub const CLOCK_SKEW_TOLERANCE_MS: u64 = 5_000;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -82,17 +94,25 @@ pub struct SchedulerHeartbeat {
     /// `cluster.json`. Mismatched heartbeats are filtered out as
     /// orphans by [`SchedulerHeartbeatStore::list_alive`].
     pub instance_id: Uuid,
+    /// The writer's wall clock when it wrote the beat, later than its previous
+    /// beat. Readers judge liveness by the object's version, not by this.
     pub last_heartbeat_ms: u64,
     pub ttl_ms: u64,
 }
 
-impl SchedulerHeartbeat {
-    /// Returns true if this heartbeat is older than its TTL plus the
-    /// configured clock-skew tolerance.
+/// A heartbeat as read, and how long the reading process has seen this
+/// version of it unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedHeartbeat {
+    pub beat: SchedulerHeartbeat,
+    pub unchanged_for: Duration,
+}
+
+impl ObservedHeartbeat {
+    /// Whether the heartbeat has lapsed: unchanged for its TTL.
     #[must_use]
-    pub fn is_stale(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.last_heartbeat_ms)
-            > self.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS)
+    pub fn lapsed(&self) -> bool {
+        self.unchanged_for >= Duration::from_millis(self.beat.ttl_ms)
     }
 }
 
@@ -107,6 +127,12 @@ pub struct SchedulerHeartbeatStore {
     store: Arc<dyn ObjectStore>,
     /// e.g. `prefix/heartbeats/` or `heartbeats/`. Always ends with `/`.
     prefix: String,
+    /// How long this process has seen each scheduler's heartbeat object, or
+    /// its absence under one registration, unchanged. Keyed by scheduler id.
+    lapse: LapseClock,
+    /// Renewal times of this process's heartbeats, so each beat it writes
+    /// changes the object's version.
+    renew: RenewClock,
 }
 
 impl SchedulerHeartbeatStore {
@@ -118,7 +144,42 @@ impl SchedulerHeartbeatStore {
         } else {
             format!("{trimmed}/heartbeats/")
         };
-        Self { store, prefix }
+        Self {
+            store,
+            prefix,
+            lapse: LapseClock::default(),
+            renew: RenewClock::default(),
+        }
+    }
+
+    /// Records a read of `scheduler_id`'s heartbeat object at `version`
+    /// (`None`: no object), started at `read_at`, and returns how long this
+    /// process has seen that version unchanged.
+    pub fn observe(
+        &self,
+        scheduler_id: &str,
+        version: Option<&UpdateVersion>,
+        read_at: Instant,
+    ) -> Duration {
+        self.lapse.observe(scheduler_id, version, read_at)
+    }
+
+    /// Records that `scheduler_id`, registered by `instance_id`, has no
+    /// heartbeat object in a listing started at `listed_at`, and returns how
+    /// long this process has seen it so. Absence under another registration is
+    /// another state, so each registration has its own TTL to publish its
+    /// first beat.
+    pub fn observe_missing(
+        &self,
+        scheduler_id: &str,
+        instance_id: Uuid,
+        listed_at: Instant,
+    ) -> Duration {
+        let absent = UpdateVersion {
+            e_tag: None,
+            version: Some(format!("absent; registered by {instance_id}")),
+        };
+        self.lapse.observe(scheduler_id, Some(&absent), listed_at)
     }
 
     /// Returns the full path for a given scheduler id.
@@ -226,20 +287,22 @@ impl SchedulerHeartbeatStore {
     /// the caller is still the registered incarnation. Callers that need
     /// ownership must check membership separately, as `write_heartbeat` does.
     ///
+    /// The beat carries a renewal time later than this process's previous
+    /// beat, so every write changes the object's version.
+    ///
     /// Returns the version of the object just written, so a caller can keep
     /// writing conditionally even while reads are failing.
     pub async fn heartbeat_if_unchanged(
         &self,
         scheduler_id: &str,
         instance_id: Uuid,
-        now_ms: u64,
         ttl_ms: u64,
         expected: Option<&UpdateVersion>,
     ) -> Result<Option<UpdateVersion>> {
         let beat = SchedulerHeartbeat {
             scheduler_id: scheduler_id.to_string(),
             instance_id,
-            last_heartbeat_ms: now_ms,
+            last_heartbeat_ms: u64::try_from(self.renew.next_ms()).unwrap_or_default(),
             ttl_ms,
         };
         let payload = serde_json::to_vec(&beat).context(SerdeSnafu)?;
@@ -310,9 +373,32 @@ impl SchedulerHeartbeatStore {
         }
     }
 
-    /// Lists every heartbeat present in the store. Always performs a
-    /// fresh `list` + `get`; never reads from a cache.
-    pub async fn list_all(&self) -> Result<HashMap<SchedulerId, SchedulerHeartbeat>> {
+    /// Lists the heartbeat files in the store, with the time the store last
+    /// wrote each.
+    pub async fn list_files(&self) -> Result<Vec<(SchedulerId, DateTime<Utc>)>> {
+        let prefix_path = Path::from(self.prefix.trim_end_matches('/'));
+        let mut stream = self.store.list(Some(&prefix_path));
+        let mut files = Vec::new();
+        while let Some(meta) = stream.next().await {
+            let meta = meta.map_err(|source| Error::List {
+                prefix: self.prefix.clone(),
+                source,
+            })?;
+            let path = meta.location.to_string();
+            if let Some(id) = path
+                .strip_prefix(&self.prefix)
+                .and_then(|rest| rest.strip_suffix(".json"))
+            {
+                files.push((id.to_string(), meta.last_modified));
+            }
+        }
+        Ok(files)
+    }
+
+    /// Lists every heartbeat present in the store, with how long this process
+    /// has seen each one unchanged. Always performs a fresh `list` + `get`;
+    /// never reads from a cache.
+    pub async fn list_all(&self) -> Result<HashMap<SchedulerId, ObservedHeartbeat>> {
         let prefix_path = Path::from(self.prefix.trim_end_matches('/'));
         let mut stream = self.store.list(Some(&prefix_path));
         let mut paths = Vec::new();
@@ -333,15 +419,27 @@ impl SchedulerHeartbeatStore {
             let Some(id) = rest.strip_suffix(".json") else {
                 continue;
             };
+            let read_at = Instant::now();
             match self.store.get(&path).await {
                 Ok(result) => {
+                    let version = UpdateVersion {
+                        e_tag: result.meta.e_tag.clone(),
+                        version: result.meta.version.clone(),
+                    };
                     let bytes = result.bytes().await.map_err(|source| Error::Read {
                         path: path_str.clone(),
                         source,
                     })?;
                     match serde_json::from_slice::<SchedulerHeartbeat>(&bytes) {
                         Ok(beat) => {
-                            out.insert(id.to_string(), beat);
+                            let unchanged_for = self.observe(id, Some(&version), read_at);
+                            out.insert(
+                                id.to_string(),
+                                ObservedHeartbeat {
+                                    beat,
+                                    unchanged_for,
+                                },
+                            );
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -367,26 +465,27 @@ impl SchedulerHeartbeatStore {
         Ok(out)
     }
 
-    /// Returns the heartbeats that are (a) registered in `cluster_state`,
-    /// (b) carry the matching `instance_id`, and (c) are not stale.
-    pub async fn list_alive(
-        &self,
-        now_ms: u64,
-        cluster_state: &ClusterState,
-    ) -> Result<HashMap<SchedulerId, SchedulerHeartbeat>> {
+    /// Returns the schedulers registered in `cluster_state` that are alive:
+    /// their heartbeat carries the matching `instance_id` and has not lapsed,
+    /// or they have no heartbeat file and this process has not yet seen it
+    /// missing for their TTL.
+    pub async fn list_alive(&self, cluster_state: &ClusterState) -> Result<HashSet<SchedulerId>> {
+        let listed_at = Instant::now();
         let all = self.list_all().await?;
-        let mut alive = HashMap::with_capacity(all.len());
-        for (id, beat) in all {
-            let Some(entry) = cluster_state.schedulers.get(&id) else {
-                continue;
+        let mut alive = HashSet::with_capacity(cluster_state.schedulers.len());
+        for (id, entry) in &cluster_state.schedulers {
+            let live = match all.get(id) {
+                Some(observed) => {
+                    entry.instance_id == observed.beat.instance_id && !observed.lapsed()
+                }
+                None => {
+                    self.observe_missing(id, entry.instance_id, listed_at)
+                        < Duration::from_millis(entry.ttl_ms)
+                }
             };
-            if entry.instance_id != beat.instance_id {
-                continue;
+            if live {
+                alive.insert(id.clone());
             }
-            if beat.is_stale(now_ms) {
-                continue;
-            }
-            alive.insert(id, beat);
         }
         Ok(alive)
     }
@@ -467,19 +566,92 @@ mod tests {
         assert_eq!(read.last_heartbeat_ms, 1000);
     }
 
-    #[tokio::test]
-    async fn list_alive_filters_stale() {
+    /// A heartbeat that keeps changing stays alive; one that stops changing
+    /// lapses once the reader has seen it unchanged for its TTL.
+    #[tokio::test(start_paused = true)]
+    async fn list_alive_drops_a_heartbeat_unchanged_for_its_ttl() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let s = SchedulerHeartbeatStore::new(Arc::clone(&store), "");
         let id_a = Uuid::new_v4();
         let id_b = Uuid::new_v4();
-        s.heartbeat("a", id_a, 100_000, 30_000).await.expect("a");
-        s.heartbeat("b", id_b, 1_000, 30_000).await.expect("b"); // stale
-
+        s.heartbeat("a", id_a, 1_000, 30_000).await.expect("a");
+        s.heartbeat("b", id_b, 1_000, 30_000).await.expect("b");
         let cluster = cluster_with(&[entry("a", id_a), entry("b", id_b)]).await;
-        let alive = s.list_alive(100_000, &cluster).await.expect("list");
-        assert!(alive.contains_key("a"));
-        assert!(!alive.contains_key("b"));
+
+        // A first read judges neither gone, however old their timestamps.
+        let alive = s.list_alive(&cluster).await.expect("list");
+        assert!(alive.contains("a") && alive.contains("b"));
+
+        // a renews every 10s; b stops.
+        for renewal in 1..=3_u64 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            s.heartbeat("a", id_a, 1_000 + renewal * 10_000, 30_000)
+                .await
+                .expect("a renews");
+            let alive = s.list_alive(&cluster).await.expect("list");
+            assert!(alive.contains("a"));
+            assert_eq!(alive.contains("b"), renewal < 3, "after {renewal}0s");
+        }
+    }
+
+    /// A scheduler registered without a heartbeat lapses after its TTL. A new
+    /// registration under the same id gets a TTL of its own.
+    #[tokio::test(start_paused = true)]
+    async fn list_alive_gives_each_registration_its_own_ttl_to_publish_a_beat() {
+        let s = SchedulerHeartbeatStore::new(Arc::new(InMemory::new()), "");
+        let first = cluster_with(&[entry("a", Uuid::new_v4())]).await;
+        assert!(s.list_alive(&first).await.expect("list").contains("a"));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(!s.list_alive(&first).await.expect("list").contains("a"));
+
+        let second = cluster_with(&[entry("a", Uuid::new_v4())]).await;
+        assert!(s.list_alive(&second).await.expect("list").contains("a"));
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(s.list_alive(&second).await.expect("list").contains("a"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!s.list_alive(&second).await.expect("list").contains("a"));
+    }
+
+    /// Liveness reads no wall clock: a scheduler whose clock is a minute behind
+    /// or ahead of the reader's stays alive while it renews.
+    #[tokio::test(start_paused = true)]
+    async fn list_alive_ignores_the_writers_clock() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let s = SchedulerHeartbeatStore::new(Arc::clone(&store), "");
+        let behind = Uuid::new_v4();
+        let ahead = Uuid::new_v4();
+        let cluster = cluster_with(&[entry("behind", behind), entry("ahead", ahead)]).await;
+        let reader_now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis(),
+        )
+        .expect("fits");
+        for renewal in 0..10_u64 {
+            s.heartbeat(
+                "behind",
+                behind,
+                reader_now - 60_000 + renewal * 10_000,
+                30_000,
+            )
+            .await
+            .expect("behind");
+            s.heartbeat(
+                "ahead",
+                ahead,
+                reader_now + 60_000 + renewal * 10_000,
+                30_000,
+            )
+            .await
+            .expect("ahead");
+            let alive = s.list_alive(&cluster).await.expect("list");
+            assert!(
+                alive.contains("behind") && alive.contains("ahead"),
+                "renewal {renewal}"
+            );
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -493,8 +665,8 @@ mod tests {
             .expect("a");
 
         let cluster = cluster_with(&[entry("a", cluster_id)]).await;
-        let alive = s.list_alive(100_000, &cluster).await.expect("list");
-        assert!(!alive.contains_key("a"));
+        let alive = s.list_alive(&cluster).await.expect("list");
+        assert!(!alive.contains("a"));
     }
 
     #[tokio::test]
