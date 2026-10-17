@@ -492,3 +492,53 @@ fn join_selection_keeps_the_order_of_a_join_with_a_dynamic_filter() {
     assert_eq!(kept.left().schema().field(0).name(), "big_col");
     assert_eq!(kept.dynamic_expressions_produced().len(), 1);
 }
+
+/// spiceai/datafusion#266. A grouped aggregate emits all of its groups as one
+/// batch and hands them on as `batch_size` slices of it, and each slice shares
+/// the whole batch's buffers. `ExternalSorter` must charge a slice for its own
+/// rows: charging every slice for the whole batch reserves memory quadratic in
+/// the group count, so `GROUP BY … ORDER BY` over many groups fails with
+/// `ResourcesExhausted` long before its rows fill the pool.
+///
+/// Spilling is disabled, so the sort has to fit in the pool or fail: the groups
+/// occupy about 4 MiB, which the pool holds several times over, while charging
+/// each of the 32 slices for the whole batch asks for about 128 MiB.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows() {
+    use datafusion::common::config::ConfigNonZeroUsize;
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+    const GROUPS: usize = 32 * 8192;
+    const POOL_BYTES: usize = 48 * 1024 * 1024;
+
+    let mut config = get_df_default_config();
+    config.options_mut().execution.target_partitions = 1;
+    config.options_mut().execution.batch_size =
+        ConfigNonZeroUsize::try_new(8192).expect("non-zero batch size");
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_limit(POOL_BYTES, 1.0)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .expect("runtime builds");
+    let ctx = SessionContext::new_with_config_rt(config, runtime);
+    run_statements(
+        &ctx,
+        &[&format!(
+            "CREATE TABLE sort_slices AS SELECT value AS k, value AS v FROM generate_series(1, {GROUPS})"
+        )],
+    )
+    .await;
+
+    let rows = answer(
+        &ctx,
+        "SELECT k, SUM(v) AS s FROM sort_slices GROUP BY k ORDER BY s DESC",
+    )
+    .await
+    .expect("the sort fits in the pool without spilling");
+    let expected: Vec<String> = (1..=GROUPS).rev().map(|k| format!("{k},{k}")).collect();
+    assert_eq!(rows.len(), GROUPS, "one row per group");
+    assert!(rows == expected, "groups sorted by their sum, descending");
+}

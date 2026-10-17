@@ -2159,9 +2159,10 @@ async fn duckdb_file_acceleration_set_operations_match_nulls() -> Result<(), Str
 
 /// A union input's own `ORDER BY` and `LIMIT` choose which of *that input's*
 /// rows reach the union, and must keep doing so when the union is federated.
-/// The unparser used to write them on the union's query, after the last
-/// operand, so they bounded the whole `UNION ALL`: `u UNION ALL` the top row of
-/// `v` came back as that one row (issue #14737).
+/// The unparser keeps them inside that input's own derived table; written on
+/// the union's query after the last operand, they would bound the whole
+/// `UNION ALL`, so `u UNION ALL` the top row of `v` would return that one row.
+/// Regression test for #14737 (spiceai/datafusion#261).
 ///
 /// Differential: each query also runs straight against the `DuckDB` file, and
 /// the federated answer must be the same multiset of rows. Each query must be
