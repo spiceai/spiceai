@@ -18,8 +18,8 @@ limitations under the License.
 //! with other instances through shared state.
 //!
 //! The identity is stable across restarts, so it tells instances apart but not
-//! two runs of one instance. A feature that must tell runs apart pairs it with a
-//! per-process id of its own.
+//! two runs of one instance. [`process_id`] tells runs apart: a feature that
+//! records which process holds shared state pairs the identity with it.
 
 use std::sync::LazyLock;
 
@@ -42,6 +42,15 @@ static INSTANCE_ID: LazyLock<String> = LazyLock::new(|| {
 #[must_use]
 pub fn instance_id() -> &'static str {
     &INSTANCE_ID
+}
+
+static PROCESS_ID: LazyLock<uuid::Uuid> = LazyLock::new(uuid::Uuid::now_v7);
+
+/// This process's id: a UUID created once per process, so two runs of one
+/// instance never share it.
+#[must_use]
+pub fn process_id() -> uuid::Uuid {
+    *PROCESS_ID
 }
 
 /// Resolves the identity from `env`, which returns a variable's value, falling
