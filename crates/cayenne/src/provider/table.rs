@@ -2182,12 +2182,17 @@ pub struct CayenneTableProvider {
     /// fire.
     #[cfg(test)]
     test_checkpoint_union_hook: Arc<ParkingMutex<Option<TestCheckpointUnionHook>>>,
-    /// Test-only seam fired after a full current-snapshot rewrite finishes its
-    /// off-fence re-encode and before it takes the listing fence to commit, so a
-    /// test can publish a protected snapshot the rewrite's scan never folded.
-    /// Consumed on first fire.
+    /// Test-only seam fired after a current-snapshot rewrite — the full rewrite or
+    /// the small-file subset rewrite — finishes its re-encode and before it takes
+    /// the locks it commits under, so a test can land a write the rewrite's scan
+    /// never read. Consumed on first fire.
     #[cfg(test)]
     test_pre_rewrite_commit_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a small-file pass has listed the current
+    /// snapshot and before it picks, so a test can land a file the listing did
+    /// not see. Consumed on first fire.
+    #[cfg(test)]
+    test_after_small_file_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only probe of the writer-concurrent full rewrite's capture, so a test
     /// can order a staged write's publish against it. Consumed on first fire.
     #[cfg(test)]
@@ -5628,6 +5633,13 @@ const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePo
     }
 }
 
+/// The bytes an append-only table's subset pass merges up to (see
+/// [`super::compaction::extend_candidate_to_bytes`]): a quarter of the Small tier's bound,
+/// 16 MiB at the default 256 MiB target file size.
+const fn append_only_merge_bytes(tiers: &super::compaction::CompactionTiers) -> u64 {
+    tiers.small_max_bytes / 4
+}
+
 /// Pure gate for the current-snapshot small-file **subset** rewrite (hardlink
 /// unpicked + re-encode only the picker candidate). Extracted so every branch
 /// is unit-testable without spinning a full provider.
@@ -5637,7 +5649,15 @@ const fn rewrite_write_policy(is_sorted: bool) -> super::delta_encoding::WritePo
 /// - no sort columns (subset hardlinks would break global sort attestation),
 /// - no protected snapshots (those are leveled by the protected-subset path;
 ///   folding them is the full rewrite's job),
-/// - candidate is a proper subset with at least 2 paths (amp win + meaningful merge).
+/// - candidate has at least 2 paths (a meaningful merge) and is a proper subset
+///   (the write-amplification win over the full rewrite), unless
+///   `append_only`.
+///
+/// `append_only` is a table with no primary key that holds no position deletes.
+/// Its subset commit carries the files appended during the encode and holds
+/// writers off only for the commit, while the full rewrite holds them off for
+/// the whole encode. So for such a table a candidate covering every current file
+/// still takes the subset rewrite: it is the full rewrite without the stall.
 #[must_use]
 const fn subset_rewrite_eligibility(
     is_position_delete: bool,
@@ -5645,11 +5665,12 @@ const fn subset_rewrite_eligibility(
     protected_snapshot_count: usize,
     candidate_paths: usize,
     total_current_files: usize,
+    append_only: bool,
 ) -> bool {
     if is_position_delete || has_sort_columns || protected_snapshot_count > 0 {
         return false;
     }
-    candidate_paths < total_current_files && candidate_paths >= 2
+    candidate_paths >= 2 && (candidate_paths < total_current_files || append_only)
 }
 
 /// Write-amplification ×100 (integer percent) of a full rewrite vs rewriting
@@ -9938,6 +9959,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_after_small_file_list_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12333,6 +12356,8 @@ impl CayenneTableProvider {
             test_checkpoint_union_hook: Arc::clone(&self.test_checkpoint_union_hook),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
+            #[cfg(test)]
+            test_after_small_file_list_hook: Arc::clone(&self.test_after_small_file_list_hook),
             #[cfg(test)]
             test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
             #[cfg(test)]
@@ -20812,6 +20837,7 @@ impl CayenneTableProvider {
         // guard, which then aborts instead of dropping the appended file.
         let (snapshot_id, generation_before, _source_pin) =
             self.pin_current_snapshot_for_compaction();
+        let credits_seen = self.new_files_since_last_compaction.load(Ordering::Acquire);
         // Recorded rather than propagated bare: this pass has no wrapper to
         // catch its errors (unlike the protected-snapshot merge and the bake), so
         // a listing failure would be the one exit that leaves no outcome — and
@@ -20828,6 +20854,11 @@ impl CayenneTableProvider {
                 return Err(e);
             }
         };
+        // A file published here is absent from `files` and present in the credit
+        // counter. Retirement must keep that credit, or the retry this pass's
+        // caller owes the file never runs.
+        #[cfg(test)]
+        self.run_test_after_small_file_list_hook().await;
         if files.len() < 2 {
             maintenance_metrics::track_compaction(
                 table_name,
@@ -20836,18 +20867,22 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
-        let Some(candidate) = pick_candidates(
-            files.iter().map(|(path, size)| FileEntry {
-                path: path.as_str(),
-                size_bytes: *size,
-            }),
-            &cfg,
-        ) else {
+        let Some(candidate) = self.pick_small_file_candidates(&files, &cfg) else {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
                 CompactionOutcome::DeclinedNoQualifyingTier,
             );
+            // Nothing a table with no primary key holds can merge until new files
+            // arrive; stop listing it on every trigger until they do.
+            if self.pk_deletion_strategy.is_position_based() {
+                self.retire_listed_small_file_credits(
+                    &snapshot_id,
+                    credits_seen,
+                    cfg.trigger_files,
+                )
+                .await;
+            }
             return Ok(false);
         };
 
@@ -20855,6 +20890,7 @@ impl CayenneTableProvider {
             number_picker_candidate_files: candidate.paths.len(),
             compaction_trigger_files: cfg.trigger_files,
         });
+        let candidate = self.append_only_merge_set(candidate, &files, &cfg);
 
         let total_bytes: u64 = files.iter().map(|(_, sz)| *sz).sum();
         let write_amp_x100 = subset_write_amp_x100(total_bytes, candidate.total_bytes);
@@ -20987,17 +21023,108 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Retire the small-file trigger credits a declined pass over `snapshot_id` covered, so
+    /// idle triggers stop listing a table that has nothing to merge.
+    ///
+    /// `credits_seen` was sampled before the pass listed the snapshot, and a write counts its
+    /// files only once they are in the snapshot directory, so each of those credits is a file
+    /// the listing saw and found nothing to merge with. Two groups are kept, and they add:
+    ///
+    /// - credits a write counted after the sample: its files were not in the listing, so they
+    ///   are still owed a pass. One such file is enough to qualify a tier the listing declined;
+    /// - up to `trigger_files - 1` of the sampled credits: the files the pass declined may be a
+    ///   file or two short of qualifying, so the next write must bring the count back to the
+    ///   trigger and admit a pass that re-checks them. Retiring every sampled credit would leave
+    ///   them unmerged until as many new files arrive as the trigger asks for, or for good on a
+    ///   table that goes idle.
+    ///
+    /// A file counted after the sample can be the one that qualifies the tier. Its credit has to
+    /// sit on top of the retained sampled credits, or the counter stays short of the trigger and
+    /// the retry that write already requested does not run.
+    ///
+    /// A replacement restarts the count, so nothing is retired once the snapshot changed; the
+    /// listing fence keeps one from landing in between.
+    async fn retire_listed_small_file_credits(
+        &self,
+        snapshot_id: &str,
+        credits_seen: usize,
+        trigger_files: usize,
+    ) {
+        let _fence = self.listing_fence.read().await;
+        if self.get_current_snapshot_id() != snapshot_id {
+            return;
+        }
+        let keep = trigger_files.saturating_sub(1);
+        let _ = self.new_files_since_last_compaction.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |credits| {
+                let post_sample = credits.saturating_sub(credits_seen);
+                let retained_sampled = credits.min(credits_seen).min(keep);
+                Some(post_sample.saturating_add(retained_sampled))
+            },
+        );
+    }
+
+    /// The picker's candidate for a small-file pass over `files`. A table with no primary key
+    /// also qualifies its Small tier by file count
+    /// ([`super::compaction::pick_append_only_candidates`]).
+    fn pick_small_file_candidates<'a>(
+        &self,
+        files: &'a [(String, u64)],
+        cfg: &super::compaction::CompactionPickerConfig,
+    ) -> Option<CompactionCandidate<&'a str>> {
+        let entries = files.iter().map(|(path, size)| FileEntry {
+            path: path.as_str(),
+            size_bytes: *size,
+        });
+        if self.pk_deletion_strategy.is_position_based() {
+            let entries: Vec<FileEntry<&str>> = entries.collect();
+            super::compaction::pick_append_only_candidates(&entries, cfg)
+        } else {
+            pick_candidates(entries, cfg)
+        }
+    }
+
+    /// The files a small-file pass merges: the picker's candidate, which an append-only table
+    /// (no primary key) extends to [`append_only_merge_bytes`] of its tier's next-smallest files
+    /// ([`super::compaction::extend_candidate_to_bytes`]).
+    fn append_only_merge_set<'a>(
+        &self,
+        candidate: CompactionCandidate<&'a str>,
+        files: &'a [(String, u64)],
+        cfg: &super::compaction::CompactionPickerConfig,
+    ) -> CompactionCandidate<&'a str> {
+        if !self.pk_deletion_strategy.is_position_based() {
+            return candidate;
+        }
+        super::compaction::extend_candidate_to_bytes(
+            candidate,
+            files,
+            &cfg.tiers,
+            append_only_merge_bytes(&cfg.tiers),
+        )
+    }
+
     fn can_subset_rewrite_current_small_files(
         &self,
         candidate: &CompactionCandidate<&str>,
         files: &[(String, u64)],
     ) -> bool {
+        // A table with no primary key holds only file-scoped position deletes. While it
+        // holds none it is an append-only table, and the subset rewrite's commit re-checks
+        // that with writers held off (`rewrite_current_snapshot_small_file_subset`), so a
+        // delete that lands during the pass aborts it rather than being lost.
+        let file_scoped_tombstones = self.should_capture_positions()
+            || (self.pk_deletion_strategy.is_position_based()
+                && self.has_rows_hidden_from_file_statistics());
         subset_rewrite_eligibility(
-            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based(),
+            file_scoped_tombstones,
             self.context.has_sort_columns() || self.context.has_cluster_by(),
             self.protected_snapshots.load().len(),
             candidate.paths.len(),
             files.len(),
+            self.pk_deletion_strategy.is_position_based(),
         )
     }
 
@@ -21102,11 +21229,32 @@ impl CayenneTableProvider {
             }
         };
 
-        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
-            false,
-            state.config().target_partitions(),
-            candidate.total_bytes,
-        );
+        // A table with no primary key holds no position deletes here (the caller admitted it
+        // only then), so it is append-only: the commit below carries the files appended during
+        // the encode instead of aborting on them.
+        let append_only = self.pk_deletion_strategy.is_position_based();
+        // Its merge encodes on one writer, as the full rewrite does. A fan-out merge of files
+        // that each filled a writer's first roll — the common shape once a table has been
+        // compacted — emits as many such files as it read, so the tier it merged qualifies
+        // again at once; one writer's files grow past it.
+        let (target_partitions, estimated_bytes, write_policy) = if append_only {
+            (
+                1,
+                None,
+                super::delta_encoding::WritePolicy::MAINTENANCE_SERIAL,
+            )
+        } else {
+            let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+                false,
+                state.config().target_partitions(),
+                candidate.total_bytes,
+            );
+            (
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WritePolicy::MAINTENANCE,
+            )
+        };
         let write_result = self
             .write_to_snapshot(
                 stream,
@@ -21114,7 +21262,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                write_policy,
             )
             .await;
 
@@ -21141,8 +21289,37 @@ impl CayenneTableProvider {
             self.evict_compaction_output_pages(&new_snapshot_id).await;
         }
 
+        #[cfg(test)]
+        self.run_test_pre_rewrite_commit_hook().await;
+
         // 4. Atomic publish: generation fence + pointer flip. Do NOT clear
         //    deletion caches — unpicked files may still need merge-on-read.
+        //
+        // An append-only table holds writers off from here through the flip, and reconciles
+        // the source snapshot with what the pass listed (`hold_writers_and_carry_appends`).
+        let (writer_guards, carried_files, generation_before) = if append_only {
+            match self
+                .hold_writers_and_carry_appends(files, source_snapshot_id, &new_snapshot_id, is_s3)
+                .await
+            {
+                Ok(Some((guards, carried_files, generation))) => {
+                    (Some(guards), carried_files, generation)
+                }
+                Ok(None) => {
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                        .await;
+                    return Err(e);
+                }
+            }
+        } else {
+            (None, 0, generation_before)
+        };
+        // Built after the guards, so a schema change that landed during the encode is in it.
         let new_listing_table = {
             let snapshot_dir_url = Self::snapshot_dir_url(
                 &self.table_metadata.path,
@@ -21173,6 +21350,8 @@ impl CayenneTableProvider {
             .merged_sequence_range_over_snapshots(&source_ids)
             .await
             .unwrap_or((0, self.table_metadata.current_sequence_number));
+        // The number of files the new snapshot holds, when the manifest listed them.
+        let mut new_snapshot_files = None;
         let manifest_authored = match self
             .upsert_snapshot_manifest_from_listing(
                 &new_snapshot_id,
@@ -21183,7 +21362,10 @@ impl CayenneTableProvider {
             )
             .await
         {
-            Ok(_files) => true,
+            Ok(listed) => {
+                new_snapshot_files = Some(listed.len());
+                true
+            }
             Err(error) => {
                 tracing::warn!(
                     target: "cayenne::compaction",
@@ -21254,9 +21436,27 @@ impl CayenneTableProvider {
 
             self.listing_table.store(new_listing_table);
             self.update_current_snapshot_id(&new_snapshot_id);
+            // An append-only table keeps the files this pass left unmerged on the trigger
+            // counter, so the next trigger takes them on rather than waiting for as many new
+            // files as the trigger asks for; every other table counts afresh.
+            let unmerged = if append_only {
+                unpicked.len() + carried_files
+            } else {
+                0
+            };
             self.new_files_since_last_compaction
-                .store(0, Ordering::Release);
+                .store(unmerged, Ordering::Release);
             drop(listing_guard);
+        }
+        drop(writer_guards);
+        // While a backlog remains, run the next pass now rather than at the next write or
+        // background tick — but only after a pass that merged its picked files into fewer, so
+        // a merge that cannot shrink its tier does not repeat back to back.
+        let merged_into_fewer = new_snapshot_files.is_some_and(|files| {
+            files.saturating_sub(unpicked.len() + carried_files) < candidate.paths.len()
+        });
+        if append_only && merged_into_fewer {
+            self.schedule_post_write_compaction();
         }
 
         // Commit succeeded: `new_snapshot_id` is now the only live snapshot (the
@@ -21317,6 +21517,118 @@ impl CayenneTableProvider {
             "Completed subset current-snapshot small-file rewrite"
         );
         Ok(true)
+    }
+
+    /// The append-only arm of the subset rewrite's commit
+    /// ([`Self::rewrite_current_snapshot_small_file_subset`]).
+    ///
+    /// Holds writers off — `write_lock`, which an append holds for its whole write, then
+    /// `visibility_lock` — and with them held reconciles the source snapshot with `files`,
+    /// the listing the pass picked from:
+    ///
+    /// - a pipelined append reserves its write under `write_lock` and publishes it later,
+    ///   under `write_lock` again, into the snapshot it reserved against, which a commit in
+    ///   between would have replaced. So the commit takes `write_lock` only once no such
+    ///   append is in flight, waiting them out first (they cannot publish while it holds the
+    ///   lock); the pass aborts if they keep it from that within
+    ///   [`STAGED_WRITE_DRAIN_TIMEOUT`];
+    /// - a position delete or a replacement that landed during the encode aborts the pass,
+    ///   and so does a listed file that is gone, which a file-unlinking retention delete
+    ///   removes: the encode read the rows it held;
+    /// - every file the source snapshot holds that `files` does not — an append, or an
+    ///   inline flush, which publishes a file without moving `current_dir_generation` — is
+    ///   linked into the new snapshot, so the pass publishes the source snapshot's whole
+    ///   live set.
+    ///
+    /// Returns the held guards, how many files it carried, and the generation the commit
+    /// fences on; `None` when the pass must abort.
+    async fn hold_writers_and_carry_appends(
+        &self,
+        files: &[(String, u64)],
+        source_snapshot_id: &str,
+        new_snapshot_id: &str,
+        is_s3: bool,
+    ) -> Result<Option<(PositionRewriteGuards, usize, u64)>> {
+        let table = self.table_metadata.table_name.as_str();
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        let write = loop {
+            if !self
+                .drain_inflight_staged_writes(deadline.saturating_duration_since(Instant::now()))
+                .await
+            {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table,
+                    "Aborting subset small-file rewrite: in-flight staged writes did not drain"
+                );
+                return Ok(None);
+            }
+            let write = self.write_lock_arc().lock_owned().await;
+            if !self.has_inflight_staging_appends() {
+                break write;
+            }
+            // An append reserved between the wait and the lock; let it publish.
+            drop(write);
+        };
+        let visibility = self.visibility_lock_arc().lock_owned().await;
+        let guards = PositionRewriteGuards {
+            _write: write,
+            _visibility: visibility,
+        };
+        if self.has_rows_hidden_from_file_statistics()
+            || self.get_current_snapshot_id() != source_snapshot_id
+        {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table,
+                "Aborting subset small-file rewrite: a delete or a replacement landed during the encode"
+            );
+            return Ok(None);
+        }
+        let generation = self.current_dir_generation.load(Ordering::Acquire);
+        let now = self
+            .list_snapshot_files_with_sizes(source_snapshot_id)
+            .await?;
+        let present: std::collections::HashSet<&str> =
+            now.iter().map(|(path, _)| path.as_str()).collect();
+        if let Some((removed, _)) = files
+            .iter()
+            .find(|(path, _)| !present.contains(path.as_str()))
+        {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table,
+                removed = removed.as_str(),
+                "Aborting subset small-file rewrite: a file it read was removed during the encode"
+            );
+            return Ok(None);
+        }
+        let listed: std::collections::HashSet<&str> =
+            files.iter().map(|(path, _)| path.as_str()).collect();
+        let appended: Vec<&str> = now
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .filter(|path| !listed.contains(*path))
+            .collect();
+        if appended.is_empty() {
+            return Ok(Some((guards, 0, generation)));
+        }
+        self.link_or_copy_snapshot_files(source_snapshot_id, new_snapshot_id, &appended)
+            .await?;
+        // The carried links are directory entries of the new snapshot, so they must be
+        // durable before the catalog points at it, as the encoded files are.
+        if !is_s3 {
+            Self::sync_snapshot_dir(&self.snapshot_dir_path_for(new_snapshot_id))
+                .await
+                .map_err(|source| Error::Catalog { source })?;
+        }
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table,
+            carried_files = appended.len(),
+            "Carrying files appended during the subset rewrite into its snapshot"
+        );
+        Ok(Some((guards, appended.len(), generation)))
     }
 
     /// Hard-link (local) or copy (S3 / cross-device) named basenames from
@@ -22870,6 +23182,7 @@ impl CayenneTableProvider {
         // commit guard — see `compact_current_snapshot_small_files`.
         let (snapshot_id, generation_before, _source_pin) =
             self.pin_current_snapshot_for_compaction();
+        let credits_seen = self.new_files_since_last_compaction.load(Ordering::Acquire);
         // Recorded rather than propagated bare, for the reason
         // `compact_current_snapshot_small_files` documents at the same call: this
         // pass has no wrapper to catch its errors, so a listing failure would be
@@ -22894,21 +23207,26 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         }
-        let Some(candidate) = pick_candidates(
-            files.iter().map(|(path, size)| FileEntry {
-                path: path.as_str(),
-                size_bytes: *size,
-            }),
-            &cfg,
-        ) else {
+        let Some(candidate) = self.pick_small_file_candidates(&files, &cfg) else {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
                 CompactionOutcome::DeclinedNoQualifyingTier,
             );
+            // Nothing a table with no primary key holds can merge until new files
+            // arrive; stop listing it on every trigger until they do.
+            if self.pk_deletion_strategy.is_position_based() {
+                self.retire_listed_small_file_credits(
+                    &snapshot_id,
+                    credits_seen,
+                    cfg.trigger_files,
+                )
+                .await;
+            }
             return Ok(false);
         };
 
+        let candidate = self.append_only_merge_set(candidate, &files, &cfg);
         let total_bytes: u64 = files.iter().map(|(_, sz)| *sz).sum();
         let write_amp_x100 = subset_write_amp_x100(total_bytes, candidate.total_bytes);
         tracing::debug!(
@@ -22923,7 +23241,7 @@ impl CayenneTableProvider {
             "Running tiered compaction pass"
         );
 
-        // Subset rewrite when safe (key-delete, no protected, proper subset);
+        // Subset rewrite when safe (`can_subset_rewrite_current_small_files`);
         // otherwise full snapshot re-encode (folds protected + clears DVs).
         if self.can_subset_rewrite_current_small_files(&candidate, &files) {
             match self
@@ -29753,6 +30071,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_post_snapshot_list_hook(&self) {
         let hook = self.test_post_snapshot_list_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-small-file-list hook, if one is
+    /// installed. See [`Self::test_after_small_file_list_hook`].
+    #[cfg(test)]
+    async fn run_test_after_small_file_list_hook(&self) {
+        let hook = self.test_after_small_file_list_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -43947,26 +44275,35 @@ mod tests {
     #[test]
     fn subset_rewrite_eligibility_covers_all_gate_branches() {
         // Happy path: key-delete, unsorted, no protected, proper subset ≥2.
-        assert!(subset_rewrite_eligibility(false, false, 0, 4, 10));
+        assert!(subset_rewrite_eligibility(false, false, 0, 4, 10, false));
         // Minimum candidate size (exactly 2) with one unpicked file.
-        assert!(subset_rewrite_eligibility(false, false, 0, 2, 3));
+        assert!(subset_rewrite_eligibility(false, false, 0, 2, 3, false));
 
         // Position-delete tables must full-rewrite.
-        assert!(!subset_rewrite_eligibility(true, false, 0, 4, 10));
+        assert!(!subset_rewrite_eligibility(true, false, 0, 4, 10, false));
         // Sort columns need a full ordered rewrite.
-        assert!(!subset_rewrite_eligibility(false, true, 0, 4, 10));
+        assert!(!subset_rewrite_eligibility(false, true, 0, 4, 10, false));
         // Protected snapshots are leveled by the protected-subset path.
-        assert!(!subset_rewrite_eligibility(false, false, 1, 4, 10));
-        assert!(!subset_rewrite_eligibility(false, false, 5, 4, 10));
+        assert!(!subset_rewrite_eligibility(false, false, 1, 4, 10, false));
+        assert!(!subset_rewrite_eligibility(false, false, 5, 4, 10, false));
         // Candidate covers every current file — no amp win, use full rewrite.
-        assert!(!subset_rewrite_eligibility(false, false, 0, 10, 10));
+        assert!(!subset_rewrite_eligibility(false, false, 0, 10, 10, false));
         // Candidate larger than files is impossible but must not enable subset.
-        assert!(!subset_rewrite_eligibility(false, false, 0, 11, 10));
+        assert!(!subset_rewrite_eligibility(false, false, 0, 11, 10, false));
         // Single-file candidate is not a meaningful merge.
-        assert!(!subset_rewrite_eligibility(false, false, 0, 1, 10));
-        assert!(!subset_rewrite_eligibility(false, false, 0, 0, 10));
+        assert!(!subset_rewrite_eligibility(false, false, 0, 1, 10, false));
+        assert!(!subset_rewrite_eligibility(false, false, 0, 0, 10, false));
         // Combined disqualifiers still false.
-        assert!(!subset_rewrite_eligibility(true, true, 3, 4, 10));
+        assert!(!subset_rewrite_eligibility(true, true, 3, 4, 10, false));
+
+        // An append-only table takes the subset rewrite for its whole file set too.
+        assert!(subset_rewrite_eligibility(false, false, 0, 10, 10, true));
+        assert!(subset_rewrite_eligibility(false, false, 0, 4, 10, true));
+        // ... but never for a single file, nor past the gates above.
+        assert!(!subset_rewrite_eligibility(false, false, 0, 1, 1, true));
+        assert!(!subset_rewrite_eligibility(true, false, 0, 10, 10, true));
+        assert!(!subset_rewrite_eligibility(false, true, 0, 10, 10, true));
+        assert!(!subset_rewrite_eligibility(false, false, 1, 10, 10, true));
     }
 
     /// A two-file subset candidate over the first two of `files`, for tests that
@@ -76851,6 +77188,8 @@ mod tests {
              discard its keyset, which rebuilds the whole keyset on every write"
         );
     }
+
+    mod append_only_compaction;
 
     mod auto_deletion_mode;
 
