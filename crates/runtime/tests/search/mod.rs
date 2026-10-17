@@ -871,6 +871,44 @@ pub(crate) async fn run_search(
         .await
 }
 
+/// `/v1/search` rejects empty and whitespace-only `text` with HTTP 400 before
+/// any dataset or embedding model is loaded.
+#[tokio::test]
+async fn search_rejects_empty_and_whitespace_text_with_http_400() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            let api_config = start_app(AppBuilder::new("search_empty_text").build()).await?;
+            let base_url = format!("http://{}", api_config.http_bind_address);
+
+            for text in ["", "   ", "\t\n "] {
+                let mut headers = HeaderMap::new();
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                let err = http_post(
+                    &format!("{base_url}/v1/search"),
+                    &json!({
+                        "datasets": ["products"],
+                        "text": text,
+                        "limit": 3
+                    })
+                    .to_string(),
+                    headers,
+                )
+                .await
+                .expect_err("empty text must be rejected");
+                assert_eq!(
+                    err.to_string(),
+                    "HTTP error: 400 Bad Request - Search text must not be empty",
+                    "text={text:?}"
+                );
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// Sanitize file paths in physical plans for deterministic snapshots.
 /// Replaces absolute file paths with placeholders.
 fn sanitize_cayenne_file_paths(plan: &str) -> String {
