@@ -21,6 +21,7 @@ arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64.workspace = true
+blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 data_components = { path = "../data_components" }
@@ -46,12 +47,14 @@ hash-index = { path = "../hash-index" }
 key-index = { path = "../key-index" }
 im = "15.1"
 object_store = { workspace = true }
+object_store_occ = { path = "../object_store_occ" }
 parking_lot = { workspace = true }
+postcard = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
 telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }

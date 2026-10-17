@@ -48,6 +48,8 @@ arrow-schema.workspace = true
 arrow_tools = { path = "../../arrow_tools" }
 futures.workspace = true
 spicepod = { path = "../../spicepod" }
+object_store_occ = { path = "../../object_store_occ" }
+runtime-state-location = { path = "../../runtime-state-location" }
 tracing.workspace = true
 byte-unit.workspace = true
 cpu-budget = { path = "../../cpu-budget" }

@@ -317,6 +317,13 @@ impl DuckDBAccelerator {
                     detail: Arc::from(e.to_string()),
                 });
             }
+            (_, Mode::Datalake) => {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "`mode: datalake` is supported by `engine: cayenne` only. Set `engine: cayenne`, or use `mode: file`.",
+                    ),
+                });
+            }
         };
 
         Ok(pool)
@@ -1201,6 +1208,7 @@ impl DataAccelerator for DuckDBAccelerator {
                     .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
                     .await;
             }
+            Mode::Datalake => return Err("`mode: datalake` is supported by `engine: cayenne` only. Set `engine: cayenne`, or use `mode: file`.".into()),
         }
 
         provider_factory().await

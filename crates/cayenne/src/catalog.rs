@@ -267,6 +267,14 @@ pub enum CatalogError {
         table_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// The catalog's authoritative copy in object storage (`mode: datalake`)
+    /// could not be read or written. The message names the location.
+    #[snafu(transparent)]
+    DurableCatalog {
+        #[snafu(source(from(crate::metastore::durable::Error, Box::new)))]
+        source: Box<crate::metastore::durable::Error>,
+    },
 }
 
 /// Result type for catalog operations.

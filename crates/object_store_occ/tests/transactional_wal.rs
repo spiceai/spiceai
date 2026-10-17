@@ -1103,3 +1103,105 @@ async fn inconsistent_checkpoint_metadata_fails_even_with_valid_content_digest()
         println!("checkpoint metadata={damage}: recovery rejected");
     }
 }
+
+fn entries(snapshot: &Snapshot) -> Vec<(String, Bytes)> {
+    snapshot
+        .scan_prefix("")
+        .map(|(key, value)| (key.to_owned(), value.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn advanced_snapshot_matches_recovery_and_keeps_occ() {
+    let state = memory();
+    let writer = open(Arc::clone(&state)).await;
+    let mut tx = writer.begin().await.expect("begin");
+    tx.put("a", Bytes::from_static(b"1")).expect("buffer a");
+    tx.put("b", Bytes::from_static(b"2")).expect("buffer b");
+    let attempt = tx.prepare().await.expect("prepare");
+    let (outcome, successor) = writer
+        .commit_and_advance(&attempt)
+        .await
+        .expect("commit and advance");
+    committed(&outcome);
+    let successor = successor.expect("a committed attempt yields its successor");
+
+    // The successor is the version a fresh recovery reads, with no recovery.
+    let recovered = writer.snapshot().await.expect("recover");
+    assert_eq!(successor.sequence(), 1);
+    assert_eq!(entries(&successor), entries(&recovered));
+
+    // Chained commits from successors, deletes included, never re-recover.
+    let mut tx = successor.transaction();
+    tx.delete("a").expect("buffer delete");
+    tx.put("c", Bytes::new()).expect("buffer empty value");
+    let attempt = tx.prepare().await.expect("prepare second");
+    let (outcome, successor) = writer
+        .commit_and_advance(&attempt)
+        .await
+        .expect("second commit");
+    committed(&outcome);
+    let successor = successor.expect("second successor");
+    assert_eq!(successor.sequence(), 2);
+    assert_eq!(
+        entries(&successor),
+        vec![
+            ("b".to_owned(), Bytes::from_static(b"2")),
+            ("c".to_owned(), Bytes::new()),
+        ]
+    );
+    assert_eq!(
+        entries(&successor),
+        entries(&writer.snapshot().await.expect("recover second"))
+    );
+
+    // A successor is still a snapshot: another client's commit fences it.
+    let other = open(state).await;
+    committed(
+        &other
+            .commit(&prepare(&other, "d", b"4").await)
+            .await
+            .expect("other commit"),
+    );
+    let mut tx = successor.transaction();
+    tx.put("e", Bytes::from_static(b"5")).expect("buffer e");
+    let fenced = tx.prepare().await.expect("prepare fenced attempt");
+    let (outcome, successor) = writer
+        .commit_and_advance(&fenced)
+        .await
+        .expect("stale commit");
+    assert!(matches!(outcome, CommitOutcome::Conflict), "{outcome:?}");
+    assert!(successor.is_none(), "a conflict has no successor");
+}
+
+#[tokio::test]
+async fn advance_recovers_when_a_later_commit_replaced_the_head() {
+    let (writer, state, _faults) = fault_store().await;
+    let attempt = prepare(&writer, "a", b"1").await;
+    committed(&writer.commit(&attempt).await.expect("commit"));
+    // Resubmitting the same committed attempt resolves it as committed, but the
+    // head now names a later publication, so the successor comes from recovery.
+    let other = WalStateStore::open(state, Path::from("domain"), Limits::default())
+        .await
+        .expect("open other");
+    committed(
+        &other
+            .commit(&prepare(&other, "b", b"2").await)
+            .await
+            .expect("other commit"),
+    );
+    let (outcome, successor) = writer
+        .commit_and_advance(&attempt)
+        .await
+        .expect("advance after replacement");
+    committed(&outcome);
+    let successor = successor.expect("recovered successor");
+    assert_eq!(successor.sequence(), 2);
+    assert_eq!(
+        entries(&successor),
+        vec![
+            ("a".to_owned(), Bytes::from_static(b"1")),
+            ("b".to_owned(), Bytes::from_static(b"2")),
+        ]
+    );
+}

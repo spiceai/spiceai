@@ -249,6 +249,13 @@ impl SqliteAccelerator {
                 datafusion_table_providers::sql::db_connection_pool::Mode::File
             }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
+            Mode::Datalake => {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(
+                        "`mode: datalake` is supported by `engine: cayenne` only. Set `engine: cayenne`, or use `mode: file`.",
+                    ),
+                });
+            }
         };
 
         let storage = if matches!(
@@ -691,6 +698,7 @@ impl DataAccelerator for SqliteAccelerator {
                     .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
                     .await;
             }
+            Mode::Datalake => return Err("`mode: datalake` is supported by `engine: cayenne` only. Set `engine: cayenne`, or use `mode: file`.".into()),
         }
 
         provider_factory().await

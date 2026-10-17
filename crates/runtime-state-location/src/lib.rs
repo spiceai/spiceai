@@ -177,6 +177,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The `runtime.state` folder holding `mode: datalake` Cayenne tables.
+pub const CAYENNE_STATE_FOLDER: &str = "cayenne";
+
 /// A runtime feature that keeps shared state in a state location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StateFeature {
@@ -187,6 +190,9 @@ pub enum StateFeature {
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
+    /// `mode: datalake` Cayenne tables without a `cayenne_datalake_location`,
+    /// each under `cayenne/<dataset>/`.
+    Cayenne,
 }
 
 impl StateFeature {
@@ -219,6 +225,7 @@ impl StateFeature {
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
             Self::StartupCheck => "_spice",
+            Self::Cayenne => CAYENNE_STATE_FOLDER,
         }
     }
 
@@ -229,6 +236,7 @@ impl StateFeature {
             Self::ResultsCacheWarmup => "SQL results cache warmup state",
             Self::Snapshots => "snapshot",
             Self::StartupCheck => "shared state location check",
+            Self::Cayenne => "Cayenne datalake table",
         }
     }
 
@@ -241,6 +249,7 @@ impl StateFeature {
             Self::ResultsCacheWarmup => "SQL results cache warmup",
             Self::Snapshots => "acceleration snapshots",
             Self::StartupCheck => "the startup check",
+            Self::Cayenne => "Cayenne datalake tables",
         }
     }
 
@@ -251,7 +260,11 @@ impl StateFeature {
         match (self, source) {
             (Self::Snapshots, _) | (_, StateSource::RuntimeState) => &SNAPSHOT_S3_PARAMETERS,
             (
-                Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck,
+                Self::Scheduler
+                | Self::RateControl
+                | Self::ResultsCacheWarmup
+                | Self::StartupCheck
+                | Self::Cayenne,
                 _,
             ) => &S3_PARAMETERS,
         }

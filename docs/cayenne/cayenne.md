@@ -83,7 +83,7 @@ Most of Cayenne's design follows from a single discipline: **the expensive part 
 
 Everything below — the tiers, the locks, the deletion index, the CDC pipeline — is machinery in service of that one idea.
 
-## Storage modes: `mode: file` vs `mode: memory`
+## Storage modes: `mode: file`, `mode: memory` and `mode: datalake`
 
 Acceleration `mode:` selects how Cayenne persists data. This is distinct from
 `cdc_durability: memory` (a durability deferral on an otherwise file-backed table).
@@ -115,6 +115,37 @@ acceleration that sets neither `engine` nor `mode` selects fully in-RAM Cayenne.
   multiple of its real size equal to its buffer count. The per-table cap, the process-global `MemTierBudget` and its query-pool mirror all
   charge this figure. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
+
+- **`mode: datalake`** (durable in object storage): the whole table, catalog
+  included, lives under one root in object storage —
+  `<cayenne_datalake_location>/<dataset>/`, or `<runtime.state.location>/cayenne/<dataset>/`
+  when that param is unset — with `catalog/`, `warm/` (the data directory) and the
+  datalake tier's `<table>-<table_id>/` beneath it. Local disk holds only a replica of
+  the catalog under `<metadata_dir>/datalake/<dataset>/cayenne.db`. Every catalog
+  transaction is captured on the metastore's single writer connection as an exact
+  row-level change set (`SQLite`'s pre-update hook: rowid tables by rowid, `WITHOUT
+  ROWID` tables by primary key, SQL-computed values recorded as stored), committed to
+  object storage first, and only then committed locally; a change object storage did not
+  accept rolls the local transaction back, so nothing is acknowledged that the local
+  disk alone holds. Opening the catalog restores the replica — keeping a local file that
+  is already a prefix of the durable state, else downloading the newest catalog image —
+  and applies the change sets that follow, so a restart on an empty volume finds every
+  acknowledged row. The change sets live in *epochs*, one `WalStateStore` domain each,
+  sealed and replaced every few dozen commits by a rotation that uploads a fresh image
+  (taken from a read connection, without blocking writers); the epoch and image two
+  rotations back are deleted, which keeps object storage bounded and every domain far
+  inside the WAL's replay and history limits. A seal fences any other process still
+  committing to the old epoch, so a second writer stops with an error instead of
+  diverging. Supported locations: `s3://` (S3 or an S3-compatible store that enforces
+  `If-None-Match`/`If-Match`, probed at registration) and a `file://`
+  `runtime.state.location`, whose data directory is local. Requires the `SQLite`
+  metastore; partitioning is rejected; snapshots are skipped; an existing `mode: file`
+  table for the dataset is refused rather than stranded beside a new one.
+
+Source (datalake): `crates/accelerators/accelerator-cayenne/src/datalake.rs` (root and
+store resolution), `crates/cayenne/src/metastore/durable/` (`changes.rs` capture and
+replay, `log.rs` epochs and rotation, `mod.rs` replica recovery), and `DurableCommit` in
+`crates/cayenne/src/metastore/sqlite.rs`.
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,

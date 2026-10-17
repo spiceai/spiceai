@@ -176,6 +176,9 @@ pub enum Mode {
     /// If the source schema is incompatible (non-additive change), snapshot (if enabled)
     /// and recreate the acceleration file from scratch.
     FileUpdate,
+    /// The whole table, catalog included, lives in object storage; local disk
+    /// is a cache (Cayenne only).
+    Datalake,
 }
 
 impl From<spicepod_acceleration::Mode> for Mode {
@@ -185,6 +188,7 @@ impl From<spicepod_acceleration::Mode> for Mode {
             spicepod_acceleration::Mode::File => Mode::File,
             spicepod_acceleration::Mode::FileCreate => Mode::FileCreate,
             spicepod_acceleration::Mode::FileUpdate => Mode::FileUpdate,
+            spicepod_acceleration::Mode::Datalake => Mode::Datalake,
         }
     }
 }
@@ -200,6 +204,7 @@ impl From<Mode> for spicepod_acceleration::Mode {
             Mode::File => spicepod_acceleration::Mode::File,
             Mode::FileCreate => spicepod_acceleration::Mode::FileCreate,
             Mode::FileUpdate => spicepod_acceleration::Mode::FileUpdate,
+            Mode::Datalake => spicepod_acceleration::Mode::Datalake,
         }
     }
 }
@@ -211,6 +216,7 @@ impl Display for Mode {
             Mode::File => write!(f, "file"),
             Mode::FileCreate => write!(f, "file_create"),
             Mode::FileUpdate => write!(f, "file_update"),
+            Mode::Datalake => write!(f, "datalake"),
         }
     }
 }
@@ -642,7 +648,8 @@ impl Acceleration {
     /// See [`CAYENNE_DATALAKE_SNAPSHOT_REASON`] for the wording that explains it.
     #[must_use]
     pub fn uses_cayenne_datalake(&self) -> bool {
-        self.engine == Engine::Cayenne && self.cayenne_datalake_location().is_some()
+        self.engine == Engine::Cayenne
+            && (self.mode == Mode::Datalake || self.cayenne_datalake_location().is_some())
     }
 
     /// The `cayenne_datalake_location` parameter, trimmed, when it is set. A non-empty

@@ -335,6 +335,7 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
                     AccelerationMode::File
                         | AccelerationMode::FileCreate
                         | AccelerationMode::FileUpdate
+                        | AccelerationMode::Datalake
                 );
             if !acceleration.enabled || !(declared_cayenne_file || reads_snapshots(dataset)) {
                 return None;

@@ -19,6 +19,7 @@ limitations under the License.
 // the same hardware-derived profile this accelerator path uses.
 pub(crate) mod autotune;
 mod change_sink;
+mod datalake;
 mod imds;
 pub mod partitioned_insert_strategy;
 pub mod s3;
@@ -87,6 +88,9 @@ pub enum Error {
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(transparent)]
+    Datalake { source: datalake::Error },
 
     #[snafu(display(
         "Failed to configure dataset {table_name} (cayenne): Invalid 'cayenne_scan_concurrency' value '{value}'. \
@@ -468,12 +472,18 @@ pub(crate) fn transform_schema_for_vortex(
     }
 }
 
+/// A lazily initialized catalog, shared by every table that opens it.
+type CatalogCell = Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>;
+
 pub struct CayenneAccelerator {
     catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
     /// Separate catalog for `mode: memory` (in-RAM) tables, backed by an in-memory
     /// `SQLite` `memdb` metastore. File-mode and memory-mode tables cannot share one
     /// metastore (memory-mode data must never touch disk), so memory tables use this.
     memory_catalog: Arc<OnceCell<Arc<dyn cayenne::MetadataCatalog>>>,
+    /// One catalog per `mode: datalake` dataset, keyed by its replica's
+    /// connection string: each table's catalog is durable at its own location.
+    datalake_catalogs: parking_lot::Mutex<HashMap<String, CatalogCell>>,
     /// Process-unique id for this accelerator instance, used to name the in-memory
     /// `memdb` metastore so separate instances (e.g. per-test runtimes) never share
     /// one in-memory database.
@@ -1542,6 +1552,7 @@ impl CayenneAccelerator {
         Self {
             catalog: Arc::new(OnceCell::new()),
             memory_catalog: Arc::new(OnceCell::new()),
+            datalake_catalogs: parking_lot::Mutex::new(HashMap::new()),
             instance_id: CAYENNE_ACCELERATOR_INSTANCE_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
@@ -1581,6 +1592,10 @@ impl CayenneAccelerator {
                 dataset: Arc::from(source.name().to_string()),
             });
         };
+
+        if datalake::is_datalake(source) {
+            return Ok(datalake::Root::resolve(source)?.data_dir());
+        }
 
         let acceleration_params = acceleration.params.clone();
         let dataset_name = source.name().to_string().replace(['.', '/'], "_");
@@ -2817,6 +2832,39 @@ impl CayenneAccelerator {
         Self::init_cayenne_catalog(&self.catalog, connection_string).await
     }
 
+    /// Get or create the catalog of a `mode: datalake` table, durable at
+    /// `location` and replicated locally under `metadata_dir`.
+    async fn get_or_create_datalake_catalog(
+        &self,
+        metadata_dir: &str,
+        source: &dyn AccelerationSource,
+        location: cayenne::metastore::durable::CatalogLocation,
+    ) -> Result<Arc<dyn cayenne::MetadataCatalog>> {
+        let replica = datalake::replica_path(metadata_dir, source);
+        let connection_string = format!("sqlite://{}", replica.display());
+        let cell = Arc::clone(
+            self.datalake_catalogs
+                .lock()
+                .entry(connection_string.clone())
+                .or_default(),
+        );
+        cell.get_or_try_init(move || async move {
+            let catalog = Arc::new(
+                cayenne::CayenneCatalog::new_durable(connection_string, location)
+                    .boxed()
+                    .context(AccelerationInitializationFailedSnafu)?,
+            ) as Arc<dyn cayenne::MetadataCatalog>;
+            catalog
+                .init()
+                .await
+                .boxed()
+                .context(AccelerationInitializationFailedSnafu)?;
+            Ok::<_, Error>(catalog)
+        })
+        .await
+        .map(Arc::clone)
+    }
+
     /// Get or create the shared in-memory (`memdb`) catalog for `mode: memory`
     /// tables. The DSN uses `SQLite`'s `memdb` VFS keyed by this accelerator's
     /// instance id, so the metastore lives entirely in RAM (nothing on disk) and
@@ -2948,8 +2996,24 @@ impl CayenneAccelerator {
         // metastore (nothing on disk) and no metadata directory. File mode creates
         // the metadata dir and uses the shared on-disk catalog as before.
         let memory_mode = !source.is_file_accelerated();
+        let datalake = if datalake::is_datalake(source) {
+            if metastore_type != "sqlite" {
+                return Err(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Failed to register dataset '{table_name}' (cayenne): `mode: datalake` keeps its catalog with the SQLite metastore; remove `cayenne_metastore: {metastore_type}`."
+                    )),
+                });
+            }
+            let root = datalake::Root::resolve(source)?;
+            Some((datalake::open(source, &root).await?, root))
+        } else {
+            None
+        };
         let catalog = if memory_mode {
             self.get_or_create_memory_catalog().await?
+        } else if let Some((opened, _)) = &datalake {
+            self.get_or_create_datalake_catalog(&metadata_dir, source, opened.catalog.clone())
+                .await?
         } else {
             // Ensure metadata directory exists
             tokio::fs::create_dir_all(&metadata_dir)
@@ -3022,6 +3086,15 @@ impl CayenneAccelerator {
         // it), so skip this entirely — memory-mode data lives only in RAM.
         let object_store = if memory_mode {
             None
+        } else if let Some((opened, root)) = &datalake {
+            vortex_config
+                .cold_tier_location
+                .clone_from(&opened.cold_location);
+            tracing::info!(
+                "Dataset '{table_name}' keeps its table in {} (`mode: datalake`).",
+                root.url()
+            );
+            opened.data_store.clone()
         } else {
             s3::build_s3_object_store(source, self.cayenne_data_dir(source)?)
                 .await
@@ -3128,7 +3201,17 @@ impl CayenneAccelerator {
         }
         // Datalake (cold) tier object store: built from the dedicated
         // `cayenne_datalake_s3_*` params (default `iam_role` auth falls back to environment/SDK credentials).
-        let cold_object_store = if table_options.vortex_config.cold_tier_enabled()
+        let datalake_cold_store = datalake.as_ref().and_then(|(opened, root)| {
+            let data = opened.data_store.as_ref()?;
+            opened.cold_location.as_ref()?;
+            Some(cayenne::metadata::ObjectStoreConfig {
+                url: url::Url::parse(root.url()).ok()?,
+                store: Arc::clone(&data.store),
+            })
+        });
+        let cold_object_store = if datalake.is_some() {
+            datalake_cold_store
+        } else if table_options.vortex_config.cold_tier_enabled()
             && table_options
                 .vortex_config
                 .cold_tier_location
@@ -3764,6 +3847,13 @@ impl DataAccelerator for CayenneAccelerator {
             return true; // memory mode Vortex is always initialized
         }
 
+        // A datalake table lives in object storage, and its catalog opens (and
+        // restores itself) when the table is created; local disk may hold
+        // nothing yet, as on a new volume.
+        if datalake::is_datalake(source) {
+            return datalake::Root::resolve(source).is_ok();
+        }
+
         // S3 Express One Zone paths are always considered initialized
         // (the bucket/prefix is assumed to exist or will be created by the object store)
         if s3::is_s3_express_data_path(source) {
@@ -3817,7 +3907,15 @@ impl DataAccelerator for CayenneAccelerator {
                 })?;
 
             let metadata_dir = Self::resolve_metadata_dir(source.acceleration());
-            let metadata_db_path = format!("{metadata_dir}/cayenne.db");
+            // A datalake table keeps its checkpoint in its own catalog replica,
+            // which every catalog image carries to object storage.
+            let metadata_db_path = if datalake::is_datalake(source) {
+                datalake::replica_path(&metadata_dir, source)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                format!("{metadata_dir}/cayenne.db")
+            };
 
             if open_option == OpenOption::OpenExisting && !path_exists(&metadata_db_path).await {
                 return Err(CheckpointError::Store {
@@ -3883,6 +3981,12 @@ impl DataAccelerator for CayenneAccelerator {
         if !source.is_file_accelerated() {
             return Ok(());
         }
+        if datalake::is_datalake(source) {
+            // The table's data and catalog are in object storage; there is no
+            // local data directory to guard.
+            datalake::Root::resolve(source).map_err(Error::from)?;
+            return Ok(());
+        }
 
         if let Some(acceleration) = source.acceleration() {
             // Validate S3 Express One Zone configuration - only one method allowed
@@ -3931,6 +4035,26 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         self.validate_init(source).await?;
         if !source.is_file_accelerated() {
+            return Ok(BootstrapStatus::none());
+        }
+        if datalake::is_datalake(source) {
+            // A datalake table is restored from its own location when its
+            // catalog opens, never from a snapshot.
+            let shared = PathBuf::from(Self::resolve_metadata_dir(source.acceleration()))
+                .join(METASTORE_DB_FILE);
+            datalake::ensure_no_file_table(source, shared)
+                .await
+                .map_err(Error::from)?;
+            // Restore the catalog replica now, before the runtime reads the
+            // dataset checkpoint it holds, so a new volume starts like the old.
+            let root = datalake::Root::resolve(source).map_err(Error::from)?;
+            let opened = datalake::open(source, &root).await.map_err(Error::from)?;
+            self.get_or_create_datalake_catalog(
+                &Self::resolve_metadata_dir(source.acceleration()),
+                source,
+                opened.catalog,
+            )
+            .await?;
             return Ok(BootstrapStatus::none());
         }
         let dir_path = self.file_path(source)?;
@@ -4207,6 +4331,13 @@ impl DataAccelerator for CayenneAccelerator {
         // partitioned memory table would fall through to the durable Vortex path and
         // silently write to disk. Reject it up front rather than half-configuring an
         // on-disk partitioned table.
+        if datalake::is_datalake(source) && !partition_by.is_empty() {
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(
+                    "Cayenne `mode: datalake` is not supported with partitioning yet. Remove partition_by, or use `mode: file` for a partitioned accelerator.",
+                ),
+            }));
+        }
         if memory_mode && !partition_by.is_empty() {
             return Err(Box::new(Error::InvalidConfiguration {
                 detail: Arc::from(
@@ -4710,6 +4841,15 @@ impl DataAccelerator for CayenneAccelerator {
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // A datalake table's catalog and files are in object storage, which
+        // this teardown does not reach; refuse rather than leave either behind.
+        if datalake::is_datalake(source) {
+            return Err(Box::new(Error::InvalidConfiguration {
+                detail: Arc::from(format!(
+                    "Failed to rebuild dataset '{table_name}' (cayenne): a `mode: datalake` table cannot be dropped and recreated yet. Revert the change that requires the rebuild, or remove the table from its location to start over. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                )),
+            }));
+        }
         let dir_path = self.cayenne_data_dir(source).boxed()?;
 
         // A schema rebuild reaches this without going through `init`, so the
@@ -4946,6 +5086,22 @@ impl DataAccelerator for CayenneAccelerator {
             tracing::debug!("Cayenne accelerator shutdown: complete");
         } else {
             tracing::debug!("Cayenne catalog was never initialized, skipping shutdown");
+        }
+
+        // Each `mode: datalake` table has its own catalog; shutting it down lets
+        // a compaction of its log in object storage finish.
+        let datalake_catalogs: Vec<_> = self
+            .datalake_catalogs
+            .lock()
+            .iter()
+            .filter_map(|(replica, cell)| Some((replica.clone(), Arc::clone(cell.get()?))))
+            .collect();
+        for (replica, catalog) in datalake_catalogs {
+            if let Err(e) = catalog.shutdown().await {
+                tracing::warn!(
+                    "Failed to shut down the `mode: datalake` catalog replica '{replica}', so its next start replays more of its log. Cause: {e}"
+                );
+            }
         }
 
         Ok(())

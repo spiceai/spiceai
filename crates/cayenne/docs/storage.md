@@ -8,6 +8,8 @@ What Cayenne persists, and where. Cayenne splits storage across **two stores plu
 | **Data lake** (local FS / S3 Express One Zone) | immutable **Vortex** data files + Arrow-IPC deletion files, grouped under per-snapshot directories | atomic file rename + snapshot-pointer flip |
 | **LSM level-0** | small writes absorbed as Arrow-IPC blobs in the metastore (`cayenne_inlined_*`) and, under the CDC profile, an in-RAM mem-tier | metastore tier is durable; RAM tier is discarded on crash and re-streamed exactly-once |
 
+> **`mode: datalake`:** the metastore is a local replica of a catalog whose authoritative copy is in object storage (`crates/cayenne/src/metastore/durable/`). Each transaction's row changes are committed there before the local `COMMIT`, and a replica is rebuilt from the latest catalog image plus the change sets after it. The replica also holds `cayenne_durable_position`, a one-row table recording the durable version it is at; it is local bookkeeping, outside `EXPECTED_TABLES`, and never replicated.
+
 > **Source of truth:** the DDL in `crates/cayenne/src/metastore/sqlite.rs` (mirrored verbatim in `turso.rs`) and the column lists in `metastore::EXPECTED_TABLES`. `validate_existing_schema` checks **column names and ordering** at startup (types are not compared — SQLite/libSQL type affinity makes exact matching unreliable). This document reflects the 11 tables in `EXPECTED_TABLES`.
 
 ---
