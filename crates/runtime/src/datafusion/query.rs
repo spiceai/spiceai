@@ -4487,6 +4487,37 @@ mod tests {
     /// A lookup of a few rows by primary key runs on the interactive runtime, so it
     /// answers while every worker of the CPU runtime is busy with other work; a
     /// query that is not one still queues on the CPU runtime.
+    /// Runtime workers a test holds until it opens.
+    #[derive(Default)]
+    struct WorkerGate {
+        open: parking_lot::Mutex<bool>,
+        opened: parking_lot::Condvar,
+    }
+
+    impl WorkerGate {
+        fn wait(&self) {
+            let mut open = self.open.lock();
+            while !*open {
+                self.opened.wait(&mut open);
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// Opens its gate when dropped, so a test that fails while it holds runtime
+    /// workers unwinds instead of hanging at runtime teardown.
+    struct OpenOnDrop(Arc<WorkerGate>);
+
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_key_lookup_answers_while_the_cpu_runtime_is_busy() {
         use datafusion::common::{Constraint, Constraints};
@@ -4553,16 +4584,19 @@ mod tests {
             .register_table("keyed", Arc::new(keyed))
             .expect("register the table");
 
-        // Hold every worker of the CPU runtime until `release`.
+        // Hold every worker of the CPU runtime until the gate opens. It also opens
+        // when this test unwinds, so a failed assertion below fails the test
+        // instead of leaving it hung on blocked workers at runtime teardown.
         let workers = cpu_handle.metrics().num_workers();
-        let release = Arc::new(std::sync::Barrier::new(workers + 1));
+        let gate = Arc::new(WorkerGate::default());
+        let _open_on_unwind = OpenOnDrop(Arc::clone(&gate));
         let held = Arc::new(AtomicUsize::new(0));
         for _ in 0..workers {
-            let release = Arc::clone(&release);
+            let gate = Arc::clone(&gate);
             let held = Arc::clone(&held);
             cpu_handle.spawn(async move {
                 held.fetch_add(1, Ordering::SeqCst);
-                release.wait();
+                gate.wait();
             });
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -4618,7 +4652,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let scan_finished_while_held = scan.is_finished();
-        release.wait();
+        gate.open();
 
         let lookup = lookup.expect("a key lookup must answer while the CPU runtime is busy");
         assert_eq!(int64_values(&lookup), vec![70, 90], "the lookup's rows");
