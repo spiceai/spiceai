@@ -559,6 +559,26 @@ fn create_response_stream(
                             // Reset the idle timeout on each received message
                             deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
 
+                            if message.app_metadata.as_ref() == crate::flight::ABANDON_APP_METADATA {
+                                let message = format!("The writer abandoned the write to dataset '{path}'.");
+                                tracing::warn!(dataset = %path, "{message}");
+                                // The write fails through its input and is driven until it has
+                                // discarded what it received, with no time limit: a write dropped
+                                // midway can still commit it, as a dual write's source insert does.
+                                let failed = batch_tx.send(Err(DataFusionError::Execution(message.clone())));
+                                let mut abandoned = std::pin::pin!(futures::future::join(failed, &mut write_future));
+                                let abandon_start = std::time::Instant::now();
+                                while tokio::time::timeout(std::time::Duration::from_secs(30), &mut abandoned).await.is_err() {
+                                    tracing::warn!(
+                                        dataset = %path,
+                                        waited_s = abandon_start.elapsed().as_secs(),
+                                        "DoPut abandoned write still pending",
+                                    );
+                                }
+                                yield Err(Status::aborted(message));
+                                break;
+                            }
+
                             // Skip keepalive messages — these are heartbeats from
                             // write-through forwarding to prevent the idle timeout.
                             if message.app_metadata.as_ref() == crate::flight::KEEPALIVE_APP_METADATA {

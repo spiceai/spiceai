@@ -1405,6 +1405,7 @@ fn get_partitions_from_store(
     // coordinator's joins) come from the reports each executor sends for the
     // slice of the table it serves (see `handle_executor_statistics`).
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+    let mut holders: HashMap<PartitionKey, Vec<&str>> = HashMap::new();
     let mut covered: Vec<PartitionValue> = Vec::new();
     let mut covered_keys: HashSet<PartitionKey> = HashSet::new();
     let mut uncovered: Vec<PartitionKey> = Vec::new();
@@ -1422,6 +1423,7 @@ fn get_partitions_from_store(
                 continue;
             }
             served = true;
+            holders.entry(key.clone()).or_default().push(executor_id);
             executor_partition_map
                 .entry(executor_id.clone())
                 .or_default()
@@ -1474,19 +1476,37 @@ fn get_partitions_from_store(
         total
     );
 
+    // Each partition is read from one selected executor, so a scan filtered to the
+    // partitions its executor serves returns no partition twice.
+    let mut to_read: HashMap<&str, Vec<PartitionValue>> = HashMap::new();
+    for partition_value in &covered {
+        let reader = holders
+            .get(&partition_key(partition_value))
+            .and_then(|ids| {
+                ids.iter()
+                    .find(|id| selected_executors.iter().any(|selected| selected == **id))
+            });
+        if let Some(reader) = reader {
+            to_read
+                .entry(*reader)
+                .or_default()
+                .push(partition_value.clone());
+        }
+    }
+
     let providers = selected_executors
-        .into_iter()
+        .iter()
         .filter_map(|executor_id| {
-            let (_, client) = executors.get(&executor_id)?;
-            let partition_values = executor_partition_map.remove(&executor_id)?;
+            let (_, client) = executors.get(executor_id)?;
+            let partition_values = to_read.remove(executor_id.as_str())?;
             // Stamp the executor-reported statistics onto this leaf scan so the
             // coordinator's planner can size joins. Project the reported per-column
             // stats onto the leaf's (possibly projected) schema by name, carrying
             // num_rows and per-column min/max.
             let statistics =
-                stamp_executor_statistics(executor_statistics, &executor_id, table, schema);
+                stamp_executor_statistics(executor_statistics, executor_id, table, schema);
             let provider = flight_sql_table_provider(
-                &executor_id,
+                executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
@@ -1556,6 +1576,8 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             .cloned()
             .unwrap_or_default();
 
+        // Each scan is filtered to the partitions its executor serves: an executor can
+        // hold rows of other partitions, such as a table it loaded whole.
         Ok(get_partitions_from_store(
             &self.partition_store,
             &executors,
@@ -1565,10 +1587,7 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             self.node_id.as_deref(),
             None,
         )?
-        .providers
-        .into_iter()
-        .map(|(provider, _)| (provider, vec![]))
-        .collect())
+        .providers)
     }
 }
 
@@ -2169,6 +2188,50 @@ mod tests {
             .resolve_accelerated_partitions(&table, &id_schema(), false)
             .expect("a table that is not discovered resolves");
         assert_eq!(partitions.len(), 1);
+    }
+
+    /// Each executor of a federated table is read for the partitions it serves,
+    /// so a scan filtered to them returns none of the rows it holds for others.
+    #[tokio::test]
+    async fn federated_scans_carry_the_partitions_their_executor_serves() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        ready_executor(&registry, "executor-2", "").await;
+        let table = TableReference::full("ice", "ns", "t");
+        let store = registry.federated_partition_store();
+        store
+            .initialize_metadata(&table, vec!["region".to_string()])
+            .await
+            .expect("initialize");
+        let region = |value: &str| HashMap::from([("region".to_string(), Some(value.to_string()))]);
+        let (east, west, north) = (region("'east'"), region("'west'"), region("'north'"));
+        store
+            .add_and_assign_partitions(
+                &table,
+                &[
+                    (&east, "executor-1"),
+                    (&west, "executor-2"),
+                    (&north, "executor-1"),
+                ],
+            )
+            .await
+            .expect("assign");
+
+        let mut served: Vec<Vec<String>> = FederatedPartitionProvider::from_registry(&registry)
+            .get_partitions(&table, &id_schema())
+            .expect("resolve")
+            .into_iter()
+            .map(|(_, values)| {
+                let mut regions: Vec<String> = values
+                    .iter()
+                    .filter_map(|value| value.get("region").cloned().flatten())
+                    .collect();
+                regions.sort();
+                regions
+            })
+            .collect();
+        served.sort();
+        assert_eq!(served, [vec!["'east'", "'north'"], vec!["'west'"]]);
     }
 
     async fn ready_executor(registry: &ExecutorRegistry, executor_id: &str, process_id: &str) {
