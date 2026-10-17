@@ -397,7 +397,8 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 /// is read the way SQLite reads a URI: its filename ends at a `?` query or `#`
 /// fragment and its percent escapes are decoded, while a plain path is read as
 /// written. `file:meta%2Fone` is therefore `meta/one/cayenne.db`, not the literal
-/// `meta%2Fone/cayenne.db`. A URI's query options are part of what it names, since
+/// `meta%2Fone/cayenne.db`, and a decoded `%00` ends the filename (see
+/// [`decode_uri_part`]). A URI's query options are part of what it names, since
 /// they can choose another database for the same file (`mode=memory` opens no file
 /// at all), so two URIs name one metastore only when their options match too. A URI
 /// whose escapes do not decode to UTF-8 is compared by its decoded bytes, which no
@@ -419,7 +420,7 @@ fn comparable_metastore_dir(dir: &str) -> ComparableMetastore {
         Some((filename, options)) => (filename, Some(options.to_string())),
         None => (without_fragment, None),
     };
-    let decoded: Vec<u8> = percent_encoding::percent_decode_str(filename).collect();
+    let decoded = decode_uri_part(filename);
     if file_uri_opens_no_file(&decoded, options.as_deref()) {
         return ComparableMetastore::AsWritten(catalog);
     }
@@ -444,11 +445,18 @@ fn file_uri_opens_no_file(filename: &[u8], options: Option<&str>) -> bool {
         .flat_map(|options| options.split('&'))
         .any(|option| {
             let (key, value) = option.split_once('=').unwrap_or((option, ""));
-            let decode =
-                |part: &str| -> Vec<u8> { percent_encoding::percent_decode_str(part).collect() };
-            let key = decode(key);
-            key == b"vfs" || (key == b"mode" && decode(value) == b"memory")
+            let key = decode_uri_part(key);
+            key == b"vfs" || (key == b"mode" && decode_uri_part(value) == b"memory")
         })
+}
+
+/// A `file:` URI's filename, option key or option value with its percent escapes
+/// decoded the way SQLite decodes them: a decoded `%00` ends it, and the rest of it
+/// is ignored, so `file::memory:%00tail` opens `:memory:`.
+fn decode_uri_part(part: &str) -> Vec<u8> {
+    percent_encoding::percent_decode_str(part)
+        .take_while(|&byte| byte != 0)
+        .collect()
 }
 
 /// A metastore directory as [`comparable_metastore_dir`] compares it.
@@ -1181,6 +1189,21 @@ mod tests {
             .is_some()
         );
         assert!(conflict("file::memory:#", &format!("file:{cwd}/:memory:#")).is_some());
+        // SQLite ends a filename, option key or option value at a decoded `%00`.
+        assert!(
+            conflict(
+                "file::memory:%00tail",
+                &format!("file:{cwd}/:memory:%00tail")
+            )
+            .is_some()
+        );
+        assert!(
+            conflict(
+                "file:meta/./shared?mode=memory%00suffix&cache=shared&unused=",
+                "file:meta/shared?mode=memory%00suffix&cache=shared&unused=",
+            )
+            .is_some()
+        );
         assert!(
             conflict(
                 "file:/meta/shared?vfs=memdb&unused=",
