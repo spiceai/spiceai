@@ -33,7 +33,7 @@ use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
-use spicepod::component::runtime::{StateLocation, StateSource};
+use spicepod::component::runtime::{SCHEDULER_STATE_FOLDER, StateLocation, StateSource};
 use spicepod::component::snapshot::SNAPSHOTS_STATE_FOLDER;
 use spicepod::param::Params;
 use tokio::runtime::Handle;
@@ -41,6 +41,8 @@ use tokio::sync::RwLock;
 use url::Url;
 
 mod check;
+pub mod metrics;
+pub mod scheduler_deprecation;
 
 pub use check::{
     CheckError, FORMAT_FILE, FORMAT_VERSION, RUNTIME_STATE_DOCS, StateLocationCheck, check_location,
@@ -69,8 +71,9 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(s3_parameters
 /// snapshot location's S3 event notifications.
 pub const SNAPSHOT_QUEUE_URL_PARAM: &str = "queue_url";
 
-/// A snapshot location's S3 parameters: the state location's, and the queue that
-/// receives its S3 event notifications.
+/// The S3 parameters of a snapshot location and of `runtime.state`: the state
+/// location's, and the queue that receives the snapshot location's S3 event
+/// notifications. Only snapshots read the queue.
 static SNAPSHOT_S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut parameters = s3_parameters();
     parameters.push(
@@ -187,10 +190,31 @@ pub enum StateFeature {
 }
 
 impl StateFeature {
+    pub const ALL: [Self; 5] = [
+        Self::Scheduler,
+        Self::RateControl,
+        Self::ResultsCacheWarmup,
+        Self::Snapshots,
+        Self::StartupCheck,
+    ];
+
+    /// The feature's `feature` label on the state-store metrics. `None` for the
+    /// startup check, which is not measured: it runs before the metrics exist.
+    #[must_use]
+    pub fn metric_label(self) -> Option<&'static str> {
+        match self {
+            Self::Scheduler => Some("scheduler"),
+            Self::RateControl => Some("rate_control"),
+            Self::ResultsCacheWarmup => Some("results_cache_warmup"),
+            Self::Snapshots => Some("snapshots"),
+            Self::StartupCheck => None,
+        }
+    }
+
     /// The folder the feature writes under in a `runtime.state` location.
     fn folder(self) -> &'static str {
         match self {
-            Self::Scheduler => "cluster",
+            Self::Scheduler => SCHEDULER_STATE_FOLDER,
             Self::RateControl => "rate-control",
             Self::ResultsCacheWarmup => "results-cache",
             Self::Snapshots => SNAPSHOTS_STATE_FOLDER,
@@ -221,12 +245,15 @@ impl StateFeature {
     }
 
     /// The S3 parameters the feature's `params` are validated against.
-    fn s3_parameters(self) -> &'static [ParameterSpec] {
-        match self {
-            Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck => {
-                &S3_PARAMETERS
-            }
-            Self::Snapshots => &SNAPSHOT_S3_PARAMETERS,
+    /// `runtime.state.params` also hold the snapshot queue (`s3_queue_url`), which
+    /// the other features accept and do not use.
+    fn s3_parameters(self, source: StateSource) -> &'static [ParameterSpec] {
+        match (self, source) {
+            (Self::Snapshots, _) | (_, StateSource::RuntimeState) => &SNAPSHOT_S3_PARAMETERS,
+            (
+                Self::Scheduler | Self::RateControl | Self::ResultsCacheWarmup | Self::StartupCheck,
+                _,
+            ) => &S3_PARAMETERS,
         }
     }
 
@@ -254,6 +281,9 @@ impl StateFeature {
 /// location's path; for the scheduler, rate control and warmup on `abfs://` and
 /// `abfss://` that is the container root, whatever path the URL has.
 ///
+/// Every request through the store is recorded in the state-store
+/// [`metrics`] under `feature`'s label, when it has one.
+///
 /// `s3://`, `abfs://`, `abfss://`, `gs://` and `file://` locations build the
 /// same store for every feature. A snapshot location with another scheme is
 /// built by `object_store`'s URL parsing; other features resolve it through the
@@ -264,6 +294,16 @@ impl StateFeature {
 /// Returns an error when the location is not a valid URL, its `params` are
 /// invalid, or the store cannot be built.
 pub async fn build_object_store(
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+    state: &StateLocation,
+    feature: StateFeature,
+) -> Result<(Arc<dyn ObjectStore>, String)> {
+    let (store, prefix) = build_unmetered_object_store(secrets, io_runtime, state, feature).await?;
+    Ok((metrics::metered(store, feature), prefix))
+}
+
+async fn build_unmetered_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,
@@ -321,7 +361,9 @@ pub async fn build_object_store(
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
         let params = params.map(Params::as_string_map);
-        let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref(), feature).await?;
+        let s3_params =
+            build_s3_parameters(Arc::clone(&secrets), params.as_ref(), feature, state.source)
+                .await?;
 
         S3ObjectStoreBuilder::from_url(&url, io_runtime)
             .context(S3ObjectStoreInitSnafu {
@@ -383,8 +425,8 @@ pub async fn build_object_store(
     Ok((store, base_prefix))
 }
 
-/// Validates an `s3://` location's `params` against `feature`'s S3 parameters,
-/// resolving `${ secrets:… }` references.
+/// Validates an `s3://` location's `params`, given by `source`, against
+/// `feature`'s S3 parameters, resolving `${ secrets:… }` references.
 ///
 /// An invalid parameter is an error, not a reason to fall back to the defaults:
 /// the defaults drop every other parameter too, the endpoint, the region and the
@@ -397,9 +439,10 @@ pub async fn build_s3_parameters<S: BuildHasher>(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<&HashMap<String, String, S>>,
     feature: StateFeature,
+    source: StateSource,
 ) -> Result<Parameters> {
     let usage = feature.usage();
-    let s3_parameters = feature.s3_parameters();
+    let s3_parameters = feature.s3_parameters(source);
     match params {
         Some(params) => {
             let params: HashMap<String, String> = params
@@ -481,7 +524,7 @@ async fn build_secret_resolved_parameters(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use object_store_occ::{ObjectState, UpdateResult, WriteResult};
+    use object_store_occ::{InsertResult, ObjectState, UpdateResult};
     use runtime_secrets::ClusterSecretExpander;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
@@ -651,24 +694,28 @@ mod tests {
         let initial = TestState { value: 1 };
         assert_eq!(
             first_writer
-                .insert_or_update("origin", &initial)
+                .insert("origin", &initial)
                 .await
                 .expect("initial write failed"),
-            WriteResult::Inserted
+            InsertResult::Ok
         );
 
-        assert_eq!(
-            second_writer
-                .get("origin")
-                .await
-                .expect("second writer get failed"),
-            Some(initial)
-        );
+        let (read, stale_version) = second_writer
+            .get_with_version("origin")
+            .await
+            .expect("second writer get failed")
+            .expect("origin exists");
+        assert_eq!(read, initial);
 
+        let (_, version) = first_writer
+            .get_with_version("origin")
+            .await
+            .expect("first writer get failed")
+            .expect("origin exists");
         let remote_update = TestState { value: 2 };
         assert_eq!(
             first_writer
-                .update("origin", &remote_update)
+                .update_with_version("origin", &remote_update, version)
                 .await
                 .expect("first writer update failed"),
             UpdateResult::Ok
@@ -676,12 +723,12 @@ mod tests {
 
         let stale_update = TestState { value: 3 };
         let result = second_writer
-            .insert_or_update("origin", &stale_update)
+            .update_with_version("origin", &stale_update, stale_version)
             .await
             .expect("stale write failed");
 
         match result {
-            WriteResult::Conflict { current } => assert_eq!(current, remote_update),
+            UpdateResult::Conflict { current } => assert_eq!(current, remote_update),
             other => panic!("expected Conflict, got {other:?}"),
         }
     }
@@ -755,9 +802,14 @@ mod tests {
             "${ secrets:S3_SECRET }".to_string(),
         );
 
-        let s3_params = build_s3_parameters(secrets, Some(&params), StateFeature::RateControl)
-            .await
-            .expect("S3 parameters should validate");
+        let s3_params = build_s3_parameters(
+            secrets,
+            Some(&params),
+            StateFeature::RateControl,
+            StateSource::RuntimeState,
+        )
+        .await
+        .expect("S3 parameters should validate");
         let secret_map = s3_params.to_secret_map();
 
         assert_eq!(
@@ -775,9 +827,14 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("s3_auth".to_string(), "not-valid".to_string());
 
-        let err = build_s3_parameters(secrets(), Some(&params), StateFeature::RateControl)
-            .await
-            .expect_err("invalid S3 parameters should fail");
+        let err = build_s3_parameters(
+            secrets(),
+            Some(&params),
+            StateFeature::RateControl,
+            StateSource::RuntimeState,
+        )
+        .await
+        .expect_err("invalid S3 parameters should fail");
 
         assert!(matches!(err, Error::S3ParameterValidation { .. }));
     }
@@ -973,6 +1030,48 @@ mod tests {
         assert_eq!(scheduler_prefix, "");
     }
 
+    /// `runtime.state.params` hold the snapshot queue, so every feature that reads
+    /// them accepts `s3_queue_url`. A feature's own `params` take it only for
+    /// snapshots.
+    #[tokio::test]
+    async fn runtime_state_params_take_the_snapshot_queue_for_every_feature() {
+        let queue_url = "https://sqs.us-east-1.amazonaws.com/123456789012/snapshots";
+        let params = HashMap::from([("s3_queue_url".to_string(), queue_url.to_string())]);
+        let queue = |parameters: &Parameters| {
+            parameters
+                .to_secret_map()
+                .get(SNAPSHOT_QUEUE_URL_PARAM)
+                .map(|url| url.expose_secret().to_string())
+        };
+
+        for feature in [
+            StateFeature::Scheduler,
+            StateFeature::RateControl,
+            StateFeature::ResultsCacheWarmup,
+            StateFeature::Snapshots,
+        ] {
+            let parameters =
+                build_s3_parameters(secrets(), Some(&params), feature, StateSource::RuntimeState)
+                    .await
+                    .expect("runtime.state S3 parameters should validate");
+            assert_eq!(
+                queue(&parameters).as_deref(),
+                Some(queue_url),
+                "{feature:?}"
+            );
+        }
+
+        let scheduler_setting = build_s3_parameters(
+            secrets(),
+            Some(&params),
+            StateFeature::Scheduler,
+            StateSource::FeatureSetting,
+        )
+        .await
+        .expect("an unknown parameter is ignored");
+        assert_eq!(queue(&scheduler_setting), None);
+    }
+
     /// A snapshot location's S3 `params` take the queue that receives its S3 event
     /// notifications.
     #[tokio::test]
@@ -982,9 +1081,14 @@ mod tests {
             "https://sqs.us-east-1.amazonaws.com/123456789012/snapshots".to_string(),
         )]);
 
-        let parameters = build_s3_parameters(secrets(), Some(&params), StateFeature::Snapshots)
-            .await
-            .expect("snapshot S3 parameters should validate");
+        let parameters = build_s3_parameters(
+            secrets(),
+            Some(&params),
+            StateFeature::Snapshots,
+            StateSource::FeatureSetting,
+        )
+        .await
+        .expect("snapshot S3 parameters should validate");
 
         assert_eq!(
             parameters.get(SNAPSHOT_QUEUE_URL_PARAM).expose().ok(),

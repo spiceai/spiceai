@@ -44,6 +44,8 @@ use tracing_subscriber::{EnvFilter, filter, fmt, layer::Layer, prelude::*, regis
 
 #[path = "tracing/dependency_log.rs"]
 mod dependency_log;
+#[path = "tracing/otel_logs.rs"]
+pub mod otel_logs;
 
 #[derive(PartialEq, Debug)]
 pub enum LogVerbosity {
@@ -331,6 +333,7 @@ pub(crate) async fn init_tracing(
     verbosity: LogVerbosity,
     cloud_connect_configured: bool,
     service_log_dir: Option<&std::path::Path>,
+    otel_logs: Option<otel_logs::LogsSink>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
@@ -367,7 +370,8 @@ pub(crate) async fn init_tracing(
                     .display()
             )
         })?)
-        .with(cloud_connect_log_capture_layer(cloud_connect_configured));
+        .with(cloud_connect_log_capture_layer(cloud_connect_configured))
+        .with(otel_logs.map(otel_logs::layer));
 
     tracing::subscriber::set_global_default(subscriber)?;
     // Routes `log` records — which most of the dependency graph, DataFusion

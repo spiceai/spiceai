@@ -38,8 +38,10 @@ use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod evaluate;
 mod worker;
 pub use evaluate::RetrievalMetrics;
-pub use worker::SearchResult;
-pub use worker::{SearchConfig, SearchRequest};
+pub use worker::{
+    CorpusId, SearchApiResponse, SearchConfig, SearchMethod, SearchRequest, SearchResponse,
+    SearchResult, SqlPipeline, SqlSearchHit, SqlSearchResponse,
+};
 use worker::{VectorSearchWorker, VectorSearchWorkerResult};
 
 pub use evaluate::{QueryId, QueryRetrievalMetrics, RetrievalEvaluation};
@@ -99,6 +101,7 @@ impl SpiceTest<NotStarted> {
             .http_client()?;
 
         // Split the requests among workers based on the parallel_count
+        let method = self.state.config.method().clone();
         let requests = self.state.config.into_requests();
         let chunk_size = if self.state.parallel_count > 0 {
             requests.len().div_ceil(self.state.parallel_count)
@@ -110,7 +113,9 @@ impl SpiceTest<NotStarted> {
             .chunks(chunk_size)
             .enumerate()
             .map(|(worker_id, chunk)| {
-                let worker_config = SearchConfig::new().add_requests(chunk.iter().cloned());
+                let worker_config = SearchConfig::new()
+                    .with_method(method.clone())
+                    .add_requests(chunk.iter().cloned());
                 VectorSearchWorker::new(worker_id, http_client.clone(), worker_config).start()
             })
             .collect();

@@ -46,6 +46,17 @@ use crate::context::PartitionExprResolver;
 /// ```
 pub type PartitionValue = HashMap<String, Option<String>>;
 
+/// A [`PartitionValue`] in a canonical, hashable form: its entries sorted by key.
+pub type PartitionKey = Vec<(String, Option<String>)>;
+
+/// Returns the [`PartitionKey`] of `value`.
+#[must_use]
+pub fn partition_key(value: &PartitionValue) -> PartitionKey {
+    let mut key: PartitionKey = value.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    key.sort();
+    key
+}
+
 /// Encodes `DataFusion` [`Statistics`] to the `datafusion-proto` prost bytes
 /// carried on the `PartitionsLoaded` wire. This is the executor → scheduler
 /// encoding for the per-executor table statistics the scheduler then holds in
@@ -162,6 +173,12 @@ pub struct TablePartitionMetadata {
     /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
     /// original SQL expression for query routing.
     pub partition_expressions: Vec<String>,
+    /// When a scheduler first found the table not registered (milliseconds since
+    /// UNIX epoch). A scheduler that has the table registered clears it; the entry
+    /// is removed once it has stayed set for
+    /// [`UNREGISTERED_TABLE_RETENTION`](crate::cluster_state::UNREGISTERED_TABLE_RETENTION).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unregistered_at_ms: Option<u64>,
 }
 
 impl TablePartitionMetadata {
@@ -177,6 +194,7 @@ impl TablePartitionMetadata {
             schema_version: 1,
             updated_at,
             partition_expressions,
+            unregistered_at_ms: None,
         }
     }
 

@@ -95,7 +95,7 @@ expression: "serde_json::to_string_pretty(&task_input).expect(\"Failed to serial
               ]
             },
             "text": {
-              "description": "The text to search documents for similarity",
+              "description": "The text to search documents for similarity. Must contain at least one non-whitespace character.",
               "type": "string"
             },
             "where": {

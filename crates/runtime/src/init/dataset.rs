@@ -25,7 +25,8 @@ use std::{
 };
 
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
-use crate::cluster::partition::get_partition_filter_exprs;
+use crate::cluster::partition::combine_partition_exprs;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
     ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
@@ -289,22 +290,32 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        if let Some(snapshots) = app.effective_snapshots().as_deref() {
-            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
-                ds.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.enabled
-                        && acceleration
-                            .refresh_mode
-                            .is_some_and(|mode| mode.is_snapshot_only())
-                })
-            });
+        // An executor runs the scheduler's spicepod, whose own startup logs these warnings.
+        if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor) {
             if let Some(warning) =
-                runtime_acceleration::snapshot::notifications::unread_queue_warning(
-                    snapshots,
-                    any_snapshot_mode_dataset,
+                runtime_state_location::scheduler_deprecation::scheduler_deprecation_warning(
+                    &app.runtime,
                 )
             {
                 tracing::warn!("{warning}");
+            }
+            if let Some(section) = app.snapshots.as_deref() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::section_deprecation::section_deprecation_warning(
+                        section,
+                        app.runtime.state.as_ref(),
+                    )
+                );
+            }
+        }
+        // A scheduler loads no accelerations, so it reads no queue whatever its datasets.
+        if self.df.snapshot_notifications().is_some() {
+            for setting in app.unread_snapshot_queues() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::notifications::unread_queue_warning(&setting)
+                );
             }
         }
 
@@ -943,6 +954,11 @@ impl Runtime {
             if restored {
                 update_cached_dataset_timestamps(ds.as_ref()).await;
             }
+            // Rows restored from an acceleration snapshot are not the rows an append
+            // cursor saved here before describes.
+            if bootstrap_status.is_bootstrapped() {
+                self.clear_append_cursor(&ds).await;
+            }
             self.load_dataset_with_retry(Arc::clone(&ds), bootstrap_status, load_semaphore, &load)
                 .await;
             if restored {
@@ -1200,6 +1216,32 @@ impl Runtime {
     fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
         ds.acceleration.as_ref().is_some_and(|a| a.enabled)
             && Self::waits_for_source_reason(ds).is_none()
+    }
+
+    /// Discards the source commit `ds`'s append refresh last loaded, so its next refresh
+    /// starts without a cursor.
+    async fn clear_append_cursor(&self, ds: &Dataset) {
+        let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+            return;
+        };
+        let refresh_mode = acceleration.refresh_mode.unwrap_or_else(|| {
+            runtime_acceleration::acceleration::unset_refresh_mode_for_connector(ds.source())
+        });
+        if refresh_mode != RefreshMode::Append {
+            return;
+        }
+        let store = crate::dataaccelerator::spice_sys::append_cursor_store_for(
+            ds,
+            Arc::clone(&self.accelerator_engine_registry),
+            runtime_acceleration::sidecar::OpenOption::OpenExisting,
+        )
+        .await;
+        if let Err(e) = store.clear().await {
+            tracing::debug!(
+                "Dataset '{}' could not clear its append cursor after restoring its acceleration snapshot: {e}",
+                ds.name
+            );
+        }
     }
 
     /// The configuration that makes an accelerated dataset wait for its source
@@ -2076,8 +2118,9 @@ impl Runtime {
     ///
     /// On an executor node (partition assignments present) with a `partition_by`
     /// configured dataset, returns the dataset with `partition_by` cleared and its
-    /// engine converted to unpartitioned, plus `Some` partition filters for the
-    /// partitions assigned to this executor. `Some(empty)` — no partition assigned —
+    /// engine converted to unpartitioned, plus `Some` partition expressions, one
+    /// per partition assigned to this executor; `combine_partition_exprs` turns
+    /// them into the load's filter. `Some(empty)` — no partition assigned —
     /// resolves downstream to a `false` predicate (load no rows) rather than an
     /// unfiltered full-table load. Otherwise returns `ds` unchanged with `None`
     /// (not partition-scoped; retrieve everything).
@@ -2101,11 +2144,11 @@ impl Runtime {
             crate::datafusion::SPICE_DEFAULT_CATALOG,
             crate::datafusion::SPICE_DEFAULT_SCHEMA,
         );
-        let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
+        let assigned = assignments.get(&resolved).cloned().unwrap_or_default();
         tracing::debug!(
-            "For table={}, extracted {} partition filter(s) for assigned partitions.",
+            "For table={}, {} partition(s) assigned.",
             ds.name,
-            partition_filters.len(),
+            assigned.len(),
         );
 
         // Clear partition_by and convert engine to unpartitioned.
@@ -2114,7 +2157,7 @@ impl Runtime {
             acc.partition_by = vec![];
             acc.engine = acc.engine.to_unpartitioned();
         }
-        (Arc::new(ds_mod), Some(partition_filters))
+        (Arc::new(ds_mod), Some(assigned))
     }
 
     async fn reload_accelerated_dataset(
@@ -2159,7 +2202,8 @@ impl Runtime {
         // Mirror the initial-load path: on an executor, scope the recreated table
         // to this node's assigned partitions so a hot reload doesn't load the full
         // source table (or duplicate it across executors).
-        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+        let (ds, assigned) = self.resolve_executor_partition_scoping(ds).await;
+        let initial_partition_filters = assigned.map(combine_partition_exprs);
 
         // create new accelerated table for updated data connector
         let accelerated_table = self
@@ -2417,7 +2461,17 @@ impl Runtime {
         // partitioned mode this is `Some`, so an executor with no assigned
         // partition gets `Some(empty)` — a `false` predicate that loads no rows —
         // rather than an unfiltered full load.
-        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+        let (ds, assigned) = self.resolve_executor_partition_scoping(ds).await;
+        // The partitions the initial load reads, one expression each, and the
+        // sequence its ack carries, taken before any later reload of the table
+        // takes one.
+        let initial_load = assigned.clone().map(|assigned| {
+            let load_sequence = self
+                .executor_outbound_broadcaster()
+                .map_or(0, |b| b.next_load_sequence());
+            (load_sequence, assigned)
+        });
+        let initial_partition_filters = assigned.map(combine_partition_exprs);
 
         // ACCELERATED TABLE
         let acceleration_settings =
@@ -2534,8 +2588,8 @@ impl Runtime {
                     return;
                 }
                 // After the executor's initial load for this dataset finishes,
-                // ack the scheduler with the partition expressions we currently
-                // hold. This is the executor → scheduler readiness signal that
+                // ack the scheduler with the partition expressions that load
+                // read. This is the executor → scheduler readiness signal that
                 // lets the scheduler flip the dataset to `Ready` once every
                 // assigned partition has at least one executor ack.
                 //
@@ -2547,23 +2601,20 @@ impl Runtime {
                 // the ack against the registered dataset regardless of how
                 // the user spelled the table in their spicepod.
                 if let Some(b) = broadcaster {
-                    let bytes: Vec<Vec<u8>> =
-                        if let Some(assignments_lock) = runtime.partition_assignments() {
-                            let assignments = assignments_lock.read().await;
-                            assignments
-                                .get(&resolved_name)
-                                .map(|exprs| {
-                                    runtime_cluster::encode_partition_exprs(exprs, &dataset_name)
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
+                    let (load_sequence, bytes) = initial_load.as_ref().map_or_else(
+                        || (0, Vec::new()),
+                        |(load_sequence, assigned)| {
+                            (
+                                *load_sequence,
+                                runtime_cluster::encode_partition_exprs(assigned, &dataset_name),
+                            )
+                        },
+                    );
                     let table_name = resolved_name.to_string();
                     // Statistics flow via the periodic ExecutorStatistics reporter,
                     // not this readiness ack.
                     let sent = b
-                        .broadcast_partitions_loaded(table_name.clone(), bytes)
+                        .broadcast_partitions_loaded(table_name.clone(), bytes, load_sequence)
                         .await;
                     if sent == 0 {
                         // Fast initial loads can finish before any scheduler
@@ -2577,6 +2628,20 @@ impl Runtime {
                             "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
                         );
                     }
+                }
+                // Partitions assigned after the initial load read its filters
+                // and before the table registered were not loaded: load them.
+                if let Some((_, assigned)) = &initial_load
+                    && let Err(e) = runtime
+                        .load_partitions_assigned_during_initial_load(
+                            resolved_name.clone(),
+                            assigned,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        "Failed to load the partitions of {dataset_name} assigned during its initial load: {e}"
+                    );
                 }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
