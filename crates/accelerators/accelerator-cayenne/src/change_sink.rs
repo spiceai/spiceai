@@ -48,7 +48,7 @@ use runtime_acceleration::change_sink::provider::{
 use runtime_acceleration::change_sink::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
     ChangeSinkContext, DurabilityObserver, Recovery, ReplacementSupport, SchemaEvolutionSupport,
-    SetKey, StorageDurability, WriteOptions,
+    StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, find_concrete};
@@ -361,8 +361,8 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        let (payload, scope) = batch.into_parts();
-        match payload {
+        let replacement_filters = replaced_scope_filters(batch.replaced_scopes());
+        match batch.into_payload() {
             ChangePayload::Cdc(rows) => {
                 let batch = rows.into_built().map_err(before_mutation)?;
                 self.apply_cdc(batch, options, ctx).await
@@ -370,7 +370,7 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
             ChangePayload::Rows {
                 schema,
                 batches,
-                append_validations,
+                scoped_inputs,
             } => {
                 let batches = if self.table.is_memory_resident_mode()
                     && batches.iter().any(|batch| batch.num_rows() > 0)
@@ -387,9 +387,8 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                             u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
                         })
                         .fold(0_u64, u64::saturating_add);
-                    let filters = scope.as_ref().map(SetKey::filters);
                     self.table
-                        .preflight_memory_append(incoming_bytes, filters.as_deref())
+                        .preflight_memory_append(incoming_bytes, replacement_filters.as_deref())
                         .await
                         .map_err(|error| before_mutation(error.into()))?;
                     batches
@@ -413,7 +412,7 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                 let ctx = rebuildable_context.as_ref().unwrap_or(ctx);
                 let changed = self
                     .provider
-                    .apply_rows(schema, batches, scope, append_validations, options, ctx)
+                    .apply_rows(schema, batches, scoped_inputs, options, ctx)
                     .await?;
                 Ok(BackendWrite::complete(
                     changed,
