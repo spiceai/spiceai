@@ -237,13 +237,17 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 /// aggregation SQL would lose, and the rewrite would silently aggregate over
 /// unfiltered rows. Bail and keep the local partial aggregate instead.
 ///
+/// A `FlightSqlExec` with a limit is not a match either: `LimitPushdown` moves a
+/// `LIMIT` into the scan and drops the `GlobalLimitExec` above it, and the
+/// aggregation SQL built from the scan would aggregate every row instead.
+///
 /// Returns `None` if the chain contains a multi-input node or an unrecognised
-/// node, or terminates at a non-`FlightSqlExec`.
+/// node, or terminates at a non-`FlightSqlExec` or a limited one.
 fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> {
     let mut current: &Arc<dyn ExecutionPlan> = plan;
     loop {
         if let Some(flight) = current.downcast_ref::<FlightSqlExec>() {
-            return Some(flight);
+            return flight.limit().is_none().then_some(flight);
         }
 
         let children = current.children();
@@ -870,6 +874,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_no_pushdown_of_aggregates_that_differ_by_a_cast() -> Result<()> {
+        use datafusion::physical_expr::expressions::CastExpr;
+
+        // `SUM(x)` and `SUM(CAST(x AS BIGINT))` are different sums (casting each row
+        // before summing is not casting the sum), and the remote engine names both
+        // `sum(x)`, so one remote query cannot return them.
+        let schema = lineitem_schema();
+        let flight = make_flight_exec(&schema, "foo.foo.lineitem", &[]);
+        let quantity: Arc<dyn PhysicalExpr> = Arc::new(Column::new("l_quantity", 0));
+        let sum_expr = AggregateExprBuilder::new(sum_udaf(), vec![Arc::clone(&quantity)])
+            .schema(Arc::clone(&schema))
+            .alias("sum(l_quantity)")
+            .build()?;
+        let sum_cast_expr = AggregateExprBuilder::new(
+            sum_udaf(),
+            vec![Arc::new(CastExpr::new(quantity, DataType::Int64, None))],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("sum(CAST(l_quantity AS Int64))")
+        .build()?;
+
+        assert_no_pushdown(partial_aggregate(
+            flight,
+            &[],
+            vec![Arc::new(sum_expr), Arc::new(sum_cast_expr)],
+        )?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_pushdown_through_projection_exec() -> Result<()> {
         use datafusion::physical_expr::expressions::BinaryExpr;
         use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
@@ -1107,6 +1141,26 @@ mod tests {
                     .build()?,
             )],
         )?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_pushdown_into_limited_scan() -> Result<()> {
+        // `SELECT count(*) FROM (SELECT * FROM t LIMIT 100)` over one executor:
+        // `LimitPushdown` folds the limit into the scan, so the partial aggregate
+        // sits directly above a `FlightSqlExec` that returns at most 100 rows.
+        let schema = lineitem_schema();
+        let limited = make_flight_exec(&schema, "foo.foo.lineitem", &[])
+            .with_fetch(Some(100))
+            .expect("FlightSqlExec supports a fetch");
+        let count_expr = AggregateExprBuilder::new(
+            count_udaf(),
+            vec![Arc::new(Literal::new(ScalarValue::Int64(Some(1))))],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("count(*)")
+        .build()?;
+        assert_no_pushdown(partial_aggregate(limited, &[], vec![Arc::new(count_expr)])?);
         Ok(())
     }
 

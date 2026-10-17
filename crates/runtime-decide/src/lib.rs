@@ -38,6 +38,7 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::logical_expr::async_udf::AsyncScalarUDF;
 use datafusion::optimizer::OptimizerRule;
 use evaluate_api::EvaluateModelStore;
+use model_capabilities::CapabilityStore;
 use runtime_status::RuntimeStatus;
 use tokio::sync::RwLock;
 
@@ -114,11 +115,16 @@ impl FunctionSet {
 }
 
 impl DecisionFunctions {
-    /// Decision functions answered by the models in `models`. `status` explains a named
-    /// model that is configured but not loaded.
+    /// Decision functions answered by the models in `models`, whose `capabilities` say
+    /// which answer natively. `status` explains a named model that is configured but not
+    /// loaded.
     #[must_use]
-    pub fn new(models: Arc<RwLock<EvaluateModelStore>>, status: Arc<RuntimeStatus>) -> Self {
-        let decider = Arc::new(Decider::new(models, status));
+    pub fn new(
+        models: Arc<RwLock<EvaluateModelStore>>,
+        capabilities: Arc<RwLock<CapabilityStore>>,
+        status: Arc<RuntimeStatus>,
+    ) -> Self {
+        let decider = Arc::new(Decider::new(models, capabilities, status));
         let udf = |kind| {
             Arc::new(
                 AsyncScalarUDF::new(Arc::new(DecisionUdf::new(kind, Arc::clone(&decider))))

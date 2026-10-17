@@ -44,6 +44,19 @@ impl TursoBlobCheckpointStore {
     }
 }
 
+impl TursoBlobCheckpointStore {
+    fn create_table_sql(table: &str) -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {table} (
+                dataset_name TEXT PRIMARY KEY,
+                checkpoint_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"
+        )
+    }
+}
+
 #[async_trait]
 impl BlobCheckpointStore for TursoBlobCheckpointStore {
     async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
@@ -61,15 +74,7 @@ impl BlobCheckpointStore for TursoBlobCheckpointStore {
         // checkpoint yet" (Ok(None)) rather than a missing-table store error.
         {
             let _schema_guard = self.pool.acquire_schema_write_lock().await;
-            let create_table = format!(
-                "CREATE TABLE IF NOT EXISTS {table} (
-                    dataset_name TEXT PRIMARY KEY,
-                    checkpoint_data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"
-            );
-            conn.execute(&create_table, ())
+            conn.execute(&Self::create_table_sql(table), ())
                 .await
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
@@ -123,15 +128,7 @@ impl BlobCheckpointStore for TursoBlobCheckpointStore {
 
         {
             let _schema_guard = self.pool.acquire_schema_write_lock().await;
-            let create_table = format!(
-                "CREATE TABLE IF NOT EXISTS {table} (
-                    dataset_name TEXT PRIMARY KEY,
-                    checkpoint_data TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )"
-            );
-            conn.execute(&create_table, ())
+            conn.execute(&Self::create_table_sql(table), ())
                 .await
                 .map_err(|source| CheckpointError::Store {
                     source: Box::new(source),
@@ -147,6 +144,39 @@ impl BlobCheckpointStore for TursoBlobCheckpointStore {
                 updated_at = CURRENT_TIMESTAMP"
         );
         conn.execute(&upsert, turso::params![dataset_name, checkpoint_data])
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    async fn delete(&self) -> Result<(), CheckpointError> {
+        let dataset_name = self.dataset_name.clone();
+        let table = self.table_name;
+
+        let conn = self
+            .pool
+            .connect()
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        {
+            // The table may not exist yet: a dataset that never checkpointed has
+            // nothing to discard, and that is not an error.
+            let _schema_guard = self.pool.acquire_schema_write_lock().await;
+            conn.execute(&Self::create_table_sql(table), ())
+                .await
+                .map_err(|source| CheckpointError::Store {
+                    source: Box::new(source),
+                })?;
+        }
+
+        let _schema_guard = self.pool.acquire_schema_read_lock().await;
+        let delete = format!("DELETE FROM {table} WHERE dataset_name = ?1");
+        conn.execute(&delete, turso::params![dataset_name])
             .await
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),

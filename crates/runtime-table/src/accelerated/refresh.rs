@@ -24,7 +24,9 @@ use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId};
-use crate::accelerated::refresh_task::{RefreshOutcome, RefreshTask};
+use crate::accelerated::refresh_task::{
+    RefreshOutcome, RefreshTask, append_cursor::AppendCursorStore,
+};
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
     create_periodic_snapshot_callback, spawn_snapshot_interval_task,
@@ -755,6 +757,8 @@ pub struct Refresher {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<AppendCursorStore>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -818,7 +822,14 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
+            append_cursor_store: None,
         }
+    }
+
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    pub fn with_append_cursor_store(&mut self, store: Option<AppendCursorStore>) -> &mut Self {
+        self.append_cursor_store = store;
+        self
     }
 
     pub fn in_flight_revalidations(
@@ -1197,6 +1208,9 @@ impl Refresher {
 
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
+
+        refresh_task_runner =
+            refresh_task_runner.with_append_cursor_store(self.append_cursor_store.clone());
 
         refresh_task_runner = refresh_task_runner
             .with_initial_load_completed(Arc::clone(&self.initial_load_completed));

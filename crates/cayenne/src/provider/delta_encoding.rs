@@ -56,9 +56,41 @@ limitations under the License.
 //! Maintenance writes ([`WriteClass::Maintenance`]) always use the full default
 //! regardless of the configured level.
 
+use std::sync::LazyLock;
+
+use vortex::VortexSessionDefault;
+use vortex::array::ArrayId;
+use vortex::editions::{ComponentKind, EditionSessionExt};
 use vortex::file::WriteStrategyBuilder;
+use vortex::utils::aliases::hash_set::HashSet;
 use vortex_btrblocks::schemes::{float, integer, string};
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
+use vortex_session::VortexSession;
+
+/// Keep only the schemes in `compressor` whose encodings a Cayenne write may
+/// serialize.
+///
+/// A Vortex writer accepts only the encodings of its session's enabled
+/// editions. It limits its own default cascade to them, but it uses an explicit
+/// strategy as given and fails the write on any other encoding
+/// (`Serialized array ID … not permitted by ctx`). The default scheme set
+/// includes such schemes, for example the one that emits `fastlanes.delta`.
+/// Cayenne builds every write session with `VortexSession::default()`, so the
+/// permitted encodings are those of the default editions.
+fn permitted_schemes(compressor: BtrBlocksCompressorBuilder) -> BtrBlocksCompressorBuilder {
+    static PERMITTED: LazyLock<HashSet<ArrayId>> = LazyLock::new(|| {
+        VortexSession::default()
+            .enabled_component_ids(ComponentKind::Array)
+            .into_iter()
+            .collect()
+    });
+    compressor.retain_allowed_encodings(&PERMITTED)
+}
+
+/// A write strategy that compresses with the permitted schemes of `compressor`.
+fn write_strategy(compressor: BtrBlocksCompressorBuilder) -> WriteStrategyBuilder {
+    WriteStrategyBuilder::default().with_btrblocks_builder(permitted_schemes(compressor))
+}
 
 /// Build a [`BtrBlocksCompressorBuilder`] restricted to exactly `schemes`.
 ///
@@ -103,7 +135,7 @@ pub(crate) fn full_strategy_builder_for(
             // add it so the per-column search can pick it when it wins.
             let builder =
                 BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme);
-            Some(WriteStrategyBuilder::default().with_btrblocks_builder(builder))
+            Some(write_strategy(builder))
         }
     }
 }
@@ -304,7 +336,7 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
         _ => BtrBlocksCompressorBuilder::default().exclude_schemes([string::FSSTScheme.id()]),
     };
 
-    Some(WriteStrategyBuilder::default().with_btrblocks_builder(builder))
+    Some(write_strategy(builder))
 }
 
 #[cfg(test)]
@@ -420,12 +452,14 @@ mod tests {
              scheme (it is the zstd param's distinguishing addition)"
         );
 
-        // ...and once added, registering it a second time must panic, proving
-        // the zstd full-tier builder genuinely carries the Zstd string scheme.
+        // ...and once added, it must survive the edition filter: registering it
+        // a second time must panic, proving the zstd full-tier builder
+        // genuinely carries the Zstd string scheme.
         let double_add = std::panic::catch_unwind(|| {
-            BtrBlocksCompressorBuilder::default()
-                .with_new_scheme(&string::ZstdScheme)
-                .with_new_scheme(&string::ZstdScheme)
+            permitted_schemes(
+                BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme),
+            )
+            .with_new_scheme(&string::ZstdScheme)
         });
         assert!(
             double_add.is_err(),

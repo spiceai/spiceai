@@ -116,6 +116,56 @@ pub async fn checkpoint_store(
     }
 }
 
+/// Where `dataset`'s append refresh keeps the source snapshot it last loaded.
+///
+/// A file-backed acceleration keeps it in its sidecar, beside the data it describes.
+/// One with no sidecar (memory mode, Arrow) keeps it for the process: its data lives no
+/// longer, so the next start takes an initial load either way. `checkpoint_store` logs
+/// why a sidecar could not be resolved, which a memory-mode dataset must not trigger.
+pub async fn append_cursor_store(
+    dataset: &crate::component::dataset::Dataset,
+) -> crate::accelerated::refresh_task::append_cursor::AppendCursorStore {
+    use crate::accelerated::refresh_task::append_cursor::{APPEND_CURSOR_TABLE, AppendCursorStore};
+    let persisted = if dataset.is_file_accelerated() {
+        checkpoint_store(dataset, APPEND_CURSOR_TABLE)
+            .await
+            .map(AppendCursorStore::persisted)
+    } else {
+        None
+    };
+    persisted.unwrap_or_else(AppendCursorStore::in_memory)
+}
+
+/// [`append_cursor_store`] for any acceleration source, through its engine registry:
+/// the recreate path, which has no dataset handle. `open_option` says whether a
+/// sidecar that does not exist yet is created; a caller that only clears passes
+/// [`OpenOption::OpenExisting`] and gets the in-memory store when there is nothing to
+/// clear, so a sidecar is never created just to delete from it.
+pub async fn append_cursor_store_for(
+    source: &dyn AccelerationSource,
+    registry: Arc<AcceleratorEngineRegistry>,
+    open_option: OpenOption,
+) -> crate::accelerated::refresh_task::append_cursor::AppendCursorStore {
+    use crate::accelerated::refresh_task::append_cursor::{APPEND_CURSOR_TABLE, AppendCursorStore};
+    if !source.is_file_accelerated() {
+        return AppendCursorStore::in_memory();
+    }
+    let store = match sidecar_for(source, registry, open_option).await {
+        Ok(sidecar) => sidecar.blob_checkpoint_store(APPEND_CURSOR_TABLE),
+        Err(e) => Err(e),
+    };
+    match store {
+        Ok(store) => AppendCursorStore::persisted(store),
+        Err(e) => {
+            tracing::debug!(
+                "Dataset '{}' has no sidecar for its append cursor ({e}); it is kept in memory",
+                source.name()
+            );
+            AppendCursorStore::in_memory()
+        }
+    }
+}
+
 /// Construct the **Kafka** checkpoint store over this dataset's accelerator.
 ///
 /// Unlike [`checkpoint_store`] this reports a resolution failure as an error: the Kafka

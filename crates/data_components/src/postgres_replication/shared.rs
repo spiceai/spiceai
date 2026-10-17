@@ -7157,6 +7157,11 @@ mod tests {
             *self.data.lock() = Some(data.to_string());
             Ok(())
         }
+
+        async fn delete(&self) -> std::result::Result<(), runtime_checkpoint_api::CheckpointError> {
+            *self.data.lock() = None;
+            Ok(())
+        }
     }
 
     /// A registry holding `xid` as an outstanding write-back transaction. The low

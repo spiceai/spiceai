@@ -244,6 +244,11 @@ pub enum DistributedNode {
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
         partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
 
+        /// Held while an assignment change from any scheduler is applied, so
+        /// changes that arrive together on different schedulers' streams
+        /// apply one after another rather than overwrite each other.
+        assignment_updates: Arc<tokio::sync::Mutex<()>>,
+
         /// Shared map of per-scheduler outbound senders. Lets the runtime
         /// broadcast unsolicited messages (e.g. `PartitionsLoaded`) without
         /// owning the [`ControlStreamManager`] directly.
@@ -612,7 +617,7 @@ use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
 pub use control_stream_client::ControlStreamManager;
-pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
+pub use heartbeat::{SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
@@ -1400,9 +1405,6 @@ pub async fn initialize_cluster_executor(
 
     // Resolve executor settings from the scheduler's app definition before the
     // executor Flight server starts.
-    if let Some(ref telemetry_config) = rt.telemetry_config {
-        let _ = telemetry_config.set(app_def.runtime.telemetry.clone());
-    }
     rt.rate_limits.set_flight_write_enabled(
         app_def
             .runtime
@@ -1852,6 +1854,15 @@ pub async fn initialize_cluster_executor(
             rt.datafusion().cluster_config.node_advertise_url(),
             initial_partitions.clone()
         );
+
+        // The scheduler that allocated the partitions now holds this executor's
+        // Flight endpoint. Every other scheduler, and each scheduler again after
+        // its control stream reconnects, gets it over the control stream.
+        if let Some(broadcaster) = rt.executor_outbound_broadcaster() {
+            broadcaster
+                .announce_flight_endpoint(rt.datafusion().cluster_config.node_advertise_url())
+                .await;
+        }
         rt.set_partition_assignments(initial_partitions).await;
 
         // Replay DDL statements from the scheduler to create tables/schemas
@@ -2416,6 +2427,7 @@ async fn executor_bind_app(
     };
 
     let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
+    let telemetry = app_def.runtime.telemetry.clone();
     rt.df.set_runtime_state_location(
         app_def
             .runtime
@@ -2433,6 +2445,14 @@ async fn executor_bind_app(
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
+
+    // Published once the scheduler's secrets are bound, which the log exporter
+    // resolves its header templates through, and before the components below
+    // load: a catalog that cannot be reached retries for as long as it takes,
+    // and the executor's log should reach the endpoint while it does.
+    if let Some(ref telemetry_config) = rt.telemetry_config {
+        let _ = telemetry_config.set(telemetry);
+    }
 
     // Task history is created by `load_components` on a normal bring-up, but
     // Fix B Ready/slots gate on this bind path — and the test harness skips
