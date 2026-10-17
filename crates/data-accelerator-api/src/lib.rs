@@ -66,17 +66,9 @@ pub mod upsert_dedup;
 
 /// Base directory Spice stores accelerator data under (`<cwd>/.spice/data`).
 ///
-/// Lives here so an engine below `runtime` can resolve it without an upward
-/// dependency; `runtime` re-exports it.
-#[must_use]
-pub fn spice_data_base_path() -> String {
-    let Ok(working_dir) = std::env::current_dir() else {
-        return ".".to_string();
-    };
-
-    let base_folder = working_dir.join(".spice/data");
-    base_folder.to_str().unwrap_or(".").to_string()
-}
+/// Defined in `util` so the Spicepod validation in `app` and every engine below
+/// `runtime` resolve the same directory; `runtime` re-exports it from here.
+pub use util::spice_paths::spice_data_base_path;
 
 /// `source`'s acceleration with `file_param` naming a file under `dir` that has the name
 /// of `live_file`, the file the acceleration stores its data in, for

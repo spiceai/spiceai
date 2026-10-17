@@ -43,18 +43,21 @@ limitations under the License.
 //! An instance is identified by [`util::instance_id::instance_id`], the identity
 //! every feature that coordinates through shared state uses. It is stable across
 //! restarts, so a restarted replica resumes the lease it held.
+//!
+//! The lease is an [`object_store_occ::lease::Lease`]; this module adds the
+//! snapshot's lease duration, the publication fence and the log lines.
 
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::Utc;
-use object_store::{ObjectStoreExt, PutPayload, UpdateVersion, path::Path as ObjectPath};
-use object_store_occ::{
-    Attempt, ConditionalWriteError, Expected, RetryOnConflictError, conditional_put,
-    retry_on_conflict,
+use async_trait::async_trait;
+use bytes::Bytes;
+use object_store::{
+    ObjectStoreExt, PutPayload, PutResult, UpdateVersion, path::Path as ObjectPath,
 };
+use object_store_occ::lease::{Acquired, Holder, Lease, LeaseError, LeaseIo, Role};
+use object_store_occ::{ConditionalWriteError, Expected};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use util::{RetryError, retry};
 
 use super::{
@@ -63,7 +66,6 @@ use super::{
 };
 
 const LEASES_DIR: &str = "leases";
-const LEASE_FORMAT_VERSION: u32 = 1;
 /// The snapshot interval assumed for a dataset that does not create snapshots
 /// on a fixed schedule: `stream_batches`, or `refresh_complete` without a
 /// `refresh_check_interval`.
@@ -73,84 +75,49 @@ const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_mins(10);
 const MIN_LEASE_DURATION: Duration = Duration::from_secs(30);
 /// A lease never lasts more than this, so a lease that claims a longer
 /// duration cannot keep the other instances waiting indefinitely.
-const MAX_LEASE_DURATION: Duration = Duration::from_hours(24);
+const MAX_LEASE_DURATION: Duration = object_store_occ::lease::MAX_LEASE_DURATION;
 /// The dataset property, in the snapshot metadata, recording the lease
 /// generation that published the dataset's latest snapshot.
 const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 
-/// This replica's identity.
-static INSTANCE_IDENTITY: LazyLock<Arc<str>> =
-    LazyLock::new(|| util::instance_id::instance_id().into());
-
-/// This process. It tells the lease a replica's previous run held apart from
-/// one written by another process that has the same identity.
-static PROCESS_ID: LazyLock<Arc<str>> = LazyLock::new(|| uuid::Uuid::now_v7().to_string().into());
-
-/// The lease object's contents.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct LeaseRecord {
-    format_version: u32,
-    holder_identity: String,
-    holder_process: String,
-    generation: u64,
-    lease_duration_ms: u64,
-    acquire_time_ms: i64,
-    renew_time_ms: i64,
-}
-
-impl LeaseRecord {
-    fn lease_duration(&self) -> Duration {
-        Duration::from_millis(self.lease_duration_ms).min(MAX_LEASE_DURATION)
-    }
-}
-
-/// A dataset's writer lease: who this instance is, how long its lease lasts,
-/// and what it last saw and wrote. Clones share that state.
+/// A dataset's writer lease: this instance's view of the lease, and the role
+/// it last reported. Clones share that state.
 #[derive(Clone)]
 pub(super) struct WriterLease {
-    identity: Arc<str>,
-    process: Arc<str>,
-    duration: Duration,
-    state: Arc<Mutex<LeaseState>>,
+    lease: Lease,
+    reported: Arc<Mutex<Reported>>,
 }
 
 #[derive(Default)]
-struct LeaseState {
+struct Reported {
     /// The role last reported, so only a change of role is logged.
-    reported: Option<RoleKind>,
-    /// The lease version last read, and when it was first read.
-    observed: Option<(UpdateVersion, Instant)>,
-    /// The lease as this instance last wrote it, so it can release it.
-    written: Option<(UpdateVersion, LeaseRecord)>,
-    /// The renewal time of this instance's latest write.
-    last_renew_time_ms: Option<i64>,
+    role: Option<RoleKind>,
     warned_shared_identity: bool,
 }
 
 impl Default for WriterLease {
     fn default() -> Self {
         Self::new(
-            Arc::clone(&INSTANCE_IDENTITY),
-            Arc::clone(&PROCESS_ID),
+            Holder::new(
+                util::instance_id::instance_id(),
+                util::instance_id::process_id().to_string(),
+            ),
             DEFAULT_SNAPSHOT_INTERVAL,
         )
     }
 }
 
 impl WriterLease {
-    fn new(identity: Arc<str>, process: Arc<str>, snapshot_interval: Duration) -> Self {
+    fn new(holder: Holder, snapshot_interval: Duration) -> Self {
         Self {
-            identity,
-            process,
-            duration: lease_duration(snapshot_interval),
-            state: Arc::new(Mutex::new(LeaseState::default())),
+            lease: Lease::new(holder, lease_duration(snapshot_interval)),
+            reported: Arc::default(),
         }
     }
 
     pub(super) fn with_snapshot_interval(self, snapshot_interval: Duration) -> Self {
         Self {
-            duration: lease_duration(snapshot_interval),
+            lease: self.lease.with_duration(lease_duration(snapshot_interval)),
             ..self
         }
     }
@@ -158,8 +125,7 @@ impl WriterLease {
     #[cfg(test)]
     pub(super) fn for_instance(identity: &str, snapshot_interval: Duration) -> Self {
         Self::new(
-            identity.into(),
-            uuid::Uuid::now_v7().to_string().into(),
+            Holder::new(identity, uuid::Uuid::now_v7().to_string()),
             snapshot_interval,
         )
     }
@@ -202,99 +168,6 @@ pub(super) enum WriterPermit {
     Standby,
 }
 
-/// The lease as read from the store.
-struct ObservedLease {
-    /// `None` when the object is not a lease this version can read.
-    record: Option<LeaseRecord>,
-    version: UpdateVersion,
-}
-
-#[derive(Debug, PartialEq)]
-enum Plan {
-    /// No lease exists: create it.
-    Create,
-    /// The lease is held under this instance's identity: renew it.
-    Renew {
-        version: UpdateVersion,
-        record: LeaseRecord,
-    },
-    /// The holder let the lease lapse: take it over.
-    TakeOver {
-        version: UpdateVersion,
-        holder: Option<String>,
-        unrenewed_for: Duration,
-        previous_generation: u64,
-    },
-    /// Another instance holds a live lease.
-    Standby {
-        holder: Option<String>,
-        lease_duration: Duration,
-    },
-}
-
-/// Decides what to do with the lease as observed, given how long this
-/// instance has seen its current version unchanged. An unreadable lease is
-/// treated as another instance's, lasting this instance's own duration.
-fn plan(observed: Option<&ObservedLease>, lease: &WriterLease, unchanged_for: Duration) -> Plan {
-    let Some(observed) = observed else {
-        return Plan::Create;
-    };
-    let record = observed.record.as_ref();
-    if let Some(record) = record
-        && *record.holder_identity == *lease.identity
-    {
-        return Plan::Renew {
-            version: observed.version.clone(),
-            record: record.clone(),
-        };
-    }
-    let holder = record.map(|record| record.holder_identity.clone());
-    let lease_duration = record.map_or(lease.duration, LeaseRecord::lease_duration);
-    if unchanged_for >= lease_duration {
-        Plan::TakeOver {
-            version: observed.version.clone(),
-            holder,
-            unrenewed_for: unchanged_for,
-            previous_generation: record.map_or(0, |record| record.generation),
-        }
-    } else {
-        Plan::Standby {
-            holder,
-            lease_duration,
-        }
-    }
-}
-
-/// What this instance may do about the dataset's next snapshot.
-#[derive(Debug, PartialEq)]
-enum Role {
-    /// It holds the lease, under this generation, and creates the snapshot.
-    Holder { generation: u64, acquired: Acquired },
-    /// Another instance holds the lease, so it skips the snapshot.
-    Standby {
-        holder: Option<String>,
-        lease_duration: Duration,
-    },
-    /// The store cannot write conditionally, so it creates the snapshot
-    /// without a lease.
-    Unsupported,
-}
-
-/// How this instance came to hold the lease.
-#[derive(Clone, Debug, PartialEq)]
-enum Acquired {
-    /// No lease existed.
-    Created,
-    /// The lease was held under this instance's identity; `by_other_process`
-    /// when a process other than this one wrote it last.
-    Renewed { by_other_process: bool },
-    /// The holder let the lease lapse.
-    TookOver {
-        holder: Option<String>,
-        unrenewed_for: Duration,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RoleKind {
     Holder,
@@ -302,13 +175,52 @@ enum RoleKind {
     Unsupported,
 }
 
-impl Role {
-    fn kind(&self) -> RoleKind {
-        match self {
-            Role::Holder { .. } => RoleKind::Holder,
-            Role::Standby { .. } => RoleKind::Standby,
-            Role::Unsupported => RoleKind::Unsupported,
-        }
+fn role_kind(role: &Role) -> RoleKind {
+    match role {
+        Role::Holder { .. } => RoleKind::Holder,
+        Role::Standby { .. } => RoleKind::Standby,
+        Role::Unsupported => RoleKind::Unsupported,
+    }
+}
+
+/// The snapshot location as the writer lease reads and writes it: with the
+/// snapshot store's retries of transient network errors.
+struct RetryingLeaseIo<'a>(&'a SnapshotManager);
+
+#[async_trait]
+impl LeaseIo for RetryingLeaseIo<'_> {
+    async fn read(
+        &self,
+        path: &ObjectPath,
+    ) -> Result<Option<(Bytes, UpdateVersion)>, object_store::Error> {
+        retry(self.0.network_retry_strategy.clone(), || async {
+            let result = match self.0.object_store.get(path).await {
+                Ok(result) => result,
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(err) if is_retriable_object_store_error(&err) => {
+                    return Err(RetryError::transient(err));
+                }
+                Err(err) => return Err(RetryError::permanent(err)),
+            };
+            let version = UpdateVersion {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            };
+            let bytes = result.bytes().await.map_err(RetryError::transient)?;
+            Ok(Some((bytes, version)))
+        })
+        .await
+    }
+
+    async fn write(
+        &self,
+        path: &ObjectPath,
+        payload: PutPayload,
+        expected: &Expected,
+    ) -> Result<PutResult, ConditionalWriteError> {
+        self.0
+            .conditional_put_with_retry(path, payload, expected)
+            .await
     }
 }
 
@@ -336,33 +248,14 @@ impl SnapshotManager {
     /// its next snapshot. Best effort: a failure leaves the lease to lapse on
     /// its own.
     pub(super) async fn release_writer_lease(&self) {
-        let Some((version, record)) = self.writer_lease.state.lock().written.take() else {
-            return;
-        };
-        let released = LeaseRecord {
-            lease_duration_ms: 0,
-            renew_time_ms: self.next_renew_time_ms(),
-            ..record
-        };
-        let path = self.writer_lease_path();
-        let result = match (
-            serde_json::to_vec_pretty(&released),
-            Expected::at_version(version),
-        ) {
-            (Ok(body), Some(expected)) => conditional_put(
-                self.object_store.as_ref(),
-                &path,
-                PutPayload::from(body),
-                &expected,
-            )
+        match self
+            .writer_lease
+            .lease
+            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
             .await
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-            (Err(error), _) => Err(error.to_string()),
-            (_, None) => Err("the lease was written without a version".to_string()),
-        };
-        match result {
-            Ok(()) => {
+        {
+            Ok(false) => {}
+            Ok(true) => {
                 tracing::debug!(dataset = %self.dataset_name, "Released the snapshot writer lease after a failed snapshot");
             }
             Err(error) => {
@@ -373,158 +266,28 @@ impl SnapshotManager {
 
     async fn acquire_writer_lease(&self) -> Result<Role, SnapshotUploadError> {
         let path = self.writer_lease_path();
-        let lease = &self.writer_lease;
-        // The lease as this instance last tried to write it, when the store
-        // refused the write.
-        let refused: Mutex<Option<(LeaseRecord, Acquired)>> = Mutex::new(None);
-
-        let role = retry_on_conflict(&self.conflict_retry, || async {
-            let observed = self.read_writer_lease(&path).await?;
-            if let Some(observed) = &observed {
-                // A refused write can still have landed: a retry after a lost
-                // response is refused by the write it repeats.
-                let last_refused = refused.lock().take();
-                if let Some((record, acquired)) = last_refused
-                    && observed.record.as_ref() == Some(&record)
-                {
-                    let generation = record.generation;
-                    self.writer_lease.state.lock().written =
-                        Some((observed.version.clone(), record));
-                    return Ok(Attempt::Done(Role::Holder {
-                        generation,
-                        acquired,
-                    }));
-                }
-                // Nothing to match a conditional write against.
-                if observed.version.e_tag.is_none() && observed.version.version.is_none() {
-                    return Ok(Attempt::Done(Role::Unsupported));
-                }
-            }
-
-            let unchanged_for = self.lease_unchanged_for(observed.as_ref());
-            let now_ms = self.next_renew_time_ms();
-            let (expected, record, acquired) = match plan(observed.as_ref(), lease, unchanged_for) {
-                Plan::Standby {
-                    holder,
-                    lease_duration,
-                } => {
-                    return Ok(Attempt::Done(Role::Standby {
-                        holder,
-                        lease_duration,
-                    }));
-                }
-                Plan::Create => (
-                    Expected::Absent,
-                    self.lease_record(self.next_writer_generation(0).await?, now_ms, now_ms),
-                    Acquired::Created,
-                ),
-                Plan::Renew { version, record } => (
-                    Expected::Version(version),
-                    self.lease_record(record.generation, record.acquire_time_ms, now_ms),
-                    Acquired::Renewed {
-                        by_other_process: *record.holder_process != *lease.process,
-                    },
-                ),
-                Plan::TakeOver {
-                    version,
-                    holder,
-                    unrenewed_for,
-                    previous_generation,
-                } => (
-                    Expected::Version(version),
-                    self.lease_record(
-                        self.next_writer_generation(previous_generation).await?,
-                        now_ms,
-                        now_ms,
-                    ),
-                    Acquired::TookOver {
-                        holder,
-                        unrenewed_for,
-                    },
-                ),
-            };
-
-            let body = serde_json::to_vec_pretty(&record).map_err(|source| {
-                SnapshotUploadError::UploadSerializeMetadata {
-                    path: path.to_string(),
-                    source,
-                }
-            })?;
-            match self
-                .conditional_put_with_retry(&path, PutPayload::from(body), &expected)
-                .await
-            {
-                Ok(result) => {
-                    let generation = record.generation;
-                    let version = UpdateVersion {
-                        e_tag: result.e_tag,
-                        version: result.version,
-                    };
-                    self.writer_lease.state.lock().written = Some((version, record));
-                    Ok(Attempt::Done(Role::Holder {
-                        generation,
-                        acquired,
-                    }))
-                }
-                // Another write changed the lease first; read it again.
-                Err(ConditionalWriteError::Conflict { .. }) => {
-                    *refused.lock() = Some((record, acquired));
-                    Ok(Attempt::Conflict)
-                }
-                Err(ConditionalWriteError::Unsupported { .. }) => {
-                    Ok(Attempt::Done(Role::Unsupported))
-                }
-                Err(ConditionalWriteError::Store { source, .. }) => {
-                    Err(SnapshotUploadError::WriterLease {
+        self.writer_lease
+            .lease
+            .acquire(
+                &RetryingLeaseIo(self),
+                &path,
+                &self.conflict_retry,
+                |previous| self.next_writer_generation(previous),
+            )
+            .await
+            .map_err(|err| match err {
+                LeaseError::Read { path, source } | LeaseError::Write { path, source } => {
+                    SnapshotUploadError::WriterLease {
                         dataset: self.dataset_name.clone(),
-                        path: path.to_string(),
+                        path,
                         source,
-                    })
+                    }
                 }
-            }
-        })
-        .await;
-
-        match role {
-            Ok(role) => Ok(role),
-            // Every write met a conflicting one. Skip this snapshot and look again
-            // before the next.
-            Err(RetryOnConflictError::ConflictsExhausted { .. }) => Ok(Role::Standby {
-                holder: None,
-                lease_duration: lease.duration,
-            }),
-            Err(RetryOnConflictError::Failed(err)) => Err(err),
-        }
-    }
-
-    fn lease_record(
-        &self,
-        generation: u64,
-        acquire_time_ms: i64,
-        renew_time_ms: i64,
-    ) -> LeaseRecord {
-        LeaseRecord {
-            format_version: LEASE_FORMAT_VERSION,
-            holder_identity: self.writer_lease.identity.to_string(),
-            holder_process: self.writer_lease.process.to_string(),
-            generation,
-            lease_duration_ms: u64::try_from(self.writer_lease.duration.as_millis())
-                .unwrap_or(u64::MAX),
-            acquire_time_ms,
-            renew_time_ms,
-        }
-    }
-
-    /// The current time, or just after this instance's latest write if the
-    /// clock has not moved past it, so each write's content differs.
-    fn next_renew_time_ms(&self) -> i64 {
-        let mut state = self.writer_lease.state.lock();
-        let now_ms = Utc::now().timestamp_millis();
-        let renew_time_ms = state
-            .last_renew_time_ms
-            .map_or(now_ms, |last| now_ms.max(last.saturating_add(1)));
-        state.last_renew_time_ms = Some(renew_time_ms);
-        renew_time_ms
+                LeaseError::Serialize { path, source } => {
+                    SnapshotUploadError::UploadSerializeMetadata { path, source }
+                }
+                LeaseError::Generation(err) => err,
+            })
     }
 
     /// The generation after both `previous` and the latest generation that
@@ -542,61 +305,16 @@ impl SnapshotManager {
                     .and_then(published_writer_generation)
             })
             .unwrap_or(0);
-        Ok(previous.max(published).saturating_add(1))
-    }
-
-    /// How long this instance has seen the lease's current version unchanged.
-    fn lease_unchanged_for(&self, observed: Option<&ObservedLease>) -> Duration {
-        let mut state = self.writer_lease.state.lock();
-        let Some(observed) = observed else {
-            state.observed = None;
-            return Duration::ZERO;
-        };
-        match &state.observed {
-            Some((version, since)) if *version == observed.version => since.elapsed(),
-            _ => {
-                state.observed = Some((observed.version.clone(), Instant::now()));
-                Duration::ZERO
-            }
-        }
-    }
-
-    async fn read_writer_lease(
-        &self,
-        path: &ObjectPath,
-    ) -> Result<Option<ObservedLease>, SnapshotUploadError> {
-        retry(self.network_retry_strategy.clone(), || async {
-            let result = match self.object_store.get(path).await {
-                Ok(result) => result,
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                Err(err) if is_retriable_object_store_error(&err) => {
-                    return Err(RetryError::transient(err));
-                }
-                Err(err) => return Err(RetryError::permanent(err)),
-            };
-            let version = UpdateVersion {
-                e_tag: result.meta.e_tag.clone(),
-                version: result.meta.version.clone(),
-            };
-            let bytes = result.bytes().await.map_err(RetryError::transient)?;
-            let record = serde_json::from_slice::<LeaseRecord>(&bytes)
-                .ok()
-                .filter(|record| record.format_version == LEASE_FORMAT_VERSION);
-            Ok(Some(ObservedLease { record, version }))
-        })
-        .await
-        .map_err(|source| SnapshotUploadError::WriterLease {
-            dataset: self.dataset_name.clone(),
-            path: path.to_string(),
-            source,
-        })
+        Ok(object_store_occ::lease::next_generation(
+            previous.max(published),
+        ))
     }
 
     /// Logs a change of role; an unchanged role is logged at debug only.
     fn report_writer_lease_role(&self, role: &Role) {
         let (previous, shared_identity) = {
-            let mut state = self.writer_lease.state.lock();
-            let previous = state.reported.replace(role.kind());
+            let mut reported = self.writer_lease.reported.lock();
+            let previous = reported.role.replace(role_kind(role));
             // A process that held the lease and now finds another process's
             // renewal under its identity is sharing that identity with it.
             let shared_identity = matches!(
@@ -608,9 +326,9 @@ impl SnapshotManager {
                     ..
                 }
             ) && previous == Some(RoleKind::Holder)
-                && !state.warned_shared_identity;
+                && !reported.warned_shared_identity;
             if shared_identity {
-                state.warned_shared_identity = true;
+                reported.warned_shared_identity = true;
             }
             (previous, shared_identity)
         };
@@ -639,7 +357,7 @@ impl SnapshotManager {
                 tracing::error!(
                     "{}",
                     util::instance_id::duplicate_instance_message(
-                        &self.writer_lease.identity,
+                        self.writer_lease.lease.holder().identity(),
                         &self.snapshot_location_uri,
                     )
                 );
@@ -732,12 +450,12 @@ mod tests {
 
     use super::*;
     use crate::snapshot::tests::build_manager_for_api_tests;
-    use async_trait::async_trait;
     use futures::stream::BoxStream;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMode, PutMultipartOptions, PutOptions, PutResult, memory::InMemory, path::Path,
+        PutMode, PutMultipartOptions, PutOptions, memory::InMemory, path::Path,
     };
+    use object_store_occ::lease::LeaseRecord;
     use util::retry_strategy::RetryBackoffBuilder;
 
     const INTERVAL: Duration = Duration::from_mins(1);
@@ -760,9 +478,13 @@ mod tests {
     /// A lease that lapses as soon as it is written, so the next instance can
     /// take it over without waiting.
     fn lapsing(identity: &str) -> WriterLease {
+        with_lease_duration(instance(identity), Duration::ZERO)
+    }
+
+    fn with_lease_duration(lease: WriterLease, duration: Duration) -> WriterLease {
         WriterLease {
-            duration: Duration::ZERO,
-            ..instance(identity)
+            lease: lease.lease.with_duration(duration),
+            ..lease
         }
     }
 
@@ -782,132 +504,7 @@ mod tests {
     }
 
     fn reported(manager: &SnapshotManager) -> Option<RoleKind> {
-        manager.writer_lease.state.lock().reported
-    }
-
-    fn record(holder: &str, generation: u64, lease_duration: Duration) -> LeaseRecord {
-        LeaseRecord {
-            format_version: LEASE_FORMAT_VERSION,
-            holder_identity: holder.to_string(),
-            holder_process: format!("{holder}-process"),
-            generation,
-            lease_duration_ms: u64::try_from(lease_duration.as_millis()).expect("fits"),
-            acquire_time_ms: 1_000,
-            renew_time_ms: 2_000,
-        }
-    }
-
-    fn observed(record: Option<LeaseRecord>) -> ObservedLease {
-        ObservedLease {
-            record,
-            version: version("7"),
-        }
-    }
-
-    fn version(e_tag: &str) -> UpdateVersion {
-        UpdateVersion {
-            e_tag: Some(e_tag.to_string()),
-            version: None,
-        }
-    }
-
-    #[test]
-    fn an_absent_lease_is_created() {
-        assert_eq!(plan(None, &instance("a"), Duration::ZERO), Plan::Create);
-    }
-
-    #[test]
-    fn a_lease_held_under_our_identity_is_renewed_even_after_a_restart() {
-        // Renewed however long it went unrenewed: no other instance took it over.
-        let ours = record("a", 4, Duration::from_secs(30));
-        assert_eq!(
-            plan(
-                Some(&observed(Some(ours.clone()))),
-                &instance("a"),
-                Duration::from_hours(3)
-            ),
-            Plan::Renew {
-                version: version("7"),
-                record: ours,
-            }
-        );
-    }
-
-    #[test]
-    fn a_live_lease_of_another_instance_is_left_to_it() {
-        let theirs = observed(Some(record("b", 1, Duration::from_mins(2))));
-        assert_eq!(
-            plan(Some(&theirs), &instance("a"), Duration::from_secs(119)),
-            Plan::Standby {
-                holder: Some("b".to_string()),
-                lease_duration: Duration::from_mins(2),
-            }
-        );
-    }
-
-    #[test]
-    fn a_lease_unchanged_for_its_duration_is_taken_over() {
-        let theirs = observed(Some(record("b", 3, Duration::from_mins(2))));
-        assert_eq!(
-            plan(Some(&theirs), &instance("a"), Duration::from_mins(2)),
-            Plan::TakeOver {
-                version: version("7"),
-                holder: Some("b".to_string()),
-                unrenewed_for: Duration::from_mins(2),
-                previous_generation: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn the_holders_own_duration_decides_when_its_lease_lapses() {
-        // Five minutes unchanged is past this instance's 30s lease, but within
-        // the 10m the holder said it renews in.
-        let theirs = observed(Some(record("b", 1, Duration::from_mins(10))));
-        let short = WriterLease {
-            duration: Duration::from_secs(30),
-            ..instance("a")
-        };
-        assert!(matches!(
-            plan(Some(&theirs), &short, Duration::from_mins(5)),
-            Plan::Standby { .. }
-        ));
-    }
-
-    #[test]
-    fn a_lease_claiming_more_than_the_maximum_duration_lapses_at_the_maximum() {
-        let theirs = observed(Some(LeaseRecord {
-            lease_duration_ms: u64::MAX,
-            ..record("b", 1, Duration::ZERO)
-        }));
-        assert!(matches!(
-            plan(Some(&theirs), &instance("a"), MAX_LEASE_DURATION),
-            Plan::TakeOver { .. }
-        ));
-    }
-
-    #[test]
-    fn an_unreadable_lease_lapses_after_our_own_duration() {
-        let lease = instance("a");
-        assert_eq!(
-            plan(
-                Some(&observed(None)),
-                &lease,
-                lease.duration.saturating_sub(Duration::from_secs(1))
-            ),
-            Plan::Standby {
-                holder: None,
-                lease_duration: lease.duration,
-            }
-        );
-        assert!(matches!(
-            plan(Some(&observed(None)), &lease, lease.duration),
-            Plan::TakeOver {
-                holder: None,
-                previous_generation: 0,
-                ..
-            }
-        ));
+        manager.writer_lease.reported.lock().role
     }
 
     #[test]
@@ -920,7 +517,7 @@ mod tests {
         assert_eq!(lease_duration(Duration::from_hours(13)), MAX_LEASE_DURATION);
         assert_eq!(lease_duration(Duration::MAX), MAX_LEASE_DURATION);
         assert_eq!(
-            WriterLease::default().duration,
+            WriterLease::default().lease.duration(),
             lease_duration(DEFAULT_SNAPSHOT_INTERVAL)
         );
     }
@@ -974,17 +571,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn each_write_is_renewed_later_than_the_previous_even_within_a_millisecond() {
-        let a = manager(&memory(), instance("host-a"));
-        // A previous write stamped ahead of this clock: the next one still
-        // comes after it, so the two writes differ.
-        let ahead = Utc::now().timestamp_millis() + 60_000;
-        a.writer_lease.state.lock().last_renew_time_ms = Some(ahead);
-        assert_eq!(a.next_renew_time_ms(), ahead + 1);
-        assert_eq!(a.next_renew_time_ms(), ahead + 2);
-    }
-
     #[tokio::test]
     async fn a_lapsed_lease_passes_to_the_next_instance_under_a_new_generation() {
         let store = memory();
@@ -1017,10 +603,7 @@ mod tests {
         let a = manager(&store, instance("host-a"));
         let b = manager(
             &store,
-            WriterLease {
-                duration: Duration::from_millis(50),
-                ..instance("host-b")
-            },
+            with_lease_duration(instance("host-b"), Duration::from_millis(50)),
         );
         a.hold_writer_lease().await.expect("a takes the lease");
         // Written with a 50ms lease, then observed: the observation starts the clock.
@@ -1130,7 +713,13 @@ mod tests {
                 by_other_process: true,
             },
         });
-        assert!(!second_run.writer_lease.state.lock().warned_shared_identity);
+        assert!(
+            !second_run
+                .writer_lease
+                .reported
+                .lock()
+                .warned_shared_identity
+        );
 
         // Were the first process still running, its next renewal would find the
         // second's: two live processes share the identity.
@@ -1138,7 +727,13 @@ mod tests {
             .hold_writer_lease()
             .await
             .expect("first run renews");
-        assert!(first_run.writer_lease.state.lock().warned_shared_identity);
+        assert!(
+            first_run
+                .writer_lease
+                .reported
+                .lock()
+                .warned_shared_identity
+        );
     }
 
     #[tokio::test]
