@@ -24,7 +24,9 @@ use ansi_colors::Color;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use spice_cloud_client::endpoints::{DEFAULT_REGION as DEFAULT_CLOUD_REGION, is_valid_region};
+use spice_cloud_client::endpoints::{
+    DEFAULT_REGION as DEFAULT_CLOUD_REGION, is_spice_cloud_flight_endpoint, is_valid_region,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -43,21 +45,31 @@ mod data_source {
 
 /// Returns true if `from` reads from a Spice Cloud app, which requires `spiceai_region`.
 ///
-/// Self-hosted sources such as `spiceai:http://localhost:50051` carry their own endpoint
-/// and don't need a region.
+/// Splits `from` the way the runtime does: the source ends at the first `://`, `:` or `/`,
+/// and a `from` with no delimiter defaults to the `spice.ai` source. A path that is a Flight
+/// URL needs a region only when it points at Spice Cloud (`spice.ai:https://flight.spiceai.io`),
+/// not at a self-hosted runtime (`spiceai:http://localhost:50051`).
 fn is_spice_cloud_source(from: &str) -> bool {
-    [data_source::SPICE_AI, data_source::SPICEAI]
+    if from.is_empty() || from == "sink" {
+        return false;
+    }
+
+    let (source, path) = match from.find([':', '/']) {
+        Some(pos) => {
+            let delimiter_len = if from[pos..].starts_with("://") { 3 } else { 1 };
+            (&from[..pos], &from[pos + delimiter_len..])
+        }
+        None => (data_source::SPICE_AI, from),
+    };
+
+    if (source != data_source::SPICE_AI && source != data_source::SPICEAI) || path.is_empty() {
+        return false;
+    }
+
+    let is_flight_url = ["http://", "https://", "grpc://", "grpc+tls://"]
         .iter()
-        .any(|prefix| {
-            from.strip_prefix(prefix)
-                .and_then(|rest| rest.strip_prefix('/').or_else(|| rest.strip_prefix(':')))
-                .is_some_and(|path| {
-                    !path.is_empty()
-                        && !["http://", "https://", "grpc://", "grpc+tls://"]
-                            .iter()
-                            .any(|scheme| path.starts_with(scheme))
-                })
-        })
+        .any(|scheme| path.starts_with(scheme));
+    !is_flight_url || is_spice_cloud_flight_endpoint(path)
 }
 
 /// Arguments for the dataset command.
@@ -397,6 +409,16 @@ mod tests {
             "spiceai:spiceai/quickstart/datasets/taxi_trips"
         ));
         assert!(is_spice_cloud_source("spiceai/eth.recent_blocks"));
+        // No source prefix defaults to spice.ai.
+        assert!(is_spice_cloud_source("eth.recent_blocks"));
+        // Spice Cloud Flight URLs still need a region.
+        assert!(is_spice_cloud_source("spice.ai:https://flight.spiceai.io"));
+        assert!(is_spice_cloud_source(
+            "spiceai:https://us-west-2-prod-aws-flight.spiceai.io"
+        ));
+        assert!(is_spice_cloud_source(
+            "spice.ai:grpc+tls://us-east-1-prod-aws-flight.spiceai.io:443"
+        ));
 
         assert!(!is_spice_cloud_source("spiceai:http://localhost:50051"));
         assert!(!is_spice_cloud_source(
@@ -409,6 +431,8 @@ mod tests {
         assert!(!is_spice_cloud_source("spiceaix:foo"));
         assert!(!is_spice_cloud_source("s3://bucket/spice.ai/data.parquet"));
         assert!(!is_spice_cloud_source("postgres:public.users"));
+        assert!(!is_spice_cloud_source("sink"));
+        assert!(!is_spice_cloud_source(""));
     }
 
     #[test]
