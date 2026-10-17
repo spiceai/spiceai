@@ -42,10 +42,13 @@ limitations under the License.
 //! A crash replays at most `checkpoint_interval` of already-applied changes,
 //! which the accelerator's PK upsert absorbs idempotently (at-least-once).
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use arrow_tools::schema_evolution::is_widening_cast;
 use bitvec::slice::BitSlice;
+use datafusion_table_providers::sql::arrow_sql_gen::mysql::map_column_to_data_type;
 use mysql_async::binlog::events::{OptionalMetaExtractor, RowsEventData, TableMapEvent};
 use mysql_async::binlog::row::BinlogRow;
 use mysql_async::binlog::value::BinlogValue;
@@ -53,6 +56,9 @@ use mysql_async::consts::ColumnType;
 use mysql_async::{BinlogStream, BinlogStreamRequest, Conn, Value};
 use mysql_common::io::ParseBuf;
 
+use super::ColumnTypeChanges;
+use super::SchemaMismatchSnafu;
+use super::changes::MemberLayout;
 use super::config::{BinlogPosition, ReplicationParams};
 use super::gtid::GtidSet;
 use super::metrics::MetricsCollector;
@@ -633,6 +639,11 @@ pub(super) struct AdoptedLayout {
     pub(super) layout: TableLayout,
     pub(super) column_map: Vec<usize>,
     pub(super) pk_source_indexes: Vec<usize>,
+    /// The schema the member's change batches are built with from here on, when
+    /// the member widens column types and a column's source type widened
+    /// losslessly (see [`widen_to_source_types`]); `None` when every column keeps
+    /// its type.
+    pub(super) widened_schema: Option<SchemaRef>,
 }
 
 /// Re-fetch the source table's layout and reconcile it against the dataset
@@ -645,11 +656,13 @@ pub(super) async fn adopt_current_layout(
     params: &ReplicationParams,
     database: &str,
     table: &str,
-    schema: &SchemaRef,
-    old_layout: &TableLayout,
+    old: &MemberLayout,
     primary_keys: &[String],
     dataset_name: &str,
+    column_type_changes: ColumnTypeChanges,
 ) -> Result<AdoptedLayout> {
+    let schema = old.change_schemas.dataset();
+    let old_layout = &old.layout;
     let mut conn = super::setup::connect(params).await?;
     let layout = super::setup::fetch_table_layout(&mut conn, database, table).await?;
     if let Err(e) = conn.disconnect().await {
@@ -657,6 +670,9 @@ pub(super) async fn adopt_current_layout(
     }
 
     let column_map = layout.column_map(schema, database, table)?;
+    if let Some(message) = lossy_retype(schema, old_layout, &layout, &column_map) {
+        return SchemaMismatchSnafu { message }.fail();
+    }
     let pk_source_indexes = compute_pk_source_indexes(schema, primary_keys, &column_map);
 
     let old_names: std::collections::HashSet<&str> =
@@ -682,11 +698,174 @@ pub(super) async fn adopt_current_layout(
         );
     }
 
+    let widened_schema = match column_type_changes {
+        ColumnTypeChanges::Keep => None,
+        ColumnTypeChanges::Widen => {
+            widen_to_source_types(schema, &layout, &column_map, primary_keys)
+        }
+    };
+
     Ok(AdoptedLayout {
         layout,
         column_map,
         pk_source_indexes,
+        widened_schema,
     })
+}
+
+/// The Arrow type the `MySQL` table provider infers for a numeric
+/// `information_schema.COLUMNS.COLUMN_TYPE`, or `None` for any other type, so a
+/// type adopted mid-stream is the type a restart would register.
+fn numeric_arrow_type(column_type: &str) -> Option<DataType> {
+    let lower = column_type.trim().to_ascii_lowercase();
+    let wire_type = match type_base_name(&lower).as_str() {
+        "tinyint" => ColumnType::MYSQL_TYPE_TINY,
+        "smallint" => ColumnType::MYSQL_TYPE_SHORT,
+        "mediumint" => ColumnType::MYSQL_TYPE_INT24,
+        "int" | "integer" => ColumnType::MYSQL_TYPE_LONG,
+        "bigint" => ColumnType::MYSQL_TYPE_LONGLONG,
+        "float" => ColumnType::MYSQL_TYPE_FLOAT,
+        "double" => ColumnType::MYSQL_TYPE_DOUBLE,
+        "decimal" | "numeric" => ColumnType::MYSQL_TYPE_NEWDECIMAL,
+        _ => return None,
+    };
+    let (precision, scale) = if wire_type == ColumnType::MYSQL_TYPE_NEWDECIMAL {
+        let (precision, scale) = decimal_precision_and_scale(&lower)?;
+        (Some(precision), Some(scale))
+    } else {
+        (None, None)
+    };
+    map_column_to_data_type(
+        wire_type,
+        false,
+        false,
+        lower.contains("unsigned"),
+        false,
+        precision,
+        scale,
+    )
+}
+
+/// `(precision, scale)` of a `decimal(p[,s])` column type. `MySQL` always
+/// reports both in `COLUMN_TYPE`; a bare `decimal` is `decimal(10,0)`.
+fn decimal_precision_and_scale(column_type: &str) -> Option<(u8, i8)> {
+    let Some(open) = column_type.find('(') else {
+        return Some((10, 0));
+    };
+    let close = column_type[open..].find(')')? + open;
+    let mut parts = column_type[open + 1..close].split(',').map(str::trim);
+    let precision = parts.next()?.parse().ok()?;
+    let scale = parts.next().map_or(Some(0), |s| s.parse().ok())?;
+    Some((precision, scale))
+}
+
+/// The lowercase type name a `COLUMN_TYPE` starts with (`int` for
+/// `int(11) unsigned`).
+fn type_base_name(column_type: &str) -> String {
+    column_type
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Why a replicated column's new source type cannot be followed, or `None`
+/// when every replicated column's new type holds each value of its old one.
+///
+/// An `ALTER` that changes a column to a type that does not hold every value of
+/// its old one (`BIGINT` to `DOUBLE`, `DOUBLE` to `INT`) rewrites the stored
+/// values in place, with no row event: `9007199254740993` becomes
+/// `9007199254740992`. The acceleration still holds the old values, and no
+/// later change can repair a row it does not touch; on a key column, a change
+/// matched by a rewritten key misses the row the acceleration holds.
+///
+/// The old and new types are both the source's, so a dataset whose `columns`
+/// declare their own types is judged by what the `ALTER` did to the source.
+fn lossy_retype(
+    schema: &SchemaRef,
+    old_layout: &TableLayout,
+    layout: &TableLayout,
+    column_map: &[usize],
+) -> Option<String> {
+    schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .find_map(|(field, &source_index)| {
+            let column = layout.columns.get(source_index)?;
+            let old_column = old_layout.columns.iter().find(|c| c.name == column.name)?;
+            let from = numeric_arrow_type(&old_column.column_type)?;
+            let to = numeric_arrow_type(&column.column_type)?;
+            let holds_every_value =
+                to == from || is_widening_cast(&from, &to) || integer_fits_decimal(&from, &to);
+            (!holds_every_value).then(|| {
+                format!(
+                    "column '{}' changed type from `{}` to `{}`, which cannot hold every value \
+                     exactly, so the source rewrote stored values the acceleration still holds",
+                    field.name(),
+                    old_column.column_type,
+                    column.column_type
+                )
+            })
+        })
+}
+
+/// Whether every value of integer type `from` is a `DECIMAL` of type `to`:
+/// its integer digits (`p - s`) cover the integer type's widest value.
+fn integer_fits_decimal(from: &DataType, to: &DataType) -> bool {
+    let digits: i16 = match from {
+        DataType::Int8 | DataType::UInt8 => 3,
+        DataType::Int16 | DataType::UInt16 => 5,
+        DataType::Int32 | DataType::UInt32 => 10,
+        DataType::Int64 => 19,
+        DataType::UInt64 => 20,
+        _ => return false,
+    };
+    match to {
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            i16::from(*precision) - i16::from(*scale) >= digits
+        }
+        _ => false,
+    }
+}
+
+/// `schema` with each column whose source type is now a lossless widening of
+/// its current type (`INT` to `DOUBLE`, `DECIMAL(10,2)` to `DECIMAL(12,2)`)
+/// retyped to the source's type, so the values the source now sends decode
+/// as what they are and reach `on_schema_change` as a schema change, rather
+/// than failing to decode as the old type.
+///
+/// Primary-key columns keep their type: a key's typed encoding must not change
+/// under the rows already stored by it. Any other change keeps the current type
+/// too, and a value that type cannot hold fails to decode.
+fn widen_to_source_types(
+    schema: &SchemaRef,
+    layout: &TableLayout,
+    column_map: &[usize],
+    primary_keys: &[String],
+) -> Option<SchemaRef> {
+    let mut changed = false;
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .map(|(field, &source_index)| {
+            let widened = layout
+                .columns
+                .get(source_index)
+                .filter(|_| !primary_keys.iter().any(|pk| pk == field.name()))
+                .and_then(|column| numeric_arrow_type(&column.column_type))
+                .filter(|to| is_widening_cast(field.data_type(), to));
+            match widened {
+                Some(to) => {
+                    changed = true;
+                    Arc::new(field.as_ref().clone().with_data_type(to))
+                }
+                None => Arc::clone(field),
+            }
+        })
+        .collect();
+    changed.then(|| Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
 }
 
 /// A coarse binlog column-type class, used to compare a layout fetched from
@@ -726,12 +905,7 @@ enum BinlogTypeClass {
 /// 5.6), `TEXT` / `BLOB` (all sent as `MYSQL_TYPE_BLOB`, distinguished only by
 /// a length byte in the metadata), and `REAL` (`REAL_AS_FLOAT` `sql_mode`).
 fn source_type_class(column_type: &str) -> Option<BinlogTypeClass> {
-    let base: String = column_type
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match base.as_str() {
+    match type_base_name(column_type).as_str() {
         "tinyint" => Some(BinlogTypeClass::Int8),
         "smallint" => Some(BinlogTypeClass::Int16),
         "mediumint" => Some(BinlogTypeClass::Int24),
@@ -1380,6 +1554,135 @@ mod tests {
         layout_mismatch_against(&layout_of(columns), |ordinal| {
             event.get(ordinal).copied().flatten()
         })
+    }
+
+    #[test]
+    fn numeric_column_types_map_like_the_table_provider() {
+        for (column_type, expected) in [
+            ("tinyint", Some(DataType::Int8)),
+            ("tinyint(3) unsigned", Some(DataType::UInt8)),
+            ("smallint", Some(DataType::Int16)),
+            ("mediumint", Some(DataType::Int32)),
+            ("int", Some(DataType::Int32)),
+            ("INT UNSIGNED", Some(DataType::UInt32)),
+            ("bigint", Some(DataType::Int64)),
+            ("bigint unsigned", Some(DataType::UInt64)),
+            ("float", Some(DataType::Float32)),
+            ("double", Some(DataType::Float64)),
+            ("decimal(12,2)", Some(DataType::Decimal128(12, 2))),
+            ("decimal(65,30)", Some(DataType::Decimal256(65, 30))),
+            ("decimal", Some(DataType::Decimal128(10, 0))),
+            ("varchar(20)", None),
+            ("datetime(6)", None),
+        ] {
+            assert_eq!(numeric_arrow_type(column_type), expected, "{column_type}");
+        }
+    }
+
+    fn schema_of(fields: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|(name, data_type)| {
+                    arrow::datatypes::Field::new(*name, data_type.clone(), true)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn a_widened_source_type_retypes_the_column_and_nothing_else() {
+        let schema = schema_of(&[
+            ("id", DataType::Int64),
+            ("k", DataType::Int32),
+            ("price", DataType::Decimal128(10, 2)),
+            ("ratio", DataType::Float64),
+            ("name", DataType::Utf8),
+        ]);
+        // `id` widens too, but a key keeps its type; `ratio` narrows to INT,
+        // which is not a widening; `name` is not numeric.
+        let layout = layout_of(&[
+            ("id", "double"),
+            ("k", "double"),
+            ("price", "decimal(12,2)"),
+            ("ratio", "int"),
+            ("name", "varchar(20)"),
+        ]);
+        let widened =
+            widen_to_source_types(&schema, &layout, &[0, 1, 2, 3, 4], &["id".to_string()])
+                .expect("k and price widen");
+        let types: Vec<_> = widened
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                DataType::Int64,
+                DataType::Float64,
+                DataType::Decimal128(12, 2),
+                DataType::Float64,
+                DataType::Utf8,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_column_retyped_to_a_type_that_loses_values_is_refused() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int64)]);
+        let old = layout_of(&[("id", "bigint"), ("k", "bigint")]);
+        let retyped = |id: &str, k: &str| {
+            lossy_retype(&schema, &old, &layout_of(&[("id", id), ("k", k)]), &[0, 1])
+        };
+        assert_eq!(
+            retyped("bigint", "double"),
+            Some(
+                "column 'k' changed type from `bigint` to `double`, which cannot hold every value \
+                 exactly, so the source rewrote stored values the acceleration still holds"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            retyped("double", "bigint"),
+            Some(
+                "column 'id' changed type from `bigint` to `double`, which cannot hold every value \
+                 exactly, so the source rewrote stored values the acceleration still holds"
+                    .to_string()
+            )
+        );
+        // `DECIMAL(18,0)` holds 18 integer digits; a `BIGINT` can have 19.
+        assert!(retyped("bigint", "decimal(18,0)").is_some());
+        // Types that hold every old value, and non-numeric types, are followed.
+        assert_eq!(retyped("bigint", "decimal(19,0)"), None);
+        assert_eq!(retyped("bigint", "bigint"), None);
+        assert_eq!(retyped("bigint", "varchar(40)"), None);
+    }
+
+    #[test]
+    fn a_column_typed_by_the_dataset_is_judged_by_its_source_types() {
+        // The dataset declares `k` as text; an `INT` to `BIGINT` change on the
+        // source loses nothing, whatever the dataset's own type.
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Utf8)]);
+        assert_eq!(
+            lossy_retype(
+                &schema,
+                &layout_of(&[("id", "bigint"), ("k", "int")]),
+                &layout_of(&[("id", "bigint"), ("k", "bigint")]),
+                &[0, 1]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unchanged_layout_keeps_the_same_schema() {
+        let schema = schema_of(&[("id", DataType::Int64), ("k", DataType::Int32)]);
+        let layout = layout_of(&[("id", "bigint"), ("k", "int")]);
+        assert_eq!(
+            widen_to_source_types(&schema, &layout, &[0, 1], &["id".to_string()]),
+            None
+        );
     }
 
     #[test]
