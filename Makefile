@@ -197,7 +197,7 @@ endif
 # Lint, test compilation, and CLI verification must enable the same capabilities.
 # The differential-test feature also belongs in lint's resolve so the two gates
 # check the same Cayenne implementation.
-RUST_GATE_FEATURES := adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench,cayenne/result-correctness-duckdb
+RUST_GATE_FEATURES := adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,qdrant,http-functions,wasm-functions,rate-control,spicebench,cayenne/result-correctness-duckdb
 NEXTEST_SELECTION := --all --exclude libnfs \
 	--features $(RUST_GATE_FEATURES)
 
