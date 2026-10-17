@@ -20,6 +20,8 @@ limitations under the License.
 //! (`hold_writers_and_carry_appends`).
 
 use super::*;
+use std::sync::atomic::AtomicBool;
+
 use arrow::array::{StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
@@ -53,6 +55,16 @@ fn one_file_per_append() -> VortexConfig {
         inline_max_buffer_bytes: 0,
         compaction_background_interval_ms: 3_600_000,
         ..VortexConfig::default()
+    }
+}
+
+/// [`one_file_per_append`] with a four-file trigger and pick, so four tiny files
+/// qualify the Small tier by count and three do not.
+fn four_file_count_trigger() -> VortexConfig {
+    VortexConfig {
+        compaction_trigger_files: 4,
+        compaction_max_files_per_pick: 4,
+        ..one_file_per_append()
     }
 }
 
@@ -670,15 +682,15 @@ async fn a_declined_pass_leaves_the_next_write_due_a_pass() {
         "the next write admits a pass over the files the declined pass saw"
     );
 
-    // Credits counted after the sample stay on top of what was seen.
+    // Credits counted after the sample stay on top of what the declined listing kept.
     counter.store(trigger + 20, Ordering::Release);
     provider
         .retire_listed_small_file_credits(&snapshot_id, trigger, trigger)
         .await;
     assert_eq!(
         counter.load(Ordering::Acquire),
-        20.max(trigger - 1),
-        "the credits counted after the sample stay"
+        20 + (trigger - 1),
+        "the credits counted after the sample stay on top of the ones the listing kept"
     );
 
     // A replacement restarts the count: a pass over the replaced snapshot retires nothing.
@@ -690,5 +702,127 @@ async fn a_declined_pass_leaves_the_next_write_due_a_pass() {
         counter.load(Ordering::Acquire),
         trigger,
         "nothing is retired once the snapshot changed"
+    );
+}
+
+/// A small file published after a pass listed a snapshot that did not qualify is
+/// absent from that listing, and its credit has to survive retirement. The pass
+/// declines, and the credit it kept — on top of the ones the declined files still
+/// hold — is enough for the retry to compact the file. No later write is required.
+#[tokio::test]
+async fn a_small_file_landing_during_a_declined_pass_is_compacted_without_another_write() {
+    const NAME: &str = "pk_less_raced_qualifying_file";
+    let schema = id_value_schema();
+    let ctx = SessionContext::new();
+    let (provider, _temp_dir) = create_cayenne_table_with_config(
+        NAME,
+        Arc::clone(&schema),
+        four_file_count_trigger(),
+        Vec::new(),
+        ctx.runtime_env(),
+    )
+    .await;
+    let trigger = provider.context.compaction_picker_config().trigger_files;
+    assert_eq!(trigger, 4, "fixture: four files qualify the tier by count");
+    for i in 0..3 {
+        insert_batch(&provider, id_value_rows(&schema, i * 50, 50)).await;
+    }
+    let listed_before = list_current(&provider).await;
+    assert_eq!(
+        listed_before.files.len(),
+        3,
+        "fixture: three small files, one short of the count trigger"
+    );
+    let picker_cfg = provider.context.compaction_picker_config();
+    assert!(
+        provider
+            .pick_small_file_candidates(&listed_before.files, &picker_cfg)
+            .is_none(),
+        "fixture: three files do not qualify"
+    );
+
+    // Three small files are one short of the count trigger, so the gate would not
+    // list them. The extra credit is what a non-small file in the same directory
+    // contributes: the pass lists, the picker still declines, and the qualifying
+    // small file lands in the hook after the counter was sampled.
+    provider
+        .new_files_since_last_compaction
+        .store(trigger, Ordering::Release);
+    let appending = provider.clone_for_write();
+    let appended = Arc::new(AtomicBool::new(false));
+    let appended_flag = Arc::clone(&appended);
+    let raced_schema = Arc::clone(&schema);
+    *provider.test_after_small_file_list_hook.lock() = Some(Box::new(move || {
+        Box::pin(async move {
+            insert_batch(&appending, id_value_rows(&raced_schema, 1_000, 50)).await;
+            appended_flag.store(true, Ordering::Release);
+        })
+    }));
+    // The append schedules its own pass. Hold that worker off so the retry this
+    // test runs is the only one, and it runs after retirement.
+    provider
+        .post_write_compaction_state
+        .store(super::super::COALESCED_TASK_RUNNING, Ordering::Release);
+
+    let snapshot_before = provider.get_current_snapshot_id();
+    assert!(
+        !provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("the pass that listed three files runs"),
+        "the listing of three files declines"
+    );
+    assert!(
+        appended.load(Ordering::Acquire),
+        "precondition: the fourth small file landed after the listing"
+    );
+    assert_eq!(
+        provider.get_current_snapshot_id(),
+        snapshot_before,
+        "the declined pass publishes nothing"
+    );
+    let listed_after_race = list_current(&provider).await;
+    assert_eq!(
+        listed_after_race.files.len(),
+        4,
+        "the raced file is in the snapshot the declined pass did not list"
+    );
+    assert_eq!(
+        provider
+            .new_files_since_last_compaction
+            .load(Ordering::Acquire),
+        trigger,
+        "retirement keeps the raced file's credit on top of the declined listing"
+    );
+    assert!(
+        provider.post_write_compaction_due(),
+        "the retry is due without another write"
+    );
+
+    // Leave the coalesced worker claimed so the retry's own schedule cannot start
+    // a second pass under these assertions.
+    assert!(
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("the retry runs"),
+        "the retry compacts the file the declined pass missed"
+    );
+    let listed_after_retry = list_current(&provider).await;
+    assert!(
+        listed_after_retry.files.len() < 4,
+        "the retry merged the four small files, left {}",
+        listed_after_retry.files.len()
+    );
+    let expected: Vec<i64> = (0..150).chain(1_000..1_050).collect();
+    assert_eq!(
+        scan_sorted_ids(&provider).await,
+        expected,
+        "every row, the raced file's included, stays visible"
+    );
+    assert_eq!(
+        ids_after_reopen(&provider, NAME).await,
+        expected,
+        "after a restart the table holds the same rows"
     );
 }

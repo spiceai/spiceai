@@ -2184,6 +2184,11 @@ pub struct CayenneTableProvider {
     /// never read. Consumed on first fire.
     #[cfg(test)]
     test_pre_rewrite_commit_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a small-file pass has listed the current
+    /// snapshot and before it picks, so a test can land a file the listing did
+    /// not see. Consumed on first fire.
+    #[cfg(test)]
+    test_after_small_file_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only probe of the writer-concurrent full rewrite's capture, so a test
     /// can order a staged write's publish against it. Consumed on first fire.
     #[cfg(test)]
@@ -9950,6 +9955,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_after_small_file_list_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12345,6 +12352,8 @@ impl CayenneTableProvider {
             test_checkpoint_union_hook: Arc::clone(&self.test_checkpoint_union_hook),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
+            #[cfg(test)]
+            test_after_small_file_list_hook: Arc::clone(&self.test_after_small_file_list_hook),
             #[cfg(test)]
             test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
             #[cfg(test)]
@@ -20822,6 +20831,11 @@ impl CayenneTableProvider {
                 return Err(e);
             }
         };
+        // A file published here is absent from `files` and present in the credit
+        // counter. Retirement must keep that credit, or the retry this pass's
+        // caller owes the file never runs.
+        #[cfg(test)]
+        self.run_test_after_small_file_list_hook().await;
         if files.len() < 2 {
             maintenance_metrics::track_compaction(
                 table_name,
@@ -20991,13 +21005,19 @@ impl CayenneTableProvider {
     ///
     /// `credits_seen` was sampled before the pass listed the snapshot, and a write counts its
     /// files only once they are in the snapshot directory, so each of those credits is a file
-    /// the listing saw and found nothing to merge with. Two things are kept:
+    /// the listing saw and found nothing to merge with. Two groups are kept, and they add:
     ///
-    /// - credits a write counted after the sample: its files are still owed a pass;
-    /// - up to `trigger_files - 1` credits: the files the pass declined may be a file or two
-    ///   short of qualifying, so the next write must bring the count back to the trigger and
-    ///   admit a pass that re-checks them. Retiring every credit would leave them unmerged until
-    ///   as many new files arrive as the trigger asks for, or for good on a table that goes idle.
+    /// - credits a write counted after the sample: its files were not in the listing, so they
+    ///   are still owed a pass. One such file is enough to qualify a tier the listing declined;
+    /// - up to `trigger_files - 1` of the sampled credits: the files the pass declined may be a
+    ///   file or two short of qualifying, so the next write must bring the count back to the
+    ///   trigger and admit a pass that re-checks them. Retiring every sampled credit would leave
+    ///   them unmerged until as many new files arrive as the trigger asks for, or for good on a
+    ///   table that goes idle.
+    ///
+    /// A file counted after the sample can be the one that qualifies the tier. Its credit has to
+    /// sit on top of the retained sampled credits, or the counter stays short of the trigger and
+    /// the retry that write already requested does not run.
     ///
     /// A replacement restarts the count, so nothing is retired once the snapshot changed; the
     /// listing fence keeps one from landing in between.
@@ -21015,7 +21035,11 @@ impl CayenneTableProvider {
         let _ = self.new_files_since_last_compaction.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
-            |credits| Some(credits.saturating_sub(credits_seen).max(credits.min(keep))),
+            |credits| {
+                let post_sample = credits.saturating_sub(credits_seen);
+                let retained_sampled = credits.min(credits_seen).min(keep);
+                Some(post_sample.saturating_add(retained_sampled))
+            },
         );
     }
 
@@ -30024,6 +30048,16 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_post_snapshot_list_hook(&self) {
         let hook = self.test_post_snapshot_list_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-small-file-list hook, if one is
+    /// installed. See [`Self::test_after_small_file_list_hook`].
+    #[cfg(test)]
+    async fn run_test_after_small_file_list_hook(&self) {
+        let hook = self.test_after_small_file_list_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
