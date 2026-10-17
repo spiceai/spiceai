@@ -644,7 +644,7 @@ fn pg_cell(row: &tokio_postgres::Row, idx: usize) -> Result<Cell, anyhow::Error>
 fn timestamptz_cell(ts: chrono::DateTime<chrono::Utc>) -> Result<Cell, anyhow::Error> {
     let subsec_nanos = ts.timestamp_subsec_nanos();
     anyhow::ensure!(
-        subsec_nanos % 1_000_000 == 0,
+        subsec_nanos.is_multiple_of(1_000_000),
         "PostgreSQL timestamptz {ts} is not millisecond-aligned (subsecond nanos {subsec_nanos})"
     );
     Ok(Cell::Int(ts.timestamp_millis()))
