@@ -10559,7 +10559,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// A publish drops the snapshots older than 14 days but keeps their files for a day,
+    /// A publish drops the snapshots older than 28 days but keeps their files for a day,
     /// so a reader that read `metadata.json` before the drop still downloads them. The
     /// first publish after that day deletes the files; a snapshot it drops itself keeps
     /// its file for another day.
@@ -10624,7 +10624,7 @@ mod tests {
             )
         };
 
-        writer.cleanup_clock = CleanupClock::ahead_by(15 * DAY);
+        writer.cleanup_clock = CleanupClock::ahead_by(29 * DAY);
         publish_contents(&writer, &local_path, "publish 3", &schema).await;
         assert_eq!(
             entry_ids(&dataset_entries(store.as_ref(), &metadata_path).await),
@@ -10642,7 +10642,7 @@ mod tests {
         assert_eq!(restored.snapshot_id, 0);
 
         let third = dataset_entries(store.as_ref(), &metadata_path).await[0].clone();
-        writer.cleanup_clock = CleanupClock::ahead_by(16 * DAY);
+        writer.cleanup_clock = CleanupClock::ahead_by(30 * DAY);
         publish_contents(&writer, &local_path, "publish 4", &schema).await;
         let entries = dataset_entries(store.as_ref(), &metadata_path).await;
         assert_eq!(entry_ids(&entries), vec![4]);
