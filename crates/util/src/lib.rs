@@ -30,6 +30,7 @@ pub mod levenshtein;
 pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;
+pub mod spice_paths;
 pub mod topological_ordering;
 pub mod tracers;
 pub use backoff::Error as RetryError;
