@@ -41,6 +41,7 @@ pub mod session_config;
 pub use runtime_query_engine::allowlist;
 pub use runtime_query_engine::query_engine;
 pub mod sort_columns;
+pub mod table_function_params;
 pub mod udf;
 pub mod url_table;
 use snafu::prelude::*;
