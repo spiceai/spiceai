@@ -107,8 +107,8 @@ struct AggregateQuery {
 struct SqlFragment {
     /// The SQL expression to emit (e.g. `SUM("l_quantity")`).
     sql: String,
-    /// Key used for deduplication. Outer CASTs are stripped so that
-    /// `SUM(col)` and `SUM(CAST(col AS DOUBLE))` are recognized as duplicates.
+    /// The remote engine's name for the expression: outer CASTs are stripped, so
+    /// `SUM(col)` and `SUM(CAST(col AS DOUBLE))` share a key.
     dedup_key: String,
     /// Whether this fragment needs an `AS "__agg_N"` alias.
     /// Group-by columns don't; aggregate expressions do.
@@ -390,19 +390,17 @@ fn remap_batch(
 // ─── SQL generation ──────────────────────────────────────────────────
 
 /// Build a SQL string from structured fields, deduplicating aggregate expressions
-/// that are *exactly* identical as remote expressions (including any explicit CASTs)
-/// and would therefore produce the same remote column name.
+/// that are identical as remote expressions.
 ///
 /// Returns the SQL and a column mapping from output position → remote column index.
 ///
-/// `DataFusion` normalises aggregate names (for example `SUM(col)` and
-/// `SUM(CAST(col AS DOUBLE))` may share the same internal name), which can cause
-/// "duplicate field name" errors on the remote side. To avoid this, we compute
-/// a deduplication key from the full remote aggregate expression, including CASTs,
-/// and emit each unique remote aggregate expression only once. When multiple local
-/// aggregates share the same remote expression, they are mapped to that single
-/// remote column, and [`remap_batch`] is responsible for casting the resulting
-/// column to the correct local target type when necessary.
+/// `DataFusion` names aggregates without their outer CASTs (`SUM(col)` and
+/// `SUM(CAST(col AS DOUBLE))` are both `sum(col)`), so a remote query with both
+/// fails with a duplicate field name. Each unique remote aggregate expression is
+/// emitted once, and local aggregates that share it map to that one remote column;
+/// [`remap_batch`] casts the column to each local target type. Two different
+/// expressions that the remote engine would name alike are an error, so the
+/// aggregate is not pushed down.
 fn build_aggregate_sql(
     table_reference: &TableReference,
     source_filters: &[Expr],
@@ -519,9 +517,6 @@ fn build_aggregate_sql(
                         needs_alias: true,
                     });
                 } else if name_lower.ends_with("[sum]") {
-                    // Use SUM(col) (no CAST) as the dedup key so it merges with an
-                    // existing explicit SUM(col). The local side casts the Decimal
-                    // result to Float64 via remap_batch.
                     all_fragments.push(SqlFragment {
                         sql: format!("SUM({arg_sql})"),
                         dedup_key: format!("SUM({stripped})"),
@@ -548,6 +543,14 @@ fn build_aggregate_sql(
 
     for frag in &all_fragments {
         if let Some(&idx) = dedup_map.get(&frag.dedup_key) {
+            // The remote engine names `SUM(x)` and `SUM(CAST(x AS BIGINT))` alike, so
+            // it cannot return both, and one cannot stand in for the other.
+            if unique_items[idx].sql != frag.sql {
+                return Err(DataFusionError::Plan(format!(
+                    "Cannot push down both {} and {}: the remote engine names them alike",
+                    unique_items[idx].sql, frag.sql
+                )));
+            }
             column_mapping.push(idx);
         } else {
             let idx = unique_items.len();
@@ -599,9 +602,8 @@ fn build_aggregate_sql(
 /// Strip an outer `CAST(... AS ...)` wrapper from a SQL fragment, returning the
 /// inner expression. If the fragment is not a CAST, return it unchanged.
 ///
-/// This is used as a deduplication key: `DataFusion` normalises `SUM(col)` and
-/// `SUM(CAST(col AS DOUBLE))` to the same internal aggregate, so we must treat
-/// them as duplicates.
+/// This is used as a deduplication key: `DataFusion` names `SUM(col)` and
+/// `SUM(CAST(col AS DOUBLE))` alike, so one remote query cannot hold both.
 fn strip_outer_cast(sql: &str) -> &str {
     let s = sql.trim();
     if let Some(inner) = s.strip_prefix("CAST(") {

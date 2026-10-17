@@ -65,6 +65,29 @@ impl RunningContainer {
     }
 
     /// The host port Docker allocated atomically for this container's TCP port.
+    /// The container's address on the Docker bridge, which another container reaches
+    /// directly: a port published on the host loopback is not visible from inside a
+    /// container on a Linux daemon.
+    pub async fn bridge_ip(&self) -> Result<String, anyhow::Error> {
+        let inspected = self.docker.inspect_container(&self.id, None).await?;
+        inspected
+            .network_settings
+            .and_then(|settings| {
+                settings
+                    .networks
+                    .and_then(|networks| networks.into_values().find_map(|n| n.ip_address))
+                    .or(settings.ip_address)
+            })
+            .filter(|ip| !ip.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Test container {} ({}) has no bridge IP address",
+                    self.name,
+                    self.id
+                )
+            })
+    }
+
     pub fn host_port(&self, container_port: u16) -> Result<u16, anyhow::Error> {
         self.ports
             .read()

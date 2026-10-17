@@ -186,6 +186,8 @@ pub enum ApiErrorKind {
     Authentication,
     /// The credentials were accepted but may not do what was asked.
     PermissionDenied,
+    /// The requested resource, for example a model or a stored response, does not exist.
+    NotFound,
     /// The provider is throttling requests.
     RateLimited,
     /// The account has no quota left.
@@ -204,6 +206,7 @@ impl ApiErrorKind {
             "invalid_request_error" => Some(Self::InvalidRequest),
             "invalid_api_key" | "authentication_error" => Some(Self::Authentication),
             "permission_error" => Some(Self::PermissionDenied),
+            "not_found_error" => Some(Self::NotFound),
             "rate_limit_exceeded" | "rate_limit_error" => Some(Self::RateLimited),
             "insufficient_quota" => Some(Self::InsufficientQuota),
             _ => None,

@@ -26,6 +26,7 @@ use std::{
 
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::cluster::partition::get_partition_filter_exprs;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
     ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
@@ -289,22 +290,32 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        if let Some(snapshots) = app.effective_snapshots().as_deref() {
-            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
-                ds.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.enabled
-                        && acceleration
-                            .refresh_mode
-                            .is_some_and(|mode| mode.is_snapshot_only())
-                })
-            });
+        // An executor runs the scheduler's spicepod, whose own startup logs these warnings.
+        if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor) {
             if let Some(warning) =
-                runtime_acceleration::snapshot::notifications::unread_queue_warning(
-                    snapshots,
-                    any_snapshot_mode_dataset,
+                runtime_state_location::scheduler_deprecation::scheduler_deprecation_warning(
+                    &app.runtime,
                 )
             {
                 tracing::warn!("{warning}");
+            }
+            if let Some(section) = app.snapshots.as_deref() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::section_deprecation::section_deprecation_warning(
+                        section,
+                        app.runtime.state.as_ref(),
+                    )
+                );
+            }
+        }
+        // A scheduler loads no accelerations, so it reads no queue whatever its datasets.
+        if self.df.snapshot_notifications().is_some() {
+            for setting in app.unread_snapshot_queues() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::notifications::unread_queue_warning(&setting)
+                );
             }
         }
 
@@ -943,6 +954,11 @@ impl Runtime {
             if restored {
                 update_cached_dataset_timestamps(ds.as_ref()).await;
             }
+            // Rows restored from an acceleration snapshot are not the rows an append
+            // cursor saved here before describes.
+            if bootstrap_status.is_bootstrapped() {
+                self.clear_append_cursor(&ds).await;
+            }
             self.load_dataset_with_retry(Arc::clone(&ds), bootstrap_status, load_semaphore, &load)
                 .await;
             if restored {
@@ -1200,6 +1216,32 @@ impl Runtime {
     fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
         ds.acceleration.as_ref().is_some_and(|a| a.enabled)
             && Self::waits_for_source_reason(ds).is_none()
+    }
+
+    /// Discards the source commit `ds`'s append refresh last loaded, so its next refresh
+    /// starts without a cursor.
+    async fn clear_append_cursor(&self, ds: &Dataset) {
+        let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+            return;
+        };
+        let refresh_mode = acceleration.refresh_mode.unwrap_or_else(|| {
+            runtime_acceleration::acceleration::unset_refresh_mode_for_connector(ds.source())
+        });
+        if refresh_mode != RefreshMode::Append {
+            return;
+        }
+        let store = crate::dataaccelerator::spice_sys::append_cursor_store_for(
+            ds,
+            Arc::clone(&self.accelerator_engine_registry),
+            runtime_acceleration::sidecar::OpenOption::OpenExisting,
+        )
+        .await;
+        if let Err(e) = store.clear().await {
+            tracing::debug!(
+                "Dataset '{}' could not clear its append cursor after restoring its acceleration snapshot: {e}",
+                ds.name
+            );
+        }
     }
 
     /// The configuration that makes an accelerated dataset wait for its source
