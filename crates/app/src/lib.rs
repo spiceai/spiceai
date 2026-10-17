@@ -401,13 +401,14 @@ fn cayenne_metastore_dir_conflict(datasets: &[Dataset]) -> Option<String> {
 /// they can choose another database for the same file (`mode=memory` opens no file
 /// at all), so two URIs name one metastore only when their options match too. A URI
 /// whose escapes do not decode to UTF-8 is compared by its decoded bytes, which no
-/// plain path equals.
+/// plain path equals. A URI that opens no file (see [`file_uri_opens_no_file`]) is
+/// named by its spelling, not by a path, so it is compared as written.
 fn comparable_metastore_dir(dir: &str) -> ComparableMetastore {
     let place = |path: &str| absolute_dir(path).unwrap_or_else(|_| PathBuf::from(path));
     let catalog = format!("{dir}/cayenne.db");
     let path = fs_probe_path(&catalog);
     if !catalog.starts_with("file:") {
-        return ComparableMetastore {
+        return ComparableMetastore::File {
             file: Ok(place(path)),
             options: None,
         };
@@ -419,21 +420,50 @@ fn comparable_metastore_dir(dir: &str) -> ComparableMetastore {
         None => (without_fragment, None),
     };
     let decoded: Vec<u8> = percent_encoding::percent_decode_str(filename).collect();
+    if file_uri_opens_no_file(&decoded, options.as_deref()) {
+        return ComparableMetastore::AsWritten(catalog);
+    }
     let file = match String::from_utf8(decoded) {
         Ok(filename) => Ok(place(&filename)),
         Err(undecodable) => Err(undecodable.into_bytes()),
     };
-    ComparableMetastore { file, options }
+    ComparableMetastore::File { file, options }
+}
+
+/// Whether SQLite opens a `file:` URI with this decoded filename and these query
+/// options as something other than that file: a private in-memory database
+/// (`:memory:`), a private temporary database (an empty filename), a named
+/// in-memory database (`mode=memory`), or a database behind another VFS
+/// (`vfs=memdb`), which names it by its filename string rather than by a path.
+fn file_uri_opens_no_file(filename: &[u8], options: Option<&str>) -> bool {
+    if filename.is_empty() || filename == b":memory:" {
+        return true;
+    }
+    options
+        .into_iter()
+        .flat_map(|options| options.split('&'))
+        .any(|option| {
+            let (key, value) = option.split_once('=').unwrap_or((option, ""));
+            let decode =
+                |part: &str| -> Vec<u8> { percent_encoding::percent_decode_str(part).collect() };
+            let key = decode(key);
+            key == b"vfs" || (key == b"mode" && decode(value) == b"memory")
+        })
 }
 
 /// A metastore directory as [`comparable_metastore_dir`] compares it.
 #[derive(Debug, PartialEq, Eq)]
-struct ComparableMetastore {
-    /// The catalog file's absolute path, or a `file:` URI's decoded filename bytes
-    /// when they are not UTF-8.
-    file: Result<PathBuf, Vec<u8>>,
-    /// A `file:` URI's query options.
-    options: Option<String>,
+enum ComparableMetastore {
+    /// A catalog file.
+    File {
+        /// The catalog file's absolute path, or a `file:` URI's decoded filename
+        /// bytes when they are not UTF-8.
+        file: Result<PathBuf, Vec<u8>>,
+        /// A `file:` URI's query options.
+        options: Option<String>,
+    },
+    /// A `file:` catalog URI that opens no file, as written.
+    AsWritten(String),
 }
 
 pub struct AppBuilder {
@@ -1120,6 +1150,44 @@ mod tests {
             .is_some()
         );
         assert!(conflict("file:meta?mode=rwc&unused=", "file:meta?mode=rwc&unused=").is_none());
+    }
+
+    /// A `file:` URI that opens no file (an in-memory database, a non-default VFS)
+    /// is named by its URI as written, not by a filesystem path, so two spellings that
+    /// would name one file still name two metastores.
+    #[test]
+    fn cayenne_compares_a_file_uri_that_opens_no_file_as_written() {
+        let conflict = |a: &str, b: &str| {
+            cayenne_metastore_dir_conflict(&[
+                cayenne_dataset("a", None, Some(a)),
+                cayenne_dataset("b", None, Some(b)),
+            ])
+        };
+        let cwd = std::env::current_dir().expect("current dir");
+        let cwd = cwd.to_string_lossy();
+
+        assert!(
+            conflict(
+                "file:meta?mode=memory&cache=shared&unused=",
+                &format!("file:{cwd}/meta?mode=memory&cache=shared&unused="),
+            )
+            .is_some()
+        );
+        assert!(
+            conflict(
+                "file:/meta/./shared?vfs=memdb&unused=",
+                "file:/meta/shared?vfs=memdb&unused=",
+            )
+            .is_some()
+        );
+        assert!(conflict("file::memory:#", &format!("file:{cwd}/:memory:#")).is_some());
+        assert!(
+            conflict(
+                "file:/meta/shared?vfs=memdb&unused=",
+                "file:/meta/shared?vfs=memdb&unused=",
+            )
+            .is_none()
+        );
     }
 
     /// SQLite decodes a URI's escapes to bytes whether or not they form UTF-8, so
