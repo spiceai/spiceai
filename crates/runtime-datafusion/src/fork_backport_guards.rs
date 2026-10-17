@@ -540,5 +540,12 @@ async fn a_sort_over_aggregate_output_slices_charges_each_slice_for_its_own_rows
     .expect("the sort fits in the pool without spilling");
     let expected: Vec<String> = (1..=GROUPS).rev().map(|k| format!("{k},{k}")).collect();
     assert_eq!(rows.len(), GROUPS, "one row per group");
-    assert!(rows == expected, "groups sorted by their sum, descending");
+    if let Some((index, (got, want))) = rows
+        .iter()
+        .zip(&expected)
+        .enumerate()
+        .find(|(_, (got, want))| got != want)
+    {
+        panic!("row {index} is {got}, expected {want}: groups must sort by their sum, descending");
+    }
 }
