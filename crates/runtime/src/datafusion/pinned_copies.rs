@@ -69,7 +69,7 @@ impl PinnedSnapshotCopies {
     ) -> Option<Self> {
         let base_dir = PathBuf::from(data_accelerator_api::spice_data_base_path())
             .join("pinned")
-            .join(dataset.name.to_string().replace(['/', '\\'], "_"));
+            .join(dir_name(&dataset.name.to_string()));
         // Probes that the engine can relocate the acceleration. Cayenne records the
         // probe's directory, and `release_relocated` forgets it again.
         let probe = accelerator.relocated(dataset, &base_dir)?;
@@ -219,6 +219,23 @@ fn refuse_different_columns(snapshot: &SchemaRef, serving: &SchemaRef) -> Result
     }
 }
 
+/// `dataset_name` as one directory name, distinct for each dataset name. Letters,
+/// digits, `_` and a `.` after the first byte are kept; every other byte becomes `-`
+/// and two hex digits, so a name such as `..` never names a directory outside
+/// `pinned/`, and the name stays the same when an engine spells the path as a URI.
+fn dir_name(dataset_name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut name = String::with_capacity(dataset_name.len());
+    for (index, byte) in dataset_name.bytes().enumerate() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || (byte == b'.' && index > 0) {
+            name.push(char::from(byte));
+        } else {
+            let _ = write!(name, "-{byte:02x}");
+        }
+    }
+    name
+}
+
 async fn remove_dir(dir: &Path) {
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => {}
@@ -243,6 +260,16 @@ mod tests {
                 .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
                 .collect::<Vec<_>>(),
         ))
+    }
+
+    #[test]
+    fn each_dataset_name_is_one_directory_of_its_own() {
+        assert_eq!(dir_name("taxi_trips"), "taxi_trips");
+        assert_eq!(dir_name("sales.orders"), "sales.orders");
+        assert_eq!(dir_name(".."), "-2e.");
+        assert_eq!(dir_name("."), "-2e");
+        assert_ne!(dir_name("a/b"), dir_name("a_b"));
+        assert_ne!(dir_name("a/b"), dir_name("a-2fb"));
     }
 
     #[test]

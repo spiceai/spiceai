@@ -1107,6 +1107,7 @@ fn cors_rules(cors: CorsLayer) -> CorsLayer {
     cors.allow_methods([
         Method::GET,
         Method::POST,
+        Method::PUT,
         Method::PATCH,
         Method::DELETE,
         Method::OPTIONS,
