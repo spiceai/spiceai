@@ -94,10 +94,11 @@ async fn exec(pool: &mysql_async::Pool, sql: &str) -> Result<(), anyhow::Error> 
 }
 
 /// Start a runtime replicating `mysqldb.<table>` into `engine` under `policy`,
-/// after the source holds the three seed rows.
+/// after the source holds the three seed rows, with `k` of type `k_type`.
 async fn start(
     port: u16,
     table: &str,
+    k_type: &str,
     engine: &str,
     policy: OnSchemaChange,
     accel_dir: &std::path::Path,
@@ -105,7 +106,7 @@ async fn start(
     let pool = common::get_mysql_conn(port)?;
     exec(
         &pool,
-        &format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, k INT)"),
+        &format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, k {k_type})"),
     )
     .await?;
     exec(
@@ -175,7 +176,7 @@ async fn start(
     runtime_ready_check(&rt).await;
     wait_for(
         &rt,
-        &format!("SELECT id, k FROM {table} ORDER BY id"),
+        &format!("SELECT id, CAST(k AS BIGINT) AS k FROM {table} ORDER BY id"),
         "+----+----+\n\
          | id | k  |\n\
          +----+----+\n\
@@ -204,6 +205,7 @@ async fn mysql_cayenne_sync_all_columns_widens_live() -> Result<(), anyhow::Erro
             let (pool, rt) = start(
                 port,
                 table,
+                "INT",
                 "cayenne",
                 OnSchemaChange::SyncAllColumns,
                 dir.path(),
@@ -243,8 +245,15 @@ async fn mysql_cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::E
             let port = container.host_port(3306)?;
             let dir = tempfile::tempdir()?;
             let table = "type_change_cayenne_block";
-            let (pool, rt) =
-                start(port, table, "cayenne", OnSchemaChange::Block, dir.path()).await?;
+            let (pool, rt) = start(
+                port,
+                table,
+                "INT",
+                "cayenne",
+                OnSchemaChange::Block,
+                dir.path(),
+            )
+            .await?;
             exec(&pool, &format!("ALTER TABLE {table} MODIFY k DOUBLE")).await?;
             exec(&pool, &format!("INSERT INTO {table} VALUES (4, 2.0)")).await?;
             exec(&pool, &format!("UPDATE {table} SET k = 7 WHERE id = 1")).await?;
@@ -283,6 +292,7 @@ async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<
             let (pool, rt) = start(
                 port,
                 table,
+                "INT",
                 "duckdb",
                 OnSchemaChange::SyncAllColumns,
                 dir.path(),
@@ -318,6 +328,132 @@ async fn mysql_duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Ok(())
+        })
+        .await
+}
+
+/// Assert `table` never gains row `id` within the bound the other changes in
+/// this file arrive within: the stream stopped at the `ALTER`.
+async fn assert_never_applied(rt: &Runtime, table: &str, id: i64) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let rows = run_query(
+            rt,
+            &format!("SELECT count(*) AS c FROM {table} WHERE id = {id}"),
+        )
+        .await?;
+        assert_eq!(
+            rows, "+---+\n| c |\n+---+\n| 0 |\n+---+",
+            "row {id} must not be applied after an `ALTER` the stream cannot follow"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(())
+}
+
+/// An integer column that becomes a `DECIMAL` stops the stream at the `ALTER`
+/// rather than adopting a layout whose first fractional value fails to apply:
+/// no accelerator widens an integer to a decimal, so even an integer-valued
+/// change after it is not applied.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_integer_to_decimal_stops_the_stream() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let table = "type_change_cayenne_decimal";
+            let (pool, rt) = start(
+                port,
+                table,
+                "INT",
+                "cayenne",
+                OnSchemaChange::SyncAllColumns,
+                dir.path(),
+            )
+            .await?;
+            exec(
+                &pool,
+                &format!("ALTER TABLE {table} MODIFY k DECIMAL(12,2)"),
+            )
+            .await?;
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
+            assert_never_applied(&rt, table, 4).await
+        })
+        .await
+}
+
+/// A `DECIMAL` with no fractional part holds only integers, so the stream keeps
+/// applying changes into the registered integer type.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_integer_to_zero_scale_decimal_keeps_applying() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let table = "type_change_cayenne_decimal0";
+            let (pool, rt) = start(
+                port,
+                table,
+                "INT",
+                "cayenne",
+                OnSchemaChange::SyncAllColumns,
+                dir.path(),
+            )
+            .await?;
+            exec(
+                &pool,
+                &format!("ALTER TABLE {table} MODIFY k DECIMAL(10,0)"),
+            )
+            .await?;
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 7)")).await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id, k, arrow_typeof(k) AS t FROM {table} WHERE id = 4"),
+                "+----+---+-------+\n\
+                 | id | k | t     |\n\
+                 +----+---+-------+\n\
+                 | 4  | 7 | Int32 |\n\
+                 +----+---+-------+",
+            )
+            .await
+        })
+        .await
+}
+
+/// Under `block` a `FLOAT` column keeps its registered `Float32` type, so a
+/// `DOUBLE` it becomes stops the stream rather than storing `16777217` rounded
+/// to `16777216`.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cayenne_block_float_to_double_stops_the_stream() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
+            let dir = tempfile::tempdir()?;
+            let table = "type_change_cayenne_float";
+            let (pool, rt) = start(
+                port,
+                table,
+                "FLOAT",
+                "cayenne",
+                OnSchemaChange::Block,
+                dir.path(),
+            )
+            .await?;
+            exec(&pool, &format!("ALTER TABLE {table} MODIFY k DOUBLE")).await?;
+            exec(&pool, &format!("INSERT INTO {table} VALUES (4, 16777217)")).await?;
+            assert_never_applied(&rt, table, 4).await
         })
         .await
 }

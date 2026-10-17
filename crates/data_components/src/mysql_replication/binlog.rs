@@ -649,6 +649,20 @@ pub(super) async fn adopt_current_layout(
     if let Some(message) = lossy_retype(schema, old_layout, &layout, &column_map) {
         return SchemaMismatchSnafu { message }.fail();
     }
+    let widened_schema = match column_type_changes {
+        ColumnTypeChanges::Keep => None,
+        ColumnTypeChanges::Widen => {
+            widen_to_source_types(schema, &layout, &column_map, primary_keys)
+        }
+    };
+    if let Some(message) = unfollowable_retype(
+        widened_schema.as_ref().unwrap_or(schema),
+        old_layout,
+        &layout,
+        &column_map,
+    ) {
+        return SchemaMismatchSnafu { message }.fail();
+    }
     let pk_source_indexes = compute_pk_source_indexes(schema, primary_keys, &column_map);
 
     let old_names: std::collections::HashSet<&str> =
@@ -673,13 +687,6 @@ pub(super) async fn adopt_current_layout(
              replicated. Add them to the dataset schema (and restart) to capture them"
         );
     }
-
-    let widened_schema = match column_type_changes {
-        ColumnTypeChanges::Keep => None,
-        ColumnTypeChanges::Widen => {
-            widen_to_source_types(schema, &layout, &column_map, primary_keys)
-        }
-    };
 
     Ok(AdoptedLayout {
         layout,
@@ -783,6 +790,57 @@ fn lossy_retype(
                     column.column_type
                 )
             })
+        })
+}
+
+/// Why a replicated column's new source type, though it loses no stored value,
+/// cannot be followed by the member's change batches, or `None` when every
+/// retyped column can be. `schema` is the one the batches are built with after
+/// adoption: the dataset schema, or its widening under `sync_all_columns`.
+///
+/// - An integer column that becomes a `DECIMAL` with a scale keeps its integer
+///   type, since no accelerator widens an integer to a decimal, so the first
+///   fractional value the source sends would fail to decode. A scale of `0`
+///   holds only integers, which decode exactly into the integer type.
+/// - A column still built as `Float32` (under `block`, or a primary key under
+///   `sync_all_columns`) whose source is no longer `FLOAT` would have its new
+///   values rounded to `f32` with nothing to say so.
+fn unfollowable_retype(
+    schema: &SchemaRef,
+    old_layout: &TableLayout,
+    layout: &TableLayout,
+    column_map: &[usize],
+) -> Option<String> {
+    schema
+        .fields()
+        .iter()
+        .zip(column_map)
+        .find_map(|(field, &source_index)| {
+            let column = layout.columns.get(source_index)?;
+            let old_column = old_layout.columns.iter().find(|c| c.name == column.name)?;
+            let from = numeric_arrow_type(&old_column.column_type)?;
+            let to = numeric_arrow_type(&column.column_type)?;
+            if from == to {
+                return None;
+            }
+            let reason = if from.is_integer()
+                && matches!(
+                    to,
+                    DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) if scale > 0
+                ) {
+                "the acceleration cannot change an integer column to a decimal with a fractional \
+                 part, so a fractional value would fail to apply"
+            } else if *field.data_type() == DataType::Float32 {
+                "the column stays `Float32`, which would round the new values"
+            } else {
+                return None;
+            };
+            Some(format!(
+                "column '{}' changed type from `{}` to `{}` and {reason}",
+                field.name(),
+                old_column.column_type,
+                column.column_type
+            ))
         })
 }
 
@@ -1609,6 +1667,58 @@ mod tests {
         assert_eq!(retyped("bigint", "decimal(19,0)"), None);
         assert_eq!(retyped("bigint", "bigint"), None);
         assert_eq!(retyped("bigint", "varchar(40)"), None);
+    }
+
+    #[test]
+    fn a_retype_the_change_batches_cannot_follow_is_refused() {
+        let old = layout_of(&[("id", "bigint"), ("k", "int"), ("f", "float")]);
+        let layout = |k: &str, f: &str| layout_of(&[("id", "bigint"), ("k", k), ("f", f)]);
+        let refused = |schema: &SchemaRef, k: &str, f: &str| {
+            unfollowable_retype(schema, &old, &layout(k, f), &[0, 1, 2])
+        };
+        let registered = schema_of(&[
+            ("id", DataType::Int64),
+            ("k", DataType::Int32),
+            ("f", DataType::Float32),
+        ]);
+        assert_eq!(
+            refused(&registered, "decimal(12,2)", "float"),
+            Some(
+                "column 'k' changed type from `int` to `decimal(12,2)` and the acceleration \
+                 cannot change an integer column to a decimal with a fractional part, so a \
+                 fractional value would fail to apply"
+                    .to_string()
+            )
+        );
+        // `block` keeps the registered `Float32`.
+        assert_eq!(
+            refused(&registered, "int", "double"),
+            Some(
+                "column 'f' changed type from `float` to `double` and the column stays \
+                 `Float32`, which would round the new values"
+                    .to_string()
+            )
+        );
+        // `sync_all_columns` widens a non-key `FLOAT` to `Float64`, which follows,
+        // but keeps a primary key's type.
+        let widened = |primary_keys: &[String]| {
+            widen_to_source_types(
+                &registered,
+                &layout("int", "double"),
+                &[0, 1, 2],
+                primary_keys,
+            )
+            .unwrap_or_else(|| Arc::clone(&registered))
+        };
+        assert_eq!(
+            refused(&widened(&["id".to_string()]), "int", "double"),
+            None
+        );
+        assert!(refused(&widened(&["f".to_string()]), "int", "double").is_some());
+        // Retypes the batches decode exactly are followed.
+        assert_eq!(refused(&registered, "decimal(10,0)", "float"), None);
+        assert_eq!(refused(&registered, "bigint", "float"), None);
+        assert_eq!(refused(&registered, "int", "float"), None);
     }
 
     #[test]
