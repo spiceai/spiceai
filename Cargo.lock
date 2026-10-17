@@ -18437,6 +18437,7 @@ dependencies = [
  "app",
  "async-trait",
  "axum",
+ "datafusion",
  "futures",
  "headers",
  "http 1.4.1",
