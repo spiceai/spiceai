@@ -13344,7 +13344,7 @@
           },
           "text": {
             "type": "string",
-            "description": "The text to search documents for similarity"
+            "description": "The text to search documents for similarity. Must contain at least one non-whitespace character."
           },
           "where": {
             "type": [
