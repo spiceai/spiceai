@@ -92,6 +92,19 @@ pub struct AssignmentRequest {
     pub executor_id: String,
 }
 
+/// What [`PartitionStore::apply_discovery`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryChanges {
+    /// Whether the table's entry was created.
+    pub created: bool,
+    /// How many partitions were added.
+    pub added: usize,
+    /// How many partitions were removed.
+    pub removed_count: usize,
+    /// Per executor, the removed partitions that were assigned to it.
+    pub removed: HashMap<String, Vec<PartitionValue>>,
+}
+
 /// Partition metadata store bound to one [`PartitionScope`] of the
 /// shared cluster document.
 ///
@@ -465,95 +478,50 @@ impl PartitionStore {
         self.apply_assignments(&requests).await
     }
 
-    /// Adds each of `partition_values` the table does not have yet, unassigned,
-    /// in one cluster-document write. Returns whether any partition was added.
+    /// Records one complete discovery of `table` in one cluster-document write:
+    /// creates the table's entry if it has none, adds each of `new` it does not
+    /// have yet, unassigned, and removes each of `removed`. A reader therefore
+    /// sees either no entry or the discovered partition set, never an entry
+    /// that lists only part of it.
     ///
     /// The change is computed from the document each write attempt reads, so a
     /// concurrent change to the same table is kept.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::TableMetadataNotFound`] when the table has no partition
-    /// metadata, or an error if the cluster state mutation fails.
-    pub async fn add_partitions(
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn apply_discovery(
         &self,
         table: &TableReference,
-        partition_values: &[PartitionValue],
-    ) -> Result<bool> {
+        partition_expressions: &[String],
+        new: &[PartitionValue],
+        removed: &[PartitionValue],
+    ) -> Result<DiscoveryChanges> {
         let key = normalized_table_name(table);
         let scope = self.scope;
-        let mut missing = false;
-        let res = self
-            .cluster
+        let mut changes = DiscoveryChanges::default();
+        self.cluster
             .mutate(|state| {
+                changes = DiscoveryChanges::default();
                 let now_ms = match crate::cluster_state::now_ms() {
                     Ok(v) => u128::from(v),
                     Err(e) => return MutationOutcome::Abort(e),
                 };
-                let Some(metadata) = scope.map_mut(state).get_mut(&key) else {
-                    missing = true;
-                    return MutationOutcome::NoChange;
-                };
-                missing = false;
-                let mut added = false;
-                for partition_value in partition_values {
+                let metadata = scope.map_mut(state).entry(key.clone()).or_insert_with(|| {
+                    changes.created = true;
+                    TablePartitionMetadata::new(table, now_ms, partition_expressions.to_vec())
+                });
+                for partition_value in new {
                     if !metadata
                         .partitions
                         .iter()
                         .any(|p| p.partition_value == *partition_value)
                     {
                         metadata.add_partition(PartitionMetadata::new(partition_value.clone()));
-                        added = true;
+                        changes.added += 1;
                     }
                 }
-                if !added {
-                    return MutationOutcome::NoChange;
-                }
-                metadata.updated_at = now_ms;
-                MutationOutcome::Apply
-            })
-            .await
-            .map_err(|e| mutate_error(&key, e))?;
-        if missing {
-            return Err(Error::TableMetadataNotFound { table: key });
-        }
-        Ok(res == MutateOk::Committed)
-    }
-
-    /// Removes each of `partition_values` from the table in one
-    /// cluster-document write. Returns, per executor, the removed partitions
-    /// that were assigned to it.
-    ///
-    /// The change is computed from the document each write attempt reads, so a
-    /// concurrent change to the same table is kept.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::TableMetadataNotFound`] when the table has no partition
-    /// metadata, or an error if the cluster state mutation fails.
-    pub async fn remove_partitions(
-        &self,
-        table: &TableReference,
-        partition_values: &[PartitionValue],
-    ) -> Result<HashMap<String, Vec<PartitionValue>>> {
-        let key = normalized_table_name(table);
-        let scope = self.scope;
-        let mut missing = false;
-        let mut removed: HashMap<String, Vec<PartitionValue>> = HashMap::new();
-        self.cluster
-            .mutate(|state| {
-                removed.clear();
-                let now_ms = match crate::cluster_state::now_ms() {
-                    Ok(v) => u128::from(v),
-                    Err(e) => return MutationOutcome::Abort(e),
-                };
-                let Some(metadata) = scope.map_mut(state).get_mut(&key) else {
-                    missing = true;
-                    return MutationOutcome::NoChange;
-                };
-                missing = false;
-                let mut removed_any = false;
-                for partition_value in partition_values {
+                for partition_value in removed {
                     if let Some(pos) = metadata
                         .partitions
                         .iter()
@@ -561,15 +529,16 @@ impl PartitionStore {
                     {
                         let partition = metadata.partitions.remove(pos);
                         for executor_id in partition.assigned_executors {
-                            removed
+                            changes
+                                .removed
                                 .entry(executor_id)
                                 .or_default()
                                 .push(partition_value.clone());
                         }
-                        removed_any = true;
+                        changes.removed_count += 1;
                     }
                 }
-                if !removed_any {
+                if !changes.created && changes.added == 0 && changes.removed_count == 0 {
                     return MutationOutcome::NoChange;
                 }
                 metadata.updated_at = now_ms;
@@ -577,10 +546,106 @@ impl PartitionStore {
             })
             .await
             .map_err(|e| mutate_error(&key, e))?;
-        if missing {
-            return Err(Error::TableMetadataNotFound { table: key });
+        Ok(changes)
+    }
+
+    /// Assigns each partition of `assignments` to its executor in one
+    /// cluster-document write, but only a partition the table still lists and
+    /// no executor holds. Returns the assignments that hold after the write: the
+    /// ones made here and the ones already in place. A partition another
+    /// scheduler assigned first keeps its executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn assign_unassigned(
+        &self,
+        assignments: &[AssignmentRequest],
+    ) -> Result<Vec<AssignmentRequest>> {
+        if assignments.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(removed)
+        let scope = self.scope;
+        let mut held: Vec<AssignmentRequest> = Vec::new();
+        self.cluster
+            .mutate(|state| {
+                held.clear();
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let mut changed = false;
+                for assignment in assignments {
+                    let Some(metadata) = map.get_mut(&normalized_table_name(&assignment.table))
+                    else {
+                        continue;
+                    };
+                    let Some(partition) = metadata
+                        .partitions
+                        .iter_mut()
+                        .find(|p| p.partition_value == assignment.partition_value)
+                    else {
+                        continue;
+                    };
+                    if !partition.is_assigned() {
+                        partition.assign_to(assignment.executor_id.clone(), now_ms);
+                        metadata.updated_at = now_ms;
+                        changed = true;
+                    } else if !partition.is_assigned_to(&assignment.executor_id) {
+                        continue;
+                    }
+                    held.push(assignment.clone());
+                }
+                if changed {
+                    MutationOutcome::Apply
+                } else {
+                    MutationOutcome::NoChange
+                }
+            })
+            .await
+            .map_err(|e| mutate_error("<batch>", e))?;
+        Ok(held)
+    }
+
+    /// Unassigns every partition `executor_id` holds, in one cluster-document
+    /// write, and returns how many partitions it held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn unassign_executor(&self, executor_id: &str) -> Result<usize> {
+        let scope = self.scope;
+        let mut unassigned = 0;
+        self.cluster
+            .mutate(|state| {
+                unassigned = 0;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                for metadata in scope.map_mut(state).values_mut() {
+                    let mut changed = false;
+                    for partition in &mut metadata.partitions {
+                        if partition.is_assigned_to(executor_id) {
+                            partition.unassign_from(executor_id);
+                            unassigned += 1;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        metadata.updated_at = now_ms;
+                    }
+                }
+                if unassigned == 0 {
+                    MutationOutcome::NoChange
+                } else {
+                    MutationOutcome::Apply
+                }
+            })
+            .await
+            .map_err(|e| mutate_error("<executor>", e))?;
+        Ok(unassigned)
     }
 
     /// Replace this table's metadata wholesale (atomic OCC write). Used

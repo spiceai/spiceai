@@ -1022,6 +1022,9 @@ pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
                             "Acceleration not ready; loading initial data for {dataset_name}"
                         ))
                     }
+                    SpiceExternalError::PartitionsUnavailable { message } => {
+                        Status::unavailable(message)
+                    }
                 }
             } else if let Some(err) = e.downcast_ref::<FlightClientError>() {
                 match err {
@@ -2116,6 +2119,24 @@ mod tests {
             status.message().starts_with("Internal error: bug"),
             "{}",
             status.message()
+        );
+    }
+
+    /// A query a cluster scheduler cannot route yet is `Unavailable`, which
+    /// clients retry, also when the planner wraps the error.
+    #[test]
+    fn unavailable_partitions_are_unavailable() {
+        let message =
+            "Cannot query t: no ready executor serves 1 of its 2 partitions; retry the query";
+        let status = handle_datafusion_error(&DataFusionError::Context(
+            "partitioned_table_scan_rewrite".to_string(),
+            Box::new(DataFusionError::External(
+                SpiceExternalError::partitions_unavailable(message.to_string()),
+            )),
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::Unavailable, message)
         );
     }
 

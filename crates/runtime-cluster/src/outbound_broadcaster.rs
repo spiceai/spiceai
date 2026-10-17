@@ -29,6 +29,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use runtime_proto::{
@@ -53,6 +54,41 @@ pub struct ExecutorOutboundBroadcaster {
     inner: Arc<ExecutorOutboundBroadcasterInner>,
 }
 
+/// A load of one table, started with [`ExecutorOutboundBroadcaster::start_load`].
+/// The table counts as loading until the guard of its newest load drops, so a
+/// load whose task is cancelled or panics also ends.
+#[derive(Debug)]
+#[must_use = "the load ends when the guard drops"]
+pub struct TableLoad {
+    inner: Arc<ExecutorOutboundBroadcasterInner>,
+    table: String,
+    load_sequence: u64,
+}
+
+impl TableLoad {
+    /// The sequence of this load (see [`ExecutorOutboundBroadcaster::next_load_sequence`]).
+    #[must_use]
+    pub fn load_sequence(&self) -> u64 {
+        self.load_sequence
+    }
+}
+
+impl Drop for TableLoad {
+    fn drop(&mut self) {
+        let mut loads = self.inner.loads_in_flight.lock();
+        if loads.get(&self.table) == Some(&self.load_sequence) {
+            loads.remove(&self.table);
+        }
+    }
+}
+
+/// A cached `PartitionsLoaded` payload and the load it reports.
+#[derive(Debug, Clone)]
+struct CachedAck {
+    load_sequence: u64,
+    partition_expr_bytes: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Default)]
 struct ExecutorOutboundBroadcasterInner {
     streams: RwLock<HashMap<String, mpsc::Sender<ExecutorControlMessage>>>,
@@ -62,7 +98,12 @@ struct ExecutorOutboundBroadcasterInner {
     /// any scheduler control stream is established; without this replay the
     /// readiness ack would be broadcast to zero schedulers and lost, leaving
     /// the dataset (and the cluster) stuck in `Refreshing` forever.
-    latest_partitions_loaded: RwLock<HashMap<String, Vec<Vec<u8>>>>,
+    latest_partitions_loaded: RwLock<HashMap<String, CachedAck>>,
+    /// The last load sequence handed out; see [`ExecutorOutboundBroadcaster::next_load_sequence`].
+    load_sequence: AtomicU64,
+    /// Per table with a load running, the sequence of the newest load started;
+    /// see [`ExecutorOutboundBroadcaster::start_load`].
+    loads_in_flight: parking_lot::Mutex<HashMap<String, u64>>,
     /// The executor's Flight endpoint URL once it serves queries, replayed to
     /// schedulers on (re)connect. A scheduler drops an executor's endpoint when
     /// its control stream ends, so every new stream must carry it again.
@@ -77,8 +118,75 @@ impl ExecutorOutboundBroadcaster {
                 streams: RwLock::new(HashMap::new()),
                 executor_id: RwLock::new(executor_id),
                 latest_partitions_loaded: RwLock::new(HashMap::new()),
+                load_sequence: AtomicU64::new(0),
+                loads_in_flight: parking_lot::Mutex::default(),
                 flight_endpoint: RwLock::new(None),
             }),
+        }
+    }
+
+    /// Returns a sequence number for a load this process starts, greater than
+    /// every one returned before. A `PartitionsLoaded` ack carries the number
+    /// of the load it reports, so schedulers can tell an older load's ack that
+    /// arrives late from a newer one's.
+    #[must_use]
+    pub fn next_load_sequence(&self) -> u64 {
+        self.inner.load_sequence.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Starts a load of `table`. The table counts as loading until the
+    /// [`TableLoad`] of the newest load started for it drops; drop it after
+    /// broadcasting the load's `PartitionsLoaded`.
+    pub fn start_load(&self, table: &str) -> TableLoad {
+        let load_sequence = self.next_load_sequence();
+        self.inner
+            .loads_in_flight
+            .lock()
+            .insert(table.to_string(), load_sequence);
+        TableLoad {
+            inner: Arc::clone(&self.inner),
+            table: table.to_string(),
+            load_sequence,
+        }
+    }
+
+    /// Whether a load of `table` started with [`Self::start_load`] has not ended.
+    #[must_use]
+    pub fn is_loading(&self, table: &str) -> bool {
+        self.inner.loads_in_flight.lock().contains_key(table)
+    }
+
+    /// The partitions in the newest `PartitionsLoaded` of `table`, if this
+    /// process has reported one.
+    pub async fn loaded_partitions(&self, table: &str) -> Option<Vec<Vec<u8>>> {
+        self.inner
+            .latest_partitions_loaded
+            .read()
+            .await
+            .get(table)
+            .map(|cached| cached.partition_expr_bytes.clone())
+    }
+
+    /// Sends the newest `PartitionsLoaded` of `table` to every connected
+    /// scheduler again. Returns the number of schedulers it reached.
+    pub async fn rebroadcast_partitions_loaded(&self, table: &str) -> usize {
+        let cached = self
+            .inner
+            .latest_partitions_loaded
+            .read()
+            .await
+            .get(table)
+            .cloned();
+        match cached {
+            Some(cached) => {
+                self.broadcast_partitions_loaded(
+                    table.to_string(),
+                    cached.partition_expr_bytes,
+                    cached.load_sequence,
+                )
+                .await
+            }
+            None => 0,
         }
     }
 
@@ -134,11 +242,11 @@ impl ExecutorOutboundBroadcaster {
         scheduler_address: &str,
         tx: &mpsc::Sender<ExecutorControlMessage>,
     ) -> usize {
-        let cached: Vec<(String, Vec<Vec<u8>>)> = {
+        let cached: Vec<(String, CachedAck)> = {
             let cache = self.inner.latest_partitions_loaded.read().await;
             cache
                 .iter()
-                .map(|(table, bytes)| (table.clone(), bytes.clone()))
+                .map(|(table, ack)| (table.clone(), ack.clone()))
                 .collect()
         };
         if cached.is_empty() {
@@ -148,9 +256,13 @@ impl ExecutorOutboundBroadcaster {
         let executor_id = self.inner.executor_id.read().await.clone();
         let total = cached.len();
         let mut replayed = 0usize;
-        for (table_name, partition_expr_bytes) in cached {
-            let payload =
-                partitions_loaded_message(executor_id.clone(), table_name, partition_expr_bytes);
+        for (table_name, ack) in cached {
+            let payload = partitions_loaded_message(
+                executor_id.clone(),
+                table_name,
+                ack.partition_expr_bytes,
+                ack.load_sequence,
+            );
             // Fail fast on a closed channel or a timed-out send: both mean
             // this connection is gone or wedged, so the remaining sends are
             // guaranteed to fail too — without the break, a large cache would
@@ -275,18 +387,31 @@ impl ExecutorOutboundBroadcaster {
         &self,
         table_name: String,
         partition_expr_bytes: Vec<Vec<u8>>,
+        load_sequence: u64,
     ) -> usize {
         // Cache before snapshotting streams — see the ordering note on
         // `replay_partitions_loaded` for why this guarantees a concurrently
-        // connecting scheduler can't miss the ack.
-        self.inner
-            .latest_partitions_loaded
-            .write()
-            .await
-            .insert(table_name.clone(), partition_expr_bytes.clone());
+        // connecting scheduler can't miss the ack. The cache keeps the ack of
+        // the newest load, whichever arrives last.
+        {
+            let mut cache = self.inner.latest_partitions_loaded.write().await;
+            if cache
+                .get(&table_name)
+                .is_none_or(|cached| cached.load_sequence <= load_sequence)
+            {
+                cache.insert(
+                    table_name.clone(),
+                    CachedAck {
+                        load_sequence,
+                        partition_expr_bytes: partition_expr_bytes.clone(),
+                    },
+                );
+            }
+        }
 
         let executor_id = self.inner.executor_id.read().await.clone();
-        let payload = partitions_loaded_message(executor_id, table_name, partition_expr_bytes);
+        let payload =
+            partitions_loaded_message(executor_id, table_name, partition_expr_bytes, load_sequence);
 
         // Snapshot the (address, sender) pairs so we don't hold the read lock
         // across awaits — a slow scheduler shouldn't block register/unregister.
@@ -382,6 +507,7 @@ fn partitions_loaded_message(
     executor_id: String,
     table_name: String,
     partition_expr_bytes: Vec<Vec<u8>>,
+    load_sequence: u64,
 ) -> ExecutorControlMessage {
     ExecutorControlMessage {
         executor_id,
@@ -390,6 +516,7 @@ fn partitions_loaded_message(
             partition_expr_bytes: Some(BytesArray {
                 items: partition_expr_bytes,
             }),
+            load_sequence,
         })),
         process_id: String::new(),
     }
@@ -415,7 +542,7 @@ mod tests {
         let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
 
         let sent = broadcaster
-            .broadcast_partitions_loaded("spice.public.region".to_string(), vec![vec![1, 2]])
+            .broadcast_partitions_loaded("spice.public.region".to_string(), vec![vec![1, 2]], 1)
             .await;
         assert_eq!(sent, 0, "no scheduler is connected yet");
 
@@ -441,6 +568,66 @@ mod tests {
         );
     }
 
+    /// A table counts as loading until the newest load started for it ends.
+    #[test]
+    fn a_table_loads_until_its_newest_load_ends() {
+        let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
+        let first = broadcaster.start_load("t");
+        let second = broadcaster.start_load("t");
+        assert!(second.load_sequence() > first.load_sequence());
+        assert!(broadcaster.is_loading("t"));
+        drop(first);
+        assert!(broadcaster.is_loading("t"), "the second load is running");
+        drop(second);
+        assert!(!broadcaster.is_loading("t"));
+    }
+
+    /// A load whose task is cancelled before it finishes ends, so later
+    /// repairs of the table are not skipped as if it still ran.
+    #[tokio::test]
+    async fn a_cancelled_load_ends() {
+        let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
+        let load = broadcaster.start_load("t");
+        let task = tokio::spawn(async move {
+            let _load = load;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.is_err_and(|err| err.is_cancelled()));
+        assert!(!broadcaster.is_loading("t"));
+    }
+
+    /// The ack of an older load broadcast after a newer one's does not
+    /// replace the newer one in the cache.
+    #[tokio::test]
+    async fn replay_sends_the_newest_load() {
+        let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
+        let older = broadcaster.next_load_sequence();
+        let newer = broadcaster.next_load_sequence();
+        assert!(newer > older);
+
+        broadcaster
+            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![2]], newer)
+            .await;
+        broadcaster
+            .broadcast_partitions_loaded("spice.public.orders".to_string(), Vec::new(), older)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        broadcaster
+            .replay_partitions_loaded("scheduler-1", &tx)
+            .await;
+        let loaded = expect_partitions_loaded(rx.recv().await.expect("replayed ack"));
+        assert_eq!(loaded.load_sequence, newer);
+        assert_eq!(
+            loaded
+                .partition_expr_bytes
+                .expect("partition bytes present")
+                .items,
+            vec![vec![2]]
+        );
+    }
+
     /// Re-broadcasting for the same table must overwrite the cached payload
     /// so a later-connecting scheduler sees only the latest assignment set.
     #[tokio::test]
@@ -448,10 +635,14 @@ mod tests {
         let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
 
         broadcaster
-            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![1]])
+            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![1]], 1)
             .await;
         broadcaster
-            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![2], vec![3]])
+            .broadcast_partitions_loaded(
+                "spice.public.orders".to_string(),
+                vec![vec![2], vec![3]],
+                2,
+            )
             .await;
 
         let (tx, mut rx) = mpsc::channel(8);
@@ -500,7 +691,7 @@ mod tests {
             .expect_err("nothing should be emitted when the cache is empty");
 
         let sent = broadcaster
-            .broadcast_partitions_loaded("spice.public.lineitem".to_string(), vec![vec![7]])
+            .broadcast_partitions_loaded("spice.public.lineitem".to_string(), vec![vec![7]], 1)
             .await;
         assert_eq!(sent, 1);
         let loaded = expect_partitions_loaded(rx1.recv().await.expect("live ack"));
@@ -534,10 +725,10 @@ mod tests {
     async fn replay_on_closed_channel_queues_nothing() {
         let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
         broadcaster
-            .broadcast_partitions_loaded("spice.public.region".to_string(), vec![vec![1]])
+            .broadcast_partitions_loaded("spice.public.region".to_string(), vec![vec![1]], 1)
             .await;
         broadcaster
-            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![2]])
+            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![2]], 1)
             .await;
         let (tx, rx) = mpsc::channel(8);
         drop(rx);
