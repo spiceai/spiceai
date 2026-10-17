@@ -85,6 +85,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
+use crate::datafusion::error::is_partitions_unavailable;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
@@ -413,6 +414,9 @@ enum SqlErrorKind {
     /// separately so it can be logged as the operator-actionable condition it
     /// is and answered with a retriable status.
     ResourcesExhausted,
+    /// A cluster scheduler cannot yet reach executors that hold the data the
+    /// query reads; a retry can succeed.
+    Unavailable,
 }
 
 impl SqlErrorKind {
@@ -420,6 +424,13 @@ impl SqlErrorKind {
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
+            QueryError::UnableToExecuteQuery { source }
+            | QueryError::UnableToCreateMemoryStream { source }
+            | QueryError::UnableToCollectResults { source }
+                if is_partitions_unavailable(source) =>
+            {
+                Self::Unavailable
+            }
             _ => Self::General,
         }
     }
@@ -431,6 +442,8 @@ impl SqlErrorKind {
             Self::Timeout
         } else if ErrorCode::from(e) == ErrorCode::ResourcesExhausted {
             Self::ResourcesExhausted
+        } else if is_partitions_unavailable(e) {
+            Self::Unavailable
         } else {
             Self::General
         }
@@ -459,7 +472,9 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         // a hard failure for a query that would likely succeed on another
         // replica. Flight already reports the same failure as the retriable
         // `RESOURCE_EXHAUSTED`.
-        SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        SqlErrorKind::ResourcesExhausted | SqlErrorKind::Unavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
@@ -904,6 +919,39 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    /// A query a cluster scheduler cannot route yet is answered 503, which
+    /// clients and load balancers retry: from the planning error the query
+    /// API returns and from a streamed error alike.
+    #[test]
+    fn sql_error_response_classifies_unavailable_partitions() {
+        let unavailable = || {
+            datafusion::error::DataFusionError::Context(
+                "partitioned_table_scan_rewrite".to_string(),
+                Box::new(datafusion::error::DataFusionError::External(
+                    crate::datafusion::error::SpiceExternalError::partitions_unavailable(
+                        "Cannot query t: no ready executor serves 1 of its 2 partitions; retry the query"
+                            .to_string(),
+                    ),
+                )),
+            )
+        };
+        let planning = QueryError::UnableToExecuteQuery {
+            source: unavailable(),
+        };
+        let response = sql_error_response(
+            planning.to_string(),
+            SqlErrorKind::of_query_error(&planning),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let streamed = unavailable();
+        let response = sql_error_response(
+            streamed.to_string(),
+            SqlErrorKind::of_datafusion_error(&streamed),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A memory-pool refusal has to be told apart from the cancellation and

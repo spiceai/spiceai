@@ -1366,7 +1366,10 @@ impl DataFusionBuilder {
                 // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                    Arc::new(AcceleratedPartitionProvider::from_registry(
+                        Arc::clone(executor_registry),
+                        self.partition_service.as_ref().map(|service| Arc::clone(&service.app)),
+                    ))
                         as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
@@ -4349,6 +4352,7 @@ mod tests {
                 "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",
+                "exact_float_literal_decimal_cast",
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"

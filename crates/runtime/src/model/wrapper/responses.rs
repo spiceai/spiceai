@@ -193,7 +193,7 @@ impl Responses for ResponsesWrapper {
                 let captured_output = &resp;
 
                 if let Some(usage) = resp.usage.clone() {
-                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.output_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.input_tokens, id=resp.id, "labels");
+                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.output_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.input_tokens, cached_tokens = %usage.input_tokens_details.cached_tokens, id=resp.id, "labels");
                     handle_token_metrics(usage.input_tokens, usage.output_tokens, &labels);
                 }
 
@@ -280,13 +280,16 @@ where
                             "Response completed"
                         );
 
+                        // Record usage as labels of the response's task.
                         if let Some(usage) = response.usage.clone() {
                             tracing::info!(
                                 target: "task_history",
+                                parent: &self.span,
                                 completion_tokens = %usage.output_tokens,
                                 total_tokens = %usage.total_tokens,
                                 prompt_tokens = %usage.input_tokens,
-                                "Usage info"
+                                cached_tokens = %usage.input_tokens_details.cached_tokens,
+                                "labels"
                             );
                             handle_token_metrics(
                                 usage.input_tokens,
