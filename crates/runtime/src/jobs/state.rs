@@ -171,9 +171,17 @@ pub struct JobState {
     /// Query parameters if any
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
-    /// Node that is scheduling this job
+    /// The scheduler run driving this job: the id its scheduler took when it
+    /// started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduler_node: Option<String>,
+    /// The generation under which `scheduler_node` drives the job. Starting
+    /// the job takes generation 1 and every takeover the next one, so a
+    /// driver that another scheduler took the job from no longer matches.
+    /// `None` when a version that does not record it wrote the job last; no
+    /// driver holds `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     /// Error details if status is Failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JobError>,
@@ -227,6 +235,7 @@ impl JobState {
             sql,
             parameters,
             scheduler_node: None,
+            generation: None,
             error: None,
             result: None,
             created_at_ms: now_ms,
@@ -255,11 +264,31 @@ impl JobState {
         self.owner_scope() == caller
     }
 
-    /// Transitions job to running state.
-    pub fn set_running(&mut self, executor_node: String) {
+    /// Transitions job to running state, driven by `scheduler_node` under the
+    /// generation after the job's current one.
+    pub fn set_running(&mut self, scheduler_node: String) {
         self.status = JobStatus::Running;
-        self.scheduler_node = Some(executor_node);
+        self.scheduler_node = Some(scheduler_node);
+        self.generation = Some(object_store_occ::lease::next_generation(
+            self.generation.unwrap_or(0),
+        ));
         self.started_at_ms = Some(now_ms_or_zero());
+    }
+
+    /// The driver this state names, if it names one.
+    #[must_use]
+    pub fn driver(&self) -> Option<JobDriver> {
+        Some(JobDriver {
+            node: self.scheduler_node.clone()?,
+            generation: self.generation?,
+        })
+    }
+
+    /// Whether `driver` still drives this job: no other scheduler took it over.
+    #[must_use]
+    pub fn is_driven_by(&self, driver: &JobDriver) -> bool {
+        self.scheduler_node.as_deref() == Some(driver.node.as_str())
+            && self.generation == Some(driver.generation)
     }
 
     /// Transitions job to succeeded state with results.
@@ -346,6 +375,15 @@ impl JobState {
         self.maximum_size = maximum_size;
         self
     }
+}
+
+/// The process that drives a running job and the generation it drives it
+/// under. Every write the driver makes for the job checks both, so a driver
+/// that another scheduler took the job from is refused at its next write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobDriver {
+    node: String,
+    generation: u64,
 }
 
 /// Gets the current Unix timestamp in milliseconds, logging a warning if the system

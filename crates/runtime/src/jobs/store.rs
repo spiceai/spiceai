@@ -25,6 +25,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, UpdateVersion};
+use object_store_occ::lease::{Fenced, FencedPutError, fenced_put};
 use object_store_occ::{
     Attempt, ConditionalWriteError, ConflictRetry, Expected, RetryOnConflictError, conditional_put,
     retry_on_conflict,
@@ -42,8 +43,8 @@ use super::error::{
     ObjectStoreListSnafu, ObjectStoreReadSnafu, Result, SerializeChunkSnafu, SerializeStateSnafu,
 };
 use super::state::{
-    ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobResult, JobResultManifest, JobSchema,
-    JobState, JobStatus, now_ms_or_zero,
+    ColumnSchema, DEFAULT_CHUNK_SIZE, DEFAULT_RESULT_TTL, JobDriver, JobResult, JobResultManifest,
+    JobSchema, JobState, JobStatus, now_ms_or_zero,
 };
 
 /// Stores job state and results in the shared object store.
@@ -198,7 +199,8 @@ impl JobStore {
         self.write_job_state(state).await
     }
 
-    /// Marks a job as running.
+    /// Marks a job as running, driven by this store's node under the next
+    /// generation.
     ///
     /// A job that already finished is not run again: a cancel that lands between
     /// submission and the executor starting the job would otherwise be flipped back to
@@ -217,16 +219,76 @@ impl JobStore {
         Ok(state)
     }
 
+    /// Takes over a running job whose driver is gone: this store's node drives
+    /// it under the next generation. The takeover lands only while the job is
+    /// still running and driven as in `observed`, so of the schedulers that
+    /// recover the same job one takes it over and the others get `None`.
+    ///
+    /// A takeover write can land and still report an error, or be retried after
+    /// it landed. The job is then read back: when it is running under this
+    /// node at the next generation, the takeover is this store's.
+    pub async fn take_over_job(&self, observed: &JobState) -> Result<Option<JobState>> {
+        let mut intended = observed.clone();
+        intended.set_running(self.node_id.clone());
+        let taken = match self
+            .modify_job(&observed.job_id, |state| {
+                if !still_driven_as(state, observed) {
+                    return Ok(false);
+                }
+                state.set_running(self.node_id.clone());
+                Ok(true)
+            })
+            .await
+        {
+            Ok((state, written)) => {
+                (written || still_driven_as(&state, &intended)).then_some(state)
+            }
+            Err(e) => match self.get_job(&observed.job_id).await {
+                Ok(state) if still_driven_as(&state, &intended) => Some(state),
+                _ => return Err(e),
+            },
+        };
+        Ok(taken)
+    }
+
+    /// Marks a running job whose driver is gone as failed, without driving it.
+    /// The failure lands only while the job is still running and driven as in
+    /// `observed`; otherwise this returns `None`. A job left as it was stays
+    /// orphaned, so the next recovery sweep tries again.
+    pub async fn fail_orphaned_job(
+        &self,
+        observed: &JobState,
+        error_code: JobErrorCode,
+        message: impl Into<String>,
+    ) -> Result<Option<JobState>> {
+        let error = super::state::JobError {
+            error_code,
+            message: message.into(),
+            sql_state: None,
+        };
+        let (state, failed) = self
+            .modify_job(&observed.job_id, |state| {
+                if !still_driven_as(state, observed) {
+                    return Ok(false);
+                }
+                state.set_failed(error.clone());
+                Ok(true)
+            })
+            .await?;
+        Ok(failed.then_some(state))
+    }
+
     /// Marks a job as cancelled. A job that already finished keeps its status.
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobState> {
         self.modify_job(job_id, |state| {
             if state.is_terminal() {
-                return false;
+                return Ok(false);
             }
             state.set_cancelled();
-            true
+            Ok(true)
         })
         .await
+        .map(|(state, _)| state)
     }
 
     /// Writes result chunks for a completed job from a stream of record batches.
@@ -235,10 +297,14 @@ impl JobStore {
     /// avoiding loading all results into memory at once. Chunks are flushed when
     /// the configured `chunk_size` row threshold is reached.
     ///
+    /// Each chunk is written only while `driver` still drives the job, over a
+    /// chunk a former driver may have left at its index.
+    ///
     /// Returns the job result manifest.
     pub async fn write_result_chunks_from_stream(
         &self,
         job_id: &str,
+        driver: &JobDriver,
         mut stream: SendableRecordBatchStream,
     ) -> Result<JobResult> {
         let state = self.get_job(job_id).await?;
@@ -284,7 +350,7 @@ impl JobStore {
             // Flush chunk if we've reached the chunk size
             if current_chunk_rows >= self.chunk_size {
                 let bytes = self
-                    .write_chunk(job_id, chunk_index, &current_chunk_batches)
+                    .write_chunk(job_id, driver, chunk_index, &current_chunk_batches)
                     .await?;
                 total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
                     super::error::Error::IntegerOverflow {
@@ -325,7 +391,7 @@ impl JobStore {
         // Flush remaining batches
         if !current_chunk_batches.is_empty() {
             let bytes = self
-                .write_chunk(job_id, chunk_index, &current_chunk_batches)
+                .write_chunk(job_id, driver, chunk_index, &current_chunk_batches)
                 .await?;
             total_bytes = total_bytes.checked_add(bytes).ok_or_else(|| {
                 super::error::Error::IntegerOverflow {
@@ -405,10 +471,11 @@ impl JobStore {
         }
     }
 
-    /// Writes a single chunk to the object store.
+    /// Writes a single chunk to the object store while `driver` drives the job.
     async fn write_chunk(
         &self,
         job_id: &str,
+        driver: &JobDriver,
         chunk_index: usize,
         batches: &[RecordBatch],
     ) -> Result<usize> {
@@ -433,18 +500,32 @@ impl JobStore {
         let path = self.chunk_path(job_id, chunk_index);
         let bytes_len = buffer.len();
 
-        // A chunk is written once: another scheduler that already wrote it wins.
-        conditional_put(self.store.as_ref(), &path, buffer.into(), &Expected::Absent)
-            .await
-            .map_err(|e| match e {
-                ConditionalWriteError::Conflict { .. } => super::error::Error::ChunkAlreadyExists {
-                    job_id: job_id.to_string(),
-                    chunk_index,
-                },
-                source => super::error::Error::ObjectStoreWrite { source },
-            })?;
-
-        Ok(bytes_len)
+        let written = fenced_put(
+            self.store.as_ref(),
+            &path,
+            buffer.into(),
+            &ConflictRetry::default(),
+            || async {
+                Ok(self
+                    .get_job_ignoring_expiry(job_id)
+                    .await?
+                    .is_driven_by(driver))
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            FencedPutError::Check(e) => e,
+            FencedPutError::Store(source) => super::error::Error::ObjectStoreWrite { source },
+            FencedPutError::Contention { .. } => super::error::Error::ConcurrentModification {
+                job_id: job_id.to_string(),
+            },
+        })?;
+        match written {
+            Fenced::Written(_) => Ok(bytes_len),
+            Fenced::Refused => Err(super::error::Error::JobTakenOver {
+                job_id: job_id.to_string(),
+            }),
+        }
     }
 
     /// Reads a result chunk from the object store.
@@ -471,11 +552,16 @@ impl JobStore {
         Ok(batches)
     }
 
-    /// Marks a job as succeeded with the given results.
+    /// Marks a job as succeeded with the given results, while `driver` drives it.
     ///
     /// The first terminal state wins: a job that was cancelled or failed while its
     /// results were being written stays that way.
-    pub async fn complete_job(&self, job_id: &str, result: JobResult) -> Result<JobState> {
+    pub async fn complete_job(
+        &self,
+        job_id: &str,
+        driver: &JobDriver,
+        result: JobResult,
+    ) -> Result<JobState> {
         self.modify_job(job_id, |state| {
             if state.is_terminal() {
                 tracing::debug!(
@@ -483,21 +569,24 @@ impl JobStore {
                     status = %state.status,
                     "Job already finished; not marking it succeeded"
                 );
-                return false;
+                return Ok(false);
             }
+            ensure_driven_by(state, driver)?;
             state.set_succeeded(result.clone(), self.result_ttl);
-            true
+            Ok(true)
         })
         .await
+        .map(|(state, _)| state)
     }
 
-    /// Marks a job as failed with the given error.
+    /// Marks a job as failed with the given error, while `driver` drives it.
     ///
     /// The first terminal state wins: a job that already succeeded or was cancelled
     /// keeps that status.
     pub async fn fail_job(
         &self,
         job_id: &str,
+        driver: &JobDriver,
         error_code: JobErrorCode,
         message: impl Into<String>,
     ) -> Result<JobState> {
@@ -513,12 +602,14 @@ impl JobStore {
                     status = %state.status,
                     "Job already finished; not marking it failed"
                 );
-                return false;
+                return Ok(false);
             }
+            ensure_driven_by(state, driver)?;
             state.set_failed(error.clone());
-            true
+            Ok(true)
         })
         .await
+        .map(|(state, _)| state)
     }
 
     /// Deletes a job and all its result chunks, and returns how many objects it
@@ -737,20 +828,21 @@ impl JobStore {
 
     /// Applies `change` to the job's current state and writes it back, starting
     /// again from a fresh read when another writer changed the job first.
-    /// `change` returns `false` to leave the job as it is.
+    /// `change` returns `false` to leave the job as it is; the result says
+    /// whether the change was written.
     async fn modify_job(
         &self,
         job_id: &str,
-        change: impl FnMut(&mut JobState) -> bool + Send,
-    ) -> Result<JobState> {
+        change: impl FnMut(&mut JobState) -> Result<bool> + Send,
+    ) -> Result<(JobState, bool)> {
         let change = Mutex::new(change);
         retry_on_conflict(&ConflictRetry::default(), || async {
             let mut state = self.get_job(job_id).await?;
-            if !(*change.lock())(&mut state) {
-                return Ok(Attempt::Done(state));
+            if !(*change.lock())(&mut state)? {
+                return Ok(Attempt::Done((state, false)));
             }
             match self.write_job_state(&mut state).await {
-                Ok(()) => Ok(Attempt::Done(state)),
+                Ok(()) => Ok(Attempt::Done((state, true))),
                 Err(super::error::Error::ConcurrentModification { .. }) => Ok(Attempt::Conflict),
                 Err(e) => Err(e),
             }
@@ -804,6 +896,24 @@ impl JobStore {
     }
 }
 
+/// Whether `state` is still running and driven as in `observed`.
+fn still_driven_as(state: &JobState, observed: &JobState) -> bool {
+    state.status == JobStatus::Running
+        && state.scheduler_node == observed.scheduler_node
+        && state.generation == observed.generation
+}
+
+/// Refuses a write by `driver` to a job that another scheduler took over.
+fn ensure_driven_by(state: &JobState, driver: &JobDriver) -> Result<()> {
+    if state.is_driven_by(driver) {
+        Ok(())
+    } else {
+        Err(super::error::Error::JobTakenOver {
+            job_id: state.job_id.clone(),
+        })
+    }
+}
+
 fn join_path(prefix: &str, suffix: &str) -> Path {
     if prefix.is_empty() {
         Path::from(suffix)
@@ -823,6 +933,16 @@ mod tests {
 
     fn test_owner() -> String {
         crate::jobs::PUBLIC_JOB_OWNER.to_string()
+    }
+
+    /// Starts the job, and returns the driver its writes go through.
+    async fn start(job_store: &JobStore, job_id: &str) -> JobDriver {
+        job_store
+            .set_job_running(job_id)
+            .await
+            .expect("to start the job")
+            .driver()
+            .expect("a started job has a driver")
     }
 
     fn make_request(sql: impl Into<String>) -> SubmitQueryRequest {
@@ -873,8 +993,9 @@ mod tests {
         assert_eq!(running.status, JobStatus::Running);
         assert_eq!(running.scheduler_node.as_deref(), Some("node-1"));
 
+        let driver = running.driver().expect("a running job has a driver");
         let completed = job_store
-            .complete_job(&job_id, empty_result())
+            .complete_job(&job_id, &driver, empty_result())
             .await
             .expect("to complete job");
         assert_eq!(completed.status, JobStatus::Succeeded);
@@ -934,13 +1055,10 @@ mod tests {
             .await
             .expect("to create job")
             .job_id;
-        job_store
-            .set_job_running(&cancelled)
-            .await
-            .expect("running");
+        let driver = start(&job_store, &cancelled).await;
         job_store.cancel_job(&cancelled).await.expect("to cancel");
         let state = job_store
-            .complete_job(&cancelled, empty_result())
+            .complete_job(&cancelled, &driver, empty_result())
             .await
             .expect("completing a cancelled job is a no-op");
         assert_eq!(state.status, JobStatus::Cancelled);
@@ -950,16 +1068,13 @@ mod tests {
             .await
             .expect("to create job")
             .job_id;
+        let driver = start(&job_store, &succeeded).await;
         job_store
-            .set_job_running(&succeeded)
-            .await
-            .expect("running");
-        job_store
-            .complete_job(&succeeded, empty_result())
+            .complete_job(&succeeded, &driver, empty_result())
             .await
             .expect("to complete");
         let state = job_store
-            .fail_job(&succeeded, JobErrorCode::Internal, "late failure")
+            .fail_job(&succeeded, &driver, JobErrorCode::Internal, "late failure")
             .await
             .expect("failing a succeeded job is a no-op");
         assert_eq!(state.status, JobStatus::Succeeded);
@@ -988,22 +1103,30 @@ mod tests {
                 .await
                 .expect("to create job")
                 .job_id;
-            stores[0].set_job_running(&job_id).await.expect("running");
+            let driver = start(&stores[0], &job_id).await;
 
             let barrier = Arc::new(tokio::sync::Barrier::new(3));
             let finishers: Vec<_> = stores
                 .iter()
                 .enumerate()
                 .map(|(n, job_store)| {
-                    let (job_store, job_id, barrier) =
-                        (Arc::clone(job_store), job_id.clone(), Arc::clone(&barrier));
+                    let (job_store, job_id, barrier, driver) = (
+                        Arc::clone(job_store),
+                        job_id.clone(),
+                        Arc::clone(&barrier),
+                        driver.clone(),
+                    );
                     tokio::spawn(async move {
                         barrier.wait().await;
                         match n {
-                            0 => job_store.complete_job(&job_id, empty_result()).await,
+                            0 => {
+                                job_store
+                                    .complete_job(&job_id, &driver, empty_result())
+                                    .await
+                            }
                             1 => {
                                 job_store
-                                    .fail_job(&job_id, JobErrorCode::Internal, "failed")
+                                    .fail_job(&job_id, &driver, JobErrorCode::Internal, "failed")
                                     .await
                             }
                             _ => job_store.cancel_job(&job_id).await,
@@ -1044,10 +1167,7 @@ mod tests {
             .await
             .expect("to create job")
             .job_id;
-        expired_store
-            .set_job_running(&expired)
-            .await
-            .expect("running");
+        let expired_driver = start(&expired_store, &expired).await;
         store
             .put(
                 &expired_store.chunk_path(&expired, 0),
@@ -1056,7 +1176,7 @@ mod tests {
             .await
             .expect("write a chunk");
         expired_store
-            .complete_job(&expired, empty_result())
+            .complete_job(&expired, &expired_driver, empty_result())
             .await
             .expect("to complete");
 
@@ -1065,9 +1185,9 @@ mod tests {
             .await
             .expect("to create job")
             .job_id;
-        live_store.set_job_running(&live).await.expect("running");
+        let live_driver = start(&live_store, &live).await;
         live_store
-            .complete_job(&live, empty_result())
+            .complete_job(&live, &live_driver, empty_result())
             .await
             .expect("to complete");
 
@@ -1105,7 +1225,12 @@ mod tests {
             .await
             .expect("to create job")
             .job_id;
-        job_store.set_job_running(&job_id).await.expect("running");
+        let driver = job_store
+            .set_job_running(&job_id)
+            .await
+            .expect("running")
+            .driver()
+            .expect("a running job has a driver");
         job_store
             .store
             .put(&job_store.chunk_path(&job_id, 0), b"chunk".to_vec().into())
@@ -1114,7 +1239,7 @@ mod tests {
         match finish {
             JobStatus::Failed => {
                 job_store
-                    .fail_job(&job_id, JobErrorCode::ExecutionFailed, "failed")
+                    .fail_job(&job_id, &driver, JobErrorCode::ExecutionFailed, "failed")
                     .await
                     .expect("to fail");
             }
@@ -1123,7 +1248,7 @@ mod tests {
             }
             JobStatus::Succeeded => {
                 job_store
-                    .complete_job(&job_id, empty_result())
+                    .complete_job(&job_id, &driver, empty_result())
                     .await
                     .expect("to complete");
             }
@@ -1137,7 +1262,7 @@ mod tests {
                 if let Some(expires_at) = state.expires_at_ms.as_mut() {
                     *expires_at = completed_at + 12 * 60 * 60 * 1000;
                 }
-                true
+                Ok(true)
             })
             .await
             .expect("to backdate the job");
@@ -1317,7 +1442,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), vec![]);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write empty stream");
 
@@ -1353,7 +1482,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write single batch stream");
 
@@ -1398,7 +1531,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), vec![batch1, batch2]);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream");
 
@@ -1443,7 +1580,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), vec![batch1, batch2, batch3]);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream");
 
@@ -1499,7 +1640,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), batches);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream");
 
@@ -1531,7 +1676,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), vec![]);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream");
 
@@ -1563,7 +1712,11 @@ mod tests {
             let stream = create_test_stream(Arc::clone(&schema), vec![batch]);
 
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream");
 
@@ -1613,7 +1766,11 @@ mod tests {
 
             // Should succeed since results are within the maximum size limit
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream within maximum size limit");
 
@@ -1657,7 +1814,11 @@ mod tests {
 
             // Should fail because results exceed the maximum size limit
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await;
 
             assert!(
@@ -1694,7 +1855,11 @@ mod tests {
 
             // Should fail on final flush because results exceed the maximum size limit
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await;
 
             assert!(
@@ -1731,7 +1896,11 @@ mod tests {
 
             // Should succeed since there's no maximum size limit
             let result = job_store
-                .write_result_chunks_from_stream(&state.job_id, stream)
+                .write_result_chunks_from_stream(
+                    &state.job_id,
+                    &start(&job_store, &state.job_id).await,
+                    stream,
+                )
                 .await
                 .expect("to write stream without maximum size limit");
 
@@ -1898,54 +2067,238 @@ mod tests {
             assert_eq!(final_state.status, JobStatus::Cancelled);
         }
 
-        #[tokio::test]
-        async fn test_chunk_already_exists_error() {
+        fn int_stream(values: Vec<i32>) -> SendableRecordBatchStream {
             use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
             use futures::stream;
 
-            let store = Arc::new(InMemory::new());
-            // Use small chunk size to ensure we write multiple chunks
-            let job_store = JobStore::new(store, "test", "node-1").with_chunk_size(2);
-
-            // Create first job and write chunks
-            let state1 = job_store
-                .create_job(make_request("SELECT * FROM test"), false, test_owner())
-                .await
-                .expect("to create first job");
-
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                vec![Arc::new(Int32Array::from(values))],
             )
             .expect("to create batch");
-
-            let stream1 = Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&schema),
-                stream::iter(vec![Ok(batch.clone())]),
-            ));
-
-            // Write chunks for first job - should succeed
-            job_store
-                .write_result_chunks_from_stream(&state1.job_id, stream1)
-                .await
-                .expect("first write should succeed");
-
-            // Now try to write the same chunks again for the same job
-            // This simulates another scheduler trying to write results for the same job
-            let stream2 = Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&schema),
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
                 stream::iter(vec![Ok(batch)]),
-            ));
+            ))
+        }
 
-            let result = job_store
-                .write_result_chunks_from_stream(&state1.job_id, stream2)
-                .await;
+        async fn chunk_values(job_store: &JobStore, job_id: &str, index: usize) -> Vec<i32> {
+            job_store
+                .read_chunk(job_id, index)
+                .await
+                .expect("to read chunk")
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("an Int32 column")
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        }
 
+        /// Another scheduler takes a job over from its driver; the former
+        /// driver comes back and is refused at each write it makes for the job.
+        #[tokio::test]
+        async fn a_driver_whose_job_was_taken_over_is_refused_at_its_next_write() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let former = JobStore::new(Arc::clone(&store), "test", "node-a").with_chunk_size(2);
+            let successor = JobStore::new(Arc::clone(&store), "test", "node-b").with_chunk_size(2);
+            let job_id = former
+                .create_job(make_request("SELECT 1"), false, test_owner())
+                .await
+                .expect("to create job")
+                .job_id;
+            let started = former.set_job_running(&job_id).await.expect("to start");
+            let former_driver = started.driver().expect("a driver");
+
+            let taken = successor
+                .take_over_job(&started)
+                .await
+                .expect("to take over")
+                .expect("the job is still driven as observed");
+            assert_eq!(taken.scheduler_node.as_deref(), Some("node-b"));
+            assert_eq!(taken.generation, Some(2));
+            let successor_driver = taken.driver().expect("a driver");
+
+            let err = former
+                .write_result_chunks_from_stream(&job_id, &former_driver, int_stream(vec![7, 7]))
+                .await
+                .expect_err("the former driver must not write results");
+            assert!(matches!(err, Error::JobTakenOver { .. }), "{err:?}");
             assert!(
-                matches!(result, Err(Error::ChunkAlreadyExists { .. })),
-                "Expected ChunkAlreadyExists error when writing duplicate chunk, got: {result:?}"
+                store.head(&former.chunk_path(&job_id, 0)).await.is_err(),
+                "the refused chunk must not be written"
+            );
+            for err in [
+                former
+                    .complete_job(&job_id, &former_driver, empty_result())
+                    .await
+                    .expect_err("the former driver must not complete the job"),
+                former
+                    .fail_job(&job_id, &former_driver, JobErrorCode::Internal, "late")
+                    .await
+                    .expect_err("the former driver must not fail the job"),
+            ] {
+                assert!(matches!(err, Error::JobTakenOver { .. }), "{err:?}");
+            }
+            assert_eq!(
+                former.get_job(&job_id).await.expect("to get job").status,
+                JobStatus::Running
+            );
+
+            let result = successor
+                .write_result_chunks_from_stream(&job_id, &successor_driver, int_stream(vec![1, 2]))
+                .await
+                .expect("the driver writes results");
+            let done = successor
+                .complete_job(&job_id, &successor_driver, result)
+                .await
+                .expect("the driver completes the job");
+            assert_eq!(done.status, JobStatus::Succeeded);
+            assert_eq!(chunk_values(&successor, &job_id, 0).await, vec![1, 2]);
+        }
+
+        /// A chunk the former driver wrote before the takeover is replaced by the
+        /// driver's own, so the results match the driver's manifest.
+        #[tokio::test]
+        async fn the_driver_replaces_a_chunk_its_former_driver_left() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let former = JobStore::new(Arc::clone(&store), "test", "node-a").with_chunk_size(2);
+            let successor = JobStore::new(Arc::clone(&store), "test", "node-b").with_chunk_size(2);
+            let job_id = former
+                .create_job(make_request("SELECT 1"), false, test_owner())
+                .await
+                .expect("to create job")
+                .job_id;
+            let started = former.set_job_running(&job_id).await.expect("to start");
+            former
+                .write_result_chunks_from_stream(
+                    &job_id,
+                    &started.driver().expect("a driver"),
+                    int_stream(vec![9, 9, 9]),
+                )
+                .await
+                .expect("the driver writes while it drives");
+
+            let taken = successor
+                .take_over_job(&started)
+                .await
+                .expect("to take over")
+                .expect("the job is still driven as observed");
+            let result = successor
+                .write_result_chunks_from_stream(
+                    &job_id,
+                    &taken.driver().expect("a driver"),
+                    int_stream(vec![1, 2]),
+                )
+                .await
+                .expect("the new driver writes over the former driver's chunk");
+            assert_eq!(result.chunk_indices, vec![0]);
+            assert_eq!(chunk_values(&successor, &job_id, 0).await, vec![1, 2]);
+        }
+
+        /// Two schedulers that recover the same orphaned job: one takes it over,
+        /// the other finds it already taken and does not drive it.
+        #[tokio::test]
+        async fn two_schedulers_recovering_one_job_take_it_over_once() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let lost = JobStore::new(Arc::clone(&store), "test", "node-lost");
+            let b = JobStore::new(Arc::clone(&store), "test", "node-b");
+            let c = JobStore::new(Arc::clone(&store), "test", "node-c");
+            let job_id = lost
+                .create_job(make_request("SELECT 1"), false, test_owner())
+                .await
+                .expect("to create job")
+                .job_id;
+            let orphaned = lost.set_job_running(&job_id).await.expect("to start");
+
+            let (by_b, by_c) = tokio::join!(b.take_over_job(&orphaned), c.take_over_job(&orphaned));
+            let takers: Vec<_> = [by_b.expect("b"), by_c.expect("c")]
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(takers.len(), 1, "{takers:?}");
+            let stored = b.get_job(&job_id).await.expect("to get job");
+            assert_eq!(stored.scheduler_node, takers[0].scheduler_node);
+            assert_eq!(stored.generation, Some(2));
+
+            // A recoverer that read the job before the takeover finds it taken.
+            assert!(
+                c.take_over_job(&orphaned)
+                    .await
+                    .expect("to take over")
+                    .is_none()
+            );
+        }
+
+        /// A job rewritten by a version that does not record the generation
+        /// counts as taken over: no driver holds a job without a generation, so
+        /// its former driver is refused, and the next takeover starts a new
+        /// generation under a new driver.
+        #[tokio::test]
+        async fn a_rewrite_that_drops_the_generation_is_a_new_owner() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let former = JobStore::new(Arc::clone(&store), "test", "node-a");
+            let next = JobStore::new(Arc::clone(&store), "test", "node-c");
+            let job_id = former
+                .create_job(make_request("SELECT 1"), false, test_owner())
+                .await
+                .expect("to create job")
+                .job_id;
+            let former_driver = former
+                .set_job_running(&job_id)
+                .await
+                .expect("to start")
+                .driver()
+                .expect("a driver");
+
+            // An older scheduler takes the job over: it writes its own node and
+            // drops the field it does not know.
+            let path = former.job_state_path(&job_id);
+            let mut stored: serde_json::Value = serde_json::from_slice(
+                &store
+                    .get(&path)
+                    .await
+                    .expect("to read job")
+                    .bytes()
+                    .await
+                    .expect("to read bytes"),
+            )
+            .expect("job JSON");
+            let fields = stored.as_object_mut().expect("an object");
+            assert!(fields.remove("generation").is_some());
+            fields.insert("scheduler_node".to_string(), "node-trunk".into());
+            store
+                .put(&path, serde_json::to_vec(&stored).expect("JSON").into())
+                .await
+                .expect("the older scheduler's rewrite");
+
+            let err = former
+                .complete_job(&job_id, &former_driver, empty_result())
+                .await
+                .expect_err("the former driver must not complete the job");
+            assert!(matches!(err, Error::JobTakenOver { .. }), "{err:?}");
+
+            let rewritten = next.get_job(&job_id).await.expect("to get job");
+            assert_eq!(rewritten.generation, None);
+            let taken = next
+                .take_over_job(&rewritten)
+                .await
+                .expect("to take over")
+                .expect("the job is still as observed");
+            assert_eq!(taken.scheduler_node.as_deref(), Some("node-c"));
+            assert_eq!(taken.generation, Some(1));
+            assert!(
+                former
+                    .fail_job(&job_id, &former_driver, JobErrorCode::Internal, "late")
+                    .await
+                    .is_err_and(|err| matches!(err, Error::JobTakenOver { .. })),
+                "the former driver stays refused after the next takeover"
             );
         }
     }

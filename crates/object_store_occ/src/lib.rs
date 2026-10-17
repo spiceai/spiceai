@@ -26,11 +26,14 @@ limitations under the License.
 //! - [`retry_on_conflict`]: a bounded, jittered compare-and-swap loop.
 //! - [`probe_conditional_writes`]: detects a store that ignores write conditions.
 //! - [`LocalConditionalPut`]: conditional writes for a local directory.
+//! - [`lease`]: which process holds a piece of shared state, when that holder
+//!   counts as gone, and the generation that fences out a former holder.
 //! - [`cleanup`]: the schedule and age rules of state cleanup.
 
 mod capabilities;
 pub mod cleanup;
 mod conditional;
+pub mod lease;
 pub mod local_conditional_put;
 mod retry;
 mod state;
