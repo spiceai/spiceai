@@ -30,6 +30,7 @@ use object_store_occ::{
     retry_on_conflict,
 };
 use parking_lot::Mutex;
+use runtime_state_location::StateFeature;
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -520,33 +521,37 @@ impl JobStore {
         .await
     }
 
-    /// Deletes a job and all its result chunks.
+    /// Deletes a job and all its result chunks, and returns how many objects it
+    /// deleted.
     ///
     /// This method attempts to delete all chunks before deleting the job state.
     /// If any chunk deletions fail, the operation returns an error without
     /// deleting the job state to avoid orphaning chunks.
-    pub async fn delete_job(&self, job_id: &str) -> Result<()> {
+    pub async fn delete_job(&self, job_id: &str) -> Result<usize> {
         // Delete all chunks first
         let chunks_prefix = self.job_chunks_prefix(job_id);
         let mut stream = self.store.list(Some(&chunks_prefix));
 
         let mut total_chunks = 0usize;
         let mut failed_deletions = 0usize;
+        let mut deleted = 0usize;
 
         while let Some(entry) = stream.next().await {
             let meta = entry.context(ObjectStoreListSnafu)?;
             total_chunks = total_chunks.saturating_add(1);
 
-            if let Err(err) = self.store.delete(&meta.location).await
-                && !matches!(err, ObjectStoreError::NotFound { .. })
-            {
-                tracing::warn!(
-                    job_id,
-                    path = %meta.location,
-                    error = %err,
-                    "Failed to delete job chunk from object store"
-                );
-                failed_deletions = failed_deletions.saturating_add(1);
+            match self.store.delete(&meta.location).await {
+                Ok(()) => deleted = deleted.saturating_add(1),
+                Err(ObjectStoreError::NotFound { .. }) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        job_id,
+                        path = %meta.location,
+                        error = %err,
+                        "Failed to delete job chunk from object store"
+                    );
+                    failed_deletions = failed_deletions.saturating_add(1);
+                }
             }
         }
 
@@ -562,8 +567,9 @@ impl JobStore {
         // Delete job state. Another scheduler's cleanup may have deleted it first.
         let path = self.job_state_path(job_id);
         match self.store.delete(&path).await {
-            Err(ObjectStoreError::NotFound { .. }) => Ok(()),
-            result => result.context(ObjectStoreDeleteSnafu),
+            Ok(()) => Ok(deleted.saturating_add(1)),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(deleted),
+            Err(source) => Err(source).context(ObjectStoreDeleteSnafu),
         }
     }
 
@@ -626,6 +632,7 @@ impl JobStore {
         let jobs_prefix = self.jobs_prefix();
         let mut stream = self.store.list(Some(&jobs_prefix));
         let mut deleted_count = 0usize;
+        let mut deleted_objects = 0usize;
 
         while let Some(entry) = stream.next().await {
             let meta = match entry {
@@ -687,9 +694,10 @@ impl JobStore {
 
             if state.is_reclaimable(now_ms, self.result_ttl) {
                 match self.delete_job(&state.job_id).await {
-                    Ok(()) => {
+                    Ok(objects) => {
                         // Saturate at MAX on overflow - cleanup count is informational only
                         deleted_count = deleted_count.saturating_add(1);
+                        deleted_objects = deleted_objects.saturating_add(objects);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -701,6 +709,10 @@ impl JobStore {
             }
         }
 
+        runtime_state_location::metrics::record_cleanup_deleted(
+            StateFeature::Scheduler,
+            deleted_objects,
+        );
         Ok(deleted_count)
     }
 
