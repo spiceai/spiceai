@@ -78,7 +78,9 @@ pub struct DatasetBuilder {
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
-    fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+    fn try_from(mut dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
+        crate::opentelemetry_logs::apply_dataset_defaults(&mut dataset);
+
         // Honoured here; the deprecation is reported by the load path
         // (`init::dataset::warn_about_acceleration_block`), not from this conversion, which
         // read-only callers run too.

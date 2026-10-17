@@ -12021,6 +12021,7 @@ dependencies = [
  "google-genai",
  "governor",
  "hf-hub",
+ "http 1.4.1",
  "indexmap 2.14.0",
  "insta",
  "itertools 0.14.0",
@@ -12050,6 +12051,7 @@ dependencies = [
  "token_provider",
  "tokenizers 0.21.4",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-futures",
  "tracing-opentelemetry",
@@ -14811,7 +14813,11 @@ name = "otelpublisher"
 version = "2.4.0-unstable"
 dependencies = [
  "clap",
+ "flate2",
  "opentelemetry-proto 0.32.0",
+ "prost 0.14.3",
+ "reqwest 0.13.4",
+ "serde_json",
  "tokio",
  "tonic",
 ]
