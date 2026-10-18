@@ -1197,8 +1197,9 @@ impl<'a> AppendMutationWriter<'a> {
         self.table.ensure_no_incomplete_write().await?;
         // Held for the whole write: its validation decides from the primary-key
         // index whether each replaced row is inline or in a file, and its
-        // publication acts on those decisions.
-        let _checkpoint_guard = self
+        // publication acts on those decisions. A streaming append hands it to
+        // that publication, which outlives a cancelled caller.
+        let checkpoint_guard = self
             .table
             .lock_mem_tier_checkpoint_for_durable_write()
             .await;
@@ -1229,7 +1230,7 @@ impl<'a> AppendMutationWriter<'a> {
             && let Some(resolver) = self.table.key_resolver()?
         {
             return self
-                .write_resolving_repeats_after(data, resolver, write_guard)
+                .write_resolving_repeats_after(data, resolver, write_guard, checkpoint_guard)
                 .await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
@@ -1264,6 +1265,7 @@ impl<'a> AppendMutationWriter<'a> {
         data: SendableRecordBatchStream,
         resolver: super::key_conflicts::KeyResolver,
         write_guard: OwnedMutexGuard<()>,
+        checkpoint_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         // A writer's row versions order a key's copies only against the copies this
         // write holds, which are all of them only in a load into an empty table.
@@ -1313,6 +1315,7 @@ impl<'a> AppendMutationWriter<'a> {
             table: self.table.clone_for_write(),
             context: Arc::clone(self.context),
             _write_guard: write_guard,
+            _checkpoint_guard: Some(checkpoint_guard),
             snapshot_id,
             rows,
             stats,
