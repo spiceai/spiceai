@@ -89,6 +89,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "runtime",
     "secrets",
     "data_components",
+    "connector_graphql",
     "cayenne",
     "cache",
     "extensions",
@@ -928,6 +929,36 @@ mod tests {
         assert!(env_filter_string(&LogVerbosity::Default).contains("tantivy=warn"));
         assert!(env_filter_string(&LogVerbosity::Verbose).contains("tantivy=warn"));
         assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("tantivy=warn"));
+    }
+
+    #[test]
+    fn default_filter_shows_graphql_retry_info_and_hides_debug() {
+        let probe = ProbeWriter::default();
+        let env_filter: EnvFilter = LogVerbosity::Default.into();
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer(false, probe.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "connector_graphql::graphql::client",
+                "Page fetch failed, will retry: example"
+            );
+            tracing::debug!(
+                target: "connector_graphql::graphql::client",
+                "graphql debug detail that stays hidden"
+            );
+        });
+
+        let output = probe.contents();
+        assert!(
+            output.contains("Page fetch failed, will retry: example"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("graphql debug detail that stays hidden"),
+            "{output}"
+        );
     }
 
     fn app_with_task_history(enabled: bool) -> Arc<App> {
