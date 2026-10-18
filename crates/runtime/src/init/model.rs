@@ -31,6 +31,8 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 use telemetry::timing::TimeMeasurement;
+use tokio::task::JoinHandle;
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -69,8 +71,38 @@ impl Runtime {
         }
     }
 
-    // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
-    async fn load_model(&self, m: &SpicepodModel) {
+    /// Loads `m`. A load that fails for a reason other than its Spicepod configuration is
+    /// retried in the background with backoff until it succeeds, so the model, and the
+    /// runtime's readiness, recover once the provider accepts it.
+    ///
+    /// The caller sets the model's status first; each attempt sets it to error or ready.
+    async fn load_model(self: &Arc<Self>, m: &SpicepodModel) {
+        self.model_retries.stop(&m.name).await;
+        if needs_retry(&self.try_load_model(m).await) {
+            let task = tokio::spawn(Arc::clone(self).retry_model_load(m.clone()));
+            self.model_retries.insert(&m.name, task);
+        }
+    }
+
+    async fn retry_model_load(self: Arc<Self>, m: SpicepodModel) {
+        let shutdown = self.status.shutdown_token();
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+        let retries = async {
+            while let Some(delay) = backoff.next_duration() {
+                tokio::time::sleep(delay).await;
+                if !needs_retry(&self.try_load_model(&m).await) {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            () = retries => {}
+            () = shutdown.cancelled() => {}
+        }
+    }
+
+    /// One attempt to load `m`, reported in its status, metrics and logs.
+    async fn try_load_model(&self, m: &SpicepodModel) -> Result<(), Error> {
         let source = m.get_source();
         let source_str = source.clone().map(|s| s.to_string()).unwrap_or_default();
         let model = m.clone();
@@ -110,7 +142,7 @@ impl Runtime {
                     status::ComponentStatus::error_with_message(err.to_string()),
                 );
                 tracing::warn!("{err}");
-                return;
+                return Err(err);
             }
         }
 
@@ -137,6 +169,7 @@ impl Runtime {
                 );
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Ready);
+                Ok(())
             }
             Err(e) => {
                 metrics::models::LOAD_ERROR.add(1, &[]);
@@ -156,10 +189,10 @@ impl Runtime {
                     && let Some(hint) = get_available_models_hint(model_source, &params).await
                 {
                     tracing::warn!("{e}{hint}");
-                    return;
+                } else {
+                    tracing::warn!("{e}");
                 }
-
-                tracing::warn!("{e}");
+                Err(e)
             }
         }
     }
@@ -279,14 +312,20 @@ impl Runtime {
         );
     }
 
-    async fn update_model(&self, m: &SpicepodModel) {
+    async fn update_model(self: &Arc<Self>, m: &SpicepodModel) {
+        // First, so a retry of the old configuration cannot register after it is removed.
+        self.model_retries.stop(&m.name).await;
         self.status
             .update_model(&m.name, status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
     }
 
-    pub(crate) async fn apply_model_diff(&self, current_app: &Arc<App>, new_app: &Arc<App>) {
+    pub(crate) async fn apply_model_diff(
+        self: &Arc<Self>,
+        current_app: &Arc<App>,
+        new_app: &Arc<App>,
+    ) {
         for model in &new_app.models {
             if let Some(current_model) = current_app.models.iter().find(|m| m.name == model.name) {
                 if current_model != model {
@@ -302,11 +341,65 @@ impl Runtime {
         // Remove models that are no longer in the app
         for model in &current_app.models {
             if !new_app.models.iter().any(|m| m.name == model.name) {
+                self.model_retries.stop(&model.name).await;
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Disabled);
                 self.remove_model(model).await;
             }
         }
+    }
+}
+
+/// The background retries of model loads that failed, so a Spicepod change can stop the
+/// retries of a configuration it replaces or removes.
+#[derive(Default)]
+pub(crate) struct ModelRetries {
+    tasks: parking_lot::Mutex<HashMap<String, JoinHandle<()>>>,
+}
+
+impl ModelRetries {
+    fn insert(&self, name: &str, task: JoinHandle<()>) {
+        if let Some(previous) = self.tasks.lock().insert(name.to_string(), task) {
+            previous.abort();
+        }
+    }
+
+    /// Stops the retries of model `name`. When this returns, no attempt to load it is
+    /// running and none will start.
+    async fn stop(&self, name: &str) {
+        let task = self.tasks.lock().remove(name);
+        if let Some(task) = task {
+            task.abort();
+            // Waits until an attempt in progress is dropped.
+            let _ = task.await;
+        }
+    }
+}
+
+fn needs_retry(attempt: &Result<(), Error>) -> bool {
+    attempt
+        .as_ref()
+        .is_err_and(|err| !is_permanent_model_failure(err))
+}
+
+/// Returns `true` when a model load failure is a mistake in the Spicepod, which no retry
+/// can clear. A Spicepod change loads the model again.
+fn is_permanent_model_failure(err: &Error) -> bool {
+    match err {
+        Error::ReferencedPathDoesNotExist { .. } => true,
+        Error::FailedToLoadLLM { source, .. } => {
+            model_error(source.as_ref()).is_some_and(llms::chat::Error::is_configuration_error)
+        }
+    }
+}
+
+/// The model error a load failure wraps, directly or in [`crate::Error::UnableToInitializeLlm`].
+fn model_error<'a>(
+    source: &'a (dyn std::error::Error + Send + Sync + 'static),
+) -> Option<&'a llms::chat::Error> {
+    match source.downcast_ref::<crate::Error>() {
+        Some(crate::Error::UnableToInitializeLlm { source }) => source.downcast_ref(),
+        _ => source.downcast_ref(),
     }
 }
 
@@ -320,4 +413,126 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "models"))]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use app::AppBuilder;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    /// An `OpenAI` provider that refuses every request, as an account without credits
+    /// does, until `accepting` is set.
+    #[derive(Default)]
+    struct Provider {
+        accepting: AtomicBool,
+        requests: AtomicUsize,
+    }
+
+    async fn chat(State(provider): State<Arc<Provider>>) -> Response {
+        provider.requests.fetch_add(1, Ordering::SeqCst);
+        if !provider.accepting.load(Ordering::SeqCst) {
+            let refusal = json!({"error": {"message": "You exceeded your current quota.", "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}});
+            return (StatusCode::FORBIDDEN, Json(refusal)).into_response();
+        }
+        Json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))
+        .into_response()
+    }
+
+    /// Starts `provider` and returns the model served by it.
+    async fn model_served_by(provider: &Arc<Provider>) -> SpicepodModel {
+        let routes = Router::new()
+            .route("/v1/chat/completions", post(chat))
+            .with_state(Arc::clone(provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        tokio::spawn(async move { axum::serve(listener, routes).await });
+
+        let mut model = SpicepodModel::new("openai:gpt-4o-mini", "flaky");
+        for (key, value) in [
+            ("endpoint", format!("http://{address}/v1")),
+            ("openai_api_key", "test-key".to_string()),
+        ] {
+            model.params.insert(key.to_string(), Value::String(value));
+        }
+        model
+    }
+
+    async fn runtime_with(model: SpicepodModel) -> Arc<Runtime> {
+        let app = AppBuilder::new("model_retry").with_model(model).build();
+        Arc::new(Runtime::builder().with_app(app).build().await)
+    }
+
+    #[tokio::test]
+    async fn a_model_its_provider_refused_loads_once_the_provider_accepts_it() {
+        let provider = Arc::new(Provider::default());
+        let rt = runtime_with(model_served_by(&provider).await).await;
+
+        Arc::clone(&rt).load_models().await;
+        let status = rt.status.get_model_status("flaky");
+        assert!(
+            matches!(&status, Some(status::ComponentStatus::Error(Some(message))) if message.contains("You exceeded your current quota.")),
+            "the refused load must report the provider's reason, got {status:?}"
+        );
+        assert!(!rt.status.is_ready());
+
+        provider.accepting.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = rt.status.get_model_status("flaky");
+            if matches!(status, Some(status::ComponentStatus::Ready)) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the model never loaded after the provider accepted it: status {status:?}, {} provider requests",
+                provider.requests.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(rt.status.is_ready());
+        assert!(rt.completion_llms().read().await.contains_key("flaky"));
+    }
+
+    /// The error each load attempt returns decides whether it is retried: a provider's
+    /// refusal is, a Spicepod mistake is not.
+    #[tokio::test]
+    async fn only_a_spicepod_mistake_is_permanent() {
+        let provider = Arc::new(Provider::default());
+        let refused_model = model_served_by(&provider).await;
+        let unknown_source = SpicepodModel::new("not_a_provider:model", "unknown");
+        let rt = runtime_with(refused_model.clone()).await;
+
+        let refused = rt
+            .try_load_model(&refused_model)
+            .await
+            .expect_err("the provider refuses");
+        assert!(!is_permanent_model_failure(&refused), "{refused}");
+
+        let unknown = rt
+            .try_load_model(&unknown_source)
+            .await
+            .expect_err("no such provider");
+        assert!(is_permanent_model_failure(&unknown), "{unknown}");
+    }
 }
