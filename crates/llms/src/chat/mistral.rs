@@ -593,6 +593,15 @@ impl MistralLlama {
         }))
     }
 
+    /// The most tokens a completion may generate. `max_tokens` is the deprecated spelling
+    /// most clients still send; `max_completion_tokens` wins when both are set.
+    #[expect(deprecated)]
+    fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
+        req.max_completion_tokens
+            .or(req.max_tokens)
+            .map(|limit| limit as usize)
+    }
+
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
     ///
     /// `tool_choice` is converted by the caller ([`convert_tool_choice`]) so a choice this
@@ -602,6 +611,7 @@ impl MistralLlama {
         req: CreateChatCompletionRequest,
         tool_choice: Option<ToolChoice>,
     ) -> Result<Receiver<MistralResponse>> {
+        let max_len = Self::completion_limit(&req);
         let message = RequestMessage::Chat {
             messages: req
                 .messages
@@ -627,7 +637,7 @@ impl MistralLlama {
                 StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
                 StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
-            max_len: req.max_completion_tokens.map(|x| x as usize),
+            max_len,
             logits_bias: None,
             n_choices: req.n.unwrap_or(1) as usize,
             dry_params: None,
@@ -1128,6 +1138,36 @@ fn parse_tool_call_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_tokens_limits_the_completion() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512
+        }));
+        assert_eq!(MistralLlama::completion_limit(&req), Some(512));
+    }
+
+    #[test]
+    fn max_completion_tokens_wins_when_both_are_set() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512,
+            "max_completion_tokens": 2048
+        }));
+        assert_eq!(MistralLlama::completion_limit(&req), Some(2048));
+    }
+
+    #[test]
+    fn no_limit_is_invented_when_neither_is_set() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(MistralLlama::completion_limit(&req), None);
+    }
 
     fn choice(json: serde_json::Value) -> ChatCompletionToolChoiceOption {
         serde_json::from_value(json).expect("tool_choice should deserialize")
