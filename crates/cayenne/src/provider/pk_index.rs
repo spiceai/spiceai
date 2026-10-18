@@ -3133,9 +3133,10 @@ mod tests {
     /// that only ever held other locations is not walked.
     #[test]
     fn a_relabel_finds_an_inlined_entry_from_every_write_path() {
-        let paths: [(&str, fn(&mut CachedPkKeyset, &super::OwnedRow)); 6] = [
+        type WritePath = fn(&mut CachedPkKeyset, &super::OwnedRow);
+        let paths: [(&str, WritePath); 6] = [
             ("insert", |keyset, row| {
-                keyset.insert(row.clone(), RowLocation::Inlined)
+                keyset.insert(row.clone(), RowLocation::Inlined);
             }),
             ("insert_with_digest over an entry", |keyset, row| {
                 keyset.insert(row.clone(), RowLocation::MEM_TIER);

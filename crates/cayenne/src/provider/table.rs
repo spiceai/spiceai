@@ -53912,7 +53912,7 @@ mod tests {
             .expect("checkpoint keys 7 and 9 into a file");
         apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
 
-        let scanned: Arc<ParkingMutex<Option<Vec<(i64, i64)>>>> = Arc::new(ParkingMutex::new(None));
+        let scanned = Arc::new(ParkingMutex::new(None::<Vec<(i64, i64)>>));
         {
             let provider_in_hook = provider.clone_for_write();
             let ctx_in_hook = ctx.clone();
@@ -57231,15 +57231,16 @@ mod tests {
         const CHECKPOINTS: usize = 5;
         // Pseudo-random hex per key, so the file sizes the bake shards by stay large.
         let pad = |id: i64| {
+            use std::fmt::Write as _;
             let mut x = u64::try_from(id).expect("non-negative key") ^ 0x9E37_79B9_7F4A_7C15;
-            (0..6)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    format!("{x:016x}{:016x}", x.rotate_left(29))
-                })
-                .collect::<String>()
+            let mut hex = String::with_capacity(6 * 32);
+            for _ in 0..6 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                write!(hex, "{x:016x}{:016x}", x.rotate_left(29)).expect("write to a String");
+            }
+            hex
         };
 
         let schema = Arc::new(Schema::new(vec![
@@ -62188,8 +62189,7 @@ mod tests {
             "precondition: key 0 hidden by its tombstone before the bake"
         );
 
-        let scanned_in_window: Arc<ParkingMutex<Option<Vec<(i64, i64)>>>> =
-            Arc::new(ParkingMutex::new(None));
+        let scanned_in_window = Arc::new(ParkingMutex::new(None::<Vec<(i64, i64)>>));
         {
             let provider_in_hook = provider.clone_for_write();
             let ctx_in_hook = ctx.clone();
@@ -62251,8 +62251,7 @@ mod tests {
         .await;
         install_int64_deletes(&provider, &[(0, 15)]);
 
-        let pre_swap: Arc<ParkingMutex<Option<Arc<HashMap<String, i64>>>>> =
-            Arc::new(ParkingMutex::new(None));
+        let pre_swap = Arc::new(ParkingMutex::new(None::<Arc<HashMap<String, i64>>>));
         {
             let provider_in_hook = provider.clone_for_write();
             let pre_swap = Arc::clone(&pre_swap);

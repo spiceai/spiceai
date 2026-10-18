@@ -2044,9 +2044,9 @@ mod tests {
                 let mut adds = Vec::new();
                 for _ in 0..count {
                     let key = (rng() as i64).rem_euclid(key_space);
-                    if rng() % 3 == 0 {
+                    if rng().is_multiple_of(3) {
                         // Upsert conflict, sometimes at an old delete sequence.
-                        let delete = if *seq > 5 && rng() % 4 == 0 {
+                        let delete = if *seq > 5 && rng().is_multiple_of(4) {
                             1 + (rng() as i64).rem_euclid(*seq)
                         } else {
                             *seq += 1;
@@ -2088,11 +2088,9 @@ mod tests {
             // spans several runs that later folds can merge among themselves.
             for burst in 0..(rng() % 3) {
                 let first = 1_000 + 100 * burst as i64;
-                let adds: Vec<_> = (0..100_i64)
-                    .map(|i| (first + i, seq + 1 + i, SEQUENCE_ABSENT))
-                    .collect();
+                let adds = (0..100_i64).map(|i| (first + i, seq + 1 + i, SEQUENCE_ABSENT));
+                idx = idx.extend(adds, hash);
                 seq += 100;
-                idx = idx.extend(adds.into_iter(), hash);
             }
 
             // Take the prefix; the model is every write so far.
@@ -2287,9 +2285,11 @@ mod tests {
     #[test]
     fn a_spliced_index_forgets_its_pruned_keys_in_its_bloom() {
         let hash = |pk: &i64| hash_key_i64(*pk);
-        let deleted: Vec<(i64, i64)> = (0..2_000_i64).map(|key| (key, key + 1)).collect();
-        let index: LayeredRuns<i64, DeletionIndexHasher> =
-            LayeredRuns::from_iters(deleted.into_iter(), std::iter::empty(), hash);
+        let index: LayeredRuns<i64, DeletionIndexHasher> = LayeredRuns::from_iters(
+            (0..2_000_i32).map(|key| (i64::from(key), i64::from(key) + 1)),
+            std::iter::empty(),
+            hash,
+        );
         let index = index.extend(
             (10_000..10_010_i64).map(|key| (key, 5_000 + key, SEQUENCE_ABSENT)),
             hash,
