@@ -31,6 +31,9 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Held by a scan of a pinned copy until the scan's output streams are dropped.
 pub type CopyLease = Arc<dyn Any + Send + Sync>;
 
+/// How often a stopped watcher's copies are checked for scans that still read them.
+const RELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Loads and releases the local copies of a dataset's pinned snapshot.
 #[async_trait]
 pub trait PinnedCopyLoader: Send + Sync {
@@ -58,6 +61,30 @@ struct RetiredCopy {
     snapshot_id: u64,
     provider: Arc<dyn TableProvider>,
     lease: Weak<()>,
+}
+
+impl RetiredCopy {
+    fn of(copy: &PinnedCopy) -> Self {
+        Self {
+            snapshot_id: copy.snapshot_id,
+            provider: Arc::clone(&copy.provider),
+            lease: Arc::downgrade(&copy.lease),
+        }
+    }
+}
+
+/// Releases each copy no scan holds, and returns the others.
+async fn release_unread(
+    loader: &dyn PinnedCopyLoader,
+    copies: Vec<RetiredCopy>,
+) -> Vec<RetiredCopy> {
+    let (unread, read) = copies
+        .into_iter()
+        .partition::<Vec<_>, _>(|copy| copy.lease.strong_count() == 0);
+    for copy in unread {
+        loader.release(copy.snapshot_id).await;
+    }
+    read
 }
 
 /// The copy of the pinned snapshot an accelerated table serves, when its dataset is
@@ -136,13 +163,8 @@ impl PinWatcher {
     /// snapshot cannot be loaded. Then releases each retired copy no scan reads.
     pub async fn check(&mut self) {
         self.follow_pin().await;
-        let (unread, read) = std::mem::take(&mut self.retired)
-            .into_iter()
-            .partition::<Vec<_>, _>(|copy| copy.lease.strong_count() == 0);
-        self.retired = read;
-        for copy in unread {
-            self.loader.release(copy.snapshot_id).await;
-        }
+        self.retired =
+            release_unread(self.loader.as_ref(), std::mem::take(&mut self.retired)).await;
     }
 
     async fn follow_pin(&mut self) {
@@ -226,11 +248,7 @@ impl PinWatcher {
     }
 
     fn retire(&mut self, copy: &PinnedCopy) {
-        self.retired.push(RetiredCopy {
-            snapshot_id: copy.snapshot_id,
-            provider: Arc::clone(&copy.provider),
-            lease: Arc::downgrade(&copy.lease),
-        });
+        self.retired.push(RetiredCopy::of(copy));
     }
 
     /// Checks at once, then again each time `wake` is notified and, when `period` is
@@ -248,6 +266,31 @@ impl PinWatcher {
                 None => wake.notified().await,
             }
         }
+    }
+}
+
+impl Drop for PinWatcher {
+    /// Hands a stopped watcher's copies, such as those of a table a reload removed, to a
+    /// task that releases each once its table no longer serves it and no scan reads it.
+    fn drop(&mut self) {
+        let mut copies = std::mem::take(&mut self.retired);
+        copies.extend(self.serving.current().as_deref().map(RetiredCopy::of));
+        if copies.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let loader = Arc::clone(&self.loader);
+        runtime.spawn(async move {
+            loop {
+                copies = release_unread(loader.as_ref(), copies).await;
+                if copies.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(RELEASE_CHECK_INTERVAL).await;
+            }
+        });
     }
 }
 
@@ -383,6 +426,32 @@ mod tests {
         drop(scan);
         watcher.check().await;
         assert_eq!(*loader.released.lock(), vec![41]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_watcher_releases_each_copy_once_its_table_and_scans_are_done() {
+        let loader = Arc::new(FakeLoader::default());
+        let (mut watcher, serving, _) = watcher(&loader);
+        *loader.pinned.lock() = Some(41);
+        watcher.check().await;
+        let (_, scan) = serving.provider().expect("served");
+        *loader.pinned.lock() = Some(40);
+        watcher.check().await;
+        drop(watcher);
+
+        tokio::time::sleep(RELEASE_CHECK_INTERVAL * 2).await;
+        assert!(
+            loader.released.lock().is_empty(),
+            "a scan reads 41 and the table serves 40"
+        );
+
+        drop(scan);
+        tokio::time::sleep(RELEASE_CHECK_INTERVAL * 2).await;
+        assert_eq!(*loader.released.lock(), vec![41]);
+
+        drop(serving);
+        tokio::time::sleep(RELEASE_CHECK_INTERVAL * 2).await;
+        assert_eq!(*loader.released.lock(), vec![41, 40]);
     }
 
     #[tokio::test]

@@ -1502,11 +1502,10 @@ impl Builder {
                             else {
                                 return;
                             };
-                            if let Err(e) =
-                                caching.invalidate_for_refresh(dataset_name.clone()).await
+                            if let Err(e) = caching.invalidate_for_table(dataset_name.clone()).await
                             {
                                 tracing::warn!(
-                                    "Failed to invalidate cached query plans and search results for dataset {dataset_name} after it switched between its pinned snapshot and its live data, so they may reflect the other data until they expire: {e}"
+                                    "Failed to invalidate cached query results, plans and search results for dataset {dataset_name} after it switched between its pinned snapshot and its live data, so they may reflect the other data until they expire: {e}"
                                 );
                             }
                         })

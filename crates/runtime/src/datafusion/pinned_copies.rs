@@ -18,7 +18,8 @@ limitations under the License.
 //! its source serves while the dataset is pinned.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
@@ -35,8 +36,14 @@ use crate::component::dataset::Dataset;
 use crate::dataaccelerator::{AcceleratorEngineRegistry, DataAccelerator};
 use crate::secrets::Secrets;
 
+/// Names this process's copy directories. Each table that serves a dataset's pin has
+/// its own, so a table that replaces another, as a Spicepod reload does, never deletes
+/// a copy the other's queries still read.
+static PROCESS: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Copies of `dataset`'s pinned snapshots, each in its own directory under
-/// `<spice data>/pinned/<dataset>/`.
+/// `<spice data>/pinned/<dataset>/<generation>/`, where the generation is this table's.
 pub(super) struct PinnedSnapshotCopies {
     dataset: Dataset,
     accelerator: Arc<dyn DataAccelerator>,
@@ -49,7 +56,7 @@ pub(super) struct PinnedSnapshotCopies {
     constraints: Option<Constraints>,
     secrets: Arc<RwLock<Secrets>>,
     ctx: Arc<SessionContext>,
-    base_dir: PathBuf,
+    generation_dir: PathBuf,
 }
 
 impl PinnedSnapshotCopies {
@@ -67,16 +74,21 @@ impl PinnedSnapshotCopies {
         secrets: Arc<RwLock<Secrets>>,
         ctx: Arc<SessionContext>,
     ) -> Option<Self> {
-        let base_dir = PathBuf::from(data_accelerator_api::spice_data_base_path())
+        let dataset_dir = PathBuf::from(data_accelerator_api::spice_data_base_path())
             .join("pinned")
             .join(dir_name(&dataset.name.to_string()));
+        let generation_dir = dataset_dir.join(format!(
+            "{}-{}",
+            *PROCESS,
+            NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+        ));
         // Probes that the engine can relocate the acceleration. Cayenne records the
         // probe's directory, and `release_relocated` forgets it again.
-        let probe = accelerator.relocated(dataset, &base_dir)?;
+        let probe = accelerator.relocated(dataset, &generation_dir)?;
         let mut probe_dataset = dataset.clone();
         probe_dataset.acceleration = Some(probe);
         accelerator.release_relocated(&probe_dataset).await;
-        remove_dir(&base_dir).await;
+        remove_other_processes_copies(&dataset_dir, &PROCESS).await;
         Some(Self {
             dataset: dataset.clone(),
             accelerator,
@@ -87,12 +99,12 @@ impl PinnedSnapshotCopies {
             constraints,
             secrets,
             ctx,
-            base_dir,
+            generation_dir,
         })
     }
 
     fn copy_dir(&self, snapshot_id: u64) -> PathBuf {
-        self.base_dir.join(snapshot_id.to_string())
+        self.generation_dir.join(snapshot_id.to_string())
     }
 
     /// The dataset as the copy of `snapshot_id` holds it: the same settings, with its
@@ -160,9 +172,6 @@ impl PinnedCopyLoader for PinnedSnapshotCopies {
     }
 
     async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, BoxError> {
-        // A copy of the same snapshot left by a table this one replaced may still be
-        // open in the engine.
-        self.release(snapshot_id).await;
         let copy = self
             .copy_dataset(snapshot_id)
             .ok_or("its acceleration engine cannot hold a second copy")?;
@@ -194,6 +203,26 @@ impl PinnedCopyLoader for PinnedSnapshotCopies {
             self.accelerator.release_relocated(&copy).await;
         }
         remove_dir(&self.copy_dir(snapshot_id)).await;
+    }
+}
+
+impl Drop for PinnedSnapshotCopies {
+    /// Deletes this table's directory when it is empty: every copy in it was released.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.generation_dir);
+    }
+}
+
+/// Deletes the copies under `dataset_dir` that a process other than `process` left.
+async fn remove_other_processes_copies(dataset_dir: &Path, process: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(dataset_dir).await else {
+        return;
+    };
+    let prefix = format!("{process}-");
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            remove_dir(&entry.path()).await;
+        }
     }
 }
 
@@ -270,6 +299,26 @@ mod tests {
         assert_eq!(dir_name("."), "-2e");
         assert_ne!(dir_name("a/b"), dir_name("a_b"));
         assert_ne!(dir_name("a/b"), dir_name("a-2fb"));
+    }
+
+    #[tokio::test]
+    async fn only_the_copies_other_processes_left_are_deleted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for copy in ["earlier-0/41", "this-0/41", "this-1/40", "41"] {
+            tokio::fs::create_dir_all(dir.path().join(copy))
+                .await
+                .expect("created");
+        }
+        remove_other_processes_copies(dir.path(), "this").await;
+        let mut left = std::fs::read_dir(dir.path())
+            .expect("listed")
+            .map(|entry| {
+                let name = entry.expect("entry").file_name();
+                name.into_string().expect("UTF-8 name")
+            })
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(left, ["this-0", "this-1"]);
     }
 
     #[test]
