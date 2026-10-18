@@ -1309,7 +1309,8 @@ impl RefreshTask {
                 .insert_into(record_batch_stream, overwrite, &write)
                 .await
         };
-        // The write is CPU-heavy (sort, encode); keep it off the main runtime, which serves queries.
+        // The write is CPU-heavy (sort, encode): run it on the dedicated refresh runtime, when
+        // provided, to keep it off the main runtime, which serves queries.
         let result = match self.cpu_runtime.clone() {
             Some(refresh_runtime) => {
                 let request_context = RequestContext::current(AsyncMarker::new().await);
