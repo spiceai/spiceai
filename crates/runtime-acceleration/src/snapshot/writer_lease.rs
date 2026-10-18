@@ -86,9 +86,9 @@ const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 pub(super) struct WriterLease {
     lease: Lease,
     reported: Arc<Mutex<Reported>>,
-    /// Set once the lease is released on shutdown. Held across acquisition and
+    /// Set once this instance resigns the lease. Held across acquisition and
     /// release so the two never interleave.
-    released_on_shutdown: Arc<tokio::sync::Mutex<bool>>,
+    resigned: Arc<tokio::sync::Mutex<bool>>,
 }
 
 #[derive(Default)]
@@ -115,7 +115,7 @@ impl WriterLease {
         Self {
             lease: Lease::new(holder, lease_duration(snapshot_interval)),
             reported: Arc::default(),
-            released_on_shutdown: Arc::default(),
+            resigned: Arc::default(),
         }
     }
 
@@ -239,8 +239,8 @@ impl SnapshotManager {
     /// Takes or renews the dataset's snapshot writer lease, and says whether
     /// this instance creates the snapshot.
     pub(super) async fn hold_writer_lease(&self) -> Result<WriterPermit, SnapshotUploadError> {
-        let released_on_shutdown = self.writer_lease.released_on_shutdown.lock().await;
-        if *released_on_shutdown {
+        let resigned = self.writer_lease.resigned.lock().await;
+        if *resigned {
             return Ok(WriterPermit::Standby);
         }
         let role = self.acquire_writer_lease().await?;
@@ -269,15 +269,15 @@ impl SnapshotManager {
 
     /// Releases the writer lease and stops re-acquiring it, so another instance
     /// takes over at its next snapshot instead of waiting for the lease to lapse.
-    pub async fn release_writer_lease_on_shutdown(&self) {
+    pub async fn resign_writer_lease(&self) {
         match self.release_lease(true).await {
             Ok(false) => {}
             Ok(true) => tracing::info!(
-                "Released the snapshot writer lease of dataset '{}' on shutdown, so another instance can take over its snapshots",
+                "Released the snapshot writer lease of dataset '{}', so another instance can take over its snapshots",
                 self.dataset_name
             ),
             Err(error) => tracing::warn!(
-                "Failed to release the snapshot writer lease of dataset '{}' on shutdown, so another instance takes over its snapshots only after the lease lapses ({}). Cause: {error}",
+                "Failed to release the snapshot writer lease of dataset '{}', so another instance takes over its snapshots only after the lease lapses ({}). Cause: {error}",
                 self.dataset_name,
                 format_duration(self.writer_lease.lease.duration()),
             ),
@@ -285,12 +285,9 @@ impl SnapshotManager {
     }
 
     /// Releases the lease after any acquisition in flight.
-    async fn release_lease(
-        &self,
-        on_shutdown: bool,
-    ) -> Result<bool, LeaseError<ConditionalWriteError>> {
-        let mut released_on_shutdown = self.writer_lease.released_on_shutdown.lock().await;
-        *released_on_shutdown |= on_shutdown;
+    async fn release_lease(&self, resign: bool) -> Result<bool, LeaseError<ConditionalWriteError>> {
+        let mut resigned = self.writer_lease.resigned.lock().await;
+        *resigned |= resign;
         self.writer_lease
             .lease
             .release(&RetryingLeaseIo(self), &self.writer_lease_path())
@@ -690,15 +687,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lease_released_on_shutdown_passes_at_once_and_is_not_taken_back() {
+    async fn a_resigned_lease_passes_at_once_and_is_not_taken_back() {
         let store = memory();
         let a = manager(&store, instance("host-a"));
         let b = manager(&store, instance("host-b"));
         a.hold_writer_lease().await.expect("a takes the lease");
 
-        a.release_writer_lease_on_shutdown().await;
+        a.resign_writer_lease().await;
         assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
-        // Stands by instead of renewing the released lease.
+        // Stands by instead of renewing the resigned lease.
         assert!(matches!(
             a.hold_writer_lease().await.expect("a reads its state"),
             WriterPermit::Standby
@@ -710,10 +707,10 @@ mod tests {
         ));
     }
 
-    /// Regression test: an acquisition in flight at shutdown must not renew the
-    /// released lease.
+    /// Regression test: an acquisition in flight when the lease is resigned must
+    /// not renew it.
     #[tokio::test]
-    async fn a_release_on_shutdown_waits_for_an_acquisition_in_flight() {
+    async fn resigning_waits_for_an_acquisition_in_flight() {
         let store = Arc::new(TestStore::over(Arc::new(InMemory::new())));
         let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
         let a = Arc::new(manager(&shared, instance("host-a")));
@@ -731,7 +728,7 @@ mod tests {
 
         let releasing = tokio::spawn({
             let a = Arc::clone(&a);
-            async move { a.release_writer_lease_on_shutdown().await }
+            async move { a.resign_writer_lease().await }
         });
         // Let a release that does not wait land first.
         tokio::time::sleep(Duration::from_millis(200)).await;

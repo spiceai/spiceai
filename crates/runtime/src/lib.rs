@@ -2337,12 +2337,12 @@ impl Runtime {
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
         //
-        // Snapshot writer leases are released alongside, so a replacement instance
+        // Snapshot writer leases are resigned alongside, so a replacement instance
         // need not wait for them to lapse.
         let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
-            tokio::time::timeout(shutdown_timeout, self.df.release_snapshot_writer_leases()),
+            tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
         );
         if leases_released.is_err() {
             tracing::warn!(
