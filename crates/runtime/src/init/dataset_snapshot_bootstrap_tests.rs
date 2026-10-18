@@ -536,9 +536,8 @@ async fn shutdown_releases_the_snapshot_writer_lease() {
 
     let lease = directory.path().join("state/snapshots/leases/orders.json");
     let lease_duration_ms = || async {
-        let contents = tokio::fs::read_to_string(&lease).await.ok()?;
-        let record: serde_json::Value = serde_json::from_str(&contents).ok()?;
-        record.get("lease-duration-ms")?.as_u64()
+        let bytes = tokio::fs::read(&lease).await.ok()?;
+        object_store_occ::lease::LeaseRecord::parse(&bytes).map(|record| record.lease_duration_ms)
     };
     assert!(
         test_framework::utils::wait_until_true(Duration::from_secs(15), || async {

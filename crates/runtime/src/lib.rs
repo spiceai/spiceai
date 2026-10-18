@@ -2290,18 +2290,6 @@ impl Runtime {
             "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
         );
 
-        // Like the CDC slots above, release snapshot writer leases at shutdown
-        // start, so a replacement instance takes over the snapshots at its next
-        // one rather than after the leases lapse.
-        if tokio::time::timeout(shutdown_timeout, self.df.release_snapshot_writer_leases())
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
-            );
-        }
-
         // Stop new Cayenne compaction-runtime passes as soon as shutdown begins.
         // In-flight passes remain counted and are drained below before the
         // dedicated compaction runtime itself can be dropped.
@@ -2348,10 +2336,19 @@ impl Runtime {
         // milliseconds. Waited on alongside the connection drain, under the same
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
-        let (unfinished_sources, _) = tokio::join!(
+        //
+        // Snapshot writer leases are released alongside, so a replacement instance
+        // takes over the snapshots at its next one rather than after they lapse.
+        let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
+            tokio::time::timeout(shutdown_timeout, self.df.release_snapshot_writer_leases()),
         );
+        if leases_released.is_err() {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
+            );
+        }
         if unfinished_sources > 0 {
             tracing::warn!(
                 "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"

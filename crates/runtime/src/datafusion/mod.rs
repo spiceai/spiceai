@@ -1444,9 +1444,11 @@ pub struct DataFusion {
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
-    /// The snapshot managers of datasets that create snapshots, so shutdown can
-    /// release their writer leases.
-    snapshot_writers: ParkingMutex<Vec<Weak<runtime_acceleration::snapshot::SnapshotManager>>>,
+    /// The snapshot manager of each dataset that creates snapshots, so shutdown
+    /// can release their writer leases.
+    snapshot_writers: ParkingMutex<
+        HashMap<ResolvedTableReference, Weak<runtime_acceleration::snapshot::SnapshotManager>>,
+    >,
     /// `sink` datasets waiting for their first write, which is when their schema becomes
     /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
     /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
@@ -4504,11 +4506,10 @@ impl DataFusion {
                     )
                     .await?
                     {
-                        {
-                            let mut writers = self.snapshot_writers.lock();
-                            writers.retain(|writer| writer.strong_count() > 0);
-                            writers.push(Arc::downgrade(&snapshot_config.manager));
-                        }
+                        self.snapshot_writers.lock().insert(
+                            resolve_table_reference(dataset.name.clone()),
+                            Arc::downgrade(&snapshot_config.manager),
+                        );
                         accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                     }
                 } else {
@@ -6735,7 +6736,7 @@ impl DataFusion {
         let writers: Vec<_> = self
             .snapshot_writers
             .lock()
-            .iter()
+            .values()
             .filter_map(Weak::upgrade)
             .collect();
         join_all(

@@ -48,7 +48,6 @@ limitations under the License.
 //! snapshot's lease duration, the publication fence and the log lines.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -87,13 +86,10 @@ const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 pub(super) struct WriterLease {
     lease: Lease,
     reported: Arc<Mutex<Reported>>,
-    /// Set once the instance releases the lease on shutdown, so it does not take
-    /// the lease back before it exits.
-    released_on_shutdown: Arc<AtomicBool>,
-    /// Held while the lease is acquired, so a release on shutdown waits for an
-    /// acquisition already past the shutdown check rather than being overwritten
-    /// by its renewal.
-    acquiring: Arc<tokio::sync::Mutex<()>>,
+    /// Whether the lease was released on shutdown, so the instance does not take
+    /// it back before it exits. Held across each acquisition and release, so a
+    /// release cannot be overwritten by an acquisition already in flight.
+    released_on_shutdown: Arc<tokio::sync::Mutex<bool>>,
 }
 
 #[derive(Default)]
@@ -121,7 +117,6 @@ impl WriterLease {
             lease: Lease::new(holder, lease_duration(snapshot_interval)),
             reported: Arc::default(),
             released_on_shutdown: Arc::default(),
-            acquiring: Arc::default(),
         }
     }
 
@@ -245,12 +240,8 @@ impl SnapshotManager {
     /// Takes or renews the dataset's snapshot writer lease, and says whether
     /// this instance creates the snapshot.
     pub(super) async fn hold_writer_lease(&self) -> Result<WriterPermit, SnapshotUploadError> {
-        let _acquiring = self.writer_lease.acquiring.lock().await;
-        if self
-            .writer_lease
-            .released_on_shutdown
-            .load(Ordering::Acquire)
-        {
+        let released_on_shutdown = self.writer_lease.released_on_shutdown.lock().await;
+        if *released_on_shutdown {
             return Ok(WriterPermit::Standby);
         }
         let role = self.acquire_writer_lease().await?;
@@ -266,12 +257,7 @@ impl SnapshotManager {
     /// its next snapshot. Best effort: a failure leaves the lease to lapse on
     /// its own.
     pub(super) async fn release_writer_lease(&self) {
-        match self
-            .writer_lease
-            .lease
-            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
-            .await
-        {
+        match self.release_lease(false).await {
             Ok(false) => {}
             Ok(true) => {
                 tracing::debug!(dataset = %self.dataset_name, "Released the snapshot writer lease after a failed snapshot");
@@ -287,16 +273,7 @@ impl SnapshotManager {
     /// of waiting for the lease to lapse. A snapshot already being created still
     /// completes; generation fencing refuses it if the new holder publishes first.
     pub async fn release_writer_lease_on_shutdown(&self) {
-        self.writer_lease
-            .released_on_shutdown
-            .store(true, Ordering::Release);
-        let _acquiring = self.writer_lease.acquiring.lock().await;
-        match self
-            .writer_lease
-            .lease
-            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
-            .await
-        {
+        match self.release_lease(true).await {
             Ok(false) => {}
             Ok(true) => tracing::info!(
                 "Released the snapshot writer lease of dataset '{}' on shutdown, so another instance can take over its snapshots",
@@ -308,6 +285,20 @@ impl SnapshotManager {
                 format_duration(self.writer_lease.lease.duration()),
             ),
         }
+    }
+
+    /// Releases the lease once no acquisition is in flight; `on_shutdown` also
+    /// stops this instance taking it back.
+    async fn release_lease(
+        &self,
+        on_shutdown: bool,
+    ) -> Result<bool, LeaseError<ConditionalWriteError>> {
+        let mut released_on_shutdown = self.writer_lease.released_on_shutdown.lock().await;
+        *released_on_shutdown |= on_shutdown;
+        self.writer_lease
+            .lease
+            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
+            .await
     }
 
     async fn acquire_writer_lease(&self) -> Result<Role, SnapshotUploadError> {
@@ -743,17 +734,15 @@ mod tests {
         });
         reached.notified().await;
 
-        let mut releasing = tokio::spawn({
+        let releasing = tokio::spawn({
             let a = Arc::clone(&a);
             async move { a.release_writer_lease_on_shutdown().await }
         });
         // Give a release that does not wait for the acquisition time to land first.
-        let _ = tokio::time::timeout(Duration::from_millis(200), &mut releasing).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         resume.notify_one();
         renewing.await.expect("renewal task").expect("a renews");
-        if !releasing.is_finished() {
-            releasing.await.expect("release task");
-        }
+        releasing.await.expect("release task");
 
         assert_eq!(stored_record(&shared, &a).await.lease_duration_ms, 0);
         assert!(matches!(
