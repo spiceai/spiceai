@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1707b349584845e802a703adca1e71f544defc5f` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `b2a63b9d8ae44a6b65836110ab76602defea6b3e` | `lukim/spiceai-v0.9.4` (TEMPORARY: spiceai/mistral.rs#47) |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `ea48c06b75b5314ad4a679adfc7bee021ceb68aa` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
@@ -620,14 +620,14 @@ Upstream [benbrandt/text-splitter](https://github.com/benbrandt/text-splitter).
 Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) and
 [huggingface/text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference).
 
-The `mistral.rs` fork's base is upstream tag `v0.9.4` (`440093545`), and it carries
-29 commits on its first-parent line. The first replays the Spice patches from the
-`v0.9.0` line in one commit: `glm-dsa` GGUF loading, the i-quant MoE fallback, ring
-tensor parallelism past two ranks, multi-node NCCL on the GGUF path, and the
-`spiceai/candle` pin. One is an `-s ours` merge of the old `spiceai` branch, which
-records it as an ancestor without changing the tree. The rest add the GGUF graphs
-that serve Qwen3.8-Flash-Next (`qwen4exp`), DeepSeek-V4.1-Flash (`deepseek41`) and
-GLM-5.3-Flash (`glm5-next`), and the fixes found serving them on a 3-node ring.
+The `mistral.rs` fork's tree is upstream tag `v0.9.4` (`440093545`) plus the Spice
+patches, landed on `spiceai` as one squash commit (`ea48c06b`, spiceai/mistral.rs#47),
+so `git diff v0.9.4 ea48c06b` is the whole fork delta. The pull request built it in
+32 commits. The first replays the Spice patches from the `v0.9.0` line: `glm-dsa`
+GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
+multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
+graphs that serve Qwen3.8-Flash-Next (`qwen4exp`), DeepSeek-V4.1-Flash (`deepseek41`)
+and GLM-5.3-Flash (`glm5-next`), and the fixes found serving them on a 3-node ring.
 
 Two rows this table used to carry — assistant messages with `tool_calls` in the
 chat template, and `tracing_subscriber.init()` removed from the loaders — are gone

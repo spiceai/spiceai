@@ -50,8 +50,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "b2a63b9d8ae44a6b65836110ab76602defea6b3e", optional = true } # branch: lukim/spiceai-v0.9.4 (mistral.rs v0.9.4 + Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash GGUF; refresh to merged SHA)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "b2a63b9d8ae44a6b65836110ab76602defea6b3e", package = "mistralrs-core", optional = true } # branch: lukim/spiceai-v0.9.4 (mistral.rs v0.9.4 + Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash GGUF; refresh to merged SHA)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "ea48c06b75b5314ad4a679adfc7bee021ceb68aa", optional = true } # branch: spiceai (spiceai/mistral.rs#47: mistral.rs v0.9.4 + Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash GGUF)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "ea48c06b75b5314ad4a679adfc7bee021ceb68aa", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#47: mistral.rs v0.9.4 + Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash, GLM-5.3-Flash GGUF)
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
