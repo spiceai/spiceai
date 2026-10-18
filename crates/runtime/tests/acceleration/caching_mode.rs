@@ -48,6 +48,12 @@ limitations under the License.
 
 use app::AppBuilder;
 use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt16Array};
+use axum::{
+    Router,
+    extract::RawQuery,
+    http::{StatusCode, header},
+    routing::get,
+};
 use datafusion::prelude::*;
 use runtime::Runtime;
 use spicepod::{
@@ -56,11 +62,82 @@ use spicepod::{
     param::Params,
 };
 use std::sync::Arc;
+use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
     configure_test_datafusion, init_tracing,
     utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
+
+/// A search term the local origin answers with an empty result list.
+const NO_MATCH_QUERY_TERM: &str = "xyznonexistent123456";
+
+/// A local stand-in for the `TVmaze` people-search API (`/search/people?q=...`)
+/// these tests were written against, so they exercise caching without reaching
+/// a public service whose outages failed every test in this file at once.
+///
+/// It answers a search for `NO_MATCH_QUERY_TERM` with `[]`, every other search
+/// with one match named after the query, and any other path with the 404 body
+/// `TVmaze` sends. The server stops when the returned value is dropped.
+struct PeopleSearchOrigin {
+    url: String,
+    _shutdown: oneshot::Sender<()>,
+}
+
+async fn start_people_search_origin() -> PeopleSearchOrigin {
+    let app = Router::new()
+        .route(
+            "/search/people",
+            get(|RawQuery(query): RawQuery| async move {
+                let term = query
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("q="))
+                    .unwrap_or_default()
+                    .to_string();
+                let body = if term == NO_MATCH_QUERY_TERM {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{
+                        "score": 0.9,
+                        "person": { "id": 1, "name": term },
+                    }])
+                };
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body.to_string(),
+                )
+            }),
+        )
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"name":"Not Found","message":"Page not found.","code":0,"status":404}"#,
+            )
+        });
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind people-search origin listener");
+    let addr = listener
+        .local_addr()
+        .expect("people-search origin local_addr");
+    let (shutdown, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap_or_default();
+    });
+    PeopleSearchOrigin {
+        url: format!("http://{addr}"),
+        _shutdown: shutdown,
+    }
+}
 
 /// Test that caching mode properly propagates filters to the HTTP connector on cache miss.
 /// This verifies that when a query with filters hits an empty cache, the filters are
@@ -77,7 +154,8 @@ async fn test_caching_mode_filter_propagation() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -209,7 +287,8 @@ async fn test_caching_mode_multi_filter_limitation() -> Result<(), anyhow::Error
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -423,7 +502,8 @@ async fn test_caching_mode_multi_filter_ideal() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -641,7 +721,8 @@ async fn test_caching_mode_multi_filter_cayenne() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode using Cayenne
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -794,7 +875,8 @@ async fn test_caching_mode_with_sql_results_cache() -> Result<(), anyhow::Error>
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -867,7 +949,8 @@ async fn test_caching_mode_no_filters() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![(
                     "allowed_request_paths".to_string(),
@@ -984,7 +1067,8 @@ async fn test_caching_mode_duplicate_queries() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1060,7 +1144,8 @@ async fn test_caching_mode_different_projections() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1200,7 +1285,8 @@ async fn test_caching_mode_sql_cache_interaction() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1274,7 +1360,8 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1325,7 +1412,7 @@ async fn test_caching_mode_empty_results() -> Result<(), anyhow::Error> {
                 .table("tvmaze")
                 .await?
                 .filter(col("request_path").eq(lit("/search/people")))?
-                .filter(col("request_query").eq(lit("q=xyznonexistent123456")))?
+                .filter(col("request_query").eq(lit(format!("q={NO_MATCH_QUERY_TERM}"))))?
                 .limit(0, Some(1))?;
 
             // HTTP connector may return error for empty results, which is acceptable
@@ -1363,7 +1450,8 @@ async fn test_caching_mode_background_refresh_on_miss() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1514,7 +1602,8 @@ async fn test_caching_mode_background_refresh_on_stale() -> Result<(), anyhow::E
 
     test_request_context()
         .scope(async {
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1706,7 +1795,8 @@ async fn test_caching_mode_interval_refresh_with_retention() -> Result<(), anyho
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode, short TTL, short refresh interval, and retention
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -1865,7 +1955,8 @@ async fn test_localpod_caching_synchronization() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create parent HTTP dataset with file-mode DuckDB caching
-            let mut parent_dataset = Dataset::new("https://api.tvmaze.com", "tvmaze_file");
+            let origin = start_people_search_origin().await;
+            let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_file");
             parent_dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2015,7 +2106,8 @@ async fn test_localpod_caching_initialization_from_existing_parent_data()
             eprintln!("PHASE 1: Setting up parent dataset and populating with data...");
 
             // Create parent HTTP dataset with DuckDB caching (memory mode for test)
-            let mut parent_dataset = Dataset::new("https://api.tvmaze.com", "tvmaze_parent");
+            let origin = start_people_search_origin().await;
+            let mut parent_dataset = Dataset::new(&origin.url, "tvmaze_parent");
             parent_dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2229,7 +2321,8 @@ async fn test_caching_mode_query_specific_columns() -> Result<(), anyhow::Error>
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2359,7 +2452,8 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
@@ -2454,7 +2548,8 @@ async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Err
     test_request_context()
         .scope(async {
             // Create HTTP dataset with caching mode
-            let mut dataset = Dataset::new("https://api.tvmaze.com", "tvmaze");
+            let origin = start_people_search_origin().await;
+            let mut dataset = Dataset::new(&origin.url, "tvmaze");
             dataset.params = Some(Params::from_string_map(
                 vec![
                     (
