@@ -930,43 +930,78 @@ fn unreported_retired_param_warnings<S: std::hash::BuildHasher>(
 /// Default `WithinLag` for `refresh_mode: changes`, in milliseconds.
 const DEFAULT_CHANGES_SCAN_VIEW_LAG_MS: u64 = 1000;
 
-/// Process-wide `WithinLag` for **read-only** `refresh_mode: changes`, from
-/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` (default [`DEFAULT_CHANGES_SCAN_VIEW_LAG_MS`];
-/// `0` recaptures every scan). Cached so the env var is parsed — and an invalid
-/// value warned — once per process. Writable `changes` datasets (write-back)
-/// do not use this lag — see [`scan_view_reuse_for`].
-fn changes_scan_view_lag() -> Duration {
-    static CHANGES_SCAN_VIEW_LAG: LazyLock<Duration> = LazyLock::new(|| {
-        let ms = match std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS") {
-            Err(_) => DEFAULT_CHANGES_SCAN_VIEW_LAG_MS,
-            // A set-but-invalid value is a misconfiguration; warn (don't silently
-            // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
-            // escapes control characters so untrusted input cannot inject log lines.
-            Ok(raw) => raw.trim().parse::<u64>().unwrap_or_else(|_| {
-                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms.");
-                DEFAULT_CHANGES_SCAN_VIEW_LAG_MS
-            }),
-        };
-        Duration::from_millis(ms)
+/// The share of a freshness goal a reused scan view may lag by: the rest of the
+/// goal is the source's replication lag, the apply, and the query itself.
+const FRESHNESS_GOAL_SCAN_VIEW_SHARE: f64 = 1.0 / 8.0;
+
+/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS` when set (`0` recaptures every scan),
+/// parsed — and an invalid value warned — once per process.
+fn configured_changes_scan_view_lag() -> Option<Duration> {
+    static CONFIGURED: LazyLock<Option<Duration>> = LazyLock::new(|| {
+        let raw = std::env::var("CAYENNE_SCAN_VIEW_FRESHNESS_MS").ok()?;
+        // A set-but-invalid value is a misconfiguration; warn (don't silently
+        // swallow it) before falling back, mirroring `parse_env_u64`. `{raw:?}`
+        // escapes control characters so untrusted input cannot inject log lines.
+        match raw.trim().parse::<u64>() {
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => {
+                tracing::warn!(
+                    "Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms."
+                );
+                None
+            }
+        }
     });
-    *CHANGES_SCAN_VIEW_LAG
+    *CONFIGURED
+}
+
+/// `WithinLag` for **read-only** `refresh_mode: changes`: the configured
+/// `CAYENNE_SCAN_VIEW_FRESHNESS_MS`, else [`DEFAULT_CHANGES_SCAN_VIEW_LAG_MS`],
+/// tightened to [`FRESHNESS_GOAL_SCAN_VIEW_SHARE`] of the freshness goal the
+/// closed-loop tuner runs toward (`runtime.params.target_freshness`) when one
+/// is set. A query reads rows only as fresh as its reused view, so a fixed
+/// one-second lag spends half of a two-second goal before the data is even
+/// applied. Writable `changes` datasets (write-back) do not use this lag — see
+/// [`scan_view_reuse_for`].
+fn changes_scan_view_lag(freshness_goal_secs: Option<f64>) -> Duration {
+    if let Some(configured) = configured_changes_scan_view_lag() {
+        return configured;
+    }
+    let default = Duration::from_millis(DEFAULT_CHANGES_SCAN_VIEW_LAG_MS);
+    freshness_goal_secs
+        .filter(|secs| *secs > 0.0)
+        .and_then(|secs| Duration::try_from_secs_f64(secs * FRESHNESS_GOAL_SCAN_VIEW_SHARE).ok())
+        .map_or(default, |share| default.min(share))
 }
 
 /// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
 /// replicas that batch applies). Everything else — `full` / `append` /
 /// `snapshot` / `caching`, and **writable** `changes` (write-back UPDATE/DML)
 /// — is [`ScanViewReuse::UntilInvalidated`], so a mutation cannot read a
-/// lag-cached view of its own table.
-fn scan_view_reuse_for(source: &dyn AccelerationSource) -> ScanViewReuse {
+/// lag-cached view of its own table. `freshness_goal_secs` is the goal the
+/// table's closed-loop tuner runs toward, `None` when it runs toward none.
+fn scan_view_reuse_for(
+    source: &dyn AccelerationSource,
+    freshness_goal_secs: Option<f64>,
+) -> ScanViewReuse {
     let is_readonly_changes = !source.allows_write()
         && source.acceleration().is_some_and(|acceleration| {
             resolved_refresh_mode(source, acceleration) == RefreshMode::Changes
         });
     if is_readonly_changes {
-        ScanViewReuse::WithinLag(changes_scan_view_lag())
+        ScanViewReuse::WithinLag(changes_scan_view_lag(freshness_goal_secs))
     } else {
         ScanViewReuse::UntilInvalidated
     }
+}
+
+/// The freshness goal a table's closed-loop tuner runs toward: none unless the
+/// tuner runs for it (a target alone never enables it).
+fn tuner_freshness_goal_secs(config: &cayenne::metadata::VortexConfig) -> Option<f64> {
+    config
+        .dynamic_tuning
+        .then_some(config.goal_freshness_secs)
+        .flatten()
 }
 
 /// How a dataset's refresh mode writes to its Cayenne table. The three shapes want
@@ -3066,7 +3101,10 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(Acceleration::resolves_to_durable_write_back);
 
-        let scan_view_reuse = scan_view_reuse_for(source);
+        let scan_view_reuse = scan_view_reuse_for(
+            source,
+            tuner_freshness_goal_secs(&table_options.vortex_config),
+        );
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -4466,6 +4504,7 @@ impl DataAccelerator for CayenneAccelerator {
             // off in place, which updates only the table's metastore row.
             vortex_config.pk_conflict_detection =
                 table_metadata.vortex_config.pk_conflict_detection;
+            let freshness_goal_secs = tuner_freshness_goal_secs(&vortex_config);
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
@@ -4498,7 +4537,7 @@ impl DataAccelerator for CayenneAccelerator {
                 // the dual-write path.
                 .with_background_compaction(Arc::clone(&self.compaction_semaphore))
                 .with_direct_partition_writes()
-                .with_scan_view_reuse(scan_view_reuse_for(source))
+                .with_scan_view_reuse(scan_view_reuse_for(source, freshness_goal_secs))
                 .with_secondary_indexes(secondary_index_columns(source)),
             );
 
@@ -10094,7 +10133,7 @@ mod tests {
                     if let Some(connector) = connector {
                         source = source.with_connector_name(connector);
                     }
-                    let reuse = scan_view_reuse_for(&source);
+                    let reuse = scan_view_reuse_for(&source, None);
                     assert_eq!(
                         matches!(reuse, ScanViewReuse::WithinLag(_)),
                         expect_lag,
@@ -10106,9 +10145,55 @@ mod tests {
 
         let no_accel = TestAccelerationSource::new("bare").with_allows_write(false);
         assert_eq!(
-            scan_view_reuse_for(&no_accel),
+            scan_view_reuse_for(&no_accel, None),
             ScanViewReuse::UntilInvalidated,
             "no acceleration configured is not read-only changes"
+        );
+    }
+
+    /// A read-only `changes` view may lag by an eighth of the freshness goal the
+    /// tuner runs toward, never by more than the one-second default; with no
+    /// usable goal — none, zero, not finite, or a tuner that is not running —
+    /// the default stands.
+    #[test]
+    fn changes_scan_view_lag_follows_the_freshness_goal() {
+        if configured_changes_scan_view_lag().is_some() {
+            // An operator's CAYENNE_SCAN_VIEW_FRESHNESS_MS wins over any goal.
+            return;
+        }
+        assert_eq!(changes_scan_view_lag(None), Duration::from_secs(1));
+        assert_eq!(changes_scan_view_lag(Some(2.0)), Duration::from_millis(250));
+        assert_eq!(changes_scan_view_lag(Some(4.0)), Duration::from_millis(500));
+        assert_eq!(changes_scan_view_lag(Some(30.0)), Duration::from_secs(1));
+        assert_eq!(changes_scan_view_lag(Some(0.0)), Duration::from_secs(1));
+        assert_eq!(
+            changes_scan_view_lag(Some(f64::NAN)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            changes_scan_view_lag(Some(f64::INFINITY)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(changes_scan_view_lag(Some(1e300)), Duration::from_secs(1));
+
+        let mut config = cayenne::metadata::VortexConfig {
+            goal_freshness_secs: Some(2.0),
+            ..cayenne::metadata::VortexConfig::default()
+        };
+        assert_eq!(tuner_freshness_goal_secs(&config), None, "the tuner is off");
+        config.dynamic_tuning = true;
+        assert_eq!(tuner_freshness_goal_secs(&config), Some(2.0));
+
+        let source = TestAccelerationSource::new("t")
+            .with_allows_write(false)
+            .with_connector_name("cdc")
+            .with_acceleration(Acceleration {
+                refresh_mode: Some(RefreshMode::Changes),
+                ..Acceleration::default()
+            });
+        assert_eq!(
+            scan_view_reuse_for(&source, Some(2.0)),
+            ScanViewReuse::WithinLag(Duration::from_millis(250))
         );
     }
 }
