@@ -289,12 +289,11 @@ fn pins_of(expr: &Expr) -> HashMap<String, Pin> {
 fn and_pins(mut left: HashMap<String, Pin>, right: HashMap<String, Pin>) -> HashMap<String, Pin> {
     for (column, pin) in right {
         let narrower = match left.remove(&column) {
-            None => pin,
             Some(Pin::Values(a)) => match pin {
                 Pin::Values(b) if b.len() < a.len() => Pin::Values(b),
                 _ => Pin::Values(a),
             },
-            Some(Pin::Range) => pin,
+            None | Some(Pin::Range) => pin,
         };
         left.insert(column, narrower);
     }

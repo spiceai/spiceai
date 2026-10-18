@@ -322,6 +322,15 @@ enum OffFencePrune {
     /// The bake's swap is no longer what scans see; nothing may be pruned.
     OutputNotLive,
 }
+
+/// Builds the pruned frozen prefix `P` of a deletion index `T`
+/// ([`CayenneTableProvider::prune_deletion_snapshot_off_fence`]).
+type BuildPrunedPrefix<T, P> = Arc<dyn Fn(&T) -> P + Send + Sync>;
+
+/// Splices a pruned prefix `P` over the deletion index `T` live at that moment,
+/// or declines (`None`) when the index was rebuilt since the prefix was taken.
+type SplicePrunedPrefix<T, P> = Arc<dyn Fn(&T, &P) -> Option<T> + Send + Sync>;
+
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -30727,26 +30736,19 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
             } => {
-                let build: Arc<
-                    dyn Fn(&Int64PkDeletionSnapshot) -> PrunedDeletionPrefix + Send + Sync,
-                > = Arc::new(move |snapshot: &Int64PkDeletionSnapshot| {
-                    snapshot.tombstones.prune_frozen_prefix(cutoff)
-                });
-                let splice: Arc<
-                    dyn Fn(
-                            &Int64PkDeletionSnapshot,
-                            &PrunedDeletionPrefix,
-                        ) -> Option<Int64PkDeletionSnapshot>
-                        + Send
-                        + Sync,
-                > = Arc::new(
-                    |snapshot: &Int64PkDeletionSnapshot, prefix: &PrunedDeletionPrefix| {
-                        snapshot
-                            .tombstones
-                            .with_pruned_prefix(prefix)
-                            .map(Int64PkDeletionSnapshot::from_index)
-                    },
-                );
+                let build: BuildPrunedPrefix<Int64PkDeletionSnapshot, PrunedDeletionPrefix> =
+                    Arc::new(move |snapshot: &Int64PkDeletionSnapshot| {
+                        snapshot.tombstones.prune_frozen_prefix(cutoff)
+                    });
+                let splice: SplicePrunedPrefix<Int64PkDeletionSnapshot, PrunedDeletionPrefix> =
+                    Arc::new(
+                        |snapshot: &Int64PkDeletionSnapshot, prefix: &PrunedDeletionPrefix| {
+                            snapshot
+                                .tombstones
+                                .with_pruned_prefix(prefix)
+                                .map(Int64PkDeletionSnapshot::from_index)
+                        },
+                    );
                 self.prune_deletion_snapshot_off_fence(
                     deletion_snapshot,
                     &bake,
@@ -30759,18 +30761,15 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
-                let build: Arc<
-                    dyn Fn(&RowConverterDeletionSnapshot) -> PrunedKeyDeletionPrefix + Send + Sync,
+                let build: BuildPrunedPrefix<
+                    RowConverterDeletionSnapshot,
+                    PrunedKeyDeletionPrefix,
                 > = Arc::new(move |snapshot: &RowConverterDeletionSnapshot| {
                     snapshot.tombstones.prune_frozen_prefix(cutoff)
                 });
-                let splice: Arc<
-                    dyn Fn(
-                            &RowConverterDeletionSnapshot,
-                            &PrunedKeyDeletionPrefix,
-                        ) -> Option<RowConverterDeletionSnapshot>
-                        + Send
-                        + Sync,
+                let splice: SplicePrunedPrefix<
+                    RowConverterDeletionSnapshot,
+                    PrunedKeyDeletionPrefix,
                 > = Arc::new(
                     |snapshot: &RowConverterDeletionSnapshot, prefix: &PrunedKeyDeletionPrefix| {
                         snapshot
@@ -30816,8 +30815,8 @@ impl CayenneTableProvider {
         cell: &ArcSwap<T>,
         bake: &BakeOutput<'_>,
         has_deletions: impl Fn(&T) -> bool,
-        build: Arc<dyn Fn(&T) -> P + Send + Sync>,
-        splice: Arc<dyn Fn(&T, &P) -> Option<T> + Send + Sync>,
+        build: BuildPrunedPrefix<T, P>,
+        splice: SplicePrunedPrefix<T, P>,
     ) -> Result<OffFencePrune>
     where
         T: Send + Sync + 'static,
@@ -30830,27 +30829,26 @@ impl CayenneTableProvider {
             if !has_deletions(&current) {
                 return Ok(OffFencePrune::NothingToPrune);
             }
-            let built = match &prefix {
-                Some(built) => Arc::clone(built),
-                None => {
-                    let (input, build) = (Arc::clone(&current), Arc::clone(&build));
-                    let built = Arc::new(
-                        tokio::task::spawn_blocking(move || build(&input))
-                            .await
-                            .map_err(|source| Error::TaskPanicked {
-                                table: table.clone(),
-                                source,
-                            })?,
-                    );
-                    prefix = Some(Arc::clone(&built));
-                    built
-                }
+            let pruned = if let Some(pruned) = &prefix {
+                Arc::clone(pruned)
+            } else {
+                let (input, build) = (Arc::clone(&current), Arc::clone(&build));
+                let pruned = Arc::new(
+                    tokio::task::spawn_blocking(move || build(&input))
+                        .await
+                        .map_err(|source| Error::TaskPanicked {
+                            table: table.clone(),
+                            source,
+                        })?,
+                );
+                prefix = Some(Arc::clone(&pruned));
+                pruned
             };
             // The build may have taken long enough for writers to move the index
             // on; splice over the index live now.
             let current = cell.load_full();
             let (input, splice) = (Arc::clone(&current), Arc::clone(&splice));
-            let spliced = tokio::task::spawn_blocking(move || splice(&input, &built))
+            let spliced = tokio::task::spawn_blocking(move || splice(&input, &pruned))
                 .await
                 .map_err(|source| Error::TaskPanicked {
                     table: table.clone(),
@@ -30878,7 +30876,7 @@ impl CayenneTableProvider {
         // Writers kept winning the swap. Splice once more under the write fence,
         // which no fenced writer of the index publishes through: the fence is held
         // for one pass over the index's newest entries, not for a whole prune.
-        let Some(built) = prefix else {
+        let Some(pruned) = prefix else {
             return Ok(OffFencePrune::LostRace);
         };
         let _fence = self.listing_fence.write().await;
@@ -30887,7 +30885,7 @@ impl CayenneTableProvider {
         }
         let current = cell.load_full();
         let (input, splice) = (Arc::clone(&current), Arc::clone(&splice));
-        let spliced = tokio::task::spawn_blocking(move || splice(&input, &built))
+        let spliced = tokio::task::spawn_blocking(move || splice(&input, &pruned))
             .await
             .map_err(|source| Error::TaskPanicked {
                 table: table.clone(),

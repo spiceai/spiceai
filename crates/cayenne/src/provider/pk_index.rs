@@ -1374,14 +1374,12 @@ pub(crate) struct PendingPkKeys {
     /// describes a table state that has since been superseded (a DELETE, a
     /// compaction, a recovery) and must not be cached when it comes back.
     invalidated: bool,
-    /// A checkpoint moved the inline rows into files while the index was checked
-    /// out (see [`Self::relocate_inlined_after_flush`]), so the restore relabels
-    /// the index's own `Inlined` entries. The batches held at the flush were
-    /// relabeled then; batches recorded after it keep the location they were
+    /// Whether a checkpoint moved the inline rows into files while the index was
+    /// checked out (see [`Self::relocate_inlined_after_flush`]), so the restore
+    /// relabels the index's own `Inlined` entries. The batches held at the flush
+    /// were relabeled then; batches recorded after it keep the location they were
     /// committed with.
-    inline_flushed: bool,
-    /// The flush relabeled at least one held batch's `Inlined` keys.
-    inline_keys_relocated: bool,
+    inline_flush: InlineFlush,
 }
 
 impl PendingPkKeys {
@@ -1413,8 +1411,7 @@ impl PendingPkKeys {
         }
         self.batches.clear();
         self.approx_bytes = 0;
-        self.inline_flushed = false;
-        self.inline_keys_relocated = false;
+        self.inline_flush = InlineFlush::NotFlushed;
         self.outstanding = self.outstanding.saturating_add(1);
     }
 
@@ -1429,8 +1426,7 @@ impl PendingPkKeys {
         self.invalidated = true;
         self.batches.clear();
         self.approx_bytes = 0;
-        self.inline_flushed = false;
-        self.inline_keys_relocated = false;
+        self.inline_flush = InlineFlush::NotFlushed;
     }
 
     /// Report that a checkpoint moved every inline row into files while an index
@@ -1461,10 +1457,15 @@ impl PendingPkKeys {
         if self.outstanding == 0 {
             return;
         }
+        let mut relocated = self.inline_flush == InlineFlush::RelocatedHeldKeys;
         for batch in &mut self.batches {
-            self.inline_keys_relocated |= relocate_inlined(&mut batch.location);
+            relocated |= relocate_inlined(&mut batch.location);
         }
-        self.inline_flushed = true;
+        self.inline_flush = if relocated {
+            InlineFlush::RelocatedHeldKeys
+        } else {
+            InlineFlush::Flushed
+        };
     }
 
     /// Hold one committed key batch. A no-op when no index is checked out, or once
@@ -1492,8 +1493,7 @@ impl PendingPkKeys {
             self.overflowed = true;
             self.batches.clear();
             self.approx_bytes = 0;
-            self.inline_flushed = false;
-            self.inline_keys_relocated = false;
+            self.inline_flush = InlineFlush::NotFlushed;
             return;
         }
         self.approx_bytes = self.approx_bytes.saturating_add(batch_bytes);
@@ -1515,8 +1515,7 @@ impl PendingPkKeys {
             batches: std::mem::take(&mut self.batches),
             overflowed: self.overflowed,
             invalidated: self.invalidated,
-            inline_flushed: std::mem::take(&mut self.inline_flushed),
-            inline_keys_relocated: std::mem::take(&mut self.inline_keys_relocated),
+            inline_flush: std::mem::take(&mut self.inline_flush),
         };
         self.approx_bytes = 0;
         self.outstanding = self.outstanding.saturating_sub(1);
@@ -1684,11 +1683,25 @@ pub(crate) struct RestoredPkKeys {
     overflowed: bool,
     /// The cache was invalidated while the index was out.
     invalidated: bool,
-    /// See [`PendingPkKeys::relocate_inlined_after_flush`]: a checkpoint moved the
-    /// inline rows into files during the checkout.
-    inline_flushed: bool,
-    /// That flush relabeled at least one of `batches`' `Inlined` keys.
-    inline_keys_relocated: bool,
+    /// See [`PendingPkKeys::relocate_inlined_after_flush`]: whether a checkpoint
+    /// moved the inline rows into files during the checkout, and whether that
+    /// relabeled any of `batches`' `Inlined` keys.
+    inline_flush: InlineFlush,
+}
+
+/// Whether a checkpoint moved the inline rows into files while a primary-key
+/// index was checked out ([`PendingPkKeys::relocate_inlined_after_flush`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum InlineFlush {
+    /// No checkpoint moved the inline rows during the checkout.
+    #[default]
+    NotFlushed,
+    /// A checkpoint moved the inline rows into files, and no held batch carried
+    /// an `Inlined` key to relabel.
+    Flushed,
+    /// A checkpoint moved the inline rows into files and relabeled at least one
+    /// held batch's `Inlined` keys.
+    RelocatedHeldKeys,
 }
 
 /// The location a key lives at after a checkpoint moved every inline row into a
@@ -1709,12 +1722,12 @@ impl RestoredPkKeys {
     /// (`FileUnlocated`) before caching it. The batches committed before that flush
     /// were relabeled when it happened.
     pub(crate) const fn relocates_inlined(&self) -> bool {
-        self.inline_flushed
+        !matches!(self.inline_flush, InlineFlush::NotFlushed)
     }
 
     /// Whether the flush relabeled any of the held batches' `Inlined` keys.
     pub(crate) const fn relocated_inline_keys(&self) -> bool {
-        self.inline_keys_relocated
+        matches!(self.inline_flush, InlineFlush::RelocatedHeldKeys)
     }
 
     /// Whether the index that was checked out must be dropped rather than cached:
