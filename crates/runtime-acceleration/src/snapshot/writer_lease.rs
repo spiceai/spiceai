@@ -90,6 +90,10 @@ pub(super) struct WriterLease {
     /// Set once the instance releases the lease on shutdown, so it does not take
     /// the lease back before it exits.
     released_on_shutdown: Arc<AtomicBool>,
+    /// Held while the lease is acquired, so a release on shutdown waits for an
+    /// acquisition already past the shutdown check rather than being overwritten
+    /// by its renewal.
+    acquiring: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
@@ -117,6 +121,7 @@ impl WriterLease {
             lease: Lease::new(holder, lease_duration(snapshot_interval)),
             reported: Arc::default(),
             released_on_shutdown: Arc::default(),
+            acquiring: Arc::default(),
         }
     }
 
@@ -240,6 +245,7 @@ impl SnapshotManager {
     /// Takes or renews the dataset's snapshot writer lease, and says whether
     /// this instance creates the snapshot.
     pub(super) async fn hold_writer_lease(&self) -> Result<WriterPermit, SnapshotUploadError> {
+        let _acquiring = self.writer_lease.acquiring.lock().await;
         if self
             .writer_lease
             .released_on_shutdown
@@ -284,6 +290,7 @@ impl SnapshotManager {
         self.writer_lease
             .released_on_shutdown
             .store(true, Ordering::Release);
+        let _acquiring = self.writer_lease.acquiring.lock().await;
         match self
             .writer_lease
             .lease
@@ -717,6 +724,44 @@ mod tests {
         ));
     }
 
+    /// Regression test: a snapshot attempt already acquiring the lease when shutdown
+    /// begins must not renew it after shutdown released it.
+    #[tokio::test]
+    async fn a_release_on_shutdown_waits_for_an_acquisition_in_flight() {
+        let store = Arc::new(TestStore::over(Arc::new(InMemory::new())));
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let a = Arc::new(manager(&shared, instance("host-a")));
+        let b = manager(&shared, instance("host-b"));
+        a.hold_writer_lease().await.expect("a takes the lease");
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *store.pause_next_read.lock() = Some((Arc::clone(&reached), Arc::clone(&resume)));
+        let renewing = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move { a.hold_writer_lease().await.map(|_| ()) }
+        });
+        reached.notified().await;
+
+        let mut releasing = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move { a.release_writer_lease_on_shutdown().await }
+        });
+        // Give a release that does not wait for the acquisition time to land first.
+        let _ = tokio::time::timeout(Duration::from_millis(200), &mut releasing).await;
+        resume.notify_one();
+        renewing.await.expect("renewal task").expect("a renews");
+        if !releasing.is_finished() {
+            releasing.await.expect("release task");
+        }
+
+        assert_eq!(stored_record(&shared, &a).await.lease_duration_ms, 0);
+        assert!(matches!(
+            b.hold_writer_lease().await.expect("b takes over"),
+            WriterPermit::Holder { generation: 2 }
+        ));
+    }
+
     #[tokio::test]
     async fn a_new_lease_outranks_every_generation_already_published() {
         let store = memory();
@@ -1000,6 +1045,9 @@ mod tests {
         /// Report no `ETag` or version, as a store that cannot write
         /// conditionally.
         strip_versions: bool,
+        /// Hold the next read until `resume` is notified, after notifying
+        /// `reached`, to stop an acquisition between its check and its write.
+        pause_next_read: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     }
 
     impl TestStore {
@@ -1009,6 +1057,7 @@ mod tests {
                 yield_on_io: false,
                 lose_next_response: AtomicBool::new(false),
                 strip_versions: false,
+                pause_next_read: Mutex::new(None),
             }
         }
 
@@ -1070,6 +1119,11 @@ mod tests {
         ) -> object_store::Result<GetResult> {
             if self.yield_on_io {
                 tokio::task::yield_now().await;
+            }
+            let pause = self.pause_next_read.lock().take();
+            if let Some((reached, resume)) = pause {
+                reached.notify_one();
+                resume.notified().await;
             }
             let mut result = self.inner.get_opts(location, options).await?;
             if self.strip_versions {
