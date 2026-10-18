@@ -77,8 +77,10 @@ const NO_MATCH_QUERY_TERM: &str = "xyznonexistent123456";
 /// a public service whose outages failed every test in this file at once.
 ///
 /// It answers a search for `NO_MATCH_QUERY_TERM` with `[]`, every other search
-/// with one match named after the query, and any other path with the 404 body
-/// `TVmaze` sends. The server stops when the returned value is dropped.
+/// with one match named after the query, the root path (fetched by a query that
+/// filters on `request_query` alone) with an HTML page as `TVmaze` does, and any
+/// other path with the 404 body `TVmaze` sends. The server stops when the
+/// returned value is dropped.
 struct PeopleSearchOrigin {
     url: String,
     _shutdown: oneshot::Sender<()>,
@@ -86,6 +88,15 @@ struct PeopleSearchOrigin {
 
 async fn start_people_search_origin() -> PeopleSearchOrigin {
     let app = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=UTF-8")],
+                    "<!DOCTYPE html><html><head><title>TVmaze</title></head><body></body></html>",
+                )
+            }),
+        )
         .route(
             "/search/people",
             get(|Query(params): Query<HashMap<String, String>>| async move {
