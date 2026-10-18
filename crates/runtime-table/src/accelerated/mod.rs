@@ -1330,11 +1330,12 @@ impl Builder {
         // caching scan already treats a zero-row accelerator result (whether
         // because the cache is empty or because the user's predicate
         // eliminated every cached row) as a cache miss and fetches the source.
-        // That happens regardless of the configured `on_zero_results`, so the
-        // default `return_empty` is misleading -- we always fall back to
-        // source, not return empty. Warn so users don't reason about caching
-        // mode through the lens of `on_zero_results`.
-        if refresh_mode == RefreshMode::Caching {
+        // Warn only when it is not `return_empty`: that is what an omitted
+        // setting deserializes to, so warning on it fires for every caching
+        // dataset and asks users to remove a setting they never wrote.
+        if refresh_mode == RefreshMode::Caching
+            && !matches!(self.zero_results_action, ZeroResultsAction::ReturnEmpty)
+        {
             tracing::warn!(
                 "Dataset {dataset}: `on_zero_results` is ignored when `refresh_mode: caching` is set. \
                  Caching mode always queries the source on a cache miss. \
