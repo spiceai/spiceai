@@ -1288,8 +1288,7 @@ impl RefreshTask {
         );
 
         let record_batch_stream = Box::pin(observed_record_batch_stream);
-        let sink_lock = self.sink.read().await;
-        let sink = &*sink_lock;
+        let sink_lock = Arc::clone(&self.sink).read_owned().await;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         // Ordering versions by time, the refresh may have counted the rows it did not
@@ -1305,10 +1304,29 @@ impl RefreshTask {
             superseded: table_counts.then(|| Arc::clone(&superseded)),
             row_versions,
         };
-        if let Err(e) = sink
-            .insert_into(record_batch_stream, overwrite, &write)
-            .await
-        {
+        let insert = async move {
+            sink_lock
+                .insert_into(record_batch_stream, overwrite, &write)
+                .await
+        };
+        // The write is CPU-heavy (sort, encode): run it on the dedicated refresh runtime, when
+        // provided, to keep it off the main runtime, which serves queries.
+        let result = match self.cpu_runtime.clone() {
+            Some(refresh_runtime) => {
+                let request_context = RequestContext::current(AsyncMarker::new().await);
+                let task = refresh_runtime
+                    .spawn(request_context.scope(insert).instrument(Span::current()));
+                tokio_util::task::AbortOnDropHandle::new(task)
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(RetryError::transient(super::Error::FailedToWriteData {
+                            source: DataFusionError::External(Box::new(join_error)),
+                        }))
+                    })
+            }
+            None => insert.await,
+        };
+        if let Err(e) = result {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
