@@ -87,7 +87,7 @@ impl DependencyLogTracer {
         );
     }
 
-    fn emit(&self, record: &Record<'_>, transform: LogTransform) {
+    fn emit(&self, record: &Record<'_>, transform: &LogTransform) {
         let skipped = if let Some(key) = transform.collapse_key.as_deref() {
             let decision = {
                 let mut gate = self
@@ -139,7 +139,7 @@ impl Log for DependencyLogTracer {
         }
 
         if let Some(transform) = self.rules.iter().find_map(|rule| rule.transform(record)) {
-            self.emit(record, transform);
+            self.emit(record, &transform);
             return;
         }
 
@@ -150,7 +150,7 @@ impl Log for DependencyLogTracer {
             let message = one_line(&record.args().to_string());
             self.emit(
                 record,
-                LogTransform {
+                &LogTransform {
                     collapse_key: Some(format!("opendal-retry:{message}")),
                     message,
                     diagnostic: None,
@@ -284,7 +284,7 @@ fn s3_connection_closed_message(attempt: u32, delay: &str, error: &str) -> Optio
     ))
 }
 
-/// OpenDAL's timeout layer reports only the budget, not the object. The
+/// `OpenDAL`'s timeout layer reports only the budget, not the object. The
 /// message names that budget so a burst of identical timeouts is actionable.
 fn io_timeout_message(attempt: u32, delay: &str, error: &str) -> Option<String> {
     let rest = error.strip_prefix(
@@ -320,6 +320,7 @@ const COLLAPSE_EMIT_AT: [u64; 4] = [1, 100, 1_000, 10_000];
 /// that class appears, it logs as a new one.
 const COLLAPSE_MAX_WINDOWS: usize = 64;
 
+#[derive(Default)]
 struct CollapseGate {
     windows: HashMap<String, CollapseWindow>,
 }
@@ -334,14 +335,6 @@ struct CollapseWindow {
 enum Collapse {
     Emit { skipped: u64 },
     Suppress,
-}
-
-impl Default for CollapseGate {
-    fn default() -> Self {
-        Self {
-            windows: HashMap::new(),
-        }
-    }
 }
 
 impl CollapseWindow {
