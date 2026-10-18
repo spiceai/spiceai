@@ -50,7 +50,7 @@ use app::AppBuilder;
 use arrow::array::{Array, StringArray, TimestampNanosecondArray, UInt16Array};
 use axum::{
     Router,
-    extract::RawQuery,
+    extract::Query,
     http::{StatusCode, header},
     routing::get,
 };
@@ -61,7 +61,7 @@ use spicepod::{
     component::dataset::Dataset,
     param::Params,
 };
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{
@@ -88,14 +88,8 @@ async fn start_people_search_origin() -> PeopleSearchOrigin {
     let app = Router::new()
         .route(
             "/search/people",
-            get(|RawQuery(query): RawQuery| async move {
-                let term = query
-                    .as_deref()
-                    .unwrap_or_default()
-                    .split('&')
-                    .find_map(|pair| pair.strip_prefix("q="))
-                    .unwrap_or_default()
-                    .to_string();
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let term = params.get("q").cloned().unwrap_or_default();
                 let body = if term == NO_MATCH_QUERY_TERM {
                     serde_json::json!([])
                 } else {
