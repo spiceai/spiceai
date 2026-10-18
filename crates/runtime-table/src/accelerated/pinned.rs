@@ -18,7 +18,8 @@ limitations under the License.
 //! source. While the dataset is pinned, queries read a second local copy loaded from
 //! the pinned snapshot, and refreshes and publishes keep using the live acceleration.
 
-use std::sync::Arc;
+use std::any::Any;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,6 +27,9 @@ use datafusion::datasource::TableProvider;
 use tokio::sync::Notify;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Held by a scan of a pinned copy until the scan's output streams are dropped.
+pub type CopyLease = Arc<dyn Any + Send + Sync>;
 
 /// Loads and releases the local copies of a dataset's pinned snapshot.
 #[async_trait]
@@ -45,6 +49,15 @@ pub trait PinnedCopyLoader: Send + Sync {
 struct PinnedCopy {
     snapshot_id: u64,
     provider: Arc<dyn TableProvider>,
+    /// Held by each scan of the copy until its output streams are dropped.
+    lease: Arc<()>,
+}
+
+/// A copy no longer served, kept until no scan holds its lease.
+struct RetiredCopy {
+    snapshot_id: u64,
+    provider: Arc<dyn TableProvider>,
+    lease: Weak<()>,
 }
 
 /// The copy of the pinned snapshot an accelerated table serves, when its dataset is
@@ -63,13 +76,17 @@ impl std::fmt::Debug for PinnedServing {
 }
 
 impl PinnedServing {
-    /// The provider queries read instead of the live acceleration.
+    /// The provider queries read instead of the live acceleration, and the lease a scan
+    /// of it holds until its output streams are dropped: the copy's files are deleted
+    /// only once no scan holds it.
     #[must_use]
-    pub fn provider(&self) -> Option<Arc<dyn TableProvider>> {
-        self.copy
-            .read()
-            .as_ref()
-            .map(|copy| Arc::clone(&copy.provider))
+    pub fn provider(&self) -> Option<(Arc<dyn TableProvider>, CopyLease)> {
+        self.copy.read().as_ref().map(|copy| {
+            (
+                Arc::clone(&copy.provider),
+                Arc::clone(&copy.lease) as CopyLease,
+            )
+        })
     }
 
     /// The snapshot being served.
@@ -92,9 +109,8 @@ pub struct PinWatcher {
     dataset_name: String,
     loader: Arc<dyn PinnedCopyLoader>,
     serving: Arc<PinnedServing>,
-    /// Copies no longer served. A query planned before the switch may still read one,
-    /// so each is released at the check after the one that retired it.
-    retired: Vec<u64>,
+    /// Copies no longer served that a query may still read.
+    retired: Vec<RetiredCopy>,
     /// Called after the served data changes, to drop what was cached from the old data.
     on_change: Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
 }
@@ -117,12 +133,19 @@ impl PinWatcher {
 
     /// Reads the dataset's pin and serves the copy it names: loads a newly pinned
     /// snapshot, and serves the live data when the dataset is unpinned or the pinned
-    /// snapshot cannot be loaded.
+    /// snapshot cannot be loaded. Then releases each retired copy no scan reads.
     pub async fn check(&mut self) {
-        for snapshot_id in std::mem::take(&mut self.retired) {
-            self.loader.release(snapshot_id).await;
+        self.follow_pin().await;
+        let (unread, read) = std::mem::take(&mut self.retired)
+            .into_iter()
+            .partition::<Vec<_>, _>(|copy| copy.lease.strong_count() == 0);
+        self.retired = read;
+        for copy in unread {
+            self.loader.release(copy.snapshot_id).await;
         }
+    }
 
+    async fn follow_pin(&mut self) {
         let pinned = match self.loader.pinned_snapshot().await {
             Ok(pinned) => pinned,
             Err(err) => {
@@ -141,7 +164,7 @@ impl PinWatcher {
             (Some(pinned), Some(current)) if current.snapshot_id == pinned => {}
             (None, Some(current)) => {
                 self.serving.replace(None);
-                self.retired.push(current.snapshot_id);
+                self.retire(&current);
                 tracing::info!(
                     dataset = %self.dataset_name,
                     "Dataset '{}' is no longer pinned: serving its live data instead of snapshot {}.",
@@ -151,14 +174,32 @@ impl PinWatcher {
                 (self.on_change)().await;
             }
             (Some(pinned), current) => {
-                let replaced = current.map(|copy| copy.snapshot_id);
-                match self.loader.load(pinned).await {
-                    Ok(provider) => {
-                        self.serving.replace(Some(PinnedCopy {
+                let copy = match self
+                    .retired
+                    .iter()
+                    .position(|copy| copy.snapshot_id == pinned)
+                {
+                    // A copy a query still reads is served again rather than loaded over.
+                    Some(index) => {
+                        let retired = self.retired.swap_remove(index);
+                        Ok(PinnedCopy {
                             snapshot_id: pinned,
-                            provider,
-                        }));
-                        self.retired.extend(replaced);
+                            provider: retired.provider,
+                            lease: retired.lease.upgrade().unwrap_or_default(),
+                        })
+                    }
+                    None => self.loader.load(pinned).await.map(|provider| PinnedCopy {
+                        snapshot_id: pinned,
+                        provider,
+                        lease: Arc::default(),
+                    }),
+                };
+                match copy {
+                    Ok(copy) => {
+                        self.serving.replace(Some(copy));
+                        if let Some(current) = &current {
+                            self.retire(current);
+                        }
                         tracing::info!(
                             dataset = %self.dataset_name,
                             "Dataset '{}' is pinned to snapshot {pinned}: serving it from a second local copy, while refreshes and publishes continue from the live data.",
@@ -167,10 +208,10 @@ impl PinWatcher {
                         (self.on_change)().await;
                     }
                     Err(err) => {
-                        self.retired.push(pinned);
-                        if let Some(replaced) = replaced {
+                        self.loader.release(pinned).await;
+                        if let Some(current) = &current {
                             self.serving.replace(None);
-                            self.retired.push(replaced);
+                            self.retire(current);
                             (self.on_change)().await;
                         }
                         tracing::error!(
@@ -182,6 +223,14 @@ impl PinWatcher {
                 }
             }
         }
+    }
+
+    fn retire(&mut self, copy: &PinnedCopy) {
+        self.retired.push(RetiredCopy {
+            snapshot_id: copy.snapshot_id,
+            provider: Arc::clone(&copy.provider),
+            lease: Arc::downgrade(&copy.lease),
+        });
     }
 
     /// Checks at once, then again each time `wake` is notified and, when `period` is
@@ -276,13 +325,64 @@ mod tests {
         *loader.pinned.lock() = None;
         watcher.check().await;
         assert_eq!(serving.snapshot_id(), None, "unpinned: serve live data");
+        assert_eq!(
+            *loader.released.lock(),
+            vec![41],
+            "a copy no query reads is released"
+        );
+        assert_eq!(changes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_copy_a_query_still_reads_is_released_once_the_query_ends() {
+        let loader = Arc::new(FakeLoader::default());
+        let (mut watcher, serving, _) = watcher(&loader);
+        *loader.pinned.lock() = Some(41);
+        watcher.check().await;
+        let (_, scan) = serving.provider().expect("served");
+
+        *loader.pinned.lock() = None;
+        watcher.check().await;
+        watcher.check().await;
+        assert_eq!(serving.snapshot_id(), None);
         assert!(
             loader.released.lock().is_empty(),
-            "a retired copy is released at the next check, after queries planned on it"
+            "the copy is kept while a scan holds its lease"
         );
+
+        drop(scan);
         watcher.check().await;
         assert_eq!(*loader.released.lock(), vec![41]);
-        assert_eq!(changes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pinning_a_copy_a_query_still_reads_serves_it_again() {
+        let loader = Arc::new(FakeLoader::default());
+        let (mut watcher, serving, _) = watcher(&loader);
+        *loader.pinned.lock() = Some(41);
+        watcher.check().await;
+        let (_, scan) = serving.provider().expect("served");
+        *loader.pinned.lock() = None;
+        watcher.check().await;
+
+        *loader.pinned.lock() = Some(41);
+        watcher.check().await;
+        assert_eq!(serving.snapshot_id(), Some(41));
+        assert_eq!(
+            *loader.loaded.lock(),
+            vec![41],
+            "served again, not loaded over"
+        );
+
+        *loader.pinned.lock() = None;
+        watcher.check().await;
+        assert!(
+            loader.released.lock().is_empty(),
+            "the scan planned before it was served again still reads it"
+        );
+        drop(scan);
+        watcher.check().await;
+        assert_eq!(*loader.released.lock(), vec![41]);
     }
 
     #[tokio::test]
@@ -295,7 +395,6 @@ mod tests {
         *loader.pinned.lock() = Some(40);
         watcher.check().await;
         assert_eq!(serving.snapshot_id(), Some(40));
-        watcher.check().await;
         assert_eq!(*loader.released.lock(), vec![41]);
     }
 
@@ -314,6 +413,11 @@ mod tests {
             None,
             "the old pin is not served once the dataset is pinned elsewhere"
         );
+        assert_eq!(
+            *loader.released.lock(),
+            vec![40, 41],
+            "the failed load's partial copy and the replaced copy are released"
+        );
 
         watcher.check().await;
         assert_eq!(serving.snapshot_id(), None);
@@ -321,11 +425,6 @@ mod tests {
             *loader.loaded.lock(),
             vec![41, 40, 40],
             "each check retries"
-        );
-        assert_eq!(
-            *loader.released.lock(),
-            vec![40, 41],
-            "the failed load's partial copy and the replaced copy are released"
         );
 
         loader.failing.lock().clear();

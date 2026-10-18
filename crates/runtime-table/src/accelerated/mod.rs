@@ -1880,12 +1880,12 @@ impl AcceleratedTable {
     }
 
     /// The provider queries read: the copy of the pinned snapshot while one is
-    /// served, else the live acceleration.
-    fn serving_accelerator(&self) -> Arc<dyn TableProvider> {
-        self.pinned
-            .as_ref()
-            .and_then(|pinned| pinned.provider())
-            .unwrap_or_else(|| Arc::clone(&self.accelerator))
+    /// served, with the lease its scans hold, else the live acceleration.
+    fn serving_accelerator(&self) -> (Arc<dyn TableProvider>, Option<pinned::CopyLease>) {
+        match self.pinned.as_ref().and_then(|pinned| pinned.provider()) {
+            Some((provider, lease)) => (provider, Some(lease)),
+            None => (Arc::clone(&self.accelerator), None),
+        }
     }
 
     /// Get the list of synchronized child accelerators for caching mode.
@@ -2177,9 +2177,9 @@ impl AcceleratedTable {
             None
         };
         let scan_projection = extended_projection.as_ref().or(projection);
-        // While the dataset is pinned, queries read the pinned snapshot's copy. Caching
-        // mode never has one.
-        let serving = self.serving_accelerator();
+        // While the dataset is pinned, queries read the pinned snapshot's copy, and the
+        // plan holds its lease until it has run. Caching mode never has one.
+        let (serving, pinned_copy_lease) = self.serving_accelerator();
         let input = if matches!(
             (is_caching_mode, &self.zero_results_action),
             (false, ZeroResultsAction::ReturnEmpty)
@@ -2306,10 +2306,10 @@ impl AcceleratedTable {
             }
         };
 
-        Ok(Arc::new(SchemaCastScanExec::new(
-            plan,
-            self.scan_output_schema(projection),
-        )))
+        Ok(Arc::new(
+            SchemaCastScanExec::new(plan, self.scan_output_schema(projection))
+                .with_keep_alive(pinned_copy_lease),
+        ))
     }
 
     /// The schema a scan of this layer returns for the user's original

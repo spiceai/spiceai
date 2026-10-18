@@ -56,6 +56,8 @@ pub struct SchemaCastScanExec {
     /// The actual output schema (target schema with nullability adjustments from input)
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    /// See [`Self::with_keep_alive`].
+    keep_alive: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl SchemaCastScanExec {
@@ -63,7 +65,20 @@ impl SchemaCastScanExec {
         let [input]: [Arc<dyn ExecutionPlan>; 1] = children.try_into().map_err(|_| {
             DataFusionError::Execution("SchemaCastScanExec expects exactly one input".to_string())
         })?;
-        Ok(Arc::new(Self::new(input, Arc::clone(&self.target_schema))))
+        Ok(Arc::new(self.rebuilt(input)))
+    }
+
+    /// This exec over `input`, keeping what this one keeps alive.
+    fn rebuilt(&self, input: Arc<dyn ExecutionPlan>) -> Self {
+        Self::new(input, Arc::clone(&self.target_schema)).with_keep_alive(self.keep_alive.clone())
+    }
+
+    /// Holds `held` until this plan, every plan rebuilt from it, and all their output
+    /// streams are dropped, such as a lease on files the input reads while it runs.
+    #[must_use]
+    pub fn with_keep_alive(mut self, held: Option<Arc<dyn Any + Send + Sync>>) -> Self {
+        self.keep_alive = held;
+        self
     }
 
     pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
@@ -112,6 +127,7 @@ impl SchemaCastScanExec {
             target_schema: schema,
             output_schema,
             properties,
+            keep_alive: None,
         }
     }
 
@@ -236,6 +252,7 @@ impl fmt::Debug for SchemaCastScanExec {
             .field("target_schema", &self.target_schema)
             .field("output_schema", &self.output_schema)
             .field("properties", &self.properties)
+            .field("keep_alive", &self.keep_alive.is_some())
             .finish()
     }
 }
@@ -363,11 +380,13 @@ impl ExecutionPlan for SchemaCastScanExec {
     ) -> Result<SendableRecordBatchStream> {
         let mut stream = self.input.execute(partition, context)?;
         let schema = self.schema();
+        let keep_alive = self.keep_alive.clone();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             {
                 stream! {
+                    let _keep_alive = keep_alive;
                     while let Some(batch) = stream.next().await {
                         yield record_batch::try_cast_to(batch?, Arc::clone(&schema)).map_err(From::from);
                     }
@@ -439,10 +458,9 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let target_schema = Arc::clone(&self.target_schema);
-        self.input.with_fetch(limit).map(|plan| {
-            Arc::new(SchemaCastScanExec::new(plan, target_schema)) as Arc<dyn ExecutionPlan>
-        })
+        self.input
+            .with_fetch(limit)
+            .map(|plan| Arc::new(self.rebuilt(plan)) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -486,11 +504,8 @@ impl ExecutionPlan for SchemaCastScanExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        let target_schema = Arc::clone(&self.target_schema);
         let result = self.input.try_pushdown_sort(order)?;
-        Ok(result.map(|plan| {
-            Arc::new(SchemaCastScanExec::new(plan, target_schema)) as Arc<dyn ExecutionPlan>
-        }))
+        Ok(result.map(|plan| Arc::new(self.rebuilt(plan)) as Arc<dyn ExecutionPlan>))
     }
 
     /// Not serializable. Forwarding to the input would ship a plan without the
@@ -565,6 +580,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::logical_expr::TableProviderFilterPushDown;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
     use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::physical_plan::expressions::col as physical_col;
@@ -1680,5 +1696,41 @@ mod tests {
             ],
             &batches
         );
+    }
+
+    #[tokio::test]
+    async fn what_a_scan_keeps_alive_is_held_by_rebuilt_plans_until_their_stream_is_dropped() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("valid batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("source");
+        let held = Arc::new(());
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            SchemaCastScanExec::new(input, Arc::clone(&schema))
+                .with_keep_alive(Some(Arc::clone(&held) as Arc<dyn Any + Send + Sync>)),
+        );
+
+        let children = plan.children().into_iter().cloned().collect();
+        let rebuilt = Arc::clone(&plan)
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .expect("rebuilt");
+        drop(plan);
+        let rebuilt = rebuilt.reset_state().expect("reset");
+        let mut stream = rebuilt
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("executes");
+        drop(rebuilt);
+        assert_eq!(Arc::strong_count(&held), 2, "the stream holds it");
+
+        stream.next().await.expect("a batch").expect("no error");
+        drop(stream);
+        assert_eq!(Arc::strong_count(&held), 1, "released with the stream");
     }
 }
