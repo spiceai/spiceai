@@ -109,7 +109,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
 | [arrow-rs](#arrow-rs) | `2e2cc330c64ac8a9e44d2a5f2da171b391f775b8` | `spiceai-59` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
-| [candle](#candle-and-its-kernel-crates) | `2a6ec204bfad5933332b5b053738e55bd61875be` | `lukim/spiceai-v0.9.4` (TEMPORARY: spiceai/candle#18) |
+| [candle](#candle-and-its-kernel-crates) | `3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1707b349584845e802a703adca1e71f544defc5f` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `0b0ec45c2715d86989e316fc7260abc6afb0978c` | `lukim/spiceai-v0.9.4` (TEMPORARY: spiceai/mistral.rs#47) |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `b2a63b9d8ae44a6b65836110ab76602defea6b3e` | `lukim/spiceai-v0.9.4` (TEMPORARY: spiceai/mistral.rs#47) |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
