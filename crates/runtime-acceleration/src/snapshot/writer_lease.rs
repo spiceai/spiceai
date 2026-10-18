@@ -55,8 +55,9 @@ use bytes::Bytes;
 use object_store::{
     ObjectStoreExt, PutPayload, PutResult, UpdateVersion, path::Path as ObjectPath,
 };
-use object_store_occ::lease::{Acquired, Holder, Lease, LeaseError, LeaseIo, Role};
+use object_store_occ::lease::{Acquired, Holder, Lease, LeaseError, LeaseIo, LeaseRecord, Role};
 use object_store_occ::{ConditionalWriteError, Expected};
+use super::instances::{LeaseHolder, WriterStatus};
 use parking_lot::Mutex;
 use util::{RetryError, retry};
 
@@ -110,7 +111,10 @@ impl Default for WriterLease {
 impl WriterLease {
     fn new(holder: Holder, snapshot_interval: Duration) -> Self {
         Self {
-            lease: Lease::new(holder, lease_duration(snapshot_interval)),
+            lease: with_writer_status(
+                Lease::new(holder, lease_duration(snapshot_interval)),
+                &WriterStatus::default(),
+            ),
             reported: Arc::default(),
         }
     }
@@ -129,6 +133,16 @@ impl WriterLease {
             snapshot_interval,
         )
     }
+}
+
+fn with_writer_status(lease: Lease, status: &WriterStatus) -> Lease {
+    set_writer_status(&lease, status);
+    lease
+}
+
+/// Records `status` for the lease's later writes. Returns whether it changed.
+fn set_writer_status(lease: &Lease, status: &WriterStatus) -> bool {
+    serde_json::to_value(status).is_ok_and(|status| lease.set_status(status))
 }
 
 fn lease_duration(snapshot_interval: Duration) -> Duration {
@@ -225,6 +239,47 @@ impl LeaseIo for RetryingLeaseIo<'_> {
 }
 
 impl SnapshotManager {
+    /// The instance that holds the dataset's writer lease, for listing it. `None` when no
+    /// lease is stored, or the lease was released or not renewed for its duration, by
+    /// this instance's clock.
+    pub async fn writer_lease_holder(&self) -> Option<LeaseHolder> {
+        let bytes = self
+            .object_store
+            .get(&self.writer_lease_path())
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+        let record = LeaseRecord::parse(&bytes)?;
+        let since_renewal_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(record.renew_time_ms);
+        let lasts_ms = i64::try_from(record.lease_duration().as_millis()).unwrap_or(i64::MAX);
+        if record.lease_duration_ms == 0 || since_renewal_ms > lasts_ms {
+            return None;
+        }
+        Some(LeaseHolder {
+            status: record
+                .status
+                .and_then(|status| serde_json::from_value(status).ok()),
+            instance_id: record.holder_identity,
+        })
+    }
+
+    /// Records what this instance serves of the dataset's pin for its writer lease. When
+    /// it changed and this instance holds the lease, writes the lease at once; otherwise
+    /// the next write records it.
+    pub async fn report_writer_status(&self, status: &WriterStatus) {
+        let lease = &self.writer_lease.lease;
+        if !set_writer_status(lease, status) || !lease.last_written() {
+            return;
+        }
+        if let Err(error) = self.acquire_writer_lease().await {
+            tracing::debug!(dataset = %self.dataset_name, %error, "Could not write the snapshot writer lease with what this instance serves of the pin; its next write records it");
+        }
+    }
+
     fn writer_lease_path(&self) -> ObjectPath {
         self.snapshots_location
             .clone()
@@ -455,7 +510,6 @@ mod tests {
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
         PutMode, PutMultipartOptions, PutOptions, memory::InMemory, path::Path,
     };
-    use object_store_occ::lease::LeaseRecord;
     use util::retry_strategy::RetryBackoffBuilder;
 
     const INTERVAL: Duration = Duration::from_mins(1);
@@ -532,6 +586,101 @@ mod tests {
         assert!(claim_publication(&mut dataset, 2));
         assert!(claim_publication(&mut dataset, 3));
         assert_eq!(published_writer_generation(&dataset), Some(3));
+    }
+
+    /// The writer lease record as v2.4.0-rc.2 reads it: that version parses a record into
+    /// this struct and treats one of another format version as absent.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    #[expect(dead_code)]
+    struct Rc2LeaseRecord {
+        format_version: u32,
+        holder_identity: String,
+        holder_process: String,
+        generation: u64,
+        lease_duration_ms: u64,
+        acquire_time_ms: i64,
+        renew_time_ms: i64,
+    }
+
+    #[tokio::test]
+    async fn a_lease_that_records_the_writer_status_is_still_read_by_v2_4_0_rc_2() {
+        let store = memory();
+        let a = manager(&store, instance("host-a"));
+        a.hold_writer_lease().await.expect("a takes the lease");
+        a.report_writer_status(&WriterStatus {
+            serves_snapshot_id: Some(41),
+            not_served: None,
+        })
+        .await;
+        let record = stored_record(&store, &a).await;
+        assert_eq!(
+            record.status,
+            Some(serde_json::json!({ "serves-snapshot-id": 41 })),
+            "a changed status is written at once"
+        );
+
+        let bytes = store
+            .get(&a.writer_lease_path())
+            .await
+            .expect("lease stored")
+            .bytes()
+            .await
+            .expect("read lease");
+        let rc2 = serde_json::from_slice::<Rc2LeaseRecord>(&bytes)
+            .ok()
+            .filter(|rc2| rc2.format_version == 1)
+            .expect("v2.4.0-rc.2 reads the lease as held");
+        assert_eq!(rc2.holder_identity, "host-a");
+        assert_eq!(rc2.generation, record.generation);
+    }
+
+    #[tokio::test]
+    async fn the_writer_is_listed_with_its_status_and_a_writer_without_one_as_older() {
+        let store = memory();
+        let a = manager(&store, instance("host-a"));
+        let b = manager(&store, instance("host-b"));
+        assert_eq!(a.writer_lease_holder().await, None, "no lease yet");
+
+        b.report_writer_status(&WriterStatus {
+            serves_snapshot_id: Some(7),
+            not_served: None,
+        })
+        .await;
+        assert_eq!(a.writer_lease_holder().await, None, "a status alone writes no lease");
+
+        a.hold_writer_lease().await.expect("a takes the lease");
+        let not_served = WriterStatus {
+            serves_snapshot_id: None,
+            not_served: Some("caching mode".to_string()),
+        };
+        a.report_writer_status(&not_served).await;
+        assert_eq!(
+            b.writer_lease_holder().await,
+            Some(LeaseHolder {
+                instance_id: "host-a".to_string(),
+                status: Some(not_served),
+            })
+        );
+
+        let older = LeaseRecord {
+            status: None,
+            ..stored_record(&store, &a).await
+        };
+        store
+            .put(
+                &a.writer_lease_path(),
+                serde_json::to_vec(&older).expect("serialize").into(),
+            )
+            .await
+            .expect("write an older version's lease");
+        assert_eq!(
+            b.writer_lease_holder().await,
+            Some(LeaseHolder {
+                instance_id: "host-a".to_string(),
+                status: None,
+            })
+        );
     }
 
     #[tokio::test]

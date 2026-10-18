@@ -363,6 +363,8 @@ pub struct AcceleratedTable {
     /// The copy of the pinned snapshot scans read instead of `accelerator`, for a
     /// table with [`Builder::pinned_copy_loader`].
     pinned: Option<Arc<pinned::PinnedServing>>,
+    /// What the table serves of its dataset's pin.
+    pin_status: Arc<pinned::PinStatus>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -513,6 +515,7 @@ pub struct Builder {
     append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
     pinned_copy_loader: Option<(Arc<dyn pinned::PinnedCopyLoader>, Option<Duration>)>,
+    pin_status: Arc<pinned::PinStatus>,
 }
 
 impl Builder {
@@ -575,7 +578,15 @@ impl Builder {
             append_cursor_store: None,
             node_local: false,
             pinned_copy_loader: None,
+            pin_status: Arc::default(),
         }
+    }
+
+    /// What the table serves of its dataset's pin, for whatever loads the pinned
+    /// snapshot outside the table, such as a reader's snapshot refresh.
+    #[must_use]
+    pub fn pin_status(&self) -> Arc<pinned::PinStatus> {
+        Arc::clone(&self.pin_status)
     }
 
     /// Serve the dataset's pinned snapshot from copies `loader` makes, checking for a
@@ -853,11 +864,15 @@ impl Builder {
     }
 
     /// Configure per-dataset state for `RefreshMode::Snapshot`. Required when
-    /// the refresh mode is Snapshot.
+    /// the refresh mode is Snapshot. The state reports the pin into the table's
+    /// [`Self::pin_status`].
     pub fn snapshot_refresh_state(
         &mut self,
-        state: Option<snapshots::SnapshotRefreshState>,
+        mut state: Option<snapshots::SnapshotRefreshState>,
     ) -> &mut Self {
+        if let Some(state) = &mut state {
+            state.pin_status = Arc::clone(&self.pin_status);
+        }
         self.snapshot_refresh_state = state;
         self
     }
@@ -1495,6 +1510,7 @@ impl Builder {
                     self.dataset_name.to_string(),
                     loader,
                     Arc::clone(&serving),
+                    Arc::clone(&self.pin_status),
                     Box::new(move || {
                         let caching = caching.clone();
                         let dataset_name = dataset_name.clone();
@@ -1550,6 +1566,7 @@ impl Builder {
             fallback_retention_keep,
             node_local: self.node_local,
             pinned,
+            pin_status: self.pin_status,
         };
         if let Some(prepared_child) = prepared_child {
             let rows = prepared_child.publish().map_err(|source| {
@@ -1877,6 +1894,12 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_accelerator_ref(&self) -> &Arc<dyn TableProvider> {
         &self.accelerator
+    }
+
+    /// What the table serves of its dataset's pin.
+    #[must_use]
+    pub fn pin_status(&self) -> &Arc<pinned::PinStatus> {
+        &self.pin_status
     }
 
     /// The provider queries read: the copy of the pinned snapshot while one is
@@ -2283,9 +2306,9 @@ impl AcceleratedTable {
                         accelerator_limit,
                     )
                     .await?;
-                if pinned_copy_lease.is_some() {
-                    // A pinned copy serves only the pinned snapshot's rows, so a scan
-                    // of it never falls back to the source.
+                if pinned_copy_lease.is_some() || self.pin_status.serves_pin() {
+                    // The pinned snapshot's rows are all a pinned dataset serves, so a
+                    // scan of them never falls back to the source.
                     input
                 } else {
                     // Schema only, and only invoked if the accelerator stream is
@@ -3127,6 +3150,8 @@ impl Retention {
 mod construction_tests;
 #[cfg(test)]
 mod drain_tests;
+#[cfg(test)]
+mod pin_scan_tests;
 
 #[cfg(test)]
 mod tests {

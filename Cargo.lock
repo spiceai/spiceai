@@ -17853,6 +17853,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "duckdb",
+ "fs4",
  "fundu",
  "futures",
  "hex",

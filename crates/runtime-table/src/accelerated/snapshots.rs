@@ -14,6 +14,7 @@ use crate::accelerated::SnapshotCreateTrigger;
 use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshCompletionOutcome};
+use crate::accelerated::pinned::{NotServed, PinStatus};
 use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use data_accelerator_api::DataAccelerator;
@@ -22,6 +23,7 @@ use data_accelerator_api::swappable::SwappableTableProvider;
 use data_connector_api::accelerated::RefreshRequester;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use runtime_acceleration::PinRead;
 use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::notifications::Subscription;
@@ -70,6 +72,9 @@ pub struct SnapshotRefreshState {
     /// swapped in, or a check that found nothing newer. The next poll reads the metadata
     /// conditionally on it and skips when it is unchanged. `None` until the first such poll.
     pub metadata_e_tag: Arc<StdMutex<Option<String>>>,
+    /// What the table serves of its dataset's pin, shared with the table's scans. The
+    /// table's builder sets it.
+    pub pin_status: Arc<PinStatus>,
 }
 
 impl std::fmt::Debug for SnapshotRefreshState {
@@ -120,6 +125,23 @@ impl SnapshotRefreshState {
             .metadata_e_tag
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata_e_tag;
+    }
+
+    /// Records what the table serves of its dataset's pin after a poll that read `pin`,
+    /// and why it does not serve the pin. Returns whether that changed.
+    pub fn report_pin(&self, pin: PinRead, not_served: Option<NotServed>) -> bool {
+        let mut state = self.pin_status.get();
+        match pin {
+            PinRead::Unchanged => {}
+            PinRead::Pinned(snapshot_id) => state.pinned = Some(snapshot_id),
+            PinRead::NotPinned => state.pinned = None,
+        }
+        if let Some(NotServed::NotEnoughDisk { snapshot_id, .. }) = &not_served {
+            state.pinned = Some(*snapshot_id);
+        }
+        state.serves = self.current_loaded_id();
+        state.not_served = not_served.filter(|_| state.pinned.is_some() && !state.serves_pin());
+        self.pin_status.set(state)
     }
 }
 

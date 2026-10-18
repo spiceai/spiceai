@@ -64,7 +64,7 @@ pub enum AccelerationCommand {
     /// Unpin the dataset: every instance serves the newest snapshot again
     Unpin(UnpinArgs),
 
-    /// Pin the dataset to a snapshot, as `pin` does
+    /// Deprecated: use `pin`. Pins the dataset to a snapshot, as `pin` does
     SetSnapshot(PinArgs),
 }
 
@@ -147,7 +147,45 @@ pub struct SnapshotSummary {
     pub current_snapshot_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_snapshot_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_snapshots: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<InstanceStatus>,
     pub snapshots: Vec<SnapshotInfo>,
+}
+
+/// What one instance serves of the dataset's pin, from the API.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InstanceStatus {
+    pub instance_id: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serves_snapshot_id: Option<u64>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl TableRow for InstanceStatus {
+    fn headers() -> Vec<&'static str> {
+        vec!["INSTANCE", "SERVES", "STATUS"]
+    }
+
+    fn values(&self) -> Vec<String> {
+        let status = match (self.status.as_str(), &self.reason) {
+            ("pinned", _) => "pinned".to_string(),
+            (_, Some(reason)) => format!("not pinned: {reason}"),
+            (_, None) => "not pinned".to_string(),
+        };
+        vec![
+            format!("{} ({})", self.instance_id, self.role),
+            self.serves_snapshot_id
+                .map_or_else(|| "live".to_string(), |id| id.to_string()),
+            status,
+        ]
+    }
 }
 
 /// Request to pin a dataset to a snapshot.
@@ -254,14 +292,15 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
     if let Some(ref engine) = summary.engine {
         println!("Engine: {engine}");
     }
+    let last_updated = format_timestamp_ms(summary.last_updated_ms);
+    println!("Last Updated: {last_updated}");
     if let Some(current_id) = summary.current_snapshot_id {
         println!("Current Snapshot ID: {current_id}");
     }
-    if let Some(pinned_id) = summary.pinned_snapshot_id {
-        println!("Pinned Snapshot ID: {pinned_id} (unpin with `spice acceleration unpin`)");
+    for line in pin_lines(&summary) {
+        println!("{line}");
     }
-    let last_updated = format_timestamp_ms(summary.last_updated_ms);
-    println!("Last Updated: {last_updated}");
+    write_table(&summary.instances);
     println!();
 
     // Convert to table rows
@@ -347,8 +386,13 @@ async fn execute_pin(ctx: &RuntimeContext, args: &PinArgs) -> Result<()> {
     print_message(ctx, ctx.put_json(&url, &request).await, args.output).await
 }
 
-/// Execute the set-snapshot subcommand.
+/// Execute the deprecated set-snapshot subcommand.
 async fn execute_set_snapshot(ctx: &RuntimeContext, args: &PinArgs) -> Result<()> {
+    tracing::warn!(
+        "`spice acceleration set-snapshot` is deprecated: use `spice acceleration pin {} {}`.",
+        args.dataset,
+        args.snapshot_id
+    );
     let url = format!(
         "/v1/datasets/{}/acceleration/snapshots/current",
         args.dataset
@@ -380,7 +424,7 @@ async fn print_message(
 
     let response = error::check_response(response, ctx.http_endpoint()).await?;
 
-    let result: MessageResponse = response.json().await.map_err(|e| {
+    let reply: serde_json::Value = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
             message: format!("Failed to parse response: {e}"),
         }
@@ -388,12 +432,37 @@ async fn print_message(
     })?;
 
     if matches!(output, OutputFormat::Json) {
-        return write_json(&result);
+        return write_json(&reply);
     }
 
+    let result: MessageResponse = serde_json::from_value(reply).map_err(|e| {
+        InvalidResponseSnafu {
+            message: format!("Failed to parse response: {e}"),
+        }
+        .build()
+    })?;
     tracing::info!("{}", result.message);
 
     Ok(())
+}
+
+/// The lines that describe the dataset's pin, when it is pinned.
+fn pin_lines(summary: &SnapshotSummary) -> Vec<String> {
+    let Some(pinned_id) = summary.pinned_snapshot_id else {
+        return Vec::new();
+    };
+    let since = summary
+        .pinned_at
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| format!(", since {}", at.format("%Y-%m-%d %H:%M UTC")))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Pinned Snapshot ID: {pinned_id}{since} (unpin with `spice acceleration unpin`)"
+    )];
+    if let Some(newer) = summary.newer_snapshots {
+        lines.push(format!("Newer snapshots not served: {newer}"));
+    }
+    lines
 }
 
 /// Format a timestamp in milliseconds as an RFC3339 string.
@@ -451,5 +520,75 @@ fn truncate_checksum(checksum: &str) -> String {
         format!("{}...", &checksum[..16])
     } else {
         checksum.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(pinned: Option<u64>, pinned_at: Option<i64>, newer: Option<usize>) -> SnapshotSummary {
+        SnapshotSummary {
+            dataset_name: "taxi_trips".to_string(),
+            location: "s3://my-bucket/spice/snapshots".to_string(),
+            last_updated_ms: 0,
+            engine: None,
+            current_snapshot_id: Some(41),
+            pinned_snapshot_id: pinned,
+            pinned_at,
+            newer_snapshots: newer,
+            instances: Vec::new(),
+            snapshots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_pinned_dataset_shows_when_it_was_pinned_and_the_snapshots_not_served() {
+        // 2026-10-16 10:05 UTC.
+        let lines = pin_lines(&summary(Some(41), Some(1_792_145_100_000), Some(3)));
+        assert_eq!(
+            lines,
+            vec![
+                "Pinned Snapshot ID: 41, since 2026-10-16 10:05 UTC (unpin with `spice acceleration unpin`)",
+                "Newer snapshots not served: 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_instance_shows_the_snapshot_it_serves_and_why_it_does_not_serve_the_pin() {
+        let instance = |serves, status: &str, reason: Option<&str>| InstanceStatus {
+            instance_id: "reader-1".to_string(),
+            role: "this".to_string(),
+            serves_snapshot_id: serves,
+            status: status.to_string(),
+            reason: reason.map(ToString::to_string),
+        };
+        assert_eq!(
+            instance(Some(41), "pinned", None).values(),
+            vec!["reader-1 (this)", "41", "pinned"]
+        );
+        assert_eq!(
+            instance(
+                Some(44),
+                "not_pinned",
+                Some("not enough disk for snapshot 41 (2.1 GiB needed, 1.4 GiB free)")
+            )
+            .values(),
+            vec![
+                "reader-1 (this)",
+                "44",
+                "not pinned: not enough disk for snapshot 41 (2.1 GiB needed, 1.4 GiB free)"
+            ]
+        );
+        assert_eq!(
+            instance(None, "not_pinned", None).values(),
+            vec!["reader-1 (this)", "live", "not pinned"]
+        );
+    }
+
+    #[test]
+    fn a_dataset_that_is_not_pinned_shows_no_pin() {
+        assert!(pin_lines(&summary(None, None, None)).is_empty());
     }
 }

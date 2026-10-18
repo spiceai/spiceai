@@ -116,6 +116,11 @@ pub struct LeaseRecord {
     pub lease_duration_ms: u64,
     pub acquire_time_ms: i64,
     pub renew_time_ms: i64,
+    /// What the holder reports about the state it guards, for instances that list it.
+    /// Left out when the holder reports nothing; a version of Spice that does not know
+    /// the field ignores it, so it needs no new format version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<serde_json::Value>,
 }
 
 impl LeaseRecord {
@@ -451,6 +456,8 @@ struct LeaseState {
     /// The lease as this holder last wrote it, so it can release it.
     written: Option<(UpdateVersion, LeaseRecord)>,
     renew: RenewClock,
+    /// What each write of the lease reports as [`LeaseRecord::status`].
+    status: Option<serde_json::Value>,
 }
 
 impl Lease {
@@ -467,6 +474,24 @@ impl Lease {
     #[must_use]
     pub fn with_duration(self, duration: Duration) -> Self {
         Self { duration, ..self }
+    }
+
+    /// Sets what each later write of the lease reports as [`LeaseRecord::status`].
+    /// Returns whether it changed.
+    pub fn set_status(&self, status: serde_json::Value) -> bool {
+        let mut state = self.state.lock();
+        if state.status.as_ref() == Some(&status) {
+            return false;
+        }
+        state.status = Some(status);
+        true
+    }
+
+    /// Whether this holder's last write of the lease succeeded and it has not released
+    /// it since.
+    #[must_use]
+    pub fn last_written(&self) -> bool {
+        self.state.lock().written.is_some()
     }
 
     #[must_use]
@@ -693,6 +718,7 @@ impl Lease {
             lease_duration_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
             acquire_time_ms,
             renew_time_ms,
+            status: self.state.lock().status.clone(),
         }
     }
 
@@ -880,6 +906,7 @@ mod tests {
             lease_duration_ms: u64::try_from(lease_duration.as_millis()).expect("fits"),
             acquire_time_ms: 1_000,
             renew_time_ms: 2_000,
+            status: None,
         }
     }
 
@@ -1147,6 +1174,7 @@ mod tests {
                 let record = LeaseRecord {
                     acquire_time_ms: now,
                     renew_time_ms: now,
+                    status: None,
                     ..record("skewed", generation, Duration::from_secs(30))
                 };
                 serde_json::to_vec(&record).expect("serialize")

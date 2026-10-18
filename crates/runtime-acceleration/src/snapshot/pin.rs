@@ -27,12 +27,38 @@ use super::DatasetMetadata;
 /// it reads it, so the pin survives a rewrite by an older version.
 const PINNED_PROPERTY: &str = "pinned-snapshot-id";
 
+/// The dataset property that holds when the dataset was pinned, in milliseconds since
+/// the UNIX epoch.
+const PINNED_TIME_PROPERTY: &str = "pinned-time-ms";
+
 /// The snapshot `dataset` is pinned to.
 pub(super) fn pinned_snapshot_id(dataset: &DatasetMetadata) -> Option<u64> {
     dataset
         .properties
         .get(PINNED_PROPERTY)
         .and_then(|id| id.parse().ok())
+}
+
+/// When `dataset` was pinned, in milliseconds since the UNIX epoch.
+pub(super) fn pinned_at_ms(dataset: &DatasetMetadata) -> Option<i64> {
+    pinned_snapshot_id(dataset)?;
+    dataset
+        .properties
+        .get(PINNED_TIME_PROPERTY)
+        .and_then(|ms| ms.parse().ok())
+}
+
+/// How many snapshots `dataset` lists that were published after the one it is pinned
+/// to, which it does not serve.
+pub(super) fn newer_snapshots(dataset: &DatasetMetadata) -> Option<usize> {
+    let pinned = pinned_snapshot_id(dataset)?;
+    Some(
+        dataset
+            .snapshots
+            .iter()
+            .filter(|entry| entry.snapshot_id > pinned)
+            .count(),
+    )
 }
 
 /// The snapshot `dataset` is pinned to while its snapshot list has it.
@@ -51,17 +77,28 @@ pub(super) fn current_pin(dataset: &DatasetMetadata) -> Option<u64> {
     pinned_snapshot_id(dataset).filter(|pinned| dataset.current_snapshot_id == Some(*pinned))
 }
 
-/// Makes `snapshot_id` current and pins `dataset` to it. Returns whether
+/// Makes `snapshot_id` current and pins `dataset` to it at `now_ms`. Returns whether
 /// `dataset` changed.
-pub(super) fn pin(dataset: &mut DatasetMetadata, snapshot_id: u64) -> bool {
+pub(super) fn pin(dataset: &mut DatasetMetadata, snapshot_id: u64, now_ms: i64) -> bool {
     if current_pin(dataset) == Some(snapshot_id) {
         return false;
+    }
+    if pinned_snapshot_id(dataset) != Some(snapshot_id) || pinned_at_ms(dataset).is_none() {
+        dataset
+            .properties
+            .insert(PINNED_TIME_PROPERTY.to_string(), now_ms.to_string());
     }
     dataset.current_snapshot_id = Some(snapshot_id);
     dataset
         .properties
         .insert(PINNED_PROPERTY.to_string(), snapshot_id.to_string());
     true
+}
+
+/// Removes the pin's properties. Returns whether `dataset` was pinned.
+fn remove_pin(dataset: &mut DatasetMetadata) -> bool {
+    dataset.properties.remove(PINNED_TIME_PROPERTY);
+    dataset.properties.remove(PINNED_PROPERTY).is_some()
 }
 
 /// Removes the pin and makes the newest snapshot current. Returns whether
@@ -72,7 +109,7 @@ pub(super) fn unpin(dataset: &mut DatasetMetadata) -> bool {
         .iter()
         .map(|entry| entry.snapshot_id)
         .max();
-    let removed = dataset.properties.remove(PINNED_PROPERTY).is_some();
+    let removed = remove_pin(dataset);
     let moved = dataset.current_snapshot_id != newest;
     dataset.current_snapshot_id = newest;
     removed || moved
@@ -109,7 +146,7 @@ pub(super) fn make_current_after_publish(
         .iter()
         .any(|entry| entry.snapshot_id == pinned)
     {
-        dataset.properties.remove(PINNED_PROPERTY);
+        remove_pin(dataset);
         dataset.current_snapshot_id = Some(published);
         return AfterPublish::PinRemoved {
             snapshot_id: pinned,
@@ -156,9 +193,9 @@ mod tests {
     #[test]
     fn a_pinned_snapshot_stays_current_when_a_newer_one_is_published() {
         let mut dataset = dataset(&[1, 2, 3], 3);
-        assert!(pin(&mut dataset, 1));
+        assert!(pin(&mut dataset, 1, 0));
         assert_eq!(dataset.current_snapshot_id, Some(1));
-        assert!(!pin(&mut dataset, 1), "pinning again writes nothing");
+        assert!(!pin(&mut dataset, 1, 0), "pinning again writes nothing");
         assert_eq!(listed_pin(&dataset), Some(1));
 
         dataset.snapshots.push(entry(4));
@@ -175,7 +212,7 @@ mod tests {
     #[test]
     fn a_publish_restores_a_pin_that_a_version_without_pins_moved() {
         let mut dataset = dataset(&[1, 2, 3], 3);
-        pin(&mut dataset, 1);
+        pin(&mut dataset, 1, 0);
 
         // A version without pins publishes snapshot 4: it rewrites the JSON with the new
         // entry current and keeps `properties` as it read them.
@@ -220,12 +257,42 @@ mod tests {
     #[test]
     fn unpinning_makes_the_newest_snapshot_current() {
         let mut dataset = dataset(&[1, 2, 3], 3);
-        pin(&mut dataset, 1);
+        pin(&mut dataset, 1, 0);
 
         assert!(unpin(&mut dataset));
         assert_eq!(dataset.current_snapshot_id, Some(3));
         assert_eq!(pinned_snapshot_id(&dataset), None);
         assert!(!unpin(&mut dataset), "unpinning again writes nothing");
+    }
+
+    #[test]
+    fn a_pin_records_when_it_was_set_and_counts_the_snapshots_not_served() {
+        let mut dataset = dataset(&[1, 2, 3], 3);
+        assert_eq!(pinned_at_ms(&dataset), None);
+        assert_eq!(newer_snapshots(&dataset), None);
+
+        pin(&mut dataset, 2, 1_000);
+        assert_eq!(pinned_at_ms(&dataset), Some(1_000));
+        assert_eq!(newer_snapshots(&dataset), Some(1));
+
+        dataset.snapshots.push(entry(4));
+        make_current_after_publish(&mut dataset, 4);
+        assert_eq!(newer_snapshots(&dataset), Some(2));
+        dataset.current_snapshot_id = Some(4);
+        pin(&mut dataset, 2, 2_000);
+        assert_eq!(
+            pinned_at_ms(&dataset),
+            Some(1_000),
+            "restoring a moved pin keeps its time"
+        );
+
+        pin(&mut dataset, 1, 3_000);
+        assert_eq!(pinned_at_ms(&dataset), Some(3_000), "a new pin has its own time");
+        assert_eq!(newer_snapshots(&dataset), Some(3));
+
+        unpin(&mut dataset);
+        assert_eq!(pinned_at_ms(&dataset), None);
+        assert!(dataset.properties.is_empty(), "unpinning removes the pin's properties");
     }
 
     #[test]

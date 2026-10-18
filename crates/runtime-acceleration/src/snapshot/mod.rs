@@ -68,7 +68,9 @@ use crate::dataset_checkpoint::DatasetCheckpointerFactory;
 
 mod behavior;
 pub mod directory_archive;
+mod disk;
 pub mod engine;
+pub mod instances;
 pub mod metrics;
 pub mod notifications;
 mod pin;
@@ -113,8 +115,58 @@ pub mod api {
         /// Absent when the dataset is not pinned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pinned_snapshot_id: Option<u64>,
+        /// When the dataset was pinned, in milliseconds since the UNIX epoch. Absent when
+        /// the dataset is not pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pinned_at: Option<i64>,
+        /// How many snapshots were published after the pinned one, which are not served.
+        /// Absent when the dataset is not pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub newer_snapshots: Option<usize>,
+        /// What the dataset's writer and the answering instance serve of its pin.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub instances: Vec<InstanceStatus>,
         /// The most recent snapshots, oldest first.
         pub snapshots: Vec<SnapshotInfo>,
+    }
+
+    /// What one Spice instance serves of a dataset's pin.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    pub struct InstanceStatus {
+        /// The instance's `SPICE_INSTANCE_ID`.
+        pub instance_id: String,
+        /// `writer` for the instance that holds the dataset's snapshot writer lease, as
+        /// the lease records it; `this` for the answering instance when it is not the
+        /// writer.
+        pub role: InstanceRole,
+        /// The snapshot the instance serves. Absent while an instance that refreshes the
+        /// dataset from its source serves its live data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub serves_snapshot_id: Option<u64>,
+        /// Whether the instance serves the snapshot the dataset is pinned to.
+        pub status: PinServing,
+        /// Why the instance does not serve the pin, while the dataset is pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+    }
+
+    /// Which instance an [`InstanceStatus`] describes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[serde(rename_all = "snake_case")]
+    pub enum InstanceRole {
+        Writer,
+        This,
+    }
+
+    /// Whether an instance serves the snapshot its dataset is pinned to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    #[serde(rename_all = "snake_case")]
+    pub enum PinServing {
+        Pinned,
+        NotPinned,
     }
 
     /// Information about a single snapshot.
@@ -144,6 +196,18 @@ pub mod api {
         /// `verified` when the file exists with the recorded size, `unverified` when
         /// its size differs, and empty when the file is gone.
         pub status: String,
+    }
+
+    /// The reply to pinning a dataset to a snapshot.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+    pub struct PinSnapshotResponse {
+        /// What the pin does.
+        pub message: String,
+        /// What the dataset's writer and the answering instance serve of the pin, as in
+        /// the dataset's snapshot list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub instances: Vec<InstanceStatus>,
     }
 
     /// Request body for pinning a dataset to a snapshot.
@@ -364,6 +428,19 @@ pub struct SnapshotPoll {
     /// The `ETag` of the metadata this poll acted on, when the store reports one. Passing
     /// it to the next poll lets that poll skip entirely if the metadata has not changed.
     pub metadata_e_tag: Option<String>,
+    /// The dataset's pin, as this poll read it.
+    pub pin: PinRead,
+}
+
+/// What a [`SnapshotPoll`] read of the dataset's pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRead {
+    /// The poll read no metadata: it had not changed since the poll it was read by.
+    Unchanged,
+    /// The dataset is pinned to this snapshot, which is current.
+    Pinned(u64),
+    /// The dataset is not pinned to its current snapshot.
+    NotPinned,
 }
 
 /// A dataset's current snapshot as its `metadata.json` records it: what a dataset that
@@ -665,6 +742,17 @@ pub enum SnapshotDownloadError {
     ArchiveExtract {
         path: PathBuf,
         source: std::io::Error,
+    },
+    #[snafu(display(
+        "Not enough free disk space at {} to restore snapshot {snapshot_id} of dataset {dataset}: {needed} bytes needed, {free} bytes free",
+        path.display()
+    ))]
+    NotEnoughDisk {
+        dataset: String,
+        snapshot_id: u64,
+        path: PathBuf,
+        needed: u64,
+        free: u64,
     },
 }
 
@@ -1816,19 +1904,28 @@ impl SnapshotManager {
                 return Ok(SnapshotPoll {
                     download: None,
                     metadata_e_tag: known_metadata_e_tag.map(str::to_string),
+                    pin: PinRead::Unchanged,
                 });
             }
             MetadataRead::Current(None) => {
                 return Ok(SnapshotPoll {
                     download: None,
                     metadata_e_tag: None,
+                    pin: PinRead::NotPinned,
                 });
             }
             MetadataRead::Current(Some(handle)) => Arc::new(handle),
         };
+        let pin = handle
+            .metadata
+            .datasets
+            .get(&self.dataset_name)
+            .and_then(pin::current_pin)
+            .map_or(PinRead::NotPinned, PinRead::Pinned);
         let nothing_newer = SnapshotPoll {
             download: None,
             metadata_e_tag: handle.e_tag(),
+            pin,
         };
         let Some(dataset_metadata) = handle.metadata.datasets.get(&self.dataset_name) else {
             return Ok(nothing_newer);
@@ -1866,6 +1963,7 @@ impl SnapshotManager {
                 return Ok(SnapshotPoll {
                     download: None,
                     metadata_e_tag: None,
+                    pin,
                 });
             }
             return Ok(nothing_newer);
@@ -1895,6 +1993,18 @@ impl SnapshotManager {
                     },
                 ));
             }
+        }
+
+        // An instance that serves a snapshot keeps serving it rather than start restoring a
+        // pinned one its disk has no room for.
+        if current_local_id.is_some()
+            && pin::current_pin(dataset_metadata) == Some(remote_id)
+            && let Some(entry) = dataset_metadata
+                .snapshots
+                .iter()
+                .find(|entry| entry.snapshot_id == remote_id)
+        {
+            self.require_space(entry).map_err(RetryError::permanent)?;
         }
 
         let e_tag = handle.e_tag();
@@ -1932,6 +2042,7 @@ impl SnapshotManager {
         Ok(SnapshotPoll {
             download,
             metadata_e_tag: e_tag.filter(|_| loaded_current),
+            pin,
         })
     }
 
@@ -2746,11 +2857,6 @@ impl SnapshotManager {
         &self,
         snapshot_id: u64,
     ) -> Result<SnapshotDownloadInfo, SnapshotDownloadError> {
-        let checkpointer_factory = Arc::clone(
-            self.checkpointer_factory
-                .as_ref()
-                .context(CheckpointerFactoryNotSetSnafu)?,
-        );
         let not_found = || SnapshotDownloadError::SnapshotNotFound {
             dataset: self.dataset_name.clone(),
             snapshot_id,
@@ -2766,6 +2872,12 @@ impl SnapshotManager {
             .iter()
             .find(|entry| entry.snapshot_id == snapshot_id)
             .ok_or_else(not_found)?;
+        self.require_space(entry)?;
+        let checkpointer_factory = Arc::clone(
+            self.checkpointer_factory
+                .as_ref()
+                .context(CheckpointerFactoryNotSetSnafu)?,
+        );
         self.download_snapshot_entry(
             entry,
             dataset_metadata,
@@ -2773,6 +2885,20 @@ impl SnapshotManager {
             checkpointer_factory,
         )
         .await
+    }
+
+    /// Refuses to restore `entry` to a disk without room for all of it.
+    fn require_space(&self, entry: &SnapshotEntry) -> Result<(), SnapshotDownloadError> {
+        match disk::shortfall(&self.layout, entry.snapshot_size, &std::env::temp_dir()) {
+            None => Ok(()),
+            Some(short) => Err(SnapshotDownloadError::NotEnoughDisk {
+                dataset: self.dataset_name.clone(),
+                snapshot_id: entry.snapshot_id,
+                path: short.path,
+                needed: short.needed,
+                free: short.free,
+            }),
+        }
     }
 
     /// Downloads the current snapshot described by `pinned`, or by a fresh metadata read
@@ -4090,6 +4216,8 @@ impl SnapshotManager {
 
         let current_snapshot_id = dataset_metadata.current_snapshot_id;
         let pinned_snapshot_id = pin::pinned_snapshot_id(&dataset_metadata);
+        let pinned_at = pin::pinned_at_ms(&dataset_metadata);
+        let newer_snapshots = pin::newer_snapshots(&dataset_metadata);
         let dataset_engine = dataset_metadata.engine.clone();
 
         // Take only the last `limit` entries (most recent) to avoid unnecessary
@@ -4153,6 +4281,9 @@ impl SnapshotManager {
             engine: dataset_engine,
             current_snapshot_id,
             pinned_snapshot_id,
+            pinned_at,
+            newer_snapshots,
+            instances: Vec::new(),
             snapshots,
         })
     }
@@ -4347,7 +4478,7 @@ impl SnapshotManager {
             }
             // Already pinned there: nothing to write. This also recognizes an earlier
             // attempt whose write landed but whose response was lost.
-            if !pin::pin(dataset_entry, snapshot_id) {
+            if !pin::pin(dataset_entry, snapshot_id, Utc::now().timestamp_millis()) {
                 return Ok(None);
             }
             metadata.last_updated_ms = Utc::now().timestamp_millis();
@@ -5451,6 +5582,7 @@ mod tests {
             SnapshotPoll {
                 download: None,
                 metadata_e_tag: Some(e_tag.clone()),
+                pin: PinRead::Unchanged,
             }
         );
 
@@ -11058,7 +11190,75 @@ mod tests {
             .download_if_newer(Some(2), None, None)
             .await
             .expect("poll");
+        assert_eq!(poll.pin, PinRead::Pinned(0));
         assert_eq!(poll.download.map(|info| info.snapshot_id), Some(0));
+    }
+
+    /// A serving reader whose disk has no room for the pinned snapshot keeps the snapshot
+    /// it loaded, and says why; so does a writer's copy of it.
+    #[tokio::test]
+    async fn a_pinned_snapshot_the_disk_has_no_room_for_is_not_restored() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        writer
+            .set_current_snapshot(0)
+            .await
+            .expect("pin snapshot 0");
+        // Recorded larger than any disk, so no disk has room for it.
+        edit_dataset(store.as_ref(), &metadata_path, |dataset| {
+            dataset.snapshots[0].snapshot_size = u64::MAX / 4;
+        })
+        .await;
+        let reader_dir = TempDir::new().expect("tempdir");
+        let restored = reader_dir.path().join("restored.db");
+        std::fs::write(&restored, "snapshot 2").expect("the loaded snapshot");
+        let reader = build_manager_for_engine(
+            Arc::clone(&store),
+            restored.clone(),
+            BootstrapOnFailureBehavior::Fallback,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+
+        let refused = reader.download_if_newer(Some(2), None, None).await;
+        assert!(
+            matches!(
+                refused,
+                Err(SnapshotDownloadError::NotEnoughDisk { snapshot_id: 0, needed, free, .. })
+                    if needed > free
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&restored).expect("restored"),
+            "snapshot 2",
+            "the loaded snapshot is kept"
+        );
+        assert!(
+            matches!(
+                reader.download_snapshot(0).await,
+                Err(SnapshotDownloadError::NotEnoughDisk { snapshot_id: 0, .. })
+            ),
+            "a writer's copy of the pin is refused too"
+        );
     }
 
     /// A writer serving its pin downloads the pinned snapshot by id into a second copy,

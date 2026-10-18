@@ -27,6 +27,7 @@ use axum::{
 };
 #[cfg(not(feature = "snapshots"))]
 use runtime_acceleration::snapshot::SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE;
+use runtime_acceleration::snapshot::instances::{InstanceReport, instance_statuses};
 use runtime_acceleration::snapshot::{
     SnapshotApiError, SnapshotBehavior, SnapshotManager, Unpinned, api,
 };
@@ -94,6 +95,23 @@ pub struct ListSnapshotsQuery {
                 "engine": "duckdb",
                 "current_snapshot_id": 41,
                 "pinned_snapshot_id": 41,
+                "pinned_at": 1_792_145_100_000_i64,
+                "newer_snapshots": 3,
+                "instances": [
+                    {
+                        "instance_id": "writer-0",
+                        "role": "writer",
+                        "serves_snapshot_id": 41,
+                        "status": "pinned"
+                    },
+                    {
+                        "instance_id": "reader-1",
+                        "role": "this",
+                        "serves_snapshot_id": 44,
+                        "status": "not_pinned",
+                        "reason": "not enough disk for snapshot 41 (2.1 GiB needed, 1.4 GiB free)"
+                    }
+                ],
                 "snapshots": [{
                     "snapshot_id": 41,
                     "timestamp_ms": 1_792_139_520_000_i64,
@@ -160,7 +178,10 @@ pub async fn list_snapshots(
         drop(app_lock);
         let limit = query.limit.unwrap_or(DEFAULT_SNAPSHOTS_LIMIT);
         return match snapshot_manager.get_snapshot_summary(limit).await {
-            Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+            Ok(summary) => {
+                let summary = with_instances(summary, &rt, &snapshot_manager).await;
+                (StatusCode::OK, Json(summary)).into_response()
+            }
             Err(e) => snapshot_api_error_to_response(&e),
         };
     }
@@ -209,9 +230,42 @@ pub async fn list_snapshots(
 
     let limit = query.limit.unwrap_or(DEFAULT_SNAPSHOTS_LIMIT);
     match snapshot_manager.get_snapshot_summary(limit).await {
-        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(summary) => {
+            let summary = with_instances(summary, &rt, &snapshot_manager).await;
+            (StatusCode::OK, Json(summary)).into_response()
+        }
         Err(e) => snapshot_api_error_to_response(&e),
     }
+}
+
+/// `summary` with what the dataset's writer and this instance serve of its pin.
+async fn with_instances(
+    mut summary: api::SnapshotSummary,
+    rt: &Runtime,
+    manager: &SnapshotManager,
+) -> api::SnapshotSummary {
+    summary.instances = instances(summary.pinned_snapshot_id, rt, manager, &summary.dataset_name).await;
+    summary
+}
+
+/// What `dataset_name`'s writer, as its lease records it, and this instance serve of a
+/// pin to `pinned`.
+async fn instances(
+    pinned: Option<u64>,
+    rt: &Runtime,
+    manager: &SnapshotManager,
+    dataset_name: &str,
+) -> Vec<api::InstanceStatus> {
+    let this = rt
+        .datafusion()
+        .pin_state(dataset_name)
+        .await
+        .map(|state| InstanceReport {
+            instance_id: util::instance_id::instance_id().to_string(),
+            serves: state.serves,
+            not_served: state.not_served.map(|reason| reason.to_string()),
+        });
+    instance_statuses(pinned, manager.writer_lease_holder().await, this)
 }
 
 /// Get Dataset Snapshot
@@ -356,9 +410,24 @@ pub async fn get_snapshot(
     ),
     responses(
         (status = 200, description = "The dataset is pinned", content((
-            MessageResponse = "application/json",
+            api::PinSnapshotResponse = "application/json",
             example = json!({
-                "message": "Dataset taxi_trips is pinned to snapshot 41. Every instance serves it once loaded; readers load it at their next check. Newer snapshots are published but not served until you unpin with DELETE /v1/datasets/taxi_trips/acceleration/snapshots/pin."
+                "message": "Dataset taxi_trips is pinned to snapshot 41. Every instance serves it once loaded; readers load it at their next check. Newer snapshots are published but not served until you unpin with DELETE /v1/datasets/taxi_trips/acceleration/snapshots/pin.",
+                "instances": [
+                    {
+                        "instance_id": "writer-0",
+                        "role": "writer",
+                        "status": "not_pinned",
+                        "reason": "loads it at its next check"
+                    },
+                    {
+                        "instance_id": "reader-1",
+                        "role": "this",
+                        "serves_snapshot_id": 44,
+                        "status": "not_pinned",
+                        "reason": "loads it at its next check"
+                    }
+                ]
             })
         ))),
         (status = 404, description = "Dataset or snapshot not found", content((
@@ -379,21 +448,55 @@ pub async fn pin_snapshot(
     Path(dataset_name): Path<String>,
     Json(request): Json<api::PinSnapshotRequest>,
 ) -> Response {
-    let snapshot_manager = match writable_snapshot_manager(&app, &rt, &dataset_name).await {
+    pin(&app, &rt, &dataset_name, request.snapshot_id, None).await
+}
+
+/// Pins a dataset to a snapshot, as [`pin_snapshot`] does, for the deprecated
+/// `POST /v1/datasets/{name}/acceleration/snapshots/current`. The reply names the
+/// replacement.
+pub async fn set_current_snapshot(
+    Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
+    Extension(rt): Extension<Arc<Runtime>>,
+    Path(dataset_name): Path<String>,
+    Json(request): Json<api::PinSnapshotRequest>,
+) -> Response {
+    let notice = set_current_deprecation(&dataset_name);
+    pin(&app, &rt, &dataset_name, request.snapshot_id, Some(notice)).await
+}
+
+fn set_current_deprecation(dataset_name: &str) -> String {
+    format!(
+        "POST /v1/datasets/{dataset_name}/acceleration/snapshots/current is deprecated: use PUT /v1/datasets/{dataset_name}/acceleration/snapshots/pin."
+    )
+}
+
+/// Pins `dataset_name` to `snapshot_id`, and replies with the pin's message followed by
+/// `notice`.
+async fn pin(
+    app: &RwLock<Option<Arc<App>>>,
+    rt: &Runtime,
+    dataset_name: &str,
+    snapshot_id: u64,
+    notice: Option<String>,
+) -> Response {
+    let snapshot_manager = match writable_snapshot_manager(app, rt, dataset_name).await {
         Ok(manager) => manager,
         Err(response) => return *response,
     };
-    match snapshot_manager
-        .set_current_snapshot(request.snapshot_id)
-        .await
-    {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(MessageResponse {
-                message: pinned_message(&dataset_name, request.snapshot_id),
-            }),
-        )
-            .into_response(),
+    match snapshot_manager.set_current_snapshot(snapshot_id).await {
+        Ok(()) => {
+            let mut message = pinned_message(dataset_name, snapshot_id);
+            if let Some(notice) = notice {
+                message.push(' ');
+                message.push_str(&notice);
+            }
+            let instances = instances(Some(snapshot_id), rt, &snapshot_manager, dataset_name).await;
+            (
+                StatusCode::OK,
+                Json(api::PinSnapshotResponse { message, instances }),
+            )
+                .into_response()
+        }
         Err(e) => snapshot_api_error_to_response(&e),
     }
 }
@@ -722,6 +825,17 @@ mod tests {
         .await;
 
         assert_enterprise_only_response(
+            set_current_snapshot(
+                Extension(Arc::clone(&app)),
+                Extension(Arc::clone(&runtime)),
+                Path("test_dataset".to_string()),
+                Json(api::PinSnapshotRequest { snapshot_id: 1 }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_enterprise_only_response(
             unpin_snapshot(
                 Extension(app),
                 Extension(runtime),
@@ -745,6 +859,14 @@ mod reply_tests {
         assert_eq!(
             pinned_message("taxi_trips", 41),
             "Dataset taxi_trips is pinned to snapshot 41. Every instance serves it once loaded; readers load it at their next check. Newer snapshots are published but not served until you unpin with DELETE /v1/datasets/taxi_trips/acceleration/snapshots/pin."
+        );
+    }
+
+    #[test]
+    fn the_deprecated_set_current_reply_names_the_replacement() {
+        assert_eq!(
+            set_current_deprecation("taxi_trips"),
+            "POST /v1/datasets/taxi_trips/acceleration/snapshots/current is deprecated: use PUT /v1/datasets/taxi_trips/acceleration/snapshots/pin."
         );
     }
 

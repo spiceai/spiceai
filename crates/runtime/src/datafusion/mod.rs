@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
+use crate::accelerated::pinned::{NotServed, PinnedCopyLoader};
 use crate::accelerated::refresh::{self, RefreshOverrides};
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
@@ -126,6 +127,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
     not(windows)
 ))]
 use runtime_acceleration::snapshot::SnapshotManager;
+use runtime_acceleration::snapshot::instances::WriterStatus;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
@@ -4521,35 +4523,69 @@ impl DataFusion {
         }
 
         // An instance that publishes the dataset's snapshots serves its pinned snapshot
-        // from a second copy while it keeps refreshing the live one.
-        if let Some(publisher) = snapshot_publisher
-            && refresh_mode != RefreshMode::Caching
-            && let Some(acceleration_engine) =
+        // from a second copy while it keeps refreshing the live one. One that cannot
+        // still reads the pin, to report why it does not serve it.
+        if let Some(publisher) = snapshot_publisher {
+            let copies = if refresh_mode == RefreshMode::Caching {
+                None
+            } else if let Some(acceleration_engine) =
                 engine_to_acceleration_engine(acceleration_settings.engine)
-            && let Some(accelerator) = self
-                .accelerator_engine_registry
-                .get_accelerator_engine(acceleration_settings.engine)
+                && let Some(accelerator) = self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+            {
+                pinned_copies::PinnedSnapshotCopies::new(
+                    dataset,
+                    accelerator,
+                    Arc::clone(&self.accelerator_engine_registry),
+                    acceleration_engine,
+                    Arc::clone(&publisher),
+                    Arc::clone(&storage_schema),
+                    constraints.clone(),
+                    Arc::clone(&secrets),
+                    Arc::clone(&self.ctx),
+                )
                 .await
-            && let Some(copies) = pinned_copies::PinnedSnapshotCopies::new(
-                dataset,
-                accelerator,
-                Arc::clone(&self.accelerator_engine_registry),
-                acceleration_engine,
-                publisher,
-                Arc::clone(&storage_schema),
-                constraints.clone(),
-                Arc::clone(&secrets),
-                Arc::clone(&self.ctx),
-            )
-            .await
-        {
+            } else {
+                None
+            };
             // A refresh that streams never completes, and a dataset without a refresh
             // schedule may not refresh again, so those check for a pin on a timer too.
             let streams = matches!(refresh_mode, RefreshMode::Changes)
                 || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
             let period = (streams || dataset.refresh_check_interval().is_none())
                 .then_some(DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL);
-            accelerated_table_builder.pinned_copy_loader(Arc::new(copies), period);
+            let loader: Arc<dyn PinnedCopyLoader> = match copies {
+                Some(copies) => Arc::new(copies),
+                None => Arc::new(pinned_copies::PinNotServed {
+                    publisher: Arc::clone(&publisher),
+                    reason: if refresh_mode == RefreshMode::Caching {
+                        NotServed::CachingMode
+                    } else {
+                        NotServed::LoadFailed {
+                            reason: "this instance cannot make a local copy of the dataset's acceleration".to_string(),
+                        }
+                    },
+                }),
+            };
+            accelerated_table_builder.pinned_copy_loader(loader, period);
+            // The writer lease records what the writer serves of the pin, for listings.
+            let mut pin_state = accelerated_table_builder.pin_status().subscribe();
+            self.io_runtime.spawn(async move {
+                loop {
+                    let state = pin_state.borrow_and_update().clone();
+                    publisher
+                        .report_writer_status(&WriterStatus {
+                            serves_snapshot_id: state.serves,
+                            not_served: state.not_served.map(|reason| reason.to_string()),
+                        })
+                        .await;
+                    if pin_state.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
         }
 
         accelerated_table_builder.snapshot_refresh_state(snapshot_refresh_state);
@@ -6265,6 +6301,13 @@ impl DataFusion {
         Ok(())
     }
 
+    /// What this instance serves of `dataset_name`'s pin, when it accelerates the dataset.
+    pub async fn pin_state(&self, dataset_name: &str) -> Option<crate::accelerated::pinned::PinState> {
+        let table = self.get_accelerated_table_provider(dataset_name).await.ok()?;
+        spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read)
+            .map(|table| table.pin_status().get())
+    }
+
     pub async fn get_accelerated_table_provider(
         &self,
         dataset_name: &str,
@@ -7695,6 +7738,7 @@ async fn build_snapshot_refresh_state(
         provider_factory,
         current_snapshot_id,
         metadata_e_tag: Arc::default(),
+        pin_status: Arc::default(),
     })
 }
 

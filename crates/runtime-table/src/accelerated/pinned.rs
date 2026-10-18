@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -34,6 +34,115 @@ pub type CopyLease = Arc<dyn Any + Send + Sync>;
 /// How often a stopped watcher's copies are checked for scans that still read them.
 const RELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Why an instance does not serve the snapshot its dataset is pinned to. It keeps
+/// serving what it served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotServed {
+    /// The disk has too little free space to restore the pinned snapshot.
+    NotEnoughDisk {
+        snapshot_id: u64,
+        needed: u64,
+        free: u64,
+    },
+    /// The pinned snapshot could not be loaded.
+    LoadFailed { reason: String },
+    /// The dataset uses `refresh_mode: caching`, which serves no pin.
+    CachingMode,
+}
+
+impl std::fmt::Display for NotServed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnoughDisk {
+                snapshot_id,
+                needed,
+                free,
+            } => write!(
+                f,
+                "not enough disk for snapshot {snapshot_id} ({} needed, {} free)",
+                human_bytes(*needed),
+                human_bytes(*free)
+            ),
+            Self::LoadFailed { reason } => write!(f, "the pinned copy failed to load: {reason}"),
+            Self::CachingMode => write!(f, "caching mode"),
+        }
+    }
+}
+
+/// `bytes` in the largest binary unit it reaches, to one decimal: `2.1 GiB`.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+    for (unit, size) in UNITS {
+        if bytes >= size {
+            let tenths = (u128::from(bytes) * 10 + u128::from(size) / 2) / u128::from(size);
+            return format!("{}.{} {unit}", tenths / 10, tenths % 10);
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// What an accelerated table serves of its dataset's pin.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PinState {
+    /// The snapshot the dataset is pinned to, as the table last read it.
+    pub pinned: Option<u64>,
+    /// The snapshot the table serves: the pinned copy's on an instance that refreshes
+    /// from the source, the loaded one on a reader. `None` while an instance that
+    /// refreshes from the source serves its live data.
+    pub serves: Option<u64>,
+    /// Why the table does not serve `pinned`.
+    pub not_served: Option<NotServed>,
+}
+
+impl PinState {
+    /// Whether the table serves the snapshot its dataset is pinned to.
+    #[must_use]
+    pub fn serves_pin(&self) -> bool {
+        self.pinned.is_some() && self.serves == self.pinned
+    }
+}
+
+/// A table's [`PinState`], shared by what loads its pinned snapshot, its scans, and
+/// what reports it.
+#[derive(Debug)]
+pub struct PinStatus(watch::Sender<PinState>);
+
+impl Default for PinStatus {
+    fn default() -> Self {
+        Self(watch::Sender::new(PinState::default()))
+    }
+}
+
+impl PinStatus {
+    #[must_use]
+    pub fn get(&self) -> PinState {
+        self.0.borrow().clone()
+    }
+
+    /// Whether the table serves the snapshot its dataset is pinned to.
+    #[must_use]
+    pub fn serves_pin(&self) -> bool {
+        self.0.borrow().serves_pin()
+    }
+
+    /// The state, and each change to it.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<PinState> {
+        self.0.subscribe()
+    }
+
+    /// Replaces the state. Returns whether it changed.
+    pub fn set(&self, state: PinState) -> bool {
+        self.0.send_if_modified(|current| {
+            if *current == state {
+                return false;
+            }
+            *current = state;
+            true
+        })
+    }
+}
+
 /// Loads and releases the local copies of a dataset's pinned snapshot.
 #[async_trait]
 pub trait PinnedCopyLoader: Send + Sync {
@@ -41,7 +150,7 @@ pub trait PinnedCopyLoader: Send + Sync {
     async fn pinned_snapshot(&self) -> Result<Option<u64>, BoxError>;
 
     /// Downloads snapshot `snapshot_id` into a new local copy and opens it.
-    async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, BoxError>;
+    async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, NotServed>;
 
     /// Closes and deletes the copy of `snapshot_id`, including a partial one left by a
     /// failed [`Self::load`].
@@ -136,6 +245,7 @@ pub struct PinWatcher {
     dataset_name: String,
     loader: Arc<dyn PinnedCopyLoader>,
     serving: Arc<PinnedServing>,
+    status: Arc<PinStatus>,
     /// Copies no longer served that a query may still read.
     retired: Vec<RetiredCopy>,
     /// Called after the served data changes, to drop what was cached from the old data.
@@ -147,20 +257,23 @@ impl PinWatcher {
         dataset_name: impl Into<String>,
         loader: Arc<dyn PinnedCopyLoader>,
         serving: Arc<PinnedServing>,
+        status: Arc<PinStatus>,
         on_change: Box<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
     ) -> Self {
         Self {
             dataset_name: dataset_name.into(),
             loader,
             serving,
+            status,
             retired: Vec::new(),
             on_change,
         }
     }
 
     /// Reads the dataset's pin and serves the copy it names: loads a newly pinned
-    /// snapshot, and serves the live data when the dataset is unpinned or the pinned
-    /// snapshot cannot be loaded. Then releases each retired copy no scan reads.
+    /// snapshot, and serves the live data when the dataset is unpinned. A pinned snapshot
+    /// that cannot be loaded leaves the table serving what it served. Then releases each
+    /// retired copy no scan reads.
     pub async fn check(&mut self) {
         self.follow_pin().await;
         self.retired =
@@ -182,9 +295,14 @@ impl PinWatcher {
         let current = self.serving.current();
 
         match (pinned, current) {
-            (None, None) => {}
-            (Some(pinned), Some(current)) if current.snapshot_id == pinned => {}
+            (None, None) => {
+                self.report(None, None, None);
+            }
+            (Some(pinned), Some(current)) if current.snapshot_id == pinned => {
+                self.report(Some(pinned), Some(pinned), None);
+            }
             (None, Some(current)) => {
+                self.report(None, None, None);
                 self.serving.replace(None);
                 self.retire(&current);
                 tracing::info!(
@@ -219,6 +337,7 @@ impl PinWatcher {
                 match copy {
                     Ok(copy) => {
                         self.serving.replace(Some(copy));
+                        self.report(Some(pinned), Some(pinned), None);
                         if let Some(current) = &current {
                             self.retire(current);
                         }
@@ -229,22 +348,33 @@ impl PinWatcher {
                         );
                         (self.on_change)().await;
                     }
-                    Err(err) => {
+                    Err(not_served) => {
                         self.loader.release(pinned).await;
-                        if let Some(current) = &current {
-                            self.serving.replace(None);
-                            self.retire(current);
-                            (self.on_change)().await;
+                        let serves = current.as_ref().map(|current| current.snapshot_id);
+                        if self.report(Some(pinned), serves, Some(not_served.clone())) {
+                            let served = serves.map_or_else(
+                                || "its live data".to_string(),
+                                |id| format!("snapshot {id}"),
+                            );
+                            tracing::warn!(
+                                dataset = %self.dataset_name,
+                                "Dataset '{}' is pinned to snapshot {pinned}, but this instance does not serve it, so it keeps serving {served} and tries again at its next refresh: {not_served}",
+                                self.dataset_name
+                            );
                         }
-                        tracing::error!(
-                            dataset = %self.dataset_name,
-                            "Dataset '{}' is pinned to snapshot {pinned}, but the snapshot could not be loaded, so the dataset serves its live data until the next refresh tries again: {err}",
-                            self.dataset_name
-                        );
                     }
                 }
             }
         }
+    }
+
+    /// Records what the table serves of the pin. Returns whether that changed.
+    fn report(&self, pinned: Option<u64>, serves: Option<u64>, not_served: Option<NotServed>) -> bool {
+        self.status.set(PinState {
+            pinned,
+            serves,
+            not_served,
+        })
     }
 
     fn retire(&mut self, copy: &PinnedCopy) {
@@ -319,10 +449,12 @@ mod tests {
             Ok(*self.pinned.lock())
         }
 
-        async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, BoxError> {
+        async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, NotServed> {
             self.loaded.lock().push(snapshot_id);
             if self.failing.lock().contains(&snapshot_id) {
-                return Err(format!("snapshot {snapshot_id} is unreadable").into());
+                return Err(NotServed::LoadFailed {
+                    reason: format!("snapshot {snapshot_id} is unreadable"),
+                });
             }
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
             Ok(Arc::new(EmptyTable::new(schema)))
@@ -334,19 +466,33 @@ mod tests {
     }
 
     fn watcher(loader: &Arc<FakeLoader>) -> (PinWatcher, Arc<PinnedServing>, Arc<AtomicUsize>) {
+        let (watcher, serving, _, changes) = watcher_reporting(loader);
+        (watcher, serving, changes)
+    }
+
+    fn watcher_reporting(
+        loader: &Arc<FakeLoader>,
+    ) -> (
+        PinWatcher,
+        Arc<PinnedServing>,
+        Arc<PinStatus>,
+        Arc<AtomicUsize>,
+    ) {
         let serving = Arc::new(PinnedServing::default());
+        let status = Arc::new(PinStatus::default());
         let changes = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&changes);
         let watcher = PinWatcher::new(
             "taxi_trips",
             Arc::clone(loader) as Arc<dyn PinnedCopyLoader>,
             Arc::clone(&serving),
+            Arc::clone(&status),
             Box::new(move || {
                 counter.fetch_add(1, Ordering::Relaxed);
                 Box::pin(async {})
             }),
         );
-        (watcher, serving, changes)
+        (watcher, serving, status, changes)
     }
 
     #[tokio::test]
@@ -468,9 +614,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pin_that_cannot_be_loaded_serves_live_data_and_is_retried_at_each_check() {
+    async fn a_pin_that_cannot_be_loaded_keeps_what_is_served_and_is_retried_at_each_check() {
         let loader = Arc::new(FakeLoader::default());
-        let (mut watcher, serving, _) = watcher(&loader);
+        let (mut watcher, serving, status, _) = watcher_reporting(&loader);
         *loader.pinned.lock() = Some(41);
         watcher.check().await;
 
@@ -479,17 +625,27 @@ mod tests {
         watcher.check().await;
         assert_eq!(
             serving.snapshot_id(),
-            None,
-            "the old pin is not served once the dataset is pinned elsewhere"
+            Some(41),
+            "the copy served is kept while the new pin cannot be loaded"
         );
         assert_eq!(
             *loader.released.lock(),
-            vec![40, 41],
-            "the failed load's partial copy and the replaced copy are released"
+            vec![40],
+            "the failed load's partial copy is released"
+        );
+        assert_eq!(
+            status.get(),
+            PinState {
+                pinned: Some(40),
+                serves: Some(41),
+                not_served: Some(NotServed::LoadFailed {
+                    reason: "snapshot 40 is unreadable".to_string()
+                }),
+            }
         );
 
         watcher.check().await;
-        assert_eq!(serving.snapshot_id(), None);
+        assert_eq!(serving.snapshot_id(), Some(41));
         assert_eq!(
             *loader.loaded.lock(),
             vec![41, 40, 40],
@@ -499,5 +655,48 @@ mod tests {
         loader.failing.lock().clear();
         watcher.check().await;
         assert_eq!(serving.snapshot_id(), Some(40));
+        assert!(status.serves_pin());
+        assert_eq!(*loader.released.lock(), vec![40, 40, 41]);
+    }
+
+    #[tokio::test]
+    async fn the_status_reports_the_pin_served_and_live_data_once_unpinned() {
+        let loader = Arc::new(FakeLoader::default());
+        let (mut watcher, _, status, _) = watcher_reporting(&loader);
+        loader.failing.lock().insert(41);
+        *loader.pinned.lock() = Some(41);
+        watcher.check().await;
+        assert_eq!(status.get().serves, None, "live data while the pin cannot load");
+        assert!(!status.serves_pin());
+
+        loader.failing.lock().clear();
+        watcher.check().await;
+        assert_eq!(
+            status.get(),
+            PinState {
+                pinned: Some(41),
+                serves: Some(41),
+                not_served: None,
+            }
+        );
+
+        *loader.pinned.lock() = None;
+        watcher.check().await;
+        assert_eq!(status.get(), PinState::default());
+    }
+
+    #[test]
+    fn a_reason_names_the_disk_space_needed_and_free() {
+        let not_served = NotServed::NotEnoughDisk {
+            snapshot_id: 41,
+            needed: 2_254_857_830,
+            free: 1_503_238_553,
+        };
+        assert_eq!(
+            not_served.to_string(),
+            "not enough disk for snapshot 41 (2.1 GiB needed, 1.4 GiB free)"
+        );
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(64 * 1024 * 1024), "64.0 MiB");
     }
 }

@@ -452,7 +452,7 @@ pub(crate) fn routes(
         )
         .route(
             "/v1/datasets/{name}/acceleration/snapshots/current",
-            post(v1::snapshots::pin_snapshot),
+            post(v1::snapshots::set_current_snapshot),
         )
         .route(
             "/v1/datasets/{name}/acceleration/snapshots/pin",

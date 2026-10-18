@@ -28,10 +28,10 @@ use datafusion::common::Constraints;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
 use runtime_acceleration::acceleration::Mode;
-use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotManager};
+use runtime_acceleration::snapshot::{AccelerationEngine, SnapshotDownloadError, SnapshotManager};
 use tokio::sync::RwLock;
 
-use crate::accelerated::pinned::{BoxError, PinnedCopyLoader};
+use crate::accelerated::pinned::{BoxError, NotServed, PinnedCopyLoader};
 use crate::component::dataset::Dataset;
 use crate::dataaccelerator::{AcceleratorEngineRegistry, DataAccelerator};
 use crate::secrets::Secrets;
@@ -177,15 +177,8 @@ impl PinnedSnapshotCopies {
             .await?;
         Ok(downloaded.schema)
     }
-}
 
-#[async_trait]
-impl PinnedCopyLoader for PinnedSnapshotCopies {
-    async fn pinned_snapshot(&self) -> Result<Option<u64>, BoxError> {
-        Ok(self.publisher.pinned_snapshot().await?)
-    }
-
-    async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, BoxError> {
+    async fn open(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, BoxError> {
         let copy = self
             .copy_dataset(snapshot_id)
             .ok_or("its acceleration engine cannot hold a second copy")?;
@@ -211,6 +204,33 @@ impl PinnedCopyLoader for PinnedSnapshotCopies {
             )
             .await?)
     }
+}
+
+#[async_trait]
+impl PinnedCopyLoader for PinnedSnapshotCopies {
+    async fn pinned_snapshot(&self) -> Result<Option<u64>, BoxError> {
+        Ok(self.publisher.pinned_snapshot().await?)
+    }
+
+    async fn load(&self, snapshot_id: u64) -> Result<Arc<dyn TableProvider>, NotServed> {
+        self.open(snapshot_id).await.map_err(|err| {
+            match err.downcast_ref::<SnapshotDownloadError>() {
+                Some(SnapshotDownloadError::NotEnoughDisk {
+                    snapshot_id,
+                    needed,
+                    free,
+                    ..
+                }) => NotServed::NotEnoughDisk {
+                    snapshot_id: *snapshot_id,
+                    needed: *needed,
+                    free: *free,
+                },
+                _ => NotServed::LoadFailed {
+                    reason: err.to_string(),
+                },
+            }
+        })
+    }
 
     async fn release(&self, snapshot_id: u64) {
         if let Some(copy) = self.copy_dataset(snapshot_id) {
@@ -218,6 +238,27 @@ impl PinnedCopyLoader for PinnedSnapshotCopies {
         }
         remove_dir(&self.copy_dir(snapshot_id)).await;
     }
+}
+
+/// The pin of a dataset whose instance cannot serve one: it reads the pin, to report
+/// why it is not served, and loads nothing.
+pub(super) struct PinNotServed {
+    /// The manager that publishes the dataset's snapshots, which reads its pin.
+    pub publisher: Arc<SnapshotManager>,
+    pub reason: NotServed,
+}
+
+#[async_trait]
+impl PinnedCopyLoader for PinNotServed {
+    async fn pinned_snapshot(&self) -> Result<Option<u64>, BoxError> {
+        Ok(self.publisher.pinned_snapshot().await?)
+    }
+
+    async fn load(&self, _snapshot_id: u64) -> Result<Arc<dyn TableProvider>, NotServed> {
+        Err(self.reason.clone())
+    }
+
+    async fn release(&self, _snapshot_id: u64) {}
 }
 
 impl Drop for PinnedSnapshotCopies {

@@ -20,6 +20,7 @@ bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
 data_components = { path = "../data_components" }
+fs4 = { workspace = true }
 runtime-metrics = { path = "../runtime-metrics" }
 runtime-table-partition = { path = "../runtime-table-partition" }
 twox-hash.workspace = true
