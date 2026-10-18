@@ -97,7 +97,13 @@ impl DependencyLogTracer {
                 gate.decide(key, Instant::now())
             };
             match decision {
-                Collapse::Suppress => return,
+                // The warning is the sampled line. The debug diagnostic stays
+                // so an operator who turned diagnostics on can still see the
+                // retries the warning no longer lists.
+                Collapse::Suppress => {
+                    self.forward_diagnostic(record, transform.diagnostic.as_ref());
+                    return;
+                }
                 Collapse::Emit { skipped } => skipped,
             }
         } else {
@@ -108,7 +114,11 @@ impl DependencyLogTracer {
         // Forward directly to preserve source locations and the current span,
         // and avoid re-entering the global dependency logger.
         self.forward(record, record.level(), format_args!("{message}"));
-        if let Some(diagnostic) = transform.diagnostic {
+        self.forward_diagnostic(record, transform.diagnostic.as_ref());
+    }
+
+    fn forward_diagnostic(&self, record: &Record<'_>, diagnostic: Option<&LogDiagnostic>) {
+        if let Some(diagnostic) = diagnostic {
             self.forward(
                 record,
                 Level::Debug,
@@ -603,6 +613,50 @@ mod tests {
         assert!(!gate.windows.contains_key("class-16"));
         assert!(gate.windows.contains_key("class-new"));
         assert!(gate.windows.contains_key("class-79"));
+    }
+
+    #[test]
+    fn suppressed_retry_still_logs_the_debug_diagnostic() {
+        let tracer = DependencyLogTracer::default();
+        let diagnostic = timeout_diagnostic();
+        let first = output_with_tracer(
+            &tracer,
+            "debug",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic,
+        );
+        assert!(first.contains("WARN"), "{first}");
+        assert!(first.contains("S3 read retry diagnostic"), "{first}");
+
+        let second = output_with_tracer(
+            &tracer,
+            "debug",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic,
+        );
+        assert!(
+            !second.contains("WARN"),
+            "the repeated warning is collapsed: {second}"
+        );
+        assert!(
+            second.contains("S3 read retry diagnostic"),
+            "the collapsed retry still keeps its diagnostic: {second}"
+        );
+        assert!(second.contains("io operation timeout reached"), "{second}");
+
+        let at_warn = output_with_tracer(
+            &tracer,
+            "warn",
+            OPENDAL_RETRY_TARGET,
+            Level::Warn,
+            &diagnostic,
+        );
+        assert!(
+            at_warn.is_empty(),
+            "a warn filter does not show the diagnostic: {at_warn}"
+        );
     }
 
     #[test]
