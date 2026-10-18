@@ -1314,11 +1314,8 @@ impl RefreshTask {
         let result = match self.cpu_runtime.clone() {
             Some(refresh_runtime) => {
                 let request_context = RequestContext::current(AsyncMarker::new().await);
-                let task = refresh_runtime.spawn(
-                    request_context
-                        .scope(insert)
-                        .instrument(Span::current()),
-                );
+                let task = refresh_runtime
+                    .spawn(request_context.scope(insert).instrument(Span::current()));
                 tokio_util::task::AbortOnDropHandle::new(task)
                     .await
                     .unwrap_or_else(|join_error| {
