@@ -124,8 +124,10 @@ impl SnapshotRefreshState {
 }
 
 /// Reloads a `refresh_mode: snapshot` table each time its snapshot location
-/// announces a snapshot of it newer than the one it has loaded or last asked
-/// for. Returns when the table stops accepting refreshes.
+/// announces a current snapshot of it other than the one it has loaded, such as
+/// a newer one or an older one the dataset is pinned to. A snapshot already asked
+/// for is not asked for again until the table loads another. Returns when the
+/// table stops accepting refreshes.
 ///
 /// A request cancels the refresh in flight, so the loop waits for the reload it
 /// asked for before asking again. Otherwise a writer that publishes faster than
@@ -140,13 +142,14 @@ pub async fn reload_on_snapshot_notifications(
     requester: Arc<dyn RefreshRequester>,
     completion: RefreshCompletion,
 ) {
-    let mut last_requested = None;
+    // The snapshot last asked for, and the snapshot loaded when it was asked for.
+    let mut last_request = None;
     while let Some(announced) = subscription.next_snapshot().await {
-        let known = last_requested.max(loaded_snapshot_id());
-        if known.is_some_and(|known| announced <= known) {
+        let loaded = loaded_snapshot_id();
+        if loaded == Some(announced) || last_request == Some((announced, loaded)) {
             continue;
         }
-        last_requested = Some(announced);
+        last_request = Some((announced, loaded));
         let reloaded = completion.next();
         if requester.request_refresh().await.is_err()
             || reloaded.wait().await == RefreshCompletionOutcome::Abandoned
@@ -906,6 +909,74 @@ mod tests {
         announcer.announce("orders", 4);
         settle().await;
         assert_eq!(fake.requests(), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_an_older_snapshot_and_its_unpin_are_requested() {
+        let fake = Arc::new(FakeRefresh::default());
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        fake.publish(44);
+        announcer.announce("orders", 44);
+        settle().await;
+        assert_eq!(fake.loaded(), Some(44));
+
+        fake.publish(41);
+        announcer.announce("orders", 41);
+        settle().await;
+        assert_eq!(fake.requests(), 2);
+        assert_eq!(fake.loaded(), Some(41), "the pinned snapshot is loaded");
+
+        fake.publish(44);
+        announcer.announce("orders", 44);
+        settle().await;
+        assert_eq!(fake.requests(), 3);
+        assert_eq!(fake.loaded(), Some(44), "the newest snapshot is loaded");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_asked_for_is_asked_for_again_once_another_is_loaded() {
+        let fake = Arc::new(FakeRefresh::default());
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        fake.publish(44);
+        announcer.announce("orders", 44);
+        settle().await;
+        assert_eq!(fake.requests(), 1);
+
+        // A scheduled refresh loads the pinned snapshot before its announcement.
+        *lock(&fake.loaded) = Some(41);
+        announcer.announce("orders", 41);
+        settle().await;
+        assert_eq!(fake.requests(), 1, "the loaded snapshot is not requested");
+
+        fake.publish(44);
+        announcer.announce("orders", 44);
+        settle().await;
+        assert_eq!(fake.requests(), 2, "the unpin is requested");
+        assert_eq!(fake.loaded(), Some(44));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_asked_for_is_not_asked_for_again_while_nothing_else_loads() {
+        let fake = Arc::new(FakeRefresh::default());
+        let (announcer, task) = fake.spawn_loop("orders");
+
+        // The reload loads nothing, as when the snapshot's file is gone.
+        announcer.announce("orders", 5);
+        settle().await;
+        assert_eq!(fake.requests(), 1);
+
+        announcer.announce("customers", 9);
+        settle().await;
+        assert_eq!(
+            fake.requests(),
+            1,
+            "a repeated announcement is not requested"
+        );
         task.abort();
     }
 

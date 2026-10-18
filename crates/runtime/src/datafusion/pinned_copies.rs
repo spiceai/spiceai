@@ -17,9 +17,9 @@ limitations under the License.
 //! The local copies of a pinned snapshot that an instance refreshing the dataset from
 //! its source serves while the dataset is pinned.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
@@ -36,14 +36,14 @@ use crate::component::dataset::Dataset;
 use crate::dataaccelerator::{AcceleratorEngineRegistry, DataAccelerator};
 use crate::secrets::Secrets;
 
-/// Names this process's copy directories. Each table that serves a dataset's pin has
-/// its own, so a table that replaces another, as a Spicepod reload does, never deletes
-/// a copy the other's queries still read.
-static PROCESS: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// The lock a table takes in `<spice data>/pinned/<dataset>/` while it deletes the
+/// directories no table holds and claims its own.
+const DATASET_LOCK: &str = ".lock";
 
 /// Copies of `dataset`'s pinned snapshots, each in its own directory under
-/// `<spice data>/pinned/<dataset>/<generation>/`, where the generation is this table's.
+/// `<spice data>/pinned/<dataset>/<table>/`, a directory of this table's own. The table
+/// holds the lock on `<table>.lock` while it lives, so a table that starts, in this
+/// process or another, deletes only the directories no table holds.
 pub(super) struct PinnedSnapshotCopies {
     dataset: Dataset,
     accelerator: Arc<dyn DataAccelerator>,
@@ -56,12 +56,13 @@ pub(super) struct PinnedSnapshotCopies {
     constraints: Option<Constraints>,
     secrets: Arc<RwLock<Secrets>>,
     ctx: Arc<SessionContext>,
-    generation_dir: PathBuf,
+    table_dir: PathBuf,
+    _table_lock: File,
 }
 
 impl PinnedSnapshotCopies {
     /// Copies for `dataset`, or `None` when its engine cannot hold a second copy.
-    /// Deletes the copies an earlier process left.
+    /// Deletes the copies no table holds, such as those of a process that stopped.
     #[expect(clippy::too_many_arguments)]
     pub(super) async fn new(
         dataset: &Dataset,
@@ -77,18 +78,30 @@ impl PinnedSnapshotCopies {
         let dataset_dir = PathBuf::from(data_accelerator_api::spice_data_base_path())
             .join("pinned")
             .join(dir_name(&dataset.name.to_string()));
-        let generation_dir = dataset_dir.join(format!(
-            "{}-{}",
-            *PROCESS,
-            NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
-        ));
+        let table_dir = dataset_dir.join(uuid::Uuid::new_v4().simple().to_string());
         // Probes that the engine can relocate the acceleration. Cayenne records the
         // probe's directory, and `release_relocated` forgets it again.
-        let probe = accelerator.relocated(dataset, &generation_dir)?;
+        let probe = accelerator.relocated(dataset, &table_dir)?;
         let mut probe_dataset = dataset.clone();
         probe_dataset.acceleration = Some(probe);
         accelerator.release_relocated(&probe_dataset).await;
-        remove_other_processes_copies(&dataset_dir, &PROCESS).await;
+        let claimed = tokio::task::spawn_blocking({
+            let table_dir = table_dir.clone();
+            move || claim(&table_dir)
+        })
+        .await
+        .unwrap_or_else(|err| Err(std::io::Error::other(err)));
+        let table_lock = match claimed {
+            Ok(table_lock) => table_lock,
+            Err(err) => {
+                tracing::warn!(
+                    "Dataset {} cannot serve a pinned snapshot from a local copy, so while it is pinned it serves its live data: failed to lock a directory for the copy under {}: {err}",
+                    dataset.name,
+                    dataset_dir.display()
+                );
+                return None;
+            }
+        };
         Some(Self {
             dataset: dataset.clone(),
             accelerator,
@@ -99,12 +112,13 @@ impl PinnedSnapshotCopies {
             constraints,
             secrets,
             ctx,
-            generation_dir,
+            table_dir,
+            _table_lock: table_lock,
         })
     }
 
     fn copy_dir(&self, snapshot_id: u64) -> PathBuf {
-        self.generation_dir.join(snapshot_id.to_string())
+        self.table_dir.join(snapshot_id.to_string())
     }
 
     /// The dataset as the copy of `snapshot_id` holds it: the same settings, with its
@@ -207,23 +221,66 @@ impl PinnedCopyLoader for PinnedSnapshotCopies {
 }
 
 impl Drop for PinnedSnapshotCopies {
-    /// Deletes this table's directory when it is empty: every copy in it was released.
+    /// Deletes this table's directory when it is empty, as it is once every copy in it
+    /// was released, and its lock file.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.generation_dir);
+        let _ = std::fs::remove_dir(&self.table_dir);
+        let _ = std::fs::remove_file(lock_path(&self.table_dir));
     }
 }
 
-/// Deletes the copies under `dataset_dir` that a process other than `process` left.
-async fn remove_other_processes_copies(dataset_dir: &Path, process: &str) {
-    let Ok(mut entries) = tokio::fs::read_dir(dataset_dir).await else {
+/// Locks `<table_dir>.lock` for a new table, after deleting the table directories beside
+/// it that no table holds. Holds the dataset's lock meanwhile, so no table sees another
+/// table's directory or lock file before that table holds its lock.
+fn claim(table_dir: &Path) -> std::io::Result<File> {
+    let dataset_dir = table_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the copy directory has no parent"))?;
+    std::fs::create_dir_all(dataset_dir)?;
+    let dataset_lock = File::create(dataset_dir.join(DATASET_LOCK))?;
+    dataset_lock.lock()?;
+    remove_unheld(dataset_dir);
+    let table_lock = File::create_new(lock_path(table_dir))?;
+    table_lock.try_lock()?;
+    Ok(table_lock)
+}
+
+/// Deletes each table directory under `dataset_dir`, and its lock file, when no table
+/// holds the lock.
+fn remove_unheld(dataset_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dataset_dir) else {
         return;
     };
-    let prefix = format!("{process}-");
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
-            remove_dir(&entry.path()).await;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == DATASET_LOCK {
+            continue;
         }
+        let table_dir = dataset_dir.join(name.strip_suffix(".lock").unwrap_or(&name));
+        let lock_path = lock_path(&table_dir);
+        let _unheld = match File::open(&lock_path) {
+            Ok(lock) if lock.try_lock().is_ok() => Some(lock),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            // A table holds it, or it cannot be opened: keep the directory.
+            Ok(_) | Err(_) => continue,
+        };
+        match std::fs::remove_dir_all(&table_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn_not_deleted(&table_dir, &err);
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(&lock_path);
     }
+}
+
+fn lock_path(table_dir: &Path) -> PathBuf {
+    let mut path = table_dir.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
 /// Refuses a pinned snapshot whose columns differ from the columns the dataset serves,
@@ -269,11 +326,15 @@ async fn remove_dir(dir: &Path) {
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => tracing::warn!(
-            "Failed to delete the pinned snapshot copy at {}: {err}",
-            dir.display()
-        ),
+        Err(err) => warn_not_deleted(dir, &err),
     }
+}
+
+fn warn_not_deleted(dir: &Path, err: &std::io::Error) {
+    tracing::warn!(
+        "Failed to delete the pinned snapshot copy at {}: {err}",
+        dir.display()
+    );
 }
 
 #[cfg(test)]
@@ -301,24 +362,39 @@ mod tests {
         assert_ne!(dir_name("a/b"), dir_name("a-2fb"));
     }
 
-    #[tokio::test]
-    async fn only_the_copies_other_processes_left_are_deleted() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        for copy in ["earlier-0/41", "this-0/41", "this-1/40", "41"] {
-            tokio::fs::create_dir_all(dir.path().join(copy))
-                .await
-                .expect("created");
-        }
-        remove_other_processes_copies(dir.path(), "this").await;
-        let mut left = std::fs::read_dir(dir.path())
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
             .expect("listed")
             .map(|entry| {
                 let name = entry.expect("entry").file_name();
                 name.into_string().expect("UTF-8 name")
             })
             .collect::<Vec<_>>();
-        left.sort();
-        assert_eq!(left, ["this-0", "this-1"]);
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_new_table_deletes_only_the_copies_no_table_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let held = claim(&dir.path().join("held")).expect("claimed");
+        std::fs::create_dir_all(dir.path().join("held/41")).expect("created");
+        // A table of a process that stopped, one that loaded no copy, and a copy
+        // without a lock file.
+        std::fs::create_dir_all(dir.path().join("stopped/41")).expect("created");
+        std::fs::write(dir.path().join("stopped.lock"), "").expect("created");
+        std::fs::write(dir.path().join("idle.lock"), "").expect("created");
+        std::fs::create_dir_all(dir.path().join("unlocked/40")).expect("created");
+
+        let _new = claim(&dir.path().join("new")).expect("claimed");
+        assert_eq!(
+            names(dir.path()),
+            [".lock", "held", "held.lock", "new.lock"]
+        );
+
+        drop(held);
+        let _newer = claim(&dir.path().join("newer")).expect("claimed");
+        assert_eq!(names(dir.path()), [".lock", "new.lock", "newer.lock"]);
     }
 
     #[test]

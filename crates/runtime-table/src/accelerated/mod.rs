@@ -2282,26 +2282,32 @@ impl AcceleratedTable {
                         accelerator_limit,
                     )
                     .await?;
-                // Schema only, and only invoked if the accelerator stream is
-                // empty. Planning here would coerce/simplify the keep predicate
-                // on every scan, including hits. Awaiting `table_provider()`
-                // would also block those hits on a deferred source.
-                let federated_schema = self.federated.schema();
-                let keep_spec = self.fallback_retention_keep.clone();
-                let fallback_keep_filters: FallbackKeepFilters =
-                    Arc::new(move || match &keep_spec {
-                        Some(keep) => keep
-                            .keep_filters(&federated_schema)
-                            .map_err(|e| DataFusionError::Plan(e.to_string())),
-                        None => Ok(Vec::new()),
-                    });
-                Arc::new(FallbackOnZeroResultsScanExec::new(
-                    self.dataset_name.clone(),
-                    input,
-                    fallback_fn,
-                    TableScanParams::new(state, projection, filters, limit),
-                    fallback_keep_filters,
-                ))
+                if pinned_copy_lease.is_some() {
+                    // A pinned copy serves only the pinned snapshot's rows, so a scan
+                    // of it never falls back to the source.
+                    input
+                } else {
+                    // Schema only, and only invoked if the accelerator stream is
+                    // empty. Planning here would coerce/simplify the keep predicate
+                    // on every scan, including hits. Awaiting `table_provider()`
+                    // would also block those hits on a deferred source.
+                    let federated_schema = self.federated.schema();
+                    let keep_spec = self.fallback_retention_keep.clone();
+                    let fallback_keep_filters: FallbackKeepFilters =
+                        Arc::new(move || match &keep_spec {
+                            Some(keep) => keep
+                                .keep_filters(&federated_schema)
+                                .map_err(|e| DataFusionError::Plan(e.to_string())),
+                            None => Ok(Vec::new()),
+                        });
+                    Arc::new(FallbackOnZeroResultsScanExec::new(
+                        self.dataset_name.clone(),
+                        input,
+                        fallback_fn,
+                        TableScanParams::new(state, projection, filters, limit),
+                        fallback_keep_filters,
+                    ))
+                }
             }
         };
 
