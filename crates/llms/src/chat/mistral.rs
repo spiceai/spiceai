@@ -221,6 +221,7 @@ impl MistralLlama {
             adapter_paths: AdapterPaths::None,
             gen_conf: generation_config.map(PathBuf::from),
             preprocessor_config: None,
+            video_preprocessor_config: None,
             processor_config: None,
             chat_template_json_filename: None,
         })
@@ -246,7 +247,7 @@ impl MistralLlama {
         .build(None) // Infer loader type
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
         .load_model_from_path(
-            &paths,
+            &*paths,
             &ModelDType::Auto,
             device,
             true,
@@ -307,7 +308,7 @@ impl MistralLlama {
         )
         .build()
         .load_model_from_path(
-            &paths,
+            &*paths,
             &ModelDType::Auto,
             device,
             true,
@@ -339,7 +340,7 @@ impl MistralLlama {
         )
         .build()
         .load_model_from_path(
-            &paths,
+            &*paths,
             &ModelDType::Auto,
             device,
             true,
@@ -403,6 +404,10 @@ impl MistralLlama {
             if let Some(config) = cache_config {
                 return mistralrs::SchedulerConfig::PagedAttentionMeta {
                     max_num_seqs: LOCAL_LLM_MAX_SEQS.get(),
+                    max_num_batched_tokens: mistralrs_core::DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                    max_prefill_chunk_tokens: mistralrs_core::DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
+                    max_decode_steps_before_prefill:
+                        mistralrs_core::DEFAULT_MAX_DECODE_STEPS_BEFORE_PREFILL,
                     config,
                 };
             }
@@ -562,10 +567,12 @@ impl MistralLlama {
         MistralRequest::Normal(Box::new(NormalRequest {
             messages: message,
             sampling_params: sampling.unwrap_or(SamplingParams::deterministic()),
+            seed: None,
             response: tx,
             return_logprobs: false,
             is_streaming,
             id: self.counter.fetch_add(1, Ordering::SeqCst),
+            queued_at: None,
             constraint: Constraint::None,
             suffix: None,
             web_search_options: None,
@@ -590,6 +597,7 @@ impl MistralLlama {
             session_id: None,
             files: None,
             input_files: Vec::new(),
+            adapter: None,
         }))
     }
 
@@ -618,7 +626,10 @@ impl MistralLlama {
                 .iter()
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
-            enable_thinking: None,
+            // The DeepSeek-V4.1 template answers directly unless thinking is requested.
+            // Left unset, mistral.rs turns thinking on, and the whole reply stays inside an
+            // unclosed `<think>` block.
+            enable_thinking: Some(false),
             reasoning_effort: None,
         };
 
@@ -637,6 +648,7 @@ impl MistralLlama {
                 StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
                 StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
+            ignore_eos: false,
             max_len,
             logits_bias: None,
             n_choices: req.n.unwrap_or(1) as usize,
