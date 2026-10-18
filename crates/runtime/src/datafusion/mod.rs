@@ -1444,8 +1444,7 @@ pub struct DataFusion {
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
-    /// The snapshot manager of each dataset that creates snapshots, so shutdown
-    /// can release their writer leases.
+    /// Snapshot managers by dataset, so shutdown can release their writer leases.
     snapshot_writers: ParkingMutex<
         HashMap<ResolvedTableReference, Weak<runtime_acceleration::snapshot::SnapshotManager>>,
     >,
@@ -6729,9 +6728,8 @@ impl DataFusion {
         QueryBuilder::new(sql, Arc::clone(self))
     }
 
-    /// Releases the snapshot writer leases this runtime holds, so another instance
-    /// takes over the datasets' snapshots at its next snapshot instead of waiting
-    /// for the leases to lapse.
+    /// Releases this runtime's snapshot writer leases, so another instance can
+    /// take over without waiting for them to lapse.
     pub async fn release_snapshot_writer_leases(&self) {
         let writers: Vec<_> = self
             .snapshot_writers

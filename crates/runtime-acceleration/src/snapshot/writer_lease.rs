@@ -86,9 +86,8 @@ const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 pub(super) struct WriterLease {
     lease: Lease,
     reported: Arc<Mutex<Reported>>,
-    /// Whether the lease was released on shutdown, so the instance does not take
-    /// it back before it exits. Held across each acquisition and release, so a
-    /// release cannot be overwritten by an acquisition already in flight.
+    /// Set once the lease is released on shutdown. Held across acquisition and
+    /// release so the two never interleave.
     released_on_shutdown: Arc<tokio::sync::Mutex<bool>>,
 }
 
@@ -268,10 +267,8 @@ impl SnapshotManager {
         }
     }
 
-    /// Stops this instance creating the dataset's snapshots and releases its
-    /// writer lease, so another instance takes over at its next snapshot instead
-    /// of waiting for the lease to lapse. A snapshot already being created still
-    /// completes; generation fencing refuses it if the new holder publishes first.
+    /// Releases the writer lease and stops re-acquiring it, so another instance
+    /// takes over at its next snapshot instead of waiting for the lease to lapse.
     pub async fn release_writer_lease_on_shutdown(&self) {
         match self.release_lease(true).await {
             Ok(false) => {}
@@ -287,8 +284,7 @@ impl SnapshotManager {
         }
     }
 
-    /// Releases the lease once no acquisition is in flight; `on_shutdown` also
-    /// stops this instance taking it back.
+    /// Releases the lease after any acquisition in flight.
     async fn release_lease(
         &self,
         on_shutdown: bool,
@@ -702,8 +698,7 @@ mod tests {
 
         a.release_writer_lease_on_shutdown().await;
         assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
-        // A snapshot attempt while shutting down stands by rather than renewing
-        // the lease it just released.
+        // Stands by instead of renewing the released lease.
         assert!(matches!(
             a.hold_writer_lease().await.expect("a reads its state"),
             WriterPermit::Standby
@@ -715,8 +710,8 @@ mod tests {
         ));
     }
 
-    /// Regression test: a snapshot attempt already acquiring the lease when shutdown
-    /// begins must not renew it after shutdown released it.
+    /// Regression test: an acquisition in flight at shutdown must not renew the
+    /// released lease.
     #[tokio::test]
     async fn a_release_on_shutdown_waits_for_an_acquisition_in_flight() {
         let store = Arc::new(TestStore::over(Arc::new(InMemory::new())));
@@ -738,7 +733,7 @@ mod tests {
             let a = Arc::clone(&a);
             async move { a.release_writer_lease_on_shutdown().await }
         });
-        // Give a release that does not wait for the acquisition time to land first.
+        // Let a release that does not wait land first.
         tokio::time::sleep(Duration::from_millis(200)).await;
         resume.notify_one();
         renewing.await.expect("renewal task").expect("a renews");
@@ -1034,8 +1029,7 @@ mod tests {
         /// Report no `ETag` or version, as a store that cannot write
         /// conditionally.
         strip_versions: bool,
-        /// Hold the next read until `resume` is notified, after notifying
-        /// `reached`, to stop an acquisition between its check and its write.
+        /// Pauses the next read: notifies `reached`, then waits for `resume`.
         pause_next_read: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     }
 

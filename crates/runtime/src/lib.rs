@@ -2338,7 +2338,7 @@ impl Runtime {
         // start, never a hung shutdown.
         //
         // Snapshot writer leases are released alongside, so a replacement instance
-        // takes over the snapshots at its next one rather than after they lapse.
+        // need not wait for them to lapse.
         let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),

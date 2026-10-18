@@ -501,9 +501,7 @@ fn duckdb_dataset(
     dataset
 }
 
-/// A writer releases its snapshot writer lease when the runtime shuts down, so
-/// another instance can take over the dataset's snapshots at once instead of
-/// waiting for the lease to lapse.
+/// Shutdown releases the snapshot writer lease.
 #[tokio::test]
 async fn shutdown_releases_the_snapshot_writer_lease() {
     let directory = tempfile::tempdir().expect("test directory");
