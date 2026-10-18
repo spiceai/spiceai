@@ -21,7 +21,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use cayenne::{
-    CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog,
+    CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog, RebuildableWrite,
     metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig},
 };
 use datafusion::{
@@ -99,7 +99,7 @@ async fn write(
 }
 
 #[tokio::test]
-async fn rebuildable_composed_rows_use_native_ram_without_source_callback() {
+async fn rebuildable_composed_rows_append_durably_without_source_callback() {
     for shards in [1, 4] {
         let ctx = SessionContext::new();
         let (table, _dir) = table(&ctx, shards).await;
@@ -130,13 +130,10 @@ async fn rebuildable_composed_rows_use_native_ram_without_source_callback() {
                 .expect("visible rows"),
             2
         );
-        assert!(
-            table
-                .checkpoint_mem_tier()
-                .await
-                .expect("cover buffered epoch")
-                > 0,
-            "a durable append would not have a RAM epoch to checkpoint"
+        assert_eq!(
+            table.checkpoint_mem_tier().await.expect("empty RAM tier"),
+            0,
+            "cache rows take the normal append path, not the RAM tier"
         );
         assert_eq!(
             write(&sink, &table, vec![2, 3], Recovery::Rebuildable).await,

@@ -26,7 +26,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::WideningPlan;
 use async_trait::async_trait;
-use cayenne::{CayenneTableProvider, RebuildableWrite, SlotAdvancer};
+use cayenne::{CayenneTableProvider, SlotAdvancer};
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::cdc::ChangeBatch as CdcBatch;
 use data_components::poly::PolyTableProvider;
@@ -402,14 +402,10 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                     Recovery::Durable
                 })
                 .await?;
-                let rebuildable_context = rebuildable.then(|| {
-                    let mut state = ctx.state();
-                    state
-                        .config_mut()
-                        .set_extension(Arc::new(RebuildableWrite::new(&self.table)));
-                    SessionContext::new_with_state(state)
-                });
-                let ctx = rebuildable_context.as_ref().unwrap_or(ctx);
+                // Rows take the normal append path, not the RAM tier. Most coalesced
+                // cache bursts replace some scope, and a delete checkpoints the RAM
+                // tier first, so buffering them there writes a small file on nearly
+                // every burst, which every point lookup then has to read.
                 let changed = self
                     .provider
                     .apply_rows(schema, batches, scoped_inputs, options, ctx)
