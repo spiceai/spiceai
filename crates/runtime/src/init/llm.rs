@@ -19,26 +19,34 @@ use std::sync::Arc;
 
 use crate::{
     Result, Runtime, UnableToInitializeLlmSnafu,
-    model::{LoadedChatModel, try_to_chat_model, try_to_responses_model},
+    model::{LoadedChatModel, try_to_chat_model, try_to_messages_model, try_to_responses_model},
 };
 use llms::{chat::try_map_boxed_error_to_box, responses::Responses};
-use model_capabilities::{Capability, ModelCapabilities};
+use messages_api::Messages;
+use model_capabilities::{Capability, MessagesBackend, ModelCapabilities};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 
+/// A chat model, and the endpoints of other APIs its provider serves natively.
+pub(crate) struct LoadedLlm {
+    pub(crate) chat: LoadedChatModel,
+    pub(crate) responses: Option<Arc<dyn Responses>>,
+    pub(crate) messages: Option<Arc<dyn Messages>>,
+}
+
 impl Runtime {
-    /// Loads a chat model from the spicepod, and its Responses API endpoint when
-    /// `capabilities` include one. If an error occurs, no retry attempt is made.
+    /// Loads a chat model from the spicepod, and its Responses API and native Messages API
+    /// endpoints when `capabilities` include them. If an error occurs, no retry attempt is made.
     ///
-    /// A Responses endpoint that fails to load is left out, so the model is unavailable
-    /// on `/v1/responses` while its chat still serves.
+    /// A Responses or Messages endpoint that fails to load is left out, so the model is
+    /// unavailable on `/v1/responses` or `/v1/messages` while its chat still serves.
     pub(crate) async fn load_llm(
         &self,
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
         capabilities: &ModelCapabilities,
-    ) -> Result<(LoadedChatModel, Option<Arc<dyn Responses>>)> {
+    ) -> Result<LoadedLlm> {
         let completions_model = try_to_chat_model(&m, &params, Arc::new(self.clone()))
             .await
             .boxed()
@@ -53,8 +61,26 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
+        // The chat model's health check already sent the provider a Messages API request, so
+        // the native endpoint is registered without a second one.
+        let messages = if capabilities.messages() == Some(MessagesBackend::Native) {
+            match try_to_messages_model(&m, &params, Arc::new(self.clone())).await {
+                Ok(model) => Some(model),
+                Err(e) => {
+                    tracing::warn!("{}", messages_unavailable_warning(&m.name, &e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         if !capabilities.has(Capability::Responses) {
-            return Ok((completions_model, None));
+            return Ok(LoadedLlm {
+                chat: completions_model,
+                responses: None,
+                messages,
+            });
         }
 
         let mut responses_model = match try_to_responses_model(&m, &params, Arc::new(self.clone()))
@@ -86,8 +112,19 @@ impl Runtime {
             responses_model = None;
         }
 
-        Ok((completions_model, responses_model))
+        Ok(LoadedLlm {
+            chat: completions_model,
+            responses: responses_model,
+            messages,
+        })
     }
+}
+
+/// The warning for a model whose native Messages API endpoint failed to load.
+fn messages_unavailable_warning(model: &str, cause: &llms::chat::Error) -> String {
+    format!(
+        "Failed to load the Messages API endpoint for model '{model}', so the model is not available on `/v1/messages`. Cause: {cause}"
+    )
 }
 
 /// The warning for a model whose Responses API endpoint failed its health check. The

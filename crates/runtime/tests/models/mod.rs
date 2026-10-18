@@ -42,6 +42,7 @@ pub(crate) mod hf;
 #[cfg(feature = "duckdb")]
 mod hnsw_index;
 mod local;
+mod messages;
 mod models_http_endpoint;
 pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]

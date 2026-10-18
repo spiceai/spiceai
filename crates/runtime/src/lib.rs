@@ -46,6 +46,7 @@ use crate::datafusion::DeferredRefreshOutcome;
 use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::model::LLMResponsesModelStore;
+use crate::model::LLMMessagesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
@@ -873,6 +874,11 @@ impl Runtime {
     #[must_use]
     pub fn responses_llms(&self) -> Arc<RwLock<LLMResponsesModelStore>> {
         self.llm_runtime_stores.responses_llms()
+    }
+
+    #[must_use]
+    pub fn messages_llms(&self) -> Arc<RwLock<LLMMessagesModelStore>> {
+        self.llm_runtime_stores.messages_llms()
     }
 
     #[must_use]

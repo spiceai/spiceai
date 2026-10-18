@@ -116,6 +116,8 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
+        v1::messages::post,
+        v1::messages::count_tokens,
         v1::models::get,
         v1::workers::get,
         v1::nsql::get_context,
@@ -507,6 +509,14 @@ pub(crate) fn routes(
                 "/v1/responses",
                 post(v1::responses::post).layer(ModelContextLayer),
             )
+            .route(
+                "/v1/messages",
+                post(v1::messages::post).layer(ModelContextLayer),
+            )
+            .route(
+                "/v1/messages/count_tokens",
+                post(v1::messages::count_tokens),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(
                 "/v1/decisions",
@@ -521,7 +531,12 @@ pub(crate) fn routes(
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
-            .layer(Extension(rt.responses_llms()));
+            .layer(Extension(rt.responses_llms()))
+            .layer(Extension(v1::messages::MessagesModels {
+                native: rt.messages_llms(),
+                chat: rt.completion_llms(),
+                capabilities: rt.model_capabilities(),
+            }));
     }
 
     // Add async queries API routes - registered unconditionally for discoverability and consistency.

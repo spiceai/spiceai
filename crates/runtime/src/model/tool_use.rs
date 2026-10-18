@@ -26,13 +26,15 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
     ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
+    FunctionCallStream, FunctionObject, FunctionType, PromptTokensDetails, ToolChoiceAllowedMode,
+    ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -902,7 +904,16 @@ fn make_a_stream(
                         }
                         match choice_disposition(&chat_choice) {
                             ChoiceDisposition::Forward => {
-                                finished_choices.push(chat_choice);
+                                // Tool calls are withheld until the choice finishes, when it is
+                                // known which are Spice's to run; a finish Spice does not act on
+                                // gives the client the calls whole.
+                                let mut forwarded = chat_choice;
+                                forwarded.delta.tool_calls = if forwarded.finish_reason.is_some() {
+                                    withheld_tool_calls(&tool_call_states, forwarded.index)
+                                } else {
+                                    None
+                                };
+                                finished_choices.push(forwarded);
                                 continue;
                             }
                             ChoiceDisposition::Drop => continue,
@@ -924,8 +935,12 @@ fn make_a_stream(
                         {
                             Ok(Some(round)) => round,
                             Ok(None) => {
-                                // No spice tools within returned tools, so return as message in stream.
-                                finished_choices.push(chat_choice);
+                                // No Spice tool among the calls: they are the client's, so it
+                                // receives them, whole, with the finish.
+                                let mut finished = chat_choice;
+                                finished.delta.tool_calls =
+                                    withheld_tool_calls(&tool_call_states, finished.index);
+                                finished_choices.push(finished);
                                 continue;
                             }
                             Err(e) => {
@@ -1039,6 +1054,44 @@ fn make_a_stream(
             .instrument(span),
     );
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
+}
+
+/// The tool calls of the choice at `choice_index`, accumulated from its chunks, as one chunk
+/// each in call order; `None` when it made none.
+fn withheld_tool_calls(
+    states: &Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    choice_index: u32,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    let states = match states.lock() {
+        Ok(states) => states,
+        Err(e) => {
+            tracing::error!("Failed to lock tool_call_states: {}", e);
+            return None;
+        }
+    };
+    let mut calls: Vec<(u32, &ChatCompletionMessageToolCall)> = states
+        .iter()
+        .filter(|((choice, _), _)| u32::try_from(*choice).ok() == Some(choice_index))
+        .filter_map(|((_, index), call)| Some((u32::try_from(*index).ok()?, call)))
+        .collect();
+    if calls.is_empty() {
+        return None;
+    }
+    calls.sort_by_key(|(index, _)| *index);
+    Some(
+        calls
+            .into_iter()
+            .map(|(index, call)| ChatCompletionMessageToolCallChunk {
+                index,
+                id: Some(call.id.clone()),
+                r#type: Some(FunctionType::Function),
+                function: Some(FunctionCallStream {
+                    name: Some(call.function.name.clone()),
+                    arguments: Some(call.function.arguments.clone()),
+                }),
+            })
+            .collect(),
+    )
 }
 
 // OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.

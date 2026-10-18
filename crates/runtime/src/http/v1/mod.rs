@@ -22,6 +22,7 @@ pub mod decisions;
 pub mod embeddings;
 pub mod functions;
 pub mod iceberg;
+pub mod messages;
 pub mod responses;
 pub mod snapshots;
 

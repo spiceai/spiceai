@@ -179,14 +179,14 @@ impl Runtime {
         // Every request the model serves, chat or decisions, takes a permit from it.
         let rate_controller = crate::model::rate_limit::build_model_rate_controller(m, params);
 
-        let (chat, responses) = if capabilities.has(Capability::Chat) {
-            let (chat, responses) = self
+        let (chat, responses, messages) = if capabilities.has(Capability::Chat) {
+            let loaded = self
                 .load_llm(m.clone(), params.clone(), &capabilities)
                 .await
                 .map_err(|e| failed(Box::new(e)))?;
-            (Some(chat), responses)
+            (Some(loaded.chat), loaded.responses, loaded.messages)
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let evaluator = match capabilities.decisions() {
@@ -223,6 +223,13 @@ impl Runtime {
                 .await
                 .insert(m.name.clone(), responses);
         }
+        if let Some(messages) = messages {
+            let messages_llms = self.messages_llms();
+            messages_llms
+                .write()
+                .await
+                .insert(m.name.clone(), messages);
+        }
         if let Some(evaluator) = evaluator {
             let evaluate_models = self.llm_runtime_stores.evaluate_models();
             evaluate_models
@@ -258,6 +265,11 @@ impl Runtime {
         let mut responses_map = responses_llms.write().await;
         responses_map.remove(&m.name);
         drop(responses_map);
+
+        let messages_llms = self.messages_llms();
+        let mut messages_map = messages_llms.write().await;
+        messages_map.remove(&m.name);
+        drop(messages_map);
 
         let evaluate_models = self.llm_runtime_stores.evaluate_models();
         let mut evaluate_map = evaluate_models.write().await;

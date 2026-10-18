@@ -1,0 +1,93 @@
+---
+source: crates/messages-chat/src/tests.rs
+expression: pretty(&chat)
+---
+{
+  "max_completion_tokens": 32000,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "You are a coding agent.",
+          "type": "text"
+        },
+        {
+          "text": "Be brief.",
+          "type": "text"
+        }
+      ],
+      "role": "system"
+    },
+    {
+      "content": "Show me the logo.",
+      "role": "user"
+    },
+    {
+      "content": "Reading it.",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"path\":\"logo.png\"}",
+            "name": "read_file"
+          },
+          "id": "toolu_1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "logo.png (2 KB)",
+      "role": "tool",
+      "tool_call_id": "toolu_1"
+    },
+    {
+      "content": [
+        {
+          "image_url": {
+            "url": "data:image/png;base64,iVBOR"
+          },
+          "type": "image_url"
+        },
+        {
+          "text": "Describe it.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "gpt",
+  "parallel_tool_calls": false,
+  "reasoning_effort": "high",
+  "stop": [
+    "END"
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0.5,
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "function": {
+        "description": "Reads a file.",
+        "name": "read_file",
+        "parameters": {
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ],
+  "user": "user-1"
+}

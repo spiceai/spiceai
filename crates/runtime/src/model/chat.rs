@@ -336,6 +336,15 @@ fn anthropic(
     model_id: Option<&str>,
     params: &AnthropicModelParams,
 ) -> Result<Arc<dyn Chat>, LlmError> {
+    Ok(Arc::new(anthropic_client(model_id, params)?) as Arc<dyn Chat>)
+}
+
+/// The Anthropic client of a `from: anthropic` model, which serves both its chat completions
+/// and, natively, the Messages API.
+pub(crate) fn anthropic_client(
+    model_id: Option<&str>,
+    params: &AnthropicModelParams,
+) -> Result<Anthropic, LlmError> {
     let api_base = params.endpoint.as_deref();
     let api_key = params.api_key.as_ref().map(ExposeSecret::expose_secret);
     let auth_token = params.auth_token.as_ref().map(ExposeSecret::expose_secret);
@@ -360,7 +369,7 @@ fn anthropic(
             source: format!("Invalid `anthropic_workspace_id`: {e}").into(),
         })?;
 
-    Ok(Arc::new(anthropic) as Arc<dyn Chat>)
+    Ok(anthropic)
 }
 
 async fn google(

@@ -1,0 +1,554 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::sync::{Arc, Mutex};
+
+use async_openai::error::{ApiError, OpenAIError};
+use async_openai::types::chat::{
+    ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse,
+};
+use async_trait::async_trait;
+use chat_api::Chat;
+use chat_api::SqlGeneration;
+use futures::StreamExt;
+use messages_api::{ErrorType, Messages, MessagesError, MessagesRequest};
+use serde_json::{Value, json};
+
+use crate::ChatMessages;
+use crate::request::chat_request;
+use crate::response::{message, messages_error};
+use crate::stream::message_stream;
+
+fn typed(body: &Value) -> messages_api::types::CreateMessageRequest {
+    serde_json::from_value(body.clone()).expect("a valid Messages API request")
+}
+
+fn translated(body: &Value) -> Result<Value, MessagesError> {
+    chat_request(typed(body)).map(|request| serde_json::to_value(request).expect("serializable"))
+}
+
+fn pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).expect("serializable")
+}
+
+/// A request shaped like the ones a coding agent sends: a system prompt in blocks with cache
+/// breakpoints, tools, adaptive thinking with an effort, and a history with thinking, a tool
+/// call, and a tool result that returned an image.
+fn agent_request() -> Value {
+    json!({
+        "model": "gpt",
+        "max_tokens": 32000,
+        "stream": true,
+        "system": [
+            {"type": "text", "text": "You are a coding agent."},
+            {"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}},
+        ],
+        "tools": [{
+            "name": "read_file",
+            "description": "Reads a file.",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            "cache_control": {"type": "ephemeral"},
+        }],
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "high"},
+        "metadata": {"user_id": "user-1"},
+        "temperature": 0.5,
+        "stop_sequences": ["END"],
+        "cache_control": {"type": "ephemeral"},
+        "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]},
+        "messages": [
+            {"role": "user", "content": "Show me the logo."},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "I should read it.", "signature": "sig"},
+                {"type": "text", "text": "Reading it."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "logo.png"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "logo.png (2 KB)"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR"}},
+                ]},
+                {"type": "text", "text": "Describe it.", "cache_control": {"type": "ephemeral"}},
+            ]},
+        ],
+    })
+}
+
+#[test]
+fn an_agent_request_translates_to_a_chat_completion_request() {
+    let chat = translated(&agent_request()).expect("a translatable request");
+    insta::assert_snapshot!("agent_request_as_chat_completion", pretty(&chat));
+}
+
+#[test]
+fn what_only_changes_how_a_request_is_served_is_accepted() {
+    for field in [
+        json!({"cache_control": {"type": "ephemeral"}}),
+        json!({"service_tier": "standard_only"}),
+        json!({"speed": "fast"}),
+        json!({"context_management": {"edits": []}}),
+        json!({"fallbacks": "default"}),
+        json!({"diagnostics": {"previous_message_id": null}}),
+    ] {
+        let mut body = json!({"model": "gpt", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]});
+        for (key, value) in field.as_object().expect("an object") {
+            body[key] = value.clone();
+        }
+        let chat = translated(&body).unwrap_or_else(|e| panic!("{field} refused: {e}"));
+        assert_eq!(
+            chat,
+            json!({"model": "gpt", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 10}),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn what_a_chat_completion_cannot_carry_is_refused_by_name() {
+    let base = || json!({"model": "gpt", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]});
+    let with = |key: &str, value: Value| {
+        let mut body = base();
+        body[key] = value;
+        body
+    };
+    let message = |content: Value| {
+        let mut body = base();
+        body["messages"] = content;
+        body
+    };
+    let cases = [
+        (with("top_k", json!(5)), "cannot carry `top_k`. Remove `top_k`"),
+        (with("container", json!("container_1")), "cannot carry `container`. Remove `container`"),
+        (with("mcp_servers", json!([])), "cannot carry `mcp_servers`."),
+        (with("inference_geo", json!("us")), "cannot carry `inference_geo`."),
+        (with("tools", json!([{"type": "web_search_20250305", "name": "web_search"}])), "cannot carry the Anthropic-defined tool `web_search_20250305`."),
+        (with("output_config", json!({"effort": "extreme"})), "cannot carry the effort `extreme`."),
+        (with("output_config", json!({"format": {"type": "json_object"}})), "cannot carry the output format `json_object` without a `schema`."),
+        (message(json!([{"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "d"}, "citations": {"enabled": true}}]}])), "cannot carry citations."),
+        (message(json!([{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "file_1"}}]}])), "cannot carry an image from the Anthropic Files API."),
+        (message(json!([{"role": "user", "content": [{"type": "search_result", "source": "s", "title": "t", "content": []}]}])), "cannot carry a `search_result` block in a user message."),
+        (message(json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}]}])), "cannot carry a `server_tool_use` block in an assistant message."),
+        (message(json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "f", "server_name": "github", "input": {}}]}])), "cannot carry a `mcp_tool_use` block in an assistant message."),
+    ];
+    for (body, expected) in cases {
+        let error = translated(&body).expect_err("a refused request");
+        assert_eq!(
+            (error.status, &error.error_type),
+            (400, &ErrorType::InvalidRequest),
+            "{body}"
+        );
+        assert!(
+            error.message.starts_with("Model 'gpt' serves the Messages API by translating requests into chat completions, which cannot carry")
+                && error.message.contains(expected)
+                && error.message.ends_with("See: https://spiceai.org/docs/components/models"),
+            "{}\nexpected it to contain: {expected}",
+            error.message
+        );
+    }
+}
+
+#[test]
+fn a_request_that_is_not_a_messages_request_is_an_invalid_request() {
+    let error = crate::parse(MessagesRequest::new(
+        json!({"model": "gpt", "messages": []}).as_object().cloned().expect("an object"),
+    ))
+    .expect_err("max_tokens is required");
+    assert_eq!(
+        error,
+        MessagesError::invalid_request("missing field `max_tokens`")
+    );
+}
+
+fn completion(message: &Value, finish_reason: &str) -> CreateChatCompletionResponse {
+    serde_json::from_value(json!({
+        "id": "chatcmpl-abc",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "gpt",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 100}},
+    }))
+    .expect("a chat completion")
+}
+
+#[test]
+fn a_completion_becomes_a_message() {
+    let answer = completion(
+        &json!({
+            "role": "assistant",
+            "content": "Reading it.",
+            "reasoning_content": "The user wants the file.",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "list_files", "arguments": ""}},
+            ],
+        }),
+        "tool_calls",
+    );
+    assert_eq!(
+        serde_json::to_value(message(answer.clone(), true).expect("a message")).expect("serializable"),
+        json!({
+            "id": "msg_abc",
+            "type": "message",
+            "role": "assistant",
+            "model": "gpt",
+            "content": [
+                {"type": "thinking", "thinking": "The user wants the file.", "signature": ""},
+                {"type": "text", "text": "Reading it."},
+                {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "a.rs"}},
+                {"type": "tool_use", "id": "call_2", "name": "list_files", "input": {}},
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 20, "output_tokens": 30, "cache_read_input_tokens": 100},
+        })
+    );
+    let without_thinking = message(answer, false).expect("a message");
+    assert_eq!(
+        without_thinking.content.first(),
+        Some(&messages_api::types::ContentBlock::Text {
+            text: "Reading it.".to_string()
+        })
+    );
+}
+
+#[test]
+fn finish_reasons_become_stop_reasons() {
+    let stop = |finish: &str, message: Value| {
+        serde_json::to_value(crate::response::message(completion(&message, finish), false).expect("a message"))
+            .expect("serializable")["stop_reason"]
+            .clone()
+    };
+    let text = json!({"role": "assistant", "content": "hi"});
+    assert_eq!(
+        [
+            stop("stop", text.clone()),
+            stop("length", text.clone()),
+            stop("content_filter", text.clone()),
+            stop("stop", json!({"role": "assistant", "content": null, "refusal": "I can't help with that."})),
+        ],
+        [json!("end_turn"), json!("max_tokens"), json!("refusal"), json!("refusal")]
+    );
+}
+
+#[test]
+fn tool_arguments_that_are_not_an_object_are_an_api_error() {
+    let answer = completion(
+        &json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": "}},
+        ]}),
+        "tool_calls",
+    );
+    assert_eq!(
+        message(answer, false).expect_err("truncated arguments"),
+        MessagesError::api(
+            "Model 'gpt' called the tool 'read_file' with arguments that are not a JSON object, which the Messages API cannot return: {\"path\": "
+        )
+    );
+}
+
+fn chunk(choice: &Value) -> CreateChatCompletionStreamResponse {
+    serde_json::from_value(json!({
+        "id": "chatcmpl-abc", "object": "chat.completion.chunk", "created": 0, "model": "gpt",
+        "choices": [choice],
+    }))
+    .expect("a chunk")
+}
+
+fn usage_chunk() -> CreateChatCompletionStreamResponse {
+    serde_json::from_value(json!({
+        "id": "chatcmpl-abc", "object": "chat.completion.chunk", "created": 0, "model": "gpt",
+        "choices": [],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 100}},
+    }))
+    .expect("a usage chunk")
+}
+
+fn tool_call(index: u32, id: Option<&str>, name: Option<&str>, arguments: &str) -> Value {
+    let mut function = json!({"arguments": arguments});
+    if let Some(name) = name {
+        function["name"] = json!(name);
+    }
+    let mut call = json!({"index": index, "function": function});
+    if let Some(id) = id {
+        call["id"] = json!(id);
+        call["type"] = json!("function");
+    }
+    json!({"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": null})
+}
+
+async fn events(chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>) -> Vec<Value> {
+    let chunks: ChatCompletionResponseStream = Box::pin(futures::stream::iter(chunks));
+    message_stream(chunks, "gpt".to_string())
+        .map(|event| event.unwrap_or_else(|error| error.to_envelope()))
+        .collect()
+        .await
+}
+
+#[tokio::test]
+async fn a_chunk_stream_becomes_a_message_event_stream() {
+    let streamed = events(vec![
+        Ok(chunk(&json!({"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}))),
+        Ok(chunk(&json!({"index": 0, "delta": {"content": "Reading "}, "finish_reason": null}))),
+        Ok(chunk(&json!({"index": 0, "delta": {"content": "both."}, "finish_reason": null}))),
+        Ok(chunk(&tool_call(0, Some("call_1"), Some("read_file"), ""))),
+        Ok(chunk(&tool_call(0, None, None, "{\"path\":"))),
+        Ok(chunk(&tool_call(0, None, None, "\"a.rs\"}"))),
+        Ok(chunk(&tool_call(1, Some("call_2"), Some("read_file"), "{\"path\":\"b.rs\"}"))),
+        Ok(chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}))),
+        Ok(usage_chunk()),
+    ])
+    .await;
+    insta::assert_snapshot!("chunk_stream_as_message_events", pretty(&Value::Array(streamed)));
+}
+
+#[tokio::test]
+async fn an_empty_chunk_stream_is_still_a_whole_message() {
+    assert_eq!(
+        events(vec![]).await
+            .into_iter()
+            .map(|event| event["type"].clone())
+            .collect::<Vec<_>>(),
+        [json!("message_start"), json!("message_delta"), json!("message_stop")]
+    );
+}
+
+#[tokio::test]
+async fn interleaved_tool_call_arguments_end_the_stream_with_an_error() {
+    let streamed = events(vec![
+        Ok(chunk(&tool_call(0, Some("call_1"), Some("read_file"), "{\"path\":"))),
+        Ok(chunk(&tool_call(1, Some("call_2"), Some("read_file"), "{\"path\":\"b.rs\"}"))),
+        Ok(chunk(&tool_call(0, None, None, "\"a.rs\"}"))),
+        Ok(chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}))),
+    ])
+    .await;
+    assert_eq!(
+        streamed.last(),
+        Some(&json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' streamed the arguments of its tool calls interleaved, which the Messages API cannot stream: each tool call has to be streamed whole before the next. Send the request without `stream`."}}))
+    );
+    assert_eq!(
+        streamed.iter().filter(|event| event["type"] == "message_stop").count(),
+        0,
+        "an errored stream does not also end as a whole message"
+    );
+}
+
+#[tokio::test]
+async fn a_chunk_stream_error_ends_the_stream() {
+    let streamed = events(vec![
+        Ok(chunk(&json!({"index": 0, "delta": {"content": "Partial"}, "finish_reason": null}))),
+        Err(OpenAIError::ApiError(ApiError {
+            message: "Rate limit reached".to_string(),
+            r#type: Some("requests".to_string()),
+            param: None,
+            code: Some("rate_limit_exceeded".to_string()),
+        })),
+        Ok(chunk(&json!({"index": 0, "delta": {"content": "never sent"}, "finish_reason": null}))),
+    ])
+    .await;
+    assert_eq!(
+        streamed.iter().map(|event| event["type"].clone()).collect::<Vec<_>>(),
+        [json!("message_start"), json!("content_block_start"), json!("content_block_delta"), json!("error")]
+    );
+    assert_eq!(
+        streamed.last(),
+        Some(&json!({"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit reached"}}))
+    );
+}
+
+#[test]
+fn chat_completion_errors_keep_their_kind() {
+    let api_error = |code: &str| {
+        messages_error(OpenAIError::ApiError(ApiError {
+            message: "m".to_string(),
+            r#type: None,
+            param: None,
+            code: Some(code.to_string()),
+        }))
+    };
+    assert_eq!(
+        [
+            api_error("invalid_request_error"),
+            api_error("invalid_api_key"),
+            api_error("permission_error"),
+            api_error("not_found_error"),
+            api_error("rate_limit_exceeded"),
+            api_error("insufficient_quota"),
+            api_error("server_is_on_fire"),
+        ]
+        .map(|error| (error.status, error.error_type.as_str().to_string())),
+        [
+            (400, "invalid_request_error".to_string()),
+            (401, "authentication_error".to_string()),
+            (403, "permission_error".to_string()),
+            (404, "not_found_error".to_string()),
+            (429, "rate_limit_error".to_string()),
+            (402, "billing_error".to_string()),
+            (500, "api_error".to_string()),
+        ]
+    );
+}
+
+/// A chat model that records each request and answers with `answer`, or streams `chunks`.
+struct ScriptedChat {
+    requests: Mutex<Vec<CreateChatCompletionRequest>>,
+    answer: CreateChatCompletionResponse,
+    chunks: Vec<CreateChatCompletionStreamResponse>,
+}
+
+#[async_trait]
+impl Chat for ScriptedChat {
+    fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+        None
+    }
+
+    async fn chat_request(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        self.requests.lock().expect("requests lock").push(req);
+        Ok(self.answer.clone())
+    }
+
+    async fn chat_stream(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        self.requests.lock().expect("requests lock").push(req);
+        Ok(Box::pin(futures::stream::iter(
+            self.chunks.clone().into_iter().map(Ok),
+        )))
+    }
+}
+
+fn messages_request(body: &Value) -> MessagesRequest {
+    MessagesRequest::new(body.as_object().cloned().expect("an object"))
+}
+
+#[tokio::test]
+async fn a_streamed_and_an_unstreamed_answer_carry_the_same_message() {
+    let chat = Arc::new(ScriptedChat {
+        requests: Mutex::new(Vec::new()),
+        answer: completion(
+            &json!({"role": "assistant", "content": "Reading it.", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+            ]}),
+            "tool_calls",
+        ),
+        chunks: vec![
+            chunk(&json!({"index": 0, "delta": {"role": "assistant", "content": "Reading "}, "finish_reason": null})),
+            chunk(&json!({"index": 0, "delta": {"content": "it."}, "finish_reason": null})),
+            chunk(&tool_call(0, Some("call_1"), Some("read_file"), "{\"path\":")),
+            chunk(&tool_call(0, None, None, "\"a.rs\"}")),
+            chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"})),
+            usage_chunk(),
+        ],
+    });
+    let messages = ChatMessages::new(Arc::clone(&chat) as Arc<dyn Chat>);
+    let body = json!({"model": "gpt", "max_tokens": 100, "messages": [{"role": "user", "content": "Read a.rs"}]});
+
+    let created = messages
+        .create(messages_request(&body))
+        .await
+        .expect("a message");
+    let streamed: Vec<Value> = messages
+        .create_stream(messages_request(&body))
+        .await
+        .expect("a stream")
+        .map(|event| event.expect("an event"))
+        .collect()
+        .await;
+
+    assert_eq!(accumulate(&streamed), created);
+    let requests = chat.requests.lock().expect("requests lock");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| (request.stream, request.stream_options.is_some()))
+            .collect::<Vec<_>>(),
+        [(None, false), (Some(true), true)],
+        "the unstreamed request is not marked as streaming, and the streamed one asks for usage"
+    );
+}
+
+/// The Message a client builds from `events`, as the Anthropic SDKs accumulate a stream.
+fn accumulate(events: &[Value]) -> Value {
+    let mut message = Value::Null;
+    let mut partial_json: Vec<String> = Vec::new();
+    for event in events {
+        match event["type"].as_str().expect("a typed event") {
+            "message_start" => message = event["message"].clone(),
+            "content_block_start" => {
+                message["content"]
+                    .as_array_mut()
+                    .expect("content")
+                    .push(event["content_block"].clone());
+                partial_json.push(String::new());
+            }
+            "content_block_delta" => {
+                let index = usize::try_from(event["index"].as_u64().expect("an index")).expect("an index");
+                let block = &mut message["content"][index];
+                let delta = &event["delta"];
+                match delta["type"].as_str().expect("a typed delta") {
+                    "text_delta" => {
+                        let text = format!("{}{}", block["text"].as_str().unwrap_or_default(), delta["text"].as_str().unwrap_or_default());
+                        block["text"] = json!(text);
+                    }
+                    "input_json_delta" => partial_json[index].push_str(delta["partial_json"].as_str().unwrap_or_default()),
+                    other => panic!("unexpected delta {other}"),
+                }
+            }
+            "content_block_stop" => {
+                let index = usize::try_from(event["index"].as_u64().expect("an index")).expect("an index");
+                if message["content"][index]["type"] == "tool_use" && !partial_json[index].is_empty() {
+                    message["content"][index]["input"] =
+                        serde_json::from_str(&partial_json[index]).expect("whole tool input");
+                }
+            }
+            "message_delta" => {
+                message["stop_reason"] = event["delta"]["stop_reason"].clone();
+                message["stop_sequence"] = event["delta"]["stop_sequence"].clone();
+                for (key, value) in event["usage"].as_object().expect("usage") {
+                    message["usage"][key] = value.clone();
+                }
+            }
+            "message_stop" | "ping" => {}
+            other => panic!("unexpected event {other}"),
+        }
+    }
+    message
+}
+
+#[tokio::test]
+async fn only_a_model_served_by_anthropic_counts_tokens() {
+    let chat = Arc::new(ScriptedChat {
+        requests: Mutex::new(Vec::new()),
+        answer: completion(&json!({"role": "assistant", "content": "hi"}), "stop"),
+        chunks: Vec::new(),
+    });
+    let error = ChatMessages::new(chat)
+        .count_tokens(messages_request(&json!({"model": "gpt", "messages": []})))
+        .await
+        .expect_err("no tokenizer");
+    assert_eq!(
+        error,
+        MessagesError::invalid_request(
+            "Model 'gpt' serves the Messages API by translating requests into chat completions, and only a model with `from: anthropic` can count tokens: counts are specific to the model's tokenizer. See: https://spiceai.org/docs/components/models"
+        )
+    );
+}
