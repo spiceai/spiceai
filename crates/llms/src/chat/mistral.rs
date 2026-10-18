@@ -626,10 +626,7 @@ impl MistralLlama {
                 .iter()
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
-            // The DeepSeek-V4.1 template answers directly unless thinking is requested.
-            // Left unset, mistral.rs turns thinking on, and the whole reply stays inside an
-            // unclosed `<think>` block.
-            enable_thinking: Some(false),
+            enable_thinking: None,
             reasoning_effort: None,
         };
 
