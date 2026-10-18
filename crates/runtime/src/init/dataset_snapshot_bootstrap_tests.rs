@@ -501,6 +501,63 @@ fn duckdb_dataset(
     dataset
 }
 
+/// A writer releases its snapshot writer lease when the runtime shuts down, so
+/// another instance can take over the dataset's snapshots at once instead of
+/// waiting for the lease to lapse.
+#[tokio::test]
+async fn shutdown_releases_the_snapshot_writer_lease() {
+    let directory = tempfile::tempdir().expect("test directory");
+    std::fs::write(directory.path().join("rows.csv"), "id\n1\n2\n3\n").expect("writer source");
+    let writer_app = app::AppBuilder::new("snapshot_writer_lease")
+        .with_runtime(spicepod::component::runtime::Runtime {
+            state: Some(spicepod::component::runtime::RuntimeState {
+                location: format!("file://{}/state/", directory.path().display()),
+                params: None,
+            }),
+            ..Default::default()
+        })
+        .with_dataset(duckdb_dataset(
+            directory.path(),
+            "rows.csv",
+            "writer.db",
+            spicepod::acceleration::Acceleration {
+                snapshots: spicepod::acceleration::SnapshotBehavior::CreateOnly,
+                ..Default::default()
+            },
+        ))
+        .build();
+    let writer = Arc::new(Runtime::builder().with_app(writer_app).build().await);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        Arc::clone(&writer).load_components(),
+    )
+    .await
+    .expect("the writer must finish loading");
+
+    let lease = directory.path().join("state/snapshots/leases/orders.json");
+    let lease_duration_ms = || async {
+        let contents = tokio::fs::read_to_string(&lease).await.ok()?;
+        let record: serde_json::Value = serde_json::from_str(&contents).ok()?;
+        record.get("lease-duration-ms")?.as_u64()
+    };
+    assert!(
+        test_framework::utils::wait_until_true(Duration::from_secs(15), || async {
+            lease_duration_ms().await.is_some_and(|ms| ms > 0)
+        })
+        .await,
+        "the writer must hold a live lease at {} (files: {:?})",
+        lease.display(),
+        walk(&directory.path().join("state")),
+    );
+
+    writer.shutdown().await;
+    assert_eq!(
+        lease_duration_ms().await,
+        Some(0),
+        "shutdown must release the writer lease"
+    );
+}
+
 /// With `runtime.state` set and no `snapshots` section, a writer publishes to the
 /// `snapshots/` folder of the state location, and a reader with the same
 /// `runtime.state` restores from it.

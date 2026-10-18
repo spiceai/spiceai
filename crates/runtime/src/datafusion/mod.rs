@@ -113,7 +113,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use itertools::Itertools;
 use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
@@ -1444,6 +1444,9 @@ pub struct DataFusion {
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
+    /// The snapshot managers of datasets that create snapshots, so shutdown can
+    /// release their writer leases.
+    snapshot_writers: ParkingMutex<Vec<Weak<runtime_acceleration::snapshot::SnapshotManager>>>,
     /// `sink` datasets waiting for their first write, which is when their schema becomes
     /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
     /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
@@ -4501,6 +4504,11 @@ impl DataFusion {
                     )
                     .await?
                     {
+                        {
+                            let mut writers = self.snapshot_writers.lock();
+                            writers.retain(|writer| writer.strong_count() > 0);
+                            writers.push(Arc::downgrade(&snapshot_config.manager));
+                        }
                         accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                     }
                 } else {
@@ -6718,6 +6726,24 @@ impl DataFusion {
 
     pub fn query_builder(self: &Arc<Self>, sql: &str) -> QueryBuilder {
         QueryBuilder::new(sql, Arc::clone(self))
+    }
+
+    /// Releases the snapshot writer leases this runtime holds, so another instance
+    /// takes over the datasets' snapshots at its next snapshot instead of waiting
+    /// for the leases to lapse.
+    pub async fn release_snapshot_writer_leases(&self) {
+        let writers: Vec<_> = self
+            .snapshot_writers
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        join_all(
+            writers
+                .iter()
+                .map(|writer| writer.release_writer_lease_on_shutdown()),
+        )
+        .await;
     }
 
     /// Performs `DataFusion` cleanup during shutdown.

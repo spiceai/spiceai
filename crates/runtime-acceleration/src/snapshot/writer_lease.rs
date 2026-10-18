@@ -48,6 +48,7 @@ limitations under the License.
 //! snapshot's lease duration, the publication fence and the log lines.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -86,6 +87,9 @@ const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 pub(super) struct WriterLease {
     lease: Lease,
     reported: Arc<Mutex<Reported>>,
+    /// Set once the instance releases the lease on shutdown, so it does not take
+    /// the lease back before it exits.
+    released_on_shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -112,6 +116,7 @@ impl WriterLease {
         Self {
             lease: Lease::new(holder, lease_duration(snapshot_interval)),
             reported: Arc::default(),
+            released_on_shutdown: Arc::default(),
         }
     }
 
@@ -235,6 +240,13 @@ impl SnapshotManager {
     /// Takes or renews the dataset's snapshot writer lease, and says whether
     /// this instance creates the snapshot.
     pub(super) async fn hold_writer_lease(&self) -> Result<WriterPermit, SnapshotUploadError> {
+        if self
+            .writer_lease
+            .released_on_shutdown
+            .load(Ordering::Acquire)
+        {
+            return Ok(WriterPermit::Standby);
+        }
         let role = self.acquire_writer_lease().await?;
         self.report_writer_lease_role(&role);
         Ok(match role {
@@ -261,6 +273,33 @@ impl SnapshotManager {
             Err(error) => {
                 tracing::debug!(dataset = %self.dataset_name, %error, "Could not release the snapshot writer lease after a failed snapshot; it lapses on its own");
             }
+        }
+    }
+
+    /// Stops this instance creating the dataset's snapshots and releases its
+    /// writer lease, so another instance takes over at its next snapshot instead
+    /// of waiting for the lease to lapse. A snapshot already being created still
+    /// completes; generation fencing refuses it if the new holder publishes first.
+    pub async fn release_writer_lease_on_shutdown(&self) {
+        self.writer_lease
+            .released_on_shutdown
+            .store(true, Ordering::Release);
+        match self
+            .writer_lease
+            .lease
+            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => tracing::info!(
+                "Released the snapshot writer lease of dataset '{}' on shutdown, so another instance can take over its snapshots",
+                self.dataset_name
+            ),
+            Err(error) => tracing::warn!(
+                "Failed to release the snapshot writer lease of dataset '{}' on shutdown, so another instance takes over its snapshots only after the lease lapses ({}). Cause: {error}",
+                self.dataset_name,
+                format_duration(self.writer_lease.lease.duration()),
+            ),
         }
     }
 
@@ -649,6 +688,28 @@ mod tests {
         ));
 
         a.release_writer_lease().await;
+        assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
+        assert!(matches!(
+            b.hold_writer_lease().await.expect("b takes over"),
+            WriterPermit::Holder { generation: 2 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lease_released_on_shutdown_passes_at_once_and_is_not_taken_back() {
+        let store = memory();
+        let a = manager(&store, instance("host-a"));
+        let b = manager(&store, instance("host-b"));
+        a.hold_writer_lease().await.expect("a takes the lease");
+
+        a.release_writer_lease_on_shutdown().await;
+        assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
+        // A snapshot attempt while shutting down stands by rather than renewing
+        // the lease it just released.
+        assert!(matches!(
+            a.hold_writer_lease().await.expect("a reads its state"),
+            WriterPermit::Standby
+        ));
         assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
         assert!(matches!(
             b.hold_writer_lease().await.expect("b takes over"),
