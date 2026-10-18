@@ -213,7 +213,13 @@ impl ChatEvaluator {
         let Some(choice) = response.choices.into_iter().next() else {
             return Err(failed("the model returned no reply".to_string()));
         };
-        if let Some(refusal) = choice.message.refusal {
+        // An empty refusal declines nothing: some OpenAI-compatible servers send
+        // `"refusal": ""` beside a reply that answers.
+        if let Some(refusal) = choice
+            .message
+            .refusal
+            .filter(|refusal| !refusal.trim().is_empty())
+        {
             return Err(failed(format!("the model refused to answer: {refusal}")));
         }
         match choice.finish_reason {
@@ -755,6 +761,24 @@ mod tests {
                 .to_string()
                 .contains("the model refused to answer: I can't help with that."),
             "{error}"
+        );
+        assert_eq!(chat.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_refusal_beside_an_answer_is_not_a_refusal() {
+        let mut answered = reply(&valid_answers());
+        if let Some(choice) = answered.choices.first_mut() {
+            choice.message.refusal = Some(String::new());
+        }
+        let chat = ScriptedChat::new([Ok(answered)]);
+        let evaluator = evaluator(&chat);
+
+        let response = evaluator.evaluate(request()).await.expect("evaluation");
+
+        assert_eq!(
+            response.answers.get("is_urgent"),
+            Some(&Answer::Noul { noul: 0.9 })
         );
         assert_eq!(chat.requests().len(), 1);
     }
