@@ -15,6 +15,16 @@ limitations under the License.
 */
 
 //! Scoped write conflict probes. Incoming rows are never deduplicated or rewritten.
+//!
+//! A scoped append or set replacement declares the set of rows it writes.
+//! Before `ProviderChangeSinkBackend::apply_rows` mutates, these checks refuse
+//! incoming rows whose unique keys collide with stored rows outside the
+//! input's scope, or with rows of another scope in the same coalesced write.
+//! A stored row in a scope that an earlier input replaces is not a conflict.
+//! One probe serves every input of the write. A key conflict is refused with
+//! `member_refusal`, which names the first input that would be refused on its
+//! own. They also refuse keys they cannot compare safely, such as
+//! NULL-bearing unique keys.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -33,7 +43,7 @@ use futures::StreamExt;
 
 use super::refusal::{before_mutation, member_refusal};
 use crate::change_sink::batch::{ScopeIdentity, ScopedInput, row_scalar, supports_key_equality};
-use crate::change_sink::{ChangeSinkContext, SetKey};
+use crate::change_sink::{ChangeSinkContext, ScopeKind, SetKey};
 
 struct Scoped {
     scope: SetKey,
@@ -99,7 +109,7 @@ pub async fn validate_scoped_inputs(
             scope,
             batches: range,
             identity,
-            replaces: input.replaces(),
+            replaces: input.kind() == ScopeKind::Replace,
         });
     }
     if cursor != batches.len() {

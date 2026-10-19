@@ -16,6 +16,12 @@ limitations under the License.
 
 //! Compatible CDC burst preparation for the table owner. Source acknowledgement
 //! and source control remain outside this module.
+//!
+//! The owner task drains queued inputs into a burst (`CdcBurst` or
+//! `AppendBurst`) until a limit or a compatibility boundary ends it. For CDC,
+//! `CdcBurst::prepare` then decodes and checks every input, and splits the
+//! burst into `PreparedCdc` groups, before any input mutates storage. Producers
+//! opt in with a `CdcIngress` or `AppendIngress` lane handle.
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -36,8 +42,8 @@ use runtime_metrics::acceleration as metrics;
 
 use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
-    ChangeBatch, ChangeCapabilities, ChangePayload, Recovery, SchemaEvolutionSupport, ScopedInput,
-    SetKey, WriteOptions,
+    CdcRows, ChangeBatch, ChangeCapabilities, Recovery, RowsWrite, SchemaEvolutionSupport,
+    ScopeKind, SetKey, WriteOptions,
 };
 
 /// Refuse a change whose numeric values the accelerated table's column types
@@ -92,15 +98,26 @@ fn ensure_numbers_cast_exactly(data: &RecordBatch, target: &SchemaRef) -> Result
     Ok(())
 }
 
+/// Bounds for one coalesced burst, set by the producer on its lane. A burst
+/// ends when any bound is reached, or when the queue is empty and `max_age`
+/// is zero.
 #[derive(Clone, Copy, Debug)]
 pub struct CoalescingLimits {
+    /// Maximum number of submitted inputs in one burst.
     pub max_inputs: usize,
+    /// Maximum estimated bytes in one burst. A single input can exceed it.
     pub max_bytes: usize,
+    /// How long the owner waits for more input, measured from the earlier of
+    /// the previous apply cycle and the first input's admission.
     pub max_age: Duration,
 }
 
 /// Opt-in append batching for one producer lane. It contains no row queue,
 /// source acknowledgement, or replacement policy.
+///
+/// The caching-mode writer sets one as the `lane` of each `ChangeBatch` it
+/// submits, so that many small cache fills, appends and replacements, become
+/// one write.
 #[derive(Debug)]
 pub struct AppendIngress {
     pub limits: CoalescingLimits,
@@ -119,18 +136,25 @@ impl AppendIngress {
 
 /// The owner's single admission drain uses the same limits and boundary rules
 /// for CDC and opted-in appends. An active burst is not another data queue.
+///
+/// Implemented by `CdcBurst` and `AppendBurst`; used by the owner's drain loop.
 pub(crate) trait CoalescingBurst: Send {
+    /// The lane's limits. `None` means the burst does not wait for more input.
     fn limits(&self) -> Option<CoalescingLimits>;
+    /// Number of inputs in the burst.
     fn len(&self) -> usize;
+    /// Estimated bytes in the burst.
     fn bytes(&self) -> usize;
+    /// The burst accepts no more input.
     fn is_full(&self) -> bool;
     /// Returns `Break` with the unconsumed input when this burst must end.
     fn push(&mut self, next: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch>;
+    /// The CDC lane that receives drain metrics. `None` for appends.
     fn cdc_metrics(&self) -> Option<&Arc<CdcIngress>>;
 }
 
 pub(crate) struct AppendBurst {
-    batch: ChangeBatch,
+    write: RowsWrite,
     options: WriteOptions,
     ingress: Arc<AppendIngress>,
     count: usize,
@@ -155,25 +179,21 @@ struct BurstScopes {
 }
 
 impl BurstScopes {
-    /// Admit all scoped inputs of `batch`, or none of them.
+    /// Admit the scope of `batch`, if it has one, and record it.
     fn admit(&mut self, batch: &ChangeBatch) -> bool {
-        let inputs = batch.scoped_inputs();
-        if self.closed
-            || (inputs.len() > 1
-                && (!self.replaced.is_empty() || inputs.iter().any(ScopedInput::replaces)))
-            || !inputs.iter().all(|input| self.permits(input))
-        {
+        let Some((scope, kind)) = batch.scoped_input() else {
+            return !self.closed;
+        };
+        if self.closed || !self.permits(scope, kind) {
             return false;
         }
-        for input in inputs {
-            self.record(input);
-        }
+        self.record(scope, kind);
         true
     }
 
-    fn permits(&self, input: &ScopedInput) -> bool {
-        let values = self.indexed_values(input.scope());
-        if input.replaces() {
+    fn permits(&self, scope: &SetKey, kind: ScopeKind) -> bool {
+        let values = self.indexed_values(scope);
+        if kind == ScopeKind::Replace {
             values.is_some_and(|values| {
                 !self.unindexed_append
                     && !self.appended.contains(&values)
@@ -194,8 +214,8 @@ impl BurstScopes {
             .then_some(values)
     }
 
-    fn record(&mut self, input: &ScopedInput) {
-        match input.scope().hash_identity() {
+    fn record(&mut self, scope: &SetKey, kind: ScopeKind) {
+        match scope.hash_identity() {
             Some((columns, values))
                 if self
                     .columns
@@ -203,35 +223,30 @@ impl BurstScopes {
                     .is_none_or(|shared| *shared == columns) =>
             {
                 self.columns.get_or_insert(columns);
-                if input.replaces() {
+                if kind == ScopeKind::Replace {
                     self.replaced.insert(values);
                 } else {
                     self.appended.insert(values);
                 }
             }
-            _ if input.replaces() => self.closed = true,
+            _ if kind == ScopeKind::Replace => self.closed = true,
             _ => self.unindexed_append = true,
         }
     }
 }
 
 impl AppendBurst {
-    pub(crate) fn new(batch: ChangeBatch, options: WriteOptions) -> Result<Self> {
-        let ingress = batch.append_ingress().cloned().ok_or_else(|| {
-            DataFusionError::Internal("Append batching requires a producer lane".into())
-        })?;
-        if !batch.can_merge_append(&batch) {
-            return Err(DataFusionError::Internal(
-                "Only Rows appends can enter an append burst".into(),
-            ));
-        }
+    /// Start a burst with a row write on a lane. As `push` does, returns
+    /// `Break` with the unchanged input when it is CDC or has no lane.
+    pub(crate) fn new(batch: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch, Self> {
         let bytes = batch.estimated_bytes();
+        let (write, ingress) = batch.into_laned_rows()?;
         let mut scopes = BurstScopes::default();
-        for input in batch.scoped_inputs() {
-            scopes.record(input);
+        for input in write.scoped_inputs() {
+            scopes.record(input.scope(), input.kind());
         }
-        Ok(Self {
-            batch,
+        ControlFlow::Continue(Self {
+            write,
             options,
             ingress,
             count: 1,
@@ -244,8 +259,8 @@ impl AppendBurst {
         &self.ingress.dataset
     }
 
-    pub(crate) fn finish(self) -> (ChangeBatch, WriteOptions) {
-        (self.batch, self.options)
+    pub(crate) fn finish(self) -> (RowsWrite, WriteOptions) {
+        (self.write, self.options)
     }
 }
 
@@ -276,12 +291,12 @@ impl CoalescingBurst for AppendBurst {
                 .append_ingress()
                 .is_some_and(|ingress| Arc::ptr_eq(&self.ingress, ingress))
             || self.bytes.saturating_add(bytes) > self.ingress.limits.max_bytes.max(1)
-            || !self.batch.can_merge_append(&next)
+            || !self.write.accepts(&next)
             || !self.scopes.admit(&next)
         {
             return ControlFlow::Break(next);
         }
-        self.batch.merge_append(next)?;
+        self.write.merge(next)?;
         self.count += 1;
         self.bytes = self.bytes.saturating_add(bytes);
         ControlFlow::Continue(())
@@ -294,8 +309,14 @@ impl CoalescingBurst for AppendBurst {
 
 /// One source lane's policy, limits, and owner-maintained queue accounting.
 /// Identity is a coalescing boundary; independent sources need distinct handles.
+///
+/// The CDC refresh task creates one for each stream and attaches it to every
+/// input with `ChangeBatch::cdc_rows`. Only inputs that share this handle
+/// coalesce. It also records the CDC queue and apply metrics.
 pub struct CdcIngress {
+    /// Schema policy the owner uses when it prepares a burst.
     pub policy: Arc<dyn CdcPolicy>,
+    /// Burst limits for this lane.
     pub limits: CoalescingLimits,
     labels: [KeyValue; 1],
     queued: parking_lot::Mutex<(usize, usize)>,
@@ -424,19 +445,33 @@ impl Drop for ApplyingGuard {
 
 /// A group applied once and fanned out to `input_count` result observers. Each
 /// observer must receive the same publication and durability milestones.
+///
+/// Produced by `CdcBurst::prepare`. A burst splits into groups at barriers
+/// (truncate, empty input) and, when the policy asks, at schema changes.
 pub struct PreparedCdc {
+    /// The concatenated, decoded CDC rows of the group.
     pub batch: ChangeBatch,
+    /// Options for the group. Set to `Recovery::Durable` when the group has
+    /// an operation that the backend cannot defer.
     pub options: WriteOptions,
+    /// Number of submitted inputs in the group.
     pub input_count: usize,
+    /// Number of CDC rows in the group, for metrics.
     pub rows: usize,
+    /// The lane of the inputs, if any.
     pub ingress: Option<Arc<CdcIngress>>,
+    /// Apply the group as is, or evolve the table schema first.
     pub schema: SchemaDecision,
 }
 
 /// Row data drained out of the owner's admission queue. This is an active
 /// execution batch, not another producer queue.
+///
+/// Inputs join only if they share the first input's `CdcIngress`, its
+/// `delete_batch_size` and its `Rebuildable` status, fit the limits, and are
+/// not barriers.
 pub struct CdcBurst {
-    inputs: Vec<ChangeBatch>,
+    inputs: Vec<CdcRows>,
     options: WriteOptions,
     ingress: Option<Arc<CdcIngress>>,
     bytes: usize,
@@ -445,25 +480,18 @@ pub struct CdcBurst {
 
 impl CdcBurst {
     /// Start a burst with one CDC input.
-    ///
-    /// # Errors
-    /// Returns an error if the first input is not CDC data.
-    pub fn new(first: ChangeBatch, options: WriteOptions) -> Result<Self> {
-        let ChangePayload::Cdc(rows) = first.payload() else {
-            return Err(DataFusionError::Internal(
-                "A CDC burst requires CDC input".into(),
-            ));
-        };
-        let ingress = rows.ingress().cloned();
-        let barrier = is_barrier(&first);
+    #[must_use]
+    pub fn new(first: CdcRows, options: WriteOptions) -> Self {
+        let ingress = first.ingress().cloned();
+        let barrier = first.as_built().is_some_and(cdc_barrier);
         let bytes = first.estimated_bytes();
-        Ok(Self {
+        Self {
             inputs: vec![first],
             options,
             ingress,
             bytes,
             barrier,
-        })
+        }
     }
 
     #[must_use]
@@ -506,7 +534,7 @@ impl CdcBurst {
         {
             return false;
         }
-        let (Some(ingress), ChangePayload::Cdc(rows)) = (&self.ingress, next.payload()) else {
+        let (Some(ingress), ChangeBatch::Cdc(rows)) = (&self.ingress, next) else {
             return false;
         };
         if !rows
@@ -529,11 +557,15 @@ impl CdcBurst {
         if !self.accepts(&next, options) {
             return ControlFlow::Break(next);
         }
-        self.bytes = self.bytes.saturating_add(next.estimated_bytes());
+        let rows = match next {
+            ChangeBatch::Cdc(rows) => rows,
+            other => return ControlFlow::Break(other),
+        };
+        self.bytes = self.bytes.saturating_add(rows.estimated_bytes());
         if options.recovery == Recovery::Durable {
             self.options.recovery = Recovery::Durable;
         }
-        self.inputs.push(next);
+        self.inputs.push(rows);
         ControlFlow::Continue(())
     }
 
@@ -550,19 +582,12 @@ impl CdcBurst {
         capabilities: ChangeCapabilities,
     ) -> Result<Vec<PreparedCdc>> {
         let decode_start = Instant::now();
-        let materialized = self.inputs.iter().all(
-            |batch| matches!(batch.payload(), ChangePayload::Cdc(rows) if rows.is_materialized()),
-        );
+        let materialized = self.inputs.iter().all(CdcRows::is_materialized);
         let inputs = self.inputs;
         let decode = move || -> Result<Vec<cdc::ChangeBatch>> {
             inputs
                 .into_iter()
-                .map(|batch| {
-                    let ChangePayload::Cdc(rows) = batch.into_payload() else {
-                        return Err(DataFusionError::Internal(
-                            "Non-CDC input in a CDC burst".into(),
-                        ));
-                    };
+                .map(|rows| {
                     rows.into_lazy_parts()
                         .0
                         .into_built()
@@ -729,9 +754,11 @@ impl CoalescingBurst for CdcBurst {
 }
 
 fn is_barrier(batch: &ChangeBatch) -> bool {
-    match batch.payload() {
-        ChangePayload::Rows { .. } => true,
-        ChangePayload::Cdc(rows) => rows.as_built().is_some_and(cdc_barrier),
+    match batch {
+        ChangeBatch::Append { .. }
+        | ChangeBatch::AppendScoped { .. }
+        | ChangeBatch::Replace { .. } => true,
+        ChangeBatch::Cdc(rows) => rows.as_built().is_some_and(cdc_barrier),
     }
 }
 

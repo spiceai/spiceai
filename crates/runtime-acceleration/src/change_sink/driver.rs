@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The table owner: public sink handles and the single task that applies
+//! writes in order.
+//!
+//! `ChangeSink` admits commands into a bounded queue. The private `Owner`
+//! task dequeues them, coalesces compatible inputs, calls the backend, and
+//! runs finalizers. Producers observe results through `Submission`,
+//! `WriteReceipt` and `Publication`.
+
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -29,17 +37,24 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::batching::{AppendBurst, ApplyingGuard, CdcBurst, CdcIngress, CoalescingBurst};
 use super::source_policy::SchemaDecision;
 use super::{
-    BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
-    DurabilityObserver, Recovery, SchemaEvolutionSupport, StorageDurability, WriteOptions,
+    BackendWrite, CdcRows, ChangeBatch, ChangeCapabilities, ChangeSinkBackend, ChangeWrite,
+    DurabilityObserver, Recovery, RowsWrite, SchemaEvolutionSupport, ScopedWrite,
+    StorageDurability, WriteOptions,
 };
 
 type SharedResult = std::result::Result<(), Arc<DataFusionError>>;
 type Completion = Box<dyn FnOnce(Result<()>) + Send + 'static>;
 
 /// Query-visible completion. Waiting observes work already owned by the sink.
+///
+/// Found in `WriteReceipt::publication` and returned by
+/// `ChangeSink::begin_close`, where it reports the end of the drain.
 #[derive(Clone)]
 pub enum Publication {
+    /// Complete when the receipt was made. The backend had no finalizer.
     Ready,
+    /// A finalizer or drain is still running. The value becomes `Some` with
+    /// its result when it ends.
     Pending(watch::Receiver<Option<SharedResult>>),
 }
 
@@ -71,9 +86,15 @@ impl Publication {
 }
 
 /// Completion milestones for one accepted logical operation.
+///
+/// The owner sends one to each `Submission` after the backend accepts the
+/// write. Inputs coalesced into one write get the same milestones. The
+/// producer uses it to decide when to acknowledge its source.
 #[derive(Clone)]
 pub struct WriteReceipt {
+    /// The write changed table contents.
     pub changed: bool,
+    /// When the write becomes visible to queries.
     pub publication: Publication,
     /// The storage guarantee after successful publication, not at admission.
     pub durability: StorageDurability,
@@ -92,6 +113,9 @@ impl WriteReceipt {
 }
 
 /// A result observer, not the owner of accepted data or execution.
+///
+/// Returned by `ChangePermit::submit`. Call `wait` to get the `WriteReceipt`
+/// or the error that refused the write.
 pub struct Submission {
     result: oneshot::Receiver<Result<WriteReceipt>>,
     outcome: Option<std::result::Result<WriteReceipt, Arc<DataFusionError>>>,
@@ -185,6 +209,9 @@ struct Inner {
 
 /// Reserved queue capacity. No input has been transferred yet. Dropping a
 /// reservation releases capacity; submitting is synchronous and ordered with close.
+///
+/// Returned by `ChangeSink::reserve`. A producer can wait for capacity with
+/// no input at risk, then call `submit` without an await.
 pub struct ChangePermit {
     permit: mpsc::OwnedPermit<Command>,
     inner: Arc<Inner>,
@@ -217,8 +244,8 @@ impl ChangePermit {
         if closing.is_some() {
             return Err(stopped());
         }
-        let charge = match batch.payload() {
-            ChangePayload::Cdc(rows) => rows.ingress().map(|ingress| {
+        let charge = match &batch {
+            ChangeBatch::Cdc(rows) => rows.ingress().map(|ingress| {
                 let bytes = batch.estimated_bytes();
                 let capacity = self.inner.sender.max_capacity();
                 ingress.record_send_wait(self.admission_wait);
@@ -229,7 +256,9 @@ impl ChangePermit {
                     capacity,
                 }
             }),
-            ChangePayload::Rows { .. } => None,
+            ChangeBatch::Append { .. }
+            | ChangeBatch::AppendScoped { .. }
+            | ChangeBatch::Replace { .. } => None,
         };
         self.permit.send(Command::Apply(Box::new(ApplyCommand {
             batch,
@@ -243,6 +272,11 @@ impl ChangePermit {
 }
 
 /// Cloneable handle to one table-generation owner. Cloning never starts a worker.
+///
+/// There is one sink for each generation of an accelerated table. The refresh
+/// task and the caching-mode writer share clones of it. The runtime's
+/// generation lifecycle drains a sink with `begin_close` before a new
+/// generation can own the same table.
 #[derive(Clone)]
 pub struct ChangeSink {
     inner: Arc<Inner>,
@@ -285,11 +319,13 @@ impl ChangeSink {
         }
     }
 
+    /// What the bound backend can do.
     #[must_use]
     pub fn capabilities(&self) -> ChangeCapabilities {
         self.inner.backend.capabilities()
     }
 
+    /// Register the source that receives `Deferred` durability fences.
     pub fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>) {
         self.inner.backend.set_durability_observer(observer);
     }
@@ -422,6 +458,10 @@ impl ChangeSink {
     }
 }
 
+fn scoped(write: ScopedWrite) -> ChangeWrite {
+    ChangeWrite::Rows(write.into())
+}
+
 fn stopped() -> DataFusionError {
     DataFusionError::Execution(
         "Change ingestion is closed; accepted work may require recovery".into(),
@@ -514,17 +554,28 @@ impl Owner {
             command.received();
             match command {
                 Command::Apply(input) => {
+                    let ApplyCommand {
+                        batch,
+                        options,
+                        reply,
+                        admitted_at,
+                        ..
+                    } = *input;
                     if let Some(error) = &self.failure {
-                        input.reply.refuse(error);
-                    } else if matches!(input.batch.payload(), ChangePayload::Cdc(_)) {
-                        self.apply_cdc(*input).await;
-                    } else if input.batch.append_ingress().is_some() {
-                        self.apply_append(*input).await;
+                        reply.refuse(error);
+                    } else if let ChangeBatch::Cdc(rows) = batch {
+                        self.apply_cdc(rows, options, reply, admitted_at).await;
                     } else {
-                        // A row vector is one operation. Its scope and chunk
-                        // boundaries are not CDC coalescing boundaries.
-                        self.apply(input.batch, input.options, vec![input.reply])
-                            .await;
+                        match AppendBurst::new(batch, options) {
+                            ControlFlow::Continue(burst) => {
+                                self.apply_append(burst, reply, admitted_at).await;
+                            }
+                            // A row vector without a lane is one operation. Its
+                            // scope and chunk boundaries are not coalescing boundaries.
+                            ControlFlow::Break(batch) => {
+                                self.apply(batch.into(), options, vec![reply]).await;
+                            }
+                        }
                     }
                 }
                 Command::Flush(reply) => {
@@ -648,25 +699,8 @@ impl Owner {
         reason
     }
 
-    async fn apply_append(&mut self, input: ApplyCommand) {
-        let ApplyCommand {
-            batch,
-            options,
-            reply,
-            admitted_at,
-            ..
-        } = input;
+    async fn apply_append(&mut self, mut burst: AppendBurst, reply: Reply, admitted_at: Instant) {
         let mut replies = VecDeque::from([reply]);
-        let mut burst = match AppendBurst::new(batch, options) {
-            Ok(burst) => burst,
-            Err(error) => {
-                let error = self.fail(error);
-                for reply in replies {
-                    reply.refuse(&error);
-                }
-                return;
-            }
-        };
         let reason = self
             .drain(
                 &mut burst,
@@ -681,20 +715,22 @@ impl Owner {
             close_reason = reason, "Applying coalesced Rows append"
         );
         let burst_dataset = burst.dataset().clone();
-        let (batch, options) = burst.finish();
+        let (write, options) = burst.finish();
         let replies = replies.into_iter().collect::<Vec<_>>();
-        // Each member's own batch, kept to retry one at a time if the backend
-        // refuses the coalesced write before changing anything.
-        let members = (replies.len() > 1)
-            .then(|| batch.scoped_members())
-            .flatten()
-            .filter(|members| members.len() == replies.len());
-        let Some(members) = members else {
-            self.apply(batch, options, replies).await;
-            return;
-        };
-        self.apply_members(&burst_dataset, batch, members, options, replies)
-            .await;
+        match write {
+            // Each member's own write, kept to retry one at a time if the
+            // backend refuses the coalesced write before changing anything.
+            RowsWrite::Scoped(write)
+                if replies.len() > 1 && write.inputs().len() == replies.len() =>
+            {
+                let members = write.members();
+                self.apply_members(&burst_dataset, write, members, options, replies)
+                    .await;
+            }
+            write => {
+                self.apply(write.into(), options, replies).await;
+            }
+        }
     }
 
     /// Apply a coalesced Rows burst so that one member's refusal refuses only
@@ -706,13 +742,15 @@ impl Owner {
     async fn apply_members(
         &mut self,
         dataset: &TableReference,
-        mut batch: ChangeBatch,
-        mut members: Vec<ChangeBatch>,
+        mut write: ScopedWrite,
+        mut members: Vec<ScopedWrite>,
         options: WriteOptions,
         mut replies: Vec<Reply>,
     ) {
         loop {
-            let Err((error, returned)) = self.apply_unless_refused(batch, options, replies).await
+            let Err((error, returned)) = self
+                .apply_unless_refused(scoped(write), options, replies)
+                .await
             else {
                 return;
             };
@@ -748,12 +786,12 @@ impl Owner {
             if rest_members.is_empty() {
                 return;
             }
-            let Some(rest) = ChangeBatch::coalesce_members(&rest_members) else {
+            let Some(rest) = ScopedWrite::coalesce(&rest_members) else {
                 self.apply_one_by_one(rest_members, options, rest_replies)
                     .await;
                 return;
             };
-            batch = rest;
+            write = rest;
             members = rest_members;
             replies = rest_replies;
         }
@@ -762,13 +800,13 @@ impl Owner {
     /// Apply members already known to pass in order as one write.
     async fn apply_together(
         &mut self,
-        members: Vec<ChangeBatch>,
+        members: Vec<ScopedWrite>,
         options: WriteOptions,
         replies: Vec<Reply>,
     ) {
-        match ChangeBatch::coalesce_members(&members) {
-            Some(batch) => {
-                self.apply(batch, options, replies).await;
+        match ScopedWrite::coalesce(&members) {
+            Some(write) => {
+                self.apply(scoped(write), options, replies).await;
             }
             None => self.apply_one_by_one(members, options, replies).await,
         }
@@ -776,7 +814,7 @@ impl Owner {
 
     async fn apply_one_by_one(
         &mut self,
-        members: Vec<ChangeBatch>,
+        members: Vec<ScopedWrite>,
         options: WriteOptions,
         replies: Vec<Reply>,
     ) {
@@ -784,30 +822,20 @@ impl Owner {
             if let Some(failure) = &self.failure {
                 reply.refuse(failure);
             } else {
-                self.apply(member, options, vec![reply]).await;
+                self.apply(scoped(member), options, vec![reply]).await;
             }
         }
     }
 
-    async fn apply_cdc(&mut self, input: ApplyCommand) {
-        let ApplyCommand {
-            batch,
-            options,
-            reply,
-            admitted_at,
-            ..
-        } = input;
+    async fn apply_cdc(
+        &mut self,
+        rows: CdcRows,
+        options: WriteOptions,
+        reply: Reply,
+        admitted_at: Instant,
+    ) {
         let mut replies = VecDeque::from([reply]);
-        let mut burst = match CdcBurst::new(batch, options) {
-            Ok(burst) => burst,
-            Err(error) => {
-                let error = self.fail(error);
-                for reply in replies {
-                    reply.refuse(&error);
-                }
-                return;
-            }
-        };
+        let mut burst = CdcBurst::new(rows, options);
         let reason = self
             .drain(&mut burst, &mut replies, admitted_at, self.previous_cycle)
             .await;
@@ -902,7 +930,9 @@ impl Owner {
                 }
             }
             let observers = replies.drain(..group.input_count).collect();
-            if self.apply(group.batch, group.options, observers).await
+            if self
+                .apply(group.batch.into(), group.options, observers)
+                .await
                 && let Some(ingress) = &group.ingress
             {
                 ingress.record_applied(group.rows);
@@ -912,11 +942,11 @@ impl Owner {
 
     async fn apply(
         &mut self,
-        batch: ChangeBatch,
+        write: ChangeWrite,
         options: WriteOptions,
         replies: Vec<Reply>,
     ) -> bool {
-        match self.apply_unless_refused(batch, options, replies).await {
+        match self.apply_unless_refused(write, options, replies).await {
             Ok(applied) => applied,
             Err((error, replies)) => self.refuse(error, options, replies),
         }
@@ -926,7 +956,7 @@ impl Owner {
     /// caller can decide whether the write is retried in parts.
     async fn apply_unless_refused(
         &mut self,
-        batch: ChangeBatch,
+        batch: ChangeWrite,
         options: WriteOptions,
         mut replies: Vec<Reply>,
     ) -> std::result::Result<bool, (DataFusionError, Vec<Reply>)> {

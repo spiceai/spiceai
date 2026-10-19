@@ -31,7 +31,7 @@ use datafusion::{
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
-use runtime_acceleration::change_sink::ChangeSink;
+use runtime_acceleration::change_sink::{ChangeBatch, ChangeSink};
 use tokio::runtime::Handle;
 
 async fn table(

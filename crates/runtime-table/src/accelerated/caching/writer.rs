@@ -46,7 +46,9 @@ use datafusion::physical_plan::{
 };
 use futures::{FutureExt, TryStreamExt};
 use runtime_acceleration::change_sink::batching::{AppendIngress, CoalescingLimits};
-use runtime_acceleration::change_sink::{ChangeBatch, ChangeSink, Recovery, SetKey, WriteOptions};
+use runtime_acceleration::change_sink::{
+    ChangeBatch, ChangeSink, Recovery, ScopedRows, SetKey, WriteOptions,
+};
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_status::RuntimeStatus;
 use tokio::runtime::Handle;
@@ -754,12 +756,13 @@ impl CacheSinkWriter {
             .fold(0, usize::saturating_add);
         // Replacements share the append lane: the owner coalesces those whose
         // scopes cannot overlap into one delete and one append.
+        let rows = ScopedRows::try_new(scope, Arc::clone(&self.schema), batches)?;
+        let lane = Some(Arc::clone(&self.append_ingress));
         let batch = if request.replaces_existing {
-            ChangeBatch::replace_set(scope, Arc::clone(&self.schema), batches)?
+            ChangeBatch::Replace { rows, lane }
         } else {
-            ChangeBatch::append_scoped(scope, Arc::clone(&self.schema), batches)?
-        }
-        .with_append_ingress(Arc::clone(&self.append_ingress))?;
+            ChangeBatch::AppendScoped { rows, lane }
+        };
         reservation.try_grow(batch.estimated_bytes().saturating_sub(row_bytes))?;
         Ok(batch)
     }
@@ -798,7 +801,7 @@ impl CacheSinkWriter {
                 return Err(error);
             }
         };
-        let changed = batch.num_rows() > 0 || batch.replaced_scopes().next().is_some();
+        let changed = batch.num_rows() > 0 || matches!(batch, ChangeBatch::Replace { .. });
         let health = Arc::clone(&self.health);
         let last_updated_at = Arc::clone(&self.last_updated_at);
         let publication = CachePublication {

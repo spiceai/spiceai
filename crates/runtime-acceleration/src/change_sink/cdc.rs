@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 //! CDC operation grouping and zero-copy row selection for accelerator backends.
+//!
+//! A backend splits one CDC batch into ordered upsert, delete and truncate
+//! groups with `group_into_sub_batches`, then applies each group. The
+//! provider and Cayenne backends both use these helpers.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;

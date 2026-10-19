@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 //! Bounded primary-key predicates and index deletion batches.
+//!
+//! Backends use these helpers to turn the primary keys of selected CDC delete
+//! rows into a `delete_from` filter, and into a key-only batch for
+//! `Index::delete_by_keys`.
 
 use arrow::array::RecordBatch;
 use data_components::cdc::ChangeBatch;
@@ -24,6 +28,7 @@ use datafusion::logical_expr::Expr;
 
 use super::cdc::select_rows;
 
+/// The error for a CDC delete row that has no primary key to match on.
 #[must_use]
 pub fn missing_primary_keys(dataset_name: &str) -> DataFusionError {
     DataFusionError::Execution(format!(

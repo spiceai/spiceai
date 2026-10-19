@@ -15,10 +15,22 @@ limitations under the License.
 */
 
 //! Proven pre-mutation refusals. Every unmarked failure requires reconciliation.
+//!
+//! A backend wraps an error with `before_mutation` when it is sure that the
+//! failed write changed no storage and no index. The owner checks the mark with
+//! `is_before_mutation`: a marked failure of a `Recovery::Rebuildable` write
+//! does not stop the sink. Every other failure stops it.
+//!
+//! A coalesced scoped write can instead fail with `member_refusal`, which is
+//! also a pre-mutation refusal. It names the first member, in arrival order,
+//! that would be refused on its own, so the owner can apply the members
+//! before it and refuse only that member.
 
 use datafusion::error::DataFusionError;
 use snafu::Snafu;
 
+/// Marker error that wraps a pre-mutation refusal. Its display is the source
+/// error unchanged.
 #[derive(Debug, Snafu)]
 #[snafu(display("{source}"))]
 pub struct BeforeMutation {
