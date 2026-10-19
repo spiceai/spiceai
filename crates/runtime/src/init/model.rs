@@ -544,7 +544,9 @@ mod tests {
             .await
             .expect_err("pickle weights are refused");
         assert!(
-            rejected.to_string().contains("Refusing to load model weight file"),
+            rejected
+                .to_string()
+                .contains("Refusing to load model weight file"),
             "{rejected}"
         );
         assert!(is_permanent_model_failure(&rejected), "{rejected}");
