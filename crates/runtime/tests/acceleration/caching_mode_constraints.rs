@@ -670,14 +670,15 @@ async fn a_refreshed_entry_sheds_rows_the_response_no_longer_returns() -> Result
 }
 
 /// A key over the request columns makes every lookup a primary-key point lookup.
-/// Once Cayenne holds two protected snapshots, the accelerator scan reads one
-/// partition per snapshot, and the cache lookup above it must still read all of
-/// them as one: every lookup returns its row, and keys cached earlier are
-/// served without another fetch.
+/// Once Cayenne holds cached rows in more than one storage tier (a Vortex file
+/// and the inline memtable, or several snapshots), the accelerator scan is a
+/// union with one partition per branch, and the cache lookup above it must
+/// still read all of them as one: every lookup returns its row, and keys cached
+/// earlier are served without another fetch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 // Cayenne is not built on Windows, so neither is a test that loads it.
 #[cfg(all(feature = "sqlite", not(target_os = "windows")))]
-async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), anyhow::Error> {
+async fn a_point_lookup_reads_every_cayenne_scan_partition() -> Result<(), anyhow::Error> {
     use arrow::util::display::array_value_to_string;
     use futures::TryStreamExt;
 
@@ -736,11 +737,15 @@ async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), a
         vec![
             ("cayenne_file_path".to_string(), registry),
             ("cayenne_deletion_mode".to_string(), "key".to_string()),
-            // Checkpoint each cached response into a protected snapshot within
-            // about a second, instead of the default ten.
+            // Cache writes land in the inline memtable. Flush it to a Vortex file
+            // after every second row, so the next cached row is inline while the
+            // earlier ones are in a file and the scan unions the two. The byte
+            // cap is below `inline_max_bytes` so the flush check runs on every
+            // inline write, and above one row's size so the row cap decides.
+            ("cayenne_inline_flush_max_rows".to_string(), "2".to_string()),
             (
-                "cayenne_cdc_mem_tier_max_age_ms".to_string(),
-                "500".to_string(),
+                "cayenne_inline_flush_max_bytes".to_string(),
+                "65536".to_string(),
             ),
             ("caching_ttl".to_string(), "1h".to_string()),
         ],
@@ -750,7 +755,7 @@ async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), a
     let rt = build_runtime(dataset, "caching_point_lookup_cayenne").await;
 
     // Cache one new key a second until the accelerator scan is a union of
-    // snapshots, so it has more than one partition.
+    // storage tiers, so it has more than one partition.
     let mut keys: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
@@ -771,7 +776,7 @@ async fn a_point_lookup_reads_every_cayenne_protected_snapshot() -> Result<(), a
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "the accelerator scan never read more than one snapshot after caching {} keys, \
+            "the accelerator scan never read more than one storage tier after caching {} keys, \
              so a multi-partition lookup was never exercised:\n{plan}",
             keys.len()
         );
