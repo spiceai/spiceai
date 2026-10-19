@@ -87,6 +87,9 @@ const WRITER_GENERATION_PROPERTY: &str = "writer-generation";
 pub(super) struct WriterLease {
     lease: Lease,
     reported: Arc<Mutex<Reported>>,
+    /// Set once this instance resigns the lease. Held across acquisition and
+    /// release so the two never interleave.
+    resigned: Arc<tokio::sync::Mutex<bool>>,
 }
 
 #[derive(Default)]
@@ -116,6 +119,7 @@ impl WriterLease {
                 &WriterStatus::default(),
             ),
             reported: Arc::default(),
+            resigned: Arc::default(),
         }
     }
 
@@ -290,6 +294,10 @@ impl SnapshotManager {
     /// Takes or renews the dataset's snapshot writer lease, and says whether
     /// this instance creates the snapshot.
     pub(super) async fn hold_writer_lease(&self) -> Result<WriterPermit, SnapshotUploadError> {
+        let resigned = self.writer_lease.resigned.lock().await;
+        if *resigned {
+            return Ok(WriterPermit::Standby);
+        }
         let role = self.acquire_writer_lease().await?;
         self.report_writer_lease_role(&role);
         Ok(match role {
@@ -303,12 +311,7 @@ impl SnapshotManager {
     /// its next snapshot. Best effort: a failure leaves the lease to lapse on
     /// its own.
     pub(super) async fn release_writer_lease(&self) {
-        match self
-            .writer_lease
-            .lease
-            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
-            .await
-        {
+        match self.release_lease(false).await {
             Ok(false) => {}
             Ok(true) => {
                 tracing::debug!(dataset = %self.dataset_name, "Released the snapshot writer lease after a failed snapshot");
@@ -317,6 +320,33 @@ impl SnapshotManager {
                 tracing::debug!(dataset = %self.dataset_name, %error, "Could not release the snapshot writer lease after a failed snapshot; it lapses on its own");
             }
         }
+    }
+
+    /// Releases the writer lease and stops re-acquiring it, so another instance
+    /// takes over at its next snapshot instead of waiting for the lease to lapse.
+    pub async fn resign_writer_lease(&self) {
+        match self.release_lease(true).await {
+            Ok(false) => {}
+            Ok(true) => tracing::info!(
+                "Released the snapshot writer lease of dataset '{}', so another instance can take over its snapshots",
+                self.dataset_name
+            ),
+            Err(error) => tracing::warn!(
+                "Failed to release the snapshot writer lease of dataset '{}', so another instance takes over its snapshots only after the lease lapses ({}). Cause: {error}",
+                self.dataset_name,
+                format_duration(self.writer_lease.lease.duration()),
+            ),
+        }
+    }
+
+    /// Releases the lease after any acquisition in flight.
+    async fn release_lease(&self, resign: bool) -> Result<bool, LeaseError<ConditionalWriteError>> {
+        let mut resigned = self.writer_lease.resigned.lock().await;
+        *resigned |= resign;
+        self.writer_lease
+            .lease
+            .release(&RetryingLeaseIo(self), &self.writer_lease_path())
+            .await
     }
 
     async fn acquire_writer_lease(&self) -> Result<Role, SnapshotUploadError> {
@@ -806,6 +836,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resigned_lease_passes_at_once_and_is_not_taken_back() {
+        let store = memory();
+        let a = manager(&store, instance("host-a"));
+        let b = manager(&store, instance("host-b"));
+        a.hold_writer_lease().await.expect("a takes the lease");
+
+        a.resign_writer_lease().await;
+        assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
+        // Stands by instead of renewing the resigned lease.
+        assert!(matches!(
+            a.hold_writer_lease().await.expect("a reads its state"),
+            WriterPermit::Standby
+        ));
+        assert_eq!(stored_record(&store, &a).await.lease_duration_ms, 0);
+        assert!(matches!(
+            b.hold_writer_lease().await.expect("b takes over"),
+            WriterPermit::Holder { generation: 2 }
+        ));
+    }
+
+    /// Regression test: an acquisition in flight when the lease is resigned must
+    /// not renew it.
+    #[tokio::test]
+    async fn resigning_waits_for_an_acquisition_in_flight() {
+        let store = Arc::new(TestStore::over(Arc::new(InMemory::new())));
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let a = Arc::new(manager(&shared, instance("host-a")));
+        let b = manager(&shared, instance("host-b"));
+        a.hold_writer_lease().await.expect("a takes the lease");
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *store.pause_next_read.lock() = Some((Arc::clone(&reached), Arc::clone(&resume)));
+        let renewing = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move { a.hold_writer_lease().await.map(|_| ()) }
+        });
+        reached.notified().await;
+
+        let releasing = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move { a.resign_writer_lease().await }
+        });
+        // Let a release that does not wait land first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        resume.notify_one();
+        renewing.await.expect("renewal task").expect("a renews");
+        releasing.await.expect("release task");
+
+        assert_eq!(stored_record(&shared, &a).await.lease_duration_ms, 0);
+        assert!(matches!(
+            b.hold_writer_lease().await.expect("b takes over"),
+            WriterPermit::Holder { generation: 2 }
+        ));
+    }
+
+    #[tokio::test]
     async fn a_new_lease_outranks_every_generation_already_published() {
         let store = memory();
         let a = manager(&store, instance("host-a"));
@@ -1088,6 +1175,8 @@ mod tests {
         /// Report no `ETag` or version, as a store that cannot write
         /// conditionally.
         strip_versions: bool,
+        /// Pauses the next read: notifies `reached`, then waits for `resume`.
+        pause_next_read: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     }
 
     impl TestStore {
@@ -1097,6 +1186,7 @@ mod tests {
                 yield_on_io: false,
                 lose_next_response: AtomicBool::new(false),
                 strip_versions: false,
+                pause_next_read: Mutex::new(None),
             }
         }
 
@@ -1158,6 +1248,11 @@ mod tests {
         ) -> object_store::Result<GetResult> {
             if self.yield_on_io {
                 tokio::task::yield_now().await;
+            }
+            let pause = self.pause_next_read.lock().take();
+            if let Some((reached, resume)) = pause {
+                reached.notify_one();
+                resume.notified().await;
             }
             let mut result = self.inner.get_opts(location, options).await?;
             if self.strip_versions {

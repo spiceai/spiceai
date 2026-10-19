@@ -23,8 +23,8 @@ use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RefusalKind,
     ReqwestInternalSnafu, Result, error_retry_after, is_gateway_error, is_retriable_error,
     response::{
-        ResponseBodyFormat, classify_response_body, retry_after_from_headers,
-        unexpected_response_error,
+        ResponseBodyFormat, classify_response_body, json_parse_failure_detail,
+        retry_after_from_headers, unexpected_response_error,
     },
     should_shrink_page_size,
 };
@@ -78,22 +78,27 @@ const GATEWAY_SHRINK_MIN_PAGE_SIZE: usize = 1;
 ///
 /// Mapping highest-to-lowest: `100 -> 55 -> 34 -> 21 -> 13 -> 8 -> 5 -> 3 -> 2 -> 1`.
 ///
-/// Input values that don't exactly match a step land on the nearest smaller
-/// step; values at or below the minimum return the minimum. The sequence is
-/// chosen to shrink aggressively on the first retry and then taper off as the
-/// page size approaches 1, since GitHub's GraphQL backend typically succeeds
-/// well before reaching the lower bound.
+/// A size that sits just above a rung (a configured page of 25, whose next
+/// rung is 21) does not take that tiny step. The retry would ask for almost
+/// the same page, and an upstream that already failed it fails again. Every
+/// step removes at least a fifth of the page. Values at or below the minimum
+/// stay at the minimum.
 #[must_use]
 fn reverse_fibonacci_shrink(current: usize) -> usize {
     // Reverse-Fibonacci ladder (descending).
     const LADDER: [usize; 10] = [100, 55, 34, 21, 13, 8, 5, 3, 2, 1];
 
+    let mut candidate = GATEWAY_SHRINK_MIN_PAGE_SIZE;
     for &step in &LADDER {
         if step < current {
-            return step;
+            candidate = step;
+            // `step * 5 <= current * 4` is "at least a 20% cut".
+            if step.saturating_mul(5) <= current.saturating_mul(4) {
+                return step;
+            }
         }
     }
-    GATEWAY_SHRINK_MIN_PAGE_SIZE
+    candidate
 }
 
 pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
@@ -1328,19 +1333,10 @@ impl GraphQLClient {
         let response: serde_json::Value =
             serde_json::from_str(&response_text).map_err(|source| {
                 let preview = json_error_preview(&response_text, &source);
-                let detail = if status.is_success() {
-                    format!(
-                        "The response body could not be parsed as JSON. Technical details: {source}"
-                    )
-                } else if status.is_server_error() {
-                    "The server returned a non-JSON response (likely an upstream proxy error). This is a temporary issue and will be retried automatically. If the problem persists, contact support or check the API status page.".to_string()
-                } else {
-                    format!("The response could not be parsed as JSON. Technical details: {source}")
-                };
-
+                tracing::debug!("GraphQL response was not valid JSON (HTTP {status}): {source}");
                 Error::JsonDecodeError {
                     status,
-                    detail,
+                    detail: json_parse_failure_detail(status, &source),
                     response_preview: preview,
                     retry_after,
                 }
@@ -1985,9 +1981,11 @@ impl GraphQLClient {
     }
 }
 
-/// Classify a page-fetch error for the retry loop: WARN + transient (honoring
-/// `Retry-After` when present), or permanent. Empty/truncated HTTP 200 and
-/// gateway statuses also close the pooled connection for the next attempt.
+/// Classify a page-fetch error for the retry loop. A retry that is still
+/// inside the budget is info: the refresh continues, and a warning here is
+/// an incident the operator does not have. The budget running out is a
+/// warning. Empty/truncated HTTP 200 and gateway statuses also close the
+/// pooled connection for the next attempt.
 fn map_retriable_error(
     e: Error,
     close_conn: &Arc<AtomicBool>,
@@ -2025,7 +2023,7 @@ fn map_retriable_error(
     if is_gateway_error(&e) {
         close_conn.store(true, Ordering::Relaxed);
     }
-    if let Some(page_size_override_ref) = page_size_override
+    let shrunk = if let Some(page_size_override_ref) = page_size_override
         && should_shrink_page_size(&e)
     {
         // Shrink the per-page size for the next retry. Seed from the
@@ -2043,12 +2041,18 @@ fn map_retriable_error(
                 })
         });
         let next = reverse_fibonacci_shrink(current);
-        tracing::warn!(
-            "Upstream backend error; shrinking GraphQL page size for retry: {current} -> {next}"
-        );
         *guard = Some(next);
+        (next < current).then_some((current, next))
+    } else {
+        None
+    };
+    if let Some((current, next)) = shrunk {
+        tracing::info!(
+            "Page fetch failed, so Spice will retry with a smaller page ({current} -> {next}): {e}"
+        );
+    } else {
+        tracing::info!("Page fetch failed, will retry: {e}");
     }
-    tracing::warn!("Page fetch failed, will retry: {e}");
     match error_retry_after(&e) {
         Some(retry_after) => RetryError::Transient {
             err: e,
@@ -3677,10 +3681,11 @@ mod tests {
         assert_eq!(reverse_fibonacci_shrink(1), 1);
         assert_eq!(reverse_fibonacci_shrink(0), 1);
 
-        // Non-exact values should snap down to the nearest smaller step.
+        // A size just above a rung skips that rung so the retry is actually smaller.
         assert_eq!(reverse_fibonacci_shrink(200), 100);
-        assert_eq!(reverse_fibonacci_shrink(60), 55);
-        assert_eq!(reverse_fibonacci_shrink(25), 21);
+        assert_eq!(reverse_fibonacci_shrink(60), 34);
+        assert_eq!(reverse_fibonacci_shrink(25), 13);
+        assert_eq!(reverse_fibonacci_shrink(22), 13);
         assert_eq!(reverse_fibonacci_shrink(10), 8);
     }
 

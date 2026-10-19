@@ -180,16 +180,82 @@ pub fn is_truncated_body(
 }
 
 /// Strip tags and collapse whitespace so an HTML error page can be quoted.
+///
+/// An HTML error page contributes its title, not its stylesheet. Gateway
+/// pages put the useful words in `<title>` and the rest in `<style>`.
 #[must_use]
 pub fn sanitize_preview(format: ResponseBodyFormat, body: &str) -> String {
     let text = match format {
-        ResponseBodyFormat::Html => strip_html_tags(body),
+        ResponseBodyFormat::Html => html_preview(body),
         ResponseBodyFormat::Empty => String::new(),
         ResponseBodyFormat::Incomplete | ResponseBodyFormat::Text | ResponseBodyFormat::Json => {
             collapse_whitespace(body)
         }
     };
     truncate_chars(&text, PREVIEW_MAX_CHARS)
+}
+
+fn html_preview(body: &str) -> String {
+    if let Some(title) = html_title(body) {
+        return title;
+    }
+    let stripped = strip_html_tags(&skip_embedded_blocks(body));
+    if stripped.contains('{') {
+        return String::new();
+    }
+    truncate_chars(&stripped, 80)
+}
+
+fn html_title(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let after_open = body[start..].find('>')? + start + 1;
+    let lower_rest = body[after_open..].to_ascii_lowercase();
+    let end = lower_rest.find("</title>")? + after_open;
+    let title = decode_basic_entities(&collapse_whitespace(&body[after_open..end]));
+    if title.is_empty() || title.contains('{') {
+        return None;
+    }
+    Some(truncate_chars(&title, 80))
+}
+
+/// Drop `<style>` and `<script>` bodies before the tag stripper runs. Their
+/// contents sit between tags, so a tag stripper would otherwise quote the CSS.
+fn skip_embedded_blocks(input: &str) -> String {
+    let mut out = input.to_string();
+    for (open, close) in [("<style", "</style>"), ("<script", "</script>")] {
+        out = skip_block(&out, open, close);
+    }
+    out
+}
+
+fn skip_block(input: &str, open: &str, close: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut index = 0;
+    while let Some(relative) = lower[index..].find(open) {
+        let start = index + relative;
+        out.push_str(&input[index..start]);
+        let after_open = start + open.len();
+        if let Some(end_relative) = lower[after_open..].find(close) {
+            index = after_open + end_relative + close.len();
+        } else {
+            return out;
+        }
+    }
+    out.push_str(&input[index..]);
+    out
+}
+
+fn decode_basic_entities(input: &str) -> String {
+    input
+        .replace("&middot;", "·")
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn strip_html_tags(input: &str) -> String {
@@ -276,14 +342,14 @@ pub fn unexpected_response_message(
             )
         }
         (false, ResponseBodyFormat::Html) => {
-            let preview = if preview.is_empty() {
-                String::from("HTML from upstream proxy")
-            } else if preview.contains("HTML from upstream proxy") {
-                preview.to_string()
+            let page = if preview.is_empty() {
+                String::new()
             } else {
-                format!("{preview} (HTML from upstream proxy)")
+                format!(" The page title was '{preview}'.")
             };
-            format!("The upstream server returned HTML instead of JSON (HTTP {status}). {preview}")
+            format!(
+                "The upstream server returned HTML instead of JSON (HTTP {status}).{page} This usually means a proxy in front of the API failed. If this continues, reduce the query or page size and verify the endpoint is reachable. See: https://spiceai.org/docs/components/data-connectors/graphql"
+            )
         }
         (false, _) => {
             if preview.is_empty() {
@@ -298,6 +364,24 @@ pub fn unexpected_response_message(
                 )
             }
         }
+    }
+}
+
+/// User-facing detail for a body that was classified as JSON and then failed
+/// to parse. A cut-off body (EOF mid-value) is a dropped connection, not a
+/// document the server meant to send.
+#[must_use]
+pub fn json_parse_failure_detail(status: StatusCode, source: &serde_json::Error) -> String {
+    if status.is_success() && source.is_eof() {
+        format!(
+            "The response was cut off before the JSON finished, at line {} column {}.",
+            source.line(),
+            source.column()
+        )
+    } else if status.is_server_error() {
+        "The server returned a response that was not JSON. This is often a transient upstream error.".to_string()
+    } else {
+        "The response body could not be parsed as JSON.".to_string()
     }
 }
 
@@ -473,11 +557,18 @@ mod tests {
     }
 
     #[test]
-    fn html_preview_strips_tags() {
-        let html = "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>";
-        let preview = sanitize_preview(ResponseBodyFormat::Html, html);
-        assert_eq!(preview, "502 Bad Gateway 502 Bad Gateway nginx");
+    fn html_preview_uses_the_title_and_drops_stylesheets() {
+        let nginx = "<html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body></html>";
+        let preview = sanitize_preview(ResponseBodyFormat::Html, nginx);
+        assert_eq!(preview, "502 Bad Gateway");
         assert!(!preview.contains('<'));
+
+        let github = "<html><head><title>Unicorn! &middot; GitHub</title><style>body { background-color: #f1f1f1; margin: 0; font-family: \"Helvetica Neue\", Helvetica, Arial, sans-serif; }</style></head><body><h1>504 Gateway Timeout</h1></body></html>";
+        let preview = sanitize_preview(ResponseBodyFormat::Html, github);
+        assert_eq!(preview, "Unicorn! · GitHub");
+        assert!(!preview.contains("background-color"), "{preview}");
+        assert!(!preview.contains("font-family"), "{preview}");
+        assert!(!preview.contains('<'), "{preview}");
     }
 
     #[test]
@@ -489,7 +580,10 @@ mod tests {
         );
         assert!(html_502.contains("HTML"));
         assert!(html_502.contains("502"));
-        assert!(html_502.contains("HTML from upstream proxy"));
+        assert!(html_502.contains("502 Bad Gateway"));
+        assert!(html_502.contains("proxy in front of the API"));
+        assert!(!html_502.contains("HTML from upstream proxy"));
+        assert!(!html_502.contains('\n'), "{html_502}");
         assert!(!html_502.contains("Failed to decode response body as JSON"));
 
         let empty_200 = unexpected_response_message(StatusCode::OK, ResponseBodyFormat::Empty, "");
@@ -514,6 +608,25 @@ mod tests {
         );
         assert!(message.contains("invalid JSON"));
         assert!(!message.contains("upstream server returned an error"));
+    }
+
+    #[test]
+    fn a_cut_off_json_body_is_described_as_cut_off() {
+        let err = serde_json::from_str::<serde_json::Value>("{\"data\":{\"repository\":\"")
+            .expect_err("truncated JSON");
+        assert!(err.is_eof(), "{err}");
+        let detail = json_parse_failure_detail(StatusCode::OK, &err);
+        assert!(detail.contains("cut off"), "{detail}");
+        assert!(detail.contains("column"), "{detail}");
+        assert!(!detail.contains("EOF"), "{detail}");
+        assert!(!detail.contains("Technical details"), "{detail}");
+        let message = json_decode_error_message(StatusCode::OK, &detail);
+        assert!(message.contains("invalid JSON"), "{message}");
+        assert!(message.contains("cut off"), "{message}");
+        assert!(
+            !message.contains("upstream server returned an error"),
+            "{message}"
+        );
     }
 
     #[test]
