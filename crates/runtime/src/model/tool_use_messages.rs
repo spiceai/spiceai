@@ -457,11 +457,12 @@ impl Messages for ToolUsingMessages {
                 version: version.clone(),
             })
             .await?;
+        let request_context = RequestContext::current(AsyncMarker::new().await);
         let state = StreamLoop {
             inner: Arc::clone(&self.inner),
             tools: Arc::clone(&self.tools),
             recursion_limit: self.recursion_limit,
-            context: RequestContext::current(AsyncMarker::new().await),
+            context: Arc::clone(&request_context),
             span: Span::current(),
             body,
             betas,
@@ -478,9 +479,11 @@ impl Messages for ToolUsingMessages {
             unreplayable: None,
             queue: VecDeque::new(),
         };
-        Ok(Box::pin(futures::stream::unfold(
-            state,
-            |mut state| async move {
+        // The client reads the stream after the handler has returned it, outside the request's
+        // scope, so each read is put back in it: Spice's tools, and each later round's request,
+        // run as the caller, whose identity a tool such as `sql` decides what to allow by.
+        Ok(Box::pin(request_context.scope_stream(
+            futures::stream::unfold(state, |mut state| async move {
                 loop {
                     if let Some(item) = state.queue.pop_front() {
                         return Some((item, state));
@@ -501,7 +504,7 @@ impl Messages for ToolUsingMessages {
                         None => state.events = None,
                     }
                 }
-            },
+            }),
         )))
     }
 

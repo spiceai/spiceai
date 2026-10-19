@@ -671,3 +671,59 @@ fn a_usage_field_a_round_reports_as_null_keeps_the_total() {
         json!({"input_tokens": 13, "cache_read_input_tokens": 5, "service_tier": "priority"})
     );
 }
+
+/// A `sql` Spice tool that records whether each call ran in `expected`, the caller's request
+/// context: a tool reads its caller's identity from it, for one thing to decide whether a query
+/// may write.
+struct ContextProbe {
+    expected: Arc<RequestContext>,
+    seen: Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl SpiceModelTool for ContextProbe {
+    fn name(&self) -> Cow<'_, str> {
+        "sql".into()
+    }
+
+    fn description(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+
+    fn parameters(&self) -> Option<Value> {
+        None
+    }
+
+    async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let current = RequestContext::current(AsyncMarker::new().await);
+        self.seen.lock().push(Arc::ptr_eq(&current, &self.expected));
+        Ok(json!([{"count": 3}]))
+    }
+}
+
+/// A streamed loop runs Spice's tools as the request it serves, though the client reads the
+/// stream after the request's handler has returned it.
+#[tokio::test]
+async fn a_streamed_loop_runs_spice_tools_in_the_callers_request_context() {
+    let caller = Arc::new(RequestContext::builder(runtime_request_context::Protocol::Http).build());
+    let probe = Arc::new(ContextProbe {
+        expected: Arc::clone(&caller),
+        seen: Mutex::new(Vec::new()),
+    });
+    let messages = ToolUsingMessages::new(
+        Scripted::new(two_rounds()) as Arc<dyn Messages>,
+        vec![Arc::clone(&probe) as Arc<dyn SpiceModelTool>],
+        10,
+    );
+    let events = caller
+        .scope(messages.create_stream(request()))
+        .await
+        .expect("a stream");
+    // Read outside the caller's scope, as the HTTP server reads a response body.
+    let events: Vec<Value> = events.map(|event| event.expect("an event")).collect().await;
+    assert_eq!(
+        events.last().map(|event| &event["type"]),
+        Some(&json!("message_stop"))
+    );
+    assert_eq!(*probe.seen.lock(), [true]);
+}
