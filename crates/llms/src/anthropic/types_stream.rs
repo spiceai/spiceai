@@ -337,7 +337,7 @@ pub fn transform_stream(
                     }) => {
                         // Update usage
                         if let Some(ref mut u) = state.usage {
-                            add_usage_delta(u, inner_usage);
+                            merge_cumulative_usage(u, inner_usage);
                         }
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -408,69 +408,63 @@ pub fn transform_stream(
     Box::pin(transformed_stream)
 }
 
-fn add_usage_delta(usage: &mut CompletionUsage, delta: Usage) {
+/// Merges the `usage` of a `message_delta` event into the `usage` of its `message_start` event.
+///
+/// Anthropic reports the counts of `message_delta` as totals so far, not as increments. A
+/// `message_delta` can carry only `output_tokens`, or the input and cache counts as well. Each
+/// count is the larger of the two, so a count is neither lost nor counted twice.
+fn merge_cumulative_usage(usage: &mut CompletionUsage, delta: Usage) {
     let delta = CompletionUsage::from(delta);
 
-    usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
-    usage.completion_tokens = usage
-        .completion_tokens
-        .saturating_add(delta.completion_tokens);
-    usage.total_tokens = usage.total_tokens.saturating_add(delta.total_tokens);
-    usage.prompt_tokens_details = combine_prompt_token_details(
+    usage.prompt_tokens = usage.prompt_tokens.max(delta.prompt_tokens);
+    usage.completion_tokens = usage.completion_tokens.max(delta.completion_tokens);
+    usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+    usage.prompt_tokens_details = merge_prompt_token_details(
         usage.prompt_tokens_details.take(),
         delta.prompt_tokens_details,
     );
-    usage.completion_tokens_details = combine_completion_token_details(
+    usage.completion_tokens_details = merge_completion_token_details(
         usage.completion_tokens_details.take(),
         delta.completion_tokens_details,
     );
 }
 
-fn combine_prompt_token_details(
+fn merge_prompt_token_details(
     current: Option<PromptTokensDetails>,
     delta: Option<PromptTokensDetails>,
 ) -> Option<PromptTokensDetails> {
     match (current, delta) {
         (Some(current), Some(delta)) => Some(PromptTokensDetails {
-            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
-            cached_tokens: combine_opt_u32(current.cached_tokens, delta.cached_tokens),
+            audio_tokens: max_opt_u32(current.audio_tokens, delta.audio_tokens),
+            cached_tokens: max_opt_u32(current.cached_tokens, delta.cached_tokens),
         }),
-        (Some(current), None) => Some(current),
-        (None, Some(delta)) => Some(delta),
-        (None, None) => None,
+        (current, delta) => current.or(delta),
     }
 }
 
-fn combine_completion_token_details(
+fn merge_completion_token_details(
     current: Option<CompletionTokensDetails>,
     delta: Option<CompletionTokensDetails>,
 ) -> Option<CompletionTokensDetails> {
     match (current, delta) {
         (Some(current), Some(delta)) => Some(CompletionTokensDetails {
-            accepted_prediction_tokens: combine_opt_u32(
+            accepted_prediction_tokens: max_opt_u32(
                 current.accepted_prediction_tokens,
                 delta.accepted_prediction_tokens,
             ),
-            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
-            reasoning_tokens: combine_opt_u32(current.reasoning_tokens, delta.reasoning_tokens),
-            rejected_prediction_tokens: combine_opt_u32(
+            audio_tokens: max_opt_u32(current.audio_tokens, delta.audio_tokens),
+            reasoning_tokens: max_opt_u32(current.reasoning_tokens, delta.reasoning_tokens),
+            rejected_prediction_tokens: max_opt_u32(
                 current.rejected_prediction_tokens,
                 delta.rejected_prediction_tokens,
             ),
         }),
-        (Some(current), None) => Some(current),
-        (None, Some(delta)) => Some(delta),
-        (None, None) => None,
+        (current, delta) => current.or(delta),
     }
 }
 
-fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
-    match (current, delta) {
-        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
-        (Some(current), None) => Some(current),
-        (None, Some(delta)) => Some(delta),
-        (None, None) => None,
-    }
+fn max_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
+    current.max(delta)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -652,80 +646,82 @@ mod tests {
         }
     }
 
-    #[test]
-    fn usage_delta_accumulates_cache_tokens() {
-        let mut usage = Usage {
-            input_tokens: 10,
-            output_tokens: 1,
-            cache_read_input_tokens: Some(3),
-            ..Usage::default()
+    /// The `usage` of a streamed event, from its JSON as Anthropic sends it.
+    fn event_usage(event: &str) -> Usage {
+        match serde_json::from_str(event).expect("a stream event") {
+            MessageCreateStreamResponse::MessageStart { message } => message.usage,
+            MessageCreateStreamResponse::MessageDelta { usage, .. } => usage,
+            other => panic!("expected an event with usage: {other:?}"),
         }
-        .into();
+    }
 
-        add_usage_delta(
-            &mut usage,
-            Usage {
-                input_tokens: 2,
-                output_tokens: 4,
-                cache_creation_input_tokens: Some(5),
-                cache_read_input_tokens: Some(7),
-                ..Usage::default()
-            },
+    /// The usage of a stream: its `message_start`, merged with its `message_delta`.
+    fn streamed_usage(start: &str, delta: &str) -> CompletionUsage {
+        let mut usage = event_usage(start).into();
+        merge_cumulative_usage(&mut usage, event_usage(delta));
+        usage
+    }
+
+    fn cached_tokens(usage: &CompletionUsage) -> Option<u32> {
+        usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+    }
+
+    /// A `message_delta` that repeats the input and cache counts reports totals: they are not
+    /// added to the counts of `message_start` again.
+    #[test]
+    fn message_delta_input_counts_are_not_counted_twice() {
+        let usage = streamed_usage(
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":8546,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":8546,"output_tokens":12}}"#,
         );
 
-        assert_eq!(usage.prompt_tokens, 27);
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.total_tokens, 32);
-        assert_eq!(
-            usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens),
-            Some(10)
+        assert_eq!(usage.prompt_tokens, 8552);
+        assert_eq!(cached_tokens(&usage), Some(8546));
+        assert_eq!(usage.completion_tokens, 12);
+        assert_eq!(usage.total_tokens, 8564);
+    }
+
+    /// A `message_delta` with only `output_tokens` keeps the input counts of `message_start`, and
+    /// its `output_tokens` is the total, not an increment to the `message_start` count.
+    #[test]
+    fn message_delta_with_only_output_tokens_keeps_the_input_counts() {
+        let usage = streamed_usage(
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"cache_read_input_tokens":3,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
         );
+
+        assert_eq!(usage.prompt_tokens, 28);
+        assert_eq!(cached_tokens(&usage), Some(3));
+        assert_eq!(usage.completion_tokens, 15);
+        assert_eq!(usage.total_tokens, 43);
     }
 
     #[test]
-    fn usage_delta_saturates_token_counts() {
+    fn merged_usage_total_saturates() {
         let mut usage = CompletionUsage {
             prompt_tokens: u32::MAX - 1,
-            completion_tokens: u32::MAX - 1,
+            completion_tokens: 0,
             total_tokens: u32::MAX - 1,
-            prompt_tokens_details: Some(PromptTokensDetails {
-                cached_tokens: Some(u32::MAX - 1),
-                audio_tokens: Some(u32::MAX - 1),
-            }),
+            prompt_tokens_details: None,
             completion_tokens_details: None,
         };
 
-        add_usage_delta(
+        merge_cumulative_usage(
             &mut usage,
             Usage {
-                input_tokens: 2,
                 output_tokens: 2,
-                cache_read_input_tokens: Some(2),
                 ..Usage::default()
             },
         );
 
-        assert_eq!(usage.prompt_tokens, u32::MAX);
-        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.prompt_tokens, u32::MAX - 1);
+        assert_eq!(usage.completion_tokens, 2);
         assert_eq!(usage.total_tokens, u32::MAX);
-        assert_eq!(
-            usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.cached_tokens),
-            Some(u32::MAX)
-        );
-        assert_eq!(
-            usage
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|details| details.audio_tokens),
-            Some(u32::MAX - 1)
-        );
     }
+
     /// The streaming path explains a model-not-found upstream of `transform_stream`, so the
     /// explanation has to survive this function. It did not: the fallback arm re-types every
     /// `ApiError` as `AnthropicStreamError`, which both buried the actionable message behind a
