@@ -236,6 +236,11 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// Field names and metadata have to match. A rename is a different question from a nullability
 /// flag, and admitting one here would make a reorder of same-typed sibling fields indistinguishable
 /// from a pair of renames, which positional pairing would then carry across transposed.
+///
+/// Under a field that carries an extension type, nothing may differ at all: the extension is
+/// declared over one storage layout, nullability included, so [`relabel_array_data`] refuses a
+/// storage change beneath a kept label. Such a pair keeps its cast path, which converts the
+/// values rather than republishing them under a label their storage no longer satisfies.
 fn is_nullability_relaxing_relabel(source: &DataType, target: &DataType) -> bool {
     match (source, target) {
         (DataType::List(source_item), DataType::List(target_item))
@@ -277,6 +282,8 @@ fn is_field_nullability_relaxing_relabel(source: &FieldRef, target: &FieldRef) -
         && source.dict_is_ordered() == target.dict_is_ordered()
         // At least as permissive: a nullable source under a non-nullable target is a narrowing.
         && (target.is_nullable() || !source.is_nullable())
+        // Metadata already matches above, so one side naming an extension type means both do.
+        && (source.extension_type_name().is_none() || source.data_type() == target.data_type())
         && is_nullability_relaxing_relabel(source.data_type(), target.data_type())
 }
 
@@ -2740,8 +2747,11 @@ mod test {
 #[cfg(test)]
 mod nullability_alignment_tests {
     use super::*;
-    use arrow::array::{ArrayData, Int32Array, MapArray, StringArray, StructArray};
-    use arrow::buffer::NullBuffer;
+    use arrow::array::{
+        Array, ArrayData, Int16Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        StructArray,
+    };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Fields;
 
     fn entry_fields() -> Fields {
@@ -3101,6 +3111,71 @@ mod nullability_alignment_tests {
             &DataType::List(extension("arrow.uuid")),
             &DataType::List(extension("arrow.opaque")),
         ));
+    }
+
+    /// A field that carries an extension type owns the storage layout under it, so relaxing a
+    /// storage child's nullability beneath the label is not a nullability-only relabel: the pair
+    /// keeps its cast path, which converts the values rather than republishing them under a label
+    /// their storage no longer satisfies (#13456).
+    #[test]
+    fn a_nullability_change_under_an_extension_type_is_not_relabelled() {
+        use crate::type_rewrite::tests::{extension_item, extension_storage};
+
+        let source_item = extension_item(extension_storage("timestamp", false), None);
+        let source = DataType::List(Arc::clone(&source_item));
+        let target = DataType::List(extension_item(extension_storage("timestamp", true), None));
+
+        assert!(
+            !is_nullability_relaxing_relabel(&source, &target),
+            "a storage change under an extension type must not take the relabel path"
+        );
+
+        // The conversion itself is still served, through `arrow_cast`, so the pair is routed
+        // differently rather than refused — and the values come through it unchanged.
+        let DataType::Struct(fields) = source_item.data_type() else {
+            unreachable!("built as a struct above")
+        };
+        let timestamps = Int64Array::from(vec![1, 2]);
+        let offsets = Int16Array::from(vec![60, -30]);
+        let values = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(timestamps.clone()) as ArrayRef,
+                Arc::new(offsets.clone()) as ArrayRef,
+            ],
+            None,
+        );
+        let list = ListArray::new(
+            source_item,
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        let batch = batch_of("stamps", Arc::new(list) as ArrayRef);
+        let casted = try_cast_to(batch, schema_of("stamps", target.clone()))
+            .expect("relaxing a storage child's nullability is a cast arrow performs");
+        assert_eq!(casted.schema().field(0).data_type(), &target);
+        assert_eq!(casted.num_rows(), 1);
+        let list = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("the cast column is still a list");
+        let structs = list.values();
+        let structs = structs
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("the list items are still structs");
+        assert_eq!(
+            structs.column(0).as_ref(),
+            &timestamps as &dyn Array,
+            "the `timestamp` child must come through the cast unchanged"
+        );
+        assert_eq!(
+            structs.column(1).as_ref(),
+            &offsets as &dyn Array,
+            "the `offset_minutes` child must come through the cast unchanged"
+        );
     }
 
     /// The relabel path must not swallow the casts that already worked: a genuine type change

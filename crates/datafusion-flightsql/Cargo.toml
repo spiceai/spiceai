@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
+repository.workspace = true
 description = "Arrow Flight SQL service backed by an arbitrary DataFusion SessionContext"
 
 [dependencies]

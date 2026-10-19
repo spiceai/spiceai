@@ -505,6 +505,8 @@ pub struct Builder {
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<refresh_task::append_cursor::AppendCursorStore>,
     node_local: bool,
 }
 
@@ -565,6 +567,7 @@ impl Builder {
             user_facing_schema: None,
             cdc_param_overrides: None,
             fallback_retention_keep: None,
+            append_cursor_store: None,
             node_local: false,
         }
     }
@@ -761,6 +764,16 @@ impl Builder {
         checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     ) -> &mut Self {
         self.checkpointer = checkpointer;
+        self
+    }
+
+    /// Where an append refresh keeps the source snapshot it last loaded, so an Iceberg
+    /// source's append refresh follows its snapshots. Unset, every source reads by time.
+    pub fn append_cursor_store(
+        &mut self,
+        store: refresh_task::append_cursor::AppendCursorStore,
+    ) -> &mut Self {
+        self.append_cursor_store = Some(store);
         self
     }
 
@@ -1152,6 +1165,7 @@ impl Builder {
 
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
+        refresher.with_append_cursor_store(self.append_cursor_store);
         refresher.set_bootstrap_status(self.bootstrap_status);
 
         if let Some(ref resource_monitor) = self.resource_monitor {
@@ -1293,11 +1307,12 @@ impl Builder {
         // caching scan already treats a zero-row accelerator result (whether
         // because the cache is empty or because the user's predicate
         // eliminated every cached row) as a cache miss and fetches the source.
-        // That happens regardless of the configured `on_zero_results`, so the
-        // default `return_empty` is misleading -- we always fall back to
-        // source, not return empty. Warn so users don't reason about caching
-        // mode through the lens of `on_zero_results`.
-        if refresh_mode == RefreshMode::Caching {
+        // Warn only when it is not `return_empty`: that is what an omitted
+        // setting deserializes to, so warning on it fires for every caching
+        // dataset and asks users to remove a setting they never wrote.
+        if refresh_mode == RefreshMode::Caching
+            && !matches!(self.zero_results_action, ZeroResultsAction::ReturnEmpty)
+        {
             tracing::warn!(
                 "Dataset {dataset}: `on_zero_results` is ignored when `refresh_mode: caching` is set. \
                  Caching mode always queries the source on a cache miss. \
