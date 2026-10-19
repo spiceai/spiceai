@@ -33,7 +33,7 @@ use futures::StreamExt;
 
 use super::refusal::{before_mutation, member_refusal};
 use crate::change_sink::batch::{ScopeIdentity, ScopedInput, row_scalar, supports_key_equality};
-use crate::change_sink::{ChangeSinkContext, SetKey};
+use crate::change_sink::{ChangeSinkContext, ScopeKind, SetKey};
 
 struct Scoped {
     scope: SetKey,
@@ -99,7 +99,7 @@ pub async fn validate_scoped_inputs(
             scope,
             batches: range,
             identity,
-            replaces: input.replaces(),
+            replaces: input.kind() == ScopeKind::Replace,
         });
     }
     if cursor != batches.len() {

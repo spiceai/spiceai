@@ -39,7 +39,10 @@ use datafusion::execution::context::SessionContext;
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 
-pub use batch::{CdcRows, ChangeBatch, ChangePayload, ScopedInput, SetKey, replaced_scope_filters};
+pub use batch::{
+    CdcRows, ChangeBatch, ChangeWrite, Rows, RowsWrite, ScopeKind, ScopedInput, ScopedRows,
+    ScopedWrite, SetKey, replaced_scope_filters,
+};
 pub use driver::{ChangePermit, ChangeSink, Publication, Submission, WriteReceipt};
 
 /// The producer's recovery contract. This does not contain a source offset.
@@ -164,7 +167,7 @@ pub trait ChangeSinkBackend: Send + Sync {
 
     async fn apply(
         &self,
-        batch: ChangeBatch,
+        write: ChangeWrite,
         options: WriteOptions,
         context: &SessionContext,
     ) -> Result<BackendWrite>;

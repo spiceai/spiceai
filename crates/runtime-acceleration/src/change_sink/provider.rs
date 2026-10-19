@@ -51,9 +51,9 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, SpiceTable, find_concrete};
 
 use super::{
-    BackendWrite, ChangeBatch, ChangeCapabilities, ChangeIndexes, ChangePayload, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, ScopedInput,
-    StorageDurability, WriteOptions, replaced_scope_filters,
+    BackendWrite, ChangeCapabilities, ChangeIndexes, ChangeSinkBackend, ChangeSinkContext,
+    ChangeWrite, DurabilityObserver, ReplacementSupport, RowsWrite, SchemaEvolutionSupport,
+    ScopeKind, StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use cdc::{CdcMetrics, ChangeOperationType, group_into_sub_batches, select_rows};
@@ -152,12 +152,15 @@ impl ProviderChangeSinkBackend {
     /// A failure after mutation starts does not roll back prior changes.
     pub async fn apply_rows(
         &self,
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-        scoped_inputs: Vec<ScopedInput>,
+        write: RowsWrite,
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<bool> {
+        let (rows, scoped_inputs) = match write {
+            RowsWrite::Unscoped(rows) => (rows, Vec::new()),
+            RowsWrite::Scoped(write) => write.into_parts(),
+        };
+        let (schema, batches) = rows.into_parts();
         let _guard = self.context.write_lock.lock().await;
         let state = ctx.state();
         let target_schema = self.context.table.schema();
@@ -177,7 +180,10 @@ impl ProviderChangeSinkBackend {
             tracing::debug!(
                 dataset = %self.context.dataset_name,
                 inputs,
-                replaced = scoped_inputs.iter().filter(|input| input.replaces()).count(),
+                replaced = scoped_inputs
+                    .iter()
+                    .filter(|input| input.kind() == ScopeKind::Replace)
+                    .count(),
                 chunks,
                 rows,
                 "ChangeSink scoped write preflight"
@@ -387,27 +393,20 @@ impl ChangeSinkBackend for ProviderChangeSinkBackend {
 
     async fn apply(
         &self,
-        batch: ChangeBatch,
+        write: ChangeWrite,
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        if batch.replaced_scopes().next().is_some()
+        if write.replaced_scopes().next().is_some()
             && self.replacement == ReplacementSupport::Unsupported
         {
             return Err(before_mutation(DataFusionError::NotImplemented(
                 "Set replacement is not enabled for this accelerator".into(),
             )));
         }
-        let changed = match batch.into_payload() {
-            ChangePayload::Rows {
-                schema,
-                batches,
-                scoped_inputs,
-            } => {
-                self.apply_rows(schema, batches, scoped_inputs, options, ctx)
-                    .await?
-            }
-            ChangePayload::Cdc(rows) => {
+        let changed = match write {
+            ChangeWrite::Rows(write) => self.apply_rows(write, options, ctx).await?,
+            ChangeWrite::Cdc(rows) => {
                 let batch = rows.into_built().map_err(before_mutation)?;
                 let groups = group_into_sub_batches(&batch);
                 reject_unknown_operations(&groups)?;
