@@ -237,7 +237,6 @@ mod test {
     use rstest::rstest;
     use std::sync::Arc;
 
-
     #[test]
     fn test_tpch_answers() {
         // Check that the TPCH answers are loaded correctly
@@ -258,7 +257,6 @@ mod test {
         assert_eq!(schema.fields().len(), 10);
     }
 
-
     #[test]
     fn test_static_tpch_answers_are_sf1_only() {
         let query = Query::new("tpch_q22".into(), "SELECT 1".into(), false);
@@ -278,7 +276,6 @@ mod test {
             QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswerAtScaleFactor)
         );
     }
-
 
     #[test]
     fn test_validate_tpch_query() {
@@ -342,7 +339,6 @@ mod test {
             QueryValidationResult::Pass
         );
     }
-
 
     #[tokio::test]
     async fn test_correct_answer_wrong_type() {
@@ -430,7 +426,6 @@ mod test {
             QueryValidationResult::Pass
         );
     }
-
 
     #[tokio::test]
     async fn test_wrong_answers() {
@@ -528,7 +523,6 @@ mod test {
         );
     }
 
-
     #[rstest]
     #[case(2, 1_234_567_890_123_456_789_i128, "12345678901234567.89")]
     #[case(3, 1_234_567_890_123_456_789_i128, "1234567890123456.789")]
@@ -549,7 +543,6 @@ mod test {
         let result = array_value_to_string(&array, 0).expect("Should convert value to string");
         assert_eq!(result, Some(expected.to_string()));
     }
-
 
     // A `MySQL` `SUM(DECIMAL)` widens to Decimal256(76, scale); ensure the i256
     // arm renders identically to the Decimal128 arm across sign, scale 0/>0, and
@@ -573,7 +566,6 @@ mod test {
         assert_eq!(result, Some(expected.to_string()));
     }
 
-
     #[rstest]
     #[case(123_456_789_i64, "123456789")]
     #[case(987_654_321_i64, "987654321")]
@@ -587,7 +579,6 @@ mod test {
         let result = array_value_to_string(&array, 0).expect("Failed to convert value to string");
         assert_eq!(result, Some(expected.to_string()));
     }
-
 
     #[rstest]
     #[case(123_456_789_i32, "123456789")]
@@ -609,7 +600,6 @@ mod test {
         assert_eq!(result, Some(expected.to_string()));
     }
 
-
     #[rstest]
     #[case(2_i8, "2")]
     #[case(3_i8, "3")]
@@ -630,7 +620,6 @@ mod test {
         assert_eq!(result, Some(expected.to_string()));
     }
 
-
     #[rstest]
     #[case(123_456_789_u32, "123456789")]
     #[case(987_654_321_u32, "987654321")]
@@ -648,7 +637,6 @@ mod test {
         let result = array_value_to_string(&array, 0).expect("Failed to convert value to string");
         assert_eq!(result, Some(expected.to_string()));
     }
-
 
     #[rstest]
     #[case(2_u8, "2")]
@@ -668,7 +656,6 @@ mod test {
         assert_eq!(result, Some(expected.to_string()));
     }
 
-
     #[rstest]
     #[case(123_456_789_f64, "123456789")]
     #[case(987_654_321_f64, "987654321")]
@@ -687,7 +674,6 @@ mod test {
         assert_eq!(result, Some(expected.to_string()));
     }
 
-
     #[rstest]
     #[case(123_456_f32, "123456")]
     #[case(987_654_f32, "987654")]
@@ -703,7 +689,6 @@ mod test {
         let result = array_value_to_string(&array, 0).expect("Failed to convert value to string");
         assert_eq!(result, Some(expected.to_string()));
     }
-
 
     #[test]
     fn test_dates_and_timestamps() {
@@ -743,7 +728,6 @@ mod test {
         assert_eq!(result, Some("1973-11-29 21:33:09.123456789".to_string()));
     }
 
-
     #[test]
     fn test_invalid_index() {
         // Test index out of bounds
@@ -757,7 +741,6 @@ mod test {
             "Index out of bounds: 1 >= 1"
         );
     }
-
 
     #[test]
     fn test_compare_query_result_batches_multiset_reorders() {
@@ -804,7 +787,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_compare_query_result_batches_detects_value_mismatch() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -833,7 +815,6 @@ mod test {
             "value mismatch must fail: {result:?}"
         );
     }
-
 
     #[test]
     fn test_validate_against_reference_accepts_reordered_rows() {
@@ -872,7 +853,6 @@ mod test {
         );
     }
 
-
     fn q65_tied_batches(
         left_revenue: [&str; 2],
         right_revenue: [&str; 2],
@@ -908,7 +888,6 @@ mod test {
         .expect("reference");
         (actual, reference)
     }
-
 
     #[test]
     fn test_offset_cutoff_ties_at_both_ends_of_the_page_are_free() {
@@ -970,7 +949,6 @@ mod test {
         ));
     }
 
-
     #[test]
     fn test_validate_against_reference_rejects_tied_rows_when_limit_is_not_filled() {
         // LIMIT 100 of two rows cannot have truncated a tie group, so a
@@ -994,7 +972,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_validate_against_reference_accepts_tied_limit_subsets() {
         // TPC-DS Q65: ORDER BY store name + item desc is not unique — many
@@ -1017,7 +994,6 @@ mod test {
             "tied ORDER BY + filled LIMIT subsets must pass: {result:?}"
         );
     }
-
 
     #[test]
     fn test_validate_against_reference_rejects_unique_limit_mismatch() {
@@ -1057,9 +1033,7 @@ mod test {
         );
     }
 
-
     const UNORDERED_GROUP_LIMIT: &str = r#"SELECT "UserID", "SearchPhrase", COUNT(*) FROM hits GROUP BY "UserID", "SearchPhrase" LIMIT 2"#;
-
 
     fn user_phrase_counts(rows: &[(i64, Option<&str>, i64)]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -1080,7 +1054,6 @@ mod test {
         .expect("user phrase count batch")
     }
 
-
     fn check_unordered_limit_subset(
         sql: &str,
         returned: &RecordBatch,
@@ -1100,7 +1073,6 @@ mod test {
         }
         check.finish()
     }
-
 
     #[test]
     fn test_unordered_limit_is_only_a_grouped_limit_that_returns_its_group_keys() {
@@ -1151,7 +1123,6 @@ mod test {
         }
     }
 
-
     #[test]
     fn test_unordered_limit_may_keep_different_rows_only_when_the_limit_can_cut() {
         let limit = unordered_limit(UNORDERED_GROUP_LIMIT).expect("LIMIT without ORDER BY");
@@ -1171,7 +1142,6 @@ mod test {
             "an OFFSET skips rows the query does not specify"
         );
     }
-
 
     #[test]
     fn test_unordered_limit_subset_accepts_different_rows_of_the_full_result() {
@@ -1197,7 +1167,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_unordered_limit_subset_rejects_a_row_the_full_result_does_not_have() {
         let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5), (3, Some("c"), 7)]);
@@ -1210,7 +1179,6 @@ mod test {
             })
         );
     }
-
 
     #[test]
     fn test_unordered_limit_subset_rejects_a_short_result() {
@@ -1225,7 +1193,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_unordered_limit_subset_counts_repeated_rows() {
         let full_result = user_phrase_counts(&[(1, Some("a"), 3), (2, None, 5)]);
@@ -1238,7 +1205,6 @@ mod test {
             })
         );
     }
-
 
     #[test]
     fn test_unordered_limit_subset_offset_changes_how_many_rows_not_which() {
@@ -1270,7 +1236,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_unordered_limit_subset_stops_once_membership_and_count_are_proven() {
         let sql = UNORDERED_GROUP_LIMIT;
@@ -1292,7 +1257,6 @@ mod test {
         );
         assert_eq!(check.finish(), QueryValidationResult::Pass);
     }
-
 
     #[test]
     fn test_unordered_limit_subset_keeps_reading_when_offset_leaves_the_count_open() {
@@ -1317,7 +1281,6 @@ mod test {
         assert!(check.observation_complete());
         assert_eq!(check.finish(), QueryValidationResult::Pass);
     }
-
 
     #[test]
     fn test_unordered_limit_subset_stops_a_short_result_once_the_full_result_is_too_long() {
@@ -1350,7 +1313,6 @@ mod test {
             })
         );
     }
-
 
     #[test]
     fn test_unordered_limit_subset_reports_the_count_the_full_result_requires() {
@@ -1393,7 +1355,6 @@ mod test {
             })
         );
     }
-
 
     #[test]
     fn test_numeric_cells_match_within_a_tenth_of_a_percent() {
@@ -1449,7 +1410,6 @@ mod test {
         ));
     }
 
-
     #[test]
     fn test_whole_number_cells_match_only_exactly() {
         fn one_cell(data_type: DataType, column: ArrayRef) -> RecordBatch {
@@ -1502,7 +1462,6 @@ mod test {
         assert!(mismatch(&int64(1_478_493), &float64(1_449_049.0)));
     }
 
-
     #[test]
     fn test_binary_cells_render_as_the_text_they_hold() {
         let bytes: &[u8] = b"google";
@@ -1549,9 +1508,7 @@ mod test {
         );
     }
 
-
     const Q25: &str = r#"SELECT "SearchPhrase" FROM hits WHERE "SearchPhrase" <> '' ORDER BY to_timestamp("EventTime") LIMIT 10"#;
-
 
     fn search_phrases(values: &[&str]) -> RecordBatch {
         RecordBatch::try_new(
@@ -1564,7 +1521,6 @@ mod test {
         )
         .expect("search phrase batch")
     }
-
 
     /// `ClickBench` Q25's first thirteen reference rows over `hits_0.parquet`, each
     /// with its sort key: rows 6-8 share one `EventTime`, and `LIMIT 10` cuts
@@ -1600,7 +1556,6 @@ mod test {
         .expect("keyed reference batch")
     }
 
-
     #[test]
     fn test_unprojected_sort_limit_reads_the_sort_keys_back() {
         let schema = search_phrases(&[]).schema();
@@ -1625,7 +1580,6 @@ mod test {
         }
     }
 
-
     #[test]
     fn test_unprojected_sort_limit_includes_a_hidden_suffix() {
         let schema = Arc::new(Schema::new(vec![
@@ -1646,7 +1600,6 @@ mod test {
         );
         assert!(keyed.contains("hidden"), "{keyed}");
     }
-
 
     #[test]
     fn test_visible_prefix_cutoff_does_not_accept_rows_a_hidden_key_excludes() {
@@ -1735,7 +1688,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_visible_prefix_inversion_is_a_sort_order_violation() {
         let sql = "SELECT id, payload FROM t ORDER BY id, hidden LIMIT 2";
@@ -1802,7 +1754,6 @@ mod test {
             ))
         );
     }
-
 
     #[test]
     fn test_hidden_sort_suffix_requires_the_reference_row_order() {
@@ -1898,7 +1849,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_numeric_cells_rounded_one_unit_apart_in_the_last_place_match() {
         // TPC-DS Q98's `revenueratio` for one item: the reference returned 0.000812
@@ -1953,7 +1903,6 @@ mod test {
             "an integer has no rounded place"
         );
     }
-
 
     #[test]
     fn test_sort_keys_rounded_one_unit_apart_share_a_position() {
@@ -2014,7 +1963,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_keyed_reference_accepts_any_order_of_tied_rows_and_any_pick_at_the_cutoff() {
         // The answers the reference query and the Arrow accelerator returned for Q25.
@@ -2049,7 +1997,6 @@ mod test {
         }
     }
 
-
     #[test]
     fn test_keyed_reference_rejects_a_row_past_the_cut_tie_group() {
         let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e", "g"]);
@@ -2071,7 +2018,6 @@ mod test {
             ))
         );
     }
-
 
     #[test]
     fn test_keyed_reference_rejects_an_answer_missing_a_row_before_the_cut() {
@@ -2096,7 +2042,6 @@ mod test {
             ))
         );
     }
-
 
     #[test]
     fn test_keyed_reference_rejects_a_pre_cutoff_row_replaced_by_a_cutoff_duplicate() {
@@ -2163,7 +2108,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_live_oracle_schema_mismatch_is_arity_not_physical_type() {
         let boolean = RecordBatch::try_new(
@@ -2213,7 +2157,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_keyed_reference_rejects_a_short_answer() {
         let answer = search_phrases(&["a", "a", "b", "b", "c", "d", "d", "c", "e"]);
@@ -2235,7 +2178,6 @@ mod test {
             ))
         );
     }
-
 
     /// `LIMIT 0` keeps no rows. The matcher must reject a row even when that
     /// row is in the keyed reference: a raised-LIMIT read-back is not a cutoff
@@ -2280,7 +2222,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_keyed_reference_needs_the_whole_cut_tie_group() {
         let keyed = q25_keyed_reference().slice(0, 10);
@@ -2313,9 +2254,7 @@ mod test {
         );
     }
 
-
     const Q31: &str = r#"SELECT "SearchEngineID", "ClientIP", COUNT(*) AS c, SUM("IsRefresh"), AVG("ResolutionWidth") FROM hits WHERE "SearchPhrase" <> '' GROUP BY "SearchEngineID", "ClientIP" ORDER BY c DESC LIMIT 10;"#;
-
 
     /// `ClickBench` Q31's first thirteen groups over the full `hits` dataset, in
     /// `ORDER BY c DESC` order, each average as the engines rendered it. The tenth
@@ -2335,7 +2274,6 @@ mod test {
         (2, -947_382_330, 1055, 23, "1569.5260663507108"),
         (2, -748_701_126, 1043, 15, "1565.1418983700862"),
     ];
-
 
     fn q31_rows(rows: &[(i16, i32, i64, i64, &str)]) -> RecordBatch {
         RecordBatch::try_new(
@@ -2362,14 +2300,12 @@ mod test {
         .expect("q31 batch")
     }
 
-
     /// Q31's answer with `tenth` as its tenth row.
     fn q31_answer(tenth: (i16, i32, i64, i64, &'static str)) -> RecordBatch {
         let mut rows = Q31_LEADING_ROWS[..9].to_vec();
         rows.push(tenth);
         q31_rows(&rows)
     }
-
 
     #[test]
     fn test_projected_sort_limit_raises_the_limit_and_drops_the_offset() {
@@ -2417,7 +2353,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_projected_sort_limit_keeps_positional_distinct_and_set_operation_queries() {
         // Raising the LIMIT and dropping the OFFSET leaves the query's own rows, so a
@@ -2455,7 +2390,6 @@ mod test {
             assert_eq!(unprojected_sort_limit(sql, &schema), None, "{sql}");
         }
     }
-
 
     #[test]
     fn test_keyed_reference_accepts_either_group_tied_at_a_lone_cutoff_row() {
@@ -2515,7 +2449,6 @@ mod test {
         }
     }
 
-
     #[test]
     fn test_keyed_reference_matches_cells_by_the_row_comparison_rule() {
         // An engine that renders the tied row's average one digit shorter returned
@@ -2544,7 +2477,6 @@ mod test {
             ))
         ));
     }
-
 
     #[test]
     fn test_keyed_reference_lets_an_offset_page_start_with_a_row_tied_with_skipped_ones() {
@@ -2660,7 +2592,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_keyed_reference_stops_collecting_once_the_cutoff_group_closes() {
         let full = q25_keyed_reference();
@@ -2710,7 +2641,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_unprojected_sort_limit_refuses_a_collated_sort_key() {
         // A collation decides which rows tie, and rendered keys cannot show it: under
@@ -2733,7 +2663,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_unprojected_sort_limit_refuses_a_select_alias_sort_key() {
         // A select-list alias is not in scope inside the select list that defines it,
@@ -2754,7 +2683,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_unprojected_sort_limit_refuses_a_nested_limit() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -2768,7 +2696,6 @@ mod test {
             None
         );
     }
-
 
     #[test]
     fn test_sqlite_tpcds_queries_divide_float_casts() {
@@ -2802,7 +2729,6 @@ mod test {
             );
         }
     }
-
 
     #[test]
     fn test_only_clickbench_q18_takes_the_unordered_limit_subset_check() {
@@ -2865,7 +2791,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_text_and_binary_cells_compare_equal_only_when_they_hold_the_same_text() {
         let column = |data_type: DataType, array: ArrayRef| {
@@ -2910,7 +2835,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_validate_against_reference_detects_value_mismatch() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2941,7 +2865,6 @@ mod test {
         );
     }
 
-
     #[test]
     fn test_row_order_from_sql() {
         assert_eq!(
@@ -2957,7 +2880,6 @@ mod test {
             RowOrder::Multiset
         );
     }
-
 
     #[test]
     fn test_midnight_normalization_is_limited_to_date_columns() {
