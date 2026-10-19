@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use std::pin::Pin;
@@ -822,9 +822,11 @@ fn make_a_stream(
     tokio::spawn(
         request_context
             .scope(async move {
+                // Ordered by (choice index, tool call index), so the calls run, and go back to
+                // the model, in the order that the model made them.
                 let tool_call_states: Arc<
-                    Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
-                > = Arc::new(Mutex::new(HashMap::new()));
+                    Mutex<BTreeMap<(i32, i32), ChatCompletionMessageToolCall>>,
+                > = Arc::new(Mutex::new(BTreeMap::new()));
 
                 let mut chat_output = String::new();
                 // Usage is withheld from every round and sent once, last, as the total across rounds.
@@ -1455,6 +1457,9 @@ mod tests {
     enum Reply {
         /// Call the Spice `sql` tool, with the call id `call_<request index>`.
         CallSql,
+        /// Call the Spice `sql` tool twice in parallel, with the call ids `call_<request index>`
+        /// and `call_<request index>_b`.
+        CallSqlTwice,
         /// Answer with this text.
         Answer(&'static str),
         /// Fail: a request returns an error, and a stream fails after some text.
@@ -1501,6 +1506,13 @@ mod tests {
         })
     }
 
+    /// The second of two parallel `sql` calls of request `index`.
+    fn second_sql_call(index: usize) -> Value {
+        let mut call = sql_call(index);
+        call["id"] = json!(format!("call_{index}_b"));
+        call
+    }
+
     fn scripted_failure() -> OpenAIError {
         OpenAIError::InvalidArgument("scripted failure".to_string())
     }
@@ -1534,6 +1546,10 @@ mod tests {
                     json!({ "role": "assistant", "tool_calls": [sql_call(index)] }),
                     "tool_calls",
                 ),
+                Reply::CallSqlTwice => (
+                    json!({ "role": "assistant", "tool_calls": [sql_call(index), second_sql_call(index)] }),
+                    "tool_calls",
+                ),
                 Reply::Answer(text) => (json!({ "role": "assistant", "content": text }), "stop"),
                 Reply::Fail => return Err(scripted_failure()),
             };
@@ -1558,6 +1574,26 @@ mod tests {
                         Ok(stream_chunk(
                             index,
                             &json!({ "role": "assistant", "tool_calls": [call] }),
+                            None,
+                        )),
+                        Ok(stream_chunk(index, &json!({}), Some("tool_calls"))),
+                    ]
+                }
+                // Each call streams in chunks of its own index, as `OpenAI` streams parallel calls.
+                Reply::CallSqlTwice => {
+                    let mut first = sql_call(index);
+                    first["index"] = json!(0);
+                    let mut second = second_sql_call(index);
+                    second["index"] = json!(1);
+                    vec![
+                        Ok(stream_chunk(
+                            index,
+                            &json!({ "role": "assistant", "tool_calls": [first] }),
+                            None,
+                        )),
+                        Ok(stream_chunk(
+                            index,
+                            &json!({ "tool_calls": [second] }),
                             None,
                         )),
                         Ok(stream_chunk(index, &json!({}), Some("tool_calls"))),
@@ -1882,6 +1918,29 @@ mod tests {
         assert_eq!(
             provider.messages(3),
             ["user: A", CALL_0, RESULT_0, "assistant: D", "user: E"]
+        );
+    }
+
+    /// Two `sql` calls in one streamed round run as two calls, and the next round gets both
+    /// calls and both results.
+    #[tokio::test]
+    async fn test_parallel_streamed_tool_calls_run_separately() {
+        let provider = ScriptedChat::new(vec![Reply::CallSqlTwice, Reply::Answer("D")]);
+        let model = sql_model(&provider);
+
+        let answer = streamed_turn(&model, vec![user("A")])
+            .await
+            .expect("turn 1");
+
+        assert_eq!(answer, "D");
+        assert_eq!(
+            provider.messages(1),
+            [
+                "user: A",
+                "assistant calls sql#call_0, sql#call_0_b",
+                RESULT_0,
+                r#"tool call_0_b: [{"answer":42}]"#
+            ]
         );
     }
 

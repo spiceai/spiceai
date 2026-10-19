@@ -90,7 +90,9 @@ pub enum ContentBlock {
 }
 
 impl ContentBlock {
-    pub fn into_completion(self) -> ChatCompletionStreamResponseDelta {
+    /// The `OpenAI` delta that starts this block. A `tool_use` block starts the tool call at
+    /// `tool_call_index`.
+    pub fn into_completion(self, tool_call_index: u32) -> ChatCompletionStreamResponseDelta {
         match self {
             ContentBlock::Text { text } => ChatCompletionStreamResponseDelta {
                 content: Some(text),
@@ -104,7 +106,7 @@ impl ContentBlock {
                     content: None,
                     function_call: None,
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
-                        index: 0,
+                        index: tool_call_index,
                         id: Some(id),
                         r#type: Some(FunctionType::Function),
                         function: Some(FunctionCallStream {
@@ -136,6 +138,17 @@ pub struct ContentBlockToolUse {
     pub input: Value,
 }
 
+/// A `tool_use` block of a streamed message, and the index of its `OpenAI` tool call.
+///
+/// Anthropic numbers the content blocks of a message, text blocks included. `OpenAI` numbers the
+/// tool calls of a choice, and a client assembles each call from the chunks of its index. Each
+/// `tool_use` block gets the next tool call index, so parallel tool calls stay apart.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamedToolUse {
+    pub(crate) block: ContentBlockToolUse,
+    pub(crate) tool_call_index: u32,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum Delta {
@@ -157,9 +170,9 @@ impl Delta {
     pub fn into_completion(
         self,
         role: Option<&MessageRole>,
-        tool_content: Option<&ContentBlockToolUse>,
+        tool_use: Option<&StreamedToolUse>,
     ) -> Option<ChatCompletionStreamResponseDelta> {
-        match (self, tool_content) {
+        match (self, tool_use) {
             (Delta::Text { text }, _) => Some(ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
@@ -173,14 +186,15 @@ impl Delta {
             }),
             (
                 Delta::InputJson { partial_json },
-                Some(ContentBlockToolUse {
-                    id, name: _name, ..
+                Some(StreamedToolUse {
+                    block: ContentBlockToolUse { id, .. },
+                    tool_call_index,
                 }),
             ) => Some(ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
-                    index: 0,
+                    index: *tool_call_index,
                     id: Some(id.clone()),
                     r#type: Some(FunctionType::Function),
                     function: Some(FunctionCallStream {
@@ -254,8 +268,8 @@ pub fn transform_stream(
         model: Option<String>,
         role: Option<MessageRole>,
         usage: Option<CompletionUsage>,
-        tool_id_to_content_block: HashMap<u32, ContentBlockToolUse>,
-        tool_id_to_tool_delta_idx: HashMap<u32, i32>,
+        /// The `tool_use` blocks so far, by their Anthropic content block index.
+        tool_uses: HashMap<u32, StreamedToolUse>,
     }
 
     let state = Arc::new(Mutex::new(StreamState::default()));
@@ -293,9 +307,16 @@ pub fn transform_stream(
                         index,
                         content_block,
                     }) => {
+                        let tool_call_index =
+                            u32::try_from(state.tool_uses.len()).unwrap_or(u32::MAX);
                         if let ContentBlock::ToolUse(t) = &content_block {
-                            state.tool_id_to_content_block.insert(index, t.clone());
-                            state.tool_id_to_tool_delta_idx.insert(index, 0);
+                            state.tool_uses.insert(
+                                index,
+                                StreamedToolUse {
+                                    block: t.clone(),
+                                    tool_call_index,
+                                },
+                            );
                         }
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -303,20 +324,17 @@ pub fn transform_stream(
                             None,
                             Some(ChatChoiceStream {
                                 index: 0,
-                                delta: content_block.into_completion(),
+                                delta: content_block.into_completion(tool_call_index),
                                 finish_reason: None,
                                 logprobs: None,
                             }),
                         ))
                     }
                     Ok(MessageCreateStreamResponse::ContentBlockDelta { index, delta }) => {
-                        let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
-                        state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
-
                         // A thinking block's deltas have no `OpenAI` counterpart and yield no chunk.
                         let delta = delta.into_completion(
                             state.role.as_ref(),
-                            state.tool_id_to_content_block.get(&index),
+                            state.tool_uses.get(&index),
                         )?;
 
                         Some(create_anthropic_stream_response(
@@ -644,6 +662,85 @@ mod tests {
             let out = delta.into_completion(Some(&MessageRole::Assistant), None);
             assert!(out.is_none(), "{payload} must yield no chunk: {out:?}");
         }
+    }
+
+    /// The tool calls that a client assembles from `events`, as `(index, id, name, arguments)`:
+    /// the chunks of one index make one call.
+    async fn assembled_tool_calls(events: &[&str]) -> Vec<(u32, String, String, String)> {
+        let events: Vec<Result<MessageCreateStreamResponse, OpenAIError>> = events
+            .iter()
+            .map(|event| Ok(serde_json::from_str(event).expect("a stream event")))
+            .collect();
+        let chunks: Vec<_> = transform_stream(
+            Box::pin(futures::stream::iter(events)),
+            context_with(vec![]),
+        )
+        .collect()
+        .await;
+
+        let mut calls: std::collections::BTreeMap<u32, (String, String, String)> =
+            std::collections::BTreeMap::new();
+        for chunk in chunks {
+            let chunk = chunk.expect("a chunk");
+            for choice in chunk.choices {
+                for call in choice.delta.tool_calls.unwrap_or_default() {
+                    let entry = calls.entry(call.index).or_default();
+                    if let Some(id) = call.id {
+                        entry.0 = id;
+                    }
+                    if let Some(function) = call.function {
+                        if let Some(name) = function.name {
+                            entry.1 = name;
+                        }
+                        entry.2.push_str(&function.arguments.unwrap_or_default());
+                    }
+                }
+            }
+        }
+        calls
+            .into_iter()
+            .map(|(index, (id, name, arguments))| (index, id, name, arguments))
+            .collect()
+    }
+
+    /// Two `tool_use` blocks in one message, after a text block, are two `OpenAI` tool calls: each
+    /// has its own index, so their arguments are not joined into one call.
+    #[tokio::test]
+    async fn parallel_tool_use_blocks_stream_as_separate_tool_calls() {
+        let calls = assembled_tool_calls(&[
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Running both."}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"sql","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"SELECT 1\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_b","name":"sql","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"SELECT 2\"}"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":20}}"#,
+            r#"{"type":"message_stop"}"#,
+        ])
+        .await;
+
+        assert_eq!(
+            calls,
+            [
+                (
+                    0,
+                    "toolu_a".to_string(),
+                    "sql".to_string(),
+                    r#"{"query":"SELECT 1"}"#.to_string()
+                ),
+                (
+                    1,
+                    "toolu_b".to_string(),
+                    "sql".to_string(),
+                    r#"{"query":"SELECT 2"}"#.to_string()
+                ),
+            ]
+        );
     }
 
     /// The `usage` of a streamed event, from its JSON as Anthropic sends it.
