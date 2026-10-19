@@ -37,6 +37,7 @@ use std::{
 use serde_json::{Value, json};
 mod ai_udf;
 mod bedrock;
+mod decisions;
 mod embedding;
 pub(crate) mod hf;
 #[cfg(feature = "duckdb")]
