@@ -64,8 +64,11 @@ impl<'a> SpiceSubstraitConsumer<'a> {
     }
 }
 
-/// Whether a `LIKE` pattern can contain a backslash: any pattern that is not a
-/// string literal (seen through casts), or a literal that contains one.
+/// Whether a `LIKE` pattern can contain a backslash. Only a string literal,
+/// seen through casts that keep its text, is known not to; a `NULL` pattern
+/// matches nothing either way. Any other literal can render as text with a
+/// backslash once cast (bytes `35 30 5c 25` read as `50\%`), and any other
+/// expression is unknown until it runs.
 fn pattern_may_contain_backslash(pattern: &Expr) -> bool {
     match pattern {
         Expr::Literal(
@@ -74,7 +77,7 @@ fn pattern_may_contain_backslash(pattern: &Expr) -> bool {
             | ScalarValue::Utf8View(Some(p)),
             _,
         ) => p.contains('\\'),
-        Expr::Literal(_, _) => false,
+        Expr::Literal(value, _) => !value.is_null(),
         Expr::Cast(cast) => pattern_may_contain_backslash(&cast.expr),
         Expr::TryCast(cast) => pattern_may_contain_backslash(&cast.expr),
         _ => true,

@@ -498,6 +498,12 @@ mod tests {
                 "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
                 true,
             ),
+            // The bytes of `50\%`: a cast pattern is not known to be backslash-free.
+            (
+                "SELECT p_type FROM part WHERE p_type LIKE CAST(X'35305C25' AS VARCHAR) ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
+                true,
+            ),
         ];
         for (sql, expected, names_escape) in queries {
             let plan = df.ctx.sql(sql).await?.into_unoptimized_plan();
