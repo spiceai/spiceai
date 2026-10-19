@@ -258,6 +258,12 @@ jobs:
   test-install-windows-wsl:
     name: install on Windows x64 (WSL)
     runs-on: windows-latest
+    env:
+      # WSL inherits only the Windows-side variables WSLENV names. Without this,
+      # every `wsl-bash` step's GITHUB_TOKEN stays on the Windows side and the
+      # installer and `spice` call the GitHub API anonymously, sharing the hosted
+      # runner IP's 60-requests-per-hour limit.
+      WSLENV: GITHUB_TOKEN
     steps:
       - name: checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -290,7 +296,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           # The runtime runs inside WSL, which does not inherit Windows-side env vars by default.
           # WSLENV lists which vars to forward across the interop boundary so the script below can read them.
-          WSLENV: INSTALL_SCRIPT_BRANCH:HEAD_REPO:HEAD_SHA
+          WSLENV: GITHUB_TOKEN:INSTALL_SCRIPT_BRANCH:HEAD_REPO:HEAD_SHA
         run: |
           if [ -n "${INSTALL_SCRIPT_BRANCH:-}" ]; then
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
