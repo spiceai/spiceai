@@ -6883,8 +6883,12 @@ impl DataFusion {
 
         let plan = self.create_logical_plan(session, sql).await?;
 
+        // A DDL plan is not cached: planning `CREATE TABLE` stores its `WITH` and
+        // `PARTITION BY` options for the analyzer, which takes them when the plan is
+        // analyzed, so a cached plan would run without them.
         if let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
+            && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
             cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
@@ -8237,6 +8241,49 @@ mod tests {
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
         assert_eq!(cache_provider.item_count().await, 1);
+    }
+
+    /// Each plan of a `CREATE TABLE` stores its options for the analyzer, which takes
+    /// them: a Flight SQL client plans the statement to advertise its schema, then
+    /// again to run it.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn each_plan_of_a_create_table_stores_its_options() {
+        static SQL: &str = "CREATE TABLE t (id BIGINT, region VARCHAR) \
+            WITH (\"acceleration.engine\" = 'cayenne') PARTITION BY region";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        let session = df.ctx.state();
+
+        for _ in 0..2 {
+            df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+                .await
+                .expect("logical plan");
+            let options = df
+                .ddl_extension_store()
+                .write()
+                .expect("DDL extension store lock")
+                .remove(&TableReference::parse_str("t"));
+            assert!(options.is_some(), "the plan stored no options");
+        }
     }
 
     #[cfg(all(feature = "duckdb", feature = "snapshots",))]
