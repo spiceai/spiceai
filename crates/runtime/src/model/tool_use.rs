@@ -1416,10 +1416,7 @@ mod tests {
         }
     }
 
-    async fn tool_using_chat(
-        provider: &Arc<PreambleChat>,
-        tool: &Arc<CountingSql>,
-    ) -> ToolUsingChat {
+    fn tool_using_chat(provider: &Arc<PreambleChat>, tool: &Arc<CountingSql>) -> ToolUsingChat {
         ToolUsingChat::new(
             Arc::clone(provider) as Arc<dyn Chat>,
             vec![Arc::clone(tool) as Arc<dyn SpiceModelTool>],
@@ -1465,7 +1462,6 @@ mod tests {
         let provider = PreambleChat::new(preamble);
         let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
         let chunks: Vec<CreateChatCompletionStreamResponse> = tool_using_chat(&provider, &tool)
-            .await
             .chat_stream(chat_request(true))
             .await
             .expect("a response stream")
@@ -1509,7 +1505,6 @@ mod tests {
         let provider = PreambleChat::new("Let me check.");
         let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
         let response = tool_using_chat(&provider, &tool)
-            .await
             .chat_request(chat_request(false))
             .await
             .expect("a response");
@@ -1529,7 +1524,6 @@ mod tests {
         let provider = PreambleChat::new("Let me check.");
         let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
         let chunks: Vec<CreateChatCompletionStreamResponse> = tool_using_chat(&provider, &tool)
-            .await
             .chat_stream(chat_request_with_logprobs(true))
             .await
             .expect("a response stream")
@@ -1558,7 +1552,6 @@ mod tests {
         let mut req = chat_request(false);
         req.response_format = Some(ResponseFormat::JsonObject);
         let response = tool_using_chat(&provider, &tool)
-            .await
             .chat_request(req)
             .await
             .expect("a response");
@@ -1575,7 +1568,6 @@ mod tests {
         let provider = PreambleChat::new("Let me check.");
         let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
         let response = tool_using_chat(&provider, &tool)
-            .await
             .chat_request(chat_request_with_logprobs(false))
             .await
             .expect("a response");
