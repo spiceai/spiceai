@@ -312,7 +312,6 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                         executor1_cert.cert_path.to_string_lossy().to_string(),
                     ),
                     node_mtls_key_file: Some(executor1_cert.key_path.to_string_lossy().to_string()),
-                    ..Default::default()
                 },
                 ..Default::default()
             };
@@ -372,7 +371,6 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
                         executor2_cert.cert_path.to_string_lossy().to_string(),
                     ),
                     node_mtls_key_file: Some(executor2_cert.key_path.to_string_lossy().to_string()),
-                    ..Default::default()
                 },
                 ..Default::default()
             };

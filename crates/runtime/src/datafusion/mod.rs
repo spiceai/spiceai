@@ -8602,14 +8602,28 @@ mod tests {
         use super::super::*;
         use crate::config::{ClusterConfig, ClusterRole};
 
-        fn make_cluster_config(role: ClusterRole) -> ResolvedClusterConfig {
+        /// A cluster config for `role` with cluster mTLS files from a fresh test PKI. The
+        /// returned directory holds the files and must outlive the config.
+        fn make_cluster_config(role: ClusterRole) -> (ResolvedClusterConfig, tempfile::TempDir) {
+            let _ = rustls::crypto::CryptoProvider::install_default(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            );
+            let dir = tempfile::tempdir().expect("test PKI directory should be created");
+            let pki =
+                test_framework::pki::init_pki(dir.path()).expect("test PKI should initialize");
+            let cert = pki
+                .create_client_cert("node")
+                .expect("test node certificate should be created");
             let config = ClusterConfig {
                 role: Some(role),
-                allow_insecure_connections: true,
+                node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
+                node_mtls_certificate_file: Some(cert.cert_path.to_string_lossy().to_string()),
+                node_mtls_key_file: Some(cert.key_path.to_string_lossy().to_string()),
                 node_advertise_address: Some("127.0.0.1".to_string()),
                 ..ClusterConfig::default()
             };
-            ResolvedClusterConfig::try_new(config).expect("valid test cluster config")
+            let config = ResolvedClusterConfig::try_new(config).expect("valid test cluster config");
+            (config, dir)
         }
 
         fn make_non_distributed_config() -> ResolvedClusterConfig {
@@ -8619,28 +8633,28 @@ mod tests {
 
         #[test]
         fn arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let (config, _pki) = make_cluster_config(ClusterRole::Scheduler);
             validate_distributed_engine(&config, Engine::Arrow, "ds")
                 .expect("arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn partitioned_arrow_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let (config, _pki) = make_cluster_config(ClusterRole::Scheduler);
             validate_distributed_engine(&config, Engine::PartitionedArrow, "ds")
                 .expect("partitioned_arrow engine should be allowed in distributed mode");
         }
 
         #[test]
         fn cayenne_allowed_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let (config, _pki) = make_cluster_config(ClusterRole::Scheduler);
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
                 .expect("cayenne engine should be allowed in distributed mode");
         }
 
         #[test]
         fn duckdb_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let (config, _pki) = make_cluster_config(ClusterRole::Scheduler);
             let result = validate_distributed_engine(&config, Engine::DuckDB, "my_dataset");
             assert!(
                 matches!(
@@ -8653,7 +8667,7 @@ mod tests {
 
         #[test]
         fn sqlite_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Executor);
+            let (config, _pki) = make_cluster_config(ClusterRole::Executor);
             let result = validate_distributed_engine(&config, Engine::Sqlite, "my_dataset");
             assert!(
                 matches!(
@@ -8666,7 +8680,7 @@ mod tests {
 
         #[test]
         fn postgresql_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let (config, _pki) = make_cluster_config(ClusterRole::Scheduler);
             let result = validate_distributed_engine(&config, Engine::PostgreSQL, "my_dataset");
             assert!(
                 matches!(
@@ -8679,7 +8693,7 @@ mod tests {
 
         #[test]
         fn turso_rejected_in_distributed_mode() {
-            let config = make_cluster_config(ClusterRole::Scheduler);
+            let (config, _pki) = make_cluster_config(ClusterRole::Scheduler);
             let result = validate_distributed_engine(&config, Engine::Turso, "my_dataset");
             assert!(
                 matches!(

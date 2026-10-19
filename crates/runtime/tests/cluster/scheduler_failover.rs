@@ -204,7 +204,6 @@ async fn build_executor(
             node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
             node_mtls_certificate_file: Some(cert.cert_path.to_string_lossy().to_string()),
             node_mtls_key_file: Some(cert.key_path.to_string_lossy().to_string()),
-            ..Default::default()
         },
         ..Default::default()
     };

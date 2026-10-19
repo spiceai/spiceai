@@ -1707,14 +1707,10 @@ fn peer_task_history_limit(sql: &str) -> Result<Option<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::servers::internal_cluster_server;
     use app::AppBuilder;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use ballista_core::serde::protobuf::{
-        GetJobStatusParams, scheduler_grpc_client::SchedulerGrpcClient,
-    };
     use datafusion::datasource::MemTable;
     use opentelemetry_sdk::metrics::SdkMeterProvider;
     use runtime_proto::{
@@ -1727,7 +1723,7 @@ mod tests {
     use spicepod::param::Params;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Channel;
+    use tonic::transport::{Channel, Server};
 
     /// Fixed-map secret store for `ExpandSecret` allowlist tests.
     struct FakeSecretStore(HashMap<String, String>);
@@ -1936,13 +1932,10 @@ mod tests {
             .to_string()
     }
 
-    /// Serves `service` on a loopback port built like the internal cluster port and returns
-    /// a channel to it. Plain TCP stands in for the transport: the port's gate reads only
-    /// whether the port runs cluster mTLS.
-    async fn serve_on_cluster_port(
+    /// Serves `service` over a real tonic transport on a loopback port.
+    async fn serve_test_service(
         service: ClusterServiceImpl,
-        mtls_enabled: bool,
-    ) -> (Channel, CancellationToken) {
+    ) -> (ClusterServiceClient<Channel>, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test cluster service listener should bind");
@@ -1953,7 +1946,7 @@ mod tests {
         let shutdown_signal = shutdown.clone();
 
         tokio::spawn(async move {
-            internal_cluster_server(mtls_enabled)
+            Server::builder()
                 .add_service(ClusterServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     shutdown_signal.cancelled().await;
@@ -1962,21 +1955,11 @@ mod tests {
                 .expect("test cluster service server should run");
         });
 
-        let channel = Channel::from_shared(format!("http://{address}"))
-            .expect("test cluster service address should be a valid URI")
-            .connect()
+        let client = ClusterServiceClient::connect(format!("http://{address}"))
             .await
             .expect("test cluster service client should connect");
 
-        (channel, shutdown)
-    }
-
-    /// Serves `service` on a cluster port that runs cluster mTLS.
-    async fn serve_test_service(
-        service: ClusterServiceImpl,
-    ) -> (ClusterServiceClient<Channel>, CancellationToken) {
-        let (channel, shutdown) = serve_on_cluster_port(service, true).await;
-        (ClusterServiceClient::new(channel), shutdown)
+        (client, shutdown)
     }
 
     #[test]
@@ -2136,108 +2119,6 @@ mod tests {
             .expect("store-scoped key referenced by the app should expand");
 
         assert_eq!(response.into_inner().value, "correct-store-value");
-    }
-
-    /// Every RPC on the internal cluster port, the Ballista scheduler's included, is
-    /// refused when the port does not run cluster mTLS.
-    #[tokio::test]
-    async fn cluster_port_refuses_every_rpc_without_mtls() {
-        let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
-        let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
-        let service = make_test_service_full(Some(app), secrets, None, &["trace-a"]).await;
-        let (channel, shutdown) = serve_on_cluster_port(service, false).await;
-        let mut client = ClusterServiceClient::new(channel.clone());
-        let mut scheduler = SchedulerGrpcClient::new(channel);
-
-        let outcomes = [
-            (
-                "GetAppDefinition",
-                client
-                    .get_app_definition(GetAppDefinitionRequest::default())
-                    .await
-                    .map(drop),
-            ),
-            (
-                "ExpandSecret",
-                client
-                    .expand_secret(ExpandSecretRequest {
-                        executor_id: "executor-1".to_string(),
-                        key: "PG_PASS".to_string(),
-                    })
-                    .await
-                    .map(drop),
-            ),
-            (
-                "GetSchedulers",
-                client
-                    .get_schedulers(GetSchedulersRequest::default())
-                    .await
-                    .map(drop),
-            ),
-            (
-                "GetTaskHistory",
-                client
-                    .get_task_history(GetTaskHistoryRequest {
-                        sql: format!(
-                            "SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
-                        ),
-                    })
-                    .await
-                    .map(drop),
-            ),
-            (
-                "GetMetrics",
-                client
-                    .get_metrics(GetMetricsRequest::default())
-                    .await
-                    .map(drop),
-            ),
-            (
-                "ControlStream",
-                client
-                    .control_stream(tokio_stream::empty::<ExecutorControlMessage>())
-                    .await
-                    .map(drop),
-            ),
-            (
-                "AllocateInitialPartitions",
-                client
-                    .allocate_initial_partitions(AllocateInitialPartitionsRequest::default())
-                    .await
-                    .map(drop),
-            ),
-            (
-                "GetDdlCatchup",
-                client
-                    .get_ddl_catchup(GetDdlCatchupRequest::default())
-                    .await
-                    .map(drop),
-            ),
-            (
-                "SchedulerGrpc/GetJobStatus",
-                scheduler
-                    .get_job_status(GetJobStatusParams::default())
-                    .await
-                    .map(drop),
-            ),
-        ];
-
-        for (rpc, outcome) in outcomes {
-            let Err(status) = outcome else {
-                panic!("{rpc} without cluster mTLS must be refused");
-            };
-            assert_eq!(
-                status.code(),
-                tonic::Code::PermissionDenied,
-                "{rpc}: {status:?}"
-            );
-            assert!(
-                status.message().contains("require cluster mTLS"),
-                "{rpc}: {status:?}"
-            );
-        }
-
-        shutdown.cancel();
     }
 
     #[tokio::test]

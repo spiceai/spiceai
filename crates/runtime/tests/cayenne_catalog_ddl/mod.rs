@@ -37,6 +37,8 @@ use runtime::config::{ClusterConfig, ClusterRole, Config};
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::param::Params;
+use std::sync::LazyLock;
+use test_framework::pki::{ClientCertConfig, PkiConfig, init_pki};
 
 /// Creates a [`ResolvedClusterConfig`] with Executor role for tests.
 ///
@@ -45,17 +47,36 @@ use spicepod::param::Params;
 /// distributed DML rewrites in these tests; Cayenne DDL rewriting via
 /// `CayenneDdlAnalyzerRule` is not gated on the cluster role.
 fn test_cluster_config() -> ResolvedClusterConfig {
+    let (pki, cert) = &*CLUSTER_PKI;
     ResolvedClusterConfig::try_new(ClusterConfig {
         role: Some(ClusterRole::Executor),
-        allow_insecure_connections: true,
+        node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
+        node_mtls_certificate_file: Some(cert.cert_path.to_string_lossy().to_string()),
+        node_mtls_key_file: Some(cert.key_path.to_string_lossy().to_string()),
         node_advertise_address: Some("127.0.0.1".to_string()),
         ..Default::default()
     })
     .expect(
         "failed to build Cayenne catalog DDL test ResolvedClusterConfig; expected Executor role, \
-         allow_insecure_connections = true, and node_advertise_address to be set",
+         cluster mTLS files, and node_advertise_address to be set",
     )
 }
+
+/// Cluster mTLS files for [`test_cluster_config`]. A resolved cluster config watches
+/// them, so they stay in place for the life of the test process.
+static CLUSTER_PKI: LazyLock<(PkiConfig, ClientCertConfig)> = LazyLock::new(|| {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let dir = tempfile::tempdir()
+        .expect("test PKI directory should be created")
+        .keep();
+    let pki = init_pki(&dir).expect("test PKI should initialize");
+    let cert = pki
+        .create_client_cert("executor")
+        .expect("test executor certificate should be created");
+    (pki, cert)
+});
 
 /// Helper to run a SQL query against the runtime and collect results.
 async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {

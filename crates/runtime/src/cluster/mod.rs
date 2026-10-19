@@ -867,25 +867,32 @@ impl ResolvedClusterConfig {
         if is_cluster_role {
             let mut missing_flags = Vec::new();
 
-            if tls_config.is_none() && !config.allow_insecure_connections {
-                missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --allow-insecure-connections)");
+            if tls_config.is_none() {
+                missing_flags.push(
+                    "--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
+                );
             }
             if config.node_advertise_address.is_none() {
                 missing_flags.push("--node-advertise-address");
             }
 
             if !missing_flags.is_empty() {
+                let certificate_hint = if tls_config.is_none() {
+                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`."
+                } else {
+                    ""
+                };
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "Cluster mode requires the following flags: {}",
+                        "Cluster mode requires the following flags: {}.{certificate_hint}",
                         missing_flags.join(", ")
                     ),
                 ));
             }
         }
 
-        // Determine the scheme based on TLS config or insecure flag
+        // Determine the scheme based on TLS config
         let inferred_scheme = if tls_config.is_some() {
             "https"
         } else {
@@ -1052,12 +1059,6 @@ impl ResolvedClusterConfig {
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
         self.tls_config.is_some()
-    }
-
-    /// Returns whether this node allows insecure cluster communication.
-    #[must_use]
-    pub fn allow_insecure_connections(&self) -> bool {
-        self.config.allow_insecure_connections
     }
 
     /// Returns a fresh `ClientTlsConfig` snapshot for connecting to other
@@ -2640,6 +2641,39 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn cluster_roles_require_cluster_mtls() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        let advertised = || ClusterConfig {
+            node_advertise_address: Some("127.0.0.1".to_string()),
+            ..ClusterConfig::default()
+        };
+        for (node, config) in [
+            ("scheduler", advertised().with_role(ClusterRole::Scheduler)),
+            ("executor", advertised().with_role(ClusterRole::Executor)),
+            (
+                "executor implied by --scheduler-address",
+                ClusterConfig {
+                    scheduler_address: Some("https://127.0.0.1:50052".to_string()),
+                    ..advertised()
+                },
+            ),
+        ] {
+            let Err(err) = ResolvedClusterConfig::try_new(config) else {
+                panic!("a {node} without cluster mTLS files must not start");
+            };
+            assert_eq!(
+                err.to_string(),
+                "Cluster mode requires the following flags: --node-mtls-ca-certificate-file, \
+                 --node-mtls-certificate-file, --node-mtls-key-file. Create cluster certificates \
+                 with `spice cluster tls init` and `spice cluster tls add <node-name>`.",
+                "{node}"
+            );
+        }
+    }
 
     #[test]
     fn cluster_grpc_client_config_from_params() {
