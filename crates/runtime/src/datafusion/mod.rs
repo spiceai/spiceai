@@ -113,7 +113,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use itertools::Itertools;
 use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
@@ -1444,6 +1444,10 @@ pub struct DataFusion {
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
+    /// Snapshot managers by dataset, so shutdown can resign their writer leases.
+    snapshot_writers: ParkingMutex<
+        HashMap<ResolvedTableReference, Weak<runtime_acceleration::snapshot::SnapshotManager>>,
+    >,
     /// `sink` datasets waiting for their first write, which is when their schema becomes
     /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
     /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
@@ -4495,6 +4499,10 @@ impl DataFusion {
                     )
                     .await?
                     {
+                        self.snapshot_writers.lock().insert(
+                            resolve_table_reference(dataset.name.clone()),
+                            Arc::downgrade(&snapshot_config.manager),
+                        );
                         accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                     }
                 } else {
@@ -6712,6 +6720,18 @@ impl DataFusion {
 
     pub fn query_builder(self: &Arc<Self>, sql: &str) -> QueryBuilder {
         QueryBuilder::new(sql, Arc::clone(self))
+    }
+
+    /// Resigns this runtime's snapshot writer leases, so another instance can
+    /// take over without waiting for them to lapse.
+    pub async fn resign_snapshot_writer_leases(&self) {
+        let writers: Vec<_> = self
+            .snapshot_writers
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        join_all(writers.iter().map(|writer| writer.resign_writer_lease())).await;
     }
 
     /// Performs `DataFusion` cleanup during shutdown.
