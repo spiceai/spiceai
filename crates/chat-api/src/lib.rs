@@ -193,9 +193,12 @@ impl Error {
             | Self::UnsafePickleWeight { .. }
             | Self::ModelParameterFailed { .. }
             | Self::ResponsesNotSupported { .. } => true,
+            // A loader can wrap a configuration error, such as rejected pickle weights.
+            Self::FailedToLoadModel { source } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_configuration_error),
             Self::HealthCheckError { .. }
             | Self::FailedToRunModel { .. }
-            | Self::FailedToLoadModel { .. }
             | Self::ModelNotFound { .. }
             | Self::FailedToLoadTokenizer { .. }
             | Self::ModelFileMissing { .. }

@@ -534,5 +534,19 @@ mod tests {
             .await
             .expect_err("no such provider");
         assert!(is_permanent_model_failure(&unknown), "{unknown}");
+
+        let dir = tempfile::tempdir().expect("a directory for the weights");
+        let weights = dir.path().join("model.pth");
+        std::fs::write(&weights, b"").expect("writes the pickle weights");
+        let pickled = SpicepodModel::new(format!("file:{}", weights.display()), "pickled");
+        let rejected = rt
+            .try_load_model(&pickled)
+            .await
+            .expect_err("pickle weights are refused");
+        assert!(
+            rejected.to_string().contains("Refusing to load model weight file"),
+            "{rejected}"
+        );
+        assert!(is_permanent_model_failure(&rejected), "{rejected}");
     }
 }
