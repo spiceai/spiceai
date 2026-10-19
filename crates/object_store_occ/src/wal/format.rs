@@ -15,16 +15,16 @@ limitations under the License.
 */
 
 use std::collections::BTreeMap;
-use std::io::Write;
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use snafu::{ResultExt, ensure};
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use snafu::{OptionExt, ResultExt, ensure};
 
-use super::{CodecSnafu, InvalidRecordSnafu, LimitSnafu, Result, WorkerSnafu};
+use super::{CodecSnafu, InvalidRecordSnafu, LimitSnafu, Result, WorkerSnafu, wire};
 use crate::store::MAX_VALUE_BYTES;
 
-pub(super) const FORMAT: u32 = 1;
+pub(super) const FORMAT: u32 = 2;
 pub(super) const MAX_BATCH_BYTES: usize = 128 * 1024;
 pub(super) const MAX_KEY_BYTES: usize = 1024;
 pub(super) const MAX_BATCH_KEYS: usize = 1024;
@@ -91,8 +91,7 @@ impl Reference {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub(super) struct Head {
     pub format: u32,
     pub incarnation: [u8; 16],
@@ -147,8 +146,7 @@ impl Head {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub(super) struct LogRecord {
     pub format: u32,
     pub incarnation: [u8; 16],
@@ -181,16 +179,14 @@ impl LogRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub(super) struct CheckpointReference {
     pub object: Reference,
     pub sequence: u64,
     pub commit: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub(super) struct Checkpoint {
     pub format: u32,
     pub incarnation: [u8; 16],
@@ -201,8 +197,7 @@ pub(super) struct Checkpoint {
     pub keys: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub(super) struct Page {
     pub format: u32,
     pub incarnation: [u8; 16],
@@ -287,31 +282,34 @@ pub(super) fn state_size(entries: &BTreeMap<String, Bytes>, limits: Limits) -> R
     Ok(size)
 }
 
-/// Bounds serializer output before allocation; decode is bounded by `StateStore`.
-struct BoundedWriter(Vec<u8>);
+/// A stored record and the protobuf message that encodes it.
+pub(super) trait Wire: Sized {
+    type Message: Message + Default;
 
-impl Write for BoundedWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_VALUE_BYTES - self.0.len() {
-            return Err(std::io::Error::other("state record exceeds byte limit"));
+    fn to_wire(&self) -> Self::Message;
+
+    fn from_wire(message: Self::Message) -> Result<Self>;
+}
+
+/// Encodes `value`, refusing a record larger than a state value may be.
+pub(super) fn encode<T: Wire>(value: &T) -> Result<Bytes> {
+    let message = value.to_wire();
+    ensure!(
+        message.encoded_len() <= MAX_VALUE_BYTES,
+        LimitSnafu {
+            resource: "encoded record bytes"
         }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    );
+    Ok(Bytes::from(message.encode_to_vec()))
 }
 
-pub(super) fn encode<T: Serialize>(value: &T) -> Result<Bytes> {
-    let mut writer = BoundedWriter(Vec::new());
-    serde_json::to_writer(&mut writer, value).context(CodecSnafu)?;
-    Ok(Bytes::from(writer.0))
+/// Decodes a record on the calling thread.
+pub(super) fn decode_now<T: Wire>(bytes: Bytes) -> Result<T> {
+    T::from_wire(T::Message::decode(bytes).context(CodecSnafu)?)
 }
 
-pub(super) async fn decode<T: DeserializeOwned + Send + 'static>(bytes: Bytes) -> Result<T> {
-    cpu(move || serde_json::from_slice(&bytes).context(CodecSnafu)).await
+pub(super) async fn decode<T: Wire + Send + 'static>(bytes: Bytes) -> Result<T> {
+    cpu(move || decode_now(bytes)).await
 }
 
 pub(super) async fn cpu<T: Send + 'static>(
@@ -322,4 +320,245 @@ pub(super) async fn cpu<T: Send + 'static>(
         let _ = send.send(f());
     });
     receive.await.context(WorkerSnafu)?
+}
+
+fn wire_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn count(value: u64, reason: &'static str) -> Result<usize> {
+    usize::try_from(value)
+        .ok()
+        .context(InvalidRecordSnafu { reason })
+}
+
+fn fixed<const N: usize>(bytes: &[u8], reason: &'static str) -> Result<[u8; N]> {
+    <[u8; N]>::try_from(bytes)
+        .ok()
+        .context(InvalidRecordSnafu { reason })
+}
+
+fn required<T>(value: Option<T>, reason: &'static str) -> Result<T> {
+    value.context(InvalidRecordSnafu { reason })
+}
+
+impl Limits {
+    fn to_wire(self) -> wire::Limits {
+        wire::Limits {
+            max_state_bytes: wire_count(self.max_state_bytes),
+            max_keys: wire_count(self.max_keys),
+            max_commits: self.max_commits,
+            max_replay_commits: self.max_replay_commits,
+        }
+    }
+
+    fn from_wire(limits: wire::Limits) -> Result<Self> {
+        Ok(Self {
+            max_state_bytes: count(limits.max_state_bytes, "limits")?,
+            max_keys: count(limits.max_keys, "limits")?,
+            max_commits: limits.max_commits,
+            max_replay_commits: limits.max_replay_commits,
+        })
+    }
+}
+
+impl Reference {
+    fn to_wire(&self) -> wire::Reference {
+        wire::Reference {
+            id: Bytes::copy_from_slice(&self.id),
+            digest: Bytes::copy_from_slice(&self.digest),
+        }
+    }
+
+    fn from_wire(reference: &wire::Reference) -> Result<Self> {
+        Ok(Self {
+            id: fixed(&reference.id, "reference identity")?,
+            digest: fixed(&reference.digest, "reference digest")?,
+        })
+    }
+}
+
+impl CheckpointReference {
+    fn to_wire(&self) -> wire::CheckpointReference {
+        wire::CheckpointReference {
+            object: Some(self.object.to_wire()),
+            sequence: self.sequence,
+            commit: self.commit.as_ref().map(Reference::to_wire),
+        }
+    }
+
+    fn from_wire(reference: wire::CheckpointReference) -> Result<Self> {
+        Ok(Self {
+            object: Reference::from_wire(&required(reference.object, "checkpoint object")?)?,
+            sequence: reference.sequence,
+            commit: reference
+                .commit
+                .as_ref()
+                .map(Reference::from_wire)
+                .transpose()?,
+        })
+    }
+}
+
+impl Wire for Head {
+    type Message = wire::Head;
+
+    fn to_wire(&self) -> wire::Head {
+        wire::Head {
+            format: self.format,
+            incarnation: Bytes::copy_from_slice(&self.incarnation),
+            limits: Some(self.limits.to_wire()),
+            sequence: self.sequence,
+            commit: self.commit.as_ref().map(Reference::to_wire),
+            checkpoint: self.checkpoint.as_ref().map(CheckpointReference::to_wire),
+            state_bytes: wire_count(self.state_bytes),
+            keys: wire_count(self.keys),
+        }
+    }
+
+    fn from_wire(head: wire::Head) -> Result<Self> {
+        Ok(Self {
+            format: head.format,
+            incarnation: fixed(&head.incarnation, "head incarnation")?,
+            limits: Limits::from_wire(required(head.limits, "head limits")?)?,
+            sequence: head.sequence,
+            commit: head.commit.as_ref().map(Reference::from_wire).transpose()?,
+            checkpoint: head
+                .checkpoint
+                .map(CheckpointReference::from_wire)
+                .transpose()?,
+            state_bytes: count(head.state_bytes, "head bounds")?,
+            keys: count(head.keys, "head bounds")?,
+        })
+    }
+}
+
+impl Wire for LogRecord {
+    type Message = wire::LogRecord;
+
+    fn to_wire(&self) -> wire::LogRecord {
+        wire::LogRecord {
+            format: self.format,
+            incarnation: Bytes::copy_from_slice(&self.incarnation),
+            id: Bytes::copy_from_slice(&self.id),
+            base_head: Bytes::copy_from_slice(&self.base_head),
+            sequence: self.sequence,
+            parent: self.parent.as_ref().map(Reference::to_wire),
+            changes: self
+                .changes
+                .iter()
+                .map(|(key, value)| wire::Change {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            state_bytes: wire_count(self.state_bytes),
+            keys: wire_count(self.keys),
+        }
+    }
+
+    fn from_wire(record: wire::LogRecord) -> Result<Self> {
+        let mut changes = BTreeMap::new();
+        for change in record.changes {
+            ensure!(
+                changes
+                    .last_key_value()
+                    .is_none_or(|(last, _)| *last < change.key),
+                InvalidRecordSnafu {
+                    reason: "WAL change order"
+                }
+            );
+            changes.insert(change.key, change.value);
+        }
+        Ok(Self {
+            format: record.format,
+            incarnation: fixed(&record.incarnation, "WAL incarnation")?,
+            id: fixed(&record.id, "WAL identity")?,
+            base_head: fixed(&record.base_head, "WAL base head")?,
+            sequence: record.sequence,
+            parent: record
+                .parent
+                .as_ref()
+                .map(Reference::from_wire)
+                .transpose()?,
+            changes,
+            state_bytes: count(record.state_bytes, "WAL bounds")?,
+            keys: count(record.keys, "WAL bounds")?,
+        })
+    }
+}
+
+impl Wire for Checkpoint {
+    type Message = wire::Checkpoint;
+
+    fn to_wire(&self) -> wire::Checkpoint {
+        wire::Checkpoint {
+            format: self.format,
+            incarnation: Bytes::copy_from_slice(&self.incarnation),
+            sequence: self.sequence,
+            commit: self.commit.as_ref().map(Reference::to_wire),
+            pages: self.pages.iter().map(Reference::to_wire).collect(),
+            state_bytes: wire_count(self.state_bytes),
+            keys: wire_count(self.keys),
+        }
+    }
+
+    fn from_wire(checkpoint: wire::Checkpoint) -> Result<Self> {
+        Ok(Self {
+            format: checkpoint.format,
+            incarnation: fixed(&checkpoint.incarnation, "checkpoint incarnation")?,
+            sequence: checkpoint.sequence,
+            commit: checkpoint
+                .commit
+                .as_ref()
+                .map(Reference::from_wire)
+                .transpose()?,
+            pages: checkpoint
+                .pages
+                .iter()
+                .map(Reference::from_wire)
+                .collect::<Result<_>>()?,
+            state_bytes: count(checkpoint.state_bytes, "checkpoint bounds")?,
+            keys: count(checkpoint.keys, "checkpoint bounds")?,
+        })
+    }
+}
+
+impl Wire for Page {
+    type Message = wire::Page;
+
+    fn to_wire(&self) -> wire::Page {
+        wire::Page {
+            format: self.format,
+            incarnation: Bytes::copy_from_slice(&self.incarnation),
+            entries: self
+                .entries
+                .iter()
+                .map(|(key, value)| wire::Entry {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn from_wire(page: wire::Page) -> Result<Self> {
+        let mut entries = BTreeMap::new();
+        for entry in page.entries {
+            ensure!(
+                entries
+                    .last_key_value()
+                    .is_none_or(|(last, _)| *last < entry.key),
+                InvalidRecordSnafu {
+                    reason: "checkpoint key order"
+                }
+            );
+            entries.insert(entry.key, entry.value);
+        }
+        Ok(Self {
+            format: page.format,
+            incarnation: fixed(&page.incarnation, "checkpoint page incarnation")?,
+            entries,
+        })
+    }
 }
