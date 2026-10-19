@@ -2004,7 +2004,11 @@ impl Query {
                 pre_parsed_plan: Some(ref plan),
                 ..
             } => plan.clone(),
-            QueryMethod::Text { ref sql, .. } => {
+            QueryMethod::Text {
+                ref sql,
+                ref parameters,
+                ..
+            } => {
                 // Looked up under the key `get_plan_or_cached` plans under, so a
                 // statement whose schema is advertised here is not planned again
                 // when it runs, and one that has already run is not planned again
@@ -2029,6 +2033,7 @@ impl Query {
                                 &session_ctx.state(),
                                 cached_plan_key.as_ref(),
                                 sql,
+                                parameters.as_ref(),
                             )
                             .await
                     }
