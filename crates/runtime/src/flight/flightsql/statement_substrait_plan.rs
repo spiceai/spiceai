@@ -424,8 +424,8 @@ mod tests {
     /// a DuckDB acceleration `like(a, b)`, which DuckDB has no function for
     /// (the `Substrait compliance` Mode B TPC-H DuckDB rows, q02/q09/q13/q14/q16/q20).
     #[tokio::test]
-    async fn decode_plan_lowers_a_substrait_like_to_a_like_expression()
-    -> Result<(), anyhow::Error> {
+    async fn decode_plan_lowers_a_substrait_like_to_a_like_expression() -> Result<(), anyhow::Error>
+    {
         use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;

@@ -19,7 +19,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DFSchema, Result, ScalarValue, TableReference, substrait_err};
 use datafusion::execution::{FunctionRegistry, SessionState};
@@ -33,6 +32,7 @@ use datafusion_substrait::substrait::proto::expression::ScalarFunction;
 use datafusion_substrait::substrait::proto::{
     ExtensionLeafRel, ExtensionMultiRel, ExtensionSingleRel, Type,
 };
+use parking_lot::RwLock;
 
 /// Lowers Substrait plans the way `datafusion-substrait`'s
 /// `DefaultSubstraitConsumer` does, except that a Substrait `like` or `ilike`
@@ -42,7 +42,7 @@ use datafusion_substrait::substrait::proto::{
 /// before its built-in expressions, and the session registers
 /// `datafusion-spark`'s `like` and `ilike`. Left alone, a Substrait `like`
 /// therefore lowers to a `like(..)` function call, which the unparser sends
-/// verbatim to a federated or accelerated source, and DuckDB rejects it
+/// verbatim to a federated or accelerated source, and `DuckDB` rejects it
 /// ("Scalar Function with name like does not exist"). Both Spark functions
 /// evaluate with the Arrow `like` / `ilike` kernels that [`Expr::Like`] uses, so
 /// the rewrite keeps the result and lets the unparser emit `LIKE` / `ILIKE`.
@@ -86,9 +86,7 @@ fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
     };
     let escape_char = match args.next() {
         None => None,
-        Some(Expr::Literal(ScalarValue::Utf8(escape), _)) => {
-            escape.and_then(|s| s.chars().next())
-        }
+        Some(Expr::Literal(ScalarValue::Utf8(escape), _)) => escape.and_then(|s| s.chars().next()),
         Some(other) => {
             return substrait_err!(
                 "Expected a Utf8 literal for the `{}` escape character, but found {other:?}",
