@@ -1087,43 +1087,59 @@ struct ReasoningSupport {
     /// still opens a reasoning block, as GLM-5.3's does, or matches the template's own
     /// reasoning default, as gpt-oss's does by rendering `Reasoning: medium`.
     always_reasons: bool,
-    /// The levels the template names in its prompt, lowest first. `None` when it takes every
-    /// level alike, as an on/off switch, or encodes levels in its own words.
+    /// The levels the template takes, lowest first. `None` when it takes every level alike,
+    /// as an on/off switch does.
     levels: Option<Vec<TemplateReasoningEffort>>,
 }
 
 impl ReasoningSupport {
     /// Classifies a chat template from `render`, which renders its generation prompt for an
     /// `enable_thinking` and a level, or returns `None` when the template fails. A template
-    /// that fails to render is left unchecked, so requests reach it as they would without
-    /// this check.
+    /// that fails to render with reasoning off or unset, or at every level, is left
+    /// unchecked, so requests reach it as they would without this check.
     fn from_renders(
         render: impl Fn(Option<bool>, Option<TemplateReasoningEffort>) -> Option<String>,
     ) -> Self {
         let (Some(off), Some(unset)) = (render(Some(false), None), render(None, None)) else {
             return Self::default();
         };
-        let Some(renders) = REASONING_LEVELS
+        // A level the template fails to render at is one it refuses, as Qwen3.8-Flash-Next
+        // refuses `high`.
+        let renders: Vec<_> = REASONING_LEVELS
             .iter()
-            .map(|&level| render(None, Some(level)).map(|prompt| (level, prompt)))
-            .collect::<Option<Vec<_>>>()
-        else {
+            .filter_map(|&level| render(None, Some(level)).map(|prompt| (level, prompt)))
+            .collect();
+        let Some((_, first)) = renders.first() else {
             return Self::default();
         };
-        let first = renders.first().map(|(_, prompt)| prompt);
-        let distinguishes = renders.iter().any(|(_, prompt)| Some(prompt) != first);
+        let refuses_a_level = renders.len() < REASONING_LEVELS.len();
+        let distinguishes = renders.iter().any(|(_, prompt)| prompt != first);
         // Off renders the template's default, and that default is one of its reasoning
         // levels: the template has a reasoning control but no off switch. A template with no
         // reasoning control at all renders the same prompt for everything, and doesn't reason.
         let off_is_a_level = off == unset && renders.iter().any(|(_, prompt)| *prompt == unset);
-        let named: Vec<_> = renders
+        // A template that names its levels takes those, and any level whose prompt is its own,
+        // unlike the default's and every other level's. GLM-5.3 renders `medium` and `xhigh`
+        // as its default, `Max`; Qwen3.8-Flash-Next takes `medium` without naming it. A
+        // template that names no level encodes levels its own way, and takes every level it
+        // renders.
+        let names_levels = renders
             .iter()
-            .filter(|(level, prompt)| names_level(prompt, *level))
+            .any(|(level, prompt)| names_level(prompt, *level));
+        let taken: Vec<_> = renders
+            .iter()
+            .filter(|(level, prompt)| {
+                !names_levels
+                    || names_level(prompt, *level)
+                    || (*prompt != unset
+                        && renders.iter().filter(|(_, other)| other == prompt).count() == 1)
+            })
             .map(|(level, _)| *level)
             .collect();
+        let restricts = (distinguishes && names_levels) || refuses_a_level;
         Self {
             always_reasons: opens_reasoning(&off) || (distinguishes && off_is_a_level),
-            levels: (distinguishes && !named.is_empty()).then_some(named),
+            levels: (restricts && !taken.is_empty()).then_some(taken),
         }
     }
 }
@@ -1620,6 +1636,32 @@ mod tests {
         "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".to_string()
     }
 
+    /// Qwen3.8-Flash-Next's template: it takes `low`, `medium` and its default `xhigh`, adds
+    /// instructions naming only `low` and `xhigh`, and raises on any other level.
+    fn qwen_3_8_render(
+        enable_thinking: Option<bool>,
+        effort: Option<TemplateReasoningEffort>,
+    ) -> Option<String> {
+        let (instructions, open) = if enable_thinking == Some(false) {
+            ("", "<think>\n\n</think>\n\n")
+        } else {
+            let instructions = match effort.unwrap_or(TemplateReasoningEffort::XHigh) {
+                TemplateReasoningEffort::XHigh => {
+                    "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task.<|im_end|>\n"
+                }
+                TemplateReasoningEffort::Low => {
+                    "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused.<|im_end|>\n"
+                }
+                TemplateReasoningEffort::Medium => "",
+                _ => return None,
+            };
+            (instructions, "<think>\n")
+        };
+        Some(format!(
+            "{instructions}<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n{open}"
+        ))
+    }
+
     /// Classifies a template from one of the renders above, none of which fails.
     fn classify(
         render: fn(Option<bool>, Option<TemplateReasoningEffort>) -> String,
@@ -1679,6 +1721,79 @@ mod tests {
     #[test]
     fn a_template_without_reasoning_controls_takes_any_value() {
         assert_eq!(classify(llama_3_render), ReasoningSupport::default());
+    }
+
+    // Regression test: Qwen3.8-Flash-Next's template raises on `high`, which made the whole
+    // template unchecked, so a request for `high` failed in the template with HTTP 500.
+    #[test]
+    fn qwen_3_8_takes_the_levels_it_renders_and_not_high() {
+        assert_eq!(
+            ReasoningSupport::from_renders(qwen_3_8_render),
+            ReasoningSupport {
+                always_reasons: false,
+                levels: Some(vec![
+                    TemplateReasoningEffort::Low,
+                    TemplateReasoningEffort::Medium,
+                    TemplateReasoningEffort::XHigh
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_level_the_template_fails_to_render_is_refused_with_the_levels_it_takes() {
+        let support = ReasoningSupport::from_renders(qwen_3_8_render);
+        assert_eq!(
+            reasoning_controls(Some(&ReasoningEffort::High), &support, "qwen3.8-flash-next"),
+            Err("Model 'qwen3.8-flash-next' takes `reasoning_effort` 'low', 'medium' or 'xhigh', and ignores 'high'. Set 'low', 'medium' or 'xhigh', or omit `reasoning_effort` for the model's default. See: https://spiceai.org/docs/components/models".to_string())
+        );
+        let accepted = [
+            ("none", Some(false), None),
+            ("minimal", None, Some(TemplateReasoningEffort::Low)),
+            ("medium", None, Some(TemplateReasoningEffort::Medium)),
+            ("xhigh", None, Some(TemplateReasoningEffort::XHigh)),
+        ];
+        for (value, enable_thinking, reasoning_effort) in accepted {
+            assert_eq!(
+                reasoning_controls(
+                    Some(&effort(serde_json::json!(value))),
+                    &support,
+                    "qwen3.8-flash-next"
+                ),
+                Ok(ReasoningControls {
+                    enable_thinking,
+                    reasoning_effort
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_that_encodes_levels_without_naming_them_takes_every_level() {
+        let render = |enable_thinking: Option<bool>, effort: Option<TemplateReasoningEffort>| {
+            let instruction = match (enable_thinking, effort) {
+                (Some(false), _) => "Answer directly.",
+                (_, Some(TemplateReasoningEffort::Low)) => "Think briefly.",
+                (_, Some(TemplateReasoningEffort::High | TemplateReasoningEffort::XHigh)) => {
+                    "Think hard."
+                }
+                _ => "Think.",
+            };
+            Some(format!("{instruction}<|user|>Hi<|assistant|>"))
+        };
+        assert_eq!(
+            ReasoningSupport::from_renders(render),
+            ReasoningSupport::default()
+        );
+    }
+
+    #[test]
+    fn a_template_that_renders_no_level_is_left_unchecked() {
+        assert_eq!(
+            ReasoningSupport::from_renders(|_, effort| effort.is_none().then(|| "Hi".to_string())),
+            ReasoningSupport::default()
+        );
     }
 
     #[test]
