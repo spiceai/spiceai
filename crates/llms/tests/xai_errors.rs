@@ -187,6 +187,50 @@ async fn error_kind_keeps_xai_status() {
     }
 }
 
+/// A local xAI that answers the model lookup the health check makes with `status` and `body`.
+async fn xai_looking_up_model(status: u16, body: &str) -> (MockServer, Xai) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models/grok-3-mini"))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_raw(body.to_string(), "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let xai = Xai::with_endpoint(Some("grok-3-mini"), "test-key", &server.uri());
+    (server, xai)
+}
+
+/// A model that xAI refuses to serve fails its health check with xAI's reason, not as an
+/// unknown model.
+#[tokio::test]
+async fn health_names_xai_refusal() {
+    const CREDITS: &str = "Your team has either used all available credits or reached its monthly spending limit. To continue making API requests, please purchase more credits or raise your spending limit.";
+    let (_server, xai) = xai_looking_up_model(403, &xai_error("permission-denied", CREDITS)).await;
+    let error = Chat::health(&xai).await.expect_err("xAI refused the model");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to check the status of the model. An error occurred: permission_error: {CREDITS} (code: permission_denied) Verify the model configuration."
+        )
+    );
+}
+
+#[tokio::test]
+async fn health_reports_a_model_xai_does_not_have() {
+    let (_server, xai) = xai_looking_up_model(
+        404,
+        &xai_error("not-found", "The model grok-3-mini does not exist."),
+    )
+    .await;
+    let error = Chat::health(&xai).await.expect_err("xAI has no such model");
+    assert_eq!(
+        error.to_string(),
+        "The specified model identifier 'grok-3-mini' is not valid for the source 'xai'. Verify the model exists, and try again."
+    );
+}
+
 /// A body in the `OpenAI` shape is still read by `async-openai`, as before.
 #[tokio::test]
 async fn openai_error_body_is_unchanged() {

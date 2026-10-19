@@ -113,7 +113,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
-use futures::StreamExt;
+use futures::{StreamExt, future::join_all};
 use itertools::Itertools;
 use parking_lot::Mutex as ParkingMutex;
 use query::QueryBuilder;
@@ -1444,6 +1444,10 @@ pub struct DataFusion {
     schema_evolve_locks: TokioRwLock<HashMap<TableReference, Arc<tokio::sync::RwLock<()>>>>,
     change_generations: ChangeGenerations,
     bootstrap_owners: ParkingMutex<HashMap<ResolvedTableReference, Weak<BootstrapOwner>>>,
+    /// Snapshot managers by dataset, so shutdown can resign their writer leases.
+    snapshot_writers: ParkingMutex<
+        HashMap<ResolvedTableReference, Weak<runtime_acceleration::snapshot::SnapshotManager>>,
+    >,
     /// `sink` datasets waiting for their first write, which is when their schema becomes
     /// known and the dataset is registered. Keyed by dataset name, matched by `resolved_eq`
     /// so any way of naming the dataset finds it (see `ensure_sink_dataset`). One writer
@@ -4501,6 +4505,10 @@ impl DataFusion {
                     )
                     .await?
                     {
+                        self.snapshot_writers.lock().insert(
+                            resolve_table_reference(dataset.name.clone()),
+                            Arc::downgrade(&snapshot_config.manager),
+                        );
                         accelerated_table_builder.snapshot_creation_config(Some(snapshot_config));
                     }
                 } else {
@@ -6720,6 +6728,18 @@ impl DataFusion {
         QueryBuilder::new(sql, Arc::clone(self))
     }
 
+    /// Resigns this runtime's snapshot writer leases, so another instance can
+    /// take over without waiting for them to lapse.
+    pub async fn resign_snapshot_writer_leases(&self) {
+        let writers: Vec<_> = self
+            .snapshot_writers
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        join_all(writers.iter().map(|writer| writer.resign_writer_lease())).await;
+    }
+
     /// Performs `DataFusion` cleanup during shutdown.
     /// Currently cancels active queries and cleans up accelerated tables.
     pub async fn shutdown(&self) {
@@ -6785,8 +6805,12 @@ impl DataFusion {
 
         let plan = self.create_logical_plan(session, sql).await?;
 
+        // A DDL plan is not cached: planning `CREATE TABLE` stores its `WITH` and
+        // `PARTITION BY` options for the analyzer, which takes them when the plan is
+        // analyzed, so a cached plan would run without them.
         if let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
+            && !matches!(plan, LogicalPlan::Ddl(_))
         {
             tracing::trace!("caching plan for {sql}");
             cache.put_raw_key(&cache_key.as_u64(), plan.clone()).await;
@@ -8138,6 +8162,49 @@ mod tests {
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
         assert_eq!(cache_provider.item_count().await, 1);
+    }
+
+    /// Each plan of a `CREATE TABLE` stores its options for the analyzer, which takes
+    /// them: a Flight SQL client plans the statement to advertise its schema, then
+    /// again to run it.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn each_plan_of_a_create_table_stores_its_options() {
+        static SQL: &str = "CREATE TABLE t (id BIGINT, region VARCHAR) \
+            WITH (\"acceleration.engine\" = 'cayenne') PARTITION BY region";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        let session = df.ctx.state();
+
+        for _ in 0..2 {
+            df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+                .await
+                .expect("logical plan");
+            let options = df
+                .ddl_extension_store()
+                .write()
+                .expect("DDL extension store lock")
+                .remove(&TableReference::parse_str("t"));
+            assert!(options.is_some(), "the plan stored no options");
+        }
     }
 
     #[cfg(all(feature = "duckdb", feature = "snapshots",))]
