@@ -287,12 +287,19 @@ mod tests {
         );
 
         pin(&mut dataset, 1, 3_000);
-        assert_eq!(pinned_at_ms(&dataset), Some(3_000), "a new pin has its own time");
+        assert_eq!(
+            pinned_at_ms(&dataset),
+            Some(3_000),
+            "a new pin has its own time"
+        );
         assert_eq!(newer_snapshots(&dataset), Some(3));
 
         unpin(&mut dataset);
         assert_eq!(pinned_at_ms(&dataset), None);
-        assert!(dataset.properties.is_empty(), "unpinning removes the pin's properties");
+        assert!(
+            dataset.properties.is_empty(),
+            "unpinning removes the pin's properties"
+        );
     }
 
     #[test]

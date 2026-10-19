@@ -6310,8 +6310,14 @@ impl DataFusion {
     }
 
     /// What this instance serves of `dataset_name`'s pin, when it accelerates the dataset.
-    pub async fn pin_state(&self, dataset_name: &str) -> Option<crate::accelerated::pinned::PinState> {
-        let table = self.get_accelerated_table_provider(dataset_name).await.ok()?;
+    pub async fn pin_state(
+        &self,
+        dataset_name: &str,
+    ) -> Option<crate::accelerated::pinned::PinState> {
+        let table = self
+            .get_accelerated_table_provider(dataset_name)
+            .await
+            .ok()?;
         spice_table::find_layer::<AcceleratedTable>(table.as_ref(), spice_table::LayerWalk::Read)
             .map(|table| table.pin_status().get())
     }

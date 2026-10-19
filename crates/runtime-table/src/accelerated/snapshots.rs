@@ -12,9 +12,9 @@ limitations under the License.
 */
 use crate::accelerated::SnapshotCreateTrigger;
 use crate::accelerated::caching::is_reserved_caching_column;
+use crate::accelerated::pinned::{NotServed, PinStatus};
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshCompletionOutcome};
-use crate::accelerated::pinned::{NotServed, PinStatus};
 use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use data_accelerator_api::DataAccelerator;
@@ -129,6 +129,7 @@ impl SnapshotRefreshState {
 
     /// Records what the table serves of its dataset's pin after a poll that read `pin`,
     /// and why it does not serve the pin. Returns whether that changed.
+    #[must_use]
     pub fn report_pin(&self, pin: PinRead, not_served: Option<NotServed>) -> bool {
         let mut state = self.pin_status.get();
         match pin {

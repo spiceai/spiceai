@@ -73,17 +73,25 @@ async fn a_table_serving_the_pin_never_falls_back_to_the_source() {
 
     assert_eq!(rows().await, 3, "no rows here: the source answers");
 
-    table.pin_status().set(PinState {
+    let _ = table.pin_status().set(PinState {
         pinned: Some(41),
         serves: Some(41),
         not_served: None,
     });
-    assert_eq!(rows().await, 0, "the pinned snapshot's rows are all it serves");
+    assert_eq!(
+        rows().await,
+        0,
+        "the pinned snapshot's rows are all it serves"
+    );
 
-    table.pin_status().set(PinState {
+    let _ = table.pin_status().set(PinState {
         pinned: Some(41),
         serves: Some(44),
         not_served: None,
     });
-    assert_eq!(rows().await, 3, "not serving the pin: the source answers again");
+    assert_eq!(
+        rows().await,
+        3,
+        "not serving the pin: the source answers again"
+    );
 }

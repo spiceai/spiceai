@@ -50,6 +50,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::instances::{LeaseHolder, WriterStatus};
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{
@@ -57,7 +58,6 @@ use object_store::{
 };
 use object_store_occ::lease::{Acquired, Holder, Lease, LeaseError, LeaseIo, LeaseRecord, Role};
 use object_store_occ::{ConditionalWriteError, Expected};
-use super::instances::{LeaseHolder, WriterStatus};
 use parking_lot::Mutex;
 use util::{RetryError, retry};
 
@@ -681,7 +681,11 @@ mod tests {
             not_served: None,
         })
         .await;
-        assert_eq!(a.writer_lease_holder().await, None, "a status alone writes no lease");
+        assert_eq!(
+            a.writer_lease_holder().await,
+            None,
+            "a status alone writes no lease"
+        );
 
         a.hold_writer_lease().await.expect("a takes the lease");
         let not_served = WriterStatus {
@@ -919,7 +923,9 @@ mod tests {
                 .await;
             }
         });
-        reached.notified().await;
+        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .expect("the status write reads the lease");
 
         let releasing = tokio::spawn({
             let a = Arc::clone(&a);

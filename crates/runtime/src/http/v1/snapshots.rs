@@ -244,7 +244,13 @@ async fn with_instances(
     rt: &Runtime,
     manager: &SnapshotManager,
 ) -> api::SnapshotSummary {
-    summary.instances = instances(summary.pinned_snapshot_id, rt, manager, &summary.dataset_name).await;
+    summary.instances = instances(
+        summary.pinned_snapshot_id,
+        rt,
+        manager,
+        &summary.dataset_name,
+    )
+    .await;
     summary
 }
 

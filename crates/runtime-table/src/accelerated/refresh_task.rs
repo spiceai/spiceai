@@ -66,9 +66,9 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use runtime_acceleration::snapshot::SnapshotDownloadError;
-use runtime_acceleration::{PinRead, SnapshotPoll};
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+use runtime_acceleration::snapshot::SnapshotDownloadError;
+use runtime_acceleration::{PinRead, SnapshotPoll, SnapshotPollError};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
@@ -2130,7 +2130,7 @@ impl RefreshTask {
                 pin,
             }) => {
                 state.record_metadata_e_tag(metadata_e_tag);
-                state.report_pin(pin, None);
+                let _ = state.report_pin(pin, None);
                 tracing::debug!(
                     dataset = %self.dataset_name,
                     current_snapshot_id = ?current_local_id,
@@ -2144,10 +2144,14 @@ impl RefreshTask {
             }
             // A pinned snapshot this instance has no disk for leaves it serving the
             // snapshot it serves: the table stays as it is, and the check repeats.
-            Err(SnapshotDownloadError::NotEnoughDisk {
-                snapshot_id,
-                needed,
-                free,
+            Err(SnapshotPollError {
+                error:
+                    SnapshotDownloadError::NotEnoughDisk {
+                        snapshot_id,
+                        needed,
+                        free,
+                        ..
+                    },
                 ..
             }) => {
                 let not_served = pinned::NotServed::NotEnoughDisk {
@@ -2169,11 +2173,15 @@ impl RefreshTask {
                     .finish_up_to_date(refresh, &dataset_metrics_label_sets)
                     .await);
             }
-            Err(e) => {
+            Err(SnapshotPollError { pin, error: e }) => {
+                // A serving instance that fails to load the pinned snapshot keeps serving
+                // the snapshot it serves, as when it has no disk for it, and says why.
+                let pin_not_loaded = matches!(pin, PinRead::Pinned(snapshot_id)
+                    if current_local_id.is_some_and(|local_id| local_id != snapshot_id));
                 let not_served = pinned::NotServed::LoadFailed {
                     reason: e.to_string(),
                 };
-                if state.report_pin(PinRead::Unchanged, Some(not_served.clone()))
+                if state.report_pin(pin, Some(not_served.clone()))
                     && let Some(pinned) = state.pin_status.get().pinned
                     && !state.pin_status.serves_pin()
                 {
@@ -2202,14 +2210,16 @@ impl RefreshTask {
                         error = %e,
                         "refresh_mode: snapshot - rejected snapshot before download: {detail}"
                     );
-                    self.set_refresh_status(
-                        None,
-                        status::ComponentStatus::error_with_message(format!(
-                            "snapshot schema mismatch: {detail}"
-                        )),
-                    )
-                    .await;
-                } else {
+                    if !pin_not_loaded {
+                        self.set_refresh_status(
+                            None,
+                            status::ComponentStatus::error_with_message(format!(
+                                "snapshot schema mismatch: {detail}"
+                            )),
+                        )
+                        .await;
+                    }
+                } else if !pin_not_loaded {
                     tracing::warn!(
                         dataset = %self.dataset_name,
                         error = %e,
@@ -2222,6 +2232,13 @@ impl RefreshTask {
                         ),
                     )
                     .await;
+                }
+                if pin_not_loaded {
+                    let dataset_metrics_label_sets =
+                        self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
+                    return Ok(self
+                        .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                        .await);
                 }
                 return Err(RetryError::transient(
                     super::Error::FailedToRefreshDataset {
@@ -2362,7 +2379,7 @@ impl RefreshTask {
             ));
         }
         state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
-        state.report_pin(pin, None);
+        let _ = state.report_pin(pin, None);
         // Only now: the replaced provider is no longer served.
         state
             .accelerator

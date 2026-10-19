@@ -443,6 +443,14 @@ pub enum PinRead {
     NotPinned,
 }
 
+/// A failed [`SnapshotManager::download_if_newer`] poll.
+#[derive(Debug)]
+pub struct SnapshotPollError {
+    /// The dataset's pin, as the poll read it before it failed.
+    pub pin: PinRead,
+    pub error: SnapshotDownloadError,
+}
+
 /// A dataset's current snapshot as its `metadata.json` records it: what a dataset that
 /// reads snapshots needs to know before it can create the acceleration the snapshot
 /// loads into.
@@ -1849,48 +1857,64 @@ impl SnapshotManager {
     ///
     /// Same errors as [`SnapshotManager::download_latest_snapshot`], plus
     /// [`SnapshotDownloadError::SchemaMismatch`] when `validate_schema`
-    /// rejects the metadata schema.
+    /// rejects the metadata schema, each with the pin the poll read.
     pub async fn download_if_newer(
         &self,
         current_local_id: Option<u64>,
         known_metadata_e_tag: Option<&str>,
         validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
-    ) -> Result<SnapshotPoll, SnapshotDownloadError> {
-        if !matches!(
+    ) -> Result<SnapshotPoll, SnapshotPollError> {
+        let pin = parking_lot::Mutex::new(PinRead::Unchanged);
+        let polled = if matches!(
             self.bootstrap_failure_behavior,
             BootstrapOnFailureBehavior::Retry
         ) {
-            return self
-                .poll_once(current_local_id, known_metadata_e_tag, validate_schema)
+            // Each retry is a whole poll: it reads the metadata again, unconditionally, and
+            // validates the snapshot it then downloads, so a snapshot published to replace a
+            // failed one is picked up.
+            let first_attempt = AtomicBool::new(true);
+            retry(RetryBackoffBuilder::new().build(), || async {
+                let known_metadata_e_tag = if first_attempt.swap(false, Ordering::Relaxed) {
+                    known_metadata_e_tag
+                } else {
+                    None
+                };
+                self.poll_once(
+                    current_local_id,
+                    known_metadata_e_tag,
+                    validate_schema,
+                    &pin,
+                )
                 .await
-                .map_err(|err| match err {
-                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                });
-        }
-
-        // Each retry is a whole poll: it reads the metadata again, unconditionally, and
-        // validates the snapshot it then downloads, so a snapshot published to replace a
-        // failed one is picked up.
-        let first_attempt = AtomicBool::new(true);
-        retry(RetryBackoffBuilder::new().build(), || async {
-            let known_metadata_e_tag = if first_attempt.swap(false, Ordering::Relaxed) {
-                known_metadata_e_tag
-            } else {
-                None
-            };
-            self.poll_once(current_local_id, known_metadata_e_tag, validate_schema)
-                .await
+            })
+            .await
+        } else {
+            self.poll_once(
+                current_local_id,
+                known_metadata_e_tag,
+                validate_schema,
+                &pin,
+            )
+            .await
+            .map_err(|err| match err {
+                RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
+            })
+        };
+        polled.map_err(|error| SnapshotPollError {
+            pin: *pin.lock(),
+            error,
         })
-        .await
     }
 
     /// One attempt of [`Self::download_if_newer`]. A failed download is a transient error
-    /// under `bootstrap_on_failure_behavior: retry`; every other error is permanent.
+    /// under `bootstrap_on_failure_behavior: retry`; every other error is permanent. Sets
+    /// `pin_read` to the pin once it reads the metadata.
     async fn poll_once(
         &self,
         current_local_id: Option<u64>,
         known_metadata_e_tag: Option<&str>,
         validate_schema: Option<&(dyn Fn(&SchemaRef) -> bool + Send + Sync)>,
+        pin_read: &parking_lot::Mutex<PinRead>,
     ) -> Result<SnapshotPoll, RetryError<SnapshotDownloadError>> {
         // One metadata read drives the whole attempt: the id comparison, the schema check and
         // the download all use it, so the snapshot that is downloaded is the one whose schema
@@ -1922,6 +1946,7 @@ impl SnapshotManager {
             .get(&self.dataset_name)
             .and_then(pin::current_pin)
             .map_or(PinRead::NotPinned, PinRead::Pinned);
+        *pin_read.lock() = pin;
         let nothing_newer = SnapshotPoll {
             download: None,
             metadata_e_tag: handle.e_tag(),
@@ -2028,6 +2053,19 @@ impl SnapshotManager {
                     );
                     RetryError::transient(err)
                 })?
+        } else if current_local_id.is_some() && pin == PinRead::Pinned(remote_id) {
+            // An instance that serves a snapshot keeps serving it when the pinned snapshot
+            // fails to load, and the failure is returned so it can say why: no other
+            // snapshot is loaded in the pinned one's place.
+            let checkpointer_factory = Arc::clone(
+                self.checkpointer_factory
+                    .as_ref()
+                    .context(CheckpointerFactoryNotSetSnafu)
+                    .map_err(RetryError::permanent)?,
+            );
+            self.download_latest_once(checkpointer_factory, Some(handle))
+                .await
+                .map_err(RetryError::permanent)?
         } else {
             self.download_latest(Some(handle), current_local_id)
                 .await
@@ -11242,8 +11280,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(SnapshotDownloadError::NotEnoughDisk { snapshot_id: 0, needed, free, .. })
-                    if needed > free
+                Err(SnapshotPollError {
+                    pin: PinRead::Pinned(0),
+                    error: SnapshotDownloadError::NotEnoughDisk { snapshot_id: 0, needed, free, .. },
+                }) if needed > free
             ),
             "{refused:?}"
         );
@@ -11259,6 +11299,72 @@ mod tests {
             ),
             "a writer's copy of the pin is refused too"
         );
+    }
+
+    /// A serving reader whose pinned snapshot fails to load keeps the snapshot it loaded,
+    /// loads no other one in its place, and returns why along with the pin, whatever its
+    /// bootstrap failure behavior.
+    #[tokio::test]
+    async fn a_pinned_snapshot_that_fails_to_load_is_reported_with_the_pin() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..4 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        writer
+            .set_current_snapshot(1)
+            .await
+            .expect("pin snapshot 1");
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
+        let gone = writer
+            .snapshot_uri_to_object_path(&entries[1].snapshot, None)
+            .expect("snapshot path");
+        store
+            .delete(&gone)
+            .await
+            .expect("delete the pinned snapshot's file");
+
+        for behavior in [
+            BootstrapOnFailureBehavior::Warn,
+            BootstrapOnFailureBehavior::Fallback,
+        ] {
+            let reader_dir = TempDir::new().expect("tempdir");
+            let restored = reader_dir.path().join("restored.db");
+            std::fs::write(&restored, "snapshot 2").expect("the loaded snapshot");
+            let reader = build_manager_for_engine(
+                Arc::clone(&store),
+                restored.clone(),
+                behavior,
+                &schema,
+                &AccelerationEngine::Cayenne,
+                false,
+            );
+
+            let failed = reader
+                .download_if_newer(Some(2), None, None)
+                .await
+                .expect_err("the pinned snapshot fails to load");
+            assert_eq!(failed.pin, PinRead::Pinned(1), "{behavior:?}");
+            assert_eq!(
+                std::fs::read_to_string(&restored).expect("restored"),
+                "snapshot 2",
+                "{behavior:?}: the loaded snapshot is kept"
+            );
+        }
     }
 
     /// A writer serving its pin downloads the pinned snapshot by id into a second copy,

@@ -69,6 +69,24 @@ impl std::fmt::Display for NotServed {
     }
 }
 
+impl NotServed {
+    /// Whether `other` is the same reason, whatever its details: the free disk space or a
+    /// failed load's message can change from one check to the next.
+    fn same_reason(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::NotEnoughDisk { snapshot_id, .. },
+                Self::NotEnoughDisk {
+                    snapshot_id: other, ..
+                },
+            ) => snapshot_id == other,
+            (Self::LoadFailed { .. }, Self::LoadFailed { .. })
+            | (Self::CachingMode, Self::CachingMode) => true,
+            _ => false,
+        }
+    }
+}
+
 /// `bytes` in the largest binary unit it reaches, to one decimal: `2.1 GiB`.
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 3] = [("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
@@ -99,6 +117,18 @@ impl PinState {
     #[must_use]
     pub fn serves_pin(&self) -> bool {
         self.pinned.is_some() && self.serves == self.pinned
+    }
+
+    /// Whether `other` is pinned to or serves another snapshot, or does not serve the pin
+    /// for another reason.
+    fn differs_from(&self, other: &Self) -> bool {
+        self.pinned != other.pinned
+            || self.serves != other.serves
+            || match (&self.not_served, &other.not_served) {
+                (Some(reason), Some(other)) => !reason.same_reason(other),
+                (None, None) => false,
+                _ => true,
+            }
     }
 }
 
@@ -131,14 +161,14 @@ impl PinStatus {
         self.0.subscribe()
     }
 
-    /// Replaces the state. Returns whether it changed.
+    /// Replaces the state. Returns whether it changed other than in a reason's details,
+    /// and notifies subscribers only then.
+    #[must_use]
     pub fn set(&self, state: PinState) -> bool {
         self.0.send_if_modified(|current| {
-            if *current == state {
-                return false;
-            }
+            let changed = current.differs_from(&state);
             *current = state;
-            true
+            changed
         })
     }
 }
@@ -352,13 +382,13 @@ impl PinWatcher {
                         self.loader.release(pinned).await;
                         let serves = current.as_ref().map(|current| current.snapshot_id);
                         if self.report(Some(pinned), serves, Some(not_served.clone())) {
-                            let served = serves.map_or_else(
+                            let kept = serves.map_or_else(
                                 || "its live data".to_string(),
                                 |id| format!("snapshot {id}"),
                             );
                             tracing::warn!(
                                 dataset = %self.dataset_name,
-                                "Dataset '{}' is pinned to snapshot {pinned}, but this instance does not serve it, so it keeps serving {served} and tries again at its next refresh: {not_served}",
+                                "Dataset '{}' is pinned to snapshot {pinned}, but this instance does not serve it, so it keeps serving {kept} and tries again at its next refresh: {not_served}",
                                 self.dataset_name
                             );
                         }
@@ -369,7 +399,12 @@ impl PinWatcher {
     }
 
     /// Records what the table serves of the pin. Returns whether that changed.
-    fn report(&self, pinned: Option<u64>, serves: Option<u64>, not_served: Option<NotServed>) -> bool {
+    fn report(
+        &self,
+        pinned: Option<u64>,
+        serves: Option<u64>,
+        not_served: Option<NotServed>,
+    ) -> bool {
         self.status.set(PinState {
             pinned,
             serves,
@@ -666,7 +701,11 @@ mod tests {
         loader.failing.lock().insert(41);
         *loader.pinned.lock() = Some(41);
         watcher.check().await;
-        assert_eq!(status.get().serves, None, "live data while the pin cannot load");
+        assert_eq!(
+            status.get().serves,
+            None,
+            "live data while the pin cannot load"
+        );
         assert!(!status.serves_pin());
 
         loader.failing.lock().clear();
@@ -698,5 +737,40 @@ mod tests {
         );
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(64 * 1024 * 1024), "64.0 MiB");
+    }
+
+    #[test]
+    fn a_reason_whose_details_change_is_kept_but_not_reported_as_a_change() {
+        let status = PinStatus::default();
+        let no_disk = |free| PinState {
+            pinned: Some(41),
+            serves: Some(44),
+            not_served: Some(NotServed::NotEnoughDisk {
+                snapshot_id: 41,
+                needed: 100,
+                free,
+            }),
+        };
+        let failed = |reason: &str| PinState {
+            not_served: Some(NotServed::LoadFailed {
+                reason: reason.to_string(),
+            }),
+            ..no_disk(0)
+        };
+
+        assert!(status.set(no_disk(10)));
+        assert!(!status.set(no_disk(11)), "only the free space changed");
+        assert_eq!(status.get(), no_disk(11), "the latest details are kept");
+        assert!(status.set(failed("a")), "another reason");
+        assert!(!status.set(failed("b")), "only the message changed");
+        assert_eq!(status.get(), failed("b"));
+        assert!(
+            status.set(PinState {
+                serves: Some(41),
+                not_served: None,
+                ..failed("b")
+            }),
+            "serves the pin"
+        );
     }
 }

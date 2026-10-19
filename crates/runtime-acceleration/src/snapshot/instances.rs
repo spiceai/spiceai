@@ -180,7 +180,13 @@ mod tests {
                 Some(writer("writer-0", None, None)),
                 Some(report("writer-0", Some(41), None)),
             ),
-            vec![status("writer-0", InstanceRole::Writer, Some(41), true, None)]
+            vec![status(
+                "writer-0",
+                InstanceRole::Writer,
+                Some(41),
+                true,
+                None
+            )]
         );
     }
 
@@ -188,7 +194,13 @@ mod tests {
     fn an_instance_that_has_not_loaded_the_pin_says_when_it_will() {
         assert_eq!(
             instance_statuses(Some(41), Some(writer("writer-0", None, None)), None),
-            vec![status("writer-0", InstanceRole::Writer, None, false, Some(PENDING))]
+            vec![status(
+                "writer-0",
+                InstanceRole::Writer,
+                None,
+                false,
+                Some(PENDING)
+            )]
         );
     }
 
@@ -200,7 +212,13 @@ mod tests {
         };
         assert_eq!(
             instance_statuses(Some(41), Some(older.clone()), None),
-            vec![status("writer-0", InstanceRole::Writer, None, false, Some(OLDER_VERSION))]
+            vec![status(
+                "writer-0",
+                InstanceRole::Writer,
+                None,
+                false,
+                Some(OLDER_VERSION)
+            )]
         );
         assert_eq!(
             instance_statuses(None, Some(older), None),
@@ -213,7 +231,13 @@ mod tests {
     fn no_instance_has_a_reason_while_the_dataset_is_not_pinned() {
         assert_eq!(
             instance_statuses(None, None, Some(report("reader-0", Some(44), Some(DISK)))),
-            vec![status("reader-0", InstanceRole::This, Some(44), false, None)]
+            vec![status(
+                "reader-0",
+                InstanceRole::This,
+                Some(44),
+                false,
+                None
+            )]
         );
     }
 }

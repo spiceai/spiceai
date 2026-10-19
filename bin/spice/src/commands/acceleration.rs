@@ -527,7 +527,11 @@ fn truncate_checksum(checksum: &str) -> String {
 mod tests {
     use super::*;
 
-    fn summary(pinned: Option<u64>, pinned_at: Option<i64>, newer: Option<usize>) -> SnapshotSummary {
+    fn summary(
+        pinned: Option<u64>,
+        pinned_at: Option<i64>,
+        newer: Option<usize>,
+    ) -> SnapshotSummary {
         SnapshotSummary {
             dataset_name: "taxi_trips".to_string(),
             location: "s3://my-bucket/spice/snapshots".to_string(),

@@ -478,6 +478,7 @@ impl Lease {
 
     /// Sets what each later write of the lease reports as [`LeaseRecord::status`].
     /// Returns whether it changed.
+    #[must_use]
     pub fn set_status(&self, status: serde_json::Value) -> bool {
         let mut state = self.state.lock();
         if state.status.as_ref() == Some(&status) {
