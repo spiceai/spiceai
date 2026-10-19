@@ -1564,71 +1564,69 @@ mod tests {
 
     /// GLM-5.3-Flash's template as rendered for a one-message conversation: it takes
     /// `low` and `high`, maps every other value to `Max`, and always opens `<think>`.
-    fn glm_5_3_render(_: Option<bool>, effort: Option<TemplateReasoningEffort>) -> Option<String> {
+    fn glm_5_3_render(_: Option<bool>, effort: Option<TemplateReasoningEffort>) -> String {
         let shown = match effort {
             Some(TemplateReasoningEffort::Low) => "Low",
             Some(TemplateReasoningEffort::High) => "High",
             _ => "Max",
         };
-        Some(format!(
-            "[gMASK]<sop><|system|>Reasoning Effort: {shown}<|user|>Hi<|assistant|><think>"
-        ))
+        format!("[gMASK]<sop><|system|>Reasoning Effort: {shown}<|user|>Hi<|assistant|><think>")
     }
 
     /// A Qwen3 template: thinking off closes an empty block; any level only turns it on.
-    fn qwen3_render(
-        enable_thinking: Option<bool>,
-        _: Option<TemplateReasoningEffort>,
-    ) -> Option<String> {
+    fn qwen3_render(enable_thinking: Option<bool>, _: Option<TemplateReasoningEffort>) -> String {
         let close = if enable_thinking == Some(false) {
             "<think>\n\n</think>\n\n"
         } else {
             ""
         };
-        Some(format!(
-            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n{close}"
-        ))
+        format!("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n{close}")
     }
 
     /// A `DeepSeek-V4.1` template: answers directly unless asked, closing the block up front.
     fn deepseek_v4_1_render(
         enable_thinking: Option<bool>,
         effort: Option<TemplateReasoningEffort>,
-    ) -> Option<String> {
+    ) -> String {
         let thinks = enable_thinking.unwrap_or(effort.is_some());
         let open = if thinks { "<think>" } else { "</think>" };
-        Some(format!(
-            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>{open}"
-        ))
+        format!("<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>{open}")
     }
 
     /// A Gemma 4 template: `<|think|>` turns reasoning on.
     fn gemma_4_render(
         enable_thinking: Option<bool>,
         effort: Option<TemplateReasoningEffort>,
-    ) -> Option<String> {
+    ) -> String {
         let think = if enable_thinking.unwrap_or(effort.is_some()) {
             "<|think|>"
         } else {
             ""
         };
-        Some(format!(
-            "{think}<bos><|turn>user\nHi<turn|>\n<|turn>model\n"
-        ))
+        format!("{think}<bos><|turn>user\nHi<turn|>\n<|turn>model\n")
     }
 
     /// gpt-oss's template: it ignores `enable_thinking`, defaults to `medium`, and renders
     /// whatever level it is given as `Reasoning: <level>`.
-    fn gpt_oss_render(_: Option<bool>, effort: Option<TemplateReasoningEffort>) -> Option<String> {
+    fn gpt_oss_render(_: Option<bool>, effort: Option<TemplateReasoningEffort>) -> String {
         let level = effort.map_or("medium", TemplateReasoningEffort::as_str);
-        Some(format!(
+        format!(
             "<|start|>system<|message|>Reasoning: {level}\n\n<|end|><|start|>user<|message|>Hi<|end|><|start|>assistant"
-        ))
+        )
     }
 
     /// A template with no reasoning control, as Llama 3's: every control renders alike.
-    fn llama_3_render(_: Option<bool>, _: Option<TemplateReasoningEffort>) -> Option<String> {
-        Some("<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".to_string())
+    fn llama_3_render(_: Option<bool>, _: Option<TemplateReasoningEffort>) -> String {
+        "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".to_string()
+    }
+
+    /// Classifies a template from one of the renders above, none of which fails.
+    fn classify(
+        render: fn(Option<bool>, Option<TemplateReasoningEffort>) -> String,
+    ) -> ReasoningSupport {
+        ReasoningSupport::from_renders(|enable_thinking, effort| {
+            Some(render(enable_thinking, effort))
+        })
     }
 
     fn effort(json: serde_json::Value) -> ReasoningEffort {
@@ -1638,7 +1636,7 @@ mod tests {
     #[test]
     fn glm_5_3_always_reasons_and_names_only_low_and_high() {
         assert_eq!(
-            ReasoningSupport::from_renders(glm_5_3_render),
+            classify(glm_5_3_render),
             ReasoningSupport {
                 always_reasons: true,
                 levels: Some(vec![
@@ -1657,7 +1655,7 @@ mod tests {
             ("gemma-4", gemma_4_render),
         ] {
             assert_eq!(
-                ReasoningSupport::from_renders(render),
+                classify(render),
                 ReasoningSupport {
                     always_reasons: false,
                     levels: None
@@ -1670,7 +1668,7 @@ mod tests {
     #[test]
     fn gpt_oss_always_reasons_and_names_every_level() {
         assert_eq!(
-            ReasoningSupport::from_renders(gpt_oss_render),
+            classify(gpt_oss_render),
             ReasoningSupport {
                 always_reasons: true,
                 levels: Some(REASONING_LEVELS.to_vec()),
@@ -1680,10 +1678,7 @@ mod tests {
 
     #[test]
     fn a_template_without_reasoning_controls_takes_any_value() {
-        assert_eq!(
-            ReasoningSupport::from_renders(llama_3_render),
-            ReasoningSupport::default()
-        );
+        assert_eq!(classify(llama_3_render), ReasoningSupport::default());
     }
 
     #[test]
@@ -1696,7 +1691,7 @@ mod tests {
 
     #[test]
     fn unset_reasoning_effort_leaves_the_template_default() {
-        let support = ReasoningSupport::from_renders(glm_5_3_render);
+        let support = classify(glm_5_3_render);
         assert_eq!(
             reasoning_controls(None, &support, "glm-5.3-flash"),
             Ok(ReasoningControls::default())
@@ -1705,7 +1700,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_maps_to_template_controls() {
-        let support = ReasoningSupport::from_renders(qwen3_render);
+        let support = classify(qwen3_render);
         let cases = [
             ("none", Some(false), None),
             ("minimal", None, Some(TemplateReasoningEffort::Low)),
@@ -1728,7 +1723,7 @@ mod tests {
 
     #[test]
     fn none_is_refused_by_a_model_that_always_reasons() {
-        let support = ReasoningSupport::from_renders(glm_5_3_render);
+        let support = classify(glm_5_3_render);
         assert_eq!(
             reasoning_controls(Some(&ReasoningEffort::None), &support, "glm-5.3-flash"),
             Err("Model 'glm-5.3-flash' always reasons, so `reasoning_effort: none` can't turn reasoning off. Omit `reasoning_effort`, or set 'low' for the least reasoning. See: https://spiceai.org/docs/components/models".to_string())
@@ -1737,7 +1732,7 @@ mod tests {
 
     #[test]
     fn a_level_the_template_ignores_is_refused_with_the_levels_it_takes() {
-        let support = ReasoningSupport::from_renders(glm_5_3_render);
+        let support = classify(glm_5_3_render);
         for value in ["medium", "xhigh"] {
             assert_eq!(
                 reasoning_controls(
