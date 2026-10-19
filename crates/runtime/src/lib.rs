@@ -747,6 +747,9 @@ pub struct Runtime {
     /// The dataset loads still retrying, so a Spicepod change can stop the load
     /// of a configuration it replaces or removes.
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// The model loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    model_loads: Arc<init::model::ModelLoads>,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
