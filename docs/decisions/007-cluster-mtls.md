@@ -26,8 +26,8 @@ Related decisions:
 
 ## Design Principles
 
-* **Secure by default**: mTLS is required for cluster mode unless explicitly opting out with `--allow-insecure-connections`.
-* **Developer experience first**: CLI tooling (`spice cluster tls init`, `spice cluster tls add`) simplifies certificate generation; `--allow-insecure-connections` enables quick dev/test setup without certificates.
+* **Secure by default**: mTLS is required for cluster mode.
+* **Developer experience first**: CLI tooling (`spice cluster tls init`, `spice cluster tls add`) simplifies certificate generation for development and testing.
 * **Simplicity**: Standard TLS/mTLS patterns (three-file configuration) work with existing certificate management tools.
 * **Industry standards**: gRPC with `tonic` TLS support; standard X.509 certificates; SANs for hostname verification.
 * **Extensibility**: Certificate paths are CLI arguments, allowing integration with any certificate management solution.
@@ -49,7 +49,7 @@ Related decisions:
 # Role selection
 --role {scheduler|executor}               # Explicit role (executor implied if --scheduler-address set)
 
-# mTLS configuration (required unless --allow-insecure-connections)
+# mTLS configuration (required)
 --node-mtls-ca-certificate-file <path>    # CA cert to validate peer certificates
 --node-mtls-certificate-file <path>       # This node's certificate
 --node-mtls-key-file <path>               # This node's private key
@@ -61,9 +61,6 @@ Related decisions:
 # Executor-specific
 --scheduler-address <url>                 # Scheduler's internal load-balanced/virtual IP cluster URL
                                           # If set, --role executor is implied
-
-# Development/testing only
---allow-insecure-connections              # Disable mTLS (WARNING: never use in production)
 ```
 
 ### Internal gRPC Service
@@ -81,13 +78,13 @@ This service is only served on the internal cluster port (50052) with mTLS enfor
 
 ### Certificate Requirements
 
-When mTLS is enabled (the default), all three certificate files are required:
+All three certificate files are required:
 
 * **CA Certificate**: Used by all nodes to validate peer certificates.
 * **Node Certificate**: Signed by the CA; includes SAN matching the `--node-advertise-address`.
 * **Private Key**: Corresponding to the node certificate.
 
-For development/testing, use `--allow-insecure-connections` to skip certificate requirements.
+For development and testing, create them with the CLI tooling below.
 
 ### CLI Tooling
 
@@ -104,7 +101,7 @@ spice cluster tls add executor1 --host executor1.cluster.local
 
 ### Breaking Change
 
-* Cluster mode now requires mTLS configuration (or explicit `--allow-insecure-connections` for dev/test). Existing deployments using `--cluster-mode` with API key auth must migrate.
+* Cluster mode requires mTLS configuration. Existing deployments using `--cluster-mode` with API key auth must migrate.
 
 ### Renamed CLI Arguments
 
@@ -121,7 +118,6 @@ spice cluster tls add executor1 --host executor1.cluster.local
 ### New CLI Behavior
 
 * `--scheduler-address`: If set, `--role executor` is implied and can be omitted.
-* `--allow-insecure-connections`: Disables mTLS requirement for dev/test (WARNING: never use in production).
 
 ### Removed CLI Arguments
 
