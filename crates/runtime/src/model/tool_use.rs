@@ -48,6 +48,7 @@ use super::tool_trace::{
     CallerScope, PendingTurn, StreamedReply, ToolTraceStore, returned_message,
 };
 use crate::model::ModelContextExtension;
+use crate::model::wrapper::defaults::ToolOffer;
 use crate::tools::utils::tool_call_error_response;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -83,6 +84,16 @@ impl ToolUsingChat {
             tools: self.tools.clone(),
             recursion_limit: self.recursion_limit.map(|r| r.saturating_sub(1)),
             traces: Arc::clone(&self.traces),
+        }
+    }
+
+    /// The tools that this model sends the provider with a request.
+    #[must_use]
+    pub fn tool_offer(&self) -> ToolOffer {
+        if self.tools.is_empty() || self.recursion_limit == Some(0) {
+            ToolOffer::RequestOnly
+        } else {
+            ToolOffer::WithRuntimeTools
         }
     }
 
@@ -306,7 +317,9 @@ impl ToolUsingChat {
             }) {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return Ok(ToolLoopResponse::without_tools(
-                    self.inner_chat.chat_request(req).await?,
+                    self.inner_chat
+                        .chat_request(without_orphan_tool_choice(req))
+                        .await?,
                 ));
             }
 
@@ -406,7 +419,10 @@ impl ToolUsingChat {
             .as_ref()
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None))
         {
-            return self.inner_chat.chat_stream(req).await;
+            return self
+                .inner_chat
+                .chat_stream(without_orphan_tool_choice(req))
+                .await;
         }
 
         if self.recursion_limit.is_some_and(|f| f == 0) {
@@ -566,7 +582,7 @@ fn create_new_recursive_req(
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
-    new_req.tool_choice = Some(next_round_tool_choice(new_req.tool_choice.take()));
+    new_req.tool_choice = next_round_tool_choice(new_req.tool_choice.take());
 
     // Adjust input `max_completion_tokens` if usage is known to ensure we don't exceed the limit.
     if let Some(max_completion_tokens) = new_req.max_completion_tokens
@@ -587,31 +603,41 @@ fn create_new_recursive_req(
 /// mode. Re-sending it would force a call on every round until
 /// `tool_recursion_limit` runs out, and the turn could never end in an answer.
 ///
-/// An unset choice becomes `auto` too: the model's Spicepod `tool_choice` default is
-/// filled into an unset choice on every round, below this loop.
+/// Any other choice, unset included, stays as it is: the Spicepod's `tool_choice` default is
+/// already in the request, and a round that changes the choice can lose the provider's prompt
+/// cache (Anthropic keys its cache of messages on `tool_choice`).
 fn next_round_tool_choice(
     choice: Option<ChatCompletionToolChoiceOption>,
-) -> ChatCompletionToolChoiceOption {
+) -> Option<ChatCompletionToolChoiceOption> {
     match choice {
-        None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
         Some(
             ChatCompletionToolChoiceOption::Function(_)
             | ChatCompletionToolChoiceOption::Custom(_)
             | ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
         ) => {
             tracing::debug!("Not forcing a tool call again after a round that made one.");
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            ))
         }
         Some(ChatCompletionToolChoiceOption::AllowedTools(mut allowed)) => {
             allowed.allowed_tools.mode = ToolChoiceAllowedMode::Auto;
-            ChatCompletionToolChoiceOption::AllowedTools(allowed)
+            Some(ChatCompletionToolChoiceOption::AllowedTools(allowed))
         }
-        Some(
-            choice @ ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Auto | ToolChoiceOptions::None,
-            ),
-        ) => choice,
+        unforced @ (None
+        | Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto | ToolChoiceOptions::None,
+        ))) => unforced,
     }
+}
+
+/// `req` without its `tool_choice` when it offers no tools: a request with `tool_choice: none`
+/// that gets no runtime tools would otherwise carry a tool choice and no tools.
+fn without_orphan_tool_choice(mut req: CreateChatCompletionRequest) -> CreateChatCompletionRequest {
+    if req.tools.as_ref().is_none_or(Vec::is_empty) {
+        req.tool_choice = None;
+    }
+    req
 }
 
 pub fn combine_usage(
@@ -1085,6 +1111,7 @@ impl<S: Stream> Stream for InferenceTrackingStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::wrapper::defaults::RequestDefaults;
     use async_openai::types::chat::{
         ChatCompletionAllowedTools, ChatCompletionAllowedToolsChoice,
         ChatCompletionMessageToolCall, ChatCompletionNamedToolChoiceCustom,
@@ -1347,39 +1374,44 @@ mod tests {
     // regression test for #14459
     #[test]
     fn test_next_round_tool_choice() {
-        let auto = ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto);
+        let auto = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
         for forced in [
-            None,
-            Some(ChatCompletionToolChoiceOption::Mode(
-                ToolChoiceOptions::Required,
-            )),
-            Some(ChatCompletionToolChoiceOption::Function(
-                "list_datasets".into(),
-            )),
-            Some(ChatCompletionToolChoiceOption::Custom(
-                ChatCompletionNamedToolChoiceCustom {
-                    custom: CustomName {
-                        name: "client_tool".to_string(),
-                    },
+            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required),
+            ChatCompletionToolChoiceOption::Function("list_datasets".into()),
+            ChatCompletionToolChoiceOption::Custom(ChatCompletionNamedToolChoiceCustom {
+                custom: CustomName {
+                    name: "client_tool".to_string(),
                 },
-            )),
+            }),
         ] {
-            assert_eq!(next_round_tool_choice(forced.clone()), auto, "{forced:?}");
+            assert_eq!(
+                next_round_tool_choice(Some(forced.clone())),
+                auto,
+                "{forced:?}"
+            );
         }
 
         // `allowed_tools` keeps its tool list, in `auto` mode.
         assert_eq!(
             next_round_tool_choice(Some(allowed_tools(ToolChoiceAllowedMode::Required))),
-            allowed_tools(ToolChoiceAllowedMode::Auto)
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto))
         );
 
-        // Choices that force nothing pass through unchanged.
+        // Choices that force nothing pass through unchanged, so each round sends the provider
+        // the same request prefix.
         for unforced in [
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
-            allowed_tools(ToolChoiceAllowedMode::Auto),
+            None,
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            )),
+            Some(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::None,
+            )),
+            Some(allowed_tools(ToolChoiceAllowedMode::Auto)),
         ] {
-            assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+            assert_eq!(next_round_tool_choice(unforced.clone()), unforced);
         }
     }
 
@@ -1973,5 +2005,110 @@ mod tests {
                 "user: E"
             ]
         );
+    }
+
+    impl ScriptedChat {
+        /// The `tool_choice` of each request, in order.
+        fn tool_choices(&self) -> Vec<Option<ChatCompletionToolChoiceOption>> {
+            self.requests
+                .lock()
+                .iter()
+                .map(|req| req.tool_choice.clone())
+                .collect()
+        }
+    }
+
+    /// `model` under the Spicepod request defaults `defaults`, as `try_to_chat_model` builds it.
+    fn with_defaults(model: ToolUsingChat, defaults: &[(&str, Value)]) -> RequestDefaults {
+        let tool_offer = model.tool_offer();
+        RequestDefaults::new(
+            Arc::new(model),
+            "scripted",
+            defaults
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect(),
+            tool_offer,
+        )
+    }
+
+    /// With no `tool_choice`, each round sends the provider none, so the request prefix stays
+    /// the same from one round to the next and the provider can read it from its prompt cache.
+    #[tokio::test]
+    async fn test_an_unset_tool_choice_stays_unset_on_every_round() {
+        let provider = ScriptedChat::new(vec![
+            Reply::CallSql,
+            Reply::Answer("D"),
+            Reply::CallSql,
+            Reply::Answer("F"),
+        ]);
+        let model = with_defaults(sql_model(&provider), &[("temperature", json!(0.5))]);
+
+        model
+            .chat_request(request(vec![user("A")]))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(request(vec![user("E")]))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        assert_eq!(provider.tool_choices(), [None, None, None, None]);
+    }
+
+    /// A Spicepod `tool_choice: required` forces the call of the first round only, and the next
+    /// round can answer (#14459).
+    #[tokio::test]
+    async fn test_a_required_tool_choice_default_forces_only_the_first_round() {
+        let provider = ScriptedChat::new(vec![
+            Reply::CallSql,
+            Reply::Answer("D"),
+            Reply::CallSql,
+            Reply::Answer("F"),
+        ]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("required"))]);
+
+        model
+            .chat_request(request(vec![user("A")]))
+            .await
+            .expect("turn 1");
+        let chunks: Vec<_> = model
+            .chat_stream(request(vec![user("E")]))
+            .await
+            .expect("turn 2")
+            .collect()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+
+        let required = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Required,
+        ));
+        let auto = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
+        assert_eq!(
+            provider.tool_choices(),
+            [required.clone(), auto.clone(), required, auto]
+        );
+    }
+
+    /// A `tool_choice: none` turns the runtime tools off, so the request reaches the provider
+    /// with no tools and no tool choice of its own.
+    #[tokio::test]
+    async fn test_a_none_tool_choice_sends_no_tool_choice_without_tools() {
+        let provider = ScriptedChat::new(vec![Reply::Answer("D")]);
+        let model = with_defaults(sql_model(&provider), &[("tool_choice", json!("none"))]);
+
+        model
+            .chat_request(request(vec![user("A")]))
+            .await
+            .expect("turn 1");
+
+        let requests = provider.requests.lock();
+        assert_eq!(requests[0].tools, None);
+        assert_eq!(requests[0].tool_choice, None);
     }
 }

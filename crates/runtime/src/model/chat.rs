@@ -57,6 +57,7 @@ use super::params::openai::OpenAiModelParams;
 use super::params::spiceai::SpiceAiModelParams;
 use super::params::xai::XaiModelParams;
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
+use super::wrapper::defaults::{RequestDefaults, ToolOffer};
 use super::{tool_use::ToolUsingChat, wrapper::ChatWrapper};
 use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU2MTokenProvider};
 use crate::{
@@ -138,7 +139,7 @@ pub async fn try_to_chat_model(
 
     let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
 
-    let tool_model = match spice_tool_opt {
+    let (tool_model, tool_offer) = match spice_tool_opt {
         Some(opts) if opts.can_use_tools() => {
             let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
                 LlmError::ModelParameterFailed {
@@ -150,18 +151,33 @@ pub async fn try_to_chat_model(
             let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
                 .await
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            Arc::new(ToolUsingChat::new(
-                Arc::clone(&model),
-                tools,
-                spice_recursion_limit,
-            ))
+            let tool_model = ToolUsingChat::new(Arc::clone(&model), tools, spice_recursion_limit);
+            let tool_offer = tool_model.tool_offer();
+            (Arc::new(tool_model) as Arc<dyn Chat>, tool_offer)
         }
-        Some(_) | None => Arc::clone(&model),
+        Some(_) | None => (Arc::clone(&model), ToolOffer::RequestOnly),
     };
+
+    // The Spicepod's request defaults go above the tool loop, so they apply once to each client
+    // request rather than again to each round of the loop.
+    let without_tools = RequestDefaults::new(
+        model,
+        &component.name,
+        request_defaults(component)?,
+        ToolOffer::RequestOnly,
+    );
     Ok(LoadedChatModel {
-        chat: tool_model,
-        without_tools: model,
+        chat: Arc::new(without_tools.over(tool_model, tool_offer)),
+        without_tools: Arc::new(without_tools),
     })
+}
+
+/// The request defaults that `component`'s params set, such as `temperature` or `tool_choice`.
+fn request_defaults(component: &Model) -> Result<Vec<(String, Value)>, LlmError> {
+    let source = component.get_source().ok_or(LlmError::UnknownModelSource {
+        from: component.from.clone(),
+    })?;
+    Ok(get_openai_request_overrides(component, source.short_name()))
 }
 
 /// Deserializes the source's typed params from the (already secret-resolved)
@@ -276,12 +292,7 @@ pub async fn construct_model(
         }
         None => None,
     };
-    let mut wrapper = ChatWrapper::new(
-        model,
-        component.name.as_str(),
-        system_prompt,
-        get_openai_request_overrides(component, source.short_name()),
-    );
+    let mut wrapper = ChatWrapper::new(model, component.name.as_str(), system_prompt);
 
     if let Some(Value::String(s)) = component.params.get("parameterized_prompt")
         && matches!(s.as_str(), "enabled")
