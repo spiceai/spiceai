@@ -640,7 +640,7 @@ impl Query {
         parameters: Option<ParamValues>,
     ) -> super::Result<LogicalPlan> {
         let plan = match df
-            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
+            .get_or_create_logical_plan(session, sql_raw_cache_key, sql, parameters.as_ref())
             .await
         {
             Ok(plan) => plan,
@@ -664,13 +664,14 @@ impl Query {
     /// The key a cached [`LogicalPlan`] lives under: the SQL text and the
     /// cache namespace, never the parameter values bound into it.
     ///
-    /// [`DataFusion::create_logical_plan`] is never given the parameters — it
-    /// plans the placeholders, and [`Self::get_plan`] binds the values into the
-    /// plan it hands back — so one SQL text has exactly one plan whatever is
-    /// bound into it. Mixing the values into this key gives every value tuple
-    /// its own entry, which makes a parameterized query, the case the cache
-    /// exists for, a guaranteed miss, and evicts unrelated plans while it does
-    /// so. The values do key the *results*, which are keyed separately on
+    /// Plans keep their placeholders, and [`Self::get_plan`] binds the values
+    /// into the plan it hands back, so one SQL text has exactly one plan
+    /// whatever is bound into it. (Placeholders in table-function arguments are
+    /// substituted before planning instead, and those plans are never cached.)
+    /// Mixing the values into this key gives every value tuple its own entry,
+    /// which makes a parameterized query, the case the cache exists for, a
+    /// guaranteed miss, and evicts unrelated plans while it does so. The values
+    /// do key the *results*, which are keyed separately on
     /// `CacheKey::Query(sql, parameters)` or on the bound
     /// [`CacheKey::LogicalPlan`].
     ///
