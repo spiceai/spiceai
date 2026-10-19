@@ -752,12 +752,14 @@ impl CacheSinkWriter {
             .iter()
             .map(arrow::array::RecordBatch::get_array_memory_size)
             .fold(0, usize::saturating_add);
+        // Replacements share the append lane: the owner coalesces those whose
+        // scopes cannot overlap into one delete and one append.
         let batch = if request.replaces_existing {
             ChangeBatch::replace_set(scope, Arc::clone(&self.schema), batches)?
         } else {
             ChangeBatch::append_scoped(scope, Arc::clone(&self.schema), batches)?
-                .with_append_ingress(Arc::clone(&self.append_ingress))?
-        };
+        }
+        .with_append_ingress(Arc::clone(&self.append_ingress))?;
         reservation.try_grow(batch.estimated_bytes().saturating_sub(row_bytes))?;
         Ok(batch)
     }
@@ -796,7 +798,7 @@ impl CacheSinkWriter {
                 return Err(error);
             }
         };
-        let changed = batch.num_rows() > 0 || batch.replacement_scope().is_some();
+        let changed = batch.num_rows() > 0 || batch.replaced_scopes().next().is_some();
         let health = Arc::clone(&self.health);
         let last_updated_at = Arc::clone(&self.last_updated_at);
         let publication = CachePublication {
