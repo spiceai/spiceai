@@ -31,7 +31,7 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
 use telemetry::timing::TimeMeasurement;
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 #[derive(Debug, Snafu)]
@@ -76,27 +76,35 @@ impl Runtime {
     /// runtime's readiness, recover once the provider accepts it.
     ///
     /// The caller sets the model's status first; each attempt sets it to error or ready.
+    /// Returns after the first attempt, or when a Spicepod change stops the load.
     async fn load_model(self: &Arc<Self>, m: &SpicepodModel) {
-        self.model_retries.stop(&m.name).await;
-        if needs_retry(&self.try_load_model(m).await) {
-            let task = tokio::spawn(Arc::clone(self).retry_model_load(m.clone()));
-            self.model_retries.insert(&m.name, task);
-        }
+        self.model_loads.stop(&m.name).await;
+        let (first_attempt_done, first_attempt) = oneshot::channel();
+        self.model_loads.start(
+            &m.name,
+            Arc::clone(self).load_model_until_loaded(m.clone(), first_attempt_done),
+        );
+        // Dropped without a send when the load is stopped.
+        let _ = first_attempt.await;
     }
 
-    async fn retry_model_load(self: Arc<Self>, m: SpicepodModel) {
+    async fn load_model_until_loaded(
+        self: Arc<Self>,
+        m: SpicepodModel,
+        first_attempt_done: oneshot::Sender<()>,
+    ) {
         let shutdown = self.status.shutdown_token();
-        let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
-        let retries = async {
-            while let Some(delay) = backoff.next_duration() {
+        let attempts = async {
+            let mut retry = needs_retry(&self.try_load_model(&m).await);
+            let _ = first_attempt_done.send(());
+            let mut backoff = FibonacciBackoffBuilder::new().max_retries(None).build();
+            while retry && let Some(delay) = backoff.next_duration() {
                 tokio::time::sleep(delay).await;
-                if !needs_retry(&self.try_load_model(&m).await) {
-                    return;
-                }
+                retry = needs_retry(&self.try_load_model(&m).await);
             }
         };
         tokio::select! {
-            () = retries => {}
+            () = attempts => {}
             () = shutdown.cancelled() => {}
         }
     }
@@ -313,8 +321,8 @@ impl Runtime {
     }
 
     async fn update_model(self: &Arc<Self>, m: &SpicepodModel) {
-        // First, so a retry of the old configuration cannot register after it is removed.
-        self.model_retries.stop(&m.name).await;
+        // First, so a load of the old configuration cannot register after it is removed.
+        self.model_loads.stop(&m.name).await;
         self.status
             .update_model(&m.name, status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
@@ -341,7 +349,7 @@ impl Runtime {
         // Remove models that are no longer in the app
         for model in &current_app.models {
             if !new_app.models.iter().any(|m| m.name == model.name) {
-                self.model_retries.stop(&model.name).await;
+                self.model_loads.stop(&model.name).await;
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Disabled);
                 self.remove_model(model).await;
@@ -350,21 +358,24 @@ impl Runtime {
     }
 }
 
-/// The background retries of model loads that failed, so a Spicepod change can stop the
-/// retries of a configuration it replaces or removes.
+/// The model loads in progress, from the first attempt through its retries, so a Spicepod
+/// change can stop the load of a configuration it replaces or removes.
 #[derive(Default)]
-pub(crate) struct ModelRetries {
+pub(crate) struct ModelLoads {
     tasks: parking_lot::Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
-impl ModelRetries {
-    fn insert(&self, name: &str, task: JoinHandle<()>) {
-        if let Some(previous) = self.tasks.lock().insert(name.to_string(), task) {
+impl ModelLoads {
+    /// Runs `load` as the load of model `name`. The task is tracked before it starts, so
+    /// [`Self::stop`] cannot miss it.
+    fn start(&self, name: &str, load: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock();
+        if let Some(previous) = tasks.insert(name.to_string(), tokio::spawn(load)) {
             previous.abort();
         }
     }
 
-    /// Stops the retries of model `name`. When this returns, no attempt to load it is
+    /// Stops the load of model `name`. When this returns, no attempt to load it is
     /// running and none will start.
     async fn stop(&self, name: &str) {
         let task = self.tasks.lock().remove(name);
@@ -429,19 +440,36 @@ mod tests {
         routing::post,
     };
     use serde_json::{Value, json};
+    use tokio::sync::Semaphore;
 
     use super::*;
 
     /// An `OpenAI` provider that refuses every request, as an account without credits
-    /// does, until `accepting` is set.
-    #[derive(Default)]
+    /// does, until `accepting` is set. A request is answered only once it takes a permit
+    /// from `answering`, so a test can hold one open.
     struct Provider {
         accepting: AtomicBool,
         requests: AtomicUsize,
+        answering: Semaphore,
+    }
+
+    impl Default for Provider {
+        fn default() -> Self {
+            Self {
+                accepting: AtomicBool::new(false),
+                requests: AtomicUsize::new(0),
+                answering: Semaphore::new(Semaphore::MAX_PERMITS),
+            }
+        }
     }
 
     async fn chat(State(provider): State<Arc<Provider>>) -> Response {
         provider.requests.fetch_add(1, Ordering::SeqCst);
+        let _answer = provider
+            .answering
+            .acquire()
+            .await
+            .expect("the provider's semaphore is never closed");
         if !provider.accepting.load(Ordering::SeqCst) {
             let refusal = json!({"error": {"message": "You exceeded your current quota.", "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}});
             return (StatusCode::FORBIDDEN, Json(refusal)).into_response();
@@ -512,6 +540,55 @@ mod tests {
         }
         assert!(rt.status.is_ready());
         assert!(rt.completion_llms().read().await.contains_key("flaky"));
+    }
+
+    /// A model removed from the Spicepod while its first attempt waits on the provider is
+    /// not retried, and does not register when the provider recovers.
+    #[tokio::test]
+    async fn a_model_removed_during_its_first_attempt_is_not_retried() {
+        let provider = Arc::new(Provider {
+            answering: Semaphore::new(0),
+            ..Provider::default()
+        });
+        let model = model_served_by(&provider).await;
+        let with_model = Arc::new(
+            AppBuilder::new("model_retry")
+                .with_model(model.clone())
+                .build(),
+        );
+        let without_model = Arc::new(AppBuilder::new("model_retry").build());
+        let rt = runtime_with(model).await;
+
+        let initial_load = tokio::spawn(Arc::clone(&rt).load_models());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while provider.requests.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the first attempt never reached the provider"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        rt.apply_model_diff(&with_model, &without_model).await;
+        tokio::time::timeout(Duration::from_secs(10), initial_load)
+            .await
+            .expect("removing the model must end its first attempt")
+            .expect("the initial load does not panic");
+
+        provider.accepting.store(true, Ordering::SeqCst);
+        provider.answering.add_permits(Semaphore::MAX_PERMITS);
+        // A retry would run within 1.3 s: the first backoff is 1 s with 30% jitter.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            1,
+            "the removed model was retried"
+        );
+        assert!(!rt.completion_llms().read().await.contains_key("flaky"));
+        let status = rt.status.get_model_status("flaky");
+        assert!(
+            matches!(status, Some(status::ComponentStatus::Disabled)),
+            "{status:?}"
+        );
     }
 
     /// The error each load attempt returns decides whether it is retried: a provider's
