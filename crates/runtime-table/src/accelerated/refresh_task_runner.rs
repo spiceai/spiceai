@@ -380,6 +380,8 @@ impl RefreshTaskRunner {
             // arriving mid-refresh replaces both together: the running future is
             // dropped by the `select!` below, so it never reports at all.
             let mut running_request: RefreshRequestId = 0;
+            // The owed reload the in-flight refresh runs as, if any.
+            let mut running_reload: Option<u64> = None;
 
             loop {
                 if let Some(task) = task_completion.take() {
@@ -388,6 +390,9 @@ impl RefreshTaskRunner {
                             match res {
                                 Ok(Ok(outcome)) => {
                                     tracing::debug!("Dataset {dataset_name} refreshed successfully ({outcome:?})");
+                                    if let Some(generation) = running_reload.take() {
+                                        base_refresh.write().await.reload_succeeded(generation);
+                                    }
                                     if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
@@ -422,6 +427,7 @@ impl RefreshTaskRunner {
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            running_reload = request.reload.then_some(request.reload_generation);
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                     }
@@ -430,6 +436,7 @@ impl RefreshTaskRunner {
                         Some((request_id, overrides_opt)) = on_start_refresh.recv() => {
                             running_request = request_id;
                             let request = Self::create_refresh_from_overrides(Arc::clone(&base_refresh), overrides_opt).await;
+                            running_reload = request.reload.then_some(request.reload_generation);
                             task_completion = Some(Self::wrap_refresh_future(Arc::clone(&refresh_task), request));
                         }
                         else => {
@@ -468,7 +475,7 @@ impl RefreshTaskRunner {
         if let Some(overrides) = overrides_opt {
             r = r.with_overrides(&overrides);
         }
-        r
+        r.for_run()
     }
 
     fn wrap_refresh_future(refresh_task: Arc<RefreshTask>, request: Refresh) -> RefreshRunFuture {
@@ -501,5 +508,94 @@ impl RefreshTaskRunner {
 impl Drop for RefreshTaskRunner {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
+    use runtime_component::dataset::TimeFormat;
+    use runtime_component::dataset::acceleration::RefreshMode;
+
+    /// A refresh the timer or a client asks for while a reload is owed runs as that reload,
+    /// and its success settles it.
+    #[tokio::test]
+    async fn a_refresh_requested_while_a_reload_is_owed_reloads_and_settles_it() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        // Ids 1 to 6 are older (ts 1 to 6) than those the acceleration holds (7 to 12, ts 107 to 112).
+        let rows = |ids: std::ops::RangeInclusive<i64>| {
+            let ts = ids
+                .clone()
+                .map(|id| if id <= 6 { id } else { id + 100 })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .expect("batch builds")
+        };
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(7..=12)]])
+                .expect("accelerator builds"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(1..=12)]])
+                .expect("source builds"),
+        ) as Arc<dyn TableProvider>;
+        let mut refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        refresh.owe_reload();
+        let refresh = Arc::new(RwLock::new(refresh));
+        let mut runner = RefreshTaskRunner::builder(
+            status::RuntimeStatus::new(),
+            TableReference::bare("owed_reload"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::clone(&refresh),
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let (start, mut completed) = runner.start().expect("the runner starts");
+
+        start.send((1, None)).await.expect("the request is sent");
+        let (id, outcome) = completed.recv().await.expect("the refresh completes");
+        assert_eq!(id, 1);
+        outcome.expect("the refresh succeeds");
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("the acceleration scans");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("the acceleration reads")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=12).collect::<Vec<_>>());
+        assert!(!refresh.read().await.reload, "the reload is settled");
     }
 }
