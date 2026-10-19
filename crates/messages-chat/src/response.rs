@@ -52,16 +52,16 @@ fn random_suffix() -> String {
         .collect()
 }
 
-/// The stop reason a chat completion's finish reason means. A completion that sent none
-/// stopped on its own, or to call the tools it called.
+/// The stop reason a chat completion's finish reason means. A completion that called tools
+/// stopped to have them run, whether it finished with `tool_calls`, with `stop` (as some
+/// OpenAI-compatible servers report it) or with none.
 pub(crate) fn stop_reason(finish: Option<FinishReason>, called_tools: bool) -> StopReason {
     match finish {
         Some(FinishReason::Length) => StopReason::MaxTokens,
-        Some(FinishReason::ToolCalls | FinishReason::FunctionCall) => StopReason::ToolUse,
         Some(FinishReason::ContentFilter) => StopReason::Refusal,
-        Some(FinishReason::Stop) => StopReason::EndTurn,
-        None if called_tools => StopReason::ToolUse,
-        None => StopReason::EndTurn,
+        Some(FinishReason::ToolCalls | FinishReason::FunctionCall) => StopReason::ToolUse,
+        Some(FinishReason::Stop) | None if called_tools => StopReason::ToolUse,
+        Some(FinishReason::Stop) | None => StopReason::EndTurn,
     }
 }
 
@@ -160,14 +160,21 @@ pub fn message(
         None => false,
     };
     let mut called_tools = false;
+    let cut_off = choice.finish_reason == Some(FinishReason::Length);
     for call in response_message.tool_calls.into_iter().flatten() {
         let ChatCompletionMessageToolCalls::Function(call) = call else {
             return Err(MessagesError::api(format!(
                 "Model '{model}' called a custom tool, which the Messages API has no block for."
             )));
         };
+        let input = match tool_input(&model, &call.function.name, &call.function.arguments) {
+            Ok(input) => input,
+            // The completion ran out of tokens in the middle of the call's arguments: the
+            // Message ends with `max_tokens` without the call, which was never made whole.
+            Err(_) if cut_off => continue,
+            Err(error) => return Err(error),
+        };
         called_tools = true;
-        let input = tool_input(&model, &call.function.name, &call.function.arguments)?;
         content.push(ContentBlock::ToolUse {
             id: if call.id.is_empty() {
                 tool_use_id()

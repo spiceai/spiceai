@@ -473,6 +473,12 @@ fn tool_message(
             texts.join("\n")
         }
     };
+    // A tool message has no field that marks a failed call, so its text does.
+    let text = if result.is_error == Some(true) {
+        format!("Error: {text}")
+    } else {
+        text
+    };
     Ok(ChatCompletionRequestMessage::Tool(
         ChatCompletionRequestToolMessage {
             content: ChatCompletionRequestToolMessageContent::Text(text),

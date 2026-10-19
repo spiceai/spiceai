@@ -39,40 +39,63 @@ use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::Runtime;
+use crate::model::LoadedChatModel;
 use crate::model::chat::{anthropic_client, typed_params};
 use crate::model::metrics::{handle_metrics, handle_token_metrics, request_labels_messages};
 use crate::model::params::anthropic::AnthropicModelParams;
 use crate::model::tool_use_messages::ToolUsingMessages;
-use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
-use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
-use runtime_tools::options::SpiceToolsOptions;
+use messages_chat::ChatMessages;
+use model_capabilities::MessagesBackend;
 
+/// The Messages API handlers that are built when a model loads, by model name: a native
+/// model's, and a chat model's that runs Spice's tools. Any other chat model serves the API
+/// through a handler made for each request from its chat model.
 pub type LLMMessagesModelStore = HashMap<String, Arc<dyn Messages>>;
 
-const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
-
-macro_rules! extract_secret {
-    ($params:expr, $key:expr) => {
-        $params.get($key).map(secrecy::ExposeSecret::expose_secret)
-    };
-}
-
-/// The native Messages API handler of `component`, a model whose provider has one.
+/// The Messages API handler of `component`, a model loaded as `chat`, when it needs one built at
+/// load: a native handler for a model whose provider has the API (`backend` is `Native`), with
+/// Spice's tools when the model's `tools` param enables them; and, for a model served through
+/// chat, a handler that runs Spice's tools at the Messages API's level, so that their calls
+/// reach the client as they do from a native model. `None` for a chat model without tools.
 ///
 /// # Errors
 ///
-/// Returns an error when the model's parameters are invalid, or its provider has no native
-/// Messages API.
+/// Returns an error when the model's parameters are invalid, or `backend` is `Native` for a
+/// provider without a native Messages API.
 #[expect(clippy::implicit_hasher)]
 pub async fn try_to_messages_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
     rt: Arc<Runtime>,
+    chat: &LoadedChatModel,
+    backend: MessagesBackend,
+) -> Result<Option<Arc<dyn Messages>>, LlmError> {
+    let (tools, recursion_limit) = chat.tools();
+    let messages: Arc<dyn Messages> = match backend {
+        MessagesBackend::Native => native(component, params, &rt).await?,
+        MessagesBackend::ViaChat if tools.is_empty() => return Ok(None),
+        MessagesBackend::ViaChat => Arc::new(ChatMessages::new(chat.without_tools())),
+    };
+    if tools.is_empty() {
+        return Ok(Some(messages));
+    }
+    Ok(Some(Arc::new(ToolUsingMessages::new(
+        messages,
+        tools.to_vec(),
+        recursion_limit,
+    ))))
+}
+
+/// The native Messages API of `component`, with what Spice adds to each request.
+async fn native(
+    component: &Model,
+    params: &HashMap<String, SecretString>,
+    rt: &Arc<Runtime>,
 ) -> Result<Arc<dyn Messages>, LlmError> {
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
         from: component.from.clone(),
     })?;
-    let native: Arc<dyn Messages> = match source {
+    let (native, provider_model): (Arc<dyn Messages>, String) = match source {
         ModelSource::Anthropic => {
             let p = typed_params::<AnthropicModelParams>(
                 component,
@@ -81,7 +104,9 @@ pub async fn try_to_messages_model(
                 &rt.secrets(),
             )
             .await?;
-            Arc::new(anthropic_client(component.get_model_id().as_deref(), &p)?.messages())
+            let native = anthropic_client(component.get_model_id().as_deref(), &p)?.messages();
+            let provider_model = native.model().to_string();
+            (Arc::new(native), provider_model)
         }
         other => {
             return Err(LlmError::FailedToLoadModel {
@@ -104,7 +129,7 @@ pub async fn try_to_messages_model(
         }
         None => None,
     };
-    let wrapped: Arc<dyn Messages> = Arc::new(MessagesWrapper {
+    Ok(Arc::new(MessagesWrapper {
         public_name: component.name.clone(),
         messages: native,
         system_prompt,
@@ -112,50 +137,13 @@ pub async fn try_to_messages_model(
             component,
             source.short_name(),
         ),
-    });
-
-    let spice_tool_opt: Option<SpiceToolsOptions> = extract_secret!(params, "tools")
-        .or(extract_secret!(params, "spice_tools"))
-        .map(str::parse)
-        .transpose()
-        .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
-    let recursion_limit = extract_secret!(params, "tool_recursion_limit")
-        .map(|x| {
-            x.parse().map_err(|e| LlmError::FailedToLoadModel {
-                source: format!(
-                    "Invalid value specified for `params.tool_recursion_limit`: {x}. Error: {e}"
-                )
-                .into(),
-            })
-        })
-        .transpose()?
-        .unwrap_or(DEFAULT_SPICE_TOOL_RECURSION_LIMIT);
-
-    match spice_tool_opt {
-        Some(opts) if opts.can_use_tools() => {
-            let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
-                LlmError::ModelParameterFailed {
-                    model: component.name.clone(),
-                    source: e,
-                }
-            })?;
-            let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
-            let tools = prepare_model_tools(
-                Arc::clone(&rt),
-                &opts,
-                tools,
-                extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM),
-            )
-            .await
-            .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
-            Ok(Arc::new(ToolUsingMessages::new(
-                wrapped,
-                tools,
-                recursion_limit,
-            )))
-        }
-        Some(_) | None => Ok(wrapped),
-    }
+        provider: Provider {
+            name: "Anthropic",
+            prefix: "anthropic",
+            model: provider_model,
+            docs: "https://spiceai.org/docs/components/models/anthropic",
+        },
+    }))
 }
 
 /// Wraps a native Messages API model with what Spice adds to each request: the Spicepod's
@@ -167,15 +155,67 @@ pub struct MessagesWrapper {
     pub system_prompt: Option<String>,
     /// The model's request defaults, by their chat completion name.
     pub defaults: Vec<(String, Value)>,
+    pub provider: Provider,
 }
 
+/// The provider that serves a model's Messages API natively, as its errors name it.
+pub struct Provider {
+    /// Its name, such as `Anthropic`.
+    pub name: &'static str,
+    /// The prefix of its `from` and of its `params`, such as `anthropic`.
+    pub prefix: &'static str,
+    /// Its id for the model.
+    pub model: String,
+    pub docs: &'static str,
+}
+
+/// The sampling controls a model can refuse outright, which a Spicepod default can set.
+const SAMPLING_CONTROLS: [&str; 2] = ["temperature", "top_p"];
+
 impl MessagesWrapper {
-    fn prepare(&self, mut request: MessagesRequest) -> MessagesRequest {
+    /// `request` with the system prompt and the request defaults, and the sampling controls the
+    /// defaults set.
+    fn prepare(&self, mut request: MessagesRequest) -> (MessagesRequest, Vec<&'static str>) {
         if let Some(prompt) = &self.system_prompt {
             with_system_prompt(&mut request.body, prompt);
         }
+        let unset: Vec<&'static str> = SAMPLING_CONTROLS
+            .into_iter()
+            .filter(|control| request.body.get(*control).is_none_or(Value::is_null))
+            .collect();
         with_model_defaults(&mut request.body, &self.defaults, &self.public_name);
-        request
+        let defaulted = unset
+            .into_iter()
+            .filter(|control| request.body.get(*control).is_some_and(|value| !value.is_null()))
+            .collect();
+        (request, defaulted)
+    }
+
+    /// `error` with a message that names where a sampling control the model refused came from,
+    /// when it came from the model's `params`, not the request: the provider's own says only
+    /// ``temperature` is deprecated for this model.`, about a field the client never sent.
+    fn explain_rejected_default(&self, mut error: MessagesError, defaulted: &[&str]) -> MessagesError {
+        if error.error_type != messages_api::ErrorType::InvalidRequest {
+            return error;
+        }
+        let Some(control) = defaulted
+            .iter()
+            .find(|control| error.message == format!("`{control}` is deprecated for this model."))
+        else {
+            return error;
+        };
+        let Provider {
+            name,
+            prefix,
+            model,
+            docs,
+        } = &self.provider;
+        error.message = format!(
+            "Failed to answer a Messages API request with {name} model '{model}': the model does not accept the `{control}` parameter, which model '{public_name}' sets in its `params` (as `{control}`, `{prefix}_{control}` or `openai_{control}`) for every request that leaves it unset. Remove `{control}` from the model's `params`, or set `from: {prefix}:<model_id>` to a model that accepts it. Cause: {cause} See: {docs}",
+            public_name = self.public_name,
+            cause = error.message,
+        );
+        error
     }
 }
 
@@ -391,7 +431,7 @@ impl TokenUsage {
 impl Messages for MessagesWrapper {
     async fn create(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
         let start = Instant::now();
-        let request = self.prepare(request);
+        let (request, defaulted) = self.prepare(request);
         let labels = request_labels_messages(&self.public_name, &request.body, false);
         let input = Value::Object(request.body.clone()).to_string();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream = false, model = %self.public_name, input = %input);
@@ -418,6 +458,7 @@ impl Messages for MessagesWrapper {
                 Ok(message)
             }
             Err(e) => {
+                let e = self.explain_rejected_default(e, &defaulted);
                 tracing::error!(target: "task_history", parent: &span, "{e}");
                 Err(e)
             }
@@ -426,7 +467,7 @@ impl Messages for MessagesWrapper {
 
     async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError> {
         let start = Instant::now();
-        let request = self.prepare(request);
+        let (request, defaulted) = self.prepare(request);
         let labels = request_labels_messages(&self.public_name, &request.body, true);
         let input = Value::Object(request.body.clone()).to_string();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream = true, model = %self.public_name, input = %input);
@@ -447,6 +488,7 @@ impl Messages for MessagesWrapper {
                 ended: false,
             })),
             Err(e) => {
+                let e = self.explain_rejected_default(e, &defaulted);
                 tracing::error!(target: "task_history", parent: &span, "{e}");
                 handle_metrics(start.elapsed(), true, &labels);
                 Err(e)
@@ -454,9 +496,14 @@ impl Messages for MessagesWrapper {
         }
     }
 
-    async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
-        // Counted as the model would be sent the request, the system prompt included.
-        self.messages.count_tokens(self.prepare(request)).await
+    async fn count_tokens(&self, mut request: MessagesRequest) -> Result<Value, MessagesError> {
+        // Counted as the model would be sent the request, the system prompt included. The
+        // request defaults are left out: they set sampling and output fields, which a token count
+        // takes none of.
+        if let Some(prompt) = &self.system_prompt {
+            with_system_prompt(&mut request.body, prompt);
+        }
+        self.messages.count_tokens(request).await
     }
 }
 

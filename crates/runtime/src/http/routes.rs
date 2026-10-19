@@ -533,7 +533,7 @@ pub(crate) fn routes(
             .layer(Extension(Arc::clone(&rt.workers)))
             .layer(Extension(rt.responses_llms()))
             .layer(Extension(v1::messages::MessagesModels {
-                native: rt.messages_llms(),
+                messages: rt.messages_llms(),
                 chat: rt.completion_llms(),
                 capabilities: rt.model_capabilities(),
             }));

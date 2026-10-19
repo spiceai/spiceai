@@ -476,3 +476,96 @@ async fn a_forced_tool_choice_is_not_forced_again_after_a_round_that_called_tool
         );
     }
 }
+
+/// A Spice call the model made but did not finish — its round stopped with `max_tokens` — is
+/// not run, and is answered so that the client's history replays as a valid request.
+#[tokio::test]
+async fn a_spice_call_the_round_did_not_end_on_is_answered_without_running() {
+    let cut = vec![round(
+        "msg_1",
+        &json!([{"type": "text", "text": "Querying."}, sql_call("toolu_1")]),
+        "max_tokens",
+        10,
+        5,
+    )];
+    let not_run = ToolOutcome::Failed(
+        "Spice did not run this call, because the model stopped with `max_tokens` before it could."
+            .to_string(),
+    );
+    let sql = Arc::new(Sql(AtomicUsize::new(0)));
+    let message = using(&Scripted::new(cut.clone()), &sql, 10)
+        .create(request())
+        .await
+        .expect("a message");
+    assert_eq!(
+        (&message["content"], &message["stop_reason"]),
+        (
+            &json!([
+                {"type": "text", "text": "Querying."},
+                mcp_tool_use(&sql_call("toolu_1")),
+                mcp_tool_result("toolu_1", &not_run),
+            ]),
+            &json!("max_tokens")
+        )
+    );
+    assert_eq!(sql.0.load(Ordering::SeqCst), 0);
+
+    let events = streamed(&using(&Scripted::new(cut), &sql, 10), request()).await;
+    assert_eq!(accumulate(&events), message);
+
+    let mut next_turn = request().body;
+    next_turn["messages"] = json!([
+        {"role": "user", "content": "How many trips?"},
+        {"role": "assistant", "content": message["content"]},
+        {"role": "user", "content": "Go on."},
+    ]);
+    replay_spice_tool_calls(&mut next_turn);
+    assert_eq!(
+        next_turn["messages"][2],
+        json!({"role": "user", "content": [tool_result("toolu_1", &not_run), {"type": "text", "text": "Go on."}]})
+    );
+}
+
+/// The client receives a Spice call whole, input included, in its `content_block_start`: an SDK
+/// that does not accumulate `input_json_delta` for `mcp_tool_use` still has the call's input.
+#[tokio::test]
+async fn a_streamed_spice_call_arrives_whole() {
+    let events = streamed(
+        &using(&Scripted::new(two_rounds()), &Arc::new(Sql(AtomicUsize::new(0))), 10),
+        request(),
+    )
+    .await;
+    let spice_index = events
+        .iter()
+        .find(|event| event["content_block"]["type"] == "mcp_tool_use")
+        .map(|event| event["index"].clone())
+        .expect("an mcp_tool_use block");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["index"] == spice_index)
+            .map(|event| event["type"].clone())
+            .collect::<Vec<_>>(),
+        [json!("content_block_start"), json!("content_block_stop")]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["content_block"]["type"] == "mcp_tool_use")
+            .map(|event| event["content_block"].clone()),
+        Some(mcp_tool_use(&sql_call("toolu_1")))
+    );
+}
+
+#[test]
+fn a_usage_field_a_round_reports_as_null_keeps_the_total() {
+    let mut total = json!({"input_tokens": 10, "cache_read_input_tokens": 5, "service_tier": "standard"});
+    add_usage(
+        &mut total,
+        &json!({"input_tokens": 3, "cache_read_input_tokens": null, "service_tier": "priority"}),
+    );
+    assert_eq!(
+        total,
+        json!({"input_tokens": 13, "cache_read_input_tokens": 5, "service_tier": "priority"})
+    );
+}

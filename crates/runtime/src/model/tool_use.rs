@@ -920,14 +920,13 @@ fn make_a_stream(
                             ChoiceDisposition::RunTools => {}
                         }
 
-                        // A tool call has finished (i.e. we have all chunks), process it.
-                        let tool_calls_to_process = match tool_call_states.lock() {
-                            Ok(states_lock) => states_lock.values().cloned().collect(),
-                            Err(e) => {
-                                tracing::error!("Failed to lock tool_call_states: {}", e);
-                                return;
-                            }
-                        };
+                        // The choice's tool calls have finished (all their chunks are in), so they
+                        // are taken, once, to be run or given to the client.
+                        let finished_calls = take_tool_calls(&tool_call_states, chat_choice.index);
+                        let tool_calls_to_process = finished_calls
+                            .iter()
+                            .map(|(_, call)| call.clone())
+                            .collect();
 
                         let round = match model
                             .process_tool_calls_and_run_spice_tools(tool_calls_to_process)
@@ -938,8 +937,7 @@ fn make_a_stream(
                                 // No Spice tool among the calls: they are the client's, so it
                                 // receives them, whole, with the finish.
                                 let mut finished = chat_choice;
-                                finished.delta.tool_calls =
-                                    withheld_tool_calls(&tool_call_states, finished.index);
+                                finished.delta.tool_calls = tool_call_chunks(finished_calls);
                                 finished_choices.push(finished);
                                 continue;
                             }
@@ -1056,42 +1054,62 @@ fn make_a_stream(
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
 }
 
-/// The tool calls of the choice at `choice_index`, accumulated from its chunks, as one chunk
-/// each in call order; `None` when it made none.
-fn withheld_tool_calls(
+/// Takes the tool calls of the choice at `choice_index`, accumulated from its chunks, in call
+/// order. Each call is taken once, so a later finish of the same choice cannot give it again.
+fn take_tool_calls(
     states: &Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
     choice_index: u32,
-) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
-    let states = match states.lock() {
+) -> Vec<(u32, ChatCompletionMessageToolCall)> {
+    let mut states = match states.lock() {
         Ok(states) => states,
         Err(e) => {
             tracing::error!("Failed to lock tool_call_states: {}", e);
-            return None;
+            return Vec::new();
         }
     };
-    let mut calls: Vec<(u32, &ChatCompletionMessageToolCall)> = states
-        .iter()
-        .filter(|((choice, _), _)| u32::try_from(*choice).ok() == Some(choice_index))
-        .filter_map(|((_, index), call)| Some((u32::try_from(*index).ok()?, call)))
+    let keys: Vec<(i32, i32)> = states
+        .keys()
+        .filter(|(choice, _)| u32::try_from(*choice).ok() == Some(choice_index))
+        .copied()
         .collect();
+    let mut calls: Vec<(u32, ChatCompletionMessageToolCall)> = keys
+        .into_iter()
+        .filter_map(|key| Some((u32::try_from(key.1).ok()?, states.remove(&key)?)))
+        .collect();
+    calls.sort_by_key(|(index, _)| *index);
+    calls
+}
+
+/// `calls` as one chunk each; `None` when there are none.
+fn tool_call_chunks(
+    calls: Vec<(u32, ChatCompletionMessageToolCall)>,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
     if calls.is_empty() {
         return None;
     }
-    calls.sort_by_key(|(index, _)| *index);
     Some(
         calls
             .into_iter()
             .map(|(index, call)| ChatCompletionMessageToolCallChunk {
                 index,
-                id: Some(call.id.clone()),
+                id: Some(call.id),
                 r#type: Some(FunctionType::Function),
                 function: Some(FunctionCallStream {
-                    name: Some(call.function.name.clone()),
-                    arguments: Some(call.function.arguments.clone()),
+                    name: Some(call.function.name),
+                    arguments: Some(call.function.arguments),
                 }),
             })
             .collect(),
     )
+}
+
+/// The tool calls of the choice at `choice_index`, accumulated from its chunks, as one chunk
+/// each in call order; `None` when it made none, or they were already given.
+fn withheld_tool_calls(
+    states: &Mutex<HashMap<(i32, i32), ChatCompletionMessageToolCall>>,
+    choice_index: u32,
+) -> Option<Vec<ChatCompletionMessageToolCallChunk>> {
+    tool_call_chunks(take_tool_calls(states, choice_index))
 }
 
 // OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.
@@ -1154,6 +1172,39 @@ mod tests {
 
     fn stream_choice(json: &str) -> ChatChoiceStream {
         serde_json::from_str(json).expect("valid stream choice")
+    }
+
+    #[test]
+    fn a_choices_withheld_tool_calls_are_given_once_in_call_order() {
+        let call = |id: &str| ChatCompletionMessageToolCall {
+            id: id.to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let states = Mutex::new(HashMap::from([
+            ((0, 1), call("b")),
+            ((0, 0), call("a")),
+            ((1, 0), call("other choice")),
+        ]));
+        let ids = |chunks: Option<Vec<ChatCompletionMessageToolCallChunk>>| {
+            chunks.map(|chunks| {
+                chunks
+                    .into_iter()
+                    .map(|chunk| (chunk.index, chunk.id.unwrap_or_default()))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            ids(withheld_tool_calls(&states, 0)),
+            Some(vec![(0, "a".to_string()), (1, "b".to_string())])
+        );
+        assert_eq!(ids(withheld_tool_calls(&states, 0)), None, "given once");
+        assert_eq!(
+            ids(withheld_tool_calls(&states, 1)),
+            Some(vec![(0, "other choice".to_string())])
+        );
     }
 
     #[test]

@@ -55,20 +55,25 @@ use crate::status::RuntimeStatus;
 /// The model stores a Messages API request is answered from.
 #[derive(Clone)]
 pub(crate) struct MessagesModels {
-    pub(crate) native: Arc<RwLock<LLMMessagesModelStore>>,
+    /// The handlers built when a model loaded: a native model's, and a chat model's that runs
+    /// Spice's tools.
+    pub(crate) messages: Arc<RwLock<LLMMessagesModelStore>>,
     pub(crate) chat: Arc<RwLock<LLMChatCompletionsModelStore>>,
     pub(crate) capabilities: Arc<RwLock<CapabilityStore>>,
 }
 
 impl MessagesModels {
-    /// The handler that answers Messages API requests for `model`: its native one, or one that
-    /// translates them through its chat completions.
+    /// The handler that answers Messages API requests for `model`: the one built when it loaded,
+    /// or one that translates them through its chat completions.
     async fn handler(&self, model: &str) -> Result<Arc<dyn Messages>, Refusal> {
+        if let Some(handler) = self.messages.read().await.get(model) {
+            return Ok(Arc::clone(handler));
+        }
         let capabilities = self.capabilities.read().await;
         match capabilities.get(model).and_then(ModelCapabilities::messages) {
             Some(MessagesBackend::Native) => require(
                 &capabilities,
-                &*self.native.read().await,
+                &*self.messages.read().await,
                 model,
                 Capability::Messages,
             ),

@@ -552,3 +552,69 @@ async fn only_a_model_served_by_anthropic_counts_tokens() {
         )
     );
 }
+
+#[tokio::test]
+async fn tool_calls_that_finish_with_stop_are_a_tool_use_stop() {
+    let answer = completion(
+        &json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+        ]}),
+        "stop",
+    );
+    assert_eq!(
+        message(answer, false).expect("a message").stop_reason,
+        Some(messages_api::types::StopReason::ToolUse)
+    );
+    let streamed = events(vec![
+        Ok(chunk(&tool_call(0, Some("call_1"), Some("read_file"), "{}"))),
+        Ok(chunk(&json!({"index": 0, "delta": {}, "finish_reason": "stop"}))),
+    ])
+    .await;
+    assert_eq!(
+        streamed
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .map(|event| event["delta"]["stop_reason"].clone()),
+        Some(json!("tool_use"))
+    );
+}
+
+#[test]
+fn a_failed_tool_result_says_so() {
+    let chat = translated(&json!({
+        "model": "gpt",
+        "max_tokens": 10,
+        "messages": [
+            {"role": "user", "content": "Read a.rs"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "ENOENT: no such file"},
+                {"type": "tool_result", "tool_use_id": "toolu_2", "is_error": false, "content": "fine"},
+            ]},
+        ],
+    }))
+    .expect("a translatable request");
+    assert_eq!(
+        chat["messages"].as_array().expect("messages")[2..],
+        [
+            json!({"role": "tool", "content": "Error: ENOENT: no such file", "tool_call_id": "toolu_1"}),
+            json!({"role": "tool", "content": "fine", "tool_call_id": "toolu_2"}),
+        ]
+    );
+}
+
+#[test]
+fn a_tool_call_cut_off_by_max_tokens_is_left_out() {
+    let answer = completion(
+        &json!({"role": "assistant", "content": "Writing it.", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\": \"a.rs\", \"content\": \"fn ma"}},
+        ]}),
+        "length",
+    );
+    let cut = message(answer, false).expect("a message");
+    assert_eq!(
+        serde_json::to_value(&cut).expect("serializable")["content"],
+        json!([{"type": "text", "text": "Writing it."}])
+    );
+    assert_eq!(cut.stop_reason, Some(messages_api::types::StopReason::MaxTokens));
+}

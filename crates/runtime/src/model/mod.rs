@@ -84,8 +84,8 @@ impl LlmRuntimeStores {
         Arc::clone(&self.responses_llms)
     }
 
-    /// The models that serve the Messages API natively, by name. Every other chat model serves
-    /// it through its chat completions.
+    /// The Messages API handlers built when a model loads, by model name (see
+    /// [`LLMMessagesModelStore`]).
     #[must_use]
     pub fn messages_llms(&self) -> Arc<RwLock<LLMMessagesModelStore>> {
         Arc::clone(&self.messages_llms)

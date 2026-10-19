@@ -32,6 +32,11 @@ use crate::model::responses_tool_history::ToolOutcome;
 /// The `server_name` of Spice's `mcp_tool_use` and `mcp_tool_result` blocks.
 pub(crate) const SERVER_NAME: &str = "spice";
 
+/// The result the model is given for a replayed call that came back without its result: every
+/// `tool_use` must be answered in the user message after it.
+const RESULT_NOT_SENT_BACK: &str =
+    "Spice ran this call, but its result was not sent back with the conversation.";
+
 /// A `tool_use` block of the model's, a call to one of Spice's tools, as the `mcp_tool_use`
 /// block the client receives.
 pub(crate) fn mcp_tool_use(tool_use: &Value) -> Value {
@@ -180,6 +185,18 @@ pub(crate) fn replay_spice_tool_calls(body: &mut Map<String, Value>) {
                 .filter_map(|block| block.get("id").and_then(Value::as_str))
                 .map(ToString::to_string)
                 .collect();
+            let call_order: Vec<String> = content
+                .iter()
+                .filter(|block| is_spice_tool_use(block))
+                .filter_map(|block| block.get("id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect();
+            let answered: HashSet<String> = content
+                .iter()
+                .filter(|block| is_spice_tool_result(block, &calls))
+                .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect();
             let mut assistant = Vec::new();
             let mut results = Vec::new();
             for block in content {
@@ -199,6 +216,13 @@ pub(crate) fn replay_spice_tool_calls(body: &mut Map<String, Value>) {
             }
             if !assistant.is_empty() {
                 replayed.push(message("assistant", assistant));
+            }
+            for id in call_order.iter().filter(|id| !answered.contains(*id)) {
+                results.push(tool_result_block(
+                    Value::from(id.as_str()),
+                    json!([{"type": "text", "text": RESULT_NOT_SENT_BACK}]),
+                    false,
+                ));
             }
             pending_results = results;
             continue;
@@ -326,6 +350,29 @@ mod tests {
         assert_eq!(
             replay(&continued)["messages"][1],
             json!({"role": "user", "content": [tool_result("toolu_s", &completed), {"type": "text", "text": "Go on."}]})
+        );
+    }
+
+    #[test]
+    fn a_call_whose_result_was_not_sent_back_is_still_answered() {
+        let received = json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [
+                mcp_tool_use(&sql_use("toolu_1")),
+                {"type": "text", "text": "One."},
+            ]},
+            {"role": "user", "content": "Thanks."},
+        ]});
+        assert_eq!(
+            replay(&received),
+            json!({"messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [sql_use("toolu_1"), {"type": "text", "text": "One."}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "Spice ran this call, but its result was not sent back with the conversation."}]},
+                    {"type": "text", "text": "Thanks."},
+                ]},
+            ]})
         );
     }
 

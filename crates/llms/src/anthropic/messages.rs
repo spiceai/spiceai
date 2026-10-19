@@ -127,7 +127,11 @@ impl AnthropicMessages {
     /// `error` with the message for a model Anthropic does not serve, which names the model and
     /// the parameter to change; Anthropic's own says only `model: <id>`.
     fn explain(&self, mut error: MessagesError) -> MessagesError {
-        if error.error_type == messages_api::ErrorType::NotFound {
+        // Anthropic answers a model it does not serve with `model: <id>`; a `not_found_error`
+        // about anything else, such as a file the request names, is left as it is.
+        if error.error_type == messages_api::ErrorType::NotFound
+            && error.message.starts_with("model:")
+        {
             error.message = model_not_found_message(
                 ACTION,
                 &self.model,

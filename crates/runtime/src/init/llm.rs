@@ -23,7 +23,7 @@ use crate::{
 };
 use llms::{chat::try_map_boxed_error_to_box, responses::Responses};
 use messages_api::Messages;
-use model_capabilities::{Capability, MessagesBackend, ModelCapabilities};
+use model_capabilities::{Capability, ModelCapabilities};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource};
@@ -61,18 +61,25 @@ impl Runtime {
             .map_err(try_map_boxed_error_to_box)
             .context(UnableToInitializeLlmSnafu)?;
 
-        // The chat model's health check already sent the provider a Messages API request, so
-        // the native endpoint is registered without a second one.
-        let messages = if capabilities.messages() == Some(MessagesBackend::Native) {
-            match try_to_messages_model(&m, &params, Arc::new(self.clone())).await {
-                Ok(model) => Some(model),
+        // A native endpoint is registered without a health check of its own: the chat model's
+        // already sent the provider a Messages API request.
+        let messages = match capabilities.messages() {
+            Some(backend) => match try_to_messages_model(
+                &m,
+                &params,
+                Arc::new(self.clone()),
+                &completions_model,
+                backend,
+            )
+            .await
+            {
+                Ok(model) => model,
                 Err(e) => {
                     tracing::warn!("{}", messages_unavailable_warning(&m.name, &e));
                     None
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
 
         if !capabilities.has(Capability::Responses) {

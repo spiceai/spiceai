@@ -214,6 +214,8 @@ fn add_usage(total: &mut Value, round: &Value) {
                 *total = Value::Number(round.clone());
             }
         }
+        // A count the round does not report leaves the total as it is.
+        (_, Value::Null) => {}
         (total, round) => *total = round.clone(),
     }
 }
@@ -228,6 +230,40 @@ fn overlay_usage(usage: &mut Value, update: &Value) {
     } else {
         *usage = update.clone();
     }
+}
+
+/// The outcome of a call to a Spice tool that the model made, but stopped with `stop_reason`
+/// rather than `tool_use` before Spice could run it.
+fn not_run_outcome(stop_reason: Option<&str>) -> ToolOutcome {
+    ToolOutcome::Failed(match stop_reason {
+        Some(stop_reason) => format!(
+            "Spice did not run this call, because the model stopped with `{stop_reason}` before it could."
+        ),
+        None => "Spice did not run this call, because the model stopped before it could.".to_string(),
+    })
+}
+
+/// `content`, a final round's, as the client receives it when the round called Spice's tools but
+/// stopped with `stop_reason` rather than `tool_use`: each call that is whole is answered, without
+/// being run, so that the client's history replays as a valid request; a call whose input is not
+/// a JSON object was cut off, and is left out.
+fn not_run(content: &[Value], spice: &HashSet<String>, stop_reason: Option<&str>) -> Vec<Value> {
+    let is_spice = |block: &Value| is_tool_use(block) && tool_name(block).is_some_and(|name| spice.contains(name));
+    let whole = |block: &Value| block.get("input").is_some_and(Value::is_object);
+    let outcome = not_run_outcome(stop_reason);
+    let mut client: Vec<Value> = content
+        .iter()
+        .filter(|block| !is_spice(block) || whole(block))
+        .map(|block| if is_spice(block) { mcp_tool_use(block) } else { block.clone() })
+        .collect();
+    client.extend(
+        content
+            .iter()
+            .filter(|block| is_spice(block) && whole(block))
+            .filter_map(|block| block.get("id").and_then(Value::as_str))
+            .map(|id| mcp_tool_result(id, &outcome)),
+    );
+    client
 }
 
 /// What one round's calls to Spice's tools produced, by call ID, in call order.
@@ -325,8 +361,10 @@ impl Messages for ToolUsingMessages {
                 .collect();
             let stop_reason = response.get("stop_reason").and_then(Value::as_str);
 
-            let (client_content, stop_reason) = if calls.is_empty() || stop_reason != Some("tool_use") {
+            let (client_content, stop_reason) = if calls.is_empty() {
                 (content, None)
+            } else if stop_reason != Some("tool_use") {
+                (not_run(&content, &spice, stop_reason), None)
             } else {
                 let outcomes = run_calls(&self.tools, &calls).await;
                 crate::model::add_tools_used(&context, outcomes.len());
@@ -454,7 +492,8 @@ impl Messages for ToolUsingMessages {
 struct RoundBlock {
     block: Value,
     partial_json: String,
-    /// Whether the block is a call to one of Spice's tools.
+    /// Whether the block is a call to one of Spice's tools, which the client receives whole, as
+    /// an `mcp_tool_use` block, once its input is.
     spice: bool,
 }
 
@@ -508,6 +547,21 @@ impl StreamLoop {
         (round_index, event)
     }
 
+    /// Whether the round's block at `round_index` is a call to one of Spice's tools.
+    fn is_spice_block(&self, round_index: Option<usize>) -> bool {
+        round_index
+            .and_then(|index| self.blocks.get(&index))
+            .is_some_and(|block| block.spice)
+    }
+
+    /// The round index of `event`'s block.
+    fn round_index(event: &Value) -> Option<usize> {
+        event
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+    }
+
     /// Passes a round's event to the client, and records what the next round needs of it.
     fn forward(&mut self, event: Value) {
         match event_type(&event) {
@@ -521,13 +575,10 @@ impl StreamLoop {
                 }
             }
             Some("content_block_start") => {
-                let (round_index, mut event) = self.reindexed(event);
+                let round_index = Self::round_index(&event);
                 let block = event.get("content_block").cloned().unwrap_or_default();
                 let spice = is_tool_use(&block)
                     && tool_name(&block).is_some_and(|name| self.spice.contains(name));
-                if spice && let Some(event) = event.as_object_mut() {
-                    event.insert("content_block".to_string(), mcp_tool_use(&block));
-                }
                 if let Some(round_index) = round_index {
                     self.blocks.insert(
                         round_index,
@@ -538,29 +589,57 @@ impl StreamLoop {
                         },
                     );
                 }
-                self.emit(event);
+                // A call to a Spice tool is withheld until its input is whole.
+                if !spice {
+                    let (_, event) = self.reindexed(event);
+                    self.emit(event);
+                }
             }
             Some("content_block_delta") => {
-                let (round_index, event) = self.reindexed(event);
+                let round_index = Self::round_index(&event);
                 if let Some(block) = round_index.and_then(|index| self.blocks.get_mut(&index))
                     && let Err(delta_type) = apply_delta(block, event.get("delta"))
                 {
                     self.unreplayable.get_or_insert(delta_type);
                 }
-                self.emit(event);
+                if !self.is_spice_block(round_index) {
+                    let (_, event) = self.reindexed(event);
+                    self.emit(event);
+                }
             }
             Some("content_block_stop") => {
-                let (round_index, event) = self.reindexed(event);
+                let round_index = Self::round_index(&event);
+                let mut cut_off = false;
                 if let Some(block) = round_index.and_then(|index| self.blocks.get_mut(&index))
                     && !block.partial_json.is_empty()
                 {
-                    let input = serde_json::from_str::<Value>(&block.partial_json)
-                        .unwrap_or_else(|_| Value::String(block.partial_json.clone()));
-                    if let Some(object) = block.block.as_object_mut() {
-                        object.insert("input".to_string(), input);
+                    match serde_json::from_str::<Value>(&block.partial_json) {
+                        Ok(input) => {
+                            if let Some(object) = block.block.as_object_mut() {
+                                object.insert("input".to_string(), input);
+                            }
+                        }
+                        Err(_) => cut_off = true,
                     }
                 }
-                self.emit(event);
+                if self.is_spice_block(round_index) {
+                    // A Spice call whose input is not whole was cut off: the client never
+                    // receives it, and it is not run.
+                    if let Some(round_index) = round_index {
+                        if cut_off {
+                            self.blocks.remove(&round_index);
+                        } else if let Some(block) = self.blocks.get(&round_index) {
+                            let content_block = mcp_tool_use(&block.block);
+                            let (_, start) = self.reindexed(json!({"type": "content_block_start", "index": round_index, "content_block": content_block}));
+                            let (_, stop) = self.reindexed(event);
+                            self.emit(start);
+                            self.emit(stop);
+                        }
+                    }
+                } else {
+                    let (_, event) = self.reindexed(event);
+                    self.emit(event);
+                }
             }
             Some("message_delta") => {
                 if let Some(usage) = event.get("usage") {
@@ -593,7 +672,15 @@ impl StreamLoop {
             .map(|block| block.block.clone())
             .collect();
 
-        if !calls.is_empty() && stop_reason.as_deref() == Some("tool_use") {
+        if !calls.is_empty() && stop_reason.as_deref() != Some("tool_use") {
+            let outcome = not_run_outcome(stop_reason.as_deref());
+            for id in calls.iter().filter_map(|call| call.get("id").and_then(Value::as_str)) {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.queue.push_back(Ok(json!({"type": "content_block_start", "index": index, "content_block": mcp_tool_result(id, &outcome)})));
+                self.queue.push_back(Ok(json!({"type": "content_block_stop", "index": index})));
+            }
+        } else if !calls.is_empty() {
             let outcomes = run_calls(&self.tools, &calls)
                 .instrument(self.span.clone())
                 .await;
