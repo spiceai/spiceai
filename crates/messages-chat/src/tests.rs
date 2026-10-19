@@ -104,6 +104,8 @@ fn what_only_changes_how_a_request_is_served_is_accepted() {
         json!({"context_management": {"edits": []}}),
         json!({"fallbacks": "default"}),
         json!({"diagnostics": {"previous_message_id": null}}),
+        json!({"thinking": {"type": "adaptive", "display": "omitted"}}),
+        json!({"output_config": {"effort": "high"}}),
     ] {
         let mut body = json!({"model": "gpt", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]});
         for (key, value) in field.as_object().expect("an object") {
@@ -132,18 +134,63 @@ fn what_a_chat_completion_cannot_carry_is_refused_by_name() {
         body
     };
     let cases = [
-        (with("top_k", json!(5)), "cannot carry `top_k`. Remove `top_k`"),
-        (with("container", json!("container_1")), "cannot carry `container`. Remove `container`"),
-        (with("mcp_servers", json!([])), "cannot carry `mcp_servers`."),
-        (with("inference_geo", json!("us")), "cannot carry `inference_geo`."),
-        (with("tools", json!([{"type": "web_search_20250305", "name": "web_search"}])), "cannot carry the Anthropic-defined tool `web_search_20250305`."),
-        (with("output_config", json!({"effort": "extreme"})), "cannot carry the effort `extreme`."),
-        (with("output_config", json!({"format": {"type": "json_object"}})), "cannot carry the output format `json_object` without a `schema`."),
-        (message(json!([{"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "d"}, "citations": {"enabled": true}}]}])), "cannot carry citations."),
-        (message(json!([{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "file_1"}}]}])), "cannot carry an image from the Anthropic Files API."),
-        (message(json!([{"role": "user", "content": [{"type": "search_result", "source": "s", "title": "t", "content": []}]}])), "cannot carry a `search_result` block in a user message."),
-        (message(json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}]}])), "cannot carry a `server_tool_use` block in an assistant message."),
-        (message(json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "f", "server_name": "github", "input": {}}]}])), "cannot carry a `mcp_tool_use` block in an assistant message."),
+        (
+            with("top_k", json!(5)),
+            "cannot carry `top_k`. Remove `top_k`",
+        ),
+        (
+            with("container", json!("container_1")),
+            "cannot carry `container`. Remove `container`",
+        ),
+        (
+            with("mcp_servers", json!([])),
+            "cannot carry `mcp_servers`.",
+        ),
+        (
+            with("inference_geo", json!("us")),
+            "cannot carry `inference_geo`.",
+        ),
+        (
+            with(
+                "tools",
+                json!([{"type": "web_search_20250305", "name": "web_search"}]),
+            ),
+            "cannot carry the Anthropic-defined tool `web_search_20250305`.",
+        ),
+        (
+            with("output_config", json!({"format": {"type": "json_object"}})),
+            "cannot carry the output format `json_object` without a `schema`.",
+        ),
+        (
+            message(
+                json!([{"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "d"}, "citations": {"enabled": true}}]}]),
+            ),
+            "cannot carry citations.",
+        ),
+        (
+            message(
+                json!([{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "file_1"}}]}]),
+            ),
+            "cannot carry an image from the Anthropic Files API.",
+        ),
+        (
+            message(
+                json!([{"role": "user", "content": [{"type": "search_result", "source": "s", "title": "t", "content": []}]}]),
+            ),
+            "cannot carry a `search_result` block in a user message.",
+        ),
+        (
+            message(
+                json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}]}]),
+            ),
+            "cannot carry a `server_tool_use` block in an assistant message.",
+        ),
+        (
+            message(
+                json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": [{"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "f", "server_name": "github", "input": {}}]}]),
+            ),
+            "cannot carry a `mcp_tool_use` block in an assistant message.",
+        ),
     ];
     for (body, expected) in cases {
         let error = translated(&body).expect_err("a refused request");
@@ -165,7 +212,10 @@ fn what_a_chat_completion_cannot_carry_is_refused_by_name() {
 #[test]
 fn a_request_that_is_not_a_messages_request_is_an_invalid_request() {
     let error = crate::parse(MessagesRequest::new(
-        json!({"model": "gpt", "messages": []}).as_object().cloned().expect("an object"),
+        json!({"model": "gpt", "messages": []})
+            .as_object()
+            .cloned()
+            .expect("an object"),
     ))
     .expect_err("max_tokens is required");
     assert_eq!(
@@ -201,7 +251,8 @@ fn a_completion_becomes_a_message() {
         "tool_calls",
     );
     assert_eq!(
-        serde_json::to_value(message(answer.clone(), true).expect("a message")).expect("serializable"),
+        serde_json::to_value(message(answer.clone(), true).expect("a message"))
+            .expect("serializable"),
         json!({
             "id": "msg_abc",
             "type": "message",
@@ -230,8 +281,10 @@ fn a_completion_becomes_a_message() {
 #[test]
 fn finish_reasons_become_stop_reasons() {
     let stop = |finish: &str, message: Value| {
-        serde_json::to_value(crate::response::message(completion(&message, finish), false).expect("a message"))
-            .expect("serializable")["stop_reason"]
+        serde_json::to_value(
+            crate::response::message(completion(&message, finish), false).expect("a message"),
+        )
+        .expect("serializable")["stop_reason"]
             .clone()
     };
     let text = json!({"role": "assistant", "content": "hi"});
@@ -239,10 +292,18 @@ fn finish_reasons_become_stop_reasons() {
         [
             stop("stop", text.clone()),
             stop("length", text.clone()),
-            stop("content_filter", text.clone()),
-            stop("stop", json!({"role": "assistant", "content": null, "refusal": "I can't help with that."})),
+            stop("content_filter", text),
+            stop(
+                "stop",
+                json!({"role": "assistant", "content": null, "refusal": "I can't help with that."})
+            ),
         ],
-        [json!("end_turn"), json!("max_tokens"), json!("refusal"), json!("refusal")]
+        [
+            json!("end_turn"),
+            json!("max_tokens"),
+            json!("refusal"),
+            json!("refusal")
+        ]
     );
 }
 
@@ -292,7 +353,9 @@ fn tool_call(index: u32, id: Option<&str>, name: Option<&str>, arguments: &str) 
     json!({"index": 0, "delta": {"tool_calls": [call]}, "finish_reason": null})
 }
 
-async fn events(chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>) -> Vec<Value> {
+async fn events(
+    chunks: Vec<Result<CreateChatCompletionStreamResponse, OpenAIError>>,
+) -> Vec<Value> {
     let chunks: ChatCompletionResponseStream = Box::pin(futures::stream::iter(chunks));
     message_stream(chunks, "gpt".to_string())
         .map(|event| event.unwrap_or_else(|error| error.to_envelope()))
@@ -314,35 +377,60 @@ async fn a_chunk_stream_becomes_a_message_event_stream() {
         Ok(usage_chunk()),
     ])
     .await;
-    insta::assert_snapshot!("chunk_stream_as_message_events", pretty(&Value::Array(streamed)));
+    insta::assert_snapshot!(
+        "chunk_stream_as_message_events",
+        pretty(&Value::Array(streamed))
+    );
 }
 
 #[tokio::test]
 async fn an_empty_chunk_stream_is_still_a_whole_message() {
     assert_eq!(
-        events(vec![]).await
+        events(vec![])
+            .await
             .into_iter()
             .map(|event| event["type"].clone())
             .collect::<Vec<_>>(),
-        [json!("message_start"), json!("message_delta"), json!("message_stop")]
+        [
+            json!("message_start"),
+            json!("message_delta"),
+            json!("message_stop")
+        ]
     );
 }
 
 #[tokio::test]
 async fn interleaved_tool_call_arguments_end_the_stream_with_an_error() {
     let streamed = events(vec![
-        Ok(chunk(&tool_call(0, Some("call_1"), Some("read_file"), "{\"path\":"))),
-        Ok(chunk(&tool_call(1, Some("call_2"), Some("read_file"), "{\"path\":\"b.rs\"}"))),
+        Ok(chunk(&tool_call(
+            0,
+            Some("call_1"),
+            Some("read_file"),
+            "{\"path\":",
+        ))),
+        Ok(chunk(&tool_call(
+            1,
+            Some("call_2"),
+            Some("read_file"),
+            "{\"path\":\"b.rs\"}",
+        ))),
         Ok(chunk(&tool_call(0, None, None, "\"a.rs\"}"))),
-        Ok(chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}))),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}),
+        )),
     ])
     .await;
     assert_eq!(
         streamed.last(),
-        Some(&json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' streamed the arguments of its tool calls interleaved, which the Messages API cannot stream: each tool call has to be streamed whole before the next. Send the request without `stream`."}}))
+        Some(
+            &json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' streamed the arguments of its tool calls interleaved, which the Messages API cannot stream: each tool call has to be streamed whole before the next. Send the request without `stream`."}})
+        )
     );
     assert_eq!(
-        streamed.iter().filter(|event| event["type"] == "message_stop").count(),
+        streamed
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
         0,
         "an errored stream does not also end as a whole message"
     );
@@ -351,23 +439,37 @@ async fn interleaved_tool_call_arguments_end_the_stream_with_an_error() {
 #[tokio::test]
 async fn a_chunk_stream_error_ends_the_stream() {
     let streamed = events(vec![
-        Ok(chunk(&json!({"index": 0, "delta": {"content": "Partial"}, "finish_reason": null}))),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {"content": "Partial"}, "finish_reason": null}),
+        )),
         Err(OpenAIError::ApiError(ApiError {
             message: "Rate limit reached".to_string(),
             r#type: Some("requests".to_string()),
             param: None,
             code: Some("rate_limit_exceeded".to_string()),
         })),
-        Ok(chunk(&json!({"index": 0, "delta": {"content": "never sent"}, "finish_reason": null}))),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {"content": "never sent"}, "finish_reason": null}),
+        )),
     ])
     .await;
     assert_eq!(
-        streamed.iter().map(|event| event["type"].clone()).collect::<Vec<_>>(),
-        [json!("message_start"), json!("content_block_start"), json!("content_block_delta"), json!("error")]
+        streamed
+            .iter()
+            .map(|event| event["type"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!("message_start"),
+            json!("content_block_start"),
+            json!("content_block_delta"),
+            json!("error")
+        ]
     );
     assert_eq!(
         streamed.last(),
-        Some(&json!({"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit reached"}}))
+        Some(
+            &json!({"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limit reached"}})
+        )
     );
 }
 
@@ -451,9 +553,16 @@ async fn a_streamed_and_an_unstreamed_answer_carry_the_same_message() {
             "tool_calls",
         ),
         chunks: vec![
-            chunk(&json!({"index": 0, "delta": {"role": "assistant", "content": "Reading "}, "finish_reason": null})),
+            chunk(
+                &json!({"index": 0, "delta": {"role": "assistant", "content": "Reading "}, "finish_reason": null}),
+            ),
             chunk(&json!({"index": 0, "delta": {"content": "it."}, "finish_reason": null})),
-            chunk(&tool_call(0, Some("call_1"), Some("read_file"), "{\"path\":")),
+            chunk(&tool_call(
+                0,
+                Some("call_1"),
+                Some("read_file"),
+                "{\"path\":",
+            )),
             chunk(&tool_call(0, None, None, "\"a.rs\"}")),
             chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"})),
             usage_chunk(),
@@ -501,21 +610,30 @@ fn accumulate(events: &[Value]) -> Value {
                 partial_json.push(String::new());
             }
             "content_block_delta" => {
-                let index = usize::try_from(event["index"].as_u64().expect("an index")).expect("an index");
+                let index =
+                    usize::try_from(event["index"].as_u64().expect("an index")).expect("an index");
                 let block = &mut message["content"][index];
                 let delta = &event["delta"];
                 match delta["type"].as_str().expect("a typed delta") {
                     "text_delta" => {
-                        let text = format!("{}{}", block["text"].as_str().unwrap_or_default(), delta["text"].as_str().unwrap_or_default());
+                        let text = format!(
+                            "{}{}",
+                            block["text"].as_str().unwrap_or_default(),
+                            delta["text"].as_str().unwrap_or_default()
+                        );
                         block["text"] = json!(text);
                     }
-                    "input_json_delta" => partial_json[index].push_str(delta["partial_json"].as_str().unwrap_or_default()),
+                    "input_json_delta" => partial_json[index]
+                        .push_str(delta["partial_json"].as_str().unwrap_or_default()),
                     other => panic!("unexpected delta {other}"),
                 }
             }
             "content_block_stop" => {
-                let index = usize::try_from(event["index"].as_u64().expect("an index")).expect("an index");
-                if message["content"][index]["type"] == "tool_use" && !partial_json[index].is_empty() {
+                let index =
+                    usize::try_from(event["index"].as_u64().expect("an index")).expect("an index");
+                if message["content"][index]["type"] == "tool_use"
+                    && !partial_json[index].is_empty()
+                {
                     message["content"][index]["input"] =
                         serde_json::from_str(&partial_json[index]).expect("whole tool input");
                 }
@@ -566,8 +684,15 @@ async fn tool_calls_that_finish_with_stop_are_a_tool_use_stop() {
         Some(messages_api::types::StopReason::ToolUse)
     );
     let streamed = events(vec![
-        Ok(chunk(&tool_call(0, Some("call_1"), Some("read_file"), "{}"))),
-        Ok(chunk(&json!({"index": 0, "delta": {}, "finish_reason": "stop"}))),
+        Ok(chunk(&tool_call(
+            0,
+            Some("call_1"),
+            Some("read_file"),
+            "{}",
+        ))),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {}, "finish_reason": "stop"}),
+        )),
     ])
     .await;
     assert_eq!(
@@ -616,5 +741,8 @@ fn a_tool_call_cut_off_by_max_tokens_is_left_out() {
         serde_json::to_value(&cut).expect("serializable")["content"],
         json!([{"type": "text", "text": "Writing it."}])
     );
-    assert_eq!(cut.stop_reason, Some(messages_api::types::StopReason::MaxTokens));
+    assert_eq!(
+        cut.stop_reason,
+        Some(messages_api::types::StopReason::MaxTokens)
+    );
 }

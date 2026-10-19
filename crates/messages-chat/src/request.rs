@@ -18,9 +18,14 @@ limitations under the License.
 //!
 //! What the chat completion can carry is carried over. What only changes how the request is
 //! served, not what the model is asked, is accepted and left out: prompt caching
-//! (`cache_control`), `service_tier`, `speed`, `context_management`, `fallbacks` and
-//! `diagnostics`. Anything else the chat completion cannot carry is refused by name, so the
-//! client never gets an answer to a different question than the one it asked.
+//! (`cache_control`), `service_tier`, `speed`, `context_management`, `fallbacks`,
+//! `diagnostics`, and how hard the model thinks (`thinking`, `output_config.effort`). Anything
+//! else the chat completion cannot carry is refused by name, so the client never gets an answer
+//! to a different question than the one it asked.
+//!
+//! `output_config.effort` is not sent as `reasoning_effort`: a model without reasoning refuses
+//! that parameter, and Claude Code sets an effort on every request, whatever the model. A
+//! reasoning model's effort is its Spicepod `reasoning_effort` param.
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionNamedToolChoice,
@@ -33,8 +38,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CreateChatCompletionRequest, FileObject, FunctionCall, FunctionName,
-    FunctionObject, ImageUrl, ReasoningEffort, ResponseFormat, ResponseFormatJsonSchema,
-    StopConfiguration, ToolChoiceOptions,
+    FunctionObject, ImageUrl, ResponseFormat, ResponseFormatJsonSchema, StopConfiguration,
+    ToolChoiceOptions,
 };
 use messages_api::MessagesError;
 use messages_api::types::{
@@ -136,17 +141,8 @@ pub fn chat_request(
         .filter(|choice| offers_tools && choice.disables_parallel_tool_use())
         .map(|_| false);
 
-    let (reasoning_effort, format) = match output_config {
-        Some(config) => (
-            config
-                .effort
-                .map(|effort| reasoning_effort(&model, &effort))
-                .transpose()?,
-            config.format,
-        ),
-        None => (None, None),
-    };
-    let response_format = format
+    let response_format = output_config
+        .and_then(|config| config.format)
         .or(output_format)
         .map(|format| response_format(&model, format))
         .transpose()?;
@@ -165,7 +161,6 @@ pub fn chat_request(
         tools,
         tool_choice: tool_choice.map(chat_tool_choice),
         parallel_tool_calls,
-        reasoning_effort,
         response_format,
         stream: streaming.then_some(true),
         stream_options: streaming.then_some(ChatCompletionStreamOptions {
@@ -384,7 +379,10 @@ fn append_document(
     document: DocumentBlockParam,
     parts: &mut Vec<ChatCompletionRequestUserMessageContentPart>,
 ) -> Result<(), MessagesError> {
-    if document.citations.is_some_and(|citations| citations.enabled) {
+    if document
+        .citations
+        .is_some_and(|citations| citations.enabled)
+    {
         return Err(unsupported(
             model,
             "citations",
@@ -448,7 +446,9 @@ fn tool_message(
             for block in blocks {
                 match block {
                     ContentBlockParam::Text(text) => texts.push(text.text),
-                    ContentBlockParam::Image(image) => images.push(image_part(model, image.source)?),
+                    ContentBlockParam::Image(image) => {
+                        images.push(image_part(model, image.source)?);
+                    }
                     ContentBlockParam::Document(document) => {
                         let mut parts = Vec::new();
                         append_document(model, document, &mut parts)?;
@@ -559,22 +559,6 @@ fn chat_tool_choice(choice: ToolChoice) -> ChatCompletionToolChoiceOption {
             })
         }
         ToolChoice::None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
-    }
-}
-
-/// `output_config.effort` as a reasoning effort. `max`, which a chat completion has no level
-/// for, is its highest level, `xhigh`.
-fn reasoning_effort(model: &str, effort: &str) -> Result<ReasoningEffort, MessagesError> {
-    match effort {
-        "low" => Ok(ReasoningEffort::Low),
-        "medium" => Ok(ReasoningEffort::Medium),
-        "high" => Ok(ReasoningEffort::High),
-        "xhigh" | "max" => Ok(ReasoningEffort::Xhigh),
-        other => Err(unsupported(
-            model,
-            &format!("the effort `{other}`"),
-            "Use one of `low`, `medium`, `high`, `xhigh` or `max`.",
-        )),
     }
 }
 

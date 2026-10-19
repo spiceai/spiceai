@@ -70,7 +70,10 @@ impl MessagesModels {
             return Ok(Arc::clone(handler));
         }
         let capabilities = self.capabilities.read().await;
-        match capabilities.get(model).and_then(ModelCapabilities::messages) {
+        match capabilities
+            .get(model)
+            .and_then(ModelCapabilities::messages)
+        {
             Some(MessagesBackend::Native) => require(
                 &capabilities,
                 &*self.messages.read().await,
@@ -311,7 +314,8 @@ fn sse_response(events: messages_api::MessageStream, span: Span) -> Response {
                         }
                     }
                     Some("content_block_delta") => {
-                        if event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                        if event.pointer("/delta/type").and_then(Value::as_str)
+                            == Some("text_delta")
                             && let Some(text) = event.pointer("/delta/text").and_then(Value::as_str)
                         {
                             state.output.push_str(text);
@@ -409,10 +413,7 @@ mod tests {
             .await
             .expect("a body")
             .to_bytes();
-        (
-            status,
-            serde_json::from_slice(&bytes).expect("a JSON body"),
-        )
+        (status, serde_json::from_slice(&bytes).expect("a JSON body"))
     }
 
     #[tokio::test]

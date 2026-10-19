@@ -63,7 +63,7 @@ pub struct ModelCapabilities {
     chat: bool,
     responses: bool,
     native_decisions: bool,
-    native_messages: bool,
+    messages: Option<MessagesBackend>,
 }
 
 /// What a model-id rule adds to its provider's default. It has no way to remove a
@@ -94,7 +94,7 @@ impl ModelCapabilities {
             Capability::Chat => self.chat,
             Capability::Responses => self.responses,
             Capability::Decisions => self.decisions().is_some(),
-            Capability::Messages => self.messages().is_some(),
+            Capability::Messages => self.messages.is_some(),
         }
     }
 
@@ -115,13 +115,7 @@ impl ModelCapabilities {
     /// through chat. `None` for a model with neither.
     #[must_use]
     pub fn messages(&self) -> Option<MessagesBackend> {
-        if self.native_messages {
-            Some(MessagesBackend::Native)
-        } else if self.chat {
-            Some(MessagesBackend::ViaChat)
-        } else {
-            None
-        }
+        self.messages
     }
 
     fn with(mut self, additions: Additions) -> Self {
@@ -139,14 +133,14 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
             chat: true,
             responses: true,
             native_decisions: false,
-            native_messages: false,
+            messages: Some(MessagesBackend::ViaChat),
         },
         ModelSource::Anthropic => ModelCapabilities {
             provider,
             chat: true,
             responses: false,
             native_decisions: false,
-            native_messages: true,
+            messages: Some(MessagesBackend::Native),
         },
         ModelSource::Bedrock
         | ModelSource::Databricks
@@ -158,14 +152,14 @@ fn provider_default(provider: ModelSource) -> ModelCapabilities {
             chat: true,
             responses: false,
             native_decisions: false,
-            native_messages: false,
+            messages: Some(MessagesBackend::ViaChat),
         },
         ModelSource::TypeSafe => ModelCapabilities {
             provider,
             chat: false,
             responses: false,
             native_decisions: true,
-            native_messages: false,
+            messages: None,
         },
     }
 }
@@ -259,7 +253,10 @@ mod tests {
         for (from, messages) in [
             ("anthropic:claude-sonnet-4-6", Some(MessagesBackend::Native)),
             ("openai:gpt-4o-mini", Some(MessagesBackend::ViaChat)),
-            ("bedrock:anthropic.claude-sonnet-4-6", Some(MessagesBackend::ViaChat)),
+            (
+                "bedrock:anthropic.claude-sonnet-4-6",
+                Some(MessagesBackend::ViaChat),
+            ),
             ("spiceai:chat-only", Some(MessagesBackend::ViaChat)),
             ("typesafe:jev", None),
         ] {

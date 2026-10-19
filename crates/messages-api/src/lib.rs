@@ -116,7 +116,8 @@ pub trait Messages: Send + Sync {
     async fn create(&self, request: MessagesRequest) -> Result<Value, MessagesError>;
 
     /// Answers `request` with a stream of events.
-    async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError>;
+    async fn create_stream(&self, request: MessagesRequest)
+    -> Result<MessageStream, MessagesError>;
 
     /// Counts the input tokens of `request`, the JSON object
     /// `POST /v1/messages/count_tokens` returns.

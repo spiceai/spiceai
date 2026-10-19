@@ -91,7 +91,12 @@ fn chunks() -> Vec<CreateChatCompletionStreamResponse> {
     let mut chunks = vec![chunk(json!({"role": "assistant"}), Value::Null)];
     chunks.extend((0..200).map(|_| chunk(json!({"content": "token "}), Value::Null)));
     chunks.push(chunk(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "tool_2", "arguments": ""}}]}), Value::Null));
-    chunks.extend((0..50).map(|_| chunk(json!({"tool_calls": [{"index": 0, "function": {"arguments": "abcd"}}]}), Value::Null)));
+    chunks.extend((0..50).map(|_| {
+        chunk(
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": "abcd"}}]}),
+            Value::Null,
+        )
+    }));
     chunks.push(chunk(json!({}), json!("tool_calls")));
     chunks
 }
@@ -102,7 +107,8 @@ fn bench(c: &mut Criterion) {
         b.iter_batched(
             || request.clone(),
             |request| {
-                let typed: CreateMessageRequest = serde_json::from_value(request).expect("a request");
+                let typed: CreateMessageRequest =
+                    serde_json::from_value(request).expect("a request");
                 chat_request(typed).expect("a chat request")
             },
             BatchSize::SmallInput,
@@ -113,7 +119,9 @@ fn bench(c: &mut Criterion) {
     c.bench_function("response: a completion as a Message", |b| {
         b.iter_batched(
             || answer.clone(),
-            |answer| serde_json::to_value(message(answer, false).expect("a message")).expect("JSON"),
+            |answer| {
+                serde_json::to_value(message(answer, false).expect("a message")).expect("JSON")
+            },
             BatchSize::SmallInput,
         );
     });

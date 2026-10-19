@@ -133,10 +133,7 @@ async fn native(
         public_name: component.name.clone(),
         messages: native,
         system_prompt,
-        defaults: crate::model::chat::get_openai_request_overrides(
-            component,
-            source.short_name(),
-        ),
+        defaults: crate::model::chat::get_openai_request_overrides(component, source.short_name()),
         provider: Provider {
             name: "Anthropic",
             prefix: "anthropic",
@@ -179,22 +176,28 @@ impl MessagesWrapper {
         if let Some(prompt) = &self.system_prompt {
             with_system_prompt(&mut request.body, prompt);
         }
-        let unset: Vec<&'static str> = SAMPLING_CONTROLS
-            .into_iter()
-            .filter(|control| request.body.get(*control).is_none_or(Value::is_null))
-            .collect();
+        let is_set = |body: &Map<String, Value>, control: &str| {
+            body.get(control).is_some_and(|value| !value.is_null())
+        };
+        let set_by_request = SAMPLING_CONTROLS.map(|control| is_set(&request.body, control));
         with_model_defaults(&mut request.body, &self.defaults, &self.public_name);
-        let defaulted = unset
+        let defaulted = SAMPLING_CONTROLS
             .into_iter()
-            .filter(|control| request.body.get(*control).is_some_and(|value| !value.is_null()))
+            .zip(set_by_request)
+            .filter(|(control, set_by_request)| !set_by_request && is_set(&request.body, control))
+            .map(|(control, _)| control)
             .collect();
         (request, defaulted)
     }
 
     /// `error` with a message that names where a sampling control the model refused came from,
-    /// when it came from the model's `params`, not the request: the provider's own says only
-    /// ``temperature` is deprecated for this model.`, about a field the client never sent.
-    fn explain_rejected_default(&self, mut error: MessagesError, defaulted: &[&str]) -> MessagesError {
+    /// when it came from the model's `params`, not the request: the provider's own says only that
+    /// the control "is deprecated for this model", about a field the client never sent.
+    fn explain_rejected_default(
+        &self,
+        mut error: MessagesError,
+        defaulted: &[&str],
+    ) -> MessagesError {
         if error.error_type != messages_api::ErrorType::InvalidRequest {
             return error;
         }
@@ -314,7 +317,8 @@ fn with_model_defaults(body: &mut Map<String, Value>, defaults: &[(String, Value
                         .or_insert_with(|| json!({"type": "auto"}));
                     match choice.as_object_mut() {
                         Some(choice) if !choice.contains_key("disable_parallel_tool_use") => {
-                            choice.insert("disable_parallel_tool_use".to_string(), Value::Bool(true));
+                            choice
+                                .insert("disable_parallel_tool_use".to_string(), Value::Bool(true));
                             Some(true)
                         }
                         _ => Some(false),
@@ -435,11 +439,7 @@ impl Messages for MessagesWrapper {
         let labels = request_labels_messages(&self.public_name, &request.body, false);
         let input = Value::Object(request.body.clone()).to_string();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream = false, model = %self.public_name, input = %input);
-        let result = self
-            .messages
-            .create(request)
-            .instrument(span.clone())
-            .await;
+        let result = self.messages.create(request).instrument(span.clone()).await;
         handle_metrics(start.elapsed(), result.is_err(), &labels);
         match result {
             Ok(mut message) => {
@@ -465,7 +465,10 @@ impl Messages for MessagesWrapper {
         }
     }
 
-    async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError> {
+    async fn create_stream(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<MessageStream, MessagesError> {
         let start = Instant::now();
         let (request, defaulted) = self.prepare(request);
         let labels = request_labels_messages(&self.public_name, &request.body, true);
@@ -532,10 +535,8 @@ impl TracedMessageStream {
                         tracing::info!(target: "task_history", parent: &self.span, id = %id, "labels");
                     }
                     if let Some(message) = message.as_object_mut() {
-                        message.insert(
-                            "model".to_string(),
-                            Value::String(self.public_name.clone()),
-                        );
+                        message
+                            .insert("model".to_string(), Value::String(self.public_name.clone()));
                     }
                 }
             }
@@ -634,7 +635,8 @@ mod tests {
         .map(|(key, value)| (key.to_string(), value))
         .collect();
 
-        let mut request = body(&json!({"messages": [], "tools": [{"name": "t", "input_schema": {}}]}));
+        let mut request =
+            body(&json!({"messages": [], "tools": [{"name": "t", "input_schema": {}}]}));
         with_model_defaults(&mut request, &defaults, "claude");
         assert_eq!(
             Value::Object(request),

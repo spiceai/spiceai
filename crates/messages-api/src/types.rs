@@ -128,7 +128,10 @@ pub enum ContentBlockParam {
     McpToolUse(McpToolUseBlockParam),
     McpToolResult(McpToolResultBlockParam),
     /// A block of a type not named above.
-    Other { block_type: String, block: Value },
+    Other {
+        block_type: String,
+        block: Value,
+    },
 }
 
 impl ContentBlockParam {
@@ -150,19 +153,21 @@ impl ContentBlockParam {
     }
 }
 
+/// A content block of type `block_type`, typed.
+fn typed<T: serde::de::DeserializeOwned, E: de::Error>(
+    block_type: &str,
+    block: Value,
+) -> Result<T, E> {
+    serde_json::from_value(block)
+        .map_err(|e| E::custom(format!("invalid `{block_type}` content block: {e}")))
+}
+
 impl<'de> Deserialize<'de> for ContentBlockParam {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let block = Value::deserialize(deserializer)?;
         let Some(block_type) = block.get("type").and_then(Value::as_str) else {
             return Err(de::Error::custom("content block has no `type`"));
         };
-        fn typed<T: serde::de::DeserializeOwned, E: de::Error>(
-            block_type: &str,
-            block: Value,
-        ) -> Result<T, E> {
-            serde_json::from_value(block)
-                .map_err(|e| E::custom(format!("invalid `{block_type}` content block: {e}")))
-        }
         Ok(match block_type {
             "text" => ContentBlockParam::Text(typed("text", block)?),
             "image" => ContentBlockParam::Image(typed("image", block)?),
@@ -504,7 +509,10 @@ mod tests {
             panic!("blocks expected");
         };
         assert_eq!(
-            blocks.iter().map(ContentBlockParam::block_type).collect::<Vec<_>>(),
+            blocks
+                .iter()
+                .map(ContentBlockParam::block_type)
+                .collect::<Vec<_>>(),
             ["text", "search_result"]
         );
         let tools = parsed.tools.expect("tools");
@@ -516,7 +524,11 @@ mod tests {
                     ToolParam::Other { tool_type, .. } => format!("other:{tool_type}"),
                 })
                 .collect::<Vec<_>>(),
-            ["custom:get_weather", "custom:lookup", "other:web_search_20250305"]
+            [
+                "custom:get_weather",
+                "custom:lookup",
+                "other:web_search_20250305"
+            ]
         );
         assert_eq!(
             parsed.other.keys().collect::<Vec<_>>(),

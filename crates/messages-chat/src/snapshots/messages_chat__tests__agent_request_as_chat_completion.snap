@@ -59,7 +59,6 @@ expression: pretty(&chat)
   ],
   "model": "gpt",
   "parallel_tool_calls": false,
-  "reasoning_effort": "high",
   "stop": [
     "END"
   ],

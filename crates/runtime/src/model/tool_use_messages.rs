@@ -121,7 +121,10 @@ impl SpiceTools {
 
     /// Runs the call `tool_use`, a `tool_use` block that names one of the tools.
     async fn run(&self, tool_use: &Value) -> ToolOutcome {
-        let name = tool_use.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = tool_use
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let id = tool_use
             .get("id")
             .and_then(Value::as_str)
@@ -239,7 +242,9 @@ fn not_run_outcome(stop_reason: Option<&str>) -> ToolOutcome {
         Some(stop_reason) => format!(
             "Spice did not run this call, because the model stopped with `{stop_reason}` before it could."
         ),
-        None => "Spice did not run this call, because the model stopped before it could.".to_string(),
+        None => {
+            "Spice did not run this call, because the model stopped before it could.".to_string()
+        }
     })
 }
 
@@ -248,13 +253,21 @@ fn not_run_outcome(stop_reason: Option<&str>) -> ToolOutcome {
 /// being run, so that the client's history replays as a valid request; a call whose input is not
 /// a JSON object was cut off, and is left out.
 fn not_run(content: &[Value], spice: &HashSet<String>, stop_reason: Option<&str>) -> Vec<Value> {
-    let is_spice = |block: &Value| is_tool_use(block) && tool_name(block).is_some_and(|name| spice.contains(name));
+    let is_spice = |block: &Value| {
+        is_tool_use(block) && tool_name(block).is_some_and(|name| spice.contains(name))
+    };
     let whole = |block: &Value| block.get("input").is_some_and(Value::is_object);
     let outcome = not_run_outcome(stop_reason);
     let mut client: Vec<Value> = content
         .iter()
         .filter(|block| !is_spice(block) || whole(block))
-        .map(|block| if is_spice(block) { mcp_tool_use(block) } else { block.clone() })
+        .map(|block| {
+            if is_spice(block) {
+                mcp_tool_use(block)
+            } else {
+                block.clone()
+            }
+        })
         .collect();
     client.extend(
         content
@@ -264,6 +277,14 @@ fn not_run(content: &[Value], spice: &HashSet<String>, stop_reason: Option<&str>
             .map(|id| mcp_tool_result(id, &outcome)),
     );
     client
+}
+
+/// A message of `role` with `content`.
+fn message(role: &str, content: Vec<Value>) -> Value {
+    let mut message = Map::new();
+    message.insert("role".to_string(), Value::from(role));
+    message.insert("content".to_string(), Value::Array(content));
+    Value::Object(message)
 }
 
 /// What one round's calls to Spice's tools produced, by call ID, in call order.
@@ -295,8 +316,8 @@ fn add_round(body: &mut Map<String, Value>, content: Vec<Value>, outcomes: &Outc
         .map(|(id, outcome)| tool_result(id, outcome))
         .collect();
     if let Some(Value::Array(messages)) = body.get_mut("messages") {
-        messages.push(json!({"role": "assistant", "content": content}));
-        messages.push(json!({"role": "user", "content": results}));
+        messages.push(message("assistant", content));
+        messages.push(message("user", results));
     }
     if let Some(choice) = body.get_mut("tool_choice").and_then(Value::as_object_mut)
         && matches!(
@@ -330,7 +351,7 @@ impl Messages for ToolUsingMessages {
             version,
         } = request;
         let spice = self.tools.offer(&mut body);
-        let context = RequestContext::current(AsyncMarker::new().await);
+        let request_context = RequestContext::current(AsyncMarker::new().await);
 
         let mut earlier: Vec<Value> = Vec::new();
         let mut usage = Value::Object(Map::new());
@@ -347,7 +368,8 @@ impl Messages for ToolUsingMessages {
             if let Some(round_usage) = response.get("usage") {
                 add_usage(&mut usage, round_usage);
             }
-            let first_id = id.get_or_insert_with(|| response.get("id").cloned().unwrap_or_default());
+            let first_id =
+                id.get_or_insert_with(|| response.get("id").cloned().unwrap_or_default());
             let first_id = first_id.clone();
             let content: Vec<Value> = response
                 .get("content")
@@ -356,7 +378,9 @@ impl Messages for ToolUsingMessages {
                 .unwrap_or_default();
             let calls: Vec<Value> = content
                 .iter()
-                .filter(|block| is_tool_use(block) && tool_name(block).is_some_and(|name| spice.contains(name)))
+                .filter(|block| {
+                    is_tool_use(block) && tool_name(block).is_some_and(|name| spice.contains(name))
+                })
                 .cloned()
                 .collect();
             let stop_reason = response.get("stop_reason").and_then(Value::as_str);
@@ -367,29 +391,35 @@ impl Messages for ToolUsingMessages {
                 (not_run(&content, &spice, stop_reason), None)
             } else {
                 let outcomes = run_calls(&self.tools, &calls).await;
-                crate::model::add_tools_used(&context, outcomes.len());
+                crate::model::add_tools_used(&request_context, outcomes.len());
                 let called_client_tools = content.iter().any(|block| {
                     is_tool_use(block) && !tool_name(block).is_some_and(|name| spice.contains(name))
                 });
                 let mut client_content: Vec<Value> = content
                     .iter()
                     .map(|block| {
-                        if is_tool_use(block) && tool_name(block).is_some_and(|name| spice.contains(name)) {
+                        if is_tool_use(block)
+                            && tool_name(block).is_some_and(|name| spice.contains(name))
+                        {
                             mcp_tool_use(block)
                         } else {
                             block.clone()
                         }
                     })
                     .collect();
-                client_content.extend(outcomes.iter().map(|(id, outcome)| mcp_tool_result(id, outcome)));
-                match stop_after_tools(called_client_tools, round == self.recursion_limit) {
-                    Some(stop) => (client_content, Some(stop)),
-                    None => {
-                        earlier.extend(client_content);
-                        add_round(&mut body, content, &outcomes);
-                        continue;
-                    }
-                }
+                client_content.extend(
+                    outcomes
+                        .iter()
+                        .map(|(id, outcome)| mcp_tool_result(id, outcome)),
+                );
+                let Some(stop) =
+                    stop_after_tools(called_client_tools, round == self.recursion_limit)
+                else {
+                    earlier.extend(client_content);
+                    add_round(&mut body, content, &outcomes);
+                    continue;
+                };
+                (client_content, Some(stop))
             };
 
             if let Some(message) = response.as_object_mut() {
@@ -409,7 +439,10 @@ impl Messages for ToolUsingMessages {
         ))
     }
 
-    async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError> {
+    async fn create_stream(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<MessageStream, MessagesError> {
         let MessagesRequest {
             mut body,
             betas,
@@ -445,28 +478,31 @@ impl Messages for ToolUsingMessages {
             unreplayable: None,
             queue: VecDeque::new(),
         };
-        Ok(Box::pin(futures::stream::unfold(state, |mut state| async move {
-            loop {
-                if let Some(item) = state.queue.pop_front() {
-                    return Some((item, state));
-                }
-                let events = state.events.as_mut()?;
-                match events.next().await {
-                    Some(Ok(event)) => {
-                        if event_type(&event) == Some("message_stop") {
-                            state.end_round().await;
-                        } else {
-                            state.forward(event);
+        Ok(Box::pin(futures::stream::unfold(
+            state,
+            |mut state| async move {
+                loop {
+                    if let Some(item) = state.queue.pop_front() {
+                        return Some((item, state));
+                    }
+                    let events = state.events.as_mut()?;
+                    match events.next().await {
+                        Some(Ok(event)) => {
+                            if event_type(&event) == Some("message_stop") {
+                                state.end_round().await;
+                            } else {
+                                state.forward(event);
+                            }
                         }
+                        Some(Err(error)) => {
+                            state.events = None;
+                            state.queue.push_back(Err(error));
+                        }
+                        None => state.events = None,
                     }
-                    Some(Err(error)) => {
-                        state.events = None;
-                        state.queue.push_back(Err(error));
-                    }
-                    None => state.events = None,
                 }
-            }
-        })))
+            },
+        )))
     }
 
     async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
@@ -674,11 +710,15 @@ impl StreamLoop {
 
         if !calls.is_empty() && stop_reason.as_deref() != Some("tool_use") {
             let outcome = not_run_outcome(stop_reason.as_deref());
-            for id in calls.iter().filter_map(|call| call.get("id").and_then(Value::as_str)) {
+            for id in calls
+                .iter()
+                .filter_map(|call| call.get("id").and_then(Value::as_str))
+            {
                 let index = self.next_index;
                 self.next_index += 1;
                 self.queue.push_back(Ok(json!({"type": "content_block_start", "index": index, "content_block": mcp_tool_result(id, &outcome)})));
-                self.queue.push_back(Ok(json!({"type": "content_block_stop", "index": index})));
+                self.queue
+                    .push_back(Ok(json!({"type": "content_block_stop", "index": index})));
             }
         } else if !calls.is_empty() {
             let outcomes = run_calls(&self.tools, &calls)
@@ -691,20 +731,22 @@ impl StreamLoop {
                 self.emit(json!({"type": "content_block_start", "index": index, "content_block": mcp_tool_result(id, outcome)}));
                 self.emit(json!({"type": "content_block_stop", "index": index}));
             }
-            let called_client_tools = self.blocks.values().any(|block| {
-                !block.spice && is_tool_use(&block.block)
-            });
-            match stop_after_tools(called_client_tools, self.round >= self.recursion_limit) {
-                Some(stop) => {
-                    if let Some(delta) = message_delta.get_mut("delta").and_then(Value::as_object_mut) {
-                        delta.insert("stop_reason".to_string(), Value::from(stop));
-                        delta.insert("stop_sequence".to_string(), Value::Null);
-                    }
-                }
-                None => {
-                    self.next_round(outcomes).await;
-                    return;
-                }
+            let called_client_tools = self
+                .blocks
+                .values()
+                .any(|block| !block.spice && is_tool_use(&block.block));
+            let Some(stop) =
+                stop_after_tools(called_client_tools, self.round >= self.recursion_limit)
+            else {
+                self.next_round(outcomes).await;
+                return;
+            };
+            if let Some(delta) = message_delta
+                .get_mut("delta")
+                .and_then(Value::as_object_mut)
+            {
+                delta.insert("stop_reason".to_string(), Value::from(stop));
+                delta.insert("stop_sequence".to_string(), Value::Null);
             }
         }
 
@@ -756,7 +798,10 @@ fn apply_delta(block: &mut RoundBlock, delta: Option<&Value>) -> Result<(), Stri
     let Some(delta) = delta else {
         return Ok(());
     };
-    let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or_default();
+    let delta_type = delta
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let append = |block: &mut Value, field: &str, text: Option<&str>| {
         if let (Some(object), Some(text)) = (block.as_object_mut(), text) {
             let existing = object
@@ -768,7 +813,11 @@ fn apply_delta(block: &mut RoundBlock, delta: Option<&Value>) -> Result<(), Stri
         }
     };
     match delta_type {
-        "text_delta" => append(&mut block.block, "text", delta.get("text").and_then(Value::as_str)),
+        "text_delta" => append(
+            &mut block.block,
+            "text",
+            delta.get("text").and_then(Value::as_str),
+        ),
         "thinking_delta" => append(
             &mut block.block,
             "thinking",

@@ -25,8 +25,7 @@ limitations under the License.
 use std::collections::{HashSet, VecDeque};
 
 use async_openai::types::chat::{
-    ChatCompletionResponseStream, CompletionUsage, CreateChatCompletionStreamResponse,
-    FinishReason,
+    ChatCompletionResponseStream, CompletionUsage, CreateChatCompletionStreamResponse, FinishReason,
 };
 use futures::StreamExt;
 use messages_api::stream::{ContentBlockDelta, DeltaUsage, MessageDelta, StreamEvent};
@@ -81,7 +80,11 @@ impl Translator {
         }
     }
 
-    fn start(&mut self, chunk: Option<&CreateChatCompletionStreamResponse>, events: &mut Vec<StreamEvent>) {
+    fn start(
+        &mut self,
+        chunk: Option<&CreateChatCompletionStreamResponse>,
+        events: &mut Vec<StreamEvent>,
+    ) {
         if self.started {
             return;
         }
@@ -116,18 +119,17 @@ impl Translator {
     }
 
     fn text(&mut self, text: String, events: &mut Vec<StreamEvent>) {
-        let index = match self.open {
-            Some(OpenBlock::Text { index }) => index,
-            _ => {
-                let index = self.open(
-                    ContentBlock::Text {
-                        text: String::new(),
-                    },
-                    events,
-                );
-                self.open = Some(OpenBlock::Text { index });
-                index
-            }
+        let index = if let Some(OpenBlock::Text { index }) = self.open {
+            index
+        } else {
+            let index = self.open(
+                ContentBlock::Text {
+                    text: String::new(),
+                },
+                events,
+            );
+            self.open = Some(OpenBlock::Text { index });
+            index
         };
         events.push(StreamEvent::ContentBlockDelta {
             index,
@@ -185,7 +187,10 @@ impl Translator {
                     self.tool_calls.insert(call.index);
                     let index = self.open(
                         ContentBlock::ToolUse {
-                            id: call.id.filter(|id| !id.is_empty()).unwrap_or_else(tool_use_id),
+                            id: call
+                                .id
+                                .filter(|id| !id.is_empty())
+                                .unwrap_or_else(tool_use_id),
                             name,
                             input: Value::Object(Map::new()),
                         },
@@ -225,15 +230,18 @@ impl Translator {
         } else {
             stop_reason(self.finish_reason, !self.tool_calls.is_empty())
         };
-        let usage = self.usage.as_ref().map_or_else(DeltaUsage::default, |usage| {
-            let (input, cache_read) = input_tokens(usage);
-            DeltaUsage {
-                output_tokens: u64::from(usage.completion_tokens),
-                input_tokens: Some(input),
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: cache_read,
-            }
-        });
+        let usage = self
+            .usage
+            .as_ref()
+            .map_or_else(DeltaUsage::default, |usage| {
+                let (input, cache_read) = input_tokens(usage);
+                DeltaUsage {
+                    output_tokens: u64::from(usage.completion_tokens),
+                    input_tokens: Some(input),
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: cache_read,
+                }
+            });
         events.push(StreamEvent::MessageDelta {
             delta: MessageDelta {
                 stop_reason: Some(stop_reason),
@@ -258,9 +266,8 @@ struct State {
 }
 
 impl State {
-    fn queue(&mut self, events: Vec<StreamEvent>) {
-        self.queue
-            .extend(events.iter().map(event_value));
+    fn queue(&mut self, events: &[StreamEvent]) {
+        self.queue.extend(events.iter().map(event_value));
     }
 }
 
@@ -280,7 +287,7 @@ pub fn message_stream(chunks: ChatCompletionResponseStream, model: String) -> Me
             let translator = state.translator.as_mut()?;
             match state.chunks.next().await {
                 Some(Ok(chunk)) => match translator.chunk(chunk) {
-                    Ok(events) => state.queue(events),
+                    Ok(events) => state.queue(&events),
                     Err(error) => {
                         state.translator = None;
                         state.queue.push_back(Err(error));
@@ -292,7 +299,7 @@ pub fn message_stream(chunks: ChatCompletionResponseStream, model: String) -> Me
                 }
                 None => {
                     let events = state.translator.take().map(Translator::finish);
-                    state.queue(events.unwrap_or_default());
+                    state.queue(&events.unwrap_or_default());
                 }
             }
         }

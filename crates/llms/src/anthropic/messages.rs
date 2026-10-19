@@ -198,7 +198,10 @@ impl Messages for AnthropicMessages {
         self.json("/messages", request).await
     }
 
-    async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError> {
+    async fn create_stream(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<MessageStream, MessagesError> {
         let response = self.send("/messages", request).await?;
         Ok(event_stream(response, self.model.clone()))
     }
@@ -257,8 +260,9 @@ impl StreamState {
                 Ok(event) => match event_type(&event) {
                     Some("error") => {
                         self.done = true;
-                        self.queue.push_back(Err(MessagesError::from_envelope(&event)
-                            .unwrap_or_else(|| MessagesError::api(data.clone()))));
+                        self.queue
+                            .push_back(Err(MessagesError::from_envelope(&event)
+                                .unwrap_or_else(|| MessagesError::api(data.clone()))));
                     }
                     Some("message_stop") => {
                         self.done = true;
@@ -327,13 +331,13 @@ mod tests {
         let mut decoder = SseDecoder::default();
         let stream = "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: ping\r\ndata: {\"type\": \"ping\"}\r\n\r\n: comment\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"h\u{e9}\"}}\n\n";
         let bytes = stream.as_bytes();
-        let mut decoded = Vec::new();
+        let mut events = Vec::new();
         // Split inside a multi-byte character, a line ending, and the event separator.
         for chunk in bytes.chunks(7) {
-            decoded.extend(decoder.push(chunk));
+            events.extend(decoder.push(chunk));
         }
         assert_eq!(
-            decoded,
+            events,
             [
                 "{\"type\":\"message_start\"}",
                 "{\"type\": \"ping\"}",

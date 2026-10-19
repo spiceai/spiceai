@@ -225,10 +225,7 @@ impl Runtime {
         }
         if let Some(messages) = messages {
             let messages_llms = self.messages_llms();
-            messages_llms
-                .write()
-                .await
-                .insert(m.name.clone(), messages);
+            messages_llms.write().await.insert(m.name.clone(), messages);
         }
         if let Some(evaluator) = evaluator {
             let evaluate_models = self.llm_runtime_stores.evaluate_models();

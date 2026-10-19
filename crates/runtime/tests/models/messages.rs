@@ -91,7 +91,9 @@ fn accumulate(events: &[Value]) -> Value {
     let mut message = Value::Null;
     let mut partial: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     for event in events {
-        let index = event["index"].as_u64().and_then(|i| usize::try_from(i).ok());
+        let index = event["index"]
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok());
         match event["type"].as_str().unwrap_or_default() {
             "message_start" => message = event["message"].clone(),
             "content_block_start" => {
@@ -105,11 +107,19 @@ fn accumulate(events: &[Value]) -> Value {
                 let block = &mut message["content"][index];
                 match delta["type"].as_str().unwrap_or_default() {
                     "text_delta" => {
-                        let text = format!("{}{}", block["text"].as_str().unwrap_or_default(), delta["text"].as_str().unwrap_or_default());
+                        let text = format!(
+                            "{}{}",
+                            block["text"].as_str().unwrap_or_default(),
+                            delta["text"].as_str().unwrap_or_default()
+                        );
                         block["text"] = json!(text);
                     }
                     "thinking_delta" => {
-                        let thinking = format!("{}{}", block["thinking"].as_str().unwrap_or_default(), delta["thinking"].as_str().unwrap_or_default());
+                        let thinking = format!(
+                            "{}{}",
+                            block["thinking"].as_str().unwrap_or_default(),
+                            delta["thinking"].as_str().unwrap_or_default()
+                        );
                         block["thinking"] = json!(thinking);
                     }
                     "signature_delta" => block["signature"] = delta["signature"].clone(),
@@ -221,7 +231,8 @@ async fn messages_on_an_anthropic_model_reach_anthropic_as_sent() -> Result<(), 
 /// must give the model, on the next turn, the calls and results it saw: Anthropic accepts the
 /// request, and the model answers from them.
 #[tokio::test]
-async fn messages_on_an_anthropic_model_run_spice_tools_and_replay_them() -> Result<(), anyhow::Error> {
+async fn messages_on_an_anthropic_model_run_spice_tools_and_replay_them()
+-> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
@@ -304,7 +315,8 @@ async fn messages_on_an_anthropic_model_run_spice_tools_and_replay_them() -> Res
 }
 
 #[tokio::test]
-async fn messages_on_an_openai_model_are_translated_to_chat_completions() -> Result<(), anyhow::Error> {
+async fn messages_on_an_openai_model_are_translated_to_chat_completions()
+-> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {

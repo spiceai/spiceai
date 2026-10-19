@@ -75,7 +75,10 @@ fn anthropic_message(body: &Value) -> Value {
             "tool_use",
         )
     } else if answered {
-        (json!([{"type": "text", "text": "There are no datasets."}]), "end_turn")
+        (
+            json!([{"type": "text", "text": "There are no datasets."}]),
+            "end_turn",
+        )
     } else {
         (json!([{"type": "text", "text": "pong"}]), "end_turn")
     };
@@ -101,7 +104,12 @@ fn anthropic_events(message: &Value) -> String {
         json!({"type": "message_start", "message": start}),
         json!({"type": "ping"}),
     ];
-    for (index, block) in message["content"].as_array().expect("content").iter().enumerate() {
+    for (index, block) in message["content"]
+        .as_array()
+        .expect("content")
+        .iter()
+        .enumerate()
+    {
         match block["type"].as_str() {
             Some("text") => {
                 events.push(json!({"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}));
@@ -118,13 +126,18 @@ fn anthropic_events(message: &Value) -> String {
     events.push(json!({"type": "future_event", "detail": "passed through"}));
     events.push(json!({"type": "message_delta", "delta": {"stop_reason": message["stop_reason"], "stop_sequence": null}, "usage": {"output_tokens": message["usage"]["output_tokens"]}}));
     events.push(json!({"type": "message_stop"}));
-    events
-        .iter()
-        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().expect("a type")))
-        .collect()
+    events.iter().fold(String::new(), |mut sse, event| {
+        let name = event["type"].as_str().expect("a type");
+        sse.push_str(&format!("event: {name}\ndata: {event}\n\n"));
+        sse
+    })
 }
 
-async fn anthropic(State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn anthropic(
+    State(seen): State<Seen>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     record(&seen, "/v1/messages", headers, &body);
     if body["metadata"]["user_id"] == "retire-me" {
         return (
@@ -156,31 +169,47 @@ async fn anthropic(State(seen): State<Seen>, headers: HeaderMap, Json(body): Jso
     }
     let message = anthropic_message(&body);
     if body["stream"] == json!(true) {
-        return ([(header::CONTENT_TYPE, "text/event-stream")], anthropic_events(&message)).into_response();
+        return (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            anthropic_events(&message),
+        )
+            .into_response();
     }
     Json(message).into_response()
 }
 
-async fn anthropic_count_tokens(State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+async fn anthropic_count_tokens(
+    State(seen): State<Seen>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
     record(&seen, "/v1/messages/count_tokens", headers, &body);
     Json(json!({"input_tokens": 42}))
 }
 
 /// An `OpenAI` chat completion: a call to `get_weather` when it is offered and has not been
 /// answered yet, else `pong`.
-async fn openai_chat(State(seen): State<Seen>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn openai_chat(
+    State(seen): State<Seen>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     record(&seen, "/v1/chat/completions", headers, &body);
-    let offers_weather = body["tools"]
-        .as_array()
-        .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == "get_weather"));
+    let offers_weather = body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "get_weather")
+    });
     let answered = body["messages"].as_array().is_some_and(|messages| {
         messages
             .iter()
             .any(|message| message["role"] == "tool" && message["tool_call_id"] == "call_w")
     });
-    let offers_list_datasets = body["tools"]
-        .as_array()
-        .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == "list_datasets"));
+    let offers_list_datasets = body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "list_datasets")
+    });
     let listed = body["messages"].as_array().is_some_and(|messages| {
         messages
             .iter()
@@ -255,10 +284,11 @@ fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Mode
         ],
         other => panic!("no mock params for {other:?}"),
     };
-    for (key, value) in params
-        .into_iter()
-        .chain(extra.iter().map(|(key, value)| (*key, (*value).to_string())))
-    {
+    for (key, value) in params.into_iter().chain(
+        extra
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_string())),
+    ) {
         model.params.insert(key.to_string(), Value::String(value));
     }
     model
@@ -289,20 +319,38 @@ async fn runtime_with(models: Vec<Model>) -> Router {
 }
 
 /// What a route answered: the status, the headers, and the body.
-async fn send(routes: &Router, path: &str, headers: &[(&str, &str)], body: &Value) -> (StatusCode, HeaderMap, String) {
+async fn send(
+    routes: &Router,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &Value,
+) -> (StatusCode, HeaderMap, String) {
     let mut request = Request::post(path).header(header::CONTENT_TYPE, "application/json");
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
     let response = routes
         .clone()
-        .oneshot(request.body(Body::from(body.to_string())).expect("a request"))
+        .oneshot(
+            request
+                .body(Body::from(body.to_string()))
+                .expect("a request"),
+        )
         .await
         .expect("a response");
     let status = response.status();
     let response_headers = response.headers().clone();
-    let bytes = response.into_body().collect().await.expect("a body").to_bytes();
-    (status, response_headers, String::from_utf8_lossy(&bytes).into_owned())
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
+    (
+        status,
+        response_headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 /// The events of an SSE body, as (name, data) pairs.
@@ -325,7 +373,10 @@ fn sse_events(body: &str) -> Vec<(String, Value)> {
 }
 
 fn header_of<'a>(received: &'a Received, name: &str) -> Option<&'a str> {
-    received.headers.get(name).and_then(|value| value.to_str().ok())
+    received
+        .headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
 }
 
 fn taken(seen: &Seen) -> Vec<Received> {
@@ -336,7 +387,13 @@ fn taken(seen: &Seen) -> Vec<Received> {
 async fn an_anthropic_model_receives_the_request_as_the_client_sent_it() {
     let seen = Seen::default();
     let endpoint = start_provider(&seen).await;
-    let routes = runtime_with(vec![model("claude", "anthropic:claude-sonnet-4-6", &endpoint, &[])]).await;
+    let routes = runtime_with(vec![model(
+        "claude",
+        "anthropic:claude-sonnet-4-6",
+        &endpoint,
+        &[],
+    )])
+    .await;
     taken(&seen);
 
     // Fields, blocks and tools no part of Spice knows of reach Anthropic unchanged.
@@ -355,7 +412,14 @@ async fn an_anthropic_model_receives_the_request_as_the_client_sent_it() {
     let (status, _, body) = send(
         &routes,
         "/v1/messages",
-        &[("x-api-key", "client-key"), ("anthropic-version", "2023-06-01"), ("anthropic-beta", "fast-mode-2026-02-01, context-management-2025-06-27")],
+        &[
+            ("x-api-key", "client-key"),
+            ("anthropic-version", "2023-06-01"),
+            (
+                "anthropic-beta",
+                "fast-mode-2026-02-01, context-management-2025-06-27",
+            ),
+        ],
         &request,
     )
     .await;
@@ -383,14 +447,23 @@ async fn an_anthropic_model_receives_the_request_as_the_client_sent_it() {
 
     let mut expected_answer = anthropic_message(&expected_upstream);
     expected_answer["model"] = json!("claude");
-    assert_eq!(serde_json::from_str::<Value>(&body).expect("a message"), expected_answer);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("a message"),
+        expected_answer
+    );
 }
 
 #[tokio::test]
 async fn an_anthropic_models_stream_reaches_the_client_as_anthropic_sent_it() {
     let seen = Seen::default();
     let endpoint = start_provider(&seen).await;
-    let routes = runtime_with(vec![model("claude", "anthropic:claude-sonnet-4-6", &endpoint, &[])]).await;
+    let routes = runtime_with(vec![model(
+        "claude",
+        "anthropic:claude-sonnet-4-6",
+        &endpoint,
+        &[],
+    )])
+    .await;
     taken(&seen);
 
     let (status, headers, body) = send(
@@ -402,7 +475,9 @@ async fn an_anthropic_models_stream_reaches_the_client_as_anthropic_sent_it() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
         Some("text/event-stream")
     );
 
@@ -416,7 +491,13 @@ async fn an_anthropic_models_stream_reaches_the_client_as_anthropic_sent_it() {
 async fn anthropic_errors_reach_the_client_in_their_own_shape() {
     let seen = Seen::default();
     let endpoint = start_provider(&seen).await;
-    let routes = runtime_with(vec![model("claude", "anthropic:claude-sonnet-4-6", &endpoint, &[])]).await;
+    let routes = runtime_with(vec![model(
+        "claude",
+        "anthropic:claude-sonnet-4-6",
+        &endpoint,
+        &[],
+    )])
+    .await;
 
     let (status, _, body) = send(
         &routes,
@@ -426,8 +507,14 @@ async fn anthropic_errors_reach_the_client_in_their_own_shape() {
     )
     .await;
     assert_eq!(
-        (status.as_u16(), serde_json::from_str::<Value>(&body).expect("an envelope")),
-        (529, json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_529"}))
+        (
+            status.as_u16(),
+            serde_json::from_str::<Value>(&body).expect("an envelope")
+        ),
+        (
+            529,
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}, "request_id": "req_529"})
+        )
     );
 
     let (status, _, body) = send(
@@ -438,10 +525,13 @@ async fn anthropic_errors_reach_the_client_in_their_own_shape() {
     )
     .await;
     assert_eq!(
-        (status, serde_json::from_str::<Value>(&body).expect("an envelope")),
+        (
+            status,
+            serde_json::from_str::<Value>(&body).expect("an envelope")
+        ),
         (
             StatusCode::NOT_FOUND,
-            json!({"type": "error", "error": {"type": "not_found_error", "message": format!("Failed to answer a Messages API request with Anthropic model 'claude-sonnet-4-6': the API at the configured `endpoint` reports no such model. Check both `from: anthropic:<model_id>` and `endpoint` — an endpoint that does not route `/messages` answers with this same error. See: https://spiceai.org/docs/components/models/anthropic")}, "request_id": "req_404"})
+            json!({"type": "error", "error": {"type": "not_found_error", "message": "Failed to answer a Messages API request with Anthropic model 'claude-sonnet-4-6': the API at the configured `endpoint` reports no such model. Check both `from: anthropic:<model_id>` and `endpoint` — an endpoint that does not route `/messages` answers with this same error. See: https://spiceai.org/docs/components/models/anthropic"}, "request_id": "req_404"})
         )
     );
 
@@ -453,8 +543,14 @@ async fn anthropic_errors_reach_the_client_in_their_own_shape() {
     )
     .await;
     assert_eq!(
-        (status, serde_json::from_str::<Value>(&body).expect("an envelope")),
-        (StatusCode::NOT_FOUND, json!({"type": "error", "error": {"type": "not_found_error", "message": "model 'nonexistent' not found"}}))
+        (
+            status,
+            serde_json::from_str::<Value>(&body).expect("an envelope")
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            json!({"type": "error", "error": {"type": "not_found_error", "message": "model 'nonexistent' not found"}})
+        )
     );
 }
 
@@ -482,7 +578,10 @@ async fn the_spicepod_system_prompt_and_defaults_reach_anthropic() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let received = taken(&seen);
     assert_eq!(
-        (&received[0].body["system"], &received[0].body["temperature"]),
+        (
+            &received[0].body["system"],
+            &received[0].body["temperature"]
+        ),
         (&json!("You answer about Spice.\n\nBe brief."), &json!(0.3))
     );
 }
@@ -514,7 +613,11 @@ async fn an_anthropic_model_runs_spice_tools_in_one_message() {
         ])
     );
     assert_eq!(
-        (&message["stop_reason"], &message["usage"]["input_tokens"], &message["usage"]["output_tokens"]),
+        (
+            &message["stop_reason"],
+            &message["usage"]["input_tokens"],
+            &message["usage"]["output_tokens"]
+        ),
         (&json!("end_turn"), &json!(24), &json!(6)),
         "one message, with the usage of both rounds"
     );
@@ -532,7 +635,13 @@ async fn an_anthropic_model_runs_spice_tools_in_one_message() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let events = sse_events(&body);
     let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names.iter().filter(|name| **name == "message_start").count(), 1);
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "message_start")
+            .count(),
+        1
+    );
     assert_eq!(names.last(), Some(&"message_stop"));
     let starts: Vec<&Value> = events
         .iter()
@@ -540,15 +649,27 @@ async fn an_anthropic_model_runs_spice_tools_in_one_message() {
         .map(|(_, data)| &data["content_block"])
         .collect();
     assert_eq!(
-        starts.iter().map(|block| block["type"].clone()).collect::<Vec<_>>(),
-        [json!("text"), json!("mcp_tool_use"), json!("mcp_tool_result"), json!("text")]
+        starts
+            .iter()
+            .map(|block| block["type"].clone())
+            .collect::<Vec<_>>(),
+        [
+            json!("text"),
+            json!("mcp_tool_use"),
+            json!("mcp_tool_result"),
+            json!("text")
+        ]
     );
     let indexes: Vec<u64> = events
         .iter()
         .filter(|(name, _)| name == "content_block_start")
         .filter_map(|(_, data)| data["index"].as_u64())
         .collect();
-    assert_eq!(indexes, [0, 1, 2, 3], "block indexes continue across rounds");
+    assert_eq!(
+        indexes,
+        [0, 1, 2, 3],
+        "block indexes continue across rounds"
+    );
 }
 
 #[tokio::test]
@@ -565,7 +686,13 @@ async fn any_other_chat_model_answers_through_its_chat_completions() {
         "tools": [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
         "messages": [{"role": "user", "content": "Weather in Paris?"}],
     });
-    let (status, _, body) = send(&routes, "/v1/messages", &[("x-api-key", "client-key")], &request).await;
+    let (status, _, body) = send(
+        &routes,
+        "/v1/messages",
+        &[("x-api-key", "client-key")],
+        &request,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let message: Value = serde_json::from_str(&body).expect("a message");
     assert_eq!(
@@ -579,8 +706,16 @@ async fn any_other_chat_model_answers_through_its_chat_completions() {
     );
     let received = taken(&seen);
     assert_eq!(
-        (received[0].path.as_str(), &received[0].body["model"], header_of(&received[0], "authorization")),
-        ("/v1/chat/completions", &json!("gpt-4o-mini"), Some("Bearer spice-openai-key"))
+        (
+            received[0].path.as_str(),
+            &received[0].body["model"],
+            header_of(&received[0], "authorization")
+        ),
+        (
+            "/v1/chat/completions",
+            &json!("gpt-4o-mini"),
+            Some("Bearer spice-openai-key")
+        )
     );
     assert_eq!(
         received[0].body["messages"],
@@ -602,10 +737,23 @@ async fn any_other_chat_model_answers_through_its_chat_completions() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let events = sse_events(&body);
     assert_eq!(
-        events.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
-        ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]
+        events
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+        ]
     );
-    assert_eq!(events[2].1["delta"], json!({"type": "text_delta", "text": "pong"}));
+    assert_eq!(
+        events[2].1["delta"],
+        json!({"type": "text_delta", "text": "pong"})
+    );
     assert_eq!(
         events[4].1,
         json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 2, "input_tokens": 12, "cache_read_input_tokens": 8}})
@@ -631,9 +779,19 @@ async fn only_an_anthropic_model_counts_tokens() {
     .await;
     taken(&seen);
 
-    let request = |model: &str| json!({"model": model, "messages": [{"role": "user", "content": "ping"}]});
-    let (status, _, body) = send(&routes, "/v1/messages/count_tokens", &[], &request("claude")).await;
-    assert_eq!((status, body.as_str()), (StatusCode::OK, r#"{"input_tokens":42}"#));
+    let request =
+        |model: &str| json!({"model": model, "messages": [{"role": "user", "content": "ping"}]});
+    let (status, _, body) = send(
+        &routes,
+        "/v1/messages/count_tokens",
+        &[],
+        &request("claude"),
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, r#"{"input_tokens":42}"#)
+    );
     let received = taken(&seen);
     assert_eq!(
         (received[0].path.as_str(), &received[0].body["model"]),
@@ -740,18 +898,30 @@ async fn chat_completions_stream_the_clients_tool_calls_beside_spice_tools() {
     let calls: Vec<(Value, Value, String)> = chunks
         .iter()
         .flat_map(|chunk| chunk["choices"].as_array().cloned().unwrap_or_default())
-        .flat_map(|choice| choice["delta"]["tool_calls"].as_array().cloned().unwrap_or_default())
+        .flat_map(|choice| {
+            choice["delta"]["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
         .map(|call| {
             (
                 call["id"].clone(),
                 call["function"]["name"].clone(),
-                call["function"]["arguments"].as_str().unwrap_or_default().to_string(),
+                call["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
             )
         })
         .collect();
     assert_eq!(
         calls,
-        [(json!("call_w"), json!("get_weather"), r#"{"city":"Paris"}"#.to_string())],
+        [(
+            json!("call_w"),
+            json!("get_weather"),
+            r#"{"city":"Paris"}"#.to_string()
+        )],
         "{chunks:?}"
     );
 }
@@ -767,7 +937,9 @@ async fn tokens_are_counted_without_the_defaults_of_a_messages_request() {
         &[("system_prompt", "You answer about Spice.")],
     );
     claude.params.insert("temperature".to_string(), json!(0.3));
-    claude.params.insert("max_completion_tokens".to_string(), json!(4096));
+    claude
+        .params
+        .insert("max_completion_tokens".to_string(), json!(4096));
     let routes = runtime_with(vec![claude]).await;
     taken(&seen);
 
@@ -802,7 +974,10 @@ async fn a_rejected_spicepod_default_names_the_param_that_sent_it() {
     )
     .await;
     assert_eq!(
-        (status, serde_json::from_str::<Value>(&body).expect("an envelope")),
+        (
+            status,
+            serde_json::from_str::<Value>(&body).expect("an envelope")
+        ),
         (
             StatusCode::BAD_REQUEST,
             json!({"type": "error", "error": {"type": "invalid_request_error", "message": "Failed to answer a Messages API request with Anthropic model 'claude-sonnet-4-6': the model does not accept the `temperature` parameter, which model 'claude' sets in its `params` (as `temperature`, `anthropic_temperature` or `openai_temperature`) for every request that leaves it unset. Remove `temperature` from the model's `params`, or set `from: anthropic:<model_id>` to a model that accepts it. Cause: `temperature` is deprecated for this model. See: https://spiceai.org/docs/components/models/anthropic"}})
@@ -814,7 +989,13 @@ async fn a_rejected_spicepod_default_names_the_param_that_sent_it() {
 async fn a_not_found_error_about_something_else_than_the_model_is_left_as_is() {
     let seen = Seen::default();
     let endpoint = start_provider(&seen).await;
-    let routes = runtime_with(vec![model("claude", "anthropic:claude-sonnet-4-6", &endpoint, &[])]).await;
+    let routes = runtime_with(vec![model(
+        "claude",
+        "anthropic:claude-sonnet-4-6",
+        &endpoint,
+        &[],
+    )])
+    .await;
 
     let (status, _, body) = send(
         &routes,
@@ -827,7 +1008,10 @@ async fn a_not_found_error_about_something_else_than_the_model_is_left_as_is() {
     )
     .await;
     assert_eq!(
-        (status, serde_json::from_str::<Value>(&body).expect("an envelope")),
+        (
+            status,
+            serde_json::from_str::<Value>(&body).expect("an envelope")
+        ),
         (
             StatusCode::NOT_FOUND,
             json!({"type": "error", "error": {"type": "not_found_error", "message": "File not found: file_missing"}})
@@ -876,5 +1060,12 @@ async fn a_chat_model_runs_spice_tools_in_one_message() {
         .filter(|(name, _)| name == "content_block_start")
         .map(|(_, data)| data["content_block"]["type"].clone())
         .collect();
-    assert_eq!(starts, [json!("mcp_tool_use"), json!("mcp_tool_result"), json!("text")]);
+    assert_eq!(
+        starts,
+        [
+            json!("mcp_tool_use"),
+            json!("mcp_tool_result"),
+            json!("text")
+        ]
+    );
 }

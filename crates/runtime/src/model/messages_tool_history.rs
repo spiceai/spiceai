@@ -118,7 +118,10 @@ fn replayed_tool_result(block: Value) -> Value {
     let mut result = tool_result_block(
         block.remove("tool_use_id").unwrap_or(Value::Null),
         block.remove("content").unwrap_or_else(|| json!([])),
-        block.remove("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
+        block
+            .remove("is_error")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false),
     );
     if let (Some(cache_control), Some(result)) =
         (block.remove("cache_control"), result.as_object_mut())
@@ -129,7 +132,10 @@ fn replayed_tool_result(block: Value) -> Value {
 }
 
 fn message(role: &str, content: Vec<Value>) -> Value {
-    json!({"role": role, "content": content})
+    let mut message = Map::new();
+    message.insert("role".to_string(), Value::from(role));
+    message.insert("content".to_string(), Value::Array(content));
+    Value::Object(message)
 }
 
 /// Whether the request's own MCP servers include one named [`SERVER_NAME`], whose blocks are
@@ -308,8 +314,10 @@ mod tests {
     #[test]
     fn results_that_end_a_turn_join_the_clients_own_results() {
         let completed = ToolOutcome::Completed(json!("42"));
-        let client_call = json!({"type": "tool_use", "id": "toolu_c", "name": "read_file", "input": {}});
-        let client_result = json!({"type": "tool_result", "tool_use_id": "toolu_c", "content": "file"});
+        let client_call =
+            json!({"type": "tool_use", "id": "toolu_c", "name": "read_file", "input": {}});
+        let client_result =
+            json!({"type": "tool_result", "tool_use_id": "toolu_c", "content": "file"});
         let received = json!({"messages": [
             {"role": "user", "content": "q"},
             {"role": "assistant", "content": [
@@ -387,8 +395,9 @@ mod tests {
         ]});
         assert_eq!(replay(&hosted), hosted);
 
-        let mut named_spice = hosted.clone();
-        named_spice["mcp_servers"] = json!([{"type": "url", "name": "spice", "url": "https://example.com/mcp"}]);
+        let mut named_spice = hosted;
+        named_spice["mcp_servers"] =
+            json!([{"type": "url", "name": "spice", "url": "https://example.com/mcp"}]);
         named_spice["messages"][1]["content"][0]["server_name"] = json!("spice");
         named_spice["messages"][1]["content"][1]["server_name"] = json!("spice");
         assert_eq!(replay(&named_spice), named_spice);

@@ -74,7 +74,10 @@ impl Messages for ChatMessages {
             .map_err(|e| MessagesError::api(format!("Failed to serialize the message: {e}")))
     }
 
-    async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError> {
+    async fn create_stream(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<MessageStream, MessagesError> {
         let mut request = parse(request)?;
         request.stream = Some(true);
         let model = request.model.clone();

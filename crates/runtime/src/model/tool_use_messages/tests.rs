@@ -36,7 +36,9 @@ impl SpiceModelTool for Sql {
     }
 
     fn parameters(&self) -> Option<Value> {
-        Some(json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}))
+        Some(
+            json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+        )
     }
 
     async fn call(&self, _arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -87,9 +89,17 @@ fn events_of(message: &Value, foreign_delta: Option<&str>) -> Vec<Value> {
     let usage = message["usage"].clone();
     start["usage"] = json!({"input_tokens": usage["input_tokens"], "output_tokens": 1});
     let mut events = vec![json!({"type": "message_start", "message": start})];
-    for (index, block) in message["content"].as_array().expect("content").iter().enumerate() {
+    for (index, block) in message["content"]
+        .as_array()
+        .expect("content")
+        .iter()
+        .enumerate()
+    {
         let halves = |text: &str| {
-            let middle = text.char_indices().nth(text.chars().count() / 2).map_or(0, |(i, _)| i);
+            let middle = text
+                .char_indices()
+                .nth(text.chars().count() / 2)
+                .map_or(0, |(i, _)| i);
             [text[..middle].to_string(), text[middle..].to_string()]
         };
         let (skeleton, deltas) = match block["type"].as_str().expect("a typed block") {
@@ -114,8 +124,12 @@ fn events_of(message: &Value, foreign_delta: Option<&str>) -> Vec<Value> {
             ),
             other => panic!("no events for {other}"),
         };
-        events.push(json!({"type": "content_block_start", "index": index, "content_block": skeleton}));
-        if index == 0 && let Some(delta_type) = foreign_delta {
+        events.push(
+            json!({"type": "content_block_start", "index": index, "content_block": skeleton}),
+        );
+        if index == 0
+            && let Some(delta_type) = foreign_delta
+        {
             events.push(json!({"type": "content_block_delta", "index": index, "delta": {"type": delta_type}}));
         }
         for delta in deltas {
@@ -138,7 +152,10 @@ impl Messages for Scripted {
         self.next(request)
     }
 
-    async fn create_stream(&self, request: MessagesRequest) -> Result<MessageStream, MessagesError> {
+    async fn create_stream(
+        &self,
+        request: MessagesRequest,
+    ) -> Result<MessageStream, MessagesError> {
         let message = self.next(request)?;
         Ok(Box::pin(futures::stream::iter(
             events_of(&message, self.foreign_delta).into_iter().map(Ok),
@@ -146,7 +163,9 @@ impl Messages for Scripted {
     }
 
     async fn count_tokens(&self, request: MessagesRequest) -> Result<Value, MessagesError> {
-        Ok(json!({"input_tokens": request.body.get("tools").and_then(Value::as_array).map_or(0, Vec::len)}))
+        Ok(
+            json!({"input_tokens": request.body.get("tools").and_then(Value::as_array).map_or(0, Vec::len)}),
+        )
     }
 }
 
@@ -188,7 +207,9 @@ fn accumulate(events: &[Value]) -> Value {
     let mut message = Value::Null;
     let mut partial: BTreeMap<usize, String> = BTreeMap::new();
     for event in events {
-        let index = event["index"].as_u64().and_then(|i| usize::try_from(i).ok());
+        let index = event["index"]
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok());
         match event["type"].as_str().expect("a typed event") {
             "message_start" => message = event["message"].clone(),
             "content_block_start" => {
@@ -208,18 +229,26 @@ fn accumulate(events: &[Value]) -> Value {
                         continue;
                     }
                     "input_json_delta" => {
-                        partial.entry(index).or_default().push_str(delta["partial_json"].as_str().expect("json"));
+                        partial
+                            .entry(index)
+                            .or_default()
+                            .push_str(delta["partial_json"].as_str().expect("json"));
                         continue;
                     }
                     other => panic!("unexpected delta {other}"),
                 };
-                let text = format!("{}{}", block[field].as_str().unwrap_or_default(), delta[field].as_str().unwrap_or_default());
+                let text = format!(
+                    "{}{}",
+                    block[field].as_str().unwrap_or_default(),
+                    delta[field].as_str().unwrap_or_default()
+                );
                 block[field] = Value::from(text);
             }
             "content_block_stop" => {
                 let index = index.expect("an index");
                 if let Some(json) = partial.remove(&index) {
-                    message["content"][index]["input"] = serde_json::from_str(&json).expect("whole input");
+                    message["content"][index]["input"] =
+                        serde_json::from_str(&json).expect("whole input");
                 }
             }
             "message_delta" => {
@@ -257,7 +286,13 @@ fn two_rounds() -> Vec<Value> {
             100,
             20,
         ),
-        round("msg_2", &json!([{"type": "text", "text": "There are 3 trips."}]), "end_turn", 150, 10),
+        round(
+            "msg_2",
+            &json!([{"type": "text", "text": "There are 3 trips."}]),
+            "end_turn",
+            150,
+            10,
+        ),
     ]
 }
 
@@ -316,23 +351,38 @@ async fn a_loop_over_spice_tools_answers_with_one_message() {
         {"role": "user", "content": "And yesterday?"},
     ]);
     replay_spice_tool_calls(&mut next_turn);
-    let mut expected = requests[1]["messages"].as_array().expect("messages").clone();
-    expected.push(json!({"role": "assistant", "content": [{"type": "text", "text": "There are 3 trips."}]}));
+    let mut expected = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .clone();
+    expected.push(
+        json!({"role": "assistant", "content": [{"type": "text", "text": "There are 3 trips."}]}),
+    );
     expected.push(json!({"role": "user", "content": "And yesterday?"}));
     assert_eq!(next_turn["messages"], Value::Array(expected));
 }
 
 #[tokio::test]
 async fn a_streamed_loop_carries_the_same_message() {
-    let unstreamed = using(&Scripted::new(two_rounds()), &Arc::new(Sql(AtomicUsize::new(0))), 10)
-        .create(request())
-        .await
-        .expect("a message");
+    let unstreamed = using(
+        &Scripted::new(two_rounds()),
+        &Arc::new(Sql(AtomicUsize::new(0))),
+        10,
+    )
+    .create(request())
+    .await
+    .expect("a message");
 
     let scripted = Scripted::new(two_rounds());
     let mut streamed_request = request();
-    streamed_request.body.insert("stream".to_string(), Value::Bool(true));
-    let events = streamed(&using(&scripted, &Arc::new(Sql(AtomicUsize::new(0))), 10), streamed_request).await;
+    streamed_request
+        .body
+        .insert("stream".to_string(), Value::Bool(true));
+    let events = streamed(
+        &using(&scripted, &Arc::new(Sql(AtomicUsize::new(0))), 10),
+        streamed_request,
+    )
+    .await;
 
     assert_eq!(accumulate(&events), unstreamed);
     assert_eq!(
@@ -378,15 +428,33 @@ async fn a_call_to_a_client_tool_ends_the_message_after_spice_runs_its_own() {
         (&message["content"], &message["stop_reason"]),
         (&expected_content, &json!("tool_use"))
     );
-    assert_eq!(scripted.requests().len(), 1, "the client runs its tool before another round");
+    assert_eq!(
+        scripted.requests().len(),
+        1,
+        "the client runs its tool before another round"
+    );
 
-    let events = streamed(&using(&Scripted::new(mixed), &Arc::new(Sql(AtomicUsize::new(0))), 10), request()).await;
+    let events = streamed(
+        &using(
+            &Scripted::new(mixed),
+            &Arc::new(Sql(AtomicUsize::new(0))),
+            10,
+        ),
+        request(),
+    )
+    .await;
     assert_eq!(accumulate(&events), message);
 }
 
 #[tokio::test]
 async fn the_last_round_runs_its_calls_and_pauses_the_turn() {
-    let looping = vec![round("msg_1", &json!([sql_call("toolu_1")]), "tool_use", 10, 5)];
+    let looping = vec![round(
+        "msg_1",
+        &json!([sql_call("toolu_1")]),
+        "tool_use",
+        10,
+        5,
+    )];
     let scripted = Scripted::new(looping.clone());
     let sql = Arc::new(Sql(AtomicUsize::new(0)));
     let message = using(&scripted, &sql, 1)
@@ -403,13 +471,27 @@ async fn the_last_round_runs_its_calls_and_pauses_the_turn() {
     );
     assert_eq!(sql.0.load(Ordering::SeqCst), 1);
 
-    let events = streamed(&using(&Scripted::new(looping), &Arc::new(Sql(AtomicUsize::new(0))), 1), request()).await;
+    let events = streamed(
+        &using(
+            &Scripted::new(looping),
+            &Arc::new(Sql(AtomicUsize::new(0))),
+            1,
+        ),
+        request(),
+    )
+    .await;
     assert_eq!(accumulate(&events), message);
 }
 
 #[tokio::test]
 async fn a_client_tool_of_the_same_name_is_the_clients_to_run() {
-    let scripted = Scripted::new(vec![round("msg_1", &json!([sql_call("toolu_1")]), "tool_use", 10, 5)]);
+    let scripted = Scripted::new(vec![round(
+        "msg_1",
+        &json!([sql_call("toolu_1")]),
+        "tool_use",
+        10,
+        5,
+    )]);
     let sql = Arc::new(Sql(AtomicUsize::new(0)));
     let mut shadowing = request();
     shadowing.body.insert(
@@ -435,27 +517,40 @@ async fn a_round_that_cannot_be_sent_back_ends_the_stream_with_an_error() {
         requests: Mutex::new(Vec::new()),
         foreign_delta: Some("compaction_delta"),
     });
-    let events = streamed(&using(&scripted, &Arc::new(Sql(AtomicUsize::new(0))), 10), request()).await;
+    let events = streamed(
+        &using(&scripted, &Arc::new(Sql(AtomicUsize::new(0))), 10),
+        request(),
+    )
+    .await;
     assert_eq!(
         events.last(),
-        Some(&json!({"type": "error", "error": {"type": "api_error", "message": "Spice ran its tools, but cannot send the model its own answer back to continue: the stream carried a `compaction_delta` delta, which Spice cannot complete a content block from. Send the request without `stream`."}}))
+        Some(
+            &json!({"type": "error", "error": {"type": "api_error", "message": "Spice ran its tools, but cannot send the model its own answer back to continue: the stream carried a `compaction_delta` delta, which Spice cannot complete a content block from. Send the request without `stream`."}})
+        )
     );
     assert_eq!(scripted.requests().len(), 1);
 }
 
 #[tokio::test]
 async fn tokens_are_counted_with_spice_tools() {
-    let counted = using(&Scripted::new(Vec::new()), &Arc::new(Sql(AtomicUsize::new(0))), 10)
-        .count_tokens(request())
-        .await
-        .expect("a count");
+    let counted = using(
+        &Scripted::new(Vec::new()),
+        &Arc::new(Sql(AtomicUsize::new(0))),
+        10,
+    )
+    .count_tokens(request())
+    .await
+    .expect("a count");
     assert_eq!(counted, json!({"input_tokens": 1}));
 }
 
 #[tokio::test]
 async fn a_forced_tool_choice_is_not_forced_again_after_a_round_that_called_tools() {
     for (forced, relaxed) in [
-        (json!({"type": "tool", "name": "sql"}), json!({"type": "auto"})),
+        (
+            json!({"type": "tool", "name": "sql"}),
+            json!({"type": "auto"}),
+        ),
         (
             json!({"type": "any", "disable_parallel_tool_use": true}),
             json!({"type": "auto", "disable_parallel_tool_use": true}),
@@ -464,7 +559,9 @@ async fn a_forced_tool_choice_is_not_forced_again_after_a_round_that_called_tool
     ] {
         let scripted = Scripted::new(two_rounds());
         let mut forcing = request();
-        forcing.body.insert("tool_choice".to_string(), forced.clone());
+        forcing
+            .body
+            .insert("tool_choice".to_string(), forced.clone());
         using(&scripted, &Arc::new(Sql(AtomicUsize::new(0))), 10)
             .create(forcing)
             .await
@@ -531,7 +628,11 @@ async fn a_spice_call_the_round_did_not_end_on_is_answered_without_running() {
 #[tokio::test]
 async fn a_streamed_spice_call_arrives_whole() {
     let events = streamed(
-        &using(&Scripted::new(two_rounds()), &Arc::new(Sql(AtomicUsize::new(0))), 10),
+        &using(
+            &Scripted::new(two_rounds()),
+            &Arc::new(Sql(AtomicUsize::new(0))),
+            10,
+        ),
         request(),
     )
     .await;
@@ -559,7 +660,8 @@ async fn a_streamed_spice_call_arrives_whole() {
 
 #[test]
 fn a_usage_field_a_round_reports_as_null_keeps_the_total() {
-    let mut total = json!({"input_tokens": 10, "cache_read_input_tokens": 5, "service_tier": "standard"});
+    let mut total =
+        json!({"input_tokens": 10, "cache_read_input_tokens": 5, "service_tier": "standard"});
     add_usage(
         &mut total,
         &json!({"input_tokens": 3, "cache_read_input_tokens": null, "service_tier": "priority"}),

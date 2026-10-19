@@ -19,9 +19,9 @@ use tokio::sync::RwLock;
 
 mod chat;
 mod embed;
+pub mod evaluate;
 pub(crate) mod messages;
 pub(crate) mod messages_tool_history;
-pub mod evaluate;
 pub(crate) mod metrics;
 mod model_context;
 pub(crate) mod nsql;
@@ -40,8 +40,8 @@ mod wrapper;
 
 pub use chat::{LLMChatCompletionsModelStore, LoadedChatModel, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
-pub use messages::{LLMMessagesModelStore, try_to_messages_model};
 pub use evaluate::{EvaluateModelStore, try_to_evaluate_model};
+pub use messages::{LLMMessagesModelStore, try_to_messages_model};
 pub use model_context::{
     ModelContextExtension, ModelContextLayer, add_tools_used, track_ai_inferences_with_spice_count,
 };

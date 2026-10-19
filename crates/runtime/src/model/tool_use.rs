@@ -27,14 +27,13 @@ use llms::chat::{Chat, Result as ChatResult};
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionCallStream, FunctionObject, FunctionType, PromptTokensDetails, ToolChoiceAllowedMode,
-    ToolChoiceOptions,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCall, FunctionCallStream, FunctionObject, FunctionType,
+    PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -1067,14 +1066,9 @@ fn take_tool_calls(
             return Vec::new();
         }
     };
-    let keys: Vec<(i32, i32)> = states
-        .keys()
-        .filter(|(choice, _)| u32::try_from(*choice).ok() == Some(choice_index))
-        .copied()
-        .collect();
-    let mut calls: Vec<(u32, ChatCompletionMessageToolCall)> = keys
-        .into_iter()
-        .filter_map(|key| Some((u32::try_from(key.1).ok()?, states.remove(&key)?)))
+    let mut calls: Vec<(u32, ChatCompletionMessageToolCall)> = states
+        .extract_if(|(choice, _), _| u32::try_from(*choice).ok() == Some(choice_index))
+        .filter_map(|((_, index), call)| Some((u32::try_from(index).ok()?, call)))
         .collect();
     calls.sort_by_key(|(index, _)| *index);
     calls

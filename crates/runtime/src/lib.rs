@@ -45,8 +45,8 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::DeferredRefreshOutcome;
 use crate::datafusion::error::format_datafusion_error;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-use crate::model::LLMResponsesModelStore;
 use crate::model::LLMMessagesModelStore;
+use crate::model::LLMResponsesModelStore;
 use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
