@@ -36,9 +36,7 @@
         "--concurrency",
         "10",
         "-p",
-        "./test/spicepods/search/mteb/quora/openai[text-embedding-3-small[chunking]]-duckdb[file].yaml",
-        "--benchmark-dataset",
-        "quora_retrieval"
+        "./test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml"
       ],
       "env": {},
       "cwd": "${workspaceFolder}",

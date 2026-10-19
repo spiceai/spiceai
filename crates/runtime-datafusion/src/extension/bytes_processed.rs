@@ -497,7 +497,7 @@ mod tests {
 
     use crate::config::request_context_config::SpiceRequestContextConfig;
     use crate::extension::bytes_processed::{BytesEmittedCallback, BytesProcessedExec};
-    use opentelemetry::trace::{SpanId, TraceId};
+    use opentelemetry::trace::{SpanId, TraceFlags, TraceId};
     use runtime_request_context::{Protocol, RequestContextBuilder, TraceParent};
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
@@ -703,7 +703,11 @@ mod tests {
 
         let cfg_ext = SpiceRequestContextConfig::from_request_context(&Arc::new(
             RequestContextBuilder::new(Protocol::FlightSQL)
-                .with_trace_parent(Some(TraceParent { trace_id, span_id }))
+                .with_trace_parent(Some(TraceParent {
+                    trace_id,
+                    span_id,
+                    trace_flags: TraceFlags::SAMPLED,
+                }))
                 .build(),
         ));
 
