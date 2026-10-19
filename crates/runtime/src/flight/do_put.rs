@@ -41,6 +41,7 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
+    accelerated::AcceleratedTable,
     cluster::partition,
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
@@ -223,6 +224,19 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
+    }
+
+    // The forwarding below assigns partition values apart from the assignments that reads
+    // of an accelerated dataset use, so a write that goes only to the acceleration is
+    // refused, as it is for SQL.
+    if let Some(table) = datafusion.get_table(&path).await
+        && let Some(refusal) = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .and_then(|accelerated| accelerated.scheduler_write_refusal("DoPut"))
+    {
+        return Err(Status::failed_precondition(refusal));
     }
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
