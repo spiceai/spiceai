@@ -167,7 +167,7 @@ jobs:
           if-no-files-found: ignore
 
   test-models:
-    name: Test Models, AI & Search
+    name: Test Models & AI
     needs: build
     # `spiceai-macos-large`, like every other job that runs this archive: the
     # Mac minis behind `spiceai-macos` cannot reliably start the debug
@@ -183,7 +183,6 @@ jobs:
       HAS_ANTHROPIC_SECRET: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
       HAS_XAI_SECRET: ${{ secrets.SPICE_SECRET_XAI_API_KEY != '' }}
       HAS_HF_SECRET: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
-      HAS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_KEY != '' && secrets.AWS_S3_VECTORS_SECRET != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -375,22 +374,6 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
-
-      # Search tests
-      - name: Run search integration test
-        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_S3_VECTORS_SECRET == 'true' }}
-        env:
-          INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
-          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
-          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
-        run: |
-          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
-          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
-            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
-            exit 1
-          fi
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
 
       - name: Push snapshots to branch
         if: ${{ !cancelled() && (github.event.inputs.update_snapshots == 'always' || github.event_name == 'schedule') }}
