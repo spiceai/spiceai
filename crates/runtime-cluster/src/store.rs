@@ -453,29 +453,109 @@ impl PartitionStore {
         }
     }
 
-    /// Adds new partitions to a table's metadata and assigns each to
-    /// its respective executor in a single OCC write.
+    /// Assigns each partition of `assignments` to its executor in one
+    /// cluster-document write, adding the partitions the table does not list
+    /// yet. A partition an executor already holds keeps it, so writers that
+    /// race to assign a new partition agree on one executor. Returns the
+    /// executor that holds each partition after the write, in the order of
+    /// `assignments`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the cluster state mutation fails (see [`Self::apply_assignments`]).
+    /// Returns an error if the table has no metadata or the cluster state
+    /// mutation fails.
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
         assignments: &[(&PartitionValue, &str)],
-    ) -> Result<()> {
-        if assignments.is_empty() {
-            return Ok(());
+    ) -> Result<Vec<String>> {
+        self.assign_partitions(table, None, assignments).await
+    }
+
+    /// [`Self::add_and_assign_partitions`] that also creates the table's entry,
+    /// partitioned by `partition_expressions`, when it has none, in the same
+    /// write: a reader sees either no entry or one listing these partitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn create_and_assign_partitions(
+        &self,
+        table: &TableReference,
+        partition_expressions: &[String],
+        assignments: &[(&PartitionValue, &str)],
+    ) -> Result<Vec<String>> {
+        self.assign_partitions(table, Some(partition_expressions), assignments)
+            .await
+    }
+
+    async fn assign_partitions(
+        &self,
+        table: &TableReference,
+        create_with: Option<&[String]>,
+        assignments: &[(&PartitionValue, &str)],
+    ) -> Result<Vec<String>> {
+        if assignments.is_empty() && create_with.is_none() {
+            return Ok(Vec::new());
         }
-        let requests: Vec<AssignmentRequest> = assignments
-            .iter()
-            .map(|(pv, executor)| AssignmentRequest {
-                table: table.clone(),
-                partition_value: (*pv).clone(),
-                executor_id: (*executor).to_string(),
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut owners: Vec<String> = Vec::new();
+        let mut missing = false;
+        self.cluster
+            .mutate(|state| {
+                owners.clear();
+                missing = false;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let mut changed = false;
+                if let Some(partition_expressions) = create_with
+                    && !map.contains_key(&key)
+                {
+                    map.insert(
+                        key.clone(),
+                        TablePartitionMetadata::new(table, now_ms, partition_expressions.to_vec()),
+                    );
+                    changed = true;
+                }
+                let Some(metadata) = map.get_mut(&key) else {
+                    missing = true;
+                    return MutationOutcome::NoChange;
+                };
+                for (partition_value, executor_id) in assignments {
+                    let position = if let Some(position) = metadata
+                        .partitions
+                        .iter()
+                        .position(|p| p.partition_value == **partition_value)
+                    {
+                        position
+                    } else {
+                        metadata.add_partition(PartitionMetadata::new((*partition_value).clone()));
+                        metadata.partitions.len() - 1
+                    };
+                    let partition = &mut metadata.partitions[position];
+                    if !partition.is_assigned() {
+                        partition.assign_to((*executor_id).to_string(), now_ms);
+                        changed = true;
+                    }
+                    owners.push(partition.assigned_executors[0].clone());
+                }
+                if changed {
+                    metadata.updated_at = now_ms;
+                    MutationOutcome::Apply
+                } else {
+                    MutationOutcome::NoChange
+                }
             })
-            .collect();
-        self.apply_assignments(&requests).await
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        if missing {
+            return Err(Error::TableMetadataNotFound { table: key });
+        }
+        Ok(owners)
     }
 
     /// Records one complete discovery of `table` in one cluster-document write:
@@ -921,6 +1001,47 @@ mod tests {
                 .expect("move again"),
             0
         );
+    }
+
+    /// Two writers that each assign a new partition to a different executor
+    /// agree on the first one's executor.
+    #[tokio::test]
+    async fn a_partition_another_writer_assigned_keeps_its_executor() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+        pm.initialize_metadata(&tbl, vec!["region".to_string()])
+            .await
+            .expect("init");
+        let east = partition_value("region", "'east'");
+        let west = partition_value("region", "'west'");
+
+        let first = pm
+            .add_and_assign_partitions(&tbl, &[(&east, "executor-1")])
+            .await
+            .expect("first writer");
+        let second = pm
+            .add_and_assign_partitions(&tbl, &[(&east, "executor-2"), (&west, "executor-2")])
+            .await
+            .expect("second writer");
+
+        assert_eq!(first, ["executor-1"]);
+        assert_eq!(second, ["executor-1", "executor-2"]);
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+        let owners = |value: &PartitionValue| {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value == *value)
+                .expect("partition")
+                .assigned_executors
+                .clone()
+        };
+        assert_eq!(owners(&east), ["executor-1"]);
+        assert_eq!(owners(&west), ["executor-2"]);
     }
 
     #[tokio::test]
