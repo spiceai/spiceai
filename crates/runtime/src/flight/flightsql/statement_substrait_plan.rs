@@ -422,7 +422,9 @@ mod tests {
     /// `datafusion-substrait` resolves a Substrait `like` to a same-named UDF
     /// first. Unless `decode_plan` lowers it to `Expr::Like`, the unparser sends
     /// a `DuckDB` acceleration `like(a, b)`, which `DuckDB` has no function for
-    /// (regression test for #15290).
+    /// (regression test for #15290). A pattern with a backslash must also carry
+    /// `ESCAPE '\'`: `DuckDB` has no default escape character, so without it the
+    /// pushed-down `LIKE` matches different rows than `DataFusion` evaluates.
     #[tokio::test]
     async fn decode_plan_lowers_a_substrait_like_to_a_like_expression() -> Result<(), anyhow::Error>
     {
@@ -451,8 +453,12 @@ mod tests {
                     "LARGE BRASS",
                     "SMALL TIN",
                     "PROMO brass",
+                    "a_b",
+                    r"a\_b",
+                    "50%",
+                    "50x",
                 ])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![15, 15, 3])),
+                Arc::new(Int32Array::from(vec![15, 15, 3, 4, 5, 6, 7])),
             ],
         )?;
         df.ctx.register_table(
@@ -460,25 +466,40 @@ mod tests {
             Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
         )?;
 
+        // (query, expected rows, whether the `DuckDB` SQL must name the escape)
         let queries = [
             (
                 "SELECT p_type FROM part WHERE p_size = 15 AND p_type LIKE '%BRASS' ORDER BY p_type",
                 "+-------------+\n| p_type      |\n+-------------+\n| LARGE BRASS |\n+-------------+",
+                false,
             ),
             (
                 "SELECT sum(CASE WHEN p_type LIKE 'PROMO%' THEN p_size ELSE 0 END) AS promo FROM part",
                 "+-------+\n| promo |\n+-------+\n| 3     |\n+-------+",
+                false,
             ),
             (
                 "SELECT p_type FROM part WHERE p_type ILIKE '%brass' AND p_type NOT LIKE 'LARGE%' ORDER BY p_type",
                 "+-------------+\n| p_type      |\n+-------------+\n| PROMO brass |\n+-------------+",
+                false,
             ),
             (
                 "SELECT p_type FROM part WHERE p_size IN (SELECT p_size FROM part WHERE p_type LIKE 'L%') ORDER BY p_type",
                 "+-------------+\n| p_type      |\n+-------------+\n| LARGE BRASS |\n| SMALL TIN   |\n+-------------+",
+                false,
+            ),
+            (
+                r"SELECT p_type FROM part WHERE p_type LIKE '%a\_b%' ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| a_b    |\n+--------+",
+                true,
+            ),
+            (
+                r"SELECT p_type FROM part WHERE p_type LIKE '50\%' ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
+                true,
             ),
         ];
-        for (sql, expected) in queries {
+        for (sql, expected, names_escape) in queries {
             let plan = df.ctx.sql(sql).await?.into_unoptimized_plan();
             let proto = to_substrait_plan(&plan, &df.ctx.state())?;
             let (decoded, _) = decode_plan(
@@ -496,6 +517,11 @@ mod tests {
                 .to_string();
             assert!(
                 !duckdb_sql.contains("like(") && duckdb_sql.contains("LIKE"),
+                "{sql} unparsed for DuckDB as: {duckdb_sql}"
+            );
+            assert_eq!(
+                duckdb_sql.contains(r"ESCAPE '\'"),
+                names_escape,
                 "{sql} unparsed for DuckDB as: {duckdb_sql}"
             );
 
