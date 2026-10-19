@@ -295,6 +295,10 @@ fn model(name: &str, from: &str, endpoint: &str, extra: &[(&str, &str)]) -> Mode
 }
 
 async fn runtime_with(models: Vec<Model>) -> Router {
+    runtime_with_cors(models, &CorsConfig::default()).await
+}
+
+async fn runtime_with_cors(models: Vec<Model>, cors: &CorsConfig) -> Router {
     let mut app = AppBuilder::new("messages");
     for model in models {
         app = app.with_model(model);
@@ -311,7 +315,7 @@ async fn runtime_with(models: Vec<Model>) -> Router {
         Arc::new(Config::new()),
         search,
         None,
-        &CorsConfig::default(),
+        cors,
         false,
         #[cfg(feature = "mcp")]
         None,
@@ -1068,4 +1072,55 @@ async fn a_chat_model_runs_spice_tools_in_one_message() {
             json!("text")
         ]
     );
+}
+
+/// A browser calling the Messages API sends its `anthropic-*` headers, which a CORS preflight
+/// has to allow for the call to be made at all.
+#[tokio::test]
+async fn a_browser_preflight_allows_the_messages_api_headers() {
+    let routes = runtime_with_cors(
+        Vec::new(),
+        &CorsConfig {
+            enabled: true,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+        },
+    )
+    .await;
+    let requested = "content-type, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access";
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = routes
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri(path)
+                    .header(header::ORIGIN, "https://app.example.com")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, requested)
+                    .body(Body::empty())
+                    .expect("a preflight"),
+            )
+            .await
+            .expect("a response");
+        let header_of = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_ascii_lowercase)
+        };
+        assert_eq!(
+            header_of(header::ACCESS_CONTROL_ALLOW_ORIGIN).as_deref(),
+            Some("https://app.example.com"),
+            "{path}"
+        );
+        let allowed = header_of(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap_or_default();
+        let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+        for name in requested.split(',').map(str::trim) {
+            assert!(
+                allowed.contains(&name),
+                "{path}: {name} is not allowed: {allowed:?}"
+            );
+        }
+    }
 }

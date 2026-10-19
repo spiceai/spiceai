@@ -245,7 +245,12 @@ fn with_model_defaults(body: &mut Map<String, Value>, defaults: &[(String, Value
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty());
-    for (key, value) in defaults {
+    // `parallel_tool_calls` sets a field of `tool_choice`, and creates it when it is missing, so it
+    // is applied after a `tool_choice` default: the defaults come in no fixed order.
+    let (parallel, others): (Vec<_>, Vec<_>) = defaults
+        .iter()
+        .partition(|(key, _)| key == "parallel_tool_calls");
+    for (key, value) in others.into_iter().chain(parallel) {
         let applied = match key.as_str() {
             "temperature" | "top_p" => set_default(body, key, value.as_f64().map(Value::from)),
             "max_completion_tokens" => {
@@ -672,6 +677,27 @@ mod tests {
                 "stop_sequences": ["END"],
             })
         );
+    }
+
+    /// A Spicepod's defaults come in no fixed order: the tool choice it sets is kept whichever
+    /// of `tool_choice` and `parallel_tool_calls` is applied first.
+    #[test]
+    fn a_tool_choice_default_is_kept_whatever_the_order_of_the_defaults() {
+        let tool_choice = ("tool_choice".to_string(), json!("required"));
+        let parallel = ("parallel_tool_calls".to_string(), json!(false));
+        for defaults in [
+            vec![tool_choice.clone(), parallel.clone()],
+            vec![parallel, tool_choice],
+        ] {
+            let mut request =
+                body(&json!({"messages": [], "tools": [{"name": "t", "input_schema": {}}]}));
+            with_model_defaults(&mut request, &defaults, "claude");
+            assert_eq!(
+                request["tool_choice"],
+                json!({"type": "any", "disable_parallel_tool_use": true}),
+                "{defaults:?}"
+            );
+        }
     }
 
     #[test]

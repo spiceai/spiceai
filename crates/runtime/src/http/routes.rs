@@ -1172,13 +1172,17 @@ const CORS_ALLOWED_HEADERS: &[&str] = &[
     "mcp-name",
     "mcp-session-id",
     "x-api-key",
+    // The Messages API's own headers, which a browser client of `/v1/messages` sends.
+    "anthropic-version",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
 ];
 
 /// Closed-set `Access-Control-Allow-Headers` when a requested name is
 /// not a valid [`HeaderValue`]. Must stay aligned with
 /// [`CORS_ALLOWED_HEADERS`].
 const CORS_ALLOWED_HEADERS_VALUE: HeaderValue = HeaderValue::from_static(
-    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key",
+    "accept, content-type, authorization, mcp-protocol-version, mcp-method, mcp-name, mcp-session-id, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access",
 );
 
 fn is_allowed_cors_request_header(name: &str) -> bool {
