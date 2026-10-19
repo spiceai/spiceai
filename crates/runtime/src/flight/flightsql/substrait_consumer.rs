@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DFSchema, Result, ScalarValue, TableReference, substrait_err};
 use datafusion::execution::{FunctionRegistry, SessionState};
-use datafusion::logical_expr::expr::{Like, ScalarFunction as ScalarFunctionExpr};
+use datafusion::logical_expr::expr::{Cast, Like, ScalarFunction as ScalarFunctionExpr, TryCast};
 use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
@@ -61,6 +61,39 @@ impl<'a> SpiceSubstraitConsumer<'a> {
             outer_schemas: RwLock::new(Vec::new()),
             lambda_consumer: DefaultSubstraitLambdaConsumer::new(),
         }
+    }
+}
+
+/// Evaluates a cast of a literal (at any depth) with `DataFusion`'s own cast, so
+/// the pattern reaches a federated or accelerated source as the value
+/// `DataFusion` would compare against. Left as a cast, the unparser can render
+/// the literal in a form the source reads differently: `DuckDB` takes
+/// `CAST(X'35305c25' AS VARCHAR)` as the text `x35305c25`, not `50\%`.
+fn fold_literal_casts(pattern: Expr) -> Result<Expr> {
+    match pattern {
+        Expr::Cast(Cast { expr, field }) => match fold_literal_casts(*expr)? {
+            Expr::Literal(value, metadata) => {
+                Ok(Expr::Literal(value.cast_to(field.data_type())?, metadata))
+            }
+            expr => Ok(Expr::Cast(Cast {
+                expr: Box::new(expr),
+                field,
+            })),
+        },
+        Expr::TryCast(TryCast { expr, field }) => match fold_literal_casts(*expr)? {
+            Expr::Literal(value, metadata) => {
+                let value = match value.cast_to(field.data_type()) {
+                    Ok(value) => value,
+                    Err(_) => ScalarValue::try_from(field.data_type())?,
+                };
+                Ok(Expr::Literal(value, metadata))
+            }
+            expr => Ok(Expr::TryCast(TryCast {
+                expr: Box::new(expr),
+                field,
+            })),
+        },
+        pattern => Ok(pattern),
     }
 }
 
@@ -111,6 +144,7 @@ fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
     let (Some(expr), Some(pattern)) = (args.next(), args.next()) else {
         return substrait_err!("Expected two or three arguments for `{}`", func.name());
     };
+    let pattern = fold_literal_casts(pattern)?;
     let escape_char = match args.next() {
         None => None,
         Some(Expr::Literal(ScalarValue::Utf8(escape), _)) => escape.and_then(|s| s.chars().next()),
