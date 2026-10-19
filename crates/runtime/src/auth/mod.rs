@@ -132,18 +132,29 @@ impl EndpointAuth {
         }
 
         let datasets = app.datasets.iter().filter_map(|dataset| {
-            if let Some(access) = access_name(&dataset.access) {
-                Some(format!("dataset '{}' (`access: {access}`)", dataset.name))
+            if dataset.access != AccessMode::Read {
+                Some(format!(
+                    "dataset '{}' (`access: {}`)",
+                    dataset.name,
+                    dataset.access.as_str()
+                ))
             } else if dataset.acceleration.as_ref().is_some_and(|a| a.enabled) {
                 Some(format!("dataset '{}' (accelerated)", dataset.name))
             } else {
                 None
             }
         });
-        let catalogs = app.catalogs.iter().filter_map(|catalog| {
-            access_name(&catalog.access)
-                .map(|access| format!("catalog '{}' (`access: {access}`)", catalog.name))
-        });
+        let catalogs = app
+            .catalogs
+            .iter()
+            .filter(|catalog| catalog.access != AccessMode::Read)
+            .map(|catalog| {
+                format!(
+                    "catalog '{}' (`access: {}`)",
+                    catalog.name,
+                    catalog.access.as_str()
+                )
+            });
         let writable: Vec<String> = datasets.chain(catalogs).collect();
         if writable.is_empty() {
             return None;
@@ -153,15 +164,6 @@ impl EndpointAuth {
             "`runtime.auth` is not configured, so any caller who can reach this runtime can modify {}. Configure `runtime.auth` with a read-write API key, or restrict network access to authorized callers. See https://spiceai.org/docs/api/auth",
             writable.join(", ")
         ))
-    }
-}
-
-/// The Spicepod name of a write `access` mode, or `None` for read-only access.
-fn access_name(access: &AccessMode) -> Option<&'static str> {
-    match access {
-        AccessMode::Read => None,
-        AccessMode::ReadWrite => Some("read_write"),
-        AccessMode::ReadWriteCreate => Some("read_write_create"),
     }
 }
 
