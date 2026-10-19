@@ -64,9 +64,33 @@ impl<'a> SpiceSubstraitConsumer<'a> {
     }
 }
 
+/// Whether a `LIKE` pattern can contain a backslash: any pattern that is not a
+/// string literal (seen through casts), or a literal that contains one.
+fn pattern_may_contain_backslash(pattern: &Expr) -> bool {
+    match pattern {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(p))
+            | ScalarValue::LargeUtf8(Some(p))
+            | ScalarValue::Utf8View(Some(p)),
+            _,
+        ) => p.contains('\\'),
+        Expr::Literal(_, _) => false,
+        Expr::Cast(cast) => pattern_may_contain_backslash(&cast.expr),
+        Expr::TryCast(cast) => pattern_may_contain_backslash(&cast.expr),
+        _ => true,
+    }
+}
+
 /// Rewrites a call to the Spark `like` / `ilike` function into [`Expr::Like`],
 /// taking an optional third argument as the escape character the way
 /// `datafusion-substrait` does. Any other expression is returned unchanged.
+///
+/// With no escape character, `DataFusion` and the Spark functions escape with a
+/// backslash, while `DuckDB` and `SQLite` have no default escape, so a pushed-down
+/// `a LIKE '50\%'` would match different rows there. A pattern that can carry a
+/// backslash therefore names it (`ESCAPE '\'`), which `DataFusion` evaluates
+/// exactly as no escape. Any other pattern keeps the plain `LIKE` every engine
+/// reads the same way.
 fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
     let Expr::ScalarFunction(ScalarFunctionExpr { func, args }) = expr else {
         return Ok(expr);
@@ -93,7 +117,8 @@ fn spark_like_to_like_expr(expr: Expr) -> Result<Expr> {
                 func.name()
             );
         }
-    };
+    }
+    .or_else(|| pattern_may_contain_backslash(&pattern).then_some('\\'));
 
     Ok(Expr::Like(Like::new(
         false,
