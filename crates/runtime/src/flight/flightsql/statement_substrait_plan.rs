@@ -421,8 +421,8 @@ mod tests {
     /// The session registers `datafusion-spark`'s `like` and `ilike`, and
     /// `datafusion-substrait` resolves a Substrait `like` to a same-named UDF
     /// first. Unless `decode_plan` lowers it to `Expr::Like`, the unparser sends
-    /// a DuckDB acceleration `like(a, b)`, which DuckDB has no function for
-    /// (the `Substrait compliance` Mode B TPC-H DuckDB rows, q02/q09/q13/q14/q16/q20).
+    /// a `DuckDB` acceleration `like(a, b)`, which `DuckDB` has no function for
+    /// (regression test for #15290).
     #[tokio::test]
     async fn decode_plan_lowers_a_substrait_like_to_a_like_expression() -> Result<(), anyhow::Error>
     {
