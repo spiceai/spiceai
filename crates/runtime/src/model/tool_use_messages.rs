@@ -307,7 +307,8 @@ async fn run_calls(tools: &SpiceTools, calls: &[Value]) -> Outcomes {
 /// round.
 ///
 /// A `tool_choice` that forces a call, `any` or a named tool, is satisfied once a round has
-/// called one, so the next round gets `auto`, with the request's own parallel tool use setting.
+/// called one, so the next round gets `auto`, with the request's own parallel tool use setting;
+/// so does a request without a choice.
 /// Sending it again would force a call on every round until `tool_recursion_limit` ran out, and
 /// the turn could never end in an answer.
 fn add_round(body: &mut Map<String, Value>, content: Vec<Value>, outcomes: &Outcomes) {
@@ -319,14 +320,23 @@ fn add_round(body: &mut Map<String, Value>, content: Vec<Value>, outcomes: &Outc
         messages.push(message("assistant", content));
         messages.push(message("user", results));
     }
-    if let Some(choice) = body.get_mut("tool_choice").and_then(Value::as_object_mut)
-        && matches!(
-            choice.get("type").and_then(Value::as_str),
-            Some("any" | "tool")
-        )
-    {
-        choice.insert("type".to_string(), Value::from("auto"));
-        choice.remove("name");
+    match body.get_mut("tool_choice") {
+        // A request without a choice is given the model's Spicepod `tool_choice` default on every
+        // round, below this loop, so the next round states `auto` for the default not to force
+        // another call.
+        None | Some(Value::Null) => {
+            body.insert("tool_choice".to_string(), json!({"type": "auto"}));
+        }
+        Some(Value::Object(choice))
+            if matches!(
+                choice.get("type").and_then(Value::as_str),
+                Some("any" | "tool")
+            ) =>
+        {
+            choice.insert("type".to_string(), Value::from("auto"));
+            choice.remove("name");
+        }
+        Some(_) => {}
     }
 }
 

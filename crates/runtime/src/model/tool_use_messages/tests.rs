@@ -556,19 +556,28 @@ async fn a_forced_tool_choice_is_not_forced_again_after_a_round_that_called_tool
             json!({"type": "auto", "disable_parallel_tool_use": true}),
         ),
         (json!({"type": "auto"}), json!({"type": "auto"})),
+        (json!({"type": "none"}), json!({"type": "none"})),
+        // A request without a choice gets the model's Spicepod default below this loop, on
+        // every round, so the next round states `auto` rather than receive a forced default.
+        (Value::Null, json!({"type": "auto"})),
     ] {
         let scripted = Scripted::new(two_rounds());
         let mut forcing = request();
-        forcing
-            .body
-            .insert("tool_choice".to_string(), forced.clone());
+        if !forced.is_null() {
+            forcing
+                .body
+                .insert("tool_choice".to_string(), forced.clone());
+        }
         using(&scripted, &Arc::new(Sql(AtomicUsize::new(0))), 10)
             .create(forcing)
             .await
             .expect("a message");
         let requests = scripted.requests();
         assert_eq!(
-            (&requests[0]["tool_choice"], &requests[1]["tool_choice"]),
+            (
+                requests[0].get("tool_choice").unwrap_or(&Value::Null),
+                &requests[1]["tool_choice"]
+            ),
             (&forced, &relaxed)
         );
     }

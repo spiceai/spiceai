@@ -773,3 +773,42 @@ fn a_documents_title_and_context_are_kept_for_every_source() {
         ])
     );
 }
+
+/// A text block carries over its text; its `citations`, which point into documents an earlier
+/// answer was given, are left behind like that answer's thinking; any other field is refused.
+#[test]
+fn a_text_block_is_carried_over_and_an_unknown_field_of_it_refused() {
+    let history = |assistant_text: Value| {
+        json!({
+            "model": "gpt",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Summarize.", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [assistant_text]},
+                {"role": "user", "content": "More?"},
+            ],
+        })
+    };
+    let chat = translated(&history(json!({
+        "type": "text",
+        "text": "It grew 4%.",
+        "citations": [{"type": "char_location", "cited_text": "grew 4%", "document_index": 0, "start_char_index": 0, "end_char_index": 7}],
+    })))
+    .expect("history with citations");
+    assert_eq!(
+        chat["messages"][1],
+        json!({"role": "assistant", "content": "It grew 4%."})
+    );
+
+    let error = translated(&history(
+        json!({"type": "text", "text": "It grew 4%.", "highlight": true}),
+    ))
+    .expect_err("an unknown text-block field");
+    assert!(
+        error
+            .message
+            .contains("cannot carry `highlight` on a text block."),
+        "{}",
+        error.message
+    );
+}

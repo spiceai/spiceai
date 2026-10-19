@@ -1124,3 +1124,35 @@ async fn a_browser_preflight_allows_the_messages_api_headers() {
         }
     }
 }
+
+/// A model's Spicepod `tool_choice` forces the first round only, as a request's own does: a
+/// loop that called a Spice tool tells the next round `auto`, which the default does not
+/// override.
+#[tokio::test]
+async fn a_spicepod_tool_choice_default_forces_only_the_first_round() {
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let routes = runtime_with(vec![model(
+        "claude",
+        "anthropic:claude-sonnet-4-6",
+        &endpoint,
+        &[("tools", "list_datasets"), ("tool_choice", "required")],
+    )])
+    .await;
+    taken(&seen);
+
+    for stream in [false, true] {
+        let request = json!({"model": "claude", "max_tokens": 100, "stream": stream, "messages": [{"role": "user", "content": "Which datasets are there?"}]});
+        let (status, _, body) = send(&routes, "/v1/messages", &[], &request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rounds = taken(&seen);
+        assert_eq!(
+            rounds
+                .iter()
+                .map(|round| round.body["tool_choice"].clone())
+                .collect::<Vec<_>>(),
+            [json!({"type": "any"}), json!({"type": "auto"})],
+            "stream: {stream}"
+        );
+    }
+}

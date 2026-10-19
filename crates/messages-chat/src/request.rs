@@ -44,8 +44,8 @@ use async_openai::types::chat::{
 use messages_api::MessagesError;
 use messages_api::types::{
     ContentBlockParam, CreateMessageRequest, CustomToolParam, DocumentBlockParam, DocumentSource,
-    ImageSource, MessageContent, MessageParam, OutputFormat, Role, SystemPrompt, ToolChoice,
-    ToolParam, ToolResultBlockParam, ToolResultContent,
+    ImageSource, MessageContent, MessageParam, OutputFormat, Role, SystemPrompt, TextBlockParam,
+    ToolChoice, ToolParam, ToolResultBlockParam, ToolResultContent,
 };
 
 /// Where to read about serving the Messages API with a model.
@@ -195,7 +195,7 @@ fn system_content(
     let mut parts = blocks
         .into_iter()
         .map(|block| match block {
-            ContentBlockParam::Text(text) => Ok(text.text),
+            ContentBlockParam::Text(text) => text_of(model, text),
             other => Err(unsupported(
                 model,
                 &format!("a `{}` block in a system prompt", other.block_type()),
@@ -263,6 +263,25 @@ fn append_message(
         }
     }
     Ok(())
+}
+
+/// A text block's text. Its `cache_control` only says how to cache the prompt, and its
+/// `citations`, which point into the documents an earlier answer was given, are left behind
+/// like that answer's thinking: the chat completion has no place for either. Any other field is
+/// refused by name.
+fn text_of(model: &str, block: TextBlockParam) -> Result<String, MessagesError> {
+    if let Some(field) = block
+        .other
+        .keys()
+        .find(|field| !matches!(field.as_str(), "type" | "cache_control"))
+    {
+        return Err(unsupported(
+            model,
+            &format!("`{field}` on a text block"),
+            &format!("Remove `{field}`, or use a model with `from: anthropic`."),
+        ));
+    }
+    Ok(block.text)
 }
 
 fn user_message(content: ChatCompletionRequestUserMessageContent) -> ChatCompletionRequestMessage {
@@ -336,7 +355,7 @@ fn append_user_part(
     parts: &mut Vec<ChatCompletionRequestUserMessageContentPart>,
 ) -> Result<(), MessagesError> {
     match block {
-        ContentBlockParam::Text(text) => parts.push(text_part(text.text)),
+        ContentBlockParam::Text(text) => parts.push(text_part(text_of(model, text)?)),
         ContentBlockParam::Image(image) => parts.push(image_part(model, image.source)?),
         ContentBlockParam::Document(document) => append_document(model, document, parts)?,
         other => {
@@ -456,7 +475,7 @@ fn tool_message(
             let mut texts = Vec::new();
             for block in blocks {
                 match block {
-                    ContentBlockParam::Text(text) => texts.push(text.text),
+                    ContentBlockParam::Text(text) => texts.push(text_of(model, text)?),
                     ContentBlockParam::Image(image) => {
                         images.push(image_part(model, image.source)?);
                     }
@@ -509,7 +528,9 @@ fn assistant_blocks(
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block {
-            ContentBlockParam::Text(block) => text.get_or_insert_default().push_str(&block.text),
+            ContentBlockParam::Text(block) => text
+                .get_or_insert_default()
+                .push_str(&text_of(model, block)?),
             ContentBlockParam::ToolUse(tool_use) => {
                 tool_calls.push(ChatCompletionMessageToolCalls::Function(
                     ChatCompletionMessageToolCall {
