@@ -638,7 +638,7 @@ async fn test_basic(
         content_pattern(model_name, "Hello")
     );
 
-    let _ = run_test(
+    let resp = run_test(
         model_name,
         "basic",
         req,
@@ -647,6 +647,17 @@ async fn test_basic(
     )
     .await
     .expect("test failed");
+
+    // A reply that answers is not a refusal: as in `OpenAI`'s API, `refusal` is unset unless the
+    // model declined, and the `ai_*` decision functions fail a request whose reply refuses.
+    if let Some(resp) = resp {
+        for choice in &resp.choices {
+            assert_eq!(
+                choice.message.refusal, None,
+                "{model_name} (stream: {as_stream}) answered and still reported a refusal"
+            );
+        }
+    }
 }
 
 #[rstest]

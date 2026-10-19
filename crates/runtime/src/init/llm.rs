@@ -37,7 +37,7 @@ pub(crate) struct LoadedLlm {
 
 impl Runtime {
     /// Loads a chat model from the spicepod, and its Responses API and native Messages API
-    /// endpoints when `capabilities` include them. If an error occurs, no retry attempt is made.
+    /// endpoints when `capabilities` include them.
     ///
     /// A Responses or Messages endpoint that fails to load is left out, so the model is
     /// unavailable on `/v1/responses` or `/v1/messages` while its chat still serves.

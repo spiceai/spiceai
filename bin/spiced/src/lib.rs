@@ -1214,6 +1214,12 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
              to reject certificate-less clients, or configure `runtime.auth`."
         );
     }
+    if let Some(app) = app.as_ref()
+        && let Some(warning) =
+            endpoint_auth.unauthenticated_writes_warning(app, client_auth_mode.into_spicepod())
+    {
+        tracing::warn!("{warning}");
+    }
     let endpoint_auth = endpoint_auth.with_identity_source(identity_source);
 
     // Captured before `args` is moved into the server task below.

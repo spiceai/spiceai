@@ -172,6 +172,41 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl Error {
+    /// Whether the error is a mistake in the model's Spicepod configuration, which only a
+    /// change to the Spicepod can clear. A refusal from the provider is not one: a missing
+    /// model, a bad key or an exhausted quota can be fixed on the provider's side.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        match self {
+            Self::LocalModelNotFound { .. }
+            | Self::LocalModelConfigNotFound { .. }
+            | Self::LocalTokenizerNotFound { .. }
+            | Self::UnsupportedModelType { .. }
+            | Self::ModelNotProvided { .. }
+            | Self::UnknownModelSource { .. }
+            | Self::UnsupportedTaskForModel { .. }
+            | Self::EvaluateOnlyModel { .. }
+            | Self::InvalidParamValueError { .. }
+            | Self::MissingParamError { .. }
+            | Self::ModelMissingWeights { .. }
+            | Self::UnsafePickleWeight { .. }
+            | Self::ModelParameterFailed { .. }
+            | Self::ResponsesNotSupported { .. } => true,
+            // A loader can wrap a configuration error, such as rejected pickle weights.
+            Self::FailedToLoadModel { source } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_configuration_error),
+            Self::HealthCheckError { .. }
+            | Self::FailedToRunModel { .. }
+            | Self::ModelNotFound { .. }
+            | Self::FailedToLoadTokenizer { .. }
+            | Self::ModelFileMissing { .. }
+            | Self::ToolNotFound { .. } => false,
+        }
+    }
+}
+
 /// The kind of failure a provider's [`ApiError`] reports.
 ///
 /// Providers put the kind in either field: `OpenAI` sends `type: invalid_request_error`
