@@ -28,10 +28,18 @@ limitations under the License.
 //!
 //! # Write kinds
 //!
-//! One `ChangeBatch` is one logical write. There are four kinds: CDC rows,
-//! a plain append, a scoped append (rows for a declared set that must not
-//! collide with rows outside it), and a set replacement (delete a declared
-//! set, then append its new rows).
+//! A producer submits one `ChangeBatch` per logical write. There are four
+//! kinds: CDC rows, a plain append, a scoped append (rows for a declared set,
+//! a `SetKey` scope, that must not collide with rows outside it), and a set
+//! replacement (delete the scope, then append its new rows). Row writes can
+//! carry an `AppendIngress` lane to opt into coalescing.
+//!
+//! A backend applies a `ChangeWrite`, which has no lane. The owner merges the
+//! row writes of one lane into one `RowsWrite`: plain appends into
+//! `RowsWrite::Unscoped`, and scoped appends and replacements into
+//! `RowsWrite::Scoped`, which keeps each input's scope, chunk range and
+//! `ScopeKind`. A scoped burst deletes every replaced scope once, then
+//! appends all rows.
 //!
 //! # Producer flow
 //!
@@ -60,9 +68,13 @@ limitations under the License.
 //!
 //! One task per sink takes commands from a bounded queue in order:
 //!
-//! - It coalesces CDC inputs from one `CdcIngress` lane, and appends that
-//!   opt in through an `AppendIngress`, into one burst. `CoalescingLimits`
-//!   bound the burst. A command that does not fit is carried to the next turn.
+//! - It coalesces CDC inputs from one `CdcIngress` lane, and row writes from
+//!   one `AppendIngress` lane, into one burst. `CoalescingLimits` bound the
+//!   burst. A command that does not fit is carried to the next turn.
+//! - It admits a scoped row write to a burst only while no replaced scope in
+//!   the burst can hold another member's rows. Then deleting every replaced
+//!   scope before one append stores the same rows as applying the members in
+//!   order.
 //! - It prepares a whole CDC burst before any mutation: it decodes every
 //!   input, rejects unknown operations and rebuild markers, classifies
 //!   schemas with the lane's `CdcPolicy`, and refuses a non-live schema
@@ -71,6 +83,9 @@ limitations under the License.
 //!   gets the same error, and the generation needs recovery. One exception:
 //!   a `Recovery::Rebuildable` write that fails with a `before_mutation`
 //!   refusal fails only that write, because storage did not change.
+//! - When a backend refuses a coalesced scoped write before mutation and names
+//!   the first member that would be refused on its own, the owner applies the
+//!   members before it, refuses that member, and coalesces the rest again.
 //!
 //! # Backends
 //!
@@ -95,9 +110,9 @@ limitations under the License.
 //!
 //! Cayenne with `cdc_durability: memory` appends `Recovery::Replayable` CDC
 //! rows to an in-memory tier and returns `StorageDurability::Deferred(epoch)`.
-//! The rows are
-//! visible, but they are not durable yet. The source must not acknowledge
-//! its replication position until a checkpoint makes that epoch durable:
+//! The rows are visible, but they are not durable yet. The source must not
+//! acknowledge its replication position until a checkpoint makes that epoch
+//! durable:
 //!
 //! ```text
 //!  time -->

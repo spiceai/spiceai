@@ -18,10 +18,13 @@ limitations under the License.
 //!
 //! A scoped append or set replacement declares the set of rows it writes.
 //! Before `ProviderChangeSinkBackend::apply_rows` mutates, these checks refuse
-//! (with `before_mutation`) incoming rows whose unique keys collide with rows
-//! outside the declared scope, or with rows of another scope in the same
-//! coalesced append. They also refuse keys they cannot compare safely, such
-//! as NULL-bearing unique keys.
+//! incoming rows whose unique keys collide with stored rows outside the
+//! input's scope, or with rows of another scope in the same coalesced write.
+//! A stored row in a scope that an earlier input replaces is not a conflict.
+//! One probe serves every input of the write. A key conflict is refused with
+//! `member_refusal`, which names the first input that would be refused on its
+//! own. They also refuse keys they cannot compare safely, such as
+//! NULL-bearing unique keys.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};

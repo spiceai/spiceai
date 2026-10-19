@@ -115,8 +115,9 @@ pub struct CoalescingLimits {
 /// Opt-in append batching for one producer lane. It contains no row queue,
 /// source acknowledgement, or replacement policy.
 ///
-/// The caching-mode writer attaches one with `ChangeBatch::with_append_ingress`,
-/// so that many small cache appends become one write.
+/// The caching-mode writer sets one as the `lane` of each `ChangeBatch` it
+/// submits, so that many small cache fills, appends and replacements, become
+/// one write.
 #[derive(Debug)]
 pub struct AppendIngress {
     pub limits: CoalescingLimits,
