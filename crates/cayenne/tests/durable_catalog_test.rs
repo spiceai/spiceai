@@ -245,7 +245,7 @@ fn assert_same_catalog(
 }
 
 /// A history long enough to rotate several times, with inline appends,
-/// upserts of existing keys, deletes, a change set too large to inline, and a
+/// upserts of existing keys, deletes, a transaction too large to inline, and a
 /// checkpoint of the inline rows into data files.
 async fn write_history(table: &CayenneTableProvider, ctx: &SessionContext, writes: i64) {
     for i in 0..writes {
@@ -263,7 +263,7 @@ async fn write_history(table: &CayenneTableProvider, ctx: &SessionContext, write
                 .expect("delete");
         }
         if i == writes / 2 {
-            // Large enough that its change set is uploaded as its own object.
+            // Large enough that its transaction is uploaded as its own object.
             insert(table, batch(100_000..104_000, "bulk")).await;
             table
                 .checkpoint_inlined_data()

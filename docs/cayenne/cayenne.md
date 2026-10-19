@@ -122,29 +122,36 @@ acceleration that sets neither `engine` nor `mode` selects fully in-RAM Cayenne.
   when that param is unset — with `catalog/`, `warm/` (the data directory) and the
   datalake tier's `<table>-<table_id>/` beneath it. Local disk holds only a replica of
   the catalog under `<metadata_dir>/datalake/<dataset>/cayenne.db`. Every catalog
-  transaction is captured on the metastore's single writer connection as an exact
-  row-level change set (`SQLite`'s pre-update hook: rowid tables by rowid, `WITHOUT
-  ROWID` tables by primary key, SQL-computed values recorded as stored), committed to
-  object storage first, and only then committed locally; a change object storage did not
-  accept rolls the local transaction back, so nothing is acknowledged that the local
-  disk alone holds. Opening the catalog restores the replica — keeping a local file that
-  is already a prefix of the durable state, else downloading the newest catalog image —
-  and applies the change sets that follow, so a restart on an empty volume finds every
-  acknowledged row. The change sets live in *epochs*, one `WalStateStore` domain each,
-  sealed and replaced every few dozen commits by a rotation that uploads a fresh image
-  (taken from a read connection, without blocking writers); the epoch and image two
-  rotations back are deleted, which keeps object storage bounded and every domain far
+  transaction is recorded as the list of logical catalog actions it applied — create a
+  table, add delete files, commit a compaction, append inlined rows — each carrying every
+  value the write chose (new identifiers, timestamps), so applying the same actions to the
+  same catalog reproduces it exactly (`proto/catalog_log.proto`). Each catalog method
+  builds its action, applies it through one function per action kind, and records it on
+  the transaction; replay calls the same functions. The transaction's actions are
+  committed to object storage first, and only then committed locally; actions object
+  storage did not accept roll the local transaction back, so nothing is acknowledged that
+  the local disk alone holds, and a write that changes rows without recording an action is
+  refused. Opening the catalog restores the replica — keeping a local file that is already
+  a prefix of the durable state, else downloading the newest catalog image — and applies
+  the transactions that follow, so a restart on an empty volume finds every acknowledged
+  row. The transactions live in *epochs*, one `WalStateStore` domain each, sealed and
+  replaced every few dozen commits by a rotation that uploads a fresh image (taken from a
+  read connection, without blocking writers); the epoch and image two rotations back are
+  deleted, which keeps object storage bounded and every domain far
   inside the WAL's replay and history limits. A seal fences any other process still
   committing to the old epoch, so a second writer stops with an error instead of
   diverging. Supported locations: `s3://` (S3 or an S3-compatible store that enforces
   `If-None-Match`/`If-Match`, probed at registration) and a `file://`
   `runtime.state.location`, whose data directory is local. Requires the `SQLite`
-  metastore; partitioning is rejected; snapshots are skipped; an existing `mode: file`
-  table for the dataset is refused rather than stranded beside a new one.
+  metastore; partitioning is rejected; snapshots are skipped, and restoring one is
+  refused; an existing `mode: file` table for the dataset is refused rather than stranded
+  beside a new one.
 
 Source (datalake): `crates/accelerators/accelerator-cayenne/src/datalake.rs` (root and
-store resolution), `crates/cayenne/src/metastore/durable/` (`changes.rs` capture and
-replay, `log.rs` epochs and rotation, `mod.rs` replica recovery), and `DurableCommit` in
+store resolution), `crates/cayenne/proto/catalog_log.proto` (the actions and log records),
+`crates/cayenne/src/metastore/durable/` (`actions.rs` action building, `log.rs` epochs and
+rotation, `mod.rs` replica recovery), the `apply_*` functions and `replay_durable` in
+`crates/cayenne/src/cayenne_catalog.rs`, and `DurableCommit` in
 `crates/cayenne/src/metastore/sqlite.rs`.
 
 Source: acceleration `mode` → `!is_file_accelerated()` in

@@ -27,6 +27,7 @@ drain after the last handle is dropped; callers still resolve cancelled writes.
 | `resolve(&receipt)` | Recover an attempt's outcome, including from an independently reopened client |
 | `checkpoint(&snapshot)` | Upload immutable pages and manifest; conditionally replace only that snapshot's head |
 
+Each object holds one protobuf message (`proto/wal.proto`, exposed as `wal::wire`).
 The head update is the only transaction commit point. A WAL upload alone does not
 change reads or justify acknowledgement. Each record binds its complete mutation
 batch, incarnation, parent, sequence and attempt identity with a BLAKE3 digest.

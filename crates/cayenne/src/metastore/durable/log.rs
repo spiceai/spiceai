@@ -18,12 +18,12 @@ limitations under the License.
 //!
 //! A catalog is a sequence of committed transactions numbered from 1. Object
 //! storage holds an *image* of the catalog database at some sequence plus the
-//! change set of every later transaction, so any replica of the state at the
+//! actions of every later transaction, so any replica of the state at the
 //! latest sequence can be rebuilt from it.
 //!
-//! The change sets live in *epochs*: each epoch is one
+//! The transactions live in *epochs*: each epoch is one
 //! [`object_store_occ::wal::WalStateStore`] domain, and a transaction is
-//! durable once its change set is committed to the current epoch. An epoch
+//! durable once its actions are committed to the current epoch. An epoch
 //! holds at most a few dozen transactions. Rotation uploads a fresh image,
 //! *seals* the current epoch with a final commit naming its successor, and
 //! starts the successor. Because the domain's optimistic concurrency covers its
@@ -36,10 +36,10 @@ limitations under the License.
 //! <prefix>/root                   {catalog_id, epoch}       conditional writes
 //! <prefix>/epochs/<epoch>/…       WalStateStore domain:
 //!     base                        image + the tail of the previous epoch
-//!     log/<sequence>              one transaction's change set (inline or a reference)
+//!     log/<sequence>              one transaction's actions (inline or a reference)
 //!     sealed                      the successor epoch and its base
 //! <prefix>/images/<id>            immutable catalog database images
-//! <prefix>/changes/<epoch>/<id>   immutable change sets too large to inline
+//! <prefix>/changes/<epoch>/<id>   immutable transactions too large to inline
 //! ```
 //!
 //! An image is taken from a read connection without blocking writers, so it
@@ -58,19 +58,21 @@ use object_store_occ::store::{
     ExpectedRevision, ObjectStoreState, StateChange, StateStore, WriteId, WriteOutcome,
 };
 use object_store_occ::wal::{CommitOutcome, Limits, Snapshot, WalStateStore};
-use serde::{Deserialize, Serialize};
+use prost::Message;
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use uuid::Uuid;
 
+use super::wire;
+
 const FORMAT: u32 = 1;
 
-/// Change sets up to this size are stored in the epoch itself; larger ones are
-/// uploaded as their own object first. The WAL encodes values as JSON, so this
-/// keeps a commit's record well inside its 1 MiB bound.
-const INLINE_CHANGE_BYTES: usize = 24 * 1024;
+/// Transactions up to this encoded size are stored in the epoch itself; larger
+/// ones are uploaded as their own object first, so a commit stays inside the
+/// WAL's 128 KiB batch bound.
+const INLINE_TRANSACTION_BYTES: usize = 96 * 1024;
 
 /// Rotation is requested once an epoch holds this many transactions, or this
-/// many bytes of change sets.
+/// many bytes of transactions.
 const ROTATE_AFTER_COMMITS: u64 = 48;
 const ROTATE_AFTER_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -148,44 +150,46 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A content-addressed immutable object under the catalog prefix.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectRef {
     /// Path relative to the catalog prefix.
     pub key: String,
     pub size: u64,
-    #[serde(with = "hex_digest")]
     pub digest: [u8; 32],
 }
 
-mod hex_digest {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-    use std::fmt::Write;
-
-    pub fn serialize<S: Serializer>(digest: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        let mut hex = String::with_capacity(64);
-        for byte in digest {
-            let _ = write!(hex, "{byte:02x}");
+impl ObjectRef {
+    fn to_wire(&self) -> wire::ObjectRef {
+        wire::ObjectRef {
+            key: self.key.clone(),
+            size: self.size,
+            digest: Bytes::copy_from_slice(&self.digest),
         }
-        s.serialize_str(&hex)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
-        let hex = String::deserialize(d)?;
-        let mut digest = [0_u8; 32];
-        if hex.len() != 64 {
-            return Err(D::Error::custom("digest must be 64 hex characters"));
-        }
-        for (i, byte) in digest.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(D::Error::custom)?;
-        }
-        Ok(digest)
+    fn from_wire(object: &wire::ObjectRef, location: &CatalogLocation) -> Result<Self> {
+        Ok(Self {
+            key: object.key.clone(),
+            size: object.size,
+            digest: <[u8; 32]>::try_from(object.digest.as_ref())
+                .ok()
+                .context(MalformedSnafu {
+                    location: &location.url,
+                    reason: "an object digest is not 32 bytes",
+                })?,
+        })
     }
 }
 
+fn uuid_from_wire(bytes: &[u8], what: &str, location: &CatalogLocation) -> Result<Uuid> {
+    Uuid::from_slice(bytes).ok().context(MalformedSnafu {
+        location: &location.url,
+        reason: format!("{what} is not a UUID"),
+    })
+}
+
 /// The sequences a sealed epoch still holds for its successor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Tail {
     pub epoch: Uuid,
     /// The last sequence of the tail; the first is the image's sequence + 1.
@@ -193,8 +197,7 @@ pub(crate) struct Tail {
 }
 
 /// Where an epoch's state starts: an image, then its tail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Base {
     pub image: ObjectRef,
     pub image_sequence: u64,
@@ -208,28 +211,121 @@ impl Base {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 struct Seal {
     next: Uuid,
     base: Base,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy)]
 struct Root {
     format: u32,
     catalog_id: Uuid,
     epoch: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 enum LogValue {
-    Inline(Vec<u8>),
+    Inline(wire::Transaction),
     Object(ObjectRef),
 }
 
-/// One durable transaction's change set, still to be fetched.
+impl Base {
+    fn to_wire(&self) -> wire::Base {
+        wire::Base {
+            image: Some(self.image.to_wire()),
+            image_sequence: self.image_sequence,
+            tail: self.tail.map(|tail| wire::Tail {
+                epoch: Bytes::copy_from_slice(tail.epoch.as_bytes()),
+                to: tail.to,
+            }),
+        }
+    }
+
+    fn from_wire(base: &wire::Base, location: &CatalogLocation) -> Result<Self> {
+        let image = base.image.as_ref().context(MalformedSnafu {
+            location: &location.url,
+            reason: "an epoch base has no image",
+        })?;
+        Ok(Self {
+            image: ObjectRef::from_wire(image, location)?,
+            image_sequence: base.image_sequence,
+            tail: base
+                .tail
+                .as_ref()
+                .map(|tail| {
+                    Ok::<_, Error>(Tail {
+                        epoch: uuid_from_wire(&tail.epoch, "a tail epoch", location)?,
+                        to: tail.to,
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+impl Seal {
+    fn to_wire(&self) -> wire::Seal {
+        wire::Seal {
+            next: Bytes::copy_from_slice(self.next.as_bytes()),
+            base: Some(self.base.to_wire()),
+        }
+    }
+
+    fn from_wire(seal: &wire::Seal, location: &CatalogLocation) -> Result<Self> {
+        let base = seal.base.as_ref().context(MalformedSnafu {
+            location: &location.url,
+            reason: "a seal has no successor base",
+        })?;
+        Ok(Self {
+            next: uuid_from_wire(&seal.next, "a seal's successor", location)?,
+            base: Base::from_wire(base, location)?,
+        })
+    }
+}
+
+impl Root {
+    fn to_wire(self) -> wire::Root {
+        wire::Root {
+            format: self.format,
+            catalog_id: Bytes::copy_from_slice(self.catalog_id.as_bytes()),
+            epoch: Bytes::copy_from_slice(self.epoch.as_bytes()),
+        }
+    }
+
+    fn from_wire(root: &wire::Root, location: &CatalogLocation) -> Result<Self> {
+        Ok(Self {
+            format: root.format,
+            catalog_id: uuid_from_wire(&root.catalog_id, "the catalog id", location)?,
+            epoch: uuid_from_wire(&root.epoch, "the root epoch", location)?,
+        })
+    }
+}
+
+impl LogValue {
+    fn to_wire(&self) -> wire::LogValue {
+        wire::LogValue {
+            value: Some(match self {
+                Self::Inline(transaction) => wire::log_value::Value::Inline(transaction.clone()),
+                Self::Object(object) => wire::log_value::Value::Object(object.to_wire()),
+            }),
+        }
+    }
+
+    fn from_wire(value: wire::LogValue, location: &CatalogLocation) -> Result<Self> {
+        match value.value.context(MalformedSnafu {
+            location: &location.url,
+            reason: "a log entry is empty",
+        })? {
+            wire::log_value::Value::Inline(transaction) => Ok(Self::Inline(transaction)),
+            wire::log_value::Value::Object(object) => {
+                Ok(Self::Object(ObjectRef::from_wire(&object, location)?))
+            }
+        }
+    }
+}
+
+/// One durable transaction, still to be fetched.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingLog {
     pub sequence: u64,
@@ -241,7 +337,7 @@ pub(crate) struct PendingLog {
 pub(crate) struct Recovery {
     /// The image to start from, when the replica is not usable as a start.
     pub image: Option<(ObjectRef, u64)>,
-    /// The change sets to apply after the start, in sequence order.
+    /// The transactions to apply after the start, in sequence order.
     pub logs: Vec<PendingLog>,
 }
 
@@ -349,7 +445,7 @@ impl CatalogLocation {
         Ok(())
     }
 
-    /// Delete an epoch's domain and the change sets uploaded for it.
+    /// Delete an epoch's domain and the transactions uploaded for it.
     async fn delete_epoch(&self, epoch: Uuid) -> Result<()> {
         self.delete_prefix(self.epoch_prefix(epoch)).await?;
         self.delete_prefix(self.prefix.clone().join("changes").join(epoch.to_string()))
@@ -424,21 +520,12 @@ fn log_key(sequence: u64) -> String {
     format!("log/{sequence:020}")
 }
 
-fn encode_json<T: Serialize>(value: &T, location: &CatalogLocation) -> Result<Bytes> {
-    serde_json::to_vec(value)
-        .map(Bytes::from)
-        .map_err(|e| Error::Malformed {
-            location: location.url.clone(),
-            reason: e.to_string(),
-        })
+fn encode(message: &impl Message) -> Bytes {
+    Bytes::from(message.encode_to_vec())
 }
 
-fn decode_json<T: for<'de> Deserialize<'de>>(
-    bytes: &[u8],
-    what: &str,
-    location: &CatalogLocation,
-) -> Result<T> {
-    serde_json::from_slice(bytes).map_err(|e| Error::Malformed {
+fn decode<M: Message + Default>(bytes: &[u8], what: &str, location: &CatalogLocation) -> Result<M> {
+    M::decode(bytes).map_err(|e| Error::Malformed {
         location: location.url.clone(),
         reason: format!("{what}: {e}"),
     })
@@ -483,7 +570,7 @@ impl DurableLog {
             location: &location.url,
             reason: "the root was deleted",
         })?;
-        let root: Root = decode_json(&value, "root", location)?;
+        let root = Root::from_wire(&decode(&value, "root", location)?, location)?;
         ensure!(
             root.format <= FORMAT,
             NewerFormatSnafu {
@@ -511,7 +598,7 @@ impl DurableLog {
                 location: &location.url,
             })?;
             if let Some(seal) = snapshot.get("sealed") {
-                let seal: Seal = decode_json(seal, "seal", &location)?;
+                let seal = Seal::from_wire(&decode(seal, "seal", &location)?, &location)?;
                 Self::start_epoch(&location, &state_store, seal.next, &seal.base).await?;
                 // Moving the root on is best-effort: recovery follows seals.
                 let next = Root {
@@ -522,7 +609,7 @@ impl DurableLog {
                     .compare_exchange(
                         &Self::root_key(&location),
                         ExpectedRevision::Exact(&revision),
-                        StateChange::Set(encode_json(&next, &location)?),
+                        StateChange::Set(encode(&next.to_wire())),
                         WriteId::new(),
                     )
                     .await;
@@ -534,12 +621,15 @@ impl DurableLog {
                 id = seal.next;
                 continue;
             }
-            let base: Base = decode_json(
-                snapshot.get("base").context(MalformedSnafu {
-                    location: &location.url,
-                    reason: format!("epoch {id} has no base"),
-                })?,
-                "base",
+            let base = Base::from_wire(
+                &decode(
+                    snapshot.get("base").context(MalformedSnafu {
+                        location: &location.url,
+                        reason: format!("epoch {id} has no base"),
+                    })?,
+                    "base",
+                    &location,
+                )?,
                 &location,
             )?;
             let (last, bytes) = Self::epoch_extent(&snapshot, &base, &location)?;
@@ -600,7 +690,7 @@ impl DurableLog {
             location: &location.url,
         })?;
         if let Some(existing) = snapshot.get("base") {
-            let existing: Base = decode_json(existing, "base", location)?;
+            let existing = Base::from_wire(&decode(existing, "base", location)?, location)?;
             ensure!(
                 &existing == base,
                 MalformedSnafu {
@@ -611,10 +701,9 @@ impl DurableLog {
             return Ok((domain, snapshot));
         }
         let mut tx = snapshot.transaction();
-        tx.put("base", encode_json(base, location)?)
-            .context(LogSnafu {
-                location: &location.url,
-            })?;
+        tx.put("base", encode(&base.to_wire())).context(LogSnafu {
+            location: &location.url,
+        })?;
         let attempt = tx.prepare().await.context(LogSnafu {
             location: &location.url,
         })?;
@@ -650,7 +739,7 @@ impl DurableLog {
             .compare_exchange(
                 &Self::root_key(&location),
                 ExpectedRevision::Absent,
-                StateChange::Set(encode_json(&root, &location)?),
+                StateChange::Set(encode(&root.to_wire())),
                 WriteId::new(),
             )
             .await
@@ -756,20 +845,24 @@ impl DurableLog {
                 location: &location.url,
                 reason: format!("sequence {sequence} is missing"),
             })?;
-            let value: LogValue = postcard::from_bytes(bytes).map_err(|e| Error::Malformed {
-                location: location.url.clone(),
-                reason: format!("sequence {sequence}: {e}"),
-            })?;
+            let value = LogValue::from_wire(
+                decode(bytes, &format!("sequence {sequence}"), location)?,
+                location,
+            )?;
             logs.push(PendingLog { sequence, value });
         }
         Ok(())
     }
 
-    /// The change set bytes of a pending log.
-    pub(crate) async fn fetch(&self, log: &PendingLog) -> Result<Bytes> {
+    /// The transaction of a pending log.
+    pub(crate) async fn fetch(&self, log: &PendingLog) -> Result<wire::Transaction> {
         match &log.value {
-            LogValue::Inline(bytes) => Ok(Bytes::copy_from_slice(bytes)),
-            LogValue::Object(object) => self.location.get_immutable(object).await,
+            LogValue::Inline(transaction) => Ok(transaction.clone()),
+            LogValue::Object(object) => decode(
+                &self.location.get_immutable(object).await?,
+                &format!("sequence {}", log.sequence),
+                &self.location,
+            ),
         }
     }
 
@@ -841,7 +934,7 @@ impl DurableLog {
     /// [`Error::Fenced`] when another process committed to the catalog, and
     /// [`Error::Uncertain`] when an outcome stayed unknown past the deadline;
     /// both stop all later writes. Other errors leave the catalog unchanged.
-    pub(crate) async fn publish(&self, changes: Vec<u8>) -> Result<u64> {
+    pub(crate) async fn publish(&self, transaction: wire::Transaction) -> Result<u64> {
         let mut state = self.state.lock().await;
         if let Some(stopped) = &state.stopped {
             return Err(Error::Fenced {
@@ -870,20 +963,18 @@ impl DurableLog {
                 commits,
             }
         );
-        let size = changes.len() as u64;
-        let value = if changes.len() <= INLINE_CHANGE_BYTES {
-            LogValue::Inline(changes)
+        let length = transaction.encoded_len();
+        let size = u64::try_from(length).unwrap_or(u64::MAX);
+        let value = if length <= INLINE_TRANSACTION_BYTES {
+            LogValue::Inline(transaction)
         } else {
             LogValue::Object(
                 self.location
-                    .put_immutable(&format!("changes/{}", state.epoch.id), Bytes::from(changes))
+                    .put_immutable(&format!("changes/{}", state.epoch.id), encode(&transaction))
                     .await?,
             )
         };
-        let encoded = postcard::to_stdvec(&value).map_err(|e| Error::Malformed {
-            location: self.location.url.clone(),
-            reason: e.to_string(),
-        })?;
+        let encoded = encode(&value.to_wire());
         let sequence = state.epoch.last + 1;
         let mut tx = state.epoch.snapshot.transaction();
         ensure!(
@@ -892,10 +983,9 @@ impl DurableLog {
                 location: &self.location.url,
             }
         );
-        tx.put(log_key(sequence), Bytes::from(encoded))
-            .context(LogSnafu {
-                location: &self.location.url,
-            })?;
+        tx.put(log_key(sequence), encoded).context(LogSnafu {
+            location: &self.location.url,
+        })?;
         let attempt = tx.prepare().await.context(LogSnafu {
             location: &self.location.url,
         })?;
@@ -980,7 +1070,7 @@ impl DurableLog {
             base: successor.base.clone(),
         };
         let mut tx = state.epoch.snapshot.transaction();
-        tx.put("sealed", encode_json(&seal, &self.location)?)
+        tx.put("sealed", encode(&seal.to_wire()))
             .context(LogSnafu {
                 location: &self.location.url,
             })?;
@@ -1064,7 +1154,7 @@ impl DurableLog {
             .compare_exchange(
                 &Self::root_key(&self.location),
                 ExpectedRevision::Exact(&revision),
-                StateChange::Set(encode_json(&next, &self.location)?),
+                StateChange::Set(encode(&next.to_wire())),
                 WriteId::new(),
             )
             .await

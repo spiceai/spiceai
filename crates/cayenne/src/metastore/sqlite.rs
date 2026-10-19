@@ -595,6 +595,11 @@ fn begin_immediate(conn: &mut rusqlite::Connection) -> Result<(), rusqlite::Erro
 /// then record how long it held the write lock. That is known only here, on
 /// the writer's thread, once any statement still running and the rollback
 /// are done.
+/// The rows changed on `conn` since it opened.
+fn total_changes(conn: &mut rusqlite::Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+}
+
 fn roll_back(conn: &mut rusqlite::Connection, began: std::time::Instant) {
     let _ = conn.execute_batch("ROLLBACK");
     telemetry::cayenne::track_metastore_writer_held(
@@ -1259,17 +1264,29 @@ impl SqliteMetastore {
         let Some(durable) = self.durable_commit(pool) else {
             return pool.writer.run(job).await.map_err(map_err);
         };
-        // An autocommit statement would commit before it is durable, so a
-        // durable write runs as a transaction of its own.
+        // A statement outside a catalog transaction records no catalog action,
+        // so on a durable catalog it runs in a transaction of its own that is
+        // rolled back if it changed any row.
         let session = pool
             .writer
             .session(begin_immediate, roll_back)
             .await
             .map_err(&map_err)?;
-        durable.durability.begin();
-        let held_start = std::time::Instant::now();
+        let before = session.call(total_changes).await.map_err(&map_err)?;
         let value = session.call(job).await.map_err(&map_err)?;
-        durable.commit(session, held_start).await?;
+        let after = session.call(total_changes).await.map_err(&map_err)?;
+        if after != before {
+            // Dropping the session rolls the transaction back.
+            return Err(durable.durability.unlogged_write().into());
+        }
+        session
+            .finish(|conn| {
+                conn.execute_batch("COMMIT").inspect_err(|_| {
+                    let _ = conn.execute_batch("ROLLBACK");
+                })
+            })
+            .await
+            .map_err(&map_err)?;
         Ok(value)
     }
 
@@ -1293,16 +1310,9 @@ impl SqliteMetastore {
     /// already enabled.
     pub(crate) async fn enable_durability(&self, log: Arc<DurableLog>) -> CatalogResult<()> {
         let pool = self.pool().await?;
-        let durability = pool
-            .writer
-            .run(move |conn| Ok(Durability::install(conn, log)))
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to enable catalog durability: {e}"),
-            })??;
         pool.writer
             .durability
-            .set(Arc::new(durability))
+            .set(Arc::new(Durability::new(log)))
             .map_err(|_| CatalogError::Database {
                 message: "Catalog durability is already enabled".to_string(),
             })
@@ -2300,9 +2310,16 @@ impl MetastoreBackend for SqliteMetastore {
         );
 
         let durable = self.durable_commit(pool);
-        if let Some(durable) = &durable {
-            durable.durability.begin();
-        }
+        // Rows this transaction changes are compared with the actions it
+        // records when it commits.
+        let changes_at_begin = match &durable {
+            Some(_) => Some(session.call(total_changes).await.map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to begin transaction: {e}"),
+                },
+            )?),
+            None => None,
+        };
 
         // METRIC 1 (writer held): the reserved write lock is held from this BEGIN
         // until commit/rollback/drop. Stamp the start so `SqliteTransaction` can
@@ -2311,6 +2328,8 @@ impl MetastoreBackend for SqliteMetastore {
             session: Some(session),
             held_start: std::time::Instant::now(),
             durable,
+            changes_at_begin: changes_at_begin.unwrap_or(0),
+            actions: parking_lot::Mutex::new(Vec::new()),
         }))
     }
 
@@ -2618,63 +2637,85 @@ struct DurableCommit {
 }
 
 impl DurableCommit {
-    /// Make the session's changes durable, then commit them locally.
+    /// Make the transaction's `actions` durable, then commit it locally. A
+    /// transaction that changed no row since `changes_at_begin` commits without
+    /// publishing, and one that changed rows without recording an action is
+    /// refused.
     ///
     /// Runs to its end even when the caller stops waiting: a change object
     /// storage has accepted must commit locally too, or the replica falls
     /// behind the state later writes are computed from.
-    async fn commit(self, session: Session, held_start: std::time::Instant) -> CatalogResult<()> {
-        tokio::spawn(async move { self.publish_and_commit(session, held_start).await })
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to commit transaction: {e}"),
-            })?
+    async fn commit(
+        self,
+        session: Session,
+        held_start: std::time::Instant,
+        actions: Vec<durable::wire::Action>,
+        changes_at_begin: i64,
+    ) -> CatalogResult<()> {
+        tokio::spawn(async move {
+            self.publish_and_commit(session, held_start, actions, changes_at_begin)
+                .await
+        })
+        .await
+        .map_err(|e| CatalogError::Database {
+            message: format!("Failed to commit transaction: {e}"),
+        })?
     }
 
     async fn publish_and_commit(
         self,
         session: Session,
         held_start: std::time::Instant,
+        actions: Vec<durable::wire::Action>,
+        changes_at_begin: i64,
     ) -> CatalogResult<()> {
-        let durability = Arc::clone(&self.durability);
-        let schema_covered = session
-            .call(move |conn| durability.covers(conn))
-            .await
-            .map_err(
-                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to commit transaction: {e}"),
-                },
-            )?;
-        let sequence = match self.durability.publish(schema_covered).await {
-            Ok(sequence) => sequence,
-            // Dropping the session rolls the transaction back.
-            Err(error) => return Err(error.into()),
+        let commit_error = |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+            message: format!("Failed to commit transaction: {e}"),
         };
+        let track_held = move || {
+            telemetry::cayenne::track_metastore_writer_held(
+                held_start.elapsed(),
+                &[telemetry::KeyValue::new("txn", "other")],
+            );
+        };
+        let changed = session.call(total_changes).await.map_err(commit_error)? != changes_at_begin;
+        if changed && actions.is_empty() {
+            // Dropping the session rolls the transaction back.
+            return Err(self.durability.unlogged_write().into());
+        }
+        if !changed {
+            // Actions that changed no row change none when replayed, so there
+            // is nothing to make durable.
+            return session
+                .finish(move |conn| {
+                    let committed = conn.execute_batch("COMMIT").inspect_err(|_| {
+                        let _ = conn.execute_batch("ROLLBACK");
+                    });
+                    track_held();
+                    committed
+                })
+                .await
+                .map_err(commit_error);
+        }
+        // Dropping the session on an error rolls the transaction back.
+        let sequence = self.durability.publish(actions).await?;
         let committed = session
             .finish(move |conn| {
-                let committed = sequence
-                    .map_or(Ok(()), |sequence| durable::set_sequence(conn, sequence))
+                let committed = durable::set_sequence(conn, sequence)
                     .and_then(|()| conn.execute_batch("COMMIT"))
                     .inspect_err(|_| {
                         let _ = conn.execute_batch("ROLLBACK");
                     });
-                telemetry::cayenne::track_metastore_writer_held(
-                    held_start.elapsed(),
-                    &[telemetry::KeyValue::new("txn", "other")],
-                );
+                track_held();
                 committed
             })
             .await;
-        match (committed, sequence) {
-            (Ok(()), Some(_)) => {
+        match committed {
+            Ok(()) => {
                 self.maybe_rotate().await;
                 Ok(())
             }
-            (Ok(()), None) => Ok(()),
-            (Err(error), Some(_)) => Err(self.durability.halt(error).into()),
-            (Err(error), None) => Err(CatalogError::Database {
-                message: format!("Failed to commit transaction: {error}"),
-            }),
+            Err(error) => Err(self.durability.halt(error).into()),
         }
     }
 
@@ -2736,6 +2777,10 @@ pub struct SqliteTransaction {
     held_start: std::time::Instant,
     /// Set when the catalog is durable in object storage.
     durable: Option<DurableCommit>,
+    /// `total_changes()` when the transaction began, on a durable catalog.
+    changes_at_begin: i64,
+    /// The catalog actions the transaction applied, on a durable catalog.
+    actions: parking_lot::Mutex<Vec<durable::wire::Action>>,
 }
 
 impl SqliteTransaction {
@@ -2867,10 +2912,19 @@ impl MetastoreTransaction for SqliteTransaction {
         Ok(())
     }
 
+    fn record(&self, action: durable::wire::Action) {
+        if self.durable.is_some() {
+            self.actions.lock().push(action);
+        }
+    }
+
     async fn commit(mut self: Box<Self>) -> CatalogResult<()> {
         let session = self.take_session()?;
         if let Some(durable) = self.durable.take() {
-            return durable.commit(session, self.held_start).await;
+            let actions = std::mem::take(&mut *self.actions.lock());
+            return durable
+                .commit(session, self.held_start, actions, self.changes_at_begin)
+                .await;
         }
 
         // COMMIT, and on a failed COMMIT the best-effort ROLLBACK that leaves the

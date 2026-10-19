@@ -1,0 +1,574 @@
+// Copyright 2024-2026 The Spice.ai OSS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The authoritative copy of a Cayenne catalog in object storage (`mode:
+// datalake`). The catalog is a numbered sequence of transactions. Each
+// transaction is the list of catalog actions it applied, in order: what was
+// done to which table, file or snapshot, with every value the action chose
+// (new identifiers, timestamps), so applying the same actions to the same
+// state always yields the same catalog.
+//
+// Identifiers named `*_id` are UUID strings unless their field says otherwise;
+// `bytes` identity fields are 16-byte UUIDs and digests are 32-byte BLAKE3
+// hashes. Timestamps are UTC strings in the form `2026-10-19T08:15:30.123Z`.
+syntax = "proto3";
+
+package spice.cayenne.catalog_log.v1;
+
+// `<catalog>/root`: the catalog's identity and the epoch holding its log.
+message Root {
+  uint32 format = 1;
+  bytes catalog_id = 2;
+  bytes epoch = 3;
+}
+
+// An immutable object under the catalog prefix.
+message ObjectRef {
+  // Path relative to the catalog prefix.
+  string key = 1;
+  uint64 size = 2;
+  bytes digest = 3;
+}
+
+// The sequences a sealed epoch still holds for its successor: from just past
+// the base image to `to`.
+message Tail {
+  bytes epoch = 1;
+  uint64 to = 2;
+}
+
+// Where an epoch's state starts: a database image, then its tail.
+message Base {
+  ObjectRef image = 1;
+  uint64 image_sequence = 2;
+  Tail tail = 3;
+}
+
+// The last commit of a sealed epoch: its successor and that successor's base.
+message Seal {
+  bytes next = 1;
+  Base base = 2;
+}
+
+// The value under an epoch's `log/<sequence>` key.
+message LogValue {
+  oneof value {
+    Transaction inline = 1;
+    // An object holding an encoded `Transaction`.
+    ObjectRef object = 2;
+  }
+}
+
+// One committed catalog transaction.
+message Transaction {
+  uint32 format = 1;
+  repeated Action actions = 2;
+}
+
+message Action {
+  oneof action {
+    CreateTable create_table = 1;
+    UpdateTableSchema update_table_schema = 2;
+    UpdateTableSettings update_table_settings = 3;
+    DropTable drop_table = 4;
+    SetCurrentSnapshot set_current_snapshot = 5;
+    SetCurrentSnapshots set_current_snapshots = 6;
+    ReserveSequenceNumbers reserve_sequence_numbers = 7;
+    SetSnapshotSequence set_snapshot_sequence = 8;
+    ClearSnapshotSequence clear_snapshot_sequence = 9;
+    AddDeleteFile add_delete_file = 10;
+    AddDeleteFiles add_delete_files = 11;
+    RemoveDeleteFiles remove_delete_files = 12;
+    ClearDeleteFiles clear_delete_files = 13;
+    CommitDeleteFilesWithInlinedRewrite commit_delete_files_with_inlined_rewrite = 14;
+    AddInsertRecords add_insert_records = 15;
+    ClearInsertRecords clear_insert_records = 16;
+    CommitOnConflictDeletions commit_on_conflict_deletions = 17;
+    CommitOnConflictDeletionsWithTombstone commit_on_conflict_deletions_with_tombstone = 18;
+    ApplyPreparedOnConflict apply_prepared_on_conflict = 19;
+    CommitCompaction commit_compaction = 20;
+    CommitCompactionFenced commit_compaction_fenced = 21;
+    SwapProtectedSnapshots swap_protected_snapshots = 22;
+    CommitOverwrite commit_overwrite = 23;
+    CommitOverwriteToCold commit_overwrite_to_cold = 24;
+    AddPartition add_partition = 25;
+    UpsertTableStatistics upsert_table_statistics = 26;
+    ClearTableStatistics clear_table_statistics = 27;
+    UpsertSnapshotFileStatistics upsert_snapshot_file_statistics = 28;
+    ClearSnapshotFileStatistics clear_snapshot_file_statistics = 29;
+    ClearSnapshotCachedMetadata clear_snapshot_cached_metadata = 30;
+    UpsertSnapshotFile upsert_snapshot_file = 31;
+    ReplaceSnapshotFiles replace_snapshot_files = 32;
+    ClearSnapshotFiles clear_snapshot_files = 33;
+    UpsertPkIndex upsert_pk_index = 34;
+    ClearPkIndex clear_pk_index = 35;
+    RegisterIndexRun register_index_run = 36;
+    RemoveIndexRun remove_index_run = 37;
+    AddInlinedData add_inlined_data = 38;
+    ClearInlinedData clear_inlined_data = 39;
+    ClearInlinedDeletes clear_inlined_deletes = 40;
+    AddInlinedDelete add_inlined_delete = 41;
+    SetInlinedDeletePublished set_inlined_delete_published = 42;
+    PublishOrphanInlinedDeletes publish_orphan_inlined_deletes = 43;
+    CommitInlinedMutation commit_inlined_mutation = 44;
+    MarkDirtyKeys mark_dirty_keys = 45;
+    ClearPendingWriteBack clear_pending_write_back = 46;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Values the actions carry.
+
+enum DeletionType {
+  DELETION_TYPE_POSITION_BASED = 0;
+  DELETION_TYPE_KEY_BASED = 1;
+}
+
+// A deletion vector file and the rows it deletes.
+message DeleteFile {
+  string delete_file_id = 1;
+  string table_id = 2;
+  // The data file a position-based vector addresses.
+  optional string source_data_file_path = 3;
+  string path = 4;
+  bool path_is_relative = 5;
+  string format = 6;
+  int64 delete_count = 7;
+  int64 file_size_bytes = 8;
+  DeletionType deletion_type = 9;
+  int64 sequence_number = 10;
+  optional int64 reinsert_sequence = 11;
+}
+
+// One data file of a snapshot's manifest.
+message SnapshotFile {
+  string table_id = 1;
+  string snapshot_id = 2;
+  string file_path = 3;
+  int64 row_count = 4;
+  int64 file_size_bytes = 5;
+  int64 min_sequence = 6;
+  int64 max_sequence = 7;
+  optional string digest = 8;
+}
+
+message SnapshotFileStatistics {
+  string table_id = 1;
+  string snapshot_id = 2;
+  string file_path = 3;
+  int64 file_size_bytes = 4;
+  int64 num_rows = 5;
+  // Vortex `FileStatistics` flatbuffer.
+  bytes statistics_blob = 6;
+}
+
+message TableStatistics {
+  string table_id = 1;
+  // Vortex `FileStatistics` flatbuffer.
+  bytes statistics_blob = 2;
+  int64 num_rows = 3;
+  bool num_rows_exact = 4;
+  optional bytes ndv_sketches = 5;
+}
+
+// A data file in the cold (datalake) tier.
+message ColdTierFile {
+  string table_id = 1;
+  string file_url = 2;
+  int64 row_count = 3;
+  int64 file_size_bytes = 4;
+  int64 min_sequence = 5;
+  int64 max_sequence = 6;
+  bytes statistics_blob = 7;
+  optional bytes pk_bloom = 8;
+}
+
+message Partition {
+  string partition_id = 1;
+  string table_id = 2;
+  repeated string partition_columns = 3;
+  repeated string partition_values = 4;
+  string path = 5;
+  bool path_is_relative = 6;
+  int64 record_count = 7;
+  int64 file_size_bytes = 8;
+}
+
+message IndexRun {
+  string table_id = 1;
+  string index_key = 2;
+  string run_name = 3;
+  uint64 row_count = 4;
+  uint64 size_bytes = 5;
+}
+
+// Rows held in the catalog itself until they are flushed to a data file.
+message InlinedData {
+  string inlined_id = 1;
+  string table_id = 2;
+  optional string partition_key = 3;
+  // Arrow IPC stream.
+  bytes data_ipc = 4;
+  int64 record_count = 5;
+  int64 sequence_number = 6;
+  string created_at = 7;
+}
+
+// The new contents of an existing inlined batch.
+message InlinedDataUpdate {
+  string inlined_id = 1;
+  bytes data_ipc = 2;
+  int64 record_count = 3;
+}
+
+// Deletes held in the catalog itself until they are flushed to a deletion
+// vector.
+message InlinedDelete {
+  string inlined_id = 1;
+  string table_id = 2;
+  // Arrow IPC stream of primary-key row keys or row ids.
+  bytes delete_ipc = 3;
+  int64 delete_count = 4;
+  int64 sequence_number = 5;
+  string created_at = 6;
+  bool published = 7;
+}
+
+message SnapshotSequence {
+  string snapshot_id = 1;
+  int64 sequence_number = 2;
+}
+
+message TableSnapshot {
+  string table_id = 1;
+  string snapshot_id = 2;
+}
+
+message PendingWriteBackKey {
+  bytes pk_bytes = 1;
+  int64 sequence_number = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Tables.
+
+message CreateTable {
+  string table_id = 1;
+  string table_name = 2;
+  // The table's data root.
+  string path = 3;
+  // Arrow IPC schema message.
+  bytes schema = 4;
+  repeated string primary_key = 5;
+  // The on-conflict policy in its canonical text form.
+  optional string on_conflict = 6;
+  string initial_snapshot_id = 7;
+  optional string partition_column = 8;
+  // The table's settings as the JSON document Cayenne stores for them.
+  string settings_json = 9;
+}
+
+message UpdateTableSchema {
+  string table_id = 1;
+  // Arrow IPC schema message.
+  bytes schema = 2;
+  // Also drop the table's statistics, which the new schema may decode wrongly.
+  bool drop_statistics = 3;
+}
+
+message UpdateTableSettings {
+  string table_id = 1;
+  string settings_json = 2;
+  optional string on_conflict = 3;
+}
+
+// Remove a table and everything the catalog records about it.
+message DropTable {
+  string table_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots and sequence numbers.
+
+// Point a table at a new snapshot, if it still points at `replaced_snapshot_id`.
+message SetCurrentSnapshot {
+  string table_id = 1;
+  string replaced_snapshot_id = 2;
+  string new_snapshot_id = 3;
+}
+
+// Point each table at its snapshot and drop the statistics of the old one.
+message SetCurrentSnapshots {
+  repeated TableSnapshot snapshots = 1;
+}
+
+// Advance a table's sequence allocator by `count`.
+message ReserveSequenceNumbers {
+  string table_id = 1;
+  uint32 count = 2;
+}
+
+message SetSnapshotSequence {
+  string table_id = 1;
+  string snapshot_id = 2;
+  int64 sequence_number = 3;
+}
+
+message ClearSnapshotSequence {
+  string table_id = 1;
+  string snapshot_id = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Deletes and re-inserts.
+
+message AddDeleteFile {
+  DeleteFile file = 1;
+}
+
+message AddDeleteFiles {
+  repeated DeleteFile files = 1;
+}
+
+message RemoveDeleteFiles {
+  string table_id = 1;
+  repeated string delete_file_ids = 2;
+}
+
+message ClearDeleteFiles {
+  string table_id = 1;
+}
+
+// Add deletion vectors and rewrite or remove the inlined batches they cover.
+message CommitDeleteFilesWithInlinedRewrite {
+  string table_id = 1;
+  repeated DeleteFile delete_files = 2;
+  repeated InlinedDataUpdate updated_data = 3;
+  repeated string deleted_inlined_ids = 4;
+}
+
+// Record that each key was re-inserted at `sequence_number`.
+message AddInsertRecords {
+  string table_id = 1;
+  repeated bytes pk_bytes = 2;
+  int64 sequence_number = 3;
+}
+
+message ClearInsertRecords {
+  string table_id = 1;
+}
+
+// An on-conflict publish: the deletion vectors of the replaced rows, each
+// key-based one stamped with the sequence its keys were re-inserted at; the
+// sequence of the snapshot holding the replacements; and optionally the
+// removal of the table's inlined rows and deletes.
+message CommitOnConflictDeletions {
+  string table_id = 1;
+  repeated DeleteFile delete_files = 2;
+  optional SnapshotSequence snapshot_sequence = 3;
+  bool clear_inlined = 4;
+}
+
+// An on-conflict publish that also records an inline tombstone and publishes
+// earlier deferred tombstones.
+message CommitOnConflictDeletionsWithTombstone {
+  string table_id = 1;
+  repeated DeleteFile delete_files = 2;
+  optional SnapshotSequence snapshot_sequence = 3;
+  InlinedDelete inline_tombstone = 4;
+  repeated string published_inlined_delete_ids = 5;
+}
+
+// The catalog half of a deferred on-conflict publish, committed with the
+// snapshot pointers of the same write.
+message ApplyPreparedOnConflict {
+  string table_id = 1;
+  repeated DeleteFile delete_files = 2;
+  string target_snapshot_id = 3;
+  int64 snapshot_sequence = 4;
+  InlinedDelete inline_tombstone = 5;
+  repeated string published_inlined_delete_ids = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Rewrites.
+
+// Replace a table's current snapshot with a compacted one, dropping every
+// delete and re-insert it absorbed.
+message CommitCompaction {
+  string table_id = 1;
+  string replaced_snapshot_id = 2;
+  string new_snapshot_id = 3;
+}
+
+// A compaction that absorbed only deletes and re-inserts up to `cutoff` and
+// the listed protected snapshots.
+message CommitCompactionFenced {
+  string table_id = 1;
+  string replaced_snapshot_id = 2;
+  string new_snapshot_id = 3;
+  int64 cutoff = 4;
+  repeated string protected_snapshot_ids = 5;
+}
+
+// Replace protected snapshots with one merged snapshot, if all of them are
+// still registered.
+message SwapProtectedSnapshots {
+  string table_id = 1;
+  repeated string old_snapshot_ids = 2;
+  string new_snapshot_id = 3;
+  int64 new_sequence_number = 4;
+}
+
+// Replace a table's whole contents with a new snapshot.
+message CommitOverwrite {
+  string table_id = 1;
+  string new_snapshot_id = 2;
+  InlinedData inlined = 3;
+  repeated DeleteFile delete_files = 4;
+}
+
+// An overwrite whose new contents are cold-tier files.
+message CommitOverwriteToCold {
+  string table_id = 1;
+  string new_snapshot_id = 2;
+  repeated ColdTierFile cold_files = 3;
+}
+
+message AddPartition {
+  Partition partition = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Statistics, manifests and indexes.
+
+message UpsertTableStatistics {
+  TableStatistics statistics = 1;
+}
+
+message ClearTableStatistics {
+  string table_id = 1;
+}
+
+message UpsertSnapshotFileStatistics {
+  SnapshotFileStatistics statistics = 1;
+}
+
+// Drop a table's per-file statistics, except those of `keep_snapshot_id`.
+message ClearSnapshotFileStatistics {
+  string table_id = 1;
+  optional string keep_snapshot_id = 2;
+}
+
+// Drop one snapshot's manifest and per-file statistics.
+message ClearSnapshotCachedMetadata {
+  string table_id = 1;
+  string snapshot_id = 2;
+}
+
+message UpsertSnapshotFile {
+  SnapshotFile file = 1;
+}
+
+message ReplaceSnapshotFiles {
+  string table_id = 1;
+  string snapshot_id = 2;
+  repeated SnapshotFile files = 3;
+}
+
+// Drop a table's snapshot manifests, except that of `keep_snapshot_id`.
+message ClearSnapshotFiles {
+  string table_id = 1;
+  optional string keep_snapshot_id = 2;
+}
+
+message UpsertPkIndex {
+  string table_id = 1;
+  string snapshot_id = 2;
+  bytes index_blob = 3;
+}
+
+message ClearPkIndex {
+  string table_id = 1;
+}
+
+message RegisterIndexRun {
+  IndexRun run = 1;
+}
+
+message RemoveIndexRun {
+  string table_id = 1;
+  string index_key = 2;
+  string run_name = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Inlined rows and deletes.
+
+message AddInlinedData {
+  InlinedData data = 1;
+}
+
+message ClearInlinedData {
+  string table_id = 1;
+  // Also drop the table's inlined deletes.
+  bool include_deletes = 2;
+}
+
+message ClearInlinedDeletes {
+  string table_id = 1;
+}
+
+message AddInlinedDelete {
+  InlinedDelete delete = 1;
+}
+
+message SetInlinedDeletePublished {
+  string table_id = 1;
+  string inlined_id = 2;
+  bool published = 3;
+}
+
+// Publish every inlined delete of the table that is not published yet.
+message PublishOrphanInlinedDeletes {
+  string table_id = 1;
+}
+
+// Rewrite and remove inlined batches and append new ones stamped with
+// `assigned_sequence`.
+message CommitInlinedMutation {
+  string table_id = 1;
+  repeated InlinedDataUpdate updated_data = 2;
+  repeated string deleted_inlined_ids = 3;
+  repeated InlinedData data = 4;
+  int64 assigned_sequence = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Federated write-back.
+
+// Mark keys whose committed value still has to reach the federated source.
+// A key already marked keeps its first time and the higher sequence.
+message MarkDirtyKeys {
+  string table_id = 1;
+  repeated bytes pk_bytes = 2;
+  int64 sequence_number = 3;
+  string marked_at = 4;
+}
+
+// Clear delivered keys whose mark is still at or below the delivered sequence.
+message ClearPendingWriteBack {
+  string table_id = 1;
+  repeated PendingWriteBackKey keys = 2;
+}

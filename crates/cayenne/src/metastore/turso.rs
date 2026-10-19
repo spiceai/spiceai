@@ -1232,6 +1232,10 @@ impl Drop for TursoTransaction {
 
 #[async_trait]
 impl MetastoreTransaction for TursoTransaction {
+    /// A Turso metastore is never durable in object storage, so no action is
+    /// kept.
+    fn record(&self, _action: super::durable::wire::Action) {}
+
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),

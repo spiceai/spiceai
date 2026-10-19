@@ -49,12 +49,12 @@ im = "15.1"
 object_store = { workspace = true }
 object_store_occ = { path = "../object_store_occ" }
 parking_lot = { workspace = true }
-postcard = { workspace = true }
+prost = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-request-context = { path = "../runtime-request-context" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
-rusqlite = { workspace = true, features = ["functions"] }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 telemetry = { path = "../telemetry" }
 tokio-rusqlite = { workspace = true }
@@ -106,6 +106,9 @@ libc = "0.2"
 # working set. See the module docs.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[build-dependencies]
+prost-build.workspace = true
 
 [features]
 default = []
