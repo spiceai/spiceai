@@ -99,7 +99,9 @@ pub use session::SessionStore;
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
 /// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
-pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive};
+pub use runtime_cluster::flight_config::{
+    ABANDON_APP_METADATA, KEEPALIVE_APP_METADATA, do_put_idle_timeout, keepalive,
+};
 
 pub struct Service {
     data_update_broadcaster: DataUpdateBroadcaster,
@@ -925,8 +927,8 @@ pub(crate) async fn check_read_only_sql(
         return Ok(None);
     }
     let session = datafusion.ctx.state();
-    let plan = datafusion
-        .create_logical_plan(&session, sql)
+    let (plan, _) = datafusion
+        .create_logical_plan(&session, sql, parameters)
         .await
         .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
     // Bind parameters to the plan so the returned plan is fully resolved.
