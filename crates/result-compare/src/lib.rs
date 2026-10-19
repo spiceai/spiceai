@@ -515,9 +515,12 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
 
         // Both sides are typed alike by the time they are compared, so Arrow's
         // own rendering of these is the same for equal values.
-        DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_) => {
-            Ok(Some(arrow::util::display::array_value_to_string(array, index)?))
-        }
+        DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_) => Ok(Some(arrow::util::display::array_value_to_string(
+            array, index,
+        )?)),
 
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
             let values = match array.data_type() {
@@ -1162,7 +1165,10 @@ pub fn compare_query_result_batches_with_sort_check(
             SortCheck::Violation(v) => {
                 diag!(
                     "Query '{query_name}' ({side}) violates its own ORDER BY on column '{}' at row {}: {} then {}",
-                    v.column, v.row_number, v.previous, v.current
+                    v.column,
+                    v.row_number,
+                    v.previous,
+                    v.current
                 );
                 return Ok(SortCheckedComparison {
                     result: QueryValidationResult::Fail(
@@ -1962,7 +1968,6 @@ mod test {
     use arrow::datatypes::{Field, Schema, TimeUnit};
     use std::sync::Arc;
 
-
     /// `GROUP BY f` over -inf, -0, 0: `PostgreSQL` names the -0/0 group `-0`,
     /// `DataFusion` `0`, and SQL holds them equal; rendered apart they sorted to
     /// different places in the multiset and paired `-0` with `-inf`.
@@ -1974,23 +1979,33 @@ mod test {
                 Field::new("n", DataType::Int64, false),
             ]));
             let n = Int64Array::from(counts);
-            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(keys)), Arc::new(n)])
-                .expect("batch")
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Float64Array::from(keys)), Arc::new(n)],
+            )
+            .expect("batch")
         };
         let postgres = batch(vec![f64::NEG_INFINITY, -0.0, f64::NAN], vec![1, 2, 1]);
         let datafusion = batch(vec![f64::NAN, f64::NEG_INFINITY, 0.0], vec![1, 1, 2]);
-        let result = compare_query_result_batches("q", &[postgres], &[datafusion], RowOrder::Multiset)
-            .expect("compare");
+        let result =
+            compare_query_result_batches("q", &[postgres], &[datafusion], RowOrder::Multiset)
+                .expect("compare");
         assert!(matches!(result, QueryValidationResult::Pass), "{result:?}");
         let different = batch(vec![f64::NAN, f64::NEG_INFINITY, 1.0], vec![1, 1, 2]);
         let result = compare_query_result_batches(
             "q",
-            &[batch(vec![f64::NEG_INFINITY, -0.0, f64::NAN], vec![1, 2, 1])],
+            &[batch(
+                vec![f64::NEG_INFINITY, -0.0, f64::NAN],
+                vec![1, 2, 1],
+            )],
             &[different],
             RowOrder::Multiset,
         )
         .expect("compare");
-        assert!(matches!(result, QueryValidationResult::Fail(_)), "{result:?}");
+        assert!(
+            matches!(result, QueryValidationResult::Fail(_)),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -2041,7 +2056,6 @@ mod test {
         }
     }
 
-
     #[test]
     fn test_timestamp_strings_equivalent() {
         // Same instant, different fractional-second width across engines.
@@ -2088,7 +2102,6 @@ mod test {
         // Decimals must fall through to the numeric comparison path.
         assert!(!timestamp_strings_equivalent("1.10", "1.1"));
     }
-
 
     #[test]
     fn test_date_and_midnight_timestamp_equivalent() {
@@ -2144,7 +2157,6 @@ mod test {
             "1995-03-05T00:00:00"
         ));
     }
-
 
     #[test]
     fn test_datatype_equivalent_date_and_timestamp() {

@@ -616,10 +616,14 @@ fn sql_float_order(array: &ArrayRef) -> ArrayRef {
     // `NaN` included, as it was.
     match array.data_type() {
         DataType::Float32 => std::sync::Arc::new(
-            array.as_primitive::<Float32Type>().unary::<_, Float32Type>(|v| v + 0.0),
+            array
+                .as_primitive::<Float32Type>()
+                .unary::<_, Float32Type>(|v| v + 0.0),
         ),
         DataType::Float64 => std::sync::Arc::new(
-            array.as_primitive::<Float64Type>().unary::<_, Float64Type>(|v| v + 0.0),
+            array
+                .as_primitive::<Float64Type>()
+                .unary::<_, Float64Type>(|v| v + 0.0),
         ),
         _ => ArrayRef::clone(array),
     }
@@ -1367,7 +1371,10 @@ mod tests {
         assert_eq!(violation.column, "id");
         let nan_last = super::check_sort_order(sql, &[batch([0.0, f64::NAN, -0.0], [5, 1, 4])])
             .expect("check");
-        assert!(matches!(nan_last, super::SortCheck::Violation(_)), "{nan_last:?}");
+        assert!(
+            matches!(nan_last, super::SortCheck::Violation(_)),
+            "{nan_last:?}"
+        );
     }
 
     /// rustdoc immediately above `fn_sig` in this file. A glued pair of comments
