@@ -45,7 +45,8 @@ use datafusion_ddl::{
 ///
 /// Extracts recognized `WITH` options and `PARTITION BY` from the AST, stores
 /// them in the [`DdlExtensionStore`], strips those clauses from the statement,
-/// and delegates the cleaned statement to `session.statement_to_plan()`.
+/// and delegates the cleaned statement to `session.statement_to_plan()`, keeping
+/// the spellings of float tokens the planned literals lose.
 ///
 /// On planning failure, automatically cleans up the store entry.
 pub(super) async fn plan_create_table(
@@ -70,7 +71,9 @@ pub(super) async fn plan_create_table(
     // Wrap the modified CreateTable back into a Statement for DataFusion.
     let modified_stmt = Statement::Statement(Box::new(SQLStatement::CreateTable(modified_ct)));
 
-    match session.statement_to_plan(modified_stmt).await {
+    // A CTAS query is planned like any other query, so its float tokens keep
+    // their spellings for the exact decimal cast (#14970).
+    match super::plan_retaining_float_spellings(modified_stmt, session).await {
         Ok(plan) => Ok(plan),
         Err(e) => {
             // Clean up the store entry if planning fails.
@@ -964,5 +967,67 @@ mod tests {
             !has_ddl_extensions(&ct),
             "LIKE should not be treated as a DDL extension"
         );
+    }
+
+    /// A `CREATE TABLE ... AS` with DDL extensions is planned here rather than
+    /// by the generic path, and its query must keep the spelling of a float
+    /// token its `f64` loses, as every other query does (#14970).
+    #[tokio::test]
+    async fn ctas_with_ddl_extensions_keeps_lossy_float_spellings() {
+        use datafusion::arrow::array::{Decimal128Array, RecordBatch};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::Expr;
+        use datafusion::prelude::SessionContext;
+        use runtime_datafusion::analyzer_rule::exact_float_decimal_cast::FLOAT_LITERAL_SPELLING_KEY;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 17),
+            false,
+        )]));
+        let amounts = Decimal128Array::from(vec![407_000_000_000_000_030_i128])
+            .with_precision_and_scale(38, 17)
+            .expect("valid decimal");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(amounts)]).expect("valid batch");
+        let ctx = SessionContext::new();
+        ctx.register_batch("source", batch).expect("register");
+        let state = ctx.state();
+        let sql = r#"CREATE TABLE target WITH ("acceleration.engine" = 'arrow') AS SELECT amount FROM source WHERE amount = 4.0700000000000003"#;
+        let statement = state
+            .sql_to_statement(sql, &datafusion::common::config::Dialect::Generic)
+            .expect("parse");
+        let Statement::Statement(sql_statement) = &statement else {
+            panic!("expected a SQL statement");
+        };
+        let SQLStatement::CreateTable(create_table) = sql_statement.as_ref() else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(has_ddl_extensions(create_table), "precondition");
+
+        let plan = plan_create_table(
+            statement,
+            &state,
+            &new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+        )
+        .await
+        .expect("plan");
+
+        let mut spellings = Vec::new();
+        plan.apply_with_subqueries(|node| {
+            node.apply_expressions(|expr| {
+                expr.apply(|expr| {
+                    if let Expr::Literal(_, Some(metadata)) = expr
+                        && let Some(spelling) = metadata.inner().get(FLOAT_LITERAL_SPELLING_KEY)
+                    {
+                        spellings.push(spelling.clone());
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })
+        .expect("walk plan");
+        assert_eq!(spellings, vec!["4.0700000000000003".to_string()]);
     }
 }

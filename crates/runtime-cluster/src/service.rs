@@ -48,10 +48,13 @@ use tokio::time::timeout;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
+use crate::executor_liveness::ExecutorLiveness;
 use crate::executor_registry::{self, ExecutorRegistry};
+use crate::metadata::{PartitionKey, partition_key};
 use crate::metrics;
+use crate::partition_load_tracker::PartitionLoadTracker;
 use crate::scheduler_task_config::PartitionAssignmentConfig;
-use crate::{PartitionStore, PartitionValue, partition_value_to_bytes, store};
+use crate::{AssignmentRequest, PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -165,8 +168,10 @@ struct ExecutorLoad {
 
 #[derive(Debug)]
 struct CommitResult {
+    /// The assignments that hold: made here, or already in place.
     committed: Vec<Assignment>,
-    failed: Vec<(Assignment, Error)>,
+    /// The assignments another scheduler made first with another executor.
+    lost: Vec<Assignment>,
 }
 
 /// Outcome of a [`PartitionService::reconcile_all`] cycle, used by the periodic
@@ -201,7 +206,25 @@ pub struct PartitionService {
     /// CDC/Changes-mode accelerations (e.g. Cayenne) only load partition data at
     /// their initial snapshot and have no re-load path once assigned later.
     first_assignment_complete: Arc<AtomicBool>,
+    /// When each executor that holds partitions was first found connected to
+    /// no live scheduler, if it still is.
+    absent_since: parking_lot::Mutex<HashMap<String, tokio::time::Instant>>,
 }
+
+/// How long an executor that holds partitions may be connected to no live
+/// scheduler before its partitions are given to other executors. Long enough
+/// for an executor to restart under the same id and keep them.
+pub const DEPARTED_EXECUTOR_GRACE: Duration = Duration::from_mins(2);
+
+/// Clock difference between schedulers tolerated when judging how recent
+/// another scheduler's view of its executors is.
+const LIVENESS_CLOCK_SKEW: Duration = Duration::from_secs(5);
+
+/// How long after an executor acks an assigned partition the partition is sent
+/// again if the executor has not reported it loaded. The executor ignores a
+/// partition it is still loading, replays the report of one it loaded, and
+/// loads again one whose load failed.
+pub const UNLOADED_RESEND_AFTER: Duration = Duration::from_secs(30);
 
 impl PartitionService {
     #[must_use]
@@ -215,6 +238,7 @@ impl PartitionService {
             executor_registry,
             app,
             first_assignment_complete: Arc::new(AtomicBool::new(false)),
+            absent_since: parking_lot::Mutex::default(),
         }
     }
 
@@ -370,35 +394,7 @@ impl PartitionService {
             .await
             .context(PartitionStoreRefreshSnafu)?;
 
-        let tables: Vec<(TableReference, Vec<PartitionedBy>)> = {
-            let ds = app.datasets.iter().filter_map(|ds| {
-                if let Some(acc) = &ds.acceleration
-                    && acc.enabled
-                    && !acc.partition_by.is_empty()
-                {
-                    Some((
-                        TableReference::parse_str(&ds.name),
-                        acc.partition_by.clone(),
-                    ))
-                } else {
-                    None
-                }
-            });
-            let views = app.views.iter().filter_map(|view| {
-                if let Some(acc) = &view.acceleration
-                    && acc.enabled
-                    && !acc.partition_by.is_empty()
-                {
-                    Some((
-                        TableReference::parse_str(&view.name),
-                        acc.partition_by.clone(),
-                    ))
-                } else {
-                    None
-                }
-            });
-            ds.chain(views).collect()
-        };
+        let tables = partitioned_tables(&app);
 
         let mut reconciled_tables: Vec<TableReference> = Vec::new();
         for (table, partition_by) in tables {
@@ -447,9 +443,9 @@ impl PartitionService {
     /// - Queries the source for current partition values.
     /// - Diffs against store metadata (new = in source but not store; removed = in store but not source).
     /// - When metadata is absent, treats all source partitions as new.
-    /// - Adds new partitions (unassigned) with OCC-retry.
-    /// - Removes stale partitions with OCC-retry and emits unload notifications
-    ///   to executors that previously held them.
+    /// - Writes the table's entry, the new partitions (unassigned) and the
+    ///   removal of stale ones in one OCC write, then emits unload
+    ///   notifications to executors that held the removed partitions.
     ///
     /// Returns the computed diff for logging/metrics in the caller.
     async fn record_diff(
@@ -490,103 +486,98 @@ impl PartitionService {
         };
 
         // Diff against store metadata.
-        let existing_partitions: Vec<crate::PartitionMetadata> =
-            match self.partition_store.get_table_metadata(table).await {
-                Ok(Some(m)) => m.partitions,
-                Ok(None) => {
-                    tracing::debug!(
-                        table = %table,
-                        count = source_partitions.len(),
-                        "No partition metadata found, treating all source partitions as new"
-                    );
-                    Vec::new()
-                }
-                Err(e) => {
-                    return Err(Error::DiscoveryFailed {
-                        table: table.to_string(),
-                        source: Box::new(e),
-                    });
-                }
-            };
+        let stored = self.partition_store.get_table_metadata(table).await;
+        let has_entry = matches!(stored, Ok(Some(_)));
+        let existing_partitions: Vec<crate::PartitionMetadata> = match stored {
+            Ok(Some(m)) => m.partitions,
+            Ok(None) => {
+                tracing::debug!(
+                    table = %table,
+                    count = source_partitions.len(),
+                    "No partition metadata found, treating all source partitions as new"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                return Err(Error::DiscoveryFailed {
+                    table: table.to_string(),
+                    source: Box::new(e),
+                });
+            }
+        };
 
-        let existing: HashSet<Vec<(String, Option<String>)>> = existing_partitions
+        let existing: HashSet<PartitionKey> = existing_partitions
             .iter()
-            .map(|p| sorted_kv(&p.partition_value))
+            .map(|p| partition_key(&p.partition_value))
             .collect();
 
-        let source_set: HashSet<Vec<(String, Option<String>)>> =
-            source_partitions.iter().map(sorted_kv).collect();
+        let source_set: HashSet<PartitionKey> =
+            source_partitions.iter().map(partition_key).collect();
 
         let new: Vec<PartitionValue> = source_partitions
             .iter()
-            .filter(|p| !existing.contains(&sorted_kv(p)))
+            .filter(|p| !existing.contains(&partition_key(p)))
             .cloned()
             .collect();
 
         let removed: Vec<PartitionValue> = existing_partitions
             .iter()
-            .filter(|p| !source_set.contains(&sorted_kv(&p.partition_value)))
+            .filter(|p| !source_set.contains(&partition_key(&p.partition_value)))
             .map(|p| p.partition_value.clone())
             .collect();
 
         let diff = PartitionDiff { new, removed };
 
-        // Ensure the table has a metadata entry (with `updated_at > 0`) even
-        // when the source currently has no partitions — readiness for
-        // zero-partition tables is gated on the `updated_at > 0` shortcut in
-        // `PartitionLoadTracker::is_table_loaded`, which could never trip if
-        // the entry were only created once partitions are added. Also lets
-        // `add_partitions_with_retry` find the entry below.
-        // No-op if already initialized.
-        let partition_expressions: Vec<String> =
-            partition_by.iter().map(|p| p.expression.clone()).collect();
-        if let Err(e) = self
-            .partition_store
-            .initialize_metadata(table, partition_expressions)
-            .await
-        {
-            tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
-        }
-
-        if diff.is_empty() {
+        if has_entry && diff.is_empty() {
             return Ok(diff);
         }
 
-        if !diff.new.is_empty() {
-            tracing::info!(
-                table = %table,
-                count = diff.new.len(),
-                "Adding new partitions"
-            );
-            add_partitions_with_retry(&self.partition_store, table, diff.new.clone()).await?;
+        // One write publishes the discovered set: the entry (with
+        // `updated_at > 0` even when the source has no partitions, which the
+        // readiness shortcut in `PartitionLoadTracker::is_table_loaded` needs),
+        // the new partitions and the removal of stale ones. A query never sees
+        // an entry that lists only part of the source's partitions.
+        let partition_expressions: Vec<String> =
+            partition_by.iter().map(|p| p.expression.clone()).collect();
+        let changes = self
+            .partition_store
+            .apply_discovery(table, &partition_expressions, &diff.new, &diff.removed)
+            .await
+            .context(WriteMetadataSnafu {
+                table: table.to_string(),
+            })?;
+
+        if changes.added > 0 {
+            tracing::info!(table = %table, count = changes.added, "Added new partitions");
             if let Some(node_id) = self.executor_registry.node_id() {
                 metrics::record_partition_state_operation(
                     node_id,
                     metrics::PartitionStateOperation::Added,
-                    diff.new.len() as u64,
+                    changes.added as u64,
                 );
             }
         }
 
-        if !diff.removed.is_empty() {
-            tracing::info!(
-                table = %table,
-                count = diff.removed.len(),
-                "Removing stale partitions"
-            );
-            remove_partitions_with_cleanup(
-                &self.partition_store,
-                &self.executor_registry,
-                ops,
-                table,
-                diff.removed.clone(),
-            )
-            .await?;
+        if changes.removed_count > 0 {
+            tracing::info!(table = %table, count = changes.removed_count, "Removed stale partitions");
+            for (executor_id, partitions) in changes.removed {
+                if let Err(e) = notify_executor_to_unload(
+                    &self.executor_registry,
+                    ops,
+                    &executor_id,
+                    table,
+                    partitions,
+                )
+                .await
+                {
+                    tracing::warn!(executor_id = %executor_id, table = %table, error = %e, "Failed to notify executor to unload partitions");
+                }
+            }
             if let Some(node_id) = self.executor_registry.node_id() {
                 metrics::record_partition_state_operation(
                     node_id,
                     metrics::PartitionStateOperation::Removed,
-                    diff.removed.len() as u64,
+                    changes.removed_count as u64,
                 );
             }
         }
@@ -646,17 +637,270 @@ impl PartitionService {
 
         let assignments =
             assign_unassigned_partitions(unassigned, &state, &self.partition_store, config, limit);
-        let CommitResult { committed, failed } = commit_assignments(
+        let CommitResult { committed, lost } = commit_assignments(
             &self.partition_store,
             assignments,
             self.executor_registry.node_id(),
         )
         .await?;
-        if !failed.is_empty() {
-            tracing::warn!("Failed to commit {} partition assignments", failed.len());
+        if !lost.is_empty() {
+            tracing::debug!(
+                "{} partitions were assigned by another scheduler first",
+                lost.len()
+            );
         }
         notify_executors(&self.executor_registry, ops, committed).await
     }
+
+    /// Publishes the executors this scheduler has connected, for other
+    /// schedulers' [`Self::live_executors`].
+    pub async fn publish_connected_executors(&self) {
+        let Some(scheduler_id) = self.executor_registry.node_id() else {
+            return;
+        };
+        let Ok(now_ms) = crate::cluster_state::now_ms() else {
+            return;
+        };
+        let connected = self.executor_registry.connected_executors().await;
+        if let Err(err) = ExecutorLiveness::new(self.partition_store.cluster_state())
+            .publish(scheduler_id, connected, now_ms)
+            .await
+        {
+            tracing::warn!("Failed to publish this scheduler's connected executors: {err}");
+        }
+    }
+
+    /// Returns every executor this scheduler has connected or that a scheduler
+    /// that published within three `interval`s has connected. Returns `None`
+    /// when the other schedulers' views cannot be read: this scheduler's view
+    /// alone cannot tell an executor that left from one it cannot reach.
+    pub async fn live_executors(&self, interval: Duration) -> Option<HashSet<String>> {
+        let connected = self.executor_registry.connected_executors().await;
+        if self.executor_registry.node_id().is_none() {
+            return Some(connected.into_iter().collect());
+        }
+        let now_ms = crate::cluster_state::now_ms().ok()?;
+        match ExecutorLiveness::new(self.partition_store.cluster_state())
+            .live_executors(now_ms, interval * 3 + LIVENESS_CLOCK_SKEW)
+            .await
+        {
+            Ok(mut live) => {
+                live.extend(connected);
+                Some(live)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to read the executors other schedulers have connected; not reassigning partitions this cycle: {err}"
+                );
+                None
+            }
+        }
+    }
+
+    /// Unassigns the partitions of each executor that has been absent from
+    /// `live` for [`DEPARTED_EXECUTOR_GRACE`], so the next assignment pass gives
+    /// them to executors that are connected. `live` holds every executor a live
+    /// scheduler has connected. Returns how many partitions were unassigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition store refresh or write fails.
+    pub async fn reassign_departed(&self, live: &HashSet<String>) -> Result<usize> {
+        self.partition_store
+            .refresh()
+            .await
+            .context(PartitionStoreRefreshSnafu)?;
+        let tables = self.partition_store.list_tables().await.unwrap_or_default();
+        let holders: HashSet<String> = tables
+            .iter()
+            .filter_map(|table| {
+                self.partition_store
+                    .get_cached_table_metadata(&TableReference::parse_str(table))
+            })
+            .flat_map(|metadata| {
+                metadata
+                    .partitions
+                    .into_iter()
+                    .flat_map(|p| p.assigned_executors)
+            })
+            .collect();
+
+        let now = tokio::time::Instant::now();
+        let departed: Vec<String> = {
+            let mut absent_since = self.absent_since.lock();
+            absent_since.retain(|id, _| holders.contains(id) && !live.contains(id));
+            holders
+                .iter()
+                .filter(|id| !live.contains(*id))
+                .filter(|id| {
+                    let since = *absent_since.entry((*id).clone()).or_insert(now);
+                    now.duration_since(since) >= DEPARTED_EXECUTOR_GRACE
+                })
+                .cloned()
+                .collect()
+        };
+
+        let mut unassigned = 0;
+        for executor_id in departed {
+            let count = self
+                .partition_store
+                .unassign_executor(&executor_id)
+                .await
+                .context(WriteMetadataSnafu {
+                    table: format!("<partitions of executor {executor_id}>"),
+                })?;
+            tracing::warn!(
+                executor = %executor_id,
+                partitions = count,
+                "Executor has been connected to no scheduler for {DEPARTED_EXECUTOR_GRACE:?}; reassigning its partitions"
+            );
+            self.absent_since.lock().remove(&executor_id);
+            unassigned += count;
+        }
+        Ok(unassigned)
+    }
+
+    /// Brings each connected executor's partitions in line with its
+    /// assignment: sends it the partitions it is assigned but has not reported
+    /// loaded, unless it acked them within [`UNLOADED_RESEND_AFTER`], and the
+    /// removal of those it reported loaded or acked but is no longer assigned.
+    /// An assignment whose notification was lost reaches the executor on the
+    /// next call; one whose load failed or whose report was lost, once the
+    /// wait has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a partition value cannot be encoded.
+    pub async fn resync_executors(
+        &self,
+        ops: &dyn PartitionOperations,
+        tracker: &PartitionLoadTracker,
+    ) -> Result<()> {
+        let executors = self.executor_registry.connected_executors().await;
+        if executors.is_empty() {
+            return Ok(());
+        }
+        let Some(app) = self.app.read().await.clone() else {
+            return Ok(());
+        };
+        for (table, _) in partitioned_tables(&app) {
+            let Some(metadata) = self.partition_store.get_cached_table_metadata(&table) else {
+                continue;
+            };
+            let mut assigned: HashMap<String, HashSet<bytes::Bytes>> = HashMap::new();
+            for partition in &metadata.partitions {
+                if !partition.is_assigned() {
+                    continue;
+                }
+                let bytes =
+                    partition_value_to_bytes(partition.partition_value.clone(), &table, ops)
+                        .await
+                        .context(PartitionValueConversionSnafu)?;
+                for executor_id in &partition.assigned_executors {
+                    assigned
+                        .entry(executor_id.clone())
+                        .or_default()
+                        .insert(bytes.clone());
+                }
+            }
+            let acks = tracker.acks(&canonical_table(&table)).await;
+            let table_name = table.to_string();
+            for executor_id in &executors {
+                let assigned = assigned.remove(executor_id).unwrap_or_default();
+                let process = self.executor_registry.current_process(executor_id);
+                let loaded = acks
+                    .get(executor_id)
+                    .filter(|ack| ack.process_id == process)
+                    .map(|ack| ack.partitions.clone())
+                    .unwrap_or_default();
+                let delivered = self
+                    .executor_registry
+                    .delivered_partitions(executor_id, &table_name)
+                    .await;
+                let now = tokio::time::Instant::now();
+                let added: Vec<bytes::Bytes> = assigned
+                    .iter()
+                    .filter(|bytes| {
+                        !loaded.contains(*bytes)
+                            && delivered.get(*bytes).is_none_or(|acked_at| {
+                                now.duration_since(*acked_at) >= UNLOADED_RESEND_AFTER
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                let removed: Vec<bytes::Bytes> = loaded
+                    .iter()
+                    .chain(delivered.keys())
+                    .filter(|bytes| !assigned.contains(*bytes))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                if added.is_empty() && removed.is_empty() {
+                    continue;
+                }
+                match self
+                    .executor_registry
+                    .send_partition_update(
+                        executor_id,
+                        &table_name,
+                        &added,
+                        &removed,
+                        NOTIFY_ACK_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(()) => tracing::info!(
+                        executor = %executor_id,
+                        table = %table,
+                        added = added.len(),
+                        removed = removed.len(),
+                        "Re-sent partition assignment changes the executor had not applied"
+                    ),
+                    Err(err) => tracing::warn!(
+                        executor = %executor_id,
+                        table = %table,
+                        error = %err,
+                        "Failed to re-send partition assignment changes; retrying next cycle"
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `table` resolved against the Spice defaults, the form executor reports are
+/// recorded under.
+fn canonical_table(table: &TableReference) -> TableReference {
+    let resolved = table
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    TableReference::full(resolved.catalog, resolved.schema, resolved.table)
+}
+
+/// The accelerated datasets and views of `app` that are partitioned, with their
+/// `partition_by`.
+fn partitioned_tables(app: &App) -> Vec<(TableReference, Vec<PartitionedBy>)> {
+    let datasets = app.datasets.iter().filter_map(|ds| {
+        let acc = ds.acceleration.as_ref()?;
+        (acc.enabled && !acc.partition_by.is_empty()).then(|| {
+            (
+                TableReference::parse_str(&ds.name),
+                acc.partition_by.clone(),
+            )
+        })
+    });
+    let views = app.views.iter().filter_map(|view| {
+        let acc = view.acceleration.as_ref()?;
+        (acc.enabled && !acc.partition_by.is_empty()).then(|| {
+            (
+                TableReference::parse_str(&view.name),
+                acc.partition_by.clone(),
+            )
+        })
+    });
+    datasets.chain(views).collect()
 }
 
 /// Returns the `partition_by` config for a table from the App definition.
@@ -703,83 +947,6 @@ fn dataset_label(table: &TableReference) -> String {
         .clone()
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
     format!("{}.{}", resolved.schema, resolved.table)
-}
-
-/// Sort a `PartitionValue` into a deterministic `Vec<(k, v)>` for equality comparisons.
-fn sorted_kv(p: &PartitionValue) -> Vec<(String, Option<String>)> {
-    let mut v: Vec<_> = p.clone().into_iter().collect();
-    v.sort();
-    v
-}
-
-async fn add_partitions_with_retry(
-    partition_store: &PartitionStore,
-    table: &TableReference,
-    partition_values: Vec<PartitionValue>,
-) -> Result<()> {
-    match partition_store
-        .add_partitions(table, &partition_values)
-        .await
-    {
-        Ok(added) => {
-            if added {
-                tracing::debug!(table = %table, count = partition_values.len(), "Added new partitions to metadata");
-            }
-            Ok(())
-        }
-        Err(store::Error::TableMetadataNotFound { .. }) => Err(Error::TableMetadataNotFound {
-            table: table.to_string(),
-        }),
-        Err(source) => Err(Error::WriteMetadata {
-            table: table.to_string(),
-            source,
-        }),
-    }
-}
-
-async fn remove_partitions_with_cleanup(
-    partition_store: &PartitionStore,
-    executor_registry: &ExecutorRegistry,
-    ops: &dyn PartitionOperations,
-    table: &TableReference,
-    partition_values: Vec<PartitionValue>,
-) -> Result<()> {
-    let executors_to_notify = match partition_store
-        .remove_partitions(table, &partition_values)
-        .await
-    {
-        Ok(removed) => removed,
-        Err(store::Error::TableMetadataNotFound { .. }) => {
-            return Err(Error::TableMetadataNotFound {
-                table: table.to_string(),
-            });
-        }
-        Err(source) => {
-            return Err(Error::WriteMetadata {
-                table: table.to_string(),
-                source,
-            });
-        }
-    };
-    if !executors_to_notify.is_empty() {
-        tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
-    }
-
-    for (executor_id, partitions) in &executors_to_notify {
-        if let Err(e) = notify_executor_to_unload(
-            executor_registry,
-            ops,
-            executor_id,
-            table,
-            partitions.clone(),
-        )
-        .await
-        {
-            tracing::warn!(executor_id = %executor_id, table = %table, error = %e, "Failed to notify executor to unload partitions");
-        }
-    }
-
-    Ok(())
 }
 
 async fn notify_executor_to_unload(
@@ -1006,81 +1173,75 @@ fn score_executor_for_partition(
     score.max(0.0)
 }
 
+/// Commits `assignments` in one write. A partition another scheduler assigned
+/// first keeps its executor, and only the assignments that hold are notified.
 async fn commit_assignments(
     partition_store: &PartitionStore,
     assignments: Vec<Assignment>,
     node_id: Option<&str>,
 ) -> Result<CommitResult> {
-    let mut committed = Vec::new();
-    let mut failed = Vec::new();
-
-    for assignment in assignments {
-        match assign_partition_with_retry(
-            partition_store,
-            &assignment.table,
-            &assignment.partition_value,
-            &assignment.executor_id,
-        )
+    if assignments.is_empty() {
+        return Ok(CommitResult {
+            committed: Vec::new(),
+            lost: Vec::new(),
+        });
+    }
+    let requests: Vec<AssignmentRequest> = assignments
+        .iter()
+        .map(|assignment| AssignmentRequest {
+            table: assignment.table.clone(),
+            partition_value: assignment.partition_value.clone(),
+            executor_id: assignment.executor_id.clone(),
+        })
+        .collect();
+    let held = partition_store
+        .assign_unassigned(&requests)
         .await
-        {
-            Ok(()) => {
-                tracing::debug!(
-                    table = %assignment.table,
-                    partition = ?assignment.partition_value,
-                    executor = %assignment.executor_id,
-                    "Partition assigned"
-                );
-                if let Some(node_id) = node_id {
-                    metrics::record_partition_assignment(
-                        node_id,
-                        &assignment.executor_id,
-                        metrics::AssignmentStatus::Committed,
-                    );
-                }
-                committed.push(assignment);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    table = %assignment.table,
-                    partition = ?assignment.partition_value,
-                    executor = %assignment.executor_id,
-                    error = %e,
-                    "Failed to assign partition"
-                );
-                if let Some(node_id) = node_id {
-                    metrics::record_partition_assignment(
-                        node_id,
-                        &assignment.executor_id,
-                        metrics::AssignmentStatus::Failed,
-                    );
-                }
-                failed.push((assignment, e));
-            }
+        .context(WriteMetadataSnafu {
+            table: "<assignment batch>".to_string(),
+        })?;
+    let held: HashSet<(String, PartitionKey, String)> = held
+        .iter()
+        .map(|a| {
+            (
+                crate::normalized_table_name(&a.table),
+                partition_key(&a.partition_value),
+                a.executor_id.clone(),
+            )
+        })
+        .collect();
+
+    let (committed, lost): (Vec<Assignment>, Vec<Assignment>) =
+        assignments.into_iter().partition(|assignment| {
+            held.contains(&(
+                crate::normalized_table_name(&assignment.table),
+                partition_key(&assignment.partition_value),
+                assignment.executor_id.clone(),
+            ))
+        });
+    for assignment in &committed {
+        tracing::debug!(
+            table = %assignment.table,
+            partition = ?assignment.partition_value,
+            executor = %assignment.executor_id,
+            "Partition assigned"
+        );
+        if let Some(node_id) = node_id {
+            metrics::record_partition_assignment(
+                node_id,
+                &assignment.executor_id,
+                metrics::AssignmentStatus::Committed,
+            );
         }
     }
-
-    if !committed.is_empty() || !failed.is_empty() {
+    if !committed.is_empty() || !lost.is_empty() {
         tracing::info!(
             committed_count = committed.len(),
-            failed_count = failed.len(),
+            lost_count = lost.len(),
             "Committed partition assignments"
         );
     }
-    Ok(CommitResult { committed, failed })
-}
-
-async fn assign_partition_with_retry(
-    partition_store: &PartitionStore,
-    table: &TableReference,
-    partition_value: &PartitionValue,
-    executor_id: &str,
-) -> Result<()> {
-    partition_store
-        .assign_partition(table, partition_value, executor_id)
-        .await
-        .context(WriteMetadataSnafu {
-            table: table.to_string(),
-        })
+    Ok(CommitResult { committed, lost })
 }
 
 async fn notify_executors(
@@ -1140,8 +1301,8 @@ const NOTIFY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const NOTIFY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Maximum number of retry attempts for a single executor notification.
-/// After exhaustion the assignment stays committed in the partition store;
-/// the next reconcile cycle will re-attempt notification.
+/// After exhaustion the assignment stays committed in the partition store and
+/// [`PartitionService::resync_executors`] re-sends it.
 const NOTIFY_MAX_RETRIES: usize = 8;
 
 async fn notify_executor_of_assignments(
@@ -1164,7 +1325,7 @@ async fn notify_executor_of_assignments(
             let bytes = partition_value_to_bytes(p, &table, ops)
                 .await
                 .context(PartitionValueConversionSnafu)?;
-            partitions_bytes.push(bytes.to_vec());
+            partitions_bytes.push(bytes);
         }
 
         let mut backoff = FibonacciBackoffBuilder::new()
@@ -1173,36 +1334,13 @@ async fn notify_executor_of_assignments(
             .build();
         let table_str = table.to_string();
 
-        // Wrap the payload in an Arc so each attempt's closure-build clones a
-        // cheap Arc handle instead of the full Vec<Vec<u8>>. We still
-        // materialize an owned Vec inside the closure body when constructing
-        // the proto message — that deep copy is unavoidable because
-        // BytesArray/UpdatePartitions own their data over the wire — but the
-        // Arc keeps it limited to one materialization per actual send rather
-        // than two per loop iteration.
-        let payload = Arc::new(BytesArray {
-            items: partitions_bytes,
-        });
-        let table_str = Arc::new(table_str);
-
         loop {
-            let payload = Arc::clone(&payload);
-            let table_str = Arc::clone(&table_str);
             let send_result = registry
-                .send_command_with_ack(
+                .send_partition_update(
                     executor_id,
-                    move |request_id| SchedulerControlMessage {
-                        message: Some(SchedulerControlMessageEnum::UpdatePartitions(
-                            UpdatePartitions {
-                                new_partitions: HashMap::from([(
-                                    (*table_str).clone(),
-                                    (*payload).clone(),
-                                )]),
-                                removed_partitions: HashMap::new(),
-                                request_id,
-                            },
-                        )),
-                    },
+                    &table_str,
+                    &partitions_bytes,
+                    &[],
                     NOTIFY_ACK_TIMEOUT,
                 )
                 .await;
@@ -1216,7 +1354,7 @@ async fn notify_executor_of_assignments(
                             table = %table,
                             error = %err,
                             "Exhausted retries notifying executor of partition assignments; \
-                             assignment remains committed and will retry on next reconcile cycle"
+                             the next assignment cycle re-sends them"
                         );
                         return Err(err).context(SendCommandSnafu {
                             executor_id: executor_id.to_string(),
@@ -1276,6 +1414,7 @@ mod tests {
             schema_version: 1,
             updated_at: 1000,
             partition_expressions: vec!["date".to_string()],
+            unregistered_at_ms: None,
         };
         store
             .write_metadata(&table_ref, metadata)
@@ -1630,7 +1769,7 @@ mod tests {
             .await
             .expect("commit");
         assert_eq!(result.committed.len(), 1);
-        assert!(result.failed.is_empty());
+        assert!(result.lost.is_empty());
 
         let metadata = store
             .get_table_metadata(&TableReference::parse_str("test_table"))
@@ -1663,7 +1802,8 @@ mod tests {
         let table = TableReference::parse_str("orders");
 
         // Step 1: Add new partitions to the store (as unassigned).
-        add_partitions_with_retry(&store, &table, new_partition_values)
+        store
+            .apply_discovery(&table, &["date".to_string()], &new_partition_values, &[])
             .await
             .expect("add partitions");
         store.refresh().await.expect("refresh");
@@ -1710,7 +1850,7 @@ mod tests {
             .await
             .expect("commit");
         assert_eq!(result.committed.len(), 2);
-        assert!(result.failed.is_empty());
+        assert!(result.lost.is_empty());
 
         // Verify: all 4 partitions are now assigned in the store.
         let metadata = store
@@ -1742,7 +1882,13 @@ mod tests {
         let table = TableReference::parse_str("orders");
 
         // Try to add the same partition again.
-        add_partitions_with_retry(&store, &table, vec![pv("date", "2024-01-01")])
+        store
+            .apply_discovery(
+                &table,
+                &["date".to_string()],
+                &[pv("date", "2024-01-01")],
+                &[],
+            )
             .await
             .expect("should succeed (idempotent)");
 
@@ -1765,6 +1911,8 @@ mod tests {
     struct RaceBeforeFirstWrite {
         inner: Arc<dyn ObjectStore>,
         race: tokio::sync::Mutex<Option<futures::future::BoxFuture<'static, ()>>>,
+        /// When set, how many more writes succeed; later ones fail.
+        writes_left: std::sync::Mutex<Option<usize>>,
     }
 
     impl std::fmt::Display for RaceBeforeFirstWrite {
@@ -1790,6 +1938,15 @@ mod tests {
             let race = self.race.lock().await.take();
             if let Some(race) = race {
                 race.await;
+            }
+            if let Some(left) = self.writes_left.lock().expect("lock").as_mut() {
+                if *left == 0 {
+                    return Err(object_store::Error::Generic {
+                        store: "RaceBeforeFirstWrite",
+                        source: "write refused".into(),
+                    });
+                }
+                *left -= 1;
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -1859,6 +2016,7 @@ mod tests {
         let racing = Arc::new(RaceBeforeFirstWrite {
             inner,
             race: tokio::sync::Mutex::new(None),
+            writes_left: std::sync::Mutex::new(None),
         });
         let this = PartitionStore::accelerations(Arc::new(ClusterStateStore::new(
             Arc::clone(&racing) as Arc<dyn ObjectStore>,
@@ -1895,9 +2053,14 @@ mod tests {
                 .expect("the other scheduler assigns");
         }));
 
-        add_partitions_with_retry(&this, &table, vec![pv("date", "2024-01-02")])
-            .await
-            .expect("add partitions");
+        this.apply_discovery(
+            &table,
+            &["date".to_string()],
+            &[pv("date", "2024-01-02")],
+            &[],
+        )
+        .await
+        .expect("add partitions");
 
         let meta = this
             .get_table_metadata(&table)
@@ -1926,7 +2089,6 @@ mod tests {
             ],
         )
         .await;
-        let registry = ExecutorRegistry::new(Arc::clone(&other), Arc::clone(&other));
         let (race_table, race_value) = (table.clone(), kept.clone());
         *racing.race.lock().await = Some(Box::pin(async move {
             other
@@ -1935,12 +2097,11 @@ mod tests {
                 .expect("the other scheduler assigns");
         }));
 
-        remove_partitions_with_cleanup(
-            &this,
-            &registry,
-            &EmptySourceOps,
+        this.apply_discovery(
             &table,
-            vec![pv("date", "2024-01-02")],
+            &["date".to_string()],
+            &[],
+            &[pv("date", "2024-01-02")],
         )
         .await
         .expect("remove partitions");
@@ -1955,6 +2116,305 @@ mod tests {
             assigned_to(&meta, &kept),
             vec!["exec1".to_string()],
             "the concurrent assignment must survive: {meta:?}"
+        );
+    }
+
+    /// `PartitionOperations` stub whose discovery returns `values`.
+    struct FixedSourceOps(Vec<PartitionValue>);
+
+    #[async_trait::async_trait]
+    impl crate::context::PartitionExprResolver for FixedSourceOps {
+        async fn try_parse_expr(
+            &self,
+            _tbl: &TableReference,
+            expr: &str,
+        ) -> std::result::Result<::datafusion_expr::Expr, datafusion::error::DataFusionError>
+        {
+            Ok(::datafusion_expr::col(expr))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::PartitionDiscoverer for FixedSourceOps {
+        async fn table_partition_values(
+            &self,
+            _table: &TableReference,
+            _partition_by: &[PartitionedBy],
+        ) -> std::result::Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// A table's first discovery publishes its entry together with every
+    /// discovered partition: no reader ever finds an entry that lists only
+    /// part of them, even when a later write fails.
+    #[tokio::test]
+    async fn first_discovery_publishes_the_entry_with_its_partitions() {
+        let (this, _other, racing) = racing_stores("other", Vec::new()).await;
+        *racing.writes_left.lock().expect("lock") = Some(1);
+        let service = PartitionService::new(
+            Arc::new(this.clone()),
+            Arc::new(ExecutorRegistry::new(
+                Arc::new(this.clone()),
+                Arc::new(this.clone()),
+            )),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+        let table = TableReference::parse_str("t");
+        let partition_by = vec![PartitionedBy {
+            name: "date".to_string(),
+            expression: "date".to_string(),
+        }];
+
+        service
+            .seed_table(
+                &table,
+                &partition_by,
+                &FixedSourceOps(vec![pv("date", "2024-01-01"), pv("date", "2024-01-02")]),
+            )
+            .await
+            .expect("one write publishes the table");
+
+        let meta = this
+            .get_table_metadata(&table)
+            .await
+            .expect("read")
+            .expect("the entry is published");
+        assert_eq!(
+            meta.partitions.len(),
+            2,
+            "a partial inventory was published: {meta:?}"
+        );
+    }
+
+    /// A partition another scheduler assigned first keeps its executor, and
+    /// this scheduler's competing assignment is not reported as committed.
+    #[tokio::test]
+    async fn the_first_scheduler_to_assign_a_partition_keeps_it() {
+        let table = TableReference::parse_str("t");
+        let value = pv("date", "2024-01-01");
+        let (this, other, racing) =
+            racing_stores("t", vec![unassigned_partition("date", "2024-01-01")]).await;
+        let (race_table, race_value) = (table.clone(), value.clone());
+        *racing.race.lock().await = Some(Box::pin(async move {
+            other
+                .assign_partition(&race_table, &race_value, "exec1")
+                .await
+                .expect("the other scheduler assigns");
+        }));
+
+        let result = commit_assignments(
+            &this,
+            vec![Assignment {
+                table: table.clone(),
+                partition_value: value.clone(),
+                executor_id: "exec2".to_string(),
+            }],
+            None,
+        )
+        .await
+        .expect("commit");
+
+        let meta = this
+            .get_table_metadata(&table)
+            .await
+            .expect("read")
+            .expect("table metadata");
+        assert_eq!(
+            assigned_to(&meta, &value),
+            vec!["exec1".to_string()],
+            "the first assignment must hold: {meta:?}"
+        );
+        assert!(result.committed.is_empty(), "{result:?}");
+        assert_eq!(result.lost.len(), 1, "{result:?}");
+    }
+
+    /// An executor connected to no live scheduler keeps its partitions for the
+    /// grace period, then loses them; one that comes back in time keeps them.
+    #[tokio::test(start_paused = true)]
+    async fn an_executor_gone_for_the_grace_period_loses_its_partitions() {
+        let store = make_store().await;
+        setup_table(
+            &store,
+            "t",
+            vec![
+                assigned_partition("date", "1", "exec1"),
+                assigned_partition("date", "2", "exec2"),
+            ],
+        )
+        .await;
+        let service = PartitionService::new(
+            Arc::clone(&store),
+            Arc::new(ExecutorRegistry::new(
+                Arc::clone(&store),
+                make_store().await,
+            )),
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+        let only_exec2 = HashSet::from(["exec2".to_string()]);
+        let both = HashSet::from(["exec1".to_string(), "exec2".to_string()]);
+
+        assert_eq!(
+            service.reassign_departed(&only_exec2).await.expect("cycle"),
+            0
+        );
+        tokio::time::advance(DEPARTED_EXECUTOR_GRACE / 2).await;
+        // Back before the grace period ends: the absence starts over.
+        assert_eq!(service.reassign_departed(&both).await.expect("cycle"), 0);
+        assert_eq!(
+            service.reassign_departed(&only_exec2).await.expect("cycle"),
+            0
+        );
+        tokio::time::advance(DEPARTED_EXECUTOR_GRACE / 2).await;
+        assert_eq!(
+            service.reassign_departed(&only_exec2).await.expect("cycle"),
+            0
+        );
+        tokio::time::advance(DEPARTED_EXECUTOR_GRACE / 2).await;
+        assert_eq!(
+            service.reassign_departed(&only_exec2).await.expect("cycle"),
+            1
+        );
+
+        let meta = store
+            .get_table_metadata(&TableReference::parse_str("t"))
+            .await
+            .expect("read")
+            .expect("table metadata");
+        assert!(assigned_to(&meta, &pv("date", "1")).is_empty(), "{meta:?}");
+        assert_eq!(
+            assigned_to(&meta, &pv("date", "2")),
+            vec!["exec2".to_string()]
+        );
+    }
+
+    /// Answers every `UpdatePartitions` it receives and forwards it.
+    fn ack_and_forward(
+        mut rx: tokio::sync::mpsc::Receiver<SchedulerControlMessage>,
+        pending_acks: crate::correlated::CorrelatedResponses<runtime_proto::Ack>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<UpdatePartitions> {
+        let (tx, forwarded) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Some(SchedulerControlMessageEnum::UpdatePartitions(update)) = msg.message {
+                    pending_acks.deliver(
+                        &update.request_id,
+                        runtime_proto::Ack {
+                            request_id: update.request_id.clone(),
+                            error: None,
+                        },
+                    );
+                    let _ = tx.send(update);
+                }
+            }
+        });
+        forwarded
+    }
+
+    fn partitioned_app(table: &str) -> Arc<App> {
+        let mut dataset = spicepod::component::dataset::Dataset::new("memory:data", table);
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            partition_by: vec![PartitionedBy {
+                name: "date".to_string(),
+                expression: "date".to_string(),
+            }],
+            ..spicepod::acceleration::Acceleration::default()
+        });
+        Arc::new(app::AppBuilder::new("test").with_dataset(dataset).build())
+    }
+
+    async fn encoded(table: &TableReference, value: &str) -> bytes::Bytes {
+        partition_value_to_bytes(pv("date", value), table, &EmptySourceOps)
+            .await
+            .expect("encode")
+    }
+
+    /// An assignment whose notification never reached the executor is sent
+    /// again, once, and again after a while if the executor never reports it
+    /// loaded; a partition the executor reports loaded but is no longer
+    /// assigned is removed from it.
+    #[tokio::test(start_paused = true)]
+    async fn assignment_changes_an_executor_has_not_applied_are_sent_again() {
+        let store = make_store().await;
+        setup_table(&store, "t", vec![assigned_partition("date", "1", "exec1")]).await;
+        let registry = Arc::new(ExecutorRegistry::new(
+            Arc::clone(&store),
+            make_store().await,
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let handles = registry
+            .register("exec1".to_string(), "p1", tx)
+            .await
+            .handles;
+        let mut updates = ack_and_forward(rx, handles.pending_acks);
+        let service = PartitionService::new(
+            Arc::clone(&store),
+            Arc::clone(&registry),
+            Arc::new(tokio::sync::RwLock::new(Some(partitioned_app("t")))),
+        );
+        let tracker = PartitionLoadTracker::new();
+        let table = TableReference::parse_str("t");
+        let ops = EmptySourceOps;
+        service
+            .resync_executors(&ops, &tracker)
+            .await
+            .expect("resync");
+        let update = updates.try_recv().expect("the lost assignment is sent");
+        assert_eq!(
+            update.new_partitions["t"].items,
+            vec![encoded(&table, "1").await.to_vec()]
+        );
+        assert!(update.removed_partitions.is_empty());
+
+        // Acked: not sent again.
+        service
+            .resync_executors(&ops, &tracker)
+            .await
+            .expect("resync");
+        updates
+            .try_recv()
+            .expect_err("an acked assignment is not sent again");
+
+        // Still not reported loaded: sent again, so a failed load is retried.
+        tokio::time::advance(UNLOADED_RESEND_AFTER).await;
+        service
+            .resync_executors(&ops, &tracker)
+            .await
+            .expect("resync");
+        let update = updates
+            .try_recv()
+            .expect("an assignment that never loaded is sent again");
+        assert_eq!(
+            update.new_partitions["t"].items,
+            vec![encoded(&table, "1").await.to_vec()]
+        );
+
+        // The executor reports a partition it is no longer assigned.
+        tracker
+            .replace(
+                canonical_table(&table),
+                "exec1".to_string(),
+                crate::LoadedAck {
+                    process_id: "p1".to_string(),
+                    load_sequence: 1,
+                    partitions: HashSet::from([
+                        encoded(&table, "1").await,
+                        encoded(&table, "2").await,
+                    ]),
+                },
+            )
+            .await;
+        service
+            .resync_executors(&ops, &tracker)
+            .await
+            .expect("resync");
+        let update = updates.try_recv().expect("the stale partition is removed");
+        assert!(update.new_partitions.is_empty());
+        assert_eq!(
+            update.removed_partitions["t"].items,
+            vec![encoded(&table, "2").await.to_vec()]
         );
     }
 }

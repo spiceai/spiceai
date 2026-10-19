@@ -44,6 +44,19 @@ impl PostgresBlobCheckpointStore {
     }
 }
 
+impl PostgresBlobCheckpointStore {
+    fn create_table_sql(table: &str) -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {table} (
+                dataset_name TEXT PRIMARY KEY,
+                checkpoint_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"
+        )
+    }
+}
+
 #[async_trait]
 impl BlobCheckpointStore for PostgresBlobCheckpointStore {
     async fn get(&self) -> Result<Option<BlobCheckpoint>, CheckpointError> {
@@ -56,16 +69,8 @@ impl BlobCheckpointStore for PostgresBlobCheckpointStore {
 
         // Ensure the sidecar table exists so a fresh accelerator reads as "no
         // checkpoint yet" (Ok(None)) rather than a missing-table store error.
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (
-                dataset_name TEXT PRIMARY KEY,
-                checkpoint_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
         conn.conn
-            .execute(&create_table, &[])
+            .execute(&Self::create_table_sql(table), &[])
             .await
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),
@@ -108,16 +113,8 @@ impl BlobCheckpointStore for PostgresBlobCheckpointStore {
             .map_err(|source| CheckpointError::Store { source })?;
         let table = self.table_name;
 
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {table} (
-                dataset_name TEXT PRIMARY KEY,
-                checkpoint_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
         conn.conn
-            .execute(&create_table, &[])
+            .execute(&Self::create_table_sql(table), &[])
             .await
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),
@@ -133,6 +130,33 @@ impl BlobCheckpointStore for PostgresBlobCheckpointStore {
         let checkpoint_data = data.to_string();
         conn.conn
             .execute(&upsert, &[&self.dataset_name, &checkpoint_data])
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
+    async fn delete(&self) -> Result<(), CheckpointError> {
+        let conn = self
+            .pool
+            .connect_direct()
+            .await
+            .map_err(|source| CheckpointError::Store { source })?;
+        let table = self.table_name;
+
+        // The table may not exist yet: a dataset that never checkpointed has nothing
+        // to discard, and that is not an error.
+        conn.conn
+            .execute(&Self::create_table_sql(table), &[])
+            .await
+            .map_err(|source| CheckpointError::Store {
+                source: Box::new(source),
+            })?;
+
+        let delete = format!("DELETE FROM {table} WHERE dataset_name = $1");
+        conn.conn
+            .execute(&delete, &[&self.dataset_name])
             .await
             .map_err(|source| CheckpointError::Store {
                 source: Box::new(source),

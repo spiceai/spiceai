@@ -31,6 +31,7 @@ google-genai = { path = "../google-genai" }
 governor.workspace = true
 
 hf-hub.workspace = true
+http.workspace = true
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true
 regex.workspace = true
@@ -44,6 +45,7 @@ serde_json.workspace = true
 spicepod = { path = "../spicepod" }
 tokenizers.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
