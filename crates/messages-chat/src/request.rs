@@ -372,8 +372,8 @@ fn image_part(
     ))
 }
 
-/// A document as the parts that carry it: a PDF as a file, text as text after its title and
-/// context, and content blocks as their own parts.
+/// A document as the parts that carry it, after its title and context: a PDF as a file, text
+/// as text, and content blocks as their own parts.
 fn append_document(
     model: &str,
     document: DocumentBlockParam,
@@ -389,8 +389,18 @@ fn append_document(
             "Remove `citations` from the document, or use a model with `from: anthropic`.",
         ));
     }
+    // The title and context say what the document is and how to read it, so the model is given
+    // them whatever the document's source.
+    let heading = [document.title.as_deref(), document.context.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
     match document.source {
         DocumentSource::Base64 { media_type, data } => {
+            if !heading.is_empty() {
+                parts.push(text_part(heading));
+            }
             parts.push(ChatCompletionRequestUserMessageContentPart::File(
                 ChatCompletionRequestMessageContentPartFile {
                     file: FileObject {
@@ -402,24 +412,25 @@ fn append_document(
             ));
         }
         DocumentSource::Text { data, .. } => {
-            let heading: Vec<String> = [document.title, document.context]
-                .into_iter()
-                .flatten()
-                .collect();
             parts.push(text_part(if heading.is_empty() {
                 data
             } else {
-                format!("{}\n\n{data}", heading.join("\n"))
+                format!("{heading}\n\n{data}")
             }));
         }
-        DocumentSource::Content { content } => match content {
-            MessageContent::Text(text) => parts.push(text_part(text)),
-            MessageContent::Blocks(blocks) => {
-                for block in blocks {
-                    append_user_part(model, block, parts)?;
+        DocumentSource::Content { content } => {
+            if !heading.is_empty() {
+                parts.push(text_part(heading));
+            }
+            match content {
+                MessageContent::Text(text) => parts.push(text_part(text)),
+                MessageContent::Blocks(blocks) => {
+                    for block in blocks {
+                        append_user_part(model, block, parts)?;
+                    }
                 }
             }
-        },
+        }
         DocumentSource::Url { .. } | DocumentSource::File { .. } => {
             return Err(unsupported(
                 model,

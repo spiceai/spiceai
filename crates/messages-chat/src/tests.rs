@@ -746,3 +746,30 @@ fn a_tool_call_cut_off_by_max_tokens_is_left_out() {
         Some(messages_api::types::StopReason::MaxTokens)
     );
 }
+
+/// A document's title and context reach the model whatever its source: they say what the
+/// document is and how to read it.
+#[test]
+fn a_documents_title_and_context_are_kept_for_every_source() {
+    let chat = translated(&json!({
+        "model": "gpt",
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": [
+            {"type": "document", "title": "Ledger", "context": "Amounts are in cents", "source": {"type": "content", "content": "100"}},
+            {"type": "document", "title": "Ledger", "context": "Amounts are in cents", "source": {"type": "content", "content": [{"type": "text", "text": "200"}]}},
+            {"type": "document", "title": "invoice.pdf", "context": "Amounts are in cents", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBER"}},
+        ]}],
+    }))
+    .expect("a translatable request");
+    assert_eq!(
+        chat["messages"][0]["content"],
+        json!([
+            {"type": "text", "text": "Ledger\nAmounts are in cents"},
+            {"type": "text", "text": "100"},
+            {"type": "text", "text": "Ledger\nAmounts are in cents"},
+            {"type": "text", "text": "200"},
+            {"type": "text", "text": "invoice.pdf\nAmounts are in cents"},
+            {"type": "file", "file": {"file_data": "data:application/pdf;base64,JVBER", "filename": "invoice.pdf"}},
+        ])
+    );
+}
