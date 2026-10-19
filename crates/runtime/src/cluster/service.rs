@@ -85,6 +85,11 @@ use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 use runtime_cluster::{ExecutorRegistration, Registered};
 use telemetry::metrics_reader::MetricsReader;
 
+/// How long a scheduler waits for any message on an executor's control stream
+/// before it treats the executor as gone. Executors send a heartbeat every 10
+/// seconds.
+const CONTROL_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Handle for sending messages to a connected executor.
 struct ExecutorStreamHandle {
     tx: mpsc::Sender<SchedulerControlMessage>,
@@ -533,6 +538,7 @@ impl ClusterService for ClusterServiceImpl {
             .datafusion
             .query_builder(&local_sql)
             .read_only(true)
+            .for_peer_scheduler_read()
             .build()
             .run()
             .await
@@ -605,7 +611,13 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &datafusion).await;
+                        handle_executor_message(
+                            &executor_id,
+                            &msg.process_id,
+                            &message,
+                            &datafusion,
+                        )
+                        .await;
                     }
                     (executor_id, msg.process_id)
                 }
@@ -677,7 +689,13 @@ impl ClusterService for ClusterServiceImpl {
                         tracing::debug!("Executor control stream cancelled: {executor_id}");
                         break;
                     }
-                    result = inbound.next() => {
+                    result = tokio::time::timeout(CONTROL_STREAM_IDLE_TIMEOUT, inbound.next()) => {
+                        let Ok(result) = result else {
+                            tracing::warn!(
+                                "Executor {executor_id} sent nothing on its control stream for {CONTROL_STREAM_IDLE_TIMEOUT:?}; treating it as gone"
+                            );
+                            break;
+                        };
                         match result {
                             // A later process registered under this id while this
                             // one is still sending: two processes share the id.
@@ -730,9 +748,23 @@ impl ClusterService for ClusterServiceImpl {
                                             )
                                             .await;
                                         }
+                                        ExecutorMessage::Shutdown(_) => {
+                                            handle_executor_message(
+                                                &executor_id,
+                                                &process_id,
+                                                &message,
+                                                &datafusion,
+                                            )
+                                            .await;
+                                            // The executor stops serving now:
+                                            // unregister it rather than wait
+                                            // for its stream to close.
+                                            break;
+                                        }
                                         _ => {
                                             handle_executor_message(
                                                 &executor_id,
+                                                &process_id,
                                                 &message,
                                                 &datafusion,
                                             )
@@ -1059,6 +1091,7 @@ fn create_executor_flight_client(
 /// Handles an executor control message (heartbeat, shutdown, etc.)
 async fn handle_executor_message(
     executor_id: &str,
+    process_id: &str,
     message: &ExecutorMessage,
     datafusion: &DataFusion,
 ) {
@@ -1089,7 +1122,7 @@ async fn handle_executor_message(
             );
         }
         ExecutorMessage::PartitionsLoaded(loaded) => {
-            handle_partitions_loaded(executor_id, loaded, datafusion).await;
+            handle_partitions_loaded(executor_id, process_id, loaded, datafusion).await;
         }
         ExecutorMessage::ExecutorStatistics(stats_msg) => {
             handle_executor_statistics(executor_id, stats_msg, datafusion).await;
@@ -1204,6 +1237,7 @@ async fn handle_executor_statistics(
 /// actually has data.
 async fn handle_partitions_loaded(
     executor_id: &str,
+    process_id: &str,
     loaded: &runtime_proto::PartitionsLoaded,
     datafusion: &DataFusion,
 ) {
@@ -1253,9 +1287,26 @@ async fn handle_partitions_loaded(
 
     // Statistics now flow via the dedicated ExecutorStatistics message
     // (handle_executor_statistics); PartitionsLoaded is readiness-only.
-    tracker
-        .replace(table.clone(), executor_id.to_string(), partition_expr_bytes)
+    let recorded = tracker
+        .replace(
+            table.clone(),
+            executor_id.to_string(),
+            runtime_cluster::LoadedAck {
+                process_id: process_id.to_string(),
+                load_sequence: loaded.load_sequence,
+                partitions: partition_expr_bytes,
+            },
+        )
         .await;
+    if !recorded {
+        tracing::debug!(
+            executor_id,
+            table = %loaded.table_name,
+            load_sequence = loaded.load_sequence,
+            "Ignoring the PartitionsLoaded ack of a load older than one already reported"
+        );
+        return;
+    }
 
     // Refresh in-memory partition metadata snapshot before evaluating
     // readiness — the tracker compares against the latest assigned set.
@@ -1271,7 +1322,31 @@ async fn handle_partitions_loaded(
         return;
     }
 
+    update_table_coverage(datafusion, &table).await;
     evaluate_table_readiness(datafusion, &table).await;
+}
+
+/// Recomputes, from the executors' `PartitionsLoaded` acks, which partitions
+/// of `table` each executor process has loaded, which is what queries route
+/// by. Reads the partition store's cached metadata: callers refresh it first.
+pub(crate) async fn update_table_coverage(datafusion: &DataFusion, table: &TableReference) {
+    let (Some(tracker), Some(registry), Some(partition_store)) = (
+        datafusion.partition_load_tracker.as_ref(),
+        datafusion.executor_registry(),
+        datafusion
+            .partition_service
+            .as_ref()
+            .map(|s| Arc::clone(&s.partition_store)),
+    ) else {
+        return;
+    };
+    let Some(metadata) = partition_store.get_cached_table_metadata(table) else {
+        return;
+    };
+    let loaded = tracker
+        .loaded_partitions(table, &metadata, datafusion)
+        .await;
+    registry.set_loaded_partitions(table, loaded);
 }
 
 /// Evaluates whether every assigned partition for `table` is covered by an
@@ -1403,6 +1478,7 @@ pub(crate) async fn evaluate_acked_tables_readiness(datafusion: &DataFusion) {
         return;
     }
     for table in acked {
+        update_table_coverage(datafusion, &table).await;
         evaluate_table_readiness(datafusion, &table).await;
     }
 }
@@ -1754,6 +1830,7 @@ mod tests {
                 runtime.accelerator_engine_registry(),
                 tokio::runtime::Handle::current(),
             )
+            .max_concurrent_queries(None)
             .build(),
         );
         let task_history_schema = Arc::new(Schema::new(vec![Field::new(
@@ -2192,6 +2269,61 @@ mod tests {
     /// rate limiter would let through.
     const REPEATED_REQUESTS: usize = 20;
 
+    /// Polls `condition` until it holds or five seconds pass.
+    async fn eventually(mut condition: impl AsyncFnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if condition().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// An executor that announces its shutdown is unregistered at once, while
+    /// its control stream is still open, so queries stop routing to it.
+    #[tokio::test]
+    async fn an_executor_that_shuts_down_is_unregistered_at_once() {
+        use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown};
+
+        let service = make_test_service().await;
+        let registry = service.executor_registry();
+        let (mut client, shutdown) = serve_test_service(service).await;
+        let (tx, rx) = mpsc::channel::<ExecutorControlMessage>(8);
+        let message = |message| ExecutorControlMessage {
+            executor_id: "exec-1".to_string(),
+            message: Some(message),
+            process_id: "p1".to_string(),
+        };
+        tx.send(message(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+            timestamp_ms: 0,
+        })))
+        .await
+        .expect("send heartbeat");
+        let _inbound = client
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("open the control stream");
+        assert!(
+            eventually(async || registry.connected_executors().await == ["exec-1"]).await,
+            "the executor registers"
+        );
+
+        tx.send(message(ExecutorMessage::Shutdown(ExecutorShutdown {
+            ballista_executor_id: String::new(),
+            reason: "test".to_string(),
+        })))
+        .await
+        .expect("send shutdown");
+        assert!(
+            eventually(async || registry.connected_executors().await.is_empty()).await,
+            "the executor is unregistered while its stream is open"
+        );
+
+        drop(tx);
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn test_internal_get_metrics_transport_allows_repeated_requests() {
         let (metrics_reader, _provider) = metrics_reader_with_test_counter();
@@ -2269,6 +2401,45 @@ mod tests {
             .expect("SELECT against task_history must succeed under read-only");
         // The query named `task_history`; the row can only have come from the
         // seeded `local_task_history`, so the rewrite ran under the read-only gate.
+        assert_eq!(
+            render_task_history(response.into_inner().arrow_ipc),
+            "+----------+\n\
+             | trace_id |\n\
+             +----------+\n\
+             | trace-a  |\n\
+             +----------+"
+        );
+    }
+
+    /// `GetTaskHistory` serves a peer scheduler's `runtime.task_history` query,
+    /// which holds an admission permit on that peer while it waits. With every
+    /// permit here held by this scheduler's own such queries, the read must
+    /// still run, or the two schedulers wait on each other forever.
+    #[tokio::test]
+    async fn get_task_history_runs_while_every_admission_permit_is_held() {
+        let service = make_test_service_with_task_history(&["trace-a"]).await;
+        let semaphore = service
+            .datafusion
+            .query_admission_semaphore()
+            .expect("the scheduler gates queries");
+        let permits =
+            u32::try_from(semaphore.available_permits()).expect("permit count fits in u32");
+        let _held = semaphore
+            .acquire_many_owned(permits)
+            .await
+            .expect("the semaphore is open");
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            })),
+        )
+        .await
+        .expect("GetTaskHistory must not wait for an admission permit")
+        .expect("GetTaskHistory should succeed");
         assert_eq!(
             render_task_history(response.into_inner().arrow_ipc),
             "+----------+\n\

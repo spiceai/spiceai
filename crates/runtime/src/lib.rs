@@ -124,6 +124,7 @@ mod management;
 mod metrics_server;
 pub mod model;
 pub mod opentelemetry;
+pub mod opentelemetry_logs;
 pub mod opentelemetry_store;
 // Moved to `runtime-otel-push`; re-exported so `runtime::otel_push_exporter` still resolves.
 pub use runtime_otel_push as otel_push_exporter;
@@ -967,22 +968,39 @@ impl Runtime {
         }
     }
 
+    /// Adds `assignments` to the partitions this executor holds and loads the
+    /// tables whose partitions change. Partitions the scheduler pushed earlier
+    /// are kept: the scheduler removes a partition by an explicit update.
     pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
+            assignment_updates,
             ..
         }) = self.distributed.as_ref()
         {
+            let _applying = assignment_updates.lock().await;
             let mut guard = partition_assignments.write().await;
-            guard.clone_from(&assignments);
+            let mut changed = Vec::new();
+            for (table, partitions) in assignments {
+                let held = guard.entry(table.clone()).or_default();
+                let before = held.len();
+                for partition in partitions {
+                    if !held.contains(&partition) {
+                        held.push(partition);
+                    }
+                }
+                if held.len() != before {
+                    changed.push(table);
+                }
+            }
+            let merged = guard.clone();
             drop(guard); // drop lock before updating tables
 
-            self.record_executor_assigned_partitions(&assignments);
+            self.record_executor_assigned_partitions(&merged);
 
-            // Update all assigned tables
-            for table in assignments.keys() {
+            for table in changed {
                 if let Err(e) = self
-                    .update_partition_refresh_sql(table.clone(), &assignments)
+                    .update_partition_refresh_sql(table.clone(), &merged)
                     .await
                 {
                     tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
@@ -1021,6 +1039,7 @@ impl Runtime {
     ) -> Result<()> {
         let Some(DistributedNode::Executor {
             partition_assignments,
+            assignment_updates,
             ..
         }) = self.distributed.as_ref()
         else {
@@ -1032,6 +1051,7 @@ impl Runtime {
             // misconfigured here.
             return Ok(());
         };
+        let _applying = assignment_updates.lock().await;
 
         // Compute the prospective post-update state from a snapshot of the
         // current map. We apply the DataFusion filter updates against this
@@ -1079,19 +1099,29 @@ impl Runtime {
             }
         }
 
-        let affected_tables: HashSet<_> = new_partitions
-            .keys()
-            .chain(removed_partitions.keys())
-            .collect();
+        // Tables whose partitions this update changes load them. An update
+        // that repeats what the executor already holds (the scheduler re-sends
+        // partitions it has no load report for) repairs that report instead.
+        let (affected_tables, repeated_tables): (
+            HashSet<ResolvedTableReference>,
+            HashSet<ResolvedTableReference>,
+        ) = {
+            let current = partition_assignments.read().await;
+            new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .map(|table_name| {
+                    TableReference::parse_str(table_name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                })
+                .partition(|table| current.get(table) != prospective.get(table))
+        };
 
         // Apply DataFusion filter updates against the prospective state. If any
         // fails, the shared partition_assignments map is not modified — the
         // scheduler retries the update and we'll re-attempt all tables.
-        for table_name in affected_tables {
-            let resolved = TableReference::parse_str(table_name)
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-
-            self.update_partition_refresh_sql(resolved.clone(), &prospective)
+        for resolved in affected_tables {
+            self.update_partition_refresh_sql(resolved, &prospective)
                 .await?;
         }
 
@@ -1100,8 +1130,75 @@ impl Runtime {
         // All filter updates succeeded — commit the new routing state. Last
         // step so the planner's view of executor partitions never gets ahead
         // of what the AcceleratedTables actually know about.
-        *partition_assignments.write().await = prospective;
+        *partition_assignments.write().await = prospective.clone();
+
+        for resolved in repeated_tables {
+            self.repair_partition_load(resolved, &prospective).await?;
+        }
         Ok(())
+    }
+
+    /// Answers a scheduler that re-sent partitions of `table` this executor
+    /// already holds because it has no report of them loaded: replays the
+    /// report of the load of the current partitions, or loads them again when
+    /// no load of them finished (it failed) and none is running. Does nothing
+    /// before the table's initial load reports, which reports on its own.
+    async fn repair_partition_load(
+        &self,
+        table: ResolvedTableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+            return Ok(());
+        };
+        let table_name = table.to_string();
+        if broadcaster.is_loading(&table_name) {
+            return Ok(());
+        }
+        let Some(loaded) = broadcaster.loaded_partitions(&table_name).await else {
+            return Ok(());
+        };
+        let assigned: HashSet<Vec<u8>> = assignments
+            .get(&table)
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if loaded.into_iter().collect::<HashSet<_>>() == assigned {
+            let sent = broadcaster.rebroadcast_partitions_loaded(&table_name).await;
+            tracing::debug!("Re-sent PartitionsLoaded for {table_name} to {sent} scheduler(s)");
+            return Ok(());
+        }
+        tracing::info!("Loading the assigned partitions of {table_name} again");
+        self.update_partition_refresh_sql(table, assignments).await
+    }
+
+    /// Loads the partitions of `table` assigned while its initial load read
+    /// `loaded`, the partitions that load filtered to.
+    pub(crate) async fn load_partitions_assigned_during_initial_load(
+        &self,
+        table: ResolvedTableReference,
+        loaded: &[Expr],
+    ) -> Result<()> {
+        let Some(DistributedNode::Executor {
+            partition_assignments,
+            assignment_updates,
+            ..
+        }) = self.distributed.as_ref()
+        else {
+            return Ok(());
+        };
+        let _applying = assignment_updates.lock().await;
+        let current = partition_assignments.read().await.clone();
+        let loaded: HashSet<&Expr> = loaded.iter().collect();
+        let assigned: HashSet<&Expr> = current
+            .get(&table)
+            .map(|exprs| exprs.iter().collect())
+            .unwrap_or_default();
+        if loaded == assigned {
+            return Ok(());
+        }
+        self.update_partition_refresh_sql(table, &current).await
     }
 
     pub(crate) async fn update_partition_refresh_sql(
@@ -1144,75 +1241,80 @@ impl Runtime {
         // Capturing later would tie the ack to whatever the name resolves to by
         // then, which is a different table if a rebuild has landed in between.
         let instance = self.datafusion().capture_table_instance(&table_ref).await;
+        let table_name = table.to_string();
+        let broadcaster = self.executor_outbound_broadcaster();
+        // Dropping the guard ends the load, including when this future is
+        // cancelled before the completion task below takes it over.
+        let load = broadcaster
+            .as_ref()
+            .map(|broadcaster| broadcaster.start_load(&table_name));
 
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
-        self.datafusion()
-            .update_partition_filters(table_ref.clone(), partition_filters)
-            .await
-            .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
-                table: table.to_string(),
-                source: Box::new(source),
-            })?;
-
-        tracing::info!("Updated partition assignments for {table}");
-
         // Trigger a refresh to load the data for the new partitions, capturing
         // the completion notifier so we can ack the scheduler with a
         // `PartitionsLoaded` once the accelerated table has actually finished
-        // loading. Refresh failures are non-fatal — the assignment is still
-        // valid; data just hasn't been pulled yet, so we skip the ack.
-        let notifier = match self.datafusion().refresh_table(&table_ref, None).await {
-            Ok(notifier) => notifier,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to trigger refresh for {table} after updating partitions: {e}"
-                );
-                return Ok(());
-            }
-        };
+        // loading. A refresh that cannot start fails the update, so the
+        // scheduler sends it again rather than count it delivered.
+        let started = async {
+            self.datafusion()
+                .update_partition_filters(table_ref.clone(), partition_filters)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })?;
+            tracing::info!("Updated partition assignments for {table}");
+            self.datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })
+        }
+        .await;
+        let notifier = started?;
 
         // Snapshot the partition exprs assigned to us for this table, encoded
         // the same way the scheduler encodes them when sending UpdatePartitions
         // (`Expr::to_bytes()`). `partition_value_to_bytes` sorts entries by
         // key so the encoding is deterministic across re-serialization.
-        let table_str = table.to_string();
         let partition_expr_bytes: Vec<Vec<u8>> = assignments
             .get(&table)
-            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_str))
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
             .unwrap_or_default();
 
-        if let Some(broadcaster) = self.executor_outbound_broadcaster() {
+        if let (Some(broadcaster), Some(load)) = (broadcaster, load) {
             // Send the ack even when `partition_expr_bytes` is empty — a
             // legitimately empty assignment (e.g. zero-partition source, or
             // partitions that all failed to serialize) still needs to flip
             // the scheduler-side readiness gate via the
             // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
             // case here would leave the dataset stuck in `Refreshing`.
-            let table_name = table.to_string();
             let df = self.datafusion();
             tokio::spawn(async move {
                 // Acking readiness for a table that did not load this partition
                 // set tells the scheduler a lie it then caches, so wait for the
                 // refresh *and* re-resolve the table before broadcasting.
-                match df.await_refresh_completion(instance, notifier).await {
-                    DeferredRefreshOutcome::Apply => {}
+                let loaded = match df.await_refresh_completion(instance, notifier).await {
+                    DeferredRefreshOutcome::Apply => true,
                     DeferredRefreshOutcome::Abandoned => {
                         // The table was removed before the refresh we triggered
                         // landed, so the partition set was never loaded.
                         tracing::debug!(
                             "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
                     DeferredRefreshOutcome::Failed => {
                         // A one-shot refresh failed. Advertising those
                         // partitions as queryable would tell the scheduler a
                         // lie it then caches.
-                        tracing::debug!(
+                        tracing::warn!(
                             "{table_name} partition refresh failed terminally; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
                     DeferredRefreshOutcome::TableChanged => {
                         // A refresh did land, but not on the table this ack is
@@ -1221,17 +1323,24 @@ impl Runtime {
                         tracing::debug!(
                             "{table_name} was removed or rebuilt after its partition refresh completed; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
+                };
+                if loaded {
+                    // Statistics flow via the periodic ExecutorStatistics
+                    // reporter, not this readiness ack.
+                    let sent = broadcaster
+                        .broadcast_partitions_loaded(
+                            table_name.clone(),
+                            partition_expr_bytes,
+                            load.load_sequence(),
+                        )
+                        .await;
+                    tracing::debug!(
+                        "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                    );
                 }
-                // Statistics flow via the periodic ExecutorStatistics reporter, not
-                // this readiness ack.
-                let sent = broadcaster
-                    .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
-                    .await;
-                tracing::debug!(
-                    "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
-                );
+                drop(load);
             });
         }
 
@@ -1477,6 +1586,7 @@ impl Runtime {
     /// [`Runtime::init_cache_metrics`].
     pub fn init_component_metrics(&self) {
         runtime_metrics::publish_component_counters_at_zero();
+        runtime_state_location::metrics::init();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.

@@ -244,6 +244,11 @@ pub enum DistributedNode {
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
         partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
 
+        /// Held while an assignment change from any scheduler is applied, so
+        /// changes that arrive together on different schedulers' streams
+        /// apply one after another rather than overwrite each other.
+        assignment_updates: Arc<tokio::sync::Mutex<()>>,
+
         /// Shared map of per-scheduler outbound senders. Lets the runtime
         /// broadcast unsolicited messages (e.g. `PartitionsLoaded`) without
         /// owning the [`ControlStreamManager`] directly.
@@ -607,14 +612,14 @@ mod service;
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use runtime_cluster::ControlStreamManager;
-// Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
-pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
+pub use heartbeat::{SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
+pub use runtime_cluster::ControlStreamManager;
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+// Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
 pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};

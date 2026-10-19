@@ -189,6 +189,12 @@ pub enum Error {
     ))]
     CayenneCatalogTableNotSupportedInDistributedQuery { table: String },
 
+    #[snafu(display(
+        "Querying '{table}' via async queries API is not supported: task history is read only on \
+        the scheduler. Use the synchronous query API (/v1/sql or Flight SQL) instead."
+    ))]
+    TaskHistoryNotSupportedInDistributedQuery { table: String },
+
     #[snafu(display("Query {query_id} was cancelled"))]
     QueryCancelled { query_id: String },
 
@@ -258,6 +264,11 @@ pub(super) enum QueryRuntimeBinding {
     /// an admission permit so they share the query budget.
     #[default]
     QueryRuntime,
+    /// A read that serves a peer scheduler's query: hop onto `cpu_runtime`
+    /// like a user query, but skip query admission. The peer's query holds a
+    /// permit on its own scheduler while it waits for this read, so taking a
+    /// permit here could leave two schedulers waiting on each other.
+    QueryRuntimeUngated,
     /// Background cache warming: stay on the current runtime (the refresh
     /// runtime) and skip query admission so warming cannot stall user queries.
     CurrentRuntimeUngated,
@@ -741,8 +752,10 @@ impl Query {
                 }
             }
         }
-        if matches!(self.runtime_binding, QueryRuntimeBinding::QueryRuntime)
-            && let Some(runtime_handle) = self.df.cpu_runtime().cloned()
+        if matches!(
+            self.runtime_binding,
+            QueryRuntimeBinding::QueryRuntime | QueryRuntimeBinding::QueryRuntimeUngated
+        ) && let Some(runtime_handle) = self.df.cpu_runtime().cloned()
             && !probe.is_servable_in_place()
         {
             return self
@@ -1104,8 +1117,19 @@ impl Query {
         }
 
         // Distributed execution doesn't currently support querying accelerated datasets
-        // or Cayenne catalog tables
+        // or Cayenne catalog tables, and task history is read only on the scheduler.
         for tr in &input_tables {
+            if tr.schema() == Some(SPICE_RUNTIME_SCHEMA)
+                && matches!(
+                    tr.table(),
+                    crate::task_history::DEFAULT_TASK_HISTORY_TABLE
+                        | crate::task_history::LOCAL_TASK_HISTORY_TABLE
+                )
+            {
+                return Err(Error::TaskHistoryNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
+            }
             if self.df.is_accelerated(tr).await {
                 return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
                     table: tr.to_string(),
@@ -1280,7 +1304,7 @@ impl Query {
         };
         let skip_query_admission = matches!(
             self.runtime_binding,
-            QueryRuntimeBinding::CurrentRuntimeUngated
+            QueryRuntimeBinding::CurrentRuntimeUngated | QueryRuntimeBinding::QueryRuntimeUngated
         );
         let query_id_str: Arc<str> = Arc::from(self.query_id.to_string());
 
@@ -3644,7 +3668,7 @@ mod tests {
     /// The ids `sql` returns through the runtime query path (runtime planner,
     /// built analyzer rules, parameter binding) from a `Decimal128(38, 17)`
     /// column holding 4.07 (id 1) and 4.0700000000000003 (id 2), two decimals
-    /// whose nearest `f64` is the same.
+    /// whose nearest `f64` is the same, and 173665.47 (id 3).
     async fn ids_matching_decimal_literal(sql: &str, parameters: Option<ParamValues>) -> Vec<i64> {
         let df = Arc::new(
             DataFusionBuilder::new(
@@ -3661,12 +3685,13 @@ mod tests {
         let amounts = arrow::array::Decimal128Array::from(vec![
             407_000_000_000_000_000_i128,
             407_000_000_000_000_030,
+            17_366_547_000_000_000_000_000,
         ])
         .with_precision_and_scale(38, 17)
         .expect("valid decimal");
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(amounts)],
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(amounts)],
         )
         .expect("valid batch");
         df.ctx
@@ -3723,15 +3748,17 @@ mod tests {
             .await,
             vec![2]
         );
-        // The binary cast of the f64 4.07 at scale 17 is 4.07000000000000028.
-        let parameters = convert_json_to_param_values(json!([4.07])).expect("json to paramvalues");
+        // A bound float has no token, so it casts through its shortest
+        // spelling; the binary cast of 173665.47 at scale 17 matches no row.
+        let parameters =
+            convert_json_to_param_values(json!([173_665.47])).expect("json to paramvalues");
         assert_eq!(
             ids_matching_decimal_literal(
                 "SELECT id FROM decimals WHERE amount = $1 ORDER BY id",
                 Some(parameters)
             )
             .await,
-            vec![1]
+            vec![3]
         );
     }
 

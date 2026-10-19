@@ -175,6 +175,9 @@ message PartitionsLoaded {
     // field is removed.
     reserved 3;
     reserved "statistics";
+    // Orders one executor process's acks for a table: an ack with a lower
+    // sequence reports an older load. 0 from executors that send none.
+    uint64 load_sequence = 4;
 }
 
 // Message sent from scheduler to executor on the control stream.

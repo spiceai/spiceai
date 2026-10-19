@@ -787,6 +787,7 @@ impl RuntimeBuilder {
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                assignment_updates: Arc::default(),
                 outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
