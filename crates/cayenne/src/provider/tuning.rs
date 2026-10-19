@@ -646,7 +646,7 @@ fn lazy_free_sampler_loop() {
 
 /// `LazyFree` from a `/proc/<pid>/smaps_rollup` body, in bytes (the kernel
 /// reports kB).
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn parse_smaps_lazy_free(contents: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
         let kb = line
