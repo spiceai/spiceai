@@ -34,7 +34,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
+use tonic::service::{Interceptor, InterceptorLayer};
 use tonic::transport::Server;
+use tower::layer::util::{Identity, Stack};
 
 type ClusterServerResult<T> = std::result::Result<T, Error>;
 
@@ -52,15 +55,31 @@ async fn bind_cluster_listener(bind_address: SocketAddr) -> Result<TcpListener, 
     })
 }
 
-/// The cluster mTLS server configuration that every cluster server listens with. Its
-/// handshake requires a client certificate signed by the cluster CA.
-fn cluster_mtls_server_config(rt: &Runtime) -> ClusterServerResult<Arc<rustls::ServerConfig>> {
-    rt.df
-        .cluster_config
-        .cluster_server_config()
-        .ok_or_else(|| Error::InsecureConfiguration {
-            message: "Cluster mode requires cluster mTLS. Set --node-mtls-ca-certificate-file, --node-mtls-certificate-file and --node-mtls-key-file.".to_string(),
-        })
+/// Refuses every request on the internal cluster port unless the port runs cluster mTLS,
+/// whose handshake requires a client certificate signed by the cluster CA.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterMtlsGate {
+    mtls_enabled: bool,
+}
+
+impl Interceptor for ClusterMtlsGate {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if self.mtls_enabled {
+            Ok(request)
+        } else {
+            Err(Status::permission_denied(
+                "Cluster RPCs require cluster mTLS",
+            ))
+        }
+    }
+}
+
+/// The server builder for the internal cluster port. Every service added to it is behind
+/// [`ClusterMtlsGate`].
+pub(crate) fn internal_cluster_server(
+    mtls_enabled: bool,
+) -> Server<Stack<InterceptorLayer<ClusterMtlsGate>, Identity>> {
+    Server::builder().layer(InterceptorLayer::new(ClusterMtlsGate { mtls_enabled }))
 }
 
 /// Starts the internal cluster gRPC server for scheduler mode.
@@ -88,9 +107,22 @@ pub async fn start_internal_cluster_server(
         return Err(Error::ClusterSchedulerNotInitialized {});
     };
 
-    let server_config = cluster_mtls_server_config(&rt)?;
-    let mut server = Server::builder();
-    tracing::info!("Cluster mTLS enabled for internal cluster server");
+    let cluster_server_config = rt.df.cluster_config.cluster_server_config();
+    let mtls_enabled = cluster_server_config.is_some();
+    let mut server = internal_cluster_server(mtls_enabled);
+
+    if mtls_enabled {
+        tracing::info!("Cluster mTLS enabled for internal cluster server");
+    } else if !rt.df.cluster_config.allow_insecure_connections() {
+        return Err(Error::InsecureConfiguration {
+            message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
+                .to_string(),
+        });
+    } else {
+        tracing::warn!(
+            "Cluster mTLS disabled for internal cluster server (--allow-insecure-connections flag is set); cluster RPCs are refused"
+        );
+    }
 
     let scheduler_grpc_server = SchedulerGrpcServer::from_arc(scheduler)
         .max_decoding_message_size(usize::MAX)
@@ -140,15 +172,25 @@ pub async fn start_internal_cluster_server(
         .add_service(scheduler_grpc_server)
         .add_service(cluster_service_server);
 
-    let listener = bind_cluster_listener(bind_address).await?;
-    tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
-    let incoming = tls_incoming(listener, server_config);
-    let serve_result = if let Some(token) = shutdown_signal {
+    let serve_result = if let Some(server_config) = cluster_server_config {
+        let listener = bind_cluster_listener(bind_address).await?;
+        tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
+        let incoming = tls_incoming(listener, server_config);
+        if let Some(token) = shutdown_signal {
+            server
+                .serve_with_incoming_shutdown(incoming, token.cancelled())
+                .await
+        } else {
+            server.serve_with_incoming(incoming).await
+        }
+    } else if let Some(token) = shutdown_signal {
+        tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
         server
-            .serve_with_incoming_shutdown(incoming, token.cancelled())
+            .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
-        server.serve_with_incoming(incoming).await
+        tracing::info!("Spice Runtime internal cluster server listening on {bind_address}");
+        server.serve(bind_address).await
     };
 
     serve_result.map_err(|e| {
@@ -175,14 +217,24 @@ const EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 100_000;
 /// This server uses a composite Flight service that routes:
 /// - Ballista-format requests (`FetchPartition`, `IO_BLOCK_TRANSPORT`) to `BallistaFlightService`
 /// - SQL and `FlightSQL` requests to Spice's Flight service
+///
+/// mTLS is optional when `--allow-insecure-connections` is used.
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
     endpoint_auth: EndpointAuth,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
-    let server_config = cluster_mtls_server_config(&rt)?;
+    let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let has_flight_auth = endpoint_auth.flight_basic_auth.is_some();
+
+    // In executor mode, never allow unauthenticated Flight DoPut without mTLS.
+    // Scheduler-trusted forwarding mode requires authenticated scheduler identity via mTLS.
+    if !has_flight_auth && cluster_server_config.is_none() {
+        return Err(Error::InsecureConfiguration {
+            message: "Executor Flight server requires either API key auth or cluster mTLS. Configure endpoint auth or enable mTLS for scheduler-trusted forwarding.".to_string(),
+        });
+    }
 
     // The executor Flight server is the cluster shuffle endpoint: reducer partitions
     // fetch concurrently over a pooled, multiplexed HTTP/2 connection per peer, and a
@@ -190,12 +242,25 @@ pub async fn start_executor_flight_server(
     // RST_STREAMs would otherwise trip h2's Rapid-Reset flood protection
     // (`GOAWAY ENHANCE_YOUR_CALM` after 20 pending-accept resets, hyperium/hyper#2877),
     // so the threshold is set well above any realistic shuffle cancellation burst. This
-    // is an internal cluster endpoint reached only by the scheduler and peer executors
-    // over cluster mTLS, so relaxing the Rapid-Reset threshold is safe.
+    // is an internal cluster endpoint reached only by the scheduler and peer executors;
+    // in production that path is secured by cluster mTLS. Running without mTLS requires
+    // the dev-only `--allow-insecure-connections` flag, which is not used in deployments
+    // exposed to untrusted clients, so relaxing the Rapid-Reset threshold is safe.
     let server = configure_flight_server_transport(Server::builder())
         .http2_max_pending_accept_reset_streams(Some(EXECUTOR_MAX_PENDING_ACCEPT_RESET_STREAMS));
 
-    tracing::info!("Cluster mTLS enabled for executor flight server");
+    if cluster_server_config.is_some() {
+        tracing::info!("Cluster mTLS enabled for executor flight server");
+    } else if !rt.df.cluster_config.allow_insecure_connections() {
+        return Err(Error::InsecureConfiguration {
+            message: "Cluster mode without mTLS requires the --allow-insecure-connections flag"
+                .to_string(),
+        });
+    } else {
+        tracing::warn!(
+            "Cluster mTLS disabled for executor flight server (--allow-insecure-connections flag is set)"
+        );
+    }
 
     if !has_flight_auth {
         tracing::debug!(
@@ -265,17 +330,29 @@ pub async fn start_executor_flight_server(
         None => bind_address,
     };
 
-    let listener = bind_cluster_listener(bind_address).await?;
-    // Bind succeeded — emit started log + metric only now.
-    tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-    let incoming = tls_incoming(listener, server_config);
-    let serve_result = if let Some(token) = shutdown_signal {
+    let serve_result = if let Some(server_config) = cluster_server_config {
+        let listener = bind_cluster_listener(bind_address).await?;
+        // Bind succeeded — emit started log + metric only now.
+        tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
+        let incoming = tls_incoming(listener, server_config);
+        if let Some(token) = shutdown_signal {
+            server
+                .serve_with_incoming_shutdown(incoming, token.cancelled())
+                .await
+        } else {
+            server.serve_with_incoming(incoming).await
+        }
+    } else if let Some(token) = shutdown_signal {
+        tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server
-            .serve_with_incoming_shutdown(incoming, token.cancelled())
+            .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
-        server.serve_with_incoming(incoming).await
+        tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
+        server.serve(bind_address).await
     };
 
     serve_result.map_err(|e| {

@@ -279,6 +279,7 @@ async fn test_simple_cluster_mode() -> Result<(), anyhow::Error> {
                         executor_cert.cert_path.to_string_lossy().to_string(),
                     ),
                     node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
+                    ..Default::default()
                 },
                 ..Default::default()
             };

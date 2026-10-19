@@ -779,6 +779,9 @@ impl ClusterTlsConfig {
     }
 }
 
+/// Logged when a cluster node is started with `--allow-insecure-connections`.
+const INSECURE_CONNECTIONS_DEPRECATION_WARNING: &str = "`--allow-insecure-connections` is deprecated and no longer allows insecure cluster connections: without cluster mTLS, cluster RPCs are refused, so executors cannot join a scheduler. Set `--node-mtls-ca-certificate-file`, `--node-mtls-certificate-file` and `--node-mtls-key-file`; create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`. The flag will be removed in a future release.";
+
 fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -867,7 +870,7 @@ impl ResolvedClusterConfig {
         if is_cluster_role {
             let mut missing_flags = Vec::new();
 
-            if tls_config.is_none() {
+            if tls_config.is_none() && !config.allow_insecure_connections {
                 missing_flags.push(
                     "--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
                 );
@@ -890,9 +893,13 @@ impl ResolvedClusterConfig {
                     ),
                 ));
             }
+
+            if config.allow_insecure_connections {
+                tracing::warn!("{INSECURE_CONNECTIONS_DEPRECATION_WARNING}");
+            }
         }
 
-        // Determine the scheme based on TLS config
+        // Determine the scheme based on TLS config or insecure flag
         let inferred_scheme = if tls_config.is_some() {
             "https"
         } else {
@@ -1059,6 +1066,12 @@ impl ResolvedClusterConfig {
     #[must_use]
     pub fn tls_enabled(&self) -> bool {
         self.tls_config.is_some()
+    }
+
+    /// Returns whether this node allows insecure cluster communication.
+    #[must_use]
+    pub fn allow_insecure_connections(&self) -> bool {
+        self.config.allow_insecure_connections
     }
 
     /// Returns a fresh `ClientTlsConfig` snapshot for connecting to other
@@ -2643,7 +2656,7 @@ mod tests {
     };
 
     #[test]
-    fn cluster_roles_require_cluster_mtls() {
+    fn cluster_roles_require_cluster_mtls_files() {
         use super::ResolvedClusterConfig;
         use crate::config::{ClusterConfig, ClusterRole};
 
@@ -2673,6 +2686,31 @@ mod tests {
                 "{node}"
             );
         }
+    }
+
+    /// The deprecated flag still parses and still lets a node start without cluster mTLS
+    /// files; the node then refuses every cluster RPC.
+    #[test]
+    fn deprecated_insecure_connections_flag_still_starts_a_node() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole};
+        use clap::Parser;
+
+        let config = ClusterConfig::try_parse_from([
+            "spiced",
+            "--role",
+            "scheduler",
+            "--node-advertise-address",
+            "127.0.0.1",
+            "--allow-insecure-connections",
+        ])
+        .expect("--allow-insecure-connections should still parse");
+        assert!(config.allow_insecure_connections);
+        assert_eq!(config.role, Some(ClusterRole::Scheduler));
+
+        let resolved = ResolvedClusterConfig::try_new(config)
+            .expect("a node started with the deprecated flag should still start");
+        assert!(!resolved.tls_enabled());
     }
 
     #[test]

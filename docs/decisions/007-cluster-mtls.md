@@ -61,6 +61,9 @@ Related decisions:
 # Executor-specific
 --scheduler-address <url>                 # Scheduler's internal load-balanced/virtual IP cluster URL
                                           # If set, --role executor is implied
+
+# Deprecated; will be removed
+--allow-insecure-connections              # Starts the node without mTLS, which then refuses every cluster RPC
 ```
 
 ### Internal gRPC Service
@@ -118,6 +121,7 @@ spice cluster tls add executor1 --host executor1.cluster.local
 ### New CLI Behavior
 
 * `--scheduler-address`: If set, `--role executor` is implied and can be omitted.
+* `--allow-insecure-connections`: Deprecated and will be removed. A node started with it and without the mTLS files starts, logs a deprecation warning, and refuses every cluster RPC, so executors cannot join.
 
 ### Removed CLI Arguments
 

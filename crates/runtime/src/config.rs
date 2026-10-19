@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use clap::ArgAction;
 use spicepod::component::caching::{CacheConfig, Caching, SQLResultsCacheConfig};
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -164,6 +165,11 @@ pub struct ClusterConfig {
     #[arg(long = "node-mtls-key-file", value_name = "NODE_MTLS_KEY_FILE")]
     pub node_mtls_key_file: Option<String>,
 
+    /// Deprecated, and will be removed. No longer allows insecure cluster connections: without
+    /// cluster mTLS, cluster RPCs are refused. Set the `--node-mtls-*` flags instead.
+    #[arg(long = "allow-insecure-connections", default_value_t = false, action = ArgAction::SetTrue)]
+    pub allow_insecure_connections: bool,
+
     /// The URL of the scheduler service. Required for executors to join a cluster.
     /// If set, --role executor is implied and can be omitted.
     /// If the scheme (http/https) is omitted, it will be inferred from TLS configuration.
@@ -175,7 +181,7 @@ pub struct ClusterConfig {
     /// For executors: used during registration to tell the scheduler how to contact this node.
     ///
     /// The fully qualified advertise URL will be constructed as:
-    ///   https://<node-advertise-address>:<port from --node-bind-address>
+    ///   https://<node-advertise-address>:<port from --node-bind-address> (http:// without cluster mTLS)
     #[arg(long = "node-advertise-address", value_name = "NODE_ADVERTISE_ADDRESS")]
     pub node_advertise_address: Option<String>,
 }
@@ -188,6 +194,7 @@ impl Default for ClusterConfig {
             node_mtls_ca_certificate_file: None,
             node_mtls_certificate_file: None,
             node_mtls_key_file: None,
+            allow_insecure_connections: false,
             scheduler_address: None,
             node_advertise_address: None,
         }
