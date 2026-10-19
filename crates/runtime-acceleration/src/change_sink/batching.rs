@@ -16,6 +16,12 @@ limitations under the License.
 
 //! Compatible CDC burst preparation for the table owner. Source acknowledgement
 //! and source control remain outside this module.
+//!
+//! The owner task drains queued inputs into a burst (`CdcBurst` or
+//! `AppendBurst`) until a limit or a compatibility boundary ends it. For CDC,
+//! `CdcBurst::prepare` then decodes and checks every input, and splits the
+//! burst into `PreparedCdc` groups, before any input mutates storage. Producers
+//! opt in with a `CdcIngress` or `AppendIngress` lane handle.
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -92,15 +98,25 @@ fn ensure_numbers_cast_exactly(data: &RecordBatch, target: &SchemaRef) -> Result
     Ok(())
 }
 
+/// Bounds for one coalesced burst, set by the producer on its lane. A burst
+/// ends when any bound is reached, or when the queue is empty and `max_age`
+/// is zero.
 #[derive(Clone, Copy, Debug)]
 pub struct CoalescingLimits {
+    /// Maximum number of submitted inputs in one burst.
     pub max_inputs: usize,
+    /// Maximum estimated bytes in one burst. A single input can exceed it.
     pub max_bytes: usize,
+    /// How long the owner waits for more input, measured from the earlier of
+    /// the previous apply cycle and the first input's admission.
     pub max_age: Duration,
 }
 
 /// Opt-in append batching for one producer lane. It contains no row queue,
 /// source acknowledgement, or replacement policy.
+///
+/// The caching-mode writer attaches one with `ChangeBatch::with_append_ingress`,
+/// so that many small cache appends become one write.
 #[derive(Debug)]
 pub struct AppendIngress {
     pub limits: CoalescingLimits,
@@ -119,13 +135,20 @@ impl AppendIngress {
 
 /// The owner's single admission drain uses the same limits and boundary rules
 /// for CDC and opted-in appends. An active burst is not another data queue.
+///
+/// Implemented by `CdcBurst` and `AppendBurst`; used by the owner's drain loop.
 pub(crate) trait CoalescingBurst: Send {
+    /// The lane's limits. `None` means the burst does not wait for more input.
     fn limits(&self) -> Option<CoalescingLimits>;
+    /// Number of inputs in the burst.
     fn len(&self) -> usize;
+    /// Estimated bytes in the burst.
     fn bytes(&self) -> usize;
+    /// The burst accepts no more input.
     fn is_full(&self) -> bool;
     /// Returns `Break` with the unconsumed input when this burst must end.
     fn push(&mut self, next: ChangeBatch, options: WriteOptions) -> ControlFlow<ChangeBatch>;
+    /// The CDC lane that receives drain metrics. `None` for appends.
     fn cdc_metrics(&self) -> Option<&Arc<CdcIngress>>;
 }
 
@@ -285,8 +308,14 @@ impl CoalescingBurst for AppendBurst {
 
 /// One source lane's policy, limits, and owner-maintained queue accounting.
 /// Identity is a coalescing boundary; independent sources need distinct handles.
+///
+/// The CDC refresh task creates one for each stream and attaches it to every
+/// input with `ChangeBatch::cdc_rows`. Only inputs that share this handle
+/// coalesce. It also records the CDC queue and apply metrics.
 pub struct CdcIngress {
+    /// Schema policy the owner uses when it prepares a burst.
     pub policy: Arc<dyn CdcPolicy>,
+    /// Burst limits for this lane.
     pub limits: CoalescingLimits,
     labels: [KeyValue; 1],
     queued: parking_lot::Mutex<(usize, usize)>,
@@ -415,17 +444,31 @@ impl Drop for ApplyingGuard {
 
 /// A group applied once and fanned out to `input_count` result observers. Each
 /// observer must receive the same publication and durability milestones.
+///
+/// Produced by `CdcBurst::prepare`. A burst splits into groups at barriers
+/// (truncate, empty input) and, when the policy asks, at schema changes.
 pub struct PreparedCdc {
+    /// The concatenated, decoded CDC rows of the group.
     pub batch: ChangeBatch,
+    /// Options for the group. Set to `Recovery::Durable` when the group has
+    /// an operation that the backend cannot defer.
     pub options: WriteOptions,
+    /// Number of submitted inputs in the group.
     pub input_count: usize,
+    /// Number of CDC rows in the group, for metrics.
     pub rows: usize,
+    /// The lane of the inputs, if any.
     pub ingress: Option<Arc<CdcIngress>>,
+    /// Apply the group as is, or evolve the table schema first.
     pub schema: SchemaDecision,
 }
 
 /// Row data drained out of the owner's admission queue. This is an active
 /// execution batch, not another producer queue.
+///
+/// Inputs join only if they share the first input's `CdcIngress`, its
+/// `delete_batch_size` and its `Rebuildable` status, fit the limits, and are
+/// not barriers.
 pub struct CdcBurst {
     inputs: Vec<CdcRows>,
     options: WriteOptions,

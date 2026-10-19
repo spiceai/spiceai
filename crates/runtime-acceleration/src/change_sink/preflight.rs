@@ -15,6 +15,13 @@ limitations under the License.
 */
 
 //! Scoped write conflict probes. Incoming rows are never deduplicated or rewritten.
+//!
+//! A scoped append or set replacement declares the set of rows it writes.
+//! Before `ProviderChangeSinkBackend::apply_rows` mutates, these checks refuse
+//! (with `before_mutation`) incoming rows whose unique keys collide with rows
+//! outside the declared scope, or with rows of another scope in the same
+//! coalesced append. They also refuse keys they cannot compare safely, such
+//! as NULL-bearing unique keys.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};

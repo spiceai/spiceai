@@ -15,6 +15,11 @@ limitations under the License.
 */
 
 //! Execution through the composed provider's insert and delete methods.
+//!
+//! `ProviderChangeSinkBackend` is the generic backend. It works with any
+//! accelerator engine and is the fallback when an engine supplies no native
+//! backend. The public helpers here (index deletion, index maintenance, Arrow
+//! row deletion) are also used by native backends.
 
 #[path = "cdc.rs"]
 pub mod cdc;
@@ -92,6 +97,10 @@ impl InsertPlanCache {
 
 /// Provider execution selected at binding when no native backend is available.
 /// Plan completion does not establish a storage durability guarantee.
+///
+/// Every write returns `StorageDurability::NotPromised` and no finalizer. By
+/// default it refuses set replacement and reports `SchemaEvolutionSupport::Restart`
+/// (`Recreate` for a partitioned Cayenne table).
 pub struct ProviderChangeSinkBackend {
     context: ChangeSinkContext,
     insert_plan: Mutex<Option<InsertPlanCache>>,
@@ -453,6 +462,8 @@ impl ChangeSinkBackend for ProviderChangeSinkBackend {
     }
 }
 
+/// The error text when a partitioned Cayenne table refuses a widening schema
+/// change. It tells the user how to rebuild the dataset for each mode.
 #[must_use]
 pub fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
     format!(

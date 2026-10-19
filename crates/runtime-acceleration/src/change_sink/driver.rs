@@ -14,6 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! The table owner: public sink handles and the single task that applies
+//! writes in order.
+//!
+//! `ChangeSink` admits commands into a bounded queue. The private `Owner`
+//! task dequeues them, coalesces compatible inputs, calls the backend, and
+//! runs finalizers. Producers observe results through `Submission`,
+//! `WriteReceipt` and `Publication`.
+
 use std::collections::VecDeque;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -38,9 +46,15 @@ type SharedResult = std::result::Result<(), Arc<DataFusionError>>;
 type Completion = Box<dyn FnOnce(Result<()>) + Send + 'static>;
 
 /// Query-visible completion. Waiting observes work already owned by the sink.
+///
+/// Found in `WriteReceipt::publication` and returned by
+/// `ChangeSink::begin_close`, where it reports the end of the drain.
 #[derive(Clone)]
 pub enum Publication {
+    /// Complete when the receipt was made. The backend had no finalizer.
     Ready,
+    /// A finalizer or drain is still running. The value becomes `Some` with
+    /// its result when it ends.
     Pending(watch::Receiver<Option<SharedResult>>),
 }
 
@@ -72,9 +86,15 @@ impl Publication {
 }
 
 /// Completion milestones for one accepted logical operation.
+///
+/// The owner sends one to each `Submission` after the backend accepts the
+/// write. Inputs coalesced into one write get the same milestones. The
+/// producer uses it to decide when to acknowledge its source.
 #[derive(Clone)]
 pub struct WriteReceipt {
+    /// The write changed table contents.
     pub changed: bool,
+    /// When the write becomes visible to queries.
     pub publication: Publication,
     /// The storage guarantee after successful publication, not at admission.
     pub durability: StorageDurability,
@@ -93,6 +113,9 @@ impl WriteReceipt {
 }
 
 /// A result observer, not the owner of accepted data or execution.
+///
+/// Returned by `ChangePermit::submit`. Call `wait` to get the `WriteReceipt`
+/// or the error that refused the write.
 pub struct Submission {
     result: oneshot::Receiver<Result<WriteReceipt>>,
     outcome: Option<std::result::Result<WriteReceipt, Arc<DataFusionError>>>,
@@ -186,6 +209,9 @@ struct Inner {
 
 /// Reserved queue capacity. No input has been transferred yet. Dropping a
 /// reservation releases capacity; submitting is synchronous and ordered with close.
+///
+/// Returned by `ChangeSink::reserve`. A producer can wait for capacity with
+/// no input at risk, then call `submit` without an await.
 pub struct ChangePermit {
     permit: mpsc::OwnedPermit<Command>,
     inner: Arc<Inner>,
@@ -246,6 +272,11 @@ impl ChangePermit {
 }
 
 /// Cloneable handle to one table-generation owner. Cloning never starts a worker.
+///
+/// There is one sink for each generation of an accelerated table. The refresh
+/// task and the caching-mode writer share clones of it. The runtime's
+/// generation lifecycle drains a sink with `begin_close` before a new
+/// generation can own the same table.
 #[derive(Clone)]
 pub struct ChangeSink {
     inner: Arc<Inner>,
@@ -288,11 +319,13 @@ impl ChangeSink {
         }
     }
 
+    /// What the bound backend can do.
     #[must_use]
     pub fn capabilities(&self) -> ChangeCapabilities {
         self.inner.backend.capabilities()
     }
 
+    /// Register the source that receives `Deferred` durability fences.
     pub fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>) {
         self.inner.backend.set_durability_observer(observer);
     }
