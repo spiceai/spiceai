@@ -273,10 +273,14 @@ impl SnapshotManager {
 
     /// Records what this instance serves of the dataset's pin for its writer lease. When
     /// it changed and this instance holds the lease, writes the lease at once; otherwise
-    /// the next write records it.
+    /// the next write records it. A resigned lease is not written.
     pub async fn report_writer_status(&self, status: &WriterStatus) {
         let lease = &self.writer_lease.lease;
-        if !set_writer_status(lease, status) || !lease.last_written() {
+        if !set_writer_status(lease, status) {
+            return;
+        }
+        let resigned = self.writer_lease.resigned.lock().await;
+        if *resigned || !lease.last_written() {
             return;
         }
         if let Err(error) = self.acquire_writer_lease().await {
@@ -883,6 +887,48 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         resume.notify_one();
         renewing.await.expect("renewal task").expect("a renews");
+        releasing.await.expect("release task");
+
+        assert_eq!(stored_record(&shared, &a).await.lease_duration_ms, 0);
+        assert!(matches!(
+            b.hold_writer_lease().await.expect("b takes over"),
+            WriterPermit::Holder { generation: 2 }
+        ));
+    }
+
+    /// Regression test: a status write in flight when the lease is resigned must not
+    /// take the lease back.
+    #[tokio::test]
+    async fn resigning_waits_for_a_status_write_in_flight() {
+        let store = Arc::new(TestStore::over(Arc::new(InMemory::new())));
+        let shared: Arc<dyn ObjectStore> = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let a = Arc::new(manager(&shared, instance("host-a")));
+        let b = manager(&shared, instance("host-b"));
+        a.hold_writer_lease().await.expect("a takes the lease");
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *store.pause_next_read.lock() = Some((Arc::clone(&reached), Arc::clone(&resume)));
+        let reporting = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move {
+                a.report_writer_status(&WriterStatus {
+                    serves_snapshot_id: Some(41),
+                    not_served: None,
+                })
+                .await;
+            }
+        });
+        reached.notified().await;
+
+        let releasing = tokio::spawn({
+            let a = Arc::clone(&a);
+            async move { a.resign_writer_lease().await }
+        });
+        // Let a release that does not wait land first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        resume.notify_one();
+        reporting.await.expect("status task");
         releasing.await.expect("release task");
 
         assert_eq!(stored_record(&shared, &a).await.lease_duration_ms, 0);
