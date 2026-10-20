@@ -1,0 +1,24 @@
+[package]
+name = "http-body-limit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Size-capped reads of HTTP response bodies, so a response cannot force an unbounded allocation"
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+reqwest.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+flate2 = "1.1"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net"] }
+zstd = "0.13"
+
+[lints]
+workspace = true

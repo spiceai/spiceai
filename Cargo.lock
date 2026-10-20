@@ -4836,6 +4836,7 @@ dependencies = [
  "futures",
  "graphql-parser",
  "http 1.4.1",
+ "http-body-limit",
  "linkme",
  "paste",
  "regex",
@@ -6486,6 +6487,7 @@ dependencies = [
  "globset",
  "hash-index",
  "http 1.4.1",
+ "http-body-limit",
  "httpdate",
  "iceberg",
  "iceberg-catalog-rest",
@@ -8179,6 +8181,7 @@ version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
  "bytes",
+ "http-body-limit",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -10327,6 +10330,20 @@ checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
 dependencies = [
  "bytes",
  "http 1.4.1",
+]
+
+[[package]]
+name = "http-body-limit"
+version = "2.4.0-unstable"
+dependencies = [
+ "bytes",
+ "flate2",
+ "http 1.4.1",
+ "reqwest 0.13.4",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -17690,6 +17707,7 @@ dependencies = [
  "hf-hub",
  "http 1.4.1",
  "http-body 1.0.1",
+ "http-body-limit",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",
