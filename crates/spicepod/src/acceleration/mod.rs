@@ -97,6 +97,10 @@ pub enum Mode {
     /// If the source schema is incompatible (non-additive change), snapshot (if enabled)
     /// and recreate the acceleration file from scratch.
     FileUpdate,
+    /// Keep the whole table, catalog included, in object storage under
+    /// `runtime.state.location`. Local disk is a cache, so a restart on a new
+    /// volume loses nothing. Supported by the Cayenne engine.
+    Datalake,
 }
 
 impl Display for Mode {
@@ -106,6 +110,7 @@ impl Display for Mode {
             Mode::File => write!(f, "file"),
             Mode::FileCreate => write!(f, "file_create"),
             Mode::FileUpdate => write!(f, "file_update"),
+            Mode::Datalake => write!(f, "datalake"),
         }
     }
 }

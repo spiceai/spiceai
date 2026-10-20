@@ -21,6 +21,7 @@ arrow-schema = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64.workspace = true
+blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 data_components = { path = "../data_components" }
@@ -46,7 +47,9 @@ hash-index = { path = "../hash-index" }
 key-index = { path = "../key-index" }
 im = "15.1"
 object_store = { workspace = true }
+object_store_occ = { path = "../object_store_occ" }
 parking_lot = { workspace = true }
+prost = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-request-context = { path = "../runtime-request-context" }
@@ -103,6 +106,9 @@ libc = "0.2"
 # working set. See the module docs.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[build-dependencies]
+prost-build.workspace = true
 
 [features]
 default = []

@@ -13,6 +13,7 @@ blake3.workspace = true
 futures.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
@@ -21,6 +22,9 @@ snafu.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "v7"] }
+
+[build-dependencies]
+prost-build.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -36,8 +36,9 @@ use object_store_occ::store::{
 };
 use object_store_occ::wal::{
     CommitOutcome, CommitReceipt, Error, Limits, PreparedCommit, Resolution, Snapshot,
-    WalStateStore,
+    WalStateStore, wire,
 };
+use prost::Message;
 use tokio::sync::Notify;
 
 fn memory() -> Arc<dyn StateStore> {
@@ -633,10 +634,9 @@ async fn missing_wal_and_unsupported_head_format_fail_closed() {
         .await
         .expect("head read")
         .expect("head");
-    let mut json: serde_json::Value =
-        serde_json::from_slice(head.value.as_ref().expect("head value")).expect("decode head");
-    let id: [u8; 16] = serde_json::from_value(json["commit"]["id"].clone()).expect("WAL id");
-    let wal_key = Path::from(format!("domain/wal/{}", uuid::Uuid::from_bytes(id)));
+    let mut stored =
+        wire::Head::decode(head.value.clone().expect("head value")).expect("decode head");
+    let wal_key = referenced_key("wal", stored.commit.as_ref().expect("WAL reference"));
     let wal = state.read(&wal_key).await.expect("WAL read").expect("WAL");
     assert!(matches!(
         state
@@ -654,13 +654,13 @@ async fn missing_wal_and_unsupported_head_format_fail_closed() {
         store.snapshot().await.expect_err("missing committed data"),
         Error::InvalidRecord { .. }
     ));
-    json["format"] = serde_json::json!(2);
+    stored.format = 3;
     assert!(matches!(
         state
             .compare_exchange(
                 &head_key,
                 ExpectedRevision::Exact(&head.revision),
-                StateChange::Set(Bytes::from(serde_json::to_vec(&json).expect("future head"))),
+                StateChange::Set(Bytes::from(stored.encode_to_vec())),
                 WriteId::new()
             )
             .await
@@ -947,7 +947,7 @@ fn process_restart_at_wal_publication_boundaries() {
     }
 }
 
-async fn replace_json(state: &dyn StateStore, key: &Path, value: &serde_json::Value) {
+async fn replace_record(state: &dyn StateStore, key: &Path, value: &impl Message) {
     let previous = state
         .read(key)
         .await
@@ -958,9 +958,7 @@ async fn replace_json(state: &dyn StateStore, key: &Path, value: &serde_json::Va
             .compare_exchange(
                 key,
                 ExpectedRevision::Exact(&previous.revision),
-                StateChange::Set(Bytes::from(
-                    serde_json::to_vec(value).expect("encode injected record")
-                )),
+                StateChange::Set(Bytes::from(value.encode_to_vec())),
                 WriteId::new(),
             )
             .await
@@ -969,18 +967,18 @@ async fn replace_json(state: &dyn StateStore, key: &Path, value: &serde_json::Va
     ));
 }
 
-fn referenced_key(kind: &str, reference: &serde_json::Value) -> Path {
-    let id: [u8; 16] = serde_json::from_value(reference["id"].clone()).expect("object identity");
-    Path::from(format!("domain/{kind}/{}", uuid::Uuid::from_bytes(id)))
+fn referenced_key(kind: &str, reference: &wire::Reference) -> Path {
+    let id = uuid::Uuid::from_slice(&reference.id).expect("object identity");
+    Path::from(format!("domain/{kind}/{id}"))
 }
 
-async fn json_record(state: &dyn StateStore, key: &Path) -> serde_json::Value {
+async fn stored_record<M: Message + Default>(state: &dyn StateStore, key: &Path) -> M {
     let record = state
         .read(key)
         .await
-        .expect("read JSON record")
+        .expect("read stored record")
         .expect("record");
-    serde_json::from_slice(&record.value.expect("record value")).expect("decode JSON record")
+    M::decode(record.value.expect("record value")).expect("decode stored record")
 }
 
 #[tokio::test]
@@ -996,11 +994,12 @@ async fn missing_and_corrupt_checkpoint_artifacts_fail_closed() {
                 store.checkpoint(&retained).await.expect("checkpoint"),
                 WriteOutcome::Applied
             ));
-            let head = json_record(state.as_ref(), &Path::from("domain/head")).await;
-            let manifest_key = referenced_key("checkpoints", &head["checkpoint"]["object"]);
+            let head: wire::Head = stored_record(state.as_ref(), &Path::from("domain/head")).await;
+            let manifest_key = referenced_key("checkpoints", checkpoint_object(&head));
             let target = if kind == "pages" {
-                let checkpoint = json_record(state.as_ref(), &manifest_key).await;
-                referenced_key("pages", &checkpoint["pages"][0])
+                let checkpoint: wire::Checkpoint =
+                    stored_record(state.as_ref(), &manifest_key).await;
+                referenced_key("pages", &checkpoint.pages[0])
             } else {
                 manifest_key
             };
@@ -1071,28 +1070,29 @@ async fn inconsistent_checkpoint_metadata_fails_even_with_valid_content_digest()
             WriteOutcome::Applied
         ));
         let head_key = Path::from("domain/head");
-        let mut head = json_record(state.as_ref(), &head_key).await;
-        let key = referenced_key("checkpoints", &head["checkpoint"]["object"]);
-        let mut checkpoint = json_record(state.as_ref(), &key).await;
+        let mut head: wire::Head = stored_record(state.as_ref(), &head_key).await;
+        let key = referenced_key("checkpoints", checkpoint_object(&head));
+        let mut checkpoint: wire::Checkpoint = stored_record(state.as_ref(), &key).await;
         match damage {
-            "sequence" => checkpoint["sequence"] = serde_json::json!(1),
-            "incarnation" => checkpoint["incarnation"] = serde_json::json!(vec![0; 16]),
-            "commit" => checkpoint["commit"] = serde_json::Value::Null,
+            "sequence" => checkpoint.sequence = 1,
+            "incarnation" => checkpoint.incarnation = Bytes::from(vec![0; 16]),
+            "commit" => checkpoint.commit = None,
             "duplicate_page" => {
-                let first = checkpoint["pages"][0].clone();
-                checkpoint["pages"]
-                    .as_array_mut()
-                    .expect("pages")
-                    .push(first);
+                let first = checkpoint.pages[0].clone();
+                checkpoint.pages.push(first);
             }
-            "reversed_pages" => checkpoint["pages"].as_array_mut().expect("pages").reverse(),
-            "totals" => checkpoint["keys"] = serde_json::json!(0),
+            "reversed_pages" => checkpoint.pages.reverse(),
+            "totals" => checkpoint.keys = 0,
             _ => panic!("unknown test damage"),
         }
-        let bytes = serde_json::to_vec(&checkpoint).expect("damaged manifest");
-        head["checkpoint"]["object"]["digest"] = serde_json::json!(blake3::hash(&bytes).as_bytes());
-        replace_json(state.as_ref(), &key, &checkpoint).await;
-        replace_json(state.as_ref(), &head_key, &head).await;
+        let digest = blake3::hash(&checkpoint.encode_to_vec());
+        head.checkpoint
+            .as_mut()
+            .and_then(|reference| reference.object.as_mut())
+            .expect("checkpoint object")
+            .digest = Bytes::copy_from_slice(digest.as_bytes());
+        replace_record(state.as_ref(), &key, &checkpoint).await;
+        replace_record(state.as_ref(), &head_key, &head).await;
         assert!(matches!(
             store
                 .snapshot()
@@ -1102,4 +1102,113 @@ async fn inconsistent_checkpoint_metadata_fails_even_with_valid_content_digest()
         ));
         println!("checkpoint metadata={damage}: recovery rejected");
     }
+}
+
+fn checkpoint_object(head: &wire::Head) -> &wire::Reference {
+    head.checkpoint
+        .as_ref()
+        .and_then(|reference| reference.object.as_ref())
+        .expect("checkpoint object")
+}
+
+fn entries(snapshot: &Snapshot) -> Vec<(String, Bytes)> {
+    snapshot
+        .scan_prefix("")
+        .map(|(key, value)| (key.to_owned(), value.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn advanced_snapshot_matches_recovery_and_keeps_occ() {
+    let state = memory();
+    let writer = open(Arc::clone(&state)).await;
+    let mut tx = writer.begin().await.expect("begin");
+    tx.put("a", Bytes::from_static(b"1")).expect("buffer a");
+    tx.put("b", Bytes::from_static(b"2")).expect("buffer b");
+    let attempt = tx.prepare().await.expect("prepare");
+    let (outcome, successor) = writer
+        .commit_and_advance(&attempt)
+        .await
+        .expect("commit and advance");
+    committed(&outcome);
+    let successor = successor.expect("a committed attempt yields its successor");
+
+    // The successor is the version a fresh recovery reads, with no recovery.
+    let recovered = writer.snapshot().await.expect("recover");
+    assert_eq!(successor.sequence(), 1);
+    assert_eq!(entries(&successor), entries(&recovered));
+
+    // Chained commits from successors, deletes included, never re-recover.
+    let mut tx = successor.transaction();
+    tx.delete("a").expect("buffer delete");
+    tx.put("c", Bytes::new()).expect("buffer empty value");
+    let attempt = tx.prepare().await.expect("prepare second");
+    let (outcome, successor) = writer
+        .commit_and_advance(&attempt)
+        .await
+        .expect("second commit");
+    committed(&outcome);
+    let successor = successor.expect("second successor");
+    assert_eq!(successor.sequence(), 2);
+    assert_eq!(
+        entries(&successor),
+        vec![
+            ("b".to_owned(), Bytes::from_static(b"2")),
+            ("c".to_owned(), Bytes::new()),
+        ]
+    );
+    assert_eq!(
+        entries(&successor),
+        entries(&writer.snapshot().await.expect("recover second"))
+    );
+
+    // A successor is still a snapshot: another client's commit fences it.
+    let other = open(state).await;
+    committed(
+        &other
+            .commit(&prepare(&other, "d", b"4").await)
+            .await
+            .expect("other commit"),
+    );
+    let mut tx = successor.transaction();
+    tx.put("e", Bytes::from_static(b"5")).expect("buffer e");
+    let fenced = tx.prepare().await.expect("prepare fenced attempt");
+    let (outcome, successor) = writer
+        .commit_and_advance(&fenced)
+        .await
+        .expect("stale commit");
+    assert!(matches!(outcome, CommitOutcome::Conflict), "{outcome:?}");
+    assert!(successor.is_none(), "a conflict has no successor");
+}
+
+#[tokio::test]
+async fn advance_recovers_when_a_later_commit_replaced_the_head() {
+    let (writer, state, _faults) = fault_store().await;
+    let attempt = prepare(&writer, "a", b"1").await;
+    committed(&writer.commit(&attempt).await.expect("commit"));
+    // Resubmitting the same committed attempt resolves it as committed, but the
+    // head now names a later publication, so the successor comes from recovery.
+    let other = WalStateStore::open(state, Path::from("domain"), Limits::default())
+        .await
+        .expect("open other");
+    committed(
+        &other
+            .commit(&prepare(&other, "b", b"2").await)
+            .await
+            .expect("other commit"),
+    );
+    let (outcome, successor) = writer
+        .commit_and_advance(&attempt)
+        .await
+        .expect("advance after replacement");
+    committed(&outcome);
+    let successor = successor.expect("recovered successor");
+    assert_eq!(successor.sequence(), 2);
+    assert_eq!(
+        entries(&successor),
+        vec![
+            ("a".to_owned(), Bytes::from_static(b"1")),
+            ("b".to_owned(), Bytes::from_static(b"2")),
+        ]
+    );
 }

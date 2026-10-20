@@ -2164,6 +2164,11 @@
           "description": "Open an existing file if it exists, then check schema compatibility on refresh.\nIf the source schema is incompatible (non-additive change), snapshot (if enabled)\nand recreate the acceleration file from scratch.",
           "type": "string",
           "const": "file_update"
+        },
+        {
+          "description": "Keep the whole table, catalog included, in object storage under\n`runtime.state.location`. Local disk is a cache, so a restart on a new\nvolume loses nothing. Supported by the Cayenne engine.",
+          "type": "string",
+          "const": "datalake"
         }
       ]
     },

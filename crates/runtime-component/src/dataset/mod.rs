@@ -672,6 +672,7 @@ impl DatasetSpec {
                     acceleration::Mode::File
                         | acceleration::Mode::FileCreate
                         | acceleration::Mode::FileUpdate
+                        | acceleration::Mode::Datalake
                 );
         }
 

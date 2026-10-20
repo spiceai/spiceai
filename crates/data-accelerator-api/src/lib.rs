@@ -1099,6 +1099,15 @@ impl AcceleratorExternalTableBuilder {
     }
 
     fn validate(&self) -> Result<(), Error> {
+        if self.mode == Mode::Datalake && self.engine != Engine::Cayenne {
+            InvalidConfigurationSnafu {
+                msg: format!(
+                    "`mode: datalake` is supported by `engine: cayenne` only, not `engine: {}`. Set `engine: cayenne`, or use `mode: file`. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                    self.engine
+                ),
+            }
+            .fail()?;
+        }
         match self.engine {
             Engine::Arrow => self.validate_arrow(),
             _ => Ok(()),

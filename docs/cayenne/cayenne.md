@@ -83,7 +83,7 @@ Most of Cayenne's design follows from a single discipline: **the expensive part 
 
 Everything below — the tiers, the locks, the deletion index, the CDC pipeline — is machinery in service of that one idea.
 
-## Storage modes: `mode: file` vs `mode: memory`
+## Storage modes: `mode: file`, `mode: memory` and `mode: datalake`
 
 Acceleration `mode:` selects how Cayenne persists data. This is distinct from
 `cdc_durability: memory` (a durability deferral on an otherwise file-backed table).
@@ -115,6 +115,52 @@ acceleration that sets neither `engine` nor `mode` selects fully in-RAM Cayenne.
   multiple of its real size equal to its buffer count. The per-table cap, the process-global `MemTierBudget` and its query-pool mirror all
   charge this figure. S3 Express / `cayenne_file_path` params are ignored in
   this mode (no object store is built).
+
+- **`mode: datalake`** (durable in object storage): the whole table, catalog
+  included, lives in `<runtime.state.location>/cayenne/`. Every `mode: datalake` dataset
+  there shares one catalog, `catalog/`, as `mode: file` datasets share one `cayenne.db`,
+  so a transaction across them commits atomically. Each dataset's data lives under
+  `<dataset>/`: its data directory (`<dataset>/<table_id>/…`), and the datalake tier's
+  `<dataset>/<table>-<table_id>/` when the table appends or applies changes. The state
+  location's `_spice/format.json` versions this layout. A deprecated
+  `cayenne_datalake_location` still places the catalog and data there, with the same
+  layout and its own `_spice/format.json`, until 3.0. The tier's tuning params
+  (`cayenne_datalake_target_file_size_mb` and the rest) have no effect in this mode: the
+  tier uses its defaults. Local disk holds only a replica of each location's catalog,
+  under `<metadata_dir>/datalake/<hash of the location>/cayenne.db`. Every catalog
+  transaction is recorded as the list of logical catalog actions it applied — create a
+  table, add delete files, commit a compaction, append inlined rows — each carrying every
+  value the write chose (new identifiers, timestamps), so applying the same actions to the
+  same catalog reproduces it exactly (`proto/catalog_log.proto`). Each catalog method
+  builds its action, applies it through one function per action kind, and records it on
+  the transaction; replay calls the same functions. The transaction's actions are
+  committed to object storage first, and only then committed locally; actions object
+  storage did not accept roll the local transaction back, so nothing is acknowledged that
+  the local disk alone holds, and a write that changes rows without recording an action is
+  refused. Opening the catalog restores the replica — keeping a local file that is already
+  a prefix of the durable state, else downloading the newest catalog image — and applies
+  the transactions that follow, so a restart on an empty volume finds every acknowledged
+  row. The transactions live in *epochs*, one `WalStateStore` domain each, sealed and
+  replaced every few dozen commits by a rotation that uploads a fresh image (taken from a
+  read connection, without blocking writers); the epoch and image two rotations back are
+  deleted, which keeps object storage bounded and every domain far
+  inside the WAL's replay and history limits. A seal fences any other process still
+  committing to the old epoch, so a second writer stops with an error instead of
+  diverging. Transactions commit one at a time, each waiting for its object-store
+  round trip, across every dataset sharing the catalog. Supported locations: `s3://` (S3
+  or an S3-compatible store that enforces `If-None-Match`/`If-Match`, checked with the
+  format version when the catalog opens) and a `file://` `runtime.state.location`, whose
+  data is local. Requires the `SQLite` metastore; partitioning and rebuilds are refused;
+  snapshots are skipped, and restoring one is refused. Switching a dataset from
+  `mode: file` starts a new, empty table loaded from its source, and leaves the
+  `mode: file` table as it is.
+
+Source (datalake): `crates/accelerators/accelerator-cayenne/src/datalake.rs` (location,
+store and format check), `crates/cayenne/proto/catalog_log.proto` (the actions and log records),
+`crates/cayenne/src/metastore/durable/` (`actions.rs` action building, `log.rs` epochs and
+rotation, `mod.rs` replica recovery), the `apply_*` functions and `replay_durable` in
+`crates/cayenne/src/cayenne_catalog.rs`, and `DurableCommit` in
+`crates/cayenne/src/metastore/sqlite.rs`.
 
 Source: acceleration `mode` → `!is_file_accelerated()` in
 `crates/accelerators/accelerator-cayenne/src/lib.rs` (`apply_memory_mode_overrides`,

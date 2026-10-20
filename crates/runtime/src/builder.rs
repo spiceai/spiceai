@@ -648,6 +648,14 @@ impl RuntimeBuilder {
         {
             check.record_feature(runtime_state_location::StateFeature::Snapshots);
         }
+        if let Some(check) = &state_location_check
+            && self
+                .app
+                .as_deref()
+                .is_some_and(crate::state_location::cayenne_uses_runtime_state)
+        {
+            check.record_feature(runtime_state_location::StateFeature::Cayenne);
+        }
 
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));

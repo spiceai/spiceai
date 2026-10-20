@@ -1,0 +1,102 @@
+// Copyright 2024-2026 The Spice.ai OSS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The records a `WalStateStore` domain keeps in object storage. Each object
+// holds exactly one message. Every `bytes` identity field is a 16-byte UUID and
+// every digest is a 32-byte BLAKE3 hash of the referenced object's bytes.
+syntax = "proto3";
+
+package spice.object_store_occ.wal.v1;
+
+// Bounds every client of a domain must agree on.
+message Limits {
+  uint64 max_state_bytes = 1;
+  uint64 max_keys = 2;
+  uint64 max_commits = 3;
+  uint64 max_replay_commits = 4;
+}
+
+// An immutable object: its identity and the digest of its bytes.
+message Reference {
+  bytes id = 1;
+  bytes digest = 2;
+}
+
+// The checkpoint a head points at and the commit it is anchored to.
+message CheckpointReference {
+  Reference object = 1;
+  uint64 sequence = 2;
+  // Absent for a checkpoint of the empty domain (sequence 0).
+  Reference commit = 3;
+}
+
+// `<domain>/head`, the only mutable object: its conditional replacement is the
+// commit point of every transaction and checkpoint.
+message Head {
+  uint32 format = 1;
+  bytes incarnation = 2;
+  Limits limits = 3;
+  uint64 sequence = 4;
+  // Absent at sequence 0.
+  Reference commit = 5;
+  CheckpointReference checkpoint = 6;
+  uint64 state_bytes = 7;
+  uint64 keys = 8;
+}
+
+// One key a transaction changed. An absent value deletes the key; an empty one
+// stores an empty value.
+message Change {
+  string key = 1;
+  optional bytes value = 2;
+}
+
+// `<domain>/wal/<id>`: one committed transaction.
+message LogRecord {
+  uint32 format = 1;
+  bytes incarnation = 2;
+  bytes id = 3;
+  // The write identity of the head the transaction read.
+  bytes base_head = 4;
+  uint64 sequence = 5;
+  // The previous commit; absent for sequence 1.
+  Reference parent = 6;
+  // Sorted by key, each key at most once.
+  repeated Change changes = 7;
+  uint64 state_bytes = 8;
+  uint64 keys = 9;
+}
+
+// `<domain>/checkpoints/<id>`: the domain's state at one sequence.
+message Checkpoint {
+  uint32 format = 1;
+  bytes incarnation = 2;
+  uint64 sequence = 3;
+  Reference commit = 4;
+  repeated Reference pages = 5;
+  uint64 state_bytes = 6;
+  uint64 keys = 7;
+}
+
+message Entry {
+  string key = 1;
+  bytes value = 2;
+}
+
+// `<domain>/pages/<id>`: one bounded slice of a checkpoint, sorted by key.
+message Page {
+  uint32 format = 1;
+  bytes incarnation = 2;
+  repeated Entry entries = 3;
+}

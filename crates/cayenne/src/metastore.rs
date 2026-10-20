@@ -20,6 +20,7 @@ limitations under the License.
 //! that can be used to store Cayenne metadata. This allows swapping between `SQLite`,
 //! Turso, or other storage implementations.
 
+pub mod durable;
 pub mod snapshot;
 pub mod sqlite;
 
@@ -631,6 +632,12 @@ pub trait MetastoreTransaction: Send + Sync {
     ///
     /// Returns an error if any statement in the batch fails.
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()>;
+
+    /// Record a catalog action this transaction applied, so a catalog durable
+    /// in object storage can make the transaction durable as the list of its
+    /// actions. Record an action after it applied successfully and in the
+    /// order applied. Other catalogs keep nothing.
+    fn record(&self, action: durable::wire::Action);
 
     /// Commit the transaction.
     ///
