@@ -726,7 +726,9 @@ jobs:
                 break
               fi
               echo "${push_log}"
-              if grep -q 'GH006' <<<"${push_log}"; then
+              # GH006 is any protected-branch rejection; only the merge-queue lock
+              # moves the snapshots to the next branch.
+              if grep -q 'GH006' <<<"${push_log}" && grep -q 'queued for merging' <<<"${push_log}"; then
                 suffix=$((suffix + 1))
                 echo "::notice::${BRANCH_NAME} is locked by the merge queue; pushing these snapshots to ${BASE_BRANCH}-${suffix} instead."
                 BRANCH_NAME="${BASE_BRANCH}-${suffix}"
