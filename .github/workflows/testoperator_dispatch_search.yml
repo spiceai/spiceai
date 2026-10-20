@@ -68,6 +68,14 @@ jobs:
             "$SPICEPOD_VALIDATOR" "$file"
           done
 
+      - name: Validate spicepods - Search - ConTEB
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/search/conteb/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
       - name: Validate spicepods - Search - FinanceBench
         run: |
           shopt -s globstar nullglob
@@ -82,7 +90,7 @@ jobs:
       # unbounded; 4 trades some of that throttling for a shorter overall dispatch. The
       # slot wait must exceed one run's wall clock (up to 60 minutes) so the queue drains
       # instead of giving up.
-      - name: Dispatch Testoperator - Search - MTEB
+      - name: Dispatch Testoperator - Search
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/search \
             --workflow search \

@@ -50,11 +50,10 @@ use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, SpiceTable, find_concrete};
 
-use super::batch::AppendValidation;
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangeIndexes, ChangePayload, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, SetKey,
-    StorageDurability, WriteOptions,
+    ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, ScopedInput,
+    StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use cdc::{CdcMetrics, ChangeOperationType, group_into_sub_batches, select_rows};
@@ -144,7 +143,8 @@ impl ProviderChangeSinkBackend {
     }
 
     /// Execute one finite append or ordered replacement through the composed
-    /// provider. All batches are cast and the append is planned before deletion.
+    /// provider: every replaced scope is deleted once, then all chunks are
+    /// appended. All batches are cast and the append is planned before deletion.
     /// The caller must establish that this provider supports ordered replacement.
     ///
     /// # Errors
@@ -154,61 +154,39 @@ impl ProviderChangeSinkBackend {
         &self,
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
-        scope: Option<SetKey>,
-        append_validations: Vec<AppendValidation>,
+        scoped_inputs: Vec<ScopedInput>,
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<bool> {
-        if scope.is_some() && !append_validations.is_empty() {
-            return Err(before_mutation(DataFusionError::Plan(
-                "Set replacement cannot carry scoped append validation ranges".into(),
-            )));
-        }
         let _guard = self.context.write_lock.lock().await;
         let state = ctx.state();
         let target_schema = self.context.table.schema();
-        let scope = scope
-            .map(|scope| SetKey::from_filters(Arc::clone(&target_schema), &scope.filters()))
-            .transpose()
-            .map_err(before_mutation)?;
         let batches = batches
             .into_iter()
             .map(|batch| try_cast_to(batch, Arc::clone(&target_schema)).map_err(Into::into))
             .collect::<Result<Vec<_>>>()
             .map_err(before_mutation)?;
-        if let Some(scope) = &scope {
-            for batch in &batches {
-                scope.validate_batch(batch).map_err(before_mutation)?;
-            }
-            preflight::validate_scope_constraints(
-                &self.context,
-                scope,
-                &batches,
-                options.delete_batch_size,
-                ctx,
-            )
-            .await?;
-        }
         let rows = batches
             .iter()
             .map(RecordBatch::num_rows)
             .fold(0_usize, usize::saturating_add);
         let has_rows = rows > 0;
         let chunks = batches.len();
-        let scoped_inputs = append_validations.len();
-        if scoped_inputs > 0 {
+        let inputs = scoped_inputs.len();
+        if inputs > 0 {
             tracing::debug!(
                 dataset = %self.context.dataset_name,
-                scoped_inputs,
+                inputs,
+                replaced = scoped_inputs.iter().filter(|input| input.replaces()).count(),
                 chunks,
                 rows,
-                "ChangeSink scoped append preflight"
+                "ChangeSink scoped write preflight"
             );
         }
-        preflight::validate_append_scopes(
+        let replaced = preflight::validate_scoped_inputs(
             &self.context,
             &batches,
-            &append_validations,
+            &scoped_inputs,
             options.delete_batch_size,
             ctx,
         )
@@ -233,31 +211,27 @@ impl ProviderChangeSinkBackend {
         } else {
             None
         };
-        let replaced = scope.is_some();
-        if let Some(scope) = scope {
-            let delete = self
-                .context
-                .table
-                .delete_from(&state, scope.filters())
-                .await?;
+        if let Some(filters) = replaced_scope_filters(replaced.iter()) {
+            let delete = self.context.table.delete_from(&state, filters).await?;
             collect(delete, ctx.task_ctx()).await?;
         }
         if let Some(insert) = insert_plan {
             collect(insert, ctx.task_ctx()).await?;
-            if scoped_inputs > 0 {
+            if inputs > 0 {
                 tracing::debug!(
                     dataset = %self.context.dataset_name,
-                    scoped_inputs,
+                    inputs,
                     chunks,
                     rows,
-                    "ChangeSink scoped append published"
+                    "ChangeSink scoped write published"
                 );
             }
         }
-        if replaced || has_rows {
+        let changed = !replaced.is_empty() || has_rows;
+        if changed {
             perform_change_write_maintenance(&self.context.table).await?;
         }
-        Ok(replaced || has_rows)
+        Ok(changed)
     }
 
     fn warn_if_synchronous_cayenne(&self) {
@@ -417,19 +391,20 @@ impl ChangeSinkBackend for ProviderChangeSinkBackend {
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        let (payload, scope) = batch.into_parts();
-        if scope.is_some() && self.replacement == ReplacementSupport::Unsupported {
+        if batch.replaced_scopes().next().is_some()
+            && self.replacement == ReplacementSupport::Unsupported
+        {
             return Err(before_mutation(DataFusionError::NotImplemented(
                 "Set replacement is not enabled for this accelerator".into(),
             )));
         }
-        let changed = match payload {
+        let changed = match batch.into_payload() {
             ChangePayload::Rows {
                 schema,
                 batches,
-                append_validations,
+                scoped_inputs,
             } => {
-                self.apply_rows(schema, batches, scope, append_validations, options, ctx)
+                self.apply_rows(schema, batches, scoped_inputs, options, ctx)
                     .await?
             }
             ChangePayload::Cdc(rows) => {
