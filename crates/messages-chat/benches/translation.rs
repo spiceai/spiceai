@@ -79,7 +79,8 @@ fn completion() -> CreateChatCompletionResponse {
     .expect("a completion")
 }
 
-/// A streamed answer of 200 text chunks and a tool call in 50 argument chunks.
+/// A streamed answer of 200 text chunks and a tool call whose JSON object arguments come in 50
+/// chunks.
 fn chunks() -> Vec<CreateChatCompletionStreamResponse> {
     let chunk = |delta: Value, finish: Value| -> CreateChatCompletionStreamResponse {
         serde_json::from_value(json!({
@@ -91,9 +92,14 @@ fn chunks() -> Vec<CreateChatCompletionStreamResponse> {
     let mut chunks = vec![chunk(json!({"role": "assistant"}), Value::Null)];
     chunks.extend((0..200).map(|_| chunk(json!({"content": "token "}), Value::Null)));
     chunks.push(chunk(json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "tool_2", "arguments": ""}}]}), Value::Null));
-    chunks.extend((0..50).map(|_| {
+    chunks.extend((0..50).map(|i| {
+        let arguments = match i {
+            0 => "{\"text\":\"abcd",
+            49 => "abcd\"}",
+            _ => "abcd",
+        };
         chunk(
-            json!({"tool_calls": [{"index": 0, "function": {"arguments": "abcd"}}]}),
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]}),
             Value::Null,
         )
     }));
@@ -138,7 +144,7 @@ fn bench(c: &mut Criterion) {
                         events += usize::from(serde_json::to_string(&event).is_ok());
                     }
                 }
-                events + translator.finish().len()
+                events + translator.end().expect("the final events").len()
             },
             BatchSize::SmallInput,
         );
