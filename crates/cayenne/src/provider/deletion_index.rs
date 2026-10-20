@@ -193,6 +193,10 @@ pub struct TombstoneEntry {
 }
 
 impl TombstoneEntry {
+    pub(crate) fn fused_with(self, other: Self) -> Self {
+        merged_entry(Some(self), other.delete_seq, other.insert_seq).entry
+    }
+
     const EMPTY: Self = Self {
         delete_seq: SEQUENCE_ABSENT,
         insert_seq: SEQUENCE_ABSENT,
@@ -228,7 +232,7 @@ pub struct Tombstone {
 
 impl Tombstone {
     #[inline]
-    fn from_entry(entry: &TombstoneEntry) -> Option<Self> {
+    pub(crate) fn from_entry(entry: &TombstoneEntry) -> Option<Self> {
         entry.delete_sequence().map(|delete_sequence| Self {
             delete_sequence,
             insert_sequence: entry.insert_sequence(),
@@ -389,8 +393,8 @@ where
     K: Copy + Eq + Hash + Ord,
     S: BuildHasher + Default + Clone,
 {
-    fn contains_key(&self, key: &K) -> bool {
-        self.active.contains_key(key) || self.runs.iter().any(|run| run.map.contains_key(key))
+    fn fused_entry(&self, key: &K) -> Option<TombstoneEntry> {
+        Self::fuse(&self.active, &self.runs, key, |_| true)
     }
 
     fn empty() -> Self {
@@ -1587,14 +1591,14 @@ struct SortedKeySet {
 }
 
 impl SortedKeySet {
-    fn from_keys(keys: impl Iterator<Item = Vec<u8>>) -> Self {
+    fn from_entries(keys: impl Iterator<Item = (Vec<u8>, TombstoneEntry)>) -> Self {
         Self {
             runs: vec![Arc::new(SortedKeyRun::new(keys))],
             tail: None,
         }
     }
 
-    fn extended(&self, keys: impl Iterator<Item = Vec<u8>>) -> Self {
+    fn extended(&self, keys: impl Iterator<Item = (Vec<u8>, TombstoneEntry)>) -> Self {
         const TAIL_CAP: usize = 4096;
         let added = SortedKeyRun::new(keys);
         let mut result = self.clone();
@@ -1625,29 +1629,41 @@ impl SortedKeySet {
 pub(crate) struct SortedKeyRun {
     data: Vec<u8>,
     offsets: Vec<usize>,
-    hashes: Vec<u128>,
+    entries: Vec<TombstoneEntry>,
+    max_delete_seq: i64,
     decoded: std::sync::OnceLock<Vec<arrow::array::ArrayRef>>,
 }
 
 impl SortedKeyRun {
-    fn new(keys: impl Iterator<Item = Vec<u8>>) -> Self {
+    fn new(keys: impl Iterator<Item = (Vec<u8>, TombstoneEntry)>) -> Self {
         let mut keys: Vec<_> = keys.collect();
-        keys.sort_unstable();
-        keys.dedup();
-        Self::from_sorted(keys.iter().map(Vec::as_slice))
+        keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut fused: Vec<(Vec<u8>, TombstoneEntry)> = Vec::with_capacity(keys.len());
+        for (key, entry) in keys {
+            if let Some((previous, value)) = fused.last_mut()
+                && *previous == key
+            {
+                *value = value.fused_with(entry);
+            } else {
+                fused.push((key, entry));
+            }
+        }
+        Self::from_sorted(fused.iter().map(|(key, entry)| (key.as_slice(), *entry)))
     }
 
-    fn from_sorted<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Self {
+    fn from_sorted<'a>(keys: impl Iterator<Item = (&'a [u8], TombstoneEntry)>) -> Self {
         let mut result = Self {
             data: Vec::new(),
             offsets: vec![0],
-            hashes: Vec::new(),
+            entries: Vec::new(),
+            max_delete_seq: SEQUENCE_ABSENT,
             decoded: std::sync::OnceLock::new(),
         };
-        for key in keys {
+        for (key, entry) in keys {
             result.data.extend_from_slice(key);
             result.offsets.push(result.data.len());
-            result.hashes.push(hash_key_128(key));
+            result.entries.push(entry);
+            result.max_delete_seq = result.max_delete_seq.max(entry.delete_seq);
         }
         result
     }
@@ -1657,13 +1673,13 @@ impl SortedKeyRun {
         let mut keys = Vec::with_capacity(self.len() + other.len());
         while a < self.len() || b < other.len() {
             if b == other.len() || (a < self.len() && self.key_bytes(a) < other.key_bytes(b)) {
-                keys.push(self.key_bytes(a));
+                keys.push((self.key_bytes(a), self.entry(a)));
                 a += 1;
             } else if a == self.len() || other.key_bytes(b) < self.key_bytes(a) {
-                keys.push(other.key_bytes(b));
+                keys.push((other.key_bytes(b), other.entry(b)));
                 b += 1;
             } else {
-                keys.push(self.key_bytes(a));
+                keys.push((self.key_bytes(a), self.entry(a).fused_with(other.entry(b))));
                 a += 1;
                 b += 1;
             }
@@ -1672,10 +1688,10 @@ impl SortedKeyRun {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.hashes.len()
+        self.entries.len()
     }
-    pub(crate) fn hash(&self, i: usize) -> u128 {
-        self.hashes[i]
+    pub(crate) fn entry(&self, i: usize) -> TombstoneEntry {
+        self.entries[i]
     }
     pub(crate) fn key_bytes(&self, i: usize) -> &[u8] {
         &self.data[self.offsets[i]..self.offsets[i + 1]]
@@ -1699,7 +1715,7 @@ impl SortedKeyRun {
     fn bytes(&self) -> usize {
         self.data.capacity()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
-            + self.hashes.capacity() * std::mem::size_of::<u128>()
+            + self.entries.capacity() * std::mem::size_of::<TombstoneEntry>()
             + self.decoded.get().map_or(0, |arrays| {
                 arrays.iter().map(|a| a.get_array_memory_size()).sum()
             })
@@ -1726,7 +1742,7 @@ impl SortedKeyRun {
 #[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
     core: LayeredRuns<u128, PrehashedBuildHasher>,
-    sorted_keys: Option<SortedKeySet>,
+    sorted_keys: SortedKeySet,
 }
 
 impl Default for KeyDeletionIndex {
@@ -1736,37 +1752,62 @@ impl Default for KeyDeletionIndex {
 }
 
 impl KeyDeletionIndex {
-    pub(crate) fn sorted_runs(&self) -> Option<impl Iterator<Item = &Arc<SortedKeyRun>>> {
+    pub(crate) fn sorted_runs(&self) -> impl Iterator<Item = &Arc<SortedKeyRun>> {
         self.sorted_keys
-            .as_ref()
-            .map(|s| s.runs.iter().chain(s.tail.iter()))
+            .runs
+            .iter()
+            .chain(self.sorted_keys.tail.iter())
     }
 
     /// Resident bytes retained by the native-search key set.
     #[must_use]
     pub fn sorted_key_set_bytes(&self) -> usize {
-        self.sorted_runs()
-            .map_or(0, |runs| runs.map(|r| r.bytes()).sum())
+        self.sorted_runs().map(|r| r.bytes()).sum()
     }
 
     /// Number of keys across sorted runs, including overlap between runs.
     #[must_use]
     pub fn sorted_key_set_len(&self) -> usize {
-        self.sorted_runs()
-            .map_or(0, |runs| runs.map(|r| r.len()).sum())
+        self.sorted_runs().map(|r| r.len()).sum()
     }
 
-    fn filtered_sorted_keys(
+    fn consolidated_sorted_keys(&self) -> SortedKeyRun {
+        self.sorted_runs()
+            .fold(SortedKeyRun::new(std::iter::empty()), |keys, run| {
+                keys.merged(run)
+            })
+    }
+
+    fn filtered_sorted_keys(&self, core: &LayeredRuns<u128, PrehashedBuildHasher>) -> SortedKeySet {
+        let keys = self.consolidated_sorted_keys();
+        SortedKeySet::from_entries((0..keys.len()).filter_map(|i| {
+            let key = keys.key_bytes(i);
+            core.fused_entry(&hash_key_128(key))
+                .map(|entry| (key.to_vec(), entry))
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sorted_fused_entries(
         &self,
-        core: &LayeredRuns<u128, PrehashedBuildHasher>,
-    ) -> Option<SortedKeySet> {
-        self.sorted_runs().map(|runs| {
-            SortedKeySet::from_keys(runs.flat_map(|r| {
-                (0..r.len())
-                    .filter(|&i| core.contains_key(&r.hash(i)))
-                    .map(|i| r.key_bytes(i).to_vec())
-            }))
-        })
+    ) -> std::collections::BTreeMap<Vec<u8>, TombstoneEntry> {
+        let keys = self.consolidated_sorted_keys();
+        (0..keys.len())
+            .map(|i| (keys.key_bytes(i).to_vec(), keys.entry(i)))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_hash_core_for_test(&self) -> Self {
+        Self {
+            core: LayeredRuns::empty(),
+            sorted_keys: self.sorted_keys.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core_fused_entry(&self, key: &[u8]) -> Option<TombstoneEntry> {
+        self.core.fused_entry(&hash_key_128(key))
     }
 
     /// An empty index.
@@ -1774,7 +1815,7 @@ impl KeyDeletionIndex {
     pub fn empty() -> Self {
         Self {
             core: LayeredRuns::empty(),
-            sorted_keys: Some(SortedKeySet::default()),
+            sorted_keys: SortedKeySet::default(),
         }
     }
 
@@ -1802,12 +1843,28 @@ impl KeyDeletionIndex {
         deleted: HashMap<Box<[u8]>, i64>,
         insert_records: HashMap<Box<[u8]>, i64>,
     ) -> Self {
-        let sorted_keys = Some(SortedKeySet::from_keys(
+        let sorted_keys = SortedKeySet::from_entries(
             deleted
-                .keys()
-                .chain(insert_records.keys())
-                .map(|k| k.to_vec()),
-        ));
+                .iter()
+                .map(|(k, &seq)| {
+                    (
+                        k.to_vec(),
+                        TombstoneEntry {
+                            delete_seq: seq,
+                            insert_seq: SEQUENCE_ABSENT,
+                        },
+                    )
+                })
+                .chain(insert_records.iter().map(|(k, &seq)| {
+                    (
+                        k.to_vec(),
+                        TombstoneEntry {
+                            delete_seq: SEQUENCE_ABSENT,
+                            insert_seq: seq,
+                        },
+                    )
+                })),
+        );
         Self {
             sorted_keys,
             core: LayeredRuns::from_iters(
@@ -1852,6 +1909,11 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn has_deletions(&self) -> bool {
         self.core.delete_count > 0
+    }
+
+    pub(crate) fn has_sorted_deletions(&self) -> bool {
+        self.sorted_runs()
+            .any(|r| r.max_delete_seq != SEQUENCE_ABSENT)
     }
 
     /// Approximate resident bytes for memory accounting. Base entries are
@@ -2044,10 +2106,15 @@ impl KeyDeletionIndex {
             .map(|(k, s)| (k.as_ref().to_vec(), s))
             .collect();
         Self {
-            sorted_keys: self
-                .sorted_keys
-                .as_ref()
-                .map(|set| set.extended(additions.iter().map(|(k, _)| k.clone()))),
+            sorted_keys: self.sorted_keys.extended(additions.iter().map(|(k, seq)| {
+                (
+                    k.clone(),
+                    TombstoneEntry {
+                        delete_seq: *seq,
+                        insert_seq: SEQUENCE_ABSENT,
+                    },
+                )
+            })),
             core: self.core.extend(
                 additions.into_iter().map(|(key, delete_seq)| {
                     (hash_key_128(key.as_ref()), delete_seq, SEQUENCE_ABSENT)
@@ -2068,10 +2135,15 @@ impl KeyDeletionIndex {
     ) -> Self {
         let keys: Vec<_> = keys.into_iter().map(|k| k.as_ref().to_vec()).collect();
         Self {
-            sorted_keys: self
-                .sorted_keys
-                .as_ref()
-                .map(|set| set.extended(keys.iter().cloned())),
+            sorted_keys: self.sorted_keys.extended(keys.iter().map(|k| {
+                (
+                    k.clone(),
+                    TombstoneEntry {
+                        delete_seq: delete_sequence,
+                        insert_seq: insert_sequence,
+                    },
+                )
+            })),
             core: self.core.extend(
                 keys.into_iter()
                     .map(|key| (hash_key_128(key.as_ref()), delete_sequence, insert_sequence)),
@@ -2097,13 +2169,27 @@ impl KeyDeletionIndex {
             .into_iter()
             .map(|(k, d, i)| (k.as_ref().to_vec(), d, i))
             .collect();
-        let sorted_keys = self.sorted_keys.as_ref().map(|set| {
-            set.extended(
-                pure.iter()
-                    .map(|(k, _)| k.clone())
-                    .chain(conflicts.iter().map(|(k, _, _)| k.clone())),
-            )
-        });
+        let sorted_keys = self.sorted_keys.extended(
+            pure.iter()
+                .map(|(k, d)| {
+                    (
+                        k.clone(),
+                        TombstoneEntry {
+                            delete_seq: *d,
+                            insert_seq: SEQUENCE_ABSENT,
+                        },
+                    )
+                })
+                .chain(conflicts.iter().map(|(k, d, i)| {
+                    (
+                        k.clone(),
+                        TombstoneEntry {
+                            delete_seq: *d,
+                            insert_seq: *i,
+                        },
+                    )
+                })),
+        );
         Self {
             sorted_keys,
             core: self.core.extend(
@@ -4008,7 +4094,7 @@ mod sorted_key_tests {
     use super::*;
 
     #[test]
-    fn sorted_key_set_superset_after_random_mutations() {
+    fn sorted_key_set_exact_after_random_mutations() {
         let seed = std::env::var("SORTED_FILTER_SEED")
             .ok()
             .map_or(0x9876_5432_10ab, |s| {
@@ -4043,19 +4129,20 @@ mod sorted_key_tests {
                         .expect("unchanged prefix applies");
                 }
             }
-            let retained: HashSet<_> = index.iter_entries().map(|(hash, _)| hash).collect();
-            let sorted: HashSet<_> = index
-                .sorted_runs()
-                .expect("sorted set available")
-                .flat_map(|run| (0..run.len()).map(|i| run.key_bytes(i).to_vec()))
-                .collect();
+            let sorted = index.sorted_fused_entries();
             for key in &keys {
-                if retained.contains(&hash_key_128(key)) {
-                    assert!(
-                        sorted.contains(key),
-                        "seed={seed}, seq={seq}, missing key={key:?}"
-                    );
-                }
+                assert_eq!(
+                    sorted.get(key).copied(),
+                    index.core.fused_entry(&hash_key_128(key)),
+                    "seed={seed}, seq={seq}, key={key:?}"
+                );
+            }
+            for (key, entry) in &sorted {
+                assert_eq!(
+                    Some(*entry),
+                    index.core.fused_entry(&hash_key_128(key)),
+                    "seed={seed}, seq={seq}, sorted key absent from core={key:?}"
+                );
             }
         }
     }

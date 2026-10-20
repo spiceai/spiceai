@@ -28,7 +28,7 @@ limitations under the License.
 //!
 //! - **`KeyBasedDeletionFilterExec`**: For tables with composite or non-integer primary keys.
 //!   Searches decoded sorted deletion keys against native PK columns in monotone
-//!   scan runs, with row encoding and hash probes as a fallback and debug oracle.
+//!   scan runs or a native sort permutation, with a separate encoding/hash oracle.
 //!
 //! # Position-Based Deletion (No Filter Exec)
 //!
@@ -46,10 +46,11 @@ limitations under the License.
 //!
 //! # Vectorised probe
 //!
-//! Each batch is filtered in two passes:
-//! 1. Build a `BooleanArray` keep-mask by probing the deletion index per row, with a
-//!    bloom-filter prefilter that early-rejects keys that are definitely not deleted.
-//! 2. Apply the mask in one shot via [`arrow::compute::filter_record_batch`].
+//! Both filters collect deleted row positions, build a packed keep-mask, and apply
+//! it with [`arrow::compute::filter_record_batch`]. Integer-PK filters probe the
+//! bloom-prefiltered index. Composite-key filters search native sorted key runs,
+//! fusing their sequence entries; shuffled batches use a native sort permutation.
+//! The composite-key hash path is used only by the experiment-OFF mode and oracle.
 //!
 //! # Pushdown transparency
 //!
@@ -74,7 +75,7 @@ pub fn experiment_set_sorted_key_deletes(enabled: bool) {
     SORTED_KEY_DELETES.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
+use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone, TombstoneEntry};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow::compute::{max as arrow_col_max, min as arrow_col_min};
 use datafusion::config::ConfigOptions;
@@ -113,9 +114,8 @@ struct DeletionFilterMetrics {
     rows_deleted: Count,
     sorted_path_rows: Count,
     sorted_path_batches: Count,
-    fallback_rows: Count,
-    fallback_batches: Count,
-    fallback_no_sorted_set_rows: Count,
+    permuted_rows: Count,
+    permuted_batches: Count,
     sorted_runs: Count,
     sorted_candidates: Count,
     sorted_path_compute: datafusion_physical_plan::metrics::Time,
@@ -133,10 +133,8 @@ impl DeletionFilterMetrics {
             sorted_path_rows: MetricBuilder::new(metrics).counter("sorted_path_rows", partition),
             sorted_path_batches: MetricBuilder::new(metrics)
                 .counter("sorted_path_batches", partition),
-            fallback_rows: MetricBuilder::new(metrics).counter("fallback_rows", partition),
-            fallback_batches: MetricBuilder::new(metrics).counter("fallback_batches", partition),
-            fallback_no_sorted_set_rows: MetricBuilder::new(metrics)
-                .counter("fallback_no_sorted_set_rows", partition),
+            permuted_rows: MetricBuilder::new(metrics).counter("permuted_rows", partition),
+            permuted_batches: MetricBuilder::new(metrics).counter("permuted_batches", partition),
             sorted_runs: MetricBuilder::new(metrics).counter("sorted_runs", partition),
             sorted_candidates: MetricBuilder::new(metrics).counter("sorted_candidates", partition),
             sorted_path_compute: MetricBuilder::new(metrics)
@@ -793,48 +791,10 @@ pub struct KeyBasedDeletionFilterStream {
 type SortedDecodeCache =
     std::collections::HashMap<(usize, Vec<arrow_schema::DataType>), Vec<ArrayRef>>;
 
-type NativeComparator = Box<dyn Fn(usize, usize) -> std::cmp::Ordering + Send + Sync>;
+#[path = "sorted_comparator.rs"]
+mod sorted_comparator;
+use sorted_comparator::{IntegerComparator, KeyCompare, TypedComparator};
 
-// Arrow dispatches once to typed primitive, Boolean, byte, view, and fixed-size
-// comparators. Its primitive float comparator uses total_cmp; null ordering is
-// independent of descending value order. Other supported types share this API.
-fn native_comparators(
-    left: &[ArrayRef],
-    right: &[ArrayRef],
-    converter: &RowConverter,
-) -> datafusion_common::Result<Vec<NativeComparator>> {
-    if left.len() != converter.sort_fields().len() || right.len() != left.len() {
-        return Err(datafusion_common::DataFusionError::Internal(
-            "Sorted deletion primary key column count differs from the row converter".into(),
-        ));
-    }
-    left.iter()
-        .zip(right)
-        .zip(converter.sort_fields())
-        .map(|((l, r), field)| {
-            let r = if l.data_type() == r.data_type() {
-                Arc::clone(r)
-            } else {
-                arrow::compute::cast(r, l.data_type())?
-            };
-            Ok(arrow::array::make_comparator(
-                l.as_ref(),
-                r.as_ref(),
-                field.options,
-            )?)
-        })
-        .collect()
-}
-
-fn compare_native(comparators: &[NativeComparator], a: usize, b: usize) -> std::cmp::Ordering {
-    comparators
-        .iter()
-        .map(|c| c(a, b))
-        .find(|o| !o.is_eq())
-        .unwrap_or(std::cmp::Ordering::Equal)
-}
-
-/// Returns `None` when the batch has too many monotone runs for native search.
 fn sorted_deleted_rows(
     columns: &[ArrayRef],
     converter: &RowConverter,
@@ -843,30 +803,71 @@ fn sorted_deleted_rows(
     cutoff: Option<i64>,
     metrics: &DeletionFilterMetrics,
     cache: &mut SortedDecodeCache,
-) -> datafusion_common::Result<Option<Vec<usize>>> {
-    let n = columns.first().map_or(0, |c| c.len());
-    if n == 0 {
-        return Ok(Some(Vec::new()));
+) -> datafusion_common::Result<Vec<usize>> {
+    let integers = columns.iter().all(|c| {
+        c.null_count() == 0
+            && matches!(
+                c.data_type(),
+                arrow_schema::DataType::Int32 | arrow_schema::DataType::Int64
+            )
+    });
+    macro_rules! integer_kernel {
+        ($($n:literal),*) => {
+            match columns.len() {
+                $($n => return sorted_deleted_rows_impl::<IntegerComparator<$n>>(columns, converter, tombstones, handling, cutoff, metrics, cache),)*
+                _ => {}
+            }
+        };
     }
-    let same = native_comparators(columns, columns, converter)?;
+    if integers {
+        integer_kernel!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+    }
+    sorted_deleted_rows_impl::<TypedComparator>(
+        columns, converter, tombstones, handling, cutoff, metrics, cache,
+    )
+}
+
+fn sorted_scan_order<C: KeyCompare>(
+    columns: &[ArrayRef],
+    converter: &RowConverter,
+    metrics: &DeletionFilterMetrics,
+) -> datafusion_common::Result<(Vec<usize>, Vec<usize>)> {
+    let n = columns.first().map_or(0, |c| c.len());
+    let same = C::new(columns, columns, converter.sort_fields())?;
     let mut boundaries = vec![0];
     for i in 1..n {
-        if compare_native(&same, i - 1, i).is_gt() {
+        if same.compare(i - 1, i).is_gt() {
             boundaries.push(i);
         }
     }
     metrics.sorted_runs.add(boundaries.len());
+    let mut order: Vec<_> = (0..n).collect();
     if boundaries.len() > (n / 16).max(1) {
-        return Ok(None);
+        order.sort_unstable_by(|&a, &b| same.compare(a, b));
+        boundaries.truncate(1);
+        metrics.permuted_batches.add(1);
+        metrics.permuted_rows.add(n);
     }
     boundaries.push(n);
-    let mut candidates = BooleanBufferBuilder::new(n);
-    candidates.append_n(n, false);
-    let mut deleted = Vec::new();
-    let Some(runs) = tombstones.sorted_runs() else {
-        return Ok(None);
-    };
-    for run in runs {
+    Ok((order, boundaries))
+}
+
+fn sorted_deleted_rows_impl<C: KeyCompare>(
+    columns: &[ArrayRef],
+    converter: &RowConverter,
+    tombstones: &KeyDeletionIndex,
+    handling: InsertRecordHandling,
+    cutoff: Option<i64>,
+    metrics: &DeletionFilterMetrics,
+    cache: &mut SortedDecodeCache,
+) -> datafusion_common::Result<Vec<usize>> {
+    let n = columns.first().map_or(0, |c| c.len());
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let (order, boundaries) = sorted_scan_order::<C>(columns, converter, metrics)?;
+    let mut candidates: Vec<Option<TombstoneEntry>> = vec![None; n];
+    for run in tombstones.sorted_runs() {
         if run.len() == 0 {
             continue;
         }
@@ -894,14 +895,13 @@ fn sorted_deleted_rows(
                 "Sorted deletion cast cache was not initialized".into(),
             )
         })?;
-        let cross = native_comparators(columns, decoded, converter)?;
+        let cross = C::new(columns, decoded, converter.sort_fields())?;
         for bounds in boundaries.windows(2) {
             let (a, b) = (bounds[0], bounds[1]);
-            let mut lo = 0;
-            let mut hi = run.len();
+            let (mut lo, mut hi) = (0, run.len());
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if compare_native(&cross, a, mid).is_gt() {
+                if cross.compare(order[a], mid).is_gt() {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -909,38 +909,42 @@ fn sorted_deleted_rows(
             }
             let mut pos = a;
             for t in lo..run.len() {
-                if compare_native(&cross, b - 1, t).is_lt() {
+                if cross.compare(order[b - 1], t).is_lt() {
                     break;
                 }
                 let mut end = b;
                 while pos < end {
                     let mid = pos + (end - pos) / 2;
-                    if compare_native(&cross, mid, t).is_lt() {
+                    if cross.compare(order[mid], t).is_lt() {
                         pos = mid + 1;
                     } else {
                         end = mid;
                     }
                 }
-                while pos < b && compare_native(&cross, pos, t).is_eq() {
-                    if !candidates.get_bit(pos) {
-                        candidates.set_bit(pos, true);
+                while pos < b && cross.compare(order[pos], t).is_eq() {
+                    let row = order[pos];
+                    if candidates[row].is_none() {
                         metrics.sorted_candidates.add(1);
-                        if tombstones
-                            .get_by_hash_with_min_seq(run.hash(t), cutoff)
-                            .is_some_and(|tombstone| {
-                                !tombstone_visible(tombstone, handling, cutoff)
-                            })
-                        {
-                            deleted.push(pos);
-                        }
                     }
+                    let addition = run.entry(t);
+                    candidates[row] =
+                        Some(candidates[row].map_or(addition, |entry| entry.fused_with(addition)));
                     pos += 1;
                 }
             }
         }
     }
-    deleted.sort_unstable();
-    Ok(Some(deleted))
+    Ok(candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| {
+            entry
+                .as_ref()
+                .and_then(Tombstone::from_entry)
+                .filter(|tombstone| !tombstone_visible(*tombstone, handling, cutoff))
+                .map(|_| i)
+        })
+        .collect())
 }
 
 impl futures::Stream for KeyBasedDeletionFilterStream {
@@ -974,7 +978,12 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
 
                     // Fast path: no deletions to apply (insert-only entries
                     // never affect visibility)
-                    if !this.tombstones.has_deletions() {
+                    let has_deletions = if this.sorted_enabled {
+                        this.tombstones.has_sorted_deletions()
+                    } else {
+                        this.tombstones.has_deletions()
+                    };
+                    if !has_deletions {
                         this.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
@@ -1006,7 +1015,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         this.pk_columns_scratch.push(Arc::clone(column));
                     }
 
-                    let sorted = if this.sorted_enabled && this.tombstones.sorted_runs().is_some() {
+                    let sorted = if this.sorted_enabled {
                         let _sorted_timer = this.metrics.sorted_path_compute.timer();
                         match sorted_deleted_rows(
                             &this.pk_columns_scratch,
@@ -1017,7 +1026,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             &this.metrics,
                             &mut this.sorted_decode_cache,
                         ) {
-                            Ok(result) => result,
+                            Ok(result) => Some(result),
                             Err(error) => return std::task::Poll::Ready(Some(Err(error))),
                         }
                     } else {
@@ -1026,11 +1035,6 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     if sorted.is_some() {
                         this.metrics.sorted_path_rows.add(batch_size);
                         this.metrics.sorted_path_batches.add(1);
-                    } else if this.tombstones.sorted_runs().is_none() {
-                        this.metrics.fallback_no_sorted_set_rows.add(batch_size);
-                    } else {
-                        this.metrics.fallback_rows.add(batch_size);
-                        this.metrics.fallback_batches.add(1);
                     }
                     if sorted.is_none() || this.sorted_verify {
                         // Convert PK columns to row bytes (single batched conversion).
@@ -1050,7 +1054,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             }
                         };
 
-                        // Hash fallback and verification oracle: encode every PK once,
+                        // Experiment-OFF path and verification oracle: encode every PK once,
                         // sweep the bloom, then resolve fused tombstones for survivors.
                         // Reuse the stream's encoding and hash buffers across batches.
                         this.deleted_scratch.clear();
