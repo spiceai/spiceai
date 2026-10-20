@@ -1000,7 +1000,7 @@ impl Https {
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(connect_timeout)
             .timeout(client_timeout)
-            .redirect(HTTP_REDIRECT_GUARD.policy())
+            .redirect(HTTP_REDIRECT_GUARD.manual_policy())
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 

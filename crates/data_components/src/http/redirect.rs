@@ -21,22 +21,22 @@ limitations under the License.
 //! set rides along — a custom API-key header, an `OAuth2` access token sent under a
 //! configured header name such as `X-Shopify-Access-Token`, or any `http_headers` value —
 //! and a 307 or 308 also replays the method and body. Headers cannot be edited from a
-//! `reqwest` redirect policy, so [`RedirectGuard::policy`] follows a redirect only while it
-//! stays on the origin of the hop before it, and stops at one that leaves it. The 3xx then
-//! comes back to the caller, which can re-issue it without the credentials (see
-//! [`cross_origin_redirect_target`]) or report it.
+//! `reqwest` redirect policy, so a client either keeps to one origin —
+//! [`RedirectGuard::policy`] follows a redirect only while it stays on the origin of the hop
+//! before it, and returns one that leaves it — or follows redirects itself under
+//! [`RedirectGuard::manual_policy`], rebuilding each hop with or without its credentials
+//! (see [`redirect_target`]).
 
 use reqwest::{Response, StatusCode, Url, header::LOCATION, redirect::Policy};
 
-/// The redirect at which a request through [`RedirectGuard::policy`] fails: it follows at
+/// The redirect at which a request fails, whichever origins its chain visits: it follows at
 /// most `MAX_REDIRECTS - 1`.
 pub const MAX_REDIRECTS: usize = 5;
 
 /// Which redirect targets may be requested at all, and the redirect policy built from it.
 ///
-/// The same guard is handed to the client (as [`RedirectGuard::policy`]) and to whatever
-/// re-issues the cross-origin redirects that policy stops at, so a target is checked
-/// whether `reqwest` or the caller requests it. The caller checks it again rather than
+/// A caller that follows redirects itself hands the same guard to the client (as
+/// [`RedirectGuard::manual_policy`]) and checks each target against it again rather than
 /// trusting that a 3xx it receives went through this policy: `reqwest` does not consult a
 /// policy for a request whose body it cannot clone, and the client may not have been
 /// built with this one.
@@ -103,16 +103,31 @@ impl RedirectGuard {
             }
         })
     }
+
+    /// A redirect policy for a caller that follows redirects itself: it fails on a blocked
+    /// target and otherwise stops, returning every 3xx to the caller (see
+    /// [`redirect_target`]). Each `send` starts a fresh redirect history, so the caller
+    /// owns the [`MAX_REDIRECTS`] budget for the whole chain.
+    #[must_use]
+    pub fn manual_policy(self) -> Policy {
+        Policy::custom(move |attempt| {
+            if self.allows(attempt.url()) {
+                attempt.stop()
+            } else {
+                attempt.error("redirect to a private address is not allowed")
+            }
+        })
+    }
 }
 
-/// The target of `response` when it is a redirect to an origin other than the one that
-/// answered it — which is a redirect [`RedirectGuard::policy`] did not follow.
+/// The target of `response` when it is a redirect, resolved against the URL that answered
+/// it.
 ///
-/// `url::Url` defines origin as scheme, host and effective port, so `https://host` and
-/// `https://host:443` share one; a scheme without a host (`file:`, `data:`) has an opaque
-/// origin that never equals another, so it is always reported as cross-origin.
+/// Compare origins with [`Url::origin`]: `url::Url` defines origin as scheme, host and
+/// effective port, so `https://host` and `https://host:443` share one, and a scheme without
+/// a host (`file:`, `data:`) has an opaque origin that never equals another.
 #[must_use]
-pub fn cross_origin_redirect_target(response: &Response) -> Option<Url> {
+pub fn redirect_target(response: &Response) -> Option<Url> {
     if !matches!(
         response.status(),
         StatusCode::MOVED_PERMANENTLY
@@ -124,8 +139,7 @@ pub fn cross_origin_redirect_target(response: &Response) -> Option<Url> {
         return None;
     }
     let location = response.headers().get(LOCATION)?.to_str().ok()?;
-    let target = response.url().join(location).ok()?;
-    (target.origin() != response.url().origin()).then_some(target)
+    response.url().join(location).ok()
 }
 
 /// Whether a redirect with `status` replays the request's method and body (RFC 9110

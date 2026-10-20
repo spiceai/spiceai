@@ -81,12 +81,18 @@ impl Origins {
     }
 
     fn victim_url(&self, path: &str) -> Url {
-        Url::parse(&format!("http://victim.test:{}{path}", self.victim.address().port()))
-            .expect("victim URL should parse")
+        Url::parse(&format!(
+            "http://victim.test:{}{path}",
+            self.victim.address().port()
+        ))
+        .expect("victim URL should parse")
     }
 
     fn attacker_url(&self) -> String {
-        format!("http://attacker.test:{}/collect", self.attacker.address().port())
+        format!(
+            "http://attacker.test:{}/collect",
+            self.attacker.address().port()
+        )
     }
 
     async fn redirect(&self, from: &str, status: u16, location: &str) {
@@ -96,12 +102,43 @@ impl Origins {
             .await;
     }
 
+    async fn attacker_redirect(&self, from: &str, location: &str) {
+        Mock::given(path(from))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location))
+            .mount(&self.attacker)
+            .await;
+    }
+
+    /// A chain of `first_leg` redirects from the configured origin's `/data`, the last of
+    /// which leaves for the other origin's `/hop1`, then two more through its `/hop2` to
+    /// its `/collect`: `first_leg + 2` redirects in all.
+    async fn mixed_redirect_chain(&self, first_leg: usize) {
+        for hop in 0..first_leg {
+            let to = if hop + 1 == first_leg {
+                format!(
+                    "http://attacker.test:{}/hop1",
+                    self.attacker.address().port()
+                )
+            } else {
+                format!("/same{}", hop + 1)
+            };
+            let from = if hop == 0 {
+                "/data".to_string()
+            } else {
+                format!("/same{hop}")
+            };
+            self.redirect(&from, 302, &to).await;
+        }
+        self.attacker_redirect("/hop1", "/hop2").await;
+        self.attacker_redirect("/hop2", "/collect").await;
+    }
+
     /// A provider built the way the runtime builds one for a dataset with
-    /// `http_headers` and `OAuth2` auth: one client carrying the guard's policy, and the
-    /// same guard on the provider.
+    /// `http_headers` and `OAuth2` auth: one client carrying the guard's manual policy, and
+    /// the same guard on the provider, which follows the redirects.
     async fn provider(&self, base_url: Url) -> HttpTableProvider {
         let client = reqwest::Client::builder()
-            .redirect(GUARD.policy())
+            .redirect(GUARD.manual_policy())
             .resolve("victim.test", *self.victim.address())
             .resolve("attacker.test", *self.attacker.address())
             .build()
@@ -173,7 +210,10 @@ fn sent_credentials() -> Vec<(&'static str, Option<&'static str>)> {
 }
 
 fn no_credentials() -> Vec<(&'static str, Option<&'static str>)> {
-    CREDENTIAL_HEADERS.iter().map(|name| (*name, None)).collect()
+    CREDENTIAL_HEADERS
+        .iter()
+        .map(|name| (*name, None))
+        .collect()
 }
 
 async fn query(provider: HttpTableProvider, sql: &str) -> Result<Vec<String>, DataFusionError> {
@@ -201,7 +241,9 @@ async fn query(provider: HttpTableProvider, sql: &str) -> Result<Vec<String>, Da
 #[tokio::test]
 async fn cross_origin_redirect_reaches_the_target_without_credentials() {
     let origins = Origins::start().await;
-    origins.redirect("/data", 302, &origins.attacker_url()).await;
+    origins
+        .redirect("/data", 302, &origins.attacker_url())
+        .await;
 
     let rows = query(
         origins.provider(origins.victim_url("/data")).await,
@@ -242,7 +284,11 @@ async fn same_origin_redirect_keeps_credentials() {
     for hop in ["/data", "/moved", "/final"] {
         let requests = requests_to(&origins.victim, hop).await;
         assert_eq!(requests.len(), 1, "{hop}");
-        assert_eq!(credential_headers(&requests[0]), sent_credentials(), "{hop}");
+        assert_eq!(
+            credential_headers(&requests[0]),
+            sent_credentials(),
+            "{hop}"
+        );
     }
     assert!(
         requests_to(&origins.attacker, "/collect").await.is_empty(),
@@ -255,7 +301,9 @@ async fn same_origin_redirect_keeps_credentials() {
 #[tokio::test]
 async fn cross_origin_307_does_not_replay_the_request_body() {
     let origins = Origins::start().await;
-    origins.redirect("/post", 307, &origins.attacker_url()).await;
+    origins
+        .redirect("/post", 307, &origins.attacker_url())
+        .await;
 
     let provider = origins
         .provider(origins.victim_url("/"))
@@ -275,7 +323,12 @@ async fn cross_origin_307_does_not_replay_the_request_body() {
     assert_eq!(to_victim.len(), 1);
     assert_eq!(to_victim[0].body, br#"{"secret":"body"}"#);
     assert!(
-        origins.attacker.received_requests().await.unwrap_or_default().is_empty(),
+        origins
+            .attacker
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "nothing should reach the other origin"
     );
 }
@@ -300,7 +353,12 @@ async fn redirect_to_a_blocked_target_is_never_requested() {
         "{error}"
     );
     assert!(
-        origins.attacker.received_requests().await.unwrap_or_default().is_empty(),
+        origins
+            .attacker
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "the blocked target should receive nothing"
     );
 }
@@ -335,7 +393,12 @@ async fn provider_checks_the_guard_before_reissuing_a_redirect() {
         .expect_err("a blocked redirect target must not be followed");
     assert!(error.to_string().contains("302"), "{error}");
     assert!(
-        origins.attacker.received_requests().await.unwrap_or_default().is_empty(),
+        origins
+            .attacker
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "the blocked target should receive nothing"
     );
 }
@@ -361,7 +424,8 @@ async fn token_request_is_not_replayed_to_another_origin() {
             client_secret: Some(SecretString::from("client-secret")),
             scopes: None,
             client_auth: ClientAuthMethod::Body,
-            header: TokenHeader::new("X-Shopify-Access-Token").expect("header name should be valid"),
+            header: TokenHeader::new("X-Shopify-Access-Token")
+                .expect("header name should be valid"),
         },
         OAuthGrant::ClientCredentials,
     )
@@ -369,7 +433,11 @@ async fn token_request_is_not_replayed_to_another_origin() {
     .expect_err("a cross-origin redirect from the token endpoint must not be followed");
     assert!(error.to_string().contains("307"), "{error}");
     assert!(
-        attacker.received_requests().await.unwrap_or_default().is_empty(),
+        attacker
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "the client secret should not reach the other origin"
     );
 }
@@ -379,7 +447,9 @@ async fn token_request_is_not_replayed_to_another_origin() {
 #[tokio::test]
 async fn cross_origin_307_after_a_body_was_dropped_is_followed() {
     let origins = Origins::start().await;
-    origins.redirect("/post", 302, &origins.attacker_url()).await;
+    origins
+        .redirect("/post", 302, &origins.attacker_url())
+        .await;
     Mock::given(path("/collect"))
         .respond_with(
             ResponseTemplate::new(307)
@@ -417,4 +487,59 @@ async fn cross_origin_307_after_a_body_was_dropped_is_followed() {
     assert_eq!(landing.len(), 1);
     assert_eq!(landing[0].method.as_str(), "GET");
     assert_eq!(credential_headers(&landing[0]), no_credentials());
+}
+
+/// Four redirects, across both origins, are within the budget: the data arrives, and the
+/// configured origin's credentials stop at the hop that leaves it.
+#[tokio::test]
+async fn mixed_origin_chain_within_the_redirect_budget_is_followed() {
+    let origins = Origins::start().await;
+    origins.mixed_redirect_chain(2).await;
+
+    let rows = query(
+        origins.provider(origins.victim_url("/data")).await,
+        "SELECT content FROM t",
+    )
+    .await
+    .expect("four redirects should be followed");
+    assert_eq!(rows, vec![ATTACKER_BODY.to_string()]);
+
+    for hop in ["/data", "/same1"] {
+        let requests = requests_to(&origins.victim, hop).await;
+        assert_eq!(requests.len(), 1, "{hop}");
+        assert_eq!(
+            credential_headers(&requests[0]),
+            sent_credentials(),
+            "{hop}"
+        );
+    }
+    for hop in ["/hop1", "/hop2", "/collect"] {
+        let requests = requests_to(&origins.attacker, hop).await;
+        assert_eq!(requests.len(), 1, "{hop}");
+        assert_eq!(credential_headers(&requests[0]), no_credentials(), "{hop}");
+    }
+}
+
+/// The fifth redirect fails the request however the chain splits between origins, as it
+/// does for a chain on one origin: the budget covers the whole chain, not each origin's
+/// part of it.
+#[tokio::test]
+async fn mixed_origin_chain_fails_at_the_fifth_redirect() {
+    let origins = Origins::start().await;
+    origins.mixed_redirect_chain(3).await;
+
+    let error = query(
+        origins.provider(origins.victim_url("/data")).await,
+        "SELECT content FROM t",
+    )
+    .await
+    .expect_err("the fifth redirect must not be followed");
+    assert!(error.to_string().contains("302"), "{error}");
+
+    assert_eq!(requests_to(&origins.attacker, "/hop1").await.len(), 1);
+    assert_eq!(requests_to(&origins.attacker, "/hop2").await.len(), 1);
+    assert!(
+        requests_to(&origins.attacker, "/collect").await.is_empty(),
+        "the fifth redirect's target should receive nothing"
+    );
 }

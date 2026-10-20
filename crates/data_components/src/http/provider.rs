@@ -18,9 +18,7 @@ mod completeness;
 pub use completeness::HttpFetchCompletion;
 
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
-use super::redirect::{
-    MAX_REDIRECTS, RedirectGuard, cross_origin_redirect_target, preserves_method_and_body,
-};
+use super::redirect::{MAX_REDIRECTS, RedirectGuard, preserves_method_and_body, redirect_target};
 use crate::rate_limit::RateLimiter;
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
@@ -823,6 +821,14 @@ impl CacheKey {
     }
 }
 
+/// What a data request carries for the origin the provider was configured with, besides
+/// the custom headers and authentication the provider itself holds.
+#[derive(Clone, Copy)]
+struct AttachedToRequest<'a> {
+    request_headers: Option<&'a HeaderMap>,
+    trace_parent: Option<&'a ForwardedTraceParent>,
+}
+
 /// A table provider that fetches data from HTTP endpoints based on path and query filters
 #[derive(Clone)]
 pub struct HttpTableProvider {
@@ -851,8 +857,8 @@ pub struct HttpTableProvider {
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
-    /// Set when `client` was built with this guard's [`RedirectGuard::policy`], whose
-    /// cross-origin redirects this provider then re-issues without its credentials.
+    /// Set when `client` was built with this guard's [`RedirectGuard::manual_policy`], so
+    /// this provider follows the redirects itself.
     redirect_guard: Option<RedirectGuard>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
@@ -1260,11 +1266,11 @@ impl HttpTableProvider {
         self
     }
 
-    /// Follow the cross-origin redirects that `guard`'s [`RedirectGuard::policy`] stops at,
-    /// as a bare `GET` that carries none of the custom headers, request headers, trace
-    /// context or authentication this provider attaches. The client must have been built
-    /// with `guard.policy()`; any other policy decides on its own which redirects it
-    /// follows, and with which headers.
+    /// Follow redirects in this provider rather than in the client, checking each target
+    /// against `guard` and sending the custom headers, request headers, trace context and
+    /// authentication only to the origin of the original request. The client must have
+    /// been built with `guard.manual_policy()`; any other policy decides on its own which
+    /// redirects it follows, and with which headers.
     #[must_use]
     pub fn with_redirect_guard(mut self, guard: RedirectGuard) -> Self {
         self.redirect_guard = Some(guard);
@@ -1458,10 +1464,7 @@ impl HttpTableProvider {
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
-        match self
-            .send_following_cross_origin_redirects(self.client.get(test_url.clone()), false)
-            .await
-        {
+        match self.send_following_redirects(&test_url, None, None).await {
             Ok(response) => {
                 self.update_rate_limiter_from_headers(response.headers())
                     .await;
@@ -1853,39 +1856,107 @@ impl HttpTableProvider {
         (400..500).contains(&status_code) && !Self::is_retryable_status(status_code)
     }
 
-    /// Sends `request`, then re-issues each cross-origin redirect the client stopped at as
-    /// a bare `GET` — without the headers, trace context and authentication this provider
-    /// attached, which are meant only for the origin it was configured with.
-    ///
-    /// The response is returned unchanged, and so reported as a redirect that was not
-    /// followed, when there is no [`RedirectGuard`], when the guard refuses the target,
-    /// after [`MAX_REDIRECTS`] origin changes, or when a 307 or 308 would replay `request`'s
-    /// body to the new origin. Same-origin hops between them are the client's to follow.
-    async fn send_following_cross_origin_redirects(
+    /// A request to `url`, as a `POST` of `body` or else a `GET`. With `attached`, it
+    /// carries what this provider attaches for the origin it was configured with: the
+    /// custom headers, the query's request headers, trace context and authentication.
+    fn build_request(
         &self,
-        request: reqwest::RequestBuilder,
-        has_body: bool,
+        url: &Url,
+        body: Option<&str>,
+        attached: Option<AttachedToRequest<'_>>,
+    ) -> reqwest::RequestBuilder {
+        let mut request_builder = if let Some(body_content) = body {
+            let mut req = self.client.post(url.clone());
+            let ct = self.content_type.as_deref().unwrap_or("application/json");
+            req = req.header("Content-Type", ct);
+            req.body(body_content.to_owned())
+        } else {
+            self.client.get(url.clone())
+        };
+        let Some(AttachedToRequest {
+            request_headers,
+            trace_parent,
+        }) = attached
+        else {
+            return request_builder;
+        };
+
+        if let Some(request_headers) = request_headers {
+            let mut merged_headers = self.custom_headers.clone();
+            for (name, value) in request_headers {
+                merged_headers.insert(name.clone(), value.clone());
+            }
+            for (name, value) in &merged_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        } else {
+            for (name, value) in &self.custom_headers {
+                request_builder = request_builder.header(name, value);
+            }
+        }
+
+        // A `traceparent` that the dataset or the query sets is sent as written.
+        if let Some(trace_parent) = trace_parent
+            && !self.custom_headers.contains_key(TRACEPARENT_HEADER)
+            && !request_headers.is_some_and(|headers| headers.contains_key(TRACEPARENT_HEADER))
+        {
+            request_builder = request_builder.header(TRACEPARENT_HEADER, trace_parent.0.clone());
+        }
+
+        if let Some(auth) = self.auth.as_ref() {
+            request_builder = auth.apply(request_builder);
+        }
+        request_builder
+    }
+
+    /// Sends a request to `url` and follows its redirects, which the client hands back
+    /// under [`RedirectGuard::manual_policy`].
+    ///
+    /// A hop to the origin of `url` is rebuilt with `attached` until the chain first
+    /// leaves that origin; that hop and every one after it are sent without it, so the
+    /// dataset's credentials reach only the origin they were configured for. A 307 or 308 replays the method and body, which is refused for
+    /// another origin; any other redirect becomes a `GET` without a body. Every target is
+    /// checked against the guard, and the chain shares one budget, so the request fails at
+    /// its [`MAX_REDIRECTS`]th redirect whichever origins it visits. A redirect that is
+    /// not followed is returned as the response.
+    async fn send_following_redirects(
+        &self,
+        url: &Url,
+        body: Option<&str>,
+        attached: Option<AttachedToRequest<'_>>,
     ) -> reqwest::Result<reqwest::Response> {
-        let mut response = request.send().await?;
+        let mut response = self.build_request(url, body, attached).send().await?;
         let Some(guard) = self.redirect_guard else {
             return Ok(response);
         };
-        let mut has_body = has_body;
-        for _ in 0..MAX_REDIRECTS {
-            let Some(target) = cross_origin_redirect_target(&response) else {
+        let origin = url.origin();
+        let mut body = body;
+        let mut attached = attached;
+        for _ in 1..MAX_REDIRECTS {
+            let Some(target) = redirect_target(&response) else {
                 break;
             };
-            if (has_body && preserves_method_and_body(response.status())) || !guard.allows(&target)
-            {
+            let same_origin = target.origin() == origin;
+            if preserves_method_and_body(response.status()) {
+                if body.is_some() && !same_origin {
+                    break;
+                }
+            } else {
+                body = None;
+            }
+            if !guard.allows(&target) {
                 break;
             }
-            tracing::debug!(
-                "Following a redirect from {} to {} without the dataset's request headers or authentication",
-                endpoint_label(response.url()),
-                endpoint_label(&target),
-            );
-            response = self.client.get(target).send().await?;
-            has_body = false;
+            // Once the chain has left the origin, a later hop back to it was chosen by the
+            // other origin, so it is not sent the credentials either.
+            if !same_origin && attached.take().is_some() {
+                tracing::debug!(
+                    "Following a redirect from {} to {} without the dataset's request headers or authentication",
+                    endpoint_label(response.url()),
+                    endpoint_label(&target),
+                );
+            }
+            response = self.build_request(&target, body, attached).send().await?;
         }
         Ok(response)
     }
@@ -1917,55 +1988,24 @@ impl HttpTableProvider {
         // charged for the attempt that failed before it.
         let attempt_started = Instant::now();
 
-        let mut request_builder = if let Some(body_content) = body {
-            let mut req = self.client.post(url.clone());
-            let ct = self.content_type.as_deref().unwrap_or("application/json");
-            req = req.header("Content-Type", ct);
-            req.body(body_content.to_owned())
-        } else {
-            self.client.get(url.clone())
-        };
-
-        if let Some(request_headers) = request_headers {
-            let mut merged_headers = self.custom_headers.clone();
-            for (name, value) in request_headers {
-                merged_headers.insert(name.clone(), value.clone());
-            }
-            for (name, value) in &merged_headers {
-                request_builder = request_builder.header(name, value);
-            }
-        } else {
-            for (name, value) in &self.custom_headers {
-                request_builder = request_builder.header(name, value);
-            }
-        }
-
-        // A `traceparent` that the dataset or the query sets is sent as written.
-        if let Some(trace_parent) = trace_parent
-            && !self.custom_headers.contains_key(TRACEPARENT_HEADER)
-            && !request_headers.is_some_and(|headers| headers.contains_key(TRACEPARENT_HEADER))
-        {
-            request_builder = request_builder.header(TRACEPARENT_HEADER, trace_parent.0.clone());
-        }
-
-        if let Some(auth) = self.auth.as_ref() {
-            request_builder = auth.apply(request_builder);
-        }
-
         // Waiting on the origin: a distributed task can lend its slot meanwhile.
+        let attached = AttachedToRequest {
+            request_headers,
+            trace_parent,
+        };
         let response = self
-            .send_following_cross_origin_redirects(request_builder, body.is_some())
+            .send_following_redirects(url, body, Some(attached))
             .io_wait()
             .await
             .map_err(|e| {
-            let err = Error::http_request(&self.base_url, e);
-            tracing::debug!("{err}");
-            // A timeout or connection error is a failure signal for adaptive
-            // rate control: the origin is unreachable or too slow, so admit
-            // fewer requests until it recovers.
-            self.record_request_outcome(RequestOutcome::Failure);
-            RetryError::transient(err)
-        })?;
+                let err = Error::http_request(&self.base_url, e);
+                tracing::debug!("{err}");
+                // A timeout or connection error is a failure signal for adaptive
+                // rate control: the origin is unreachable or too slow, so admit
+                // fewer requests until it recovers.
+                self.record_request_outcome(RequestOutcome::Failure);
+                RetryError::transient(err)
+            })?;
 
         let status = response.status();
         let status_code = status.as_u16();
