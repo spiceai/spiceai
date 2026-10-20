@@ -117,6 +117,23 @@ pub enum Error {
     #[snafu(display("{message}"))]
     RefreshNotApplied { message: String },
 
+    /// `refresh_mode: snapshot`: no snapshot of the dataset is published at the location.
+    #[snafu(display(
+        "No snapshot of the dataset is published at '{location}'. Ensure the location is correct and that a dataset with `acceleration.snapshots` enabled has published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotNotPublished { location: String },
+
+    /// `refresh_mode: snapshot`: the published snapshot is older than the loaded one and
+    /// is refused.
+    #[snafu(display(
+        "The snapshot published at '{location}' (id {published_id}) is older than the loaded snapshot (id {loaded_id}), so it was not loaded. Publish a newer snapshot, or restart Spice to load the published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotOlderThanLoaded {
+        location: String,
+        published_id: u64,
+        loaded_id: u64,
+    },
+
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
         format_datafusion_error(source)

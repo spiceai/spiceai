@@ -332,11 +332,39 @@ enum MetadataRead {
 /// The outcome of one [`SnapshotManager::download_if_newer`] poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPoll {
-    /// The snapshot that was downloaded, or `None` when nothing newer was available.
-    pub download: Option<SnapshotDownloadInfo>,
+    /// What the poll found at the snapshot location.
+    pub outcome: SnapshotPollOutcome,
     /// The `ETag` of the metadata this poll acted on, when the store reports one. Passing
     /// it to the next poll lets that poll skip entirely if the metadata has not changed.
+    /// Withheld when the poll did not load the published snapshot, so the next poll reads
+    /// the metadata again.
     pub metadata_e_tag: Option<String>,
+}
+
+impl SnapshotPoll {
+    /// The snapshot this poll downloaded, if any.
+    #[must_use]
+    pub fn download(&self) -> Option<&SnapshotDownloadInfo> {
+        match &self.outcome {
+            SnapshotPollOutcome::Downloaded(info) => Some(info),
+            _ => None,
+        }
+    }
+}
+
+/// What one [`SnapshotManager::download_if_newer`] poll found at the snapshot location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotPollOutcome {
+    /// A newer snapshot was downloaded.
+    Downloaded(SnapshotDownloadInfo),
+    /// The published snapshot is the loaded one, or the metadata is unchanged since the
+    /// last poll.
+    UpToDate,
+    /// `metadata.json` does not exist or names no current snapshot for the dataset.
+    NotPublished,
+    /// The published snapshot is older than the loaded one, as after the location was
+    /// recreated and the writer's ids restarted. It is never loaded.
+    OlderThanLoaded { published_id: u64, loaded_id: u64 },
 }
 
 /// A dataset's current snapshot as its `metadata.json` records it: what a dataset that
@@ -549,6 +577,10 @@ pub enum SnapshotDownloadError {
     CurrentSnapshotMissing { dataset: String },
     #[snafu(display("Dataset {dataset} snapshot id {snapshot_id} not found in metadata"))]
     SnapshotNotFound { dataset: String, snapshot_id: u64 },
+    #[snafu(display(
+        "Snapshot {snapshot_id} of dataset {dataset} could not be downloaded; see the preceding warning for the cause"
+    ))]
+    NotDownloaded { dataset: String, snapshot_id: u64 },
     #[snafu(display("Snapshot URI {uri} is invalid: {source}"))]
     InvalidSnapshotUri {
         uri: String,
@@ -1782,50 +1814,42 @@ impl SnapshotManager {
             .read_metadata(known_metadata_e_tag)
             .await
             .map_err(|err| RetryError::permanent(err.into()))?;
+        let not_published = SnapshotPoll {
+            outcome: SnapshotPollOutcome::NotPublished,
+            metadata_e_tag: None,
+        };
         let handle = match read {
             MetadataRead::Unchanged => {
                 return Ok(SnapshotPoll {
-                    download: None,
+                    outcome: SnapshotPollOutcome::UpToDate,
                     metadata_e_tag: known_metadata_e_tag.map(str::to_string),
                 });
             }
-            MetadataRead::Current(None) => {
-                return Ok(SnapshotPoll {
-                    download: None,
-                    metadata_e_tag: None,
-                });
-            }
+            MetadataRead::Current(None) => return Ok(not_published),
             MetadataRead::Current(Some(handle)) => Arc::new(handle),
         };
-        let nothing_newer = SnapshotPoll {
-            download: None,
-            metadata_e_tag: handle.e_tag(),
-        };
         let Some(dataset_metadata) = handle.metadata.datasets.get(&self.dataset_name) else {
-            return Ok(nothing_newer);
+            return Ok(not_published);
         };
         let Some(remote_id) = dataset_metadata.current_snapshot_id else {
-            return Ok(nothing_newer);
+            return Ok(not_published);
         };
         if let Some(local_id) = current_local_id
             && remote_id <= local_id
         {
             if remote_id < local_id {
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    remote_snapshot_id = remote_id,
-                    local_snapshot_id = local_id,
-                    "snapshot metadata current id is older than the locally loaded snapshot; \
-                     skipping reload to avoid regression"
-                );
-                // Withheld so the next poll reads the metadata again and repeats this warning
-                // for as long as the rollback lasts.
                 return Ok(SnapshotPoll {
-                    download: None,
+                    outcome: SnapshotPollOutcome::OlderThanLoaded {
+                        published_id: remote_id,
+                        loaded_id: local_id,
+                    },
                     metadata_e_tag: None,
                 });
             }
-            return Ok(nothing_newer);
+            return Ok(SnapshotPoll {
+                outcome: SnapshotPollOutcome::UpToDate,
+                metadata_e_tag: handle.e_tag(),
+            });
         }
 
         // Inspect the metadata-recorded schema first, before touching the file: an
@@ -1880,14 +1904,16 @@ impl SnapshotManager {
                 .await
                 .map_err(RetryError::permanent)?
         };
-        // The bootstrap failure behavior can turn a failed download into no download, or fall
-        // back to an older snapshot. Neither loaded the current snapshot, so the `ETag` is
-        // withheld and the next poll reads the metadata again instead of skipping.
-        let loaded_current = download
-            .as_ref()
-            .is_some_and(|info| info.snapshot_id == remote_id);
+        // A tolerated download failure leaves nothing to load, so the poll fails. A fallback
+        // to an older snapshot did not load the current one, so the `ETag` is withheld and
+        // the next poll reads the metadata again.
+        let download = download.context(NotDownloadedSnafu {
+            dataset: self.dataset_name.clone(),
+            snapshot_id: remote_id,
+        })?;
+        let loaded_current = download.snapshot_id == remote_id;
         Ok(SnapshotPoll {
-            download,
+            outcome: SnapshotPollOutcome::Downloaded(download),
             metadata_e_tag: e_tag.filter(|_| loaded_current),
         })
     }
@@ -5036,7 +5062,10 @@ mod tests {
             .download_if_newer(Some(7), None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.download.is_none(), "matching ids must not download");
+        assert!(
+            result.download().is_none(),
+            "matching ids must not download"
+        );
         assert!(
             result.metadata_e_tag.is_some(),
             "an up-to-date poll reports the ETag so the next poll can skip"
@@ -5054,13 +5083,17 @@ mod tests {
             .download_if_newer(Some(8), None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(
-            result.download.is_none(),
-            "local id ahead of remote must not regress"
+        assert_eq!(
+            result.outcome,
+            SnapshotPollOutcome::OlderThanLoaded {
+                published_id: 7,
+                loaded_id: 8,
+            },
+            "local id ahead of remote must not regress, and the poll says so"
         );
         assert_eq!(
             result.metadata_e_tag, None,
-            "a rollback withholds the ETag so every poll re-checks and warns again"
+            "a rollback withholds the ETag so every poll re-checks and reports it again"
         );
         assert!(
             !local_path.exists(),
@@ -5068,11 +5101,12 @@ mod tests {
         );
 
         // A strictly older local id (6) than the remote (7) should download.
-        let info = manager
+        let poll = manager
             .download_if_newer(Some(6), None, None)
             .await
-            .expect("download_if_newer should succeed")
-            .download
+            .expect("download_if_newer should succeed");
+        let info = poll
+            .download()
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
     }
@@ -5190,10 +5224,7 @@ mod tests {
             .download_if_newer(None, None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert_eq!(
-            loaded.download.as_ref().map(|info| info.snapshot_id),
-            Some(0)
-        );
+        assert_eq!(loaded.download().map(|info| info.snapshot_id), Some(0));
         let e_tag = loaded
             .metadata_e_tag
             .expect("the in-memory store reports an ETag");
@@ -5207,7 +5238,7 @@ mod tests {
         assert_eq!(
             unchanged,
             SnapshotPoll {
-                download: None,
+                outcome: SnapshotPollOutcome::UpToDate,
                 metadata_e_tag: Some(e_tag.clone()),
             }
         );
@@ -5224,7 +5255,7 @@ mod tests {
             .await
             .expect("download_if_newer should succeed");
         assert_eq!(
-            changed.download.as_ref().map(|info| info.snapshot_id),
+            changed.download().map(|info| info.snapshot_id),
             Some(1),
             "changed metadata must be read again"
         );
@@ -5235,11 +5266,11 @@ mod tests {
         assert_eq!(restored.as_slice(), b"second");
     }
 
-    /// A poll that did not load the current snapshot, because the bootstrap failure behavior
-    /// tolerated a failed download or fell back to an older snapshot, must not report an
-    /// `ETag`: recording it would make every later poll skip instead of retrying.
+    /// Under `warn` a poll whose current snapshot cannot be downloaded fails; under
+    /// `fallback` it loads the older snapshot and withholds the `ETag`, so later polls
+    /// retry the current one instead of skipping.
     #[tokio::test]
-    async fn download_if_newer_withholds_e_tag_when_current_snapshot_is_not_loaded() {
+    async fn download_if_newer_fails_or_falls_back_when_current_snapshot_is_not_loaded() {
         let store = Arc::new(InMemory::new());
         let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let schema = sample_schema();
@@ -5253,25 +5284,27 @@ mod tests {
         )
         .await;
 
-        for (behavior, expected_snapshot) in [
-            (BootstrapOnFailureBehavior::Warn, None),
-            (BootstrapOnFailureBehavior::Fallback, Some(0)),
-        ] {
-            let root = TempDir::new().expect("create temp dir");
-            let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
-            manager.bootstrap_failure_behavior = behavior;
+        let root = TempDir::new().expect("create temp dir");
+        let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+        manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Warn;
+        let failed = manager
+            .download_if_newer(None, None, None)
+            .await
+            .expect_err("a corrupt current snapshot fails the poll");
+        assert_eq!(
+            failed.to_string(),
+            "Snapshot 1 of dataset dataset could not be downloaded; see the preceding warning for the cause"
+        );
 
-            let poll = manager
-                .download_if_newer(None, None, None)
-                .await
-                .expect("download_if_newer should succeed");
-            assert_eq!(
-                poll.download.as_ref().map(|info| info.snapshot_id),
-                expected_snapshot,
-                "{behavior:?}"
-            );
-            assert_eq!(poll.metadata_e_tag, None, "{behavior:?}");
-        }
+        let root = TempDir::new().expect("create temp dir");
+        let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+        manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Fallback;
+        let poll = manager
+            .download_if_newer(None, None, None)
+            .await
+            .expect("download_if_newer should fall back");
+        assert_eq!(poll.download().map(|info| info.snapshot_id), Some(0));
+        assert_eq!(poll.metadata_e_tag, None);
     }
 
     /// Under `bootstrap_on_failure_behavior: retry`, a poll whose current snapshot is broken
@@ -5320,7 +5353,7 @@ mod tests {
         .expect("retry must observe the replacement snapshot instead of retrying forever")
         .expect("download_if_newer should succeed");
 
-        assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
+        assert_eq!(poll.download().map(|info| info.snapshot_id), Some(8));
         let current_e_tag = store
             .head(&metadata_path)
             .await
@@ -5374,12 +5407,11 @@ mod tests {
             true
         };
 
-        let info = manager
+        let poll = manager
             .download_if_newer(Some(6), None, Some(&validator))
             .await
-            .expect("download_if_newer should succeed")
-            .download
-            .expect("expected a newer snapshot");
+            .expect("download_if_newer should succeed");
+        let info = poll.download().expect("expected a newer snapshot");
         assert_eq!(info.snapshot_id, 7);
         let data_dir = root.path().join("data");
         let restored = fs::read(data_dir.join("part-7.vortex"))
@@ -5410,7 +5442,7 @@ mod tests {
             .download_if_newer(None, None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.download.is_none());
+        assert_eq!(result.outcome, SnapshotPollOutcome::NotPublished);
         assert!(!local_path.exists());
     }
 
@@ -5521,11 +5553,12 @@ mod tests {
             false,
         );
 
-        let info = manager
+        let poll = manager
             .download_if_newer(Some(6), None, None)
             .await
-            .expect("refresh from a replicated prefix should succeed")
-            .download
+            .expect("refresh from a replicated prefix should succeed");
+        let info = poll
+            .download()
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
         let downloaded = fs::read(&local_path)
@@ -10975,7 +11008,7 @@ mod tests {
 
     /// A reader that serves snapshot 1 skips a newer snapshot whose file is gone and
     /// loads the newest one whose file exists; it never falls back to the snapshot it
-    /// already serves or an older one.
+    /// already serves or an older one, and the poll fails when none of the newer files exist.
     #[tokio::test]
     async fn a_serving_reader_skips_a_newer_snapshot_whose_file_is_gone() {
         let schema = sample_schema();
@@ -10988,13 +11021,11 @@ mod tests {
             let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
             manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Fallback;
 
-            let poll = manager
-                .download_if_newer(Some(1), None, None)
-                .await
-                .expect("the poll succeeds");
+            let poll = manager.download_if_newer(Some(1), None, None).await;
 
             assert_eq!(
-                poll.download.map(|info| info.snapshot_id),
+                poll.ok()
+                    .and_then(|poll| poll.download().map(|info| info.snapshot_id)),
                 expected,
                 "files gone: {gone:?}"
             );

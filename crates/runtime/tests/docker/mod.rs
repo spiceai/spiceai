@@ -116,6 +116,16 @@ impl RunningContainer {
         Ok(self.docker.stop_container(&self.id, None).await?)
     }
 
+    /// Freezes the container until [`Self::unpause`]: its ports still accept connections,
+    /// which then get no response.
+    pub async fn pause(&self) -> Result<(), anyhow::Error> {
+        Ok(self.docker.pause_container(&self.id).await?)
+    }
+
+    pub async fn unpause(&self) -> Result<(), anyhow::Error> {
+        Ok(self.docker.unpause_container(&self.id).await?)
+    }
+
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         self.docker
             .start_container(&self.id, None::<StartContainerOptions<String>>)
