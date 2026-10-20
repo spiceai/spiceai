@@ -50,7 +50,11 @@ fn write_routes() -> Vec<(Method, &'static str, bool)> {
         (Method::POST, "/v1/datasets/missing/cdc", false),
         (Method::POST, "/v1/metrics", false),
         (Method::POST, "/v1/logs", false),
-        (Method::POST, "/v1/datasets/missing/acceleration/refresh", true),
+        (
+            Method::POST,
+            "/v1/datasets/missing/acceleration/refresh",
+            true,
+        ),
         (Method::PATCH, "/v1/datasets/missing/acceleration", true),
         (
             Method::POST,
