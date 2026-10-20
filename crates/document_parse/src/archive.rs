@@ -201,11 +201,13 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
 /// reads past `MAX_PACKAGE_BYTES`, so scanning an 8 GiB bomb costs the CPU and
 /// memory to decode the budget and no more.
 ///
-/// `LZWDecode` and the image codecs (`DCTDecode`, `JPXDecode`, …) are not
-/// expanded here: their output is an image raster bounded by the declared
-/// dimensions rather than a text content-stream bomb, so budgeting stops at
-/// them. A chain that reaches one of those filters is therefore not bounded by
-/// this check.
+/// The image codecs (`DCTDecode`, `JPXDecode`, `CCITTFaxDecode`, `JBIG2Decode`)
+/// are not expanded here: their output is an image raster bounded by the
+/// declared dimensions rather than a text content-stream bomb, so budgeting
+/// stops at a terminal one. A general-purpose `LZWDecode`, the `Crypt` filter,
+/// an unrecognised filter, or a `/Filter` we cannot resolve (an indirect
+/// reference) is not decoded and cannot be bounded, so the document is rejected
+/// rather than forwarded to `PDFium` with an unchecked expansion.
 pub(crate) fn ensure_pdf_within_budget(raw: &Bytes) -> Result<()> {
     let budget = MAX_PACKAGE_BYTES;
     let mut consumed: u64 = 0;
@@ -218,16 +220,24 @@ pub(crate) fn ensure_pdf_within_budget(raw: &Bytes) -> Result<()> {
     Ok(())
 }
 
-/// A decompressing filter stage we model, plus the catch-all for filters whose
-/// output is not an unbounded text expansion (image codecs, `LZWDecode`) or
-/// that we do not recognise. Budgeting stops at an [`PdfFilter::Opaque`] stage.
+/// A declared PDF stream filter, classified by how its output is bounded.
+///
+/// `Flate`, `Ascii85`, `AsciiHex`, and `RunLength` are decoded here, so a chain
+/// built from them is budgeted end to end. `Image` is a terminal codec whose
+/// output is a raster bounded by the image's declared dimensions, not a text
+/// content-stream expansion, so budgeting stops at it. `Unbounded` is a filter
+/// whose expansion we cannot bound — general-purpose `LZWDecode`, the `Crypt`
+/// filter, an unrecognised name, or a `/Filter` we could not resolve (an
+/// indirect reference or an unparsable declaration) — and reaching one fails
+/// the document closed rather than forwarding an unchecked stream to `PDFium`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PdfFilter {
     Flate,
     Ascii85,
     AsciiHex,
     RunLength,
-    Opaque,
+    Image,
+    Unbounded,
 }
 
 fn classify_filter(name: &[u8]) -> PdfFilter {
@@ -236,7 +246,15 @@ fn classify_filter(name: &[u8]) -> PdfFilter {
         b"ASCII85Decode" | b"A85" => PdfFilter::Ascii85,
         b"ASCIIHexDecode" | b"AHx" => PdfFilter::AsciiHex,
         b"RunLengthDecode" | b"RL" => PdfFilter::RunLength,
-        _ => PdfFilter::Opaque,
+        // Terminal image codecs: their output is a raster bounded by the
+        // image's declared dimensions, so budgeting stops at them.
+        b"DCTDecode" | b"DCT" | b"JPXDecode" | b"CCITTFaxDecode" | b"CCF" | b"JBIG2Decode" => {
+            PdfFilter::Image
+        }
+        // `LZWDecode` is general-purpose compression we do not decode, `Crypt`
+        // is encryption, and anything else is unrecognised. None can be bounded
+        // here, so fail closed rather than forward an unchecked stream.
+        _ => PdfFilter::Unbounded,
     }
 }
 
@@ -249,18 +267,31 @@ struct PdfStream {
 
 /// The decompressed size `PDFium` would produce for one stream, capping every
 /// decode at `remaining + 1` bytes so a bomb is detected without expanding it,
-/// and failing once any stage crosses the remaining budget. Stages up to an
-/// [`PdfFilter::Opaque`] one are still budgeted; the opaque output itself (an
-/// image raster, stored bytes, or an unmodelled filter) is not, matching the
-/// previous behaviour of counting non-Flate streams as zero.
+/// and failing once any stage crosses the remaining budget. A terminal
+/// [`PdfFilter::Image`] stage stops budgeting (its raster is bounded by the
+/// image's declared dimensions); a [`PdfFilter::Unbounded`] stage, or an image
+/// codec anywhere but last, fails the document closed because its expansion
+/// cannot be verified before the bytes reach `PDFium`.
 fn decoded_len_within(stream: &PdfStream, raw: &[u8], remaining: u64) -> Result<u64> {
     let cap = remaining.saturating_add(1);
     let mut buf: Vec<u8> = Vec::new();
     let mut size: u64 = 0;
     let last = stream.filters.len().saturating_sub(1);
     for (idx, &filter) in stream.filters.iter().enumerate() {
-        if filter == PdfFilter::Opaque {
-            return Ok(size);
+        match filter {
+            // A chain whose expansion we cannot bound (LZW, Crypt, an unknown
+            // or unresolvable filter) is rejected rather than forwarded.
+            PdfFilter::Unbounded => return Err(unverifiable_pdf_filter()),
+            // A terminal image codec is a dimension-bounded raster; stop here.
+            // An image codec that is not last means a malformed chain whose
+            // continuation we cannot bound, so fail closed.
+            PdfFilter::Image => {
+                if idx == last {
+                    return Ok(size);
+                }
+                return Err(unverifiable_pdf_filter());
+            }
+            _ => {}
         }
         let input: &[u8] = if idx == 0 { &raw[stream.data_start..] } else { &buf };
         // The final stage's bytes are never fed anywhere, so count them through a
@@ -276,6 +307,18 @@ fn decoded_len_within(stream: &PdfStream, raw: &[u8], remaining: u64) -> Result<
         buf = decoded;
     }
     Ok(size)
+}
+
+/// The error for a PDF whose filter chain cannot be bounded before `PDFium`
+/// would expand it: an indirect, `LZWDecode`, encrypted, or unrecognised
+/// `/Filter`. Such a stream is refused rather than forwarded unchecked.
+fn unverifiable_pdf_filter() -> Error {
+    Error::DocumentTooLarge {
+        format: DocumentType::Pdf,
+        reason: "it declares a stream filter whose decompressed size cannot be verified \
+                 (an indirect, LZW, encrypted, or unrecognised /Filter)"
+            .to_owned(),
+    }
 }
 
 fn ensure_within(size: u64, remaining: u64) -> Result<u64> {
@@ -303,15 +346,16 @@ fn count_decode(filter: PdfFilter, data: &[u8], cap: u64) -> u64 {
     }
 }
 
-/// Applies one filter stage, reading no more than `cap` output bytes. `Opaque`
-/// is handled by the caller and never reaches here.
+/// Applies one filter stage, reading no more than `cap` output bytes. The
+/// `Image` and `Unbounded` stages are resolved by [`decoded_len_within`] before
+/// a stage is decoded, so they never reach here.
 fn decode_stage(filter: PdfFilter, data: &[u8], cap: u64) -> Vec<u8> {
     match filter {
         PdfFilter::Flate => inflate_bounded(data, cap),
         PdfFilter::Ascii85 => ascii85_decode_bounded(data, cap),
         PdfFilter::AsciiHex => asciihex_decode_bounded(data, cap),
         PdfFilter::RunLength => runlength_decode_bounded(data, cap),
-        PdfFilter::Opaque => Vec::new(),
+        PdfFilter::Image | PdfFilter::Unbounded => Vec::new(),
     }
 }
 
@@ -347,23 +391,31 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
 }
 
 /// The `/Filter` chain of the dictionary that ends just before the `stream`
-/// keyword at `keyword_pos`. An absent `/Filter` yields an empty chain; a
-/// `/Filter` that cannot be read as a name or an array of names (for example an
-/// indirect reference) falls back to a single [`PdfFilter::Flate`] stage, the
-/// previous behaviour, so an unparsable dictionary is no worse than before.
+/// keyword at `keyword_pos`.
+///
+/// No dictionary (a `stream` keyword matched inside binary data) yields a lone
+/// [`PdfFilter::Flate`] stage, which inflates arbitrary bytes to ~0 and cannot
+/// be a bomb. An absent `/Filter` yields an empty chain (stored uncompressed).
+/// A `/Filter` that cannot be read as a name or an array of names — an indirect
+/// reference, or any token whose meaning we cannot determine — yields a single
+/// [`PdfFilter::Unbounded`] stage so the document fails closed rather than
+/// reaching `PDFium` with an unchecked expansion.
 fn filters_before(raw: &[u8], keyword_pos: usize) -> Vec<PdfFilter> {
     let Some((open, close)) = dict_before(raw, keyword_pos) else {
         return vec![PdfFilter::Flate];
     };
     let dict = &raw[open..close];
-    let Some(after) = find(dict, b"/Filter").map(|p| p + b"/Filter".len()) else {
+    let Some(value) = filter_value(dict) else {
         // A stream with no `/Filter` is stored uncompressed.
         return Vec::new();
     };
 
-    let rest = skip_ws(&dict[after..]);
+    let rest = skip_ws(value);
     match rest.first() {
-        Some(b'/') => vec![classify_filter(read_name(&rest[1..]))],
+        Some(b'/') => {
+            let (name, _) = read_name(&rest[1..]);
+            vec![classify_filter(&name)]
+        }
         Some(b'[') => {
             let mut filters = Vec::new();
             let mut cursor = &rest[1..];
@@ -371,26 +423,54 @@ fn filters_before(raw: &[u8], keyword_pos: usize) -> Vec<PdfFilter> {
                 cursor = skip_ws(cursor);
                 match cursor.first() {
                     Some(b'/') => {
-                        let name = read_name(&cursor[1..]);
-                        filters.push(classify_filter(name));
-                        cursor = &cursor[1 + name.len()..];
+                        let (name, consumed) = read_name(&cursor[1..]);
+                        filters.push(classify_filter(&name));
+                        cursor = &cursor[1 + consumed..];
                     }
-                    // The closing `]`, the end of the dictionary, or any
-                    // unexpected token (e.g. an indirect reference): stop and
-                    // keep what was read.
-                    _ => break,
+                    // The closing `]` or the end of the dictionary ends the
+                    // chain.
+                    Some(b']') | None => break,
+                    // Any other token inside the array (an indirect reference, a
+                    // stray number, …) means we cannot read the chain; fail
+                    // closed rather than measure a truncated prefix of it.
+                    _ => {
+                        filters.push(PdfFilter::Unbounded);
+                        break;
+                    }
                 }
             }
-            if filters.is_empty() {
-                vec![PdfFilter::Flate]
-            } else {
-                filters
-            }
+            filters
         }
         // `/Filter` present but neither a name nor an array (e.g. an indirect
-        // reference). Fall back to the single-Flate best effort.
-        _ => vec![PdfFilter::Flate],
+        // reference `5 0 R`). We cannot resolve the chain, so fail closed.
+        _ => vec![PdfFilter::Unbounded],
     }
+}
+
+/// The bytes of `dict` from just after its `/Filter` entry's key, or `None` when
+/// the dictionary has no `/Filter`. Name tokens are matched with `#XX` escape
+/// handling, so an escaped key such as `/Fil#74er` is still recognised.
+fn filter_value(dict: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i < dict.len() {
+        match dict[i] {
+            b'%' => {
+                i += 1;
+                while i < dict.len() && dict[i] != b'\n' && dict[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'/' => {
+                let (name, consumed) = read_name(&dict[i + 1..]);
+                if name.as_slice() == b"Filter" {
+                    return Some(&dict[i + 1 + consumed..]);
+                }
+                i += 1 + consumed;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// The byte range `[open, close)` of the `<< … >>` dictionary whose closing
@@ -424,22 +504,58 @@ fn dict_before(raw: &[u8], keyword_pos: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// Skips PDF whitespace and `%`-to-end-of-line comments, both insignificant
+/// between tokens, so a comment cannot truncate a filter array.
 fn skip_ws(data: &[u8]) -> &[u8] {
     let mut i = 0;
-    while i < data.len() && data[i].is_ascii_whitespace() {
-        i += 1;
+    while i < data.len() {
+        if data[i].is_ascii_whitespace() {
+            i += 1;
+        } else if data[i] == b'%' {
+            i += 1;
+            while i < data.len() && data[i] != b'\n' && data[i] != b'\r' {
+                i += 1;
+            }
+        } else {
+            break;
+        }
     }
     &data[i..]
 }
 
-/// A PDF name token's bytes, up to the next whitespace or delimiter.
-fn read_name(data: &[u8]) -> &[u8] {
+/// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
+/// and the number of raw bytes consumed. Decoding escapes is what makes an
+/// obfuscated `/Fl#61teDecode` classify as `FlateDecode`.
+fn read_name(data: &[u8]) -> (Vec<u8>, usize) {
     const DELIMS: &[u8] = b"/[]<>(){}%";
-    let end = data
-        .iter()
-        .position(|b| b.is_ascii_whitespace() || DELIMS.contains(b))
-        .unwrap_or(data.len());
-    &data[..end]
+    let mut name = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b.is_ascii_whitespace() || DELIMS.contains(&b) {
+            break;
+        }
+        if b == b'#'
+            && i + 2 < data.len()
+            && let (Some(hi), Some(lo)) = (hex_value(data[i + 1]), hex_value(data[i + 2]))
+        {
+            name.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        name.push(b);
+        i += 1;
+    }
+    (name, i)
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -805,6 +921,21 @@ mod tests {
         Bytes::from(pdf)
     }
 
+    /// Builds a one-stream PDF whose dictionary carries `dict_entries` verbatim
+    /// (between the `/Length` entry and the `>>`), so a test can supply an
+    /// escaped key, a comment, or an indirect `/Filter` reference.
+    fn pdf_with_dict(dict_entries: &str, data: &[u8]) -> Bytes {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n1 0 obj\n<< /Length ");
+        pdf.extend_from_slice(data.len().to_string().as_bytes());
+        pdf.push(b' ');
+        pdf.extend_from_slice(dict_entries.as_bytes());
+        pdf.extend_from_slice(b" >>\nstream\n");
+        pdf.extend_from_slice(data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        Bytes::from(pdf)
+    }
+
     fn pdf_too_large_reason(raw: &Bytes) -> String {
         match ensure_pdf_within_budget(raw) {
             Err(Error::DocumentTooLarge {
@@ -899,5 +1030,79 @@ mod tests {
         let data = ascii85_encode(&deflate(b"hello world"));
         let pdf = pdf_with_stream("[/ASCII85Decode /FlateDecode]", &data);
         ensure_pdf_within_budget(&pdf).expect("a small chained stream is within the budget");
+    }
+
+    const UNVERIFIABLE_REASON: &str =
+        "it declares a stream filter whose decompressed size cannot be verified \
+         (an indirect, LZW, encrypted, or unrecognised /Filter)";
+
+    fn flate_bomb() -> Vec<u8> {
+        let over = usize::try_from(MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
+        deflate_spaces(over)
+    }
+
+    /// A `/Filter` key obscured with a `#XX` escape (`/Fil#74er` is `/Filter`)
+    /// must still be recognised, so the Flate bomb behind it is budgeted.
+    #[test]
+    fn rejects_a_bomb_behind_an_escaped_filter_key() {
+        let pdf = pdf_with_dict("/Fil#74er /FlateDecode", &flate_bomb());
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A filter name obscured with a `#XX` escape (`/Fl#61teDecode` is
+    /// `/FlateDecode`) must classify as Flate, so its expansion is budgeted.
+    #[test]
+    fn rejects_a_bomb_behind_an_escaped_filter_name() {
+        let pdf = pdf_with_dict("/Filter /Fl#61teDecode", &flate_bomb());
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A comment between filter-array elements must not truncate the chain, so
+    /// the second Flate stage of a nested bomb is still applied.
+    #[test]
+    fn rejects_a_bomb_with_a_comment_in_the_filter_array() {
+        let data = deflate(&flate_bomb());
+        let pdf = pdf_with_dict("/Filter [/FlateDecode %drop the rest\n /FlateDecode]", &data);
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// An indirect `/Filter` reference cannot be resolved by this scan, so the
+    /// document is rejected rather than forwarded with an unchecked expansion.
+    #[test]
+    fn rejects_an_indirect_filter_reference() {
+        let pdf = pdf_with_dict("/Filter 5 0 R", &flate_bomb());
+        assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
+    }
+
+    /// A general-purpose `LZWDecode` stage is not decoded here; a chain that
+    /// reaches one is rejected rather than left unbudgeted.
+    #[test]
+    fn rejects_an_lzw_filter_chain() {
+        let pdf = pdf_with_dict("/Filter [/LZWDecode /FlateDecode]", b"anything at all");
+        assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
+    }
+
+    /// An unrecognised filter name is rejected rather than silently skipped.
+    #[test]
+    fn rejects_an_unknown_filter() {
+        let pdf = pdf_with_dict("/Filter /NotARealFilter", b"anything at all");
+        assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
+    }
+
+    /// A terminal image codec produces a dimension-bounded raster, not a text
+    /// content-stream bomb, so budgeting stops at it and the stream is accepted.
+    #[test]
+    fn accepts_a_terminal_image_codec() {
+        let pdf = pdf_with_dict("/Filter /DCTDecode", b"\xff\xd8\xff\xe0 pretend jpeg bytes");
+        ensure_pdf_within_budget(&pdf).expect("a terminal image codec stream is accepted");
     }
 }
