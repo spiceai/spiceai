@@ -561,7 +561,7 @@ async fn cache_replacements_by_key_match_the_scope_delete() {
                         let _ = done.send((
                             sink_index,
                             index,
-                            result.map(|_| ()).map_err(|error| error.to_string()),
+                            result.map_err(|error| error.to_string()),
                         ));
                     }),
                 )
