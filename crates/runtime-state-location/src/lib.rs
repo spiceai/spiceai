@@ -41,6 +41,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 mod check;
+pub mod metrics;
 pub mod scheduler_deprecation;
 
 pub use check::{
@@ -195,6 +196,27 @@ pub enum StateFeature {
 }
 
 impl StateFeature {
+    pub const ALL: [Self; 5] = [
+        Self::Scheduler,
+        Self::RateControl,
+        Self::ResultsCacheWarmup,
+        Self::Snapshots,
+        Self::StartupCheck,
+    ];
+
+    /// The feature's `feature` label on the state-store metrics. `None` for the
+    /// startup check, which is not measured: it runs before the metrics exist.
+    #[must_use]
+    pub fn metric_label(self) -> Option<&'static str> {
+        match self {
+            Self::Scheduler => Some("scheduler"),
+            Self::RateControl => Some("rate_control"),
+            Self::ResultsCacheWarmup => Some("results_cache_warmup"),
+            Self::Snapshots => Some("snapshots"),
+            Self::StartupCheck => None,
+        }
+    }
+
     /// The folder the feature writes under in a `runtime.state` location.
     fn folder(self) -> &'static str {
         match self {
@@ -272,6 +294,9 @@ impl StateFeature {
 /// location's path; for the scheduler, rate control and warmup on `abfs://` and
 /// `abfss://` that is the container root, whatever path the URL has.
 ///
+/// Every request through the store is recorded in the state-store
+/// [`metrics`] under `feature`'s label, when it has one.
+///
 /// `s3://`, `abfs://`, `abfss://`, `gs://` and `file://` locations build the
 /// same store for every feature. A snapshot location with another scheme is
 /// built by `object_store`'s URL parsing; other features resolve it through the
@@ -282,6 +307,16 @@ impl StateFeature {
 /// Returns an error when the location is not a valid URL, its `params` are
 /// invalid, or the store cannot be built.
 pub async fn build_object_store(
+    secrets: Arc<RwLock<Secrets>>,
+    io_runtime: Handle,
+    state: &StateLocation,
+    feature: StateFeature,
+) -> Result<(Arc<dyn ObjectStore>, String)> {
+    let (store, prefix) = build_unmetered_object_store(secrets, io_runtime, state, feature).await?;
+    Ok((metrics::metered(store, feature), prefix))
+}
+
+async fn build_unmetered_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state: &StateLocation,

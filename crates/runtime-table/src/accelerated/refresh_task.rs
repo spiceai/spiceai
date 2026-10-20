@@ -890,7 +890,8 @@ impl RefreshTask {
         // optimization does not apply: skipping would silently drop the override and retain the
         // previously-materialized rows (issue #11353). When an override is present, bypass the
         // skip check and reset the provider's cached version so the *next* plain refresh
-        // re-materializes the full source instead of skipping against the narrowed data.
+        // re-materializes the full source instead of skipping against the narrowed data. A reload
+        // reads the source whether or not it changed, so it skips the check.
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
@@ -899,7 +900,7 @@ impl RefreshTask {
                     table_provider.as_ref(),
                 )
                 .await;
-            } else {
+            } else if !refresh.reload {
                 match data_components::refresh_skip::should_skip_refresh_for_table_provider(
                     table_provider.as_ref(),
                 )
@@ -1288,8 +1289,7 @@ impl RefreshTask {
         );
 
         let record_batch_stream = Box::pin(observed_record_batch_stream);
-        let sink_lock = self.sink.read().await;
-        let sink = &*sink_lock;
+        let sink_lock = Arc::clone(&self.sink).read_owned().await;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         // Ordering versions by time, the refresh may have counted the rows it did not
@@ -1305,10 +1305,29 @@ impl RefreshTask {
             superseded: table_counts.then(|| Arc::clone(&superseded)),
             row_versions,
         };
-        if let Err(e) = sink
-            .insert_into(record_batch_stream, overwrite, &write)
-            .await
-        {
+        let insert = async move {
+            sink_lock
+                .insert_into(record_batch_stream, overwrite, &write)
+                .await
+        };
+        // The write is CPU-heavy (sort, encode): run it on the dedicated refresh runtime, when
+        // provided, to keep it off the main runtime, which serves queries.
+        let result = match self.cpu_runtime.clone() {
+            Some(refresh_runtime) => {
+                let request_context = RequestContext::current(AsyncMarker::new().await);
+                let task = refresh_runtime
+                    .spawn(request_context.scope(insert).instrument(Span::current()));
+                tokio_util::task::AbortOnDropHandle::new(task)
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(RetryError::transient(super::Error::FailedToWriteData {
+                            source: DataFusionError::External(Box::new(join_error)),
+                        }))
+                    })
+            }
+            None => insert.await,
+        };
+        if let Err(e) = result {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
@@ -5096,6 +5115,89 @@ mod tests {
             .expect("accelerator rows should be collected");
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         assert_eq!(row_count, 1, "insert should remain committed");
+    }
+
+    /// The ids an acceleration holds after `refresh`, when it held ids 7 to 12 (ts 107 to 112)
+    /// and the source holds ids 1 to 12, the first six older (ts 1 to 6).
+    async fn ids_after_refresh(refresh: Refresh) -> Vec<i64> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let rows = |ids: std::ops::RangeInclusive<i64>| {
+            let ts = ids
+                .clone()
+                .map(|id| if id <= 6 { id } else { id + 100 })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .expect("batch builds")
+        };
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(7..=12)]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(1..=12)]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("reload"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        task.run(refresh).await.expect("the refresh runs");
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("accelerator scan should succeed");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("accelerator rows should be collected")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_append_dataset_loads_rows_older_than_its_acceleration() {
+        let append = || {
+            Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::UnixSeconds)
+        };
+        assert_eq!(
+            ids_after_refresh(append().for_run()).await,
+            (7..=12).collect::<Vec<_>>(),
+            "an append reads only rows newer than the acceleration's"
+        );
+        let mut owing = append();
+        owing.owe_reload();
+        assert_eq!(
+            ids_after_refresh(owing.for_run()).await,
+            (1..=12).collect::<Vec<_>>()
+        );
     }
 
     /// Tests that `max_timestamp_df` returns the maximum value for integer time columns

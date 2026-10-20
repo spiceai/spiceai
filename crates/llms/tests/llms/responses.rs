@@ -23,16 +23,19 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock};
 
-use async_openai::types::responses::{
-    CreateResponse, FunctionToolCall, OutputItem, Response, ResponseStream, ResponseStreamEvent,
-    Status,
+use async_openai::{
+    error::{ApiError, OpenAIError},
+    types::responses::{
+        CreateResponse, FunctionToolCall, OutputItem, Response, ResponseStream,
+        ResponseStreamEvent, Status,
+    },
 };
 use futures::StreamExt;
 use llms::responses::Responses;
 use rstest::rstest;
 use serde_json::{Value, json};
 
-use super::{DOTENV, OPENAI_MODEL, WeatherArgs, XAI_MODEL, create};
+use super::{DOTENV, OPENAI_MODEL, WeatherArgs, XAI_MODEL, create, retry_transient};
 use crate::{TEST_ARGS, init_tracing};
 
 /// The model that tests select by `model_name`.
@@ -71,36 +74,62 @@ async fn run_test(
         serde_json::from_value(req).unwrap_or_else(|e| panic!("{label}: invalid request: {e}"));
     tracing::info!("Running test {label} with {req:?}");
 
-    let response = if as_stream {
+    if as_stream {
         req.stream = Some(true);
-        let stream = model
-            .responses_stream(req)
-            .await
-            .unwrap_or_else(|e| panic!("{label}: responses_stream failed. Error: {e:#?}"));
-        completed_response(&label, stream).await
+    }
+    let method = if as_stream {
+        "responses_stream"
     } else {
-        model
-            .responses_request(req)
-            .await
-            .unwrap_or_else(|e| panic!("{label}: responses_request failed. Error: {e:#?}"))
+        "responses_request"
     };
+    let response = retry_transient(&label, || {
+        let (model, req, label) = (Arc::clone(&model), req.clone(), label.clone());
+        async move {
+            if as_stream {
+                completed_response(&label, model.responses_stream(req).await?).await
+            } else {
+                model
+                    .responses_request(req)
+                    .await
+                    .and_then(failure_as_error)
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{label}: {method} failed. Error: {e:#?}"));
     tracing::debug!("Response for {label}: {response:?}");
 
     assert_eq!(response.status, Status::Completed, "{label}: {response:#?}");
     Some(response)
 }
 
-/// The response that `stream` completes with.
+/// `response`, or the provider's error if the response failed.
+///
+/// The error takes the form of a refused request's error, so that [`retry_transient`] reads the
+/// provider's code in both the same way.
+fn failure_as_error(response: Response) -> Result<Response, OpenAIError> {
+    match (&response.status, &response.error) {
+        (Status::Failed, Some(error)) => Err(OpenAIError::ApiError(ApiError {
+            message: error.message.clone(),
+            r#type: None,
+            param: None,
+            code: Some(error.code.clone()),
+        })),
+        _ => Ok(response),
+    }
+}
+
+/// The response that `stream` completes with, or the error that fails it.
 ///
 /// Also checks that the text deltas of the stream add up to the text of the completed response,
 /// so that a stream that sends its text only in the last event does not pass as a stream.
-async fn completed_response(label: &str, mut stream: ResponseStream) -> Response {
+async fn completed_response(
+    label: &str,
+    mut stream: ResponseStream,
+) -> Result<Response, OpenAIError> {
     let mut streamed_text = String::new();
     while let Some(event) = stream.next().await {
-        let event = event.unwrap_or_else(|e| {
-            panic!("{label}: the stream failed before the response completed: {e:#?}")
-        });
-        match event {
+        match event? {
             ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
                 streamed_text.push_str(&delta.delta);
             }
@@ -110,13 +139,13 @@ async fn completed_response(label: &str, mut stream: ResponseStream) -> Response
                     streamed_text,
                     "{label}: the text deltas do not add up to the completed response's text"
                 );
-                return completed.response;
+                return Ok(completed.response);
             }
             ResponseStreamEvent::ResponseIncomplete(event) => {
                 panic!("{label}: the response did not complete: {event:#?}")
             }
             ResponseStreamEvent::ResponseFailed(event) => {
-                panic!("{label}: the response failed: {event:#?}")
+                return failure_as_error(event.response);
             }
             _ => {}
         }

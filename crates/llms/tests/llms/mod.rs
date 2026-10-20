@@ -16,14 +16,17 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
-    CreateChatCompletionResponse,
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{
+        ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
+        CreateChatCompletionResponse,
+    },
 };
 use jsonpath_rust::JsonPath;
 use llms::{accumulate::accumulate, chat::Chat};
 use rstest::rstest;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     future::Future,
     str::FromStr,
@@ -99,8 +102,8 @@ static SHARED_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
 
 /// Drives `future` on [`SHARED_RUNTIME`] and awaits its result from the caller's runtime.
 ///
-/// A panic inside `future` is re-raised here, so a failing request still reports the message
-/// [`run_test`] panicked with rather than an opaque join error.
+/// A panic inside `future` is re-raised here, so it reaches the test with its own message rather
+/// than as an opaque join error.
 async fn on_shared_runtime<F>(future: F) -> F::Output
 where
     F: Future + Send + 'static,
@@ -349,6 +352,73 @@ async fn get_or_create_model(model_name: &str) -> Result<Arc<dyn Chat>, anyhow::
     .await
 }
 
+/// Times a test sends one request before a provider's transient refusal fails the test.
+const REQUEST_ATTEMPTS: u32 = 5;
+
+/// Wait before the first retry. It doubles before each later retry.
+const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Error codes with which a provider refuses a request only for now.
+///
+/// xAI sends `resource-exhausted` when the model is at capacity, and fails a started Responses
+/// stream with `server_error` for the same cause. `resource_exhausted` is the same code in the
+/// snake case of `OpenAI` error codes.
+const TRANSIENT_ERROR_CODES: &[&str] =
+    &["resource-exhausted", "resource_exhausted", "server_error"];
+
+fn is_transient_code(code: &str) -> bool {
+    TRANSIENT_ERROR_CODES.contains(&code)
+}
+
+/// Whether `error` is a refusal that the same request can get past later.
+///
+/// Reads only the provider's error code, never its message. `async-openai` cannot parse an xAI
+/// error body, so it hands one over as [`OpenAIError::JSONDeserialize`] with the raw body.
+fn is_transient(error: &OpenAIError) -> bool {
+    match error {
+        OpenAIError::ApiError(error) => error.code.as_deref().is_some_and(is_transient_code),
+        OpenAIError::JSONDeserialize(_, body) => {
+            serde_json::from_str::<Value>(body).is_ok_and(|body| {
+                [&body["code"], &body["error"]["code"]]
+                    .into_iter()
+                    .filter_map(Value::as_str)
+                    .any(is_transient_code)
+            })
+        }
+        _ => false,
+    }
+}
+
+/// Sends `request` until it succeeds, fails with an error that is not [`is_transient`], or has
+/// been refused [`REQUEST_ATTEMPTS`] times.
+///
+/// Hosted providers shed load by refusing a part of their requests, and a retry some seconds
+/// later gets through. The test checks Spice's handling of a model's answer, not that the
+/// provider has capacity when the test runs.
+async fn retry_transient<T, Fut>(
+    label: &str,
+    mut request: impl FnMut() -> Fut,
+) -> Result<T, OpenAIError>
+where
+    Fut: Future<Output = Result<T, OpenAIError>>,
+{
+    let mut delay = FIRST_RETRY_DELAY;
+    let mut attempt = 1;
+    loop {
+        match request().await {
+            Err(error) if attempt < REQUEST_ATTEMPTS && is_transient(&error) => {
+                tracing::warn!(
+                    "{label}: attempt {attempt} of {REQUEST_ATTEMPTS} was refused for now, retrying in {delay:?}: {error}"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn run_test(
     model_name: &str,
     test_name: &str,
@@ -375,28 +445,29 @@ async fn run_test(
 
     tracing::info!("Running test {test_name}/{model_name} with {req:?}");
 
-    let actual_resp = on_shared_runtime({
-        let (test_name, model_name) = (test_name.to_string(), model_name.to_string());
-        async move {
+    let label = format!("{test_name}/{model_name}");
+    let method = if as_stream {
+        "chat_stream"
+    } else {
+        "chat_request"
+    };
+    let actual_resp = retry_transient(&label, || {
+        let (model, mut req) = (Arc::clone(&model), req.clone());
+        on_shared_runtime(async move {
             if as_stream {
-                let mut req = req;
                 req.stream = Some(true);
                 req.stream_options = Some(ChatCompletionStreamOptions {
                     include_usage: Some(true),
                     include_obfuscation: None,
                 });
-                accumulate(model.chat_stream(req).await.unwrap_or_else(|e| {
-                    panic!("For test {test_name}/{model_name}, chat_stream failed. Error: {e:#?}")
-                }))
-                .await
+                accumulate(model.chat_stream(req).await?).await
             } else {
-                model.chat_request(req).await.unwrap_or_else(|e| {
-                    panic!("For test {test_name}/{model_name}, chat_request failed. Error: {e:#?}")
-                })
+                model.chat_request(req).await
             }
-        }
+        })
     })
-    .await;
+    .await
+    .unwrap_or_else(|e| panic!("For test {label}, {method} failed. Error: {e:#?}"));
     tracing::debug!("Response for {test_name}/{model_name}: {actual_resp:?}");
 
     let resp_value =
@@ -479,7 +550,7 @@ fn shared_runtime_keeps_spawned_work_alive_past_the_test_that_started_it() {
     );
 }
 
-/// [`run_test`] reports a provider failure by panicking with the test and model names, so
+/// A panic while a request runs must reach the test with its own message, so
 /// [`on_shared_runtime`] has to re-raise that panic rather than replace it with a join error.
 #[test]
 fn on_shared_runtime_re_raises_the_original_panic() {
@@ -502,8 +573,38 @@ fn on_shared_runtime_re_raises_the_original_panic() {
         .unwrap_or_else(|| panic!("the propagated panic carried no string payload"));
     assert!(
         message.contains("For test basic/xai, chat_request failed."),
-        "the panic reached the test as {message:?}, losing the diagnostic `run_test` panicked with"
+        "the panic reached the test as {message:?}, losing its diagnostic"
     );
+}
+
+/// A refusal xAI sent while its model was at capacity is retried. A refusal of the request itself
+/// is not, so a request that Spice builds wrong still fails the test at once.
+#[test]
+fn only_transient_refusals_are_retried() {
+    // `async-openai` reads an error body as `WrappedError` and gives up on xAI's shape.
+    let unparsed = |body: &str| {
+        let error = serde_json::from_str::<async_openai::error::WrappedError>(body)
+            .expect_err("an xAI error body is not in the `OpenAI` shape");
+        OpenAIError::JSONDeserialize(error, body.to_string())
+    };
+    let parsed = |code: &str| {
+        OpenAIError::ApiError(async_openai::error::ApiError {
+            message: String::new(),
+            r#type: None,
+            param: None,
+            code: Some(code.to_string()),
+        })
+    };
+
+    assert!(is_transient(&unparsed(
+        r#"{"code":"resource-exhausted","error":"The model is currently at capacity due to high demand. Please try again in a few minutes, or use a higher service tier for priority processing: https://docs.x.ai/developers/advanced-api-usage/priority-processing"}"#
+    )));
+    assert!(is_transient(&parsed("resource_exhausted")));
+
+    assert!(!is_transient(&unparsed(
+        r#"{"code":"invalid-argument","error":"Temperature must be less than 2 but temperature = 9"}"#
+    )));
+    assert!(!is_transient(&parsed("invalid_argument")));
 }
 
 #[rstest]
@@ -537,7 +638,7 @@ async fn test_basic(
         content_pattern(model_name, "Hello")
     );
 
-    let _ = run_test(
+    let resp = run_test(
         model_name,
         "basic",
         req,
@@ -546,6 +647,17 @@ async fn test_basic(
     )
     .await
     .expect("test failed");
+
+    // A reply that answers is not a refusal: as in `OpenAI`'s API, `refusal` is unset unless the
+    // model declined, and the `ai_*` decision functions fail a request whose reply refuses.
+    if let Some(resp) = resp {
+        for choice in &resp.choices {
+            assert_eq!(
+                choice.message.refusal, None,
+                "{model_name} (stream: {as_stream}) answered and still reported a refusal"
+            );
+        }
+    }
 }
 
 #[rstest]

@@ -62,6 +62,13 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 /// Create Chat Completion
 ///
 /// Creates a model response for the given chat conversation.
+///
+/// When a model writes text and calls a Spice tool in the same step, the message carries that
+/// text, a blank line, then the answer the tool results produce, whether or not it is streamed.
+/// There is no blank line when either side already has whitespace where they meet, or when the
+/// request sets `logprobs`, so that `content` is exactly the text its log probabilities cover. A
+/// response that is not streamed and has a `json_object` or `json_schema` `response_format`
+/// carries only the answer.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -420,6 +427,7 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
                 Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
                 Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+                Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
                 Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
                 Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
                 None => StatusCode::INTERNAL_SERVER_ERROR,
@@ -653,6 +661,10 @@ mod tests {
             (
                 api_error(Some("permission_error"), None),
                 StatusCode::FORBIDDEN,
+            ),
+            (
+                api_error(Some("not_found_error"), Some("not_found")),
+                StatusCode::NOT_FOUND,
             ),
             (
                 api_error(Some("insufficient_quota"), Some("insufficient_quota")),

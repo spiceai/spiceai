@@ -6,6 +6,7 @@ use crate::utils::{register_test_connectors, runtime_ready_check};
 use crate::{configure_test_datafusion, configure_test_datafusion_request_context};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
+use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use futures::StreamExt;
@@ -171,6 +172,91 @@ pub(crate) async fn initialize_postgres(port: usize) -> Result<PostgresConnectio
     execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
 
     Ok(db_conn)
+}
+
+/// UTC midnights used as `created_at` by [`initialize_postgres_labeled`].
+///
+/// They are inside the append `refresh_sql` window (`now() - INTERVAL '10 years'`) and fall
+/// on an exact millisecond, so an epoch-millisecond comparison does not round.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LabeledInstants {
+    pub alpha: DateTime<Utc>,
+    pub beta: DateTime<Utc>,
+    pub probe: DateTime<Utc>,
+}
+
+/// Source table whose non-time columns are an integer and a string.
+///
+/// Inserts the `alpha` row (`n = 10`, `label = 'alpha'`). Callers insert `beta` and `probe`
+/// later. `acceleration` is the database the `PostgreSQL` accelerator connects to.
+pub(crate) async fn initialize_postgres_labeled(
+    port: usize,
+) -> Result<(PostgresConnection, LabeledInstants), anyhow::Error> {
+    let pool = common::get_postgres_connection_pool(port, None).await?;
+    let db_conn = pool
+        .connect_direct()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error connecting: {e}"))?;
+
+    execute_ps_sql(&db_conn, "SET TIME ZONE 'UTC'").await?;
+    execute_ps_sql(
+        &db_conn,
+        "
+                CREATE TABLE test_table (
+                    id SERIAL PRIMARY KEY,
+                    created_at TIMESTAMP(3) WITH TIME ZONE NOT NULL,
+                    n INTEGER NOT NULL,
+                    label TEXT NOT NULL
+                )",
+    )
+    .await?;
+
+    // `AT TIME ZONE 'UTC'` yields `timestamp without time zone`. Truncating that to a day
+    // is a UTC midnight, independent of the session time zone.
+    let picked = db_conn
+        .conn
+        .query_one(
+            "SELECT
+                (date_trunc('day', (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')) - INTERVAL '2 days'),
+                (date_trunc('day', (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')) - INTERVAL '1 day'),
+                date_trunc('day', (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'))",
+            &[],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Error picking refresh instants: {e}"))?;
+    let instants = LabeledInstants {
+        alpha: utc_midnight(picked.try_get(0)?, "alpha")?,
+        beta: utc_midnight(picked.try_get(1)?, "beta")?,
+        probe: utc_midnight(picked.try_get(2)?, "probe")?,
+    };
+
+    let n = 10_i32;
+    let label = "alpha";
+    let inserted = db_conn
+        .conn
+        .execute(
+            "INSERT INTO test_table (created_at, n, label) VALUES ($1, $2, $3)",
+            &[&instants.alpha, &n, &label],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Error inserting the alpha row: {e}"))?;
+    anyhow::ensure!(
+        inserted == 1,
+        "expected to insert 1 alpha row, inserted {inserted}"
+    );
+
+    execute_ps_sql(&db_conn, "CREATE DATABASE acceleration").await?;
+
+    Ok((db_conn, instants))
+}
+
+fn utc_midnight(naive: NaiveDateTime, name: &str) -> Result<DateTime<Utc>, anyhow::Error> {
+    let time = naive.time();
+    anyhow::ensure!(
+        time.num_seconds_from_midnight() == 0 && time.nanosecond() == 0,
+        "{name} instant {naive} is not a UTC midnight"
+    );
+    Ok(naive.and_utc())
 }
 
 /// Initialize postgres with a test table that includes a `value` column for testing upsert behavior.

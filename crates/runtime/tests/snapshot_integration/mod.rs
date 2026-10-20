@@ -551,11 +551,14 @@ async fn prepare_duckdb_fixture(test_name: &str) -> Result<SnapshotFixture> {
         .map(RecordBatch::schema)
         .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
 
-    runtime.shutdown().await;
-
+    // Shutdown resigns the snapshot writer lease, and a snapshot that has not
+    // taken the lease by then is skipped, so the first snapshot is awaited first.
     let snapshot_objects = context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
+
+    runtime.shutdown().await;
+
     let metadata = build_metadata_document(
         &context,
         TAXI_TRIPS_DATASET_NAME,
@@ -639,11 +642,14 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
         .map(RecordBatch::schema)
         .ok_or_else(|| anyhow!("Failed to retrieve schema from taxi_trips dataset"))?;
 
-    runtime.shutdown().await;
-
+    // Shutdown resigns the snapshot writer lease, and a snapshot that has not
+    // taken the lease by then is skipped, so the first snapshot is awaited first.
     let snapshot_objects = context
         .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_mins(1))
         .await?;
+
+    runtime.shutdown().await;
+
     let metadata = build_metadata_document(
         &context,
         TAXI_TRIPS_DATASET_NAME,
