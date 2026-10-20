@@ -2243,6 +2243,16 @@
     {
       "run": "postgres-cdc-atomicity",
       "who": "default",
+      "key": "query: SELECT count(*) AS n FROM by_changes",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: .*1000.*, actual: ",
+      "pattern": "answer differs from the expected one: DataMismatch \\{ column: \"n\", row_number: 1, expected: .*1000.*, actual: ",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-atomicity",
+      "who": "default",
       "key": "stop-background: read-changes",
       "kind": "other",
       "signature": "<n> of <m> iterations failed; first: invariant broken: n = above expected Some(\"1000\")",
