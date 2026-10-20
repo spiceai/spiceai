@@ -1887,7 +1887,8 @@ impl AcceleratedTable {
     /// `filters` uses the three-state `RefreshSQL` partition-filter semantics:
     /// `None` (not partition-scoped, retrieve everything), `Some(filters)` (the
     /// assigned partitions), or `Some(empty)` (no partitions assigned — load no
-    /// rows).
+    /// rows). The full or append refreshes after it reload the acceleration until one succeeds
+    /// (see `Refresh::owe_reload`).
     /// # Errors
     ///
     /// Returns an error if the refresh task cannot be notified of the new filters.
@@ -1910,6 +1911,7 @@ impl AcceleratedTable {
             sql.set_partition_filters(filters);
             refresh.sql = Some(sql);
         }
+        refresh.owe_reload();
         Ok(())
     }
 
@@ -3856,6 +3858,18 @@ mod tests {
             vec![5],
             "a table that is not partitioned"
         );
+    }
+
+    #[tokio::test]
+    async fn new_partition_filters_owe_a_reload() {
+        let (table, _accelerator) =
+            accelerator_only_table(Some(ClusterRole::Executor), false).await;
+        assert!(!table.refresh_params().read().await.reload);
+        table
+            .update_partition_filters(Some(vec![col("id").eq(lit("1"))]))
+            .await
+            .expect("partition filters are set");
+        assert!(table.refresh_params().read().await.reload);
     }
 
     /// Regression test for #13548. Acceleration snapshot creation holds

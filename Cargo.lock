@@ -7431,7 +7431,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=54d90109c5db98d0420e0545a820f8bba8cc930c#54d90109c5db98d0420e0545a820f8bba8cc930c"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a#c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18300,6 +18300,7 @@ dependencies = [
  "app",
  "async-trait",
  "axum",
+ "datafusion",
  "futures",
  "headers",
  "http 1.4.1",
@@ -21637,11 +21638,9 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
- "hf-hub",
  "insta",
  "itertools 0.14.0",
  "parking_lot",
- "parquet",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",

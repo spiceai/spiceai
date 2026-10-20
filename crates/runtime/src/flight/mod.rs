@@ -927,8 +927,8 @@ pub(crate) async fn check_read_only_sql(
         return Ok(None);
     }
     let session = datafusion.ctx.state();
-    let plan = datafusion
-        .create_logical_plan(&session, sql)
+    let (plan, _) = datafusion
+        .create_logical_plan(&session, sql, parameters)
         .await
         .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
     // Bind parameters to the plan so the returned plan is fully resolved.
