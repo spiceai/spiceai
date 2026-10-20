@@ -661,16 +661,23 @@ impl std::fmt::Debug for RefreshTask {
 /// Which stored rows an append's incoming rows are compared with, by the keep-newest
 /// selection and the exact-row dedupe.
 ///
-/// The comparison is always inclusive of the mark: widening the stored side can only
-/// add rows to compare with, never cause a duplicate, so the stored side needs no
-/// `>`/`>=` distinction of its own (the source filter keeps its strict `>`).
+/// The stored side starts where the incoming rows can: after the high-water mark when
+/// the source was filtered by it, at the lowest incoming time otherwise. Widening it
+/// cannot cause a duplicate, but it is not free: the exact-row dedupe compares every
+/// incoming row with every stored row it selects, and on a time column where whole
+/// loads share one value, the stored rows *at* the high-water mark are the entire
+/// previous load (#15329).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredRowsFrom {
     /// Nothing: a full load overwrites the stored rows, and an append into an empty
     /// acceleration has none.
     None,
-    /// The stored rows at or after a mark: the high-water mark the source filter used,
-    /// or the lowest time the incoming rows can hold.
+    /// The stored rows after the high-water mark the source filter used. That filter
+    /// is a strict `>` (widened on a day-granular column), so no incoming row holds the
+    /// mark itself, and this selects with the same filter.
+    After(u128),
+    /// The stored rows at or after a time an incoming row can hold: the lowest time
+    /// bound of the source files an append reads.
     From(u128),
     /// Every stored row, when no mark is safe.
     All,
@@ -679,7 +686,7 @@ enum StoredRowsFrom {
 impl StoredRowsFrom {
     /// The high-water mark an append read from the acceleration, when it has one.
     fn from_mark(mark: Option<u128>) -> Self {
-        mark.map_or(Self::None, Self::From)
+        mark.map_or(Self::None, Self::After)
     }
 
     fn from_seed(seed: SeedMark) -> Self {
@@ -693,6 +700,7 @@ impl StoredRowsFrom {
     fn filter(self, converter: &TimestampFilterConvert) -> Option<Expr> {
         match self {
             Self::None | Self::All => None,
+            Self::After(mark) => Some(converter.convert_high_water_mark(mark)),
             Self::From(mark) => Some(converter.convert_at_or_after_mark(mark)),
         }
     }
@@ -1922,6 +1930,9 @@ impl RefreshTask {
                     )
                 });
             let start = match stored_from {
+                StoredRowsFrom::After(value) if string_time => value
+                    .checked_sub(MAX_UTC_OFFSET_NANOS)
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::After),
                 StoredRowsFrom::From(value) if string_time => value
                     .checked_sub(MAX_UTC_OFFSET_NANOS)
                     .map_or(StoredRowsFrom::All, StoredRowsFrom::From),
@@ -6629,5 +6640,120 @@ mod tests {
             2,
             "the surviving row should be the new same-day row (id=2)"
         );
+    }
+
+    /// Regression test for #15329.
+    ///
+    /// When every row of a load shares one `time_column` value, the stored rows at the
+    /// high-water mark are the whole previous load. The source filter is a strict `>`,
+    /// so no incoming row can equal one of them, and reading them into the exact-row
+    /// dedupe only multiplies its pairwise comparisons: an append of 600k rows against
+    /// 600k stored rows never finished.
+    #[tokio::test]
+    async fn test_append_dedupe_does_not_compare_stored_rows_at_the_high_water_mark() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let loaded_at: i64 = 1_760_000_000_000_000_000;
+        let appended_at = loaded_at + 60_000_000_000;
+
+        let batch = |at: i64, ids: Vec<i32>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(
+                        TimestampNanosecondArray::from(vec![at; ids.len()]).with_timezone("UTC"),
+                    ),
+                    Arc::new(Int32Array::from(ids)),
+                ],
+            )
+            .expect("batch")
+        };
+
+        let accelerator = Arc::new(
+            MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![batch(loaded_at, vec![1, 2, 3])]],
+            )
+            .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        )));
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("test_append_single_time_load"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("created_at".to_string())
+            .time_format(TimeFormat::Timestamptz);
+
+        let stored_from = high_water_mark(&task, &refresh).await;
+        let filter = stored_from
+            .filter(
+                &task
+                    .get_accelerator_filter_converter(&refresh)
+                    .expect("accelerator converter"),
+            )
+            .expect("a high-water mark selects the stored rows to compare");
+        let compared = SessionContext::new()
+            .read_table(Arc::clone(&accelerator))
+            .expect("read accelerator")
+            .filter(filter)
+            .expect("filter stored rows")
+            .count()
+            .await
+            .expect("count stored rows");
+        assert_eq!(
+            compared, 0,
+            "the three stored rows sit at the high-water mark, which the strict source filter \
+             never re-reads, so none of them belongs in the dedupe's comparison set"
+        );
+
+        // The next load, read by the source filter, is appended whole.
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(
+                vec![batch(appended_at, vec![4, 5, 6])],
+                Arc::clone(&schema),
+                None,
+            )
+            .expect("update stream"),
+        );
+        let collected = task
+            .except_existing_records_from(
+                &refresh,
+                StreamingDataUpdate::new(update_stream, UpdateType::Append),
+                stored_from,
+            )
+            .await
+            .expect("dedupe")
+            .collect_data()
+            .await
+            .expect("collect");
+        let ids: Vec<i32> = collected
+            .data
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![4, 5, 6], "every row of the new load is appended");
     }
 }
