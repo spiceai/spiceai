@@ -25,7 +25,7 @@ use crate::accelerated::timestamp_metrics_utils::with_find_max_timestamp_in_stre
 use crate::federated::FederatedTable;
 use crate::filter_converter::TimestampFilterConvert;
 use crate::filter_converter::create_timestamp_filter_convert;
-use arrow::compute::{SortOptions, filter_record_batch};
+use arrow::compute::filter_record_batch;
 use arrow::{
     array::{Array, ArrayRef, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
     datatypes::DataType,
@@ -2885,29 +2885,23 @@ impl RefreshTask {
         //
         // The index is built with the first incoming batch, so an append that brings no
         // rows does not encode the stored ones, and a stored column of the wrong type
-        // fails the refresh where the comparison would have.
-        let mut index: Option<Option<OverlapIndex>> = None;
+        // fails the refresh where the comparison would have. The stored batches are
+        // released once encoded: only the index reads them after that.
+        let mut index: Option<OverlapIndex> = None;
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&output_schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
                     let source_batch = batch?;
                     let normalized_batch = try_cast_to(source_batch.clone(), Arc::clone(&filter_schema))
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    if index.is_none() {
-                        index = Some(
-                            OverlapIndex::try_new(&existing_records, &filter_schema)
-                                .map_err(|e| DataFusionError::External(Box::new(e)))?,
-                        );
-                    }
-                    let predicates = match index.as_mut().and_then(Option::as_mut) {
-                        Some(index) => index.predicates(&normalized_batch, &filter_schema, &mut used),
-                        None => dedup_predicates(
-                            &normalized_batch,
-                            &existing_records,
-                            &filter_schema,
-                            &mut used,
-                        ),
-                    }
+                    let built = match index.take() {
+                        Some(built) => built,
+                        None => OverlapIndex::try_new(&std::mem::take(&mut existing_records), &filter_schema)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                    };
+                    let predicates = index
+                        .insert(built)
+                        .predicates(&normalized_batch, &filter_schema, &mut used)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     let batch = filter_record_batch(&source_batch, &predicates.into())
                         .context(super::FailedToFilterUpdatesSnafu)
@@ -3754,16 +3748,20 @@ fn filter_records(
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
-    let predicates = match OverlapIndex::try_new(existing_records, filter_schema)? {
-        Some(mut index) => index.predicates(update_data, filter_schema, used)?,
-        None => dedup_predicates(update_data, existing_records, filter_schema, used)?,
-    };
+    let predicates = OverlapIndex::try_new(existing_records, filter_schema)?.predicates(
+        update_data,
+        filter_schema,
+        used,
+    )?;
 
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
 }
 
 /// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
-/// each matching existing row at most once across the append overlap stream.
+/// each matching existing row at most once across the append overlap stream, by comparing
+/// every incoming row with every existing row. [`OverlapIndex`] computes the same result;
+/// this is the oracle its differential test compares it with.
+#[cfg(test)]
 fn dedup_predicates(
     update_data: &RecordBatch,
     existing_records: &[RecordBatch],
@@ -3811,32 +3809,13 @@ fn dedup_predicates(
             make_comparator(
                 &update_struct_array,
                 &existing_struct_array,
-                SortOptions::default(),
+                arrow::compute::SortOptions::default(),
             )
             .context(super::FailedToFilterUpdatesSnafu)?,
         ));
     }
 
-    // The caller builds `used` from these same batches, so a mismatch is a bug here rather
-    // than bad input - but it must not be a silent one. Too few sets and the `zip` below
-    // would skip existing batches, under-subtracting; a set longer than its batch would
-    // hand the comparator a row index that batch does not have.
-    if used.len() != comparators.len()
-        || comparators
-            .iter()
-            .zip(used.iter())
-            .any(|((rows, _), used_rows)| *rows != used_rows.len())
-    {
-        return Err(ArrowError::ComputeError(format!(
-            "append de-duplication state does not describe the rows being compared: \
-             {} existing batches holding {} rows, against {} sets of {} claim flags",
-            comparators.len(),
-            comparators.iter().map(|(rows, _)| rows).sum::<usize>(),
-            used.len(),
-            used.iter().map(Vec::len).sum::<usize>(),
-        )))
-        .context(super::FailedToFilterUpdatesSnafu);
-    }
+    ensure_claim_flags(comparators.iter().map(|(rows, _)| *rows), used)?;
 
     for i in 0..update_data.num_rows() {
         let mut not_matched = true;
@@ -3877,101 +3856,123 @@ fn dedup_columns(batch: &RecordBatch, filter_schema: &SchemaRef) -> super::Resul
         .collect()
 }
 
+/// Checks that `used` holds one claim flag per stored row, batch by batch. The caller
+/// builds it from the same batches, so a mismatch is a bug here rather than bad input -
+/// but it must not be a silent one: too few sets would skip stored batches and
+/// under-subtract, and a set longer than its batch would index a row it does not have.
+fn ensure_claim_flags(
+    stored_rows: impl Iterator<Item = usize> + Clone,
+    used: &[Vec<bool>],
+) -> super::Result<()> {
+    if stored_rows.clone().count() == used.len()
+        && stored_rows
+            .clone()
+            .zip(used)
+            .all(|(rows, flags)| rows == flags.len())
+    {
+        return Ok(());
+    }
+    Err(ArrowError::ComputeError(format!(
+        "append de-duplication state does not describe the rows being compared: \
+         {} existing batches holding {} rows, against {} sets of {} claim flags",
+        stored_rows.clone().count(),
+        stored_rows.sum::<usize>(),
+        used.len(),
+        used.iter().map(Vec::len).sum::<usize>(),
+    )))
+    .context(super::FailedToFilterUpdatesSnafu)
+}
+
 /// The stored rows of an append's overlap window, indexed so that an incoming row is
 /// compared only with the stored rows that encode the same, rather than with every one.
 ///
 /// Each row is encoded with one [`RowConverter`]: two rows encode to equal bytes exactly
-/// when [`dedup_predicates`]'s comparator finds them equal (nulls equal to nulls, floats
-/// by their total order), and stored rows are bucketed by the hash of their encoding.
-/// That turns the subtraction from one comparison per (incoming, stored) pair, which
-/// never finished for a 600k-row load against 600k stored rows (#15329), into one hash
-/// lookup per incoming row. It is the same multiset subtraction: within a bucket the
-/// stored rows stay in stored order, and an incoming row claims the first unused one
-/// that encodes equal, as the pairwise comparison does.
+/// when they are equal as whole rows, with nulls equal to nulls and floats compared by
+/// their total order. The stored rows are grouped by the hash of their encoding, which
+/// turns the subtraction from one comparison per (incoming, stored) pair - it never
+/// finished for a 600k-row load against 600k stored rows (#15329) - into one hash lookup
+/// per incoming row.
+///
+/// The subtraction is a **multiset** (bag) subtraction: each stored row cancels at most
+/// one incoming row, across every batch of the update stream, recorded in the caller's
+/// `used` flags. Within a group the stored rows stay in stored order, and an incoming
+/// row claims the first unclaimed one that encodes equal.
 struct OverlapIndex {
     converter: RowConverter,
     hasher: RandomState,
     /// The encoded rows of each stored batch, in `existing_records` order.
     rows: Vec<Rows>,
-    buckets: HashMap<u64, OverlapBucket>,
+    /// Every stored row as (batch, row), grouped by encoding hash, in stored order
+    /// within each group.
+    positions: Vec<(usize, usize)>,
+    groups: HashMap<u64, OverlapGroup>,
 }
 
-/// The stored rows whose encodings share one hash, in stored order.
-#[derive(Default)]
-struct OverlapBucket {
-    positions: Vec<(usize, usize)>,
-    /// Every position before this one has been claimed, so a run of identical rows
-    /// is not rescanned from the start for each incoming copy.
+/// One hash's run of `OverlapIndex::positions`.
+struct OverlapGroup {
+    /// Every position of the group before this one has been claimed, so a run of
+    /// identical rows is not rescanned from the start for each incoming copy.
     first_unclaimed: usize,
+    end: usize,
 }
 
 impl OverlapIndex {
-    /// Indexes `existing_records`, or returns `None` when a compared column has a type
-    /// the row format cannot encode, which leaves the pairwise comparison to do it.
-    fn try_new(
-        existing_records: &[RecordBatch],
-        filter_schema: &SchemaRef,
-    ) -> super::Result<Option<Self>> {
+    fn try_new(existing_records: &[RecordBatch], filter_schema: &SchemaRef) -> super::Result<Self> {
         let fields: Vec<SortField> = filter_schema
             .fields()
             .iter()
             .map(|field| SortField::new(field.data_type().clone()))
             .collect();
-        if !RowConverter::supports_fields(&fields) {
-            return Ok(None);
-        }
         let converter = RowConverter::new(fields).context(super::FailedToFilterUpdatesSnafu)?;
         let hasher = RandomState::new();
+        let total_rows = existing_records.iter().map(RecordBatch::num_rows).sum();
         let mut rows = Vec::with_capacity(existing_records.len());
-        let mut buckets: HashMap<u64, OverlapBucket> = HashMap::new();
+        let mut hashed: Vec<(u64, usize, usize)> = Vec::with_capacity(total_rows);
         for (batch_idx, existing) in existing_records.iter().enumerate() {
             let encoded = converter
                 .convert_columns(&dedup_columns(existing, filter_schema)?)
                 .context(super::FailedToFilterUpdatesSnafu)?;
-            for row_idx in 0..encoded.num_rows() {
-                buckets
-                    .entry(hasher.hash_one(encoded.row(row_idx)))
-                    .or_default()
-                    .positions
-                    .push((batch_idx, row_idx));
-            }
+            hashed.extend(
+                (0..encoded.num_rows())
+                    .map(|row_idx| (hasher.hash_one(encoded.row(row_idx)), batch_idx, row_idx)),
+            );
             rows.push(encoded);
         }
-        Ok(Some(Self {
+        // A stable sort, so each group keeps its rows in stored order.
+        hashed.sort_by_key(|&(hash, _, _)| hash);
+
+        let mut groups: HashMap<u64, OverlapGroup> = HashMap::new();
+        for (idx, &(hash, _, _)) in hashed.iter().enumerate() {
+            groups
+                .entry(hash)
+                .and_modify(|group| group.end = idx + 1)
+                .or_insert(OverlapGroup {
+                    first_unclaimed: idx,
+                    end: idx + 1,
+                });
+        }
+        let positions = hashed
+            .into_iter()
+            .map(|(_, batch_idx, row_idx)| (batch_idx, row_idx))
+            .collect();
+        Ok(Self {
             converter,
             hasher,
             rows,
-            buckets,
-        }))
+            positions,
+            groups,
+        })
     }
 
-    /// [`dedup_predicates`] for one incoming batch: `true` keeps a row the stored rows do
-    /// not hold, and each stored row cancels at most one incoming row across the stream,
-    /// recorded in `used`.
+    /// The incoming rows of `update_data` to keep: `false` for each one a still-unclaimed
+    /// stored row cancels, which that row's flag in `used` then records as claimed.
     fn predicates(
         &mut self,
         update_data: &RecordBatch,
         filter_schema: &SchemaRef,
         used: &mut [Vec<bool>],
     ) -> super::Result<Vec<bool>> {
-        if used.len() != self.rows.len()
-            || self
-                .rows
-                .iter()
-                .zip(used.iter())
-                .any(|(rows, used_rows)| rows.num_rows() != used_rows.len())
-        {
-            return Err(ArrowError::ComputeError(format!(
-                "append de-duplication state does not describe the rows being compared: \
-                 {} existing batches holding {} rows, against {} sets of {} claim flags",
-                self.rows.len(),
-                self.rows.iter().map(Rows::num_rows).sum::<usize>(),
-                used.len(),
-                used.iter().map(Vec::len).sum::<usize>(),
-            )))
-            .context(super::FailedToFilterUpdatesSnafu);
-        }
-
+        ensure_claim_flags(self.rows.iter().map(Rows::num_rows), used)?;
         let incoming = self
             .converter
             .convert_columns(&dedup_columns(update_data, filter_schema)?)
@@ -3979,16 +3980,17 @@ impl OverlapIndex {
         let mut predicates = Vec::with_capacity(incoming.num_rows());
         for row in &incoming {
             let claimed = self
-                .buckets
+                .groups
                 .get_mut(&self.hasher.hash_one(row))
-                .and_then(|bucket| {
-                    while let Some(&(batch_idx, row_idx)) =
-                        bucket.positions.get(bucket.first_unclaimed)
-                        && used[batch_idx][row_idx]
-                    {
-                        bucket.first_unclaimed += 1;
+                .and_then(|group| {
+                    while group.first_unclaimed < group.end {
+                        let (batch_idx, row_idx) = self.positions[group.first_unclaimed];
+                        if !used[batch_idx][row_idx] {
+                            break;
+                        }
+                        group.first_unclaimed += 1;
                     }
-                    bucket.positions[bucket.first_unclaimed..]
+                    self.positions[group.first_unclaimed..group.end]
                         .iter()
                         .copied()
                         .find(|&(batch_idx, row_idx)| {
@@ -6376,9 +6378,7 @@ mod tests {
                 existing.iter().map(|b| vec![false; b.num_rows()]).collect()
             };
             let (mut used_pairwise, mut used_indexed) = (fresh(), fresh());
-            let mut index = OverlapIndex::try_new(&existing, &schema)
-                .expect("index builds")
-                .expect("these types have a row encoding");
+            let mut index = OverlapIndex::try_new(&existing, &schema).expect("index builds");
             for update in &incoming {
                 let pairwise = dedup_predicates(update, &existing, &schema, &mut used_pairwise)
                     .expect("pairwise");
