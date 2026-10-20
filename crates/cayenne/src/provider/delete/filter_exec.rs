@@ -885,6 +885,8 @@ fn sorted_deleted_rows_impl<C: KeyCompare>(
     metrics: &DeletionFilterMetrics,
     cache: &mut SortedFilterScratch,
 ) -> datafusion_common::Result<()> {
+    #[cfg(test)]
+    sorted_filter_differential_tests::record_randomized_kernel::<C>();
     cache.deleted.clear();
     cache.candidates.clear();
     if let Some(types) = &cache.types {

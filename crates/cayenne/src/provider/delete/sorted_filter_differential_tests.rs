@@ -36,68 +36,6 @@ impl Random {
     }
 }
 
-// Utf8View batches with Utf8 converter fields are rejected by RowCodec schema
-// validation, so the differential corpus uses matching physical types.
-fn corpus(kind: usize, n: usize) -> Vec<ArrayRef> {
-    let ints = |column: usize| {
-        Arc::new(Int32Array::from(
-            (0..n)
-                .map(|i| {
-                    if (i + column * 7).is_multiple_of(17) {
-                        None
-                    } else {
-                        Some(
-                            i32::try_from(if column == 0 {
-                                i / 4
-                            } else {
-                                (i * (2 * column + 1)) % n
-                            })
-                            .expect("small corpus")
-                                - 500,
-                        )
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )) as ArrayRef
-    };
-    let longs = || {
-        Arc::new(Int64Array::from(
-            (0..n)
-                .map(|i| {
-                    if i % 19 == 0 {
-                        None
-                    } else {
-                        Some(i64::try_from(i).expect("small corpus") - 100)
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )) as ArrayRef
-    };
-    let strings = || {
-        Arc::new(StringArray::from(
-            (0..n)
-                .map(|i| (i % 13 != 0).then(|| format!("key-{i:06}")))
-                .collect::<Vec<_>>(),
-        )) as ArrayRef
-    };
-    match kind {
-        0 => vec![longs()],
-        1 => vec![ints(0), ints(1), ints(2), ints(3)],
-        2 => vec![strings()],
-        3 => {
-            let values: Vec<_> = (0..n).map(usize::to_be_bytes).collect();
-            vec![Arc::new(BinaryArray::from(
-                values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| (i % 11 != 0).then_some(b.as_slice()))
-                    .collect::<Vec<_>>(),
-            ))]
-        }
-        _ => vec![ints(0), strings(), longs()],
-    }
-}
-
 fn hash_deleted_rows(
     columns: &[ArrayRef],
     converter: &RowConverter,
@@ -115,6 +53,106 @@ fn hash_deleted_rows(
     deleted
 }
 
+thread_local! {
+    static RANDOMIZED_KERNEL: std::cell::Cell<Option<&'static str>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub(super) fn record_randomized_kernel<C>() {
+    RANDOMIZED_KERNEL.set(Some(std::any::type_name::<C>()));
+}
+
+// Utf8View batches with Utf8 converter fields are rejected by RowCodec schema
+// validation, so this corpus uses matching physical types.
+// Each family varies one column at a time, so even large chosen domains contain
+// long common prefixes. Symbols map injectively to every physical column type.
+fn small_domain_corpus(
+    kind: usize,
+    nullable: bool,
+    rng: &mut Random,
+    n: usize,
+) -> (Vec<ArrayRef>, Vec<Vec<Option<usize>>>) {
+    let width = match kind {
+        1 => 4,
+        2 => 2,
+        5 => 3,
+        _ => 1,
+    };
+    let domains: Vec<_> = (0..width).map(|_| [2, 3, 4, 8, 64][rng.index(5)]).collect();
+    let mut symbols = vec![vec![Some(0); width]; n];
+    // A live key and a tombstone differ only in their last column. NULLs also
+    // occupy that distinguishing position in nullable cases.
+    symbols[0][width - 1] = if nullable { None } else { Some(0) };
+    symbols[1][width - 1] = Some(1);
+    symbols[2][0] = Some(1);
+    for base in (3..n).step_by(8) {
+        let prefix: Vec<_> = domains
+            .iter()
+            .map(|&d| {
+                if nullable && rng.index(5) == 0 {
+                    None
+                } else {
+                    Some(rng.index(d))
+                }
+            })
+            .collect();
+        let varying = rng.index(width);
+        for row in symbols.iter_mut().take((base + 8).min(n)).skip(base) {
+            row.clone_from(&prefix);
+            row[varying] = if nullable && rng.index(5) == 0 {
+                None
+            } else {
+                Some(rng.index(domains[varying]))
+            };
+        }
+    }
+    if nullable {
+        for column in 0..width {
+            symbols[3 + column] = vec![Some(0); width];
+            symbols[3 + column][column] = None;
+        }
+    }
+    let text = |v: usize| match v {
+        0 => "a".to_owned(),
+        1 => "aa".to_owned(),
+        2 => "ab".to_owned(),
+        _ => format!("aa{v:02}"),
+    };
+    let columns = (0..width)
+        .map(|column| {
+            let values: Vec<_> = symbols.iter().map(|row| row[column]).collect();
+            match (kind, column) {
+                (0, _) | (2, 1) | (5, 2) => Arc::new(Int64Array::from(
+                    values
+                        .iter()
+                        .map(|v| v.map(|v| i64::try_from(v).expect("small domain") - 1))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                (3, _) | (5, 1) => Arc::new(StringArray::from(
+                    values.iter().map(|v| v.map(text)).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                (4, _) => {
+                    let bytes: Vec<_> = values
+                        .iter()
+                        .map(|v| v.map(|v| text(v).into_bytes()))
+                        .collect();
+                    Arc::new(BinaryArray::from(
+                        bytes.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+                    )) as ArrayRef
+                }
+                _ => Arc::new(Int32Array::from(
+                    values
+                        .iter()
+                        .map(|v| v.map(|v| i32::try_from(v).expect("small domain") - 1))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            }
+        })
+        .collect();
+    (columns, symbols)
+}
+
 #[tokio::test]
 async fn sorted_filter_randomized_differential() {
     let initial = std::env::var("SORTED_FILTER_SEED")
@@ -122,174 +160,274 @@ async fn sorted_filter_randomized_differential() {
         .map_or(0x91ab_5234_7789, |s| {
             s.parse::<u64>().expect("SORTED_FILTER_SEED must be u64")
         });
+    let started = std::time::Instant::now();
+    let mut deleting_cases = 0;
+    let mut near_miss_cases = 0;
+    let mut integer_cases = 0;
+    let mut typed_cases = 0;
     for case in 0..300_u64 {
         let seed = initial.wrapping_add(case);
         let mut rng = Random(seed.max(1));
-        let n = if case < 5 { 16000 } else { 192 };
-        let columns = corpus(usize::try_from(case % 5).expect("small kind"), n);
-        let converter = Arc::new(
-            RowConverter::new(
-                columns
+        for (kind, nullable) in [
+            (usize::try_from(case % 3).expect("small shape"), false),
+            (
+                3 + usize::try_from(case % 3).expect("small shape"),
+                case % 2 == 0,
+            ),
+        ] {
+            let n = 96;
+            let (columns, symbols) = small_domain_corpus(kind, nullable, &mut rng, n);
+            let converter = Arc::new(
+                RowConverter::new(
+                    columns
+                        .iter()
+                        .map(|a| SortField::new(a.data_type().clone()))
+                        .collect(),
+                )
+                .expect("converter"),
+            );
+            let keys = converter.convert_columns(&columns).expect("encode corpus");
+            let key = |i: usize| keys.row(i).as_ref().to_vec();
+            let reserved: Vec<_> = (0..3).map(key).collect();
+            let available: Vec<_> = (3..n).filter(|&i| !reserved.contains(&key(i))).collect();
+            let mut index = KeyDeletionIndex::from_maps(
+                available
                     .iter()
-                    .map(|a| SortField::new(a.data_type().clone()))
+                    .take(8)
+                    .map(|&i| (key(i).into_boxed_slice(), 1))
                     .collect(),
-            )
-            .expect("converter"),
-        );
-        let keys = converter.convert_columns(&columns).expect("encode corpus");
-        let key = |i: usize| keys.row(i).as_ref().to_vec();
-        let mut index = KeyDeletionIndex::from_maps(
-            (0..16).map(|i| (key(i).into_boxed_slice(), 1)).collect(),
-            (16..32).map(|i| (key(i).into_boxed_slice(), 2)).collect(),
-        );
-        if case < 5 {
-            for range in [0..10000, 10000..14520, 14520..15220] {
-                index = index.extend_max_deletes(range.map(|i| (key(i), 1)));
-            }
-            assert_eq!(index.sorted_runs().count(), 3, "seed={seed}");
-        }
-        for seq in 2..30_i64 {
-            let additions: Vec<_> = (0..=rng.index(50)).map(|_| key(rng.index(n))).collect();
-            match rng.index(5) {
-                0 => index = index.extend_max_deletes(additions.into_iter().map(|k| (k, seq))),
-                1 => index = index.extend_max_conflicts(additions, seq, seq + 1),
-                2 => {
-                    index = index.extend_max(
-                        additions.iter().cloned().map(|k| (k, seq)),
-                        additions.iter().cloned().map(|k| (k, seq, seq + 1)),
+                available
+                    .iter()
+                    .skip(8)
+                    .take(8)
+                    .map(|&i| (key(i).into_boxed_slice(), 2))
+                    .collect(),
+            );
+            for seq in 2..30_i64 {
+                let additions: Vec<_> = if available.is_empty() {
+                    Vec::new()
+                } else {
+                    (0..=rng.index(12))
+                        .map(|_| key(available[rng.index(available.len())]))
+                        .collect()
+                };
+                match rng.index(5) {
+                    0 => index = index.extend_max_deletes(additions.into_iter().map(|k| (k, seq))),
+                    1 => index = index.extend_max_conflicts(additions, seq, seq + 1),
+                    2 => {
+                        index = index.extend_max(
+                            additions.iter().cloned().map(|k| (k, seq)),
+                            additions.iter().cloned().map(|k| (k, seq, seq + 1)),
+                        );
+                    }
+                    3 => index = index.prune_deletes_at_or_below(seq / 2),
+                    _ => {
+                        let prefix = index.prune_frozen_prefix(seq / 2);
+                        index = index
+                            .with_pruned_prefix(&prefix)
+                            .expect("unchanged prefix applies");
+                    }
+                }
+                let sorted = index.sorted_fused_entries();
+                for key in &keys {
+                    assert_eq!(
+                        sorted.get(key.as_ref()).copied(),
+                        index.core_fused_entry(key.as_ref()),
+                        "seed={seed}, sequence={seq}, key={:?}",
+                        key.as_ref()
                     );
                 }
-                3 => index = index.prune_deletes_at_or_below(seq / 2),
-                _ => {
-                    let prefix = index.prune_frozen_prefix(seq / 2);
-                    index = index
-                        .with_pruned_prefix(&prefix)
-                        .expect("unchanged prefix applies");
+                for (key, entry) in &sorted {
+                    assert_eq!(
+                        Some(*entry),
+                        index.core_fused_entry(key),
+                        "seed={seed}, sequence={seq}, unexpected sorted key={key:?}"
+                    );
                 }
             }
-            let sorted = index.sorted_fused_entries();
-            for key in &keys {
-                assert_eq!(
-                    sorted.get(key.as_ref()).copied(),
-                    index.core_fused_entry(key.as_ref()),
-                    "seed={seed}, sequence={seq}, key={:?}",
-                    key.as_ref()
+            // Consolidate a delete into the old run, then place newer per-side
+            // maxima in the tail. First-run-wins must disagree with the oracle.
+            if columns.len() > 1 {
+                index = index.extend_max_deletes([(key(2), 100)]);
+            }
+            index = index.prune_deletes_at_or_below(-1);
+            if columns.len() > 1 {
+                index = index.extend_max_conflicts([key(2)], 101, 102);
+            }
+            index = index.extend_max_deletes([(key(1), 103)]);
+            if columns.len() > 1 {
+                assert!(
+                    index.sorted_runs().count() >= 2,
+                    "seed={seed}, kind={kind}, missing cross-run fusion coverage"
                 );
             }
-            for (key, entry) in &sorted {
-                assert_eq!(
-                    Some(*entry),
-                    index.core_fused_entry(key),
-                    "seed={seed}, sequence={seq}, unexpected sorted key={key:?}"
-                );
-            }
-        }
-        let index = Arc::new(index);
-        let mut positions: Vec<_> = (0..256).map(|_| rng.index(n)).collect();
-        match case % 4 {
-            0 => positions.sort_by(|&a, &b| keys.row(a).as_ref().cmp(keys.row(b).as_ref())),
-            1 => {
-                let run_count = 2 + rng.index(4);
-                let chunk_len = positions.len().div_ceil(run_count);
-                for run in positions.chunks_mut(chunk_len) {
-                    run.sort_by(|&a, &b| keys.row(a).as_ref().cmp(keys.row(b).as_ref()));
-                }
-            }
-            2 => positions.clear(),
-            _ => {}
-        }
-        let take = UInt32Array::from(
-            positions
-                .iter()
-                .map(|&i| u32::try_from(i).expect("small index"))
-                .collect::<Vec<_>>(),
-        );
-        let batch_columns: Vec<_> = columns
-            .iter()
-            .map(|a| arrow::compute::take(a.as_ref(), &take, None).expect("take corpus"))
-            .collect();
-        let schema = Arc::new(Schema::new(
-            batch_columns
+            let index = Arc::new(index);
+            let mut positions: Vec<_> = (0..96).map(|_| rng.index(n)).collect();
+            positions.extend([0, 0, 1, 1, 1, 2, 2]);
+            let near_misses = symbols
                 .iter()
                 .enumerate()
-                .map(|(i, a)| Field::new(format!("k{i}"), a.data_type().clone(), true))
-                .collect::<Vec<_>>(),
-        ));
-        let batch = arrow::array::RecordBatch::try_new(Arc::clone(&schema), batch_columns.clone())
-            .expect("batch");
-        for handling in [InsertRecordHandling::Apply, InsertRecordHandling::Ignore] {
-            for cutoff in [
-                None,
-                Some(i64::try_from(rng.index(30)).expect("small sequence")),
-            ] {
-                let metrics = DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-                let sorted = sorted_deleted_rows(
-                    &batch_columns,
-                    &converter,
-                    &index,
-                    handling,
-                    cutoff,
-                    &metrics,
-                    &mut SortedFilterScratch::new(),
-                )
-                .expect("native kernel");
-                let hash = hash_deleted_rows(&batch_columns, &converter, &index, handling, cutoff);
-                assert_eq!(
-                    sorted, hash,
-                    "seed={seed}, cutoff={cutoff:?}, handling={handling:?}"
-                );
-                assert_eq!(
-                    metrics.permuted_batches.value(),
-                    usize::from(case % 4 == 3),
-                    "seed={seed}, permutation path"
-                );
-                assert_eq!(
-                    metrics.permuted_rows.value(),
-                    if case % 4 == 3 { positions.len() } else { 0 },
-                    "seed={seed}, permuted rows"
-                );
-                if case % 4 <= 1 {
+                .filter(|(i, tomb)| {
+                    index.get_with_min_seq(&key(*i), None).is_some()
+                        && positions.iter().any(|&row| {
+                            tomb.iter()
+                                .zip(&symbols[row])
+                                .filter(|(a, b)| a != b)
+                                .count()
+                                == 1
+                        })
+                })
+                .count();
+            assert!(
+                near_misses > 0,
+                "seed={seed}, kind={kind}, missing near-miss tombstones"
+            );
+            near_miss_cases += usize::from(near_misses > 0);
+            match case % 4 {
+                0 | 2 => positions.sort_by(|&a, &b| keys.row(a).as_ref().cmp(keys.row(b).as_ref())),
+                1 => {
+                    let run_count = 2 + rng.index(4);
+                    let chunk_len = positions.len().div_ceil(run_count);
+                    for run in positions.chunks_mut(chunk_len) {
+                        run.sort_by(|&a, &b| keys.row(a).as_ref().cmp(keys.row(b).as_ref()));
+                    }
+                }
+                _ => {}
+            }
+            let take = UInt32Array::from(
+                positions
+                    .iter()
+                    .map(|&i| u32::try_from(i).expect("small index"))
+                    .collect::<Vec<_>>(),
+            );
+            let batch_columns: Vec<_> = columns
+                .iter()
+                .map(|a| arrow::compute::take(a.as_ref(), &take, None).expect("take corpus"))
+                .collect();
+            let schema = Arc::new(Schema::new(
+                batch_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| Field::new(format!("k{i}"), a.data_type().clone(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch =
+                arrow::array::RecordBatch::try_new(Arc::clone(&schema), batch_columns.clone())
+                    .expect("batch");
+            let mut oracle_deletes = false;
+            for handling in [InsertRecordHandling::Apply, InsertRecordHandling::Ignore] {
+                for cutoff in [
+                    None,
+                    Some(i64::try_from(rng.index(30)).expect("small sequence")),
+                ] {
+                    let metrics = DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+                    RANDOMIZED_KERNEL.set(None);
+                    let sorted = sorted_deleted_rows(
+                        &batch_columns,
+                        &converter,
+                        &index,
+                        handling,
+                        cutoff,
+                        &metrics,
+                        &mut SortedFilterScratch::new(),
+                    )
+                    .expect("native kernel");
+                    let kernel = RANDOMIZED_KERNEL.get().unwrap_or_default();
                     assert_eq!(
-                        metrics.sorted_runs.value() > 0,
-                        !positions.is_empty(),
-                        "seed={seed}"
+                        kernel.contains("IntegerComparator"),
+                        kind <= 2,
+                        "seed={seed}, kind={kind}, wrong kernel: {kernel}"
+                    );
+                    assert_eq!(
+                        kernel.contains("TypedComparator"),
+                        kind >= 3,
+                        "seed={seed}, kind={kind}, wrong kernel: {kernel}"
+                    );
+                    let hash =
+                        hash_deleted_rows(&batch_columns, &converter, &index, handling, cutoff);
+                    if cutoff.is_none() {
+                        for (row, &source) in positions.iter().enumerate() {
+                            if source == 0 || source == 1 {
+                                assert_eq!(
+                                    hash.contains(&row),
+                                    source == 1,
+                                    "seed={seed}, kind={kind}, oracle near-miss/duplicate fixture row={row}"
+                                );
+                            }
+                        }
+                    }
+                    oracle_deletes |= !hash.is_empty();
+                    assert_eq!(
+                        sorted, hash,
+                        "seed={seed}, kind={kind}, nullable={nullable}, cutoff={cutoff:?}, handling={handling:?}"
+                    );
+                    let actual_runs = 1 + positions
+                        .windows(2)
+                        .filter(|pair| keys.row(pair[0]).as_ref() > keys.row(pair[1]).as_ref())
+                        .count();
+                    assert_eq!(
+                        metrics.permuted_batches.value(),
+                        usize::from(actual_runs > (positions.len() / 16).max(1)),
+                        "seed={seed}, kind={kind}, permutation path"
+                    );
+                    let input = MemorySourceConfig::try_new_exec(
+                        &[vec![batch.clone()]],
+                        Arc::clone(&schema),
+                        None,
+                    )
+                    .expect("input plan");
+                    let exec = KeyBasedDeletionFilterExec::new(
+                        input,
+                        Arc::clone(&index),
+                        handling,
+                        (0..columns.len()).collect(),
+                        Arc::clone(&converter),
+                        cutoff,
+                    );
+                    let ctx = SessionContext::new();
+                    let sorted_output: Vec<_> = exec
+                        .execute_sorted_options(0, ctx.task_ctx(), true, false)
+                        .expect("sorted stream")
+                        .try_collect()
+                        .await
+                        .expect("sorted output");
+                    let hash_output: Vec<_> = exec
+                        .execute_sorted_options(0, ctx.task_ctx(), false, false)
+                        .expect("hash stream")
+                        .try_collect()
+                        .await
+                        .expect("hash output");
+                    assert_eq!(
+                        arrow::compute::concat_batches(&schema, &sorted_output)
+                            .expect("concat sorted"),
+                        arrow::compute::concat_batches(&schema, &hash_output).expect("concat hash"),
+                        "seed={seed}, kind={kind}, nullable={nullable}, cutoff={cutoff:?}, handling={handling:?}"
                     );
                 }
-                let input = MemorySourceConfig::try_new_exec(
-                    &[vec![batch.clone()]],
-                    Arc::clone(&schema),
-                    None,
-                )
-                .expect("input plan");
-                let exec = KeyBasedDeletionFilterExec::new(
-                    input,
-                    Arc::clone(&index),
-                    handling,
-                    (0..columns.len()).collect(),
-                    Arc::clone(&converter),
-                    cutoff,
-                );
-                let ctx = SessionContext::new();
-                let sorted_output: Vec<_> = exec
-                    .execute_sorted_options(0, ctx.task_ctx(), true, false)
-                    .expect("sorted stream")
-                    .try_collect()
-                    .await
-                    .expect("sorted output");
-                let hash_output: Vec<_> = exec
-                    .execute_sorted_options(0, ctx.task_ctx(), false, false)
-                    .expect("hash stream")
-                    .try_collect()
-                    .await
-                    .expect("hash output");
-                assert_eq!(
-                    arrow::compute::concat_batches(&schema, &sorted_output).expect("concat sorted"),
-                    arrow::compute::concat_batches(&schema, &hash_output).expect("concat hash"),
-                    "seed={seed}, cutoff={cutoff:?}, handling={handling:?}"
-                );
             }
+            assert!(
+                oracle_deletes,
+                "seed={seed}, kind={kind}, oracle never deleted a row"
+            );
+            deleting_cases += usize::from(oracle_deletes);
+            integer_cases += usize::from(kind <= 2);
+            typed_cases += usize::from(kind >= 3);
         }
     }
+    assert_eq!(integer_cases, 300, "seed={initial}, integer coverage");
+    assert_eq!(typed_cases, 300, "seed={initial}, typed coverage");
+    assert!(
+        deleting_cases >= 450,
+        "seed={initial}, deleting cases={deleting_cases}/600"
+    );
+    assert!(
+        near_miss_cases >= 450,
+        "seed={initial}, near-miss cases={near_miss_cases}/600"
+    );
+    eprintln!(
+        "seed={initial}, integer_cases={integer_cases}, typed_cases={typed_cases}, deleting_cases={deleting_cases}, near_miss_cases={near_miss_cases}, debug_runtime={:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
