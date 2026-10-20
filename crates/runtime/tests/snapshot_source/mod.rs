@@ -30,7 +30,7 @@ limitations under the License.
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -53,7 +53,10 @@ use tempfile::TempDir;
 use crate::{
     docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
     init_tracing,
-    utils::{run_query, runtime_ready_check, test_request_context},
+    utils::{
+        PROMETHEUS, metric_series, metric_value, run_query, runtime_ready_check,
+        test_request_context,
+    },
 };
 
 const ACCESS_KEY: &str = "spiceadmin";
@@ -1496,6 +1499,195 @@ async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()
     );
 
     load.abort();
+    reader.shutdown().await;
+    Ok(())
+}
+
+const METRICS: &str = "spice_test_rustfs_snapshot_source_metrics";
+const REFRESH_ERRORS: &str = "dataset_acceleration_refresh_errors";
+const FETCHES_SKIPPED: &str = "dataset_acceleration_refresh_data_fetches_skipped";
+const REFRESH_DURATION: &str = "dataset_acceleration_refresh_duration_ms";
+
+/// Waits for `metric` over `labels` to reach `at_least`.
+async fn wait_for_metric(
+    metric: &str,
+    labels: &[(&str, &str)],
+    at_least: f64,
+    deadline: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut value = metric_value(&PROMETHEUS, metric, labels);
+    while value < at_least {
+        if started.elapsed() >= deadline {
+            return Err(anyhow!(
+                "{metric}{labels:?} should reach {at_least} within {deadline:?}, is {value}; all series: {:?}",
+                metric_series(&PROMETHEUS, metric, &[])
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        value = metric_value(&PROMETHEUS, metric, labels);
+    }
+    Ok(())
+}
+
+/// The count of `metric` over `labels`.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn count(metric: &str, labels: &[(&str, &str)]) -> u64 {
+    metric_value(&PROMETHEUS, metric, labels) as u64
+}
+
+/// Waits for one more skipped fetch: a poll that found the loaded snapshot published.
+async fn wait_for_a_skipped_fetch(labels: &[(&str, &str)], deadline: Duration) -> Result<()> {
+    let before = metric_value(&PROMETHEUS, FETCHES_SKIPPED, labels);
+    wait_for_metric(FETCHES_SKIPPED, labels, before + 1.0, deadline).await
+}
+
+/// `modules` still serves the 5 rows of the loaded snapshot and is `Ready`.
+async fn assert_serving_loaded_snapshot(
+    reader: &Arc<Runtime>,
+    table: &datafusion::common::TableReference,
+    modules: &str,
+) -> Result<()> {
+    assert_eq!(
+        rows(reader, modules).await?.len(),
+        5,
+        "keeps serving the loaded snapshot"
+    );
+    assert_eq!(
+        reader.status().get_dataset_status(table),
+        Some(ComponentStatus::Ready)
+    );
+    Ok(())
+}
+
+/// A reader that cannot advance to the published snapshot counts each failed poll on
+/// `dataset_acceleration_refresh_errors` with a reason, under `mode="snapshot"`, and
+/// keeps serving the loaded snapshot; a poll that finds nothing newer is still a skipped
+/// fetch (#15294, #15295).
+#[tokio::test]
+async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    LazyLock::force(&PROMETHEUS);
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(METRICS).await?;
+            let result = metrics_scenario(rustfs, &container, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+#[expect(clippy::float_cmp)] // counters are whole numbers
+async fn metrics_scenario(
+    rustfs: Rustfs,
+    container: &RunningContainer,
+    modules: &str,
+) -> Result<()> {
+    let snapshot_mode = [("dataset", modules), ("mode", "snapshot")];
+    let with_reason = |reason| [snapshot_mode[0], snapshot_mode[1], ("reason", reason)];
+    let not_found = with_reason("snapshot_not_found");
+    let older = with_reason("snapshot_older_than_loaded");
+    let other = with_reason("other");
+    let errors = |labels: &[(&str, &str)]| count(REFRESH_ERRORS, labels);
+
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let table = datafusion::common::TableReference::bare(modules);
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
+
+    // So an unreachable store fails a poll within the test.
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    let mut params = s3_params(rustfs);
+    params.insert("file_format".to_string(), "snapshot".to_string());
+    params.insert("client_timeout".to_string(), "2s".to_string());
+    dataset.params = Some(Params::from_string_map(params));
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_metrics_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&reader).await?;
+    assert_eq!(rows(&reader, modules).await?.len(), 3);
+
+    // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
+    std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
+    wait_for_rows(&writer, modules, 5).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 1).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+    wait_for_rows(&reader, modules, 5).await?;
+    writer.shutdown().await;
+    // Polls that find nothing newer are skipped fetches.
+    wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
+    assert_eq!(errors(&[("dataset", modules)]), 0);
+
+    // The location is deleted.
+    let reader_bucket = bucket_store(rustfs, READER_BUCKET)?;
+    let metadata_key = ObjectPath::from(format!("{prefix}/metadata.json"));
+    let metadata = reader_bucket.get(&metadata_key).await?.bytes().await?;
+    reader_bucket.delete(&metadata_key).await?;
+    wait_for_metric(REFRESH_ERRORS, &not_found, 1.0, Duration::from_secs(30)).await?;
+    let skipped_at_first_error = count(FETCHES_SKIPPED, &snapshot_mode);
+    wait_for_metric(REFRESH_ERRORS, &not_found, 3.0, Duration::from_secs(30)).await?;
+    assert_eq!(
+        count(FETCHES_SKIPPED, &snapshot_mode),
+        skipped_at_first_error,
+        "a poll that finds no snapshot is a failed refresh, not a skipped fetch"
+    );
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+
+    // The location is recreated and the writer's ids restart.
+    let mut rolled_back: serde_json::Value = serde_json::from_slice(&metadata)?;
+    rolled_back[modules]["current-snapshot-id"] = serde_json::json!(0);
+    reader_bucket
+        .put(&metadata_key, serde_json::to_vec(&rolled_back)?.into())
+        .await?;
+    wait_for_metric(REFRESH_ERRORS, &older, 2.0, Duration::from_secs(30)).await?;
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+
+    // The current snapshot is published again.
+    reader_bucket.put(&metadata_key, metadata.into()).await?;
+    wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
+    let not_found_count = errors(&not_found);
+    let older_count = errors(&older);
+
+    // The store is unreachable. The client retries each read ten times and the metadata
+    // read retries that three times, so the failure surfaces after about 100 s.
+    assert_eq!(errors(&other), 0);
+    container.pause().await?;
+    let unreachable = wait_for_metric(REFRESH_ERRORS, &other, 1.0, Duration::from_mins(3)).await;
+    container.unpause().await?;
+    unreachable?;
+    // Reachable again.
+    wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_mins(2)).await?;
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+    assert_eq!(errors(&not_found), not_found_count);
+    assert_eq!(errors(&older), older_count);
+
+    // No refresh series of the dataset is without a mode (the writer's carry `full`).
+    assert!(
+        metric_value(&PROMETHEUS, REFRESH_DURATION, &snapshot_mode) >= 1.0,
+        "{REFRESH_DURATION} series: {:?}",
+        metric_series(&PROMETHEUS, REFRESH_DURATION, &[("dataset", modules)])
+    );
+    for metric in [REFRESH_ERRORS, FETCHES_SKIPPED, REFRESH_DURATION] {
+        let without_mode: Vec<_> = metric_series(&PROMETHEUS, metric, &[("dataset", modules)])
+            .into_iter()
+            .filter(|(labels, _)| !labels.iter().any(|(name, _)| name == "mode"))
+            .collect();
+        assert!(
+            without_mode.is_empty(),
+            "{metric} series without a mode: {without_mode:?}"
+        );
+    }
+
     reader.shutdown().await;
     Ok(())
 }

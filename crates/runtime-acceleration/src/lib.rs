@@ -37,7 +37,9 @@ pub use acceleration_source::AccelerationSource;
 pub use engine::Engine;
 pub use schema_change::OnSchemaChange;
 pub use sidecar::{AcceleratorSidecar, OpenOption};
-pub use snapshot::{PinRead, SnapshotDownloadInfo, SnapshotPoll, SnapshotPollError};
+pub use snapshot::{
+    PinRead, SnapshotDownloadInfo, SnapshotPoll, SnapshotPollError, SnapshotPollOutcome,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

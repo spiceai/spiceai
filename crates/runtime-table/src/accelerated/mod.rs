@@ -118,6 +118,23 @@ pub enum Error {
     #[snafu(display("{message}"))]
     RefreshNotApplied { message: String },
 
+    /// `refresh_mode: snapshot`: no snapshot of the dataset is published at the location.
+    #[snafu(display(
+        "No snapshot of the dataset is published at '{location}'. Ensure the location is correct and that a dataset with `acceleration.snapshots` enabled has published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotNotPublished { location: String },
+
+    /// `refresh_mode: snapshot`: the published snapshot is older than the loaded one and
+    /// is refused.
+    #[snafu(display(
+        "The snapshot published at '{location}' (id {published_id}) is older than the loaded snapshot (id {loaded_id}), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotOlderThanLoaded {
+        location: String,
+        published_id: u64,
+        loaded_id: u64,
+    },
+
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
         format_datafusion_error(source)
@@ -1975,7 +1992,8 @@ impl AcceleratedTable {
     /// `filters` uses the three-state `RefreshSQL` partition-filter semantics:
     /// `None` (not partition-scoped, retrieve everything), `Some(filters)` (the
     /// assigned partitions), or `Some(empty)` (no partitions assigned — load no
-    /// rows).
+    /// rows). The full or append refreshes after it reload the acceleration until one succeeds
+    /// (see `Refresh::owe_reload`).
     /// # Errors
     ///
     /// Returns an error if the refresh task cannot be notified of the new filters.
@@ -1998,6 +2016,7 @@ impl AcceleratedTable {
             sql.set_partition_filters(filters);
             refresh.sql = Some(sql);
         }
+        refresh.owe_reload();
         Ok(())
     }
 
@@ -3954,6 +3973,18 @@ mod tests {
             vec![5],
             "a table that is not partitioned"
         );
+    }
+
+    #[tokio::test]
+    async fn new_partition_filters_owe_a_reload() {
+        let (table, _accelerator) =
+            accelerator_only_table(Some(ClusterRole::Executor), false).await;
+        assert!(!table.refresh_params().read().await.reload);
+        table
+            .update_partition_filters(Some(vec![col("id").eq(lit("1"))]))
+            .await
+            .expect("partition filters are set");
+        assert!(table.refresh_params().read().await.reload);
     }
 
     /// Regression test for #13548. Acceleration snapshot creation holds

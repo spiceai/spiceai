@@ -29,10 +29,13 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
 };
+use http::{HeaderMap, header::AUTHORIZATION};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, http::HttpBuilder};
 use object_store_spawn::SpawnedReqwestConnector;
 use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
+
+use crate::http_auth;
 
 /// Records how a cached object store entry was built so fragment-aware lookups
 /// can repair a poisoned (env-default) entry without clobbering deliberate
@@ -505,10 +508,13 @@ impl SpiceObjectStoreRegistry {
         &self,
         url: &Url,
     ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        // Host and port only: object_store does not send URL user information, and
+        // its errors print the base URL.
+        let host_and_port = &url[url::Position::BeforeHost..url::Position::AfterPort];
         let base_url = if url.scheme() == "https" {
-            format!("https://{}/", url.authority())
+            format!("https://{host_and_port}/")
         } else {
-            format!("http://{}/", url.authority())
+            format!("http://{host_and_port}/")
         };
 
         let mut client_options = ClientOptions::new().with_allow_http(true);
@@ -520,6 +526,13 @@ impl SpiceObjectStoreRegistry {
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
                     DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}"))
                 })?);
+        }
+        if let Some(authorization) = params
+            .get(http_auth::FRAGMENT_KEY)
+            .and_then(|token| http_auth::authorization(url, token))
+        {
+            client_options = client_options
+                .with_default_headers(HeaderMap::from_iter([(AUTHORIZATION, authorization)]));
         }
 
         let builder = HttpBuilder::new()
@@ -935,6 +948,109 @@ pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves 404 to every request on a loopback port and records each request's
+    /// `Authorization` header.
+    async fn header_recording_server() -> (Url, Arc<Mutex<Vec<Option<String>>>>) {
+        use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+
+        async fn handler(
+            State(seen): State<Arc<Mutex<Vec<Option<String>>>>>,
+            request: Request<Body>,
+        ) -> Response<Body> {
+            let authorization = request
+                .headers()
+                .get(AUTHORIZATION)
+                .map(|value| value.to_str().unwrap_or_default().to_string());
+            seen.lock()
+                .expect("the request log is not poisoned")
+                .push(authorization);
+            Response::builder()
+                .status(404)
+                .body(Body::empty())
+                .expect("a 404 response builds")
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(axum::routing::any(handler))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the server binds a loopback port");
+        let address = listener.local_addr().expect("the server has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (
+            Url::parse(&format!("http://{address}/")).expect("valid URL"),
+            seen,
+        )
+    }
+
+    async fn head_through_registry(url: &Url) -> String {
+        use object_store::ObjectStoreExt;
+
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(url)
+            .expect("the registry builds an HTTP store");
+        store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("the server answers 404")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn http_store_sends_a_stored_credential_only_to_its_origin() {
+        let (origin, origin_seen) = header_recording_server().await;
+        let (other, other_seen) = header_recording_server().await;
+        let token = http_auth::register(
+            &origin,
+            "registry_user",
+            secrecy::SecretString::from("registry-pass"),
+        );
+        let with_token = |base: &Url| {
+            let mut url = base.join("items.csv").expect("valid path");
+            url.set_fragment(Some(&format!("{}={token}", http_auth::FRAGMENT_KEY)));
+            url
+        };
+
+        let origin_error = head_through_registry(&with_token(&origin)).await;
+        let other_error = head_through_registry(&with_token(&other)).await;
+
+        assert_eq!(
+            origin_seen.lock().expect("not poisoned").as_slice(),
+            [Some(
+                "Basic cmVnaXN0cnlfdXNlcjpyZWdpc3RyeS1wYXNz".to_string()
+            )]
+        );
+        assert_eq!(other_seen.lock().expect("not poisoned").as_slice(), [None]);
+        for error in [origin_error, other_error] {
+            assert!(
+                !error.contains("registry-pass") && !error.contains(&token),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_store_errors_do_not_show_url_user_information() {
+        let (origin, seen) = header_recording_server().await;
+        let mut url = origin.join("items.csv").expect("valid path");
+        url.set_username("url_user").expect("http URL takes a user");
+        url.set_password(Some("url-pass"))
+            .expect("http URL takes a password");
+
+        let error = head_through_registry(&url).await;
+
+        assert!(!error.contains("url-pass"), "{error}");
+        assert!(
+            error.contains(&format!("HEAD {origin}items.csv")),
+            "{error}"
+        );
+        assert_eq!(seen.lock().expect("not poisoned").as_slice(), [None]);
+    }
 
     #[tokio::test]
     async fn test_default_runtime_env() {
