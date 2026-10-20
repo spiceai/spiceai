@@ -47,8 +47,11 @@ use datafusion::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::Uri;
 use reqwest::{
-    Client,
-    header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
+    Client, StatusCode,
+    header::{
+        CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName,
+        HeaderValue, TRANSFER_ENCODING,
+    },
 };
 use runtime_rate_control::{Permit, RateController, RequestOutcome};
 use runtime_request_context::{TRACEPARENT_HEADER, resolve_request_context};
@@ -820,6 +823,14 @@ impl CacheKey {
             + self.request_headers.as_ref().map_or(0, String::capacity)
     }
 }
+
+/// Headers that describe a request body, which a redirect that drops the body drops too.
+const PAYLOAD_HEADERS: [HeaderName; 4] = [
+    CONTENT_TYPE,
+    CONTENT_LENGTH,
+    CONTENT_ENCODING,
+    TRANSFER_ENCODING,
+];
 
 /// What a data request carries for the origin the provider was configured with, besides
 /// the custom headers and authentication the provider itself holds.
@@ -1863,6 +1874,7 @@ impl HttpTableProvider {
         &self,
         url: &Url,
         body: Option<&str>,
+        drop_payload_headers: bool,
         attached: Option<AttachedToRequest<'_>>,
     ) -> reqwest::RequestBuilder {
         let mut request_builder = if let Some(body_content) = body {
@@ -1881,16 +1893,17 @@ impl HttpTableProvider {
             return request_builder;
         };
 
+        let is_sent = |name: &HeaderName| !(drop_payload_headers && PAYLOAD_HEADERS.contains(name));
         if let Some(request_headers) = request_headers {
             let mut merged_headers = self.custom_headers.clone();
             for (name, value) in request_headers {
                 merged_headers.insert(name.clone(), value.clone());
             }
-            for (name, value) in &merged_headers {
+            for (name, value) in merged_headers.iter().filter(|(name, _)| is_sent(name)) {
                 request_builder = request_builder.header(name, value);
             }
         } else {
-            for (name, value) in &self.custom_headers {
+            for (name, value) in self.custom_headers.iter().filter(|(name, _)| is_sent(name)) {
                 request_builder = request_builder.header(name, value);
             }
         }
@@ -1912,10 +1925,13 @@ impl HttpTableProvider {
     /// Sends a request to `url` and follows its redirects, which the client hands back
     /// under [`RedirectGuard::manual_policy`].
     ///
-    /// A hop to the origin of `url` is rebuilt with `attached` until the chain first
-    /// leaves that origin; that hop and every one after it are sent without it, so the
-    /// dataset's credentials reach only the origin they were configured for. A 307 or 308 replays the method and body, which is refused for
-    /// another origin; any other redirect becomes a `GET` without a body. Every target is
+    /// A hop to the origin of `url` is rebuilt with `attached` and with the user name and
+    /// password of `url` until the chain first leaves that origin; that hop and every one
+    /// after it are sent without them, so the dataset's credentials reach only the origin
+    /// they were configured for. A 307 or 308 replays the method and body, which is
+    /// refused for another origin; any other redirect becomes a `GET` without a body, and
+    /// — as `reqwest` does when it follows one — without the payload headers once a 303,
+    /// or a 301 or 302 to a `POST`, has dropped the body. Every target is
     /// checked against the guard, and the chain shares one budget, so the request fails at
     /// its [`MAX_REDIRECTS`]th redirect whichever origins it visits. A redirect that is
     /// not followed is returned as the response.
@@ -1925,15 +1941,21 @@ impl HttpTableProvider {
         body: Option<&str>,
         attached: Option<AttachedToRequest<'_>>,
     ) -> reqwest::Result<reqwest::Response> {
-        let mut response = self.build_request(url, body, attached).send().await?;
+        let mut response = self
+            .build_request(url, body, false, attached)
+            .send()
+            .await?;
         let Some(guard) = self.redirect_guard else {
             return Ok(response);
         };
         let origin = url.origin();
         let mut body = body;
-        let mut attached = attached;
+        let mut drop_payload_headers = false;
+        // Once the chain has left the origin, a later hop back to it was chosen by the
+        // other origin, so it is not sent the credentials either.
+        let mut on_origin = true;
         for _ in 1..MAX_REDIRECTS {
-            let Some(target) = redirect_target(&response) else {
+            let Some(mut target) = redirect_target(&response) else {
                 break;
             };
             let same_origin = target.origin() == origin;
@@ -1941,22 +1963,37 @@ impl HttpTableProvider {
                 if body.is_some() && !same_origin {
                     break;
                 }
-            } else {
-                body = None;
+            } else if body.take().is_some() || response.status() == StatusCode::SEE_OTHER {
+                drop_payload_headers = true;
             }
             if !guard.allows(&target) {
                 break;
             }
-            // Once the chain has left the origin, a later hop back to it was chosen by the
-            // other origin, so it is not sent the credentials either.
-            if !same_origin && attached.take().is_some() {
+            if on_origin && !same_origin {
+                on_origin = false;
                 tracing::debug!(
                     "Following a redirect from {} to {} without the dataset's request headers or authentication",
                     endpoint_label(response.url()),
                     endpoint_label(&target),
                 );
             }
-            response = self.build_request(&target, body, attached).send().await?;
+            // `reqwest` sends the URL's user name and password as an `Authorization`
+            // header and removes them from the URL a response reports.
+            if on_origin
+                && (target.set_username(url.username()).is_err()
+                    || target.set_password(url.password()).is_err())
+            {
+                break;
+            }
+            response = self
+                .build_request(
+                    &target,
+                    body,
+                    drop_payload_headers,
+                    attached.filter(|_| on_origin),
+                )
+                .send()
+                .await?;
         }
         Ok(response)
     }

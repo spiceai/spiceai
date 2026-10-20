@@ -543,3 +543,141 @@ async fn mixed_origin_chain_fails_at_the_fifth_redirect() {
         "the fifth redirect's target should receive nothing"
     );
 }
+
+/// A 302 turns the `POST` into a `GET` without its body, so the headers that describe the
+/// body go with it, while the configured origin's credentials stay.
+#[tokio::test]
+async fn same_origin_redirect_that_drops_the_body_drops_its_payload_headers() {
+    let origins = Origins::start().await;
+    origins.redirect("/post", 302, "/final").await;
+    Mock::given(path("/final"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(VICTIM_BODY))
+        .mount(&origins.victim)
+        .await;
+
+    let base = origins.provider(origins.victim_url("/")).await;
+    let mut headers = base.custom_headers().clone();
+    headers.insert(
+        reqwest::header::CONTENT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    let provider = base
+        .with_headers(headers)
+        .with_allowed_paths(vec!["/post".to_string()])
+        .expect("allowed paths should be valid")
+        .enable_body_filters(DEFAULT_MAX_BODY_BYTES);
+    let rows = query(
+        provider,
+        r#"SELECT content FROM t WHERE request_path = '/post' AND request_body = '{"x":1}'"#,
+    )
+    .await
+    .expect("the redirect should be followed");
+    assert_eq!(rows, vec![VICTIM_BODY.to_string()]);
+
+    let posted = requests_to(&origins.victim, "/post").await;
+    assert_eq!(posted.len(), 1);
+    assert_eq!(header(&posted[0], "content-encoding"), Some("identity"));
+
+    let followed = requests_to(&origins.victim, "/final").await;
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0].method.as_str(), "GET");
+    assert!(followed[0].body.is_empty());
+    for name in [
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+    ] {
+        assert_eq!(header(&followed[0], name), None, "{name}");
+    }
+    assert_eq!(credential_headers(&followed[0]), sent_credentials());
+}
+
+/// A provider for a dataset whose URL carries a user name and password, which `reqwest`
+/// sends as `Authorization: Basic`.
+async fn provider_with_url_credentials(origins: &Origins, request_path: &str) -> HttpTableProvider {
+    let mut url = origins.victim_url(request_path);
+    url.set_username("user")
+        .expect("URL should take a user name");
+    url.set_password(Some("pass"))
+        .expect("URL should take a password");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-api-key"),
+        HeaderValue::from_static(API_KEY),
+    );
+    origins.provider(url).await.with_headers(headers)
+}
+
+const URL_BASIC_AUTHORIZATION: &str = "Basic dXNlcjpwYXNz";
+
+/// The URL's user name and password are the configured origin's credentials, so a
+/// same-origin redirect keeps them.
+#[tokio::test]
+async fn same_origin_redirect_keeps_url_credentials() {
+    let origins = Origins::start().await;
+    origins.redirect("/data", 302, "/final").await;
+    Mock::given(path("/final"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(VICTIM_BODY))
+        .mount(&origins.victim)
+        .await;
+
+    let rows = query(
+        provider_with_url_credentials(&origins, "/data").await,
+        "SELECT content FROM t",
+    )
+    .await
+    .expect("the redirect should be followed");
+    assert_eq!(rows, vec![VICTIM_BODY.to_string()]);
+
+    for hop in ["/data", "/final"] {
+        let requests = requests_to(&origins.victim, hop).await;
+        assert_eq!(requests.len(), 1, "{hop}");
+        assert_eq!(
+            header(&requests[0], "authorization"),
+            Some(URL_BASIC_AUTHORIZATION),
+            "{hop}"
+        );
+    }
+}
+
+/// ...and a cross-origin redirect does not, including a later hop back to the origin.
+#[tokio::test]
+async fn cross_origin_redirect_drops_url_credentials() {
+    let origins = Origins::start().await;
+    origins
+        .redirect("/data", 302, &origins.attacker_url())
+        .await;
+    Mock::given(path("/collect"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", origins.victim_url("/landing").as_str()),
+        )
+        .with_priority(1)
+        .mount(&origins.attacker)
+        .await;
+    Mock::given(path("/landing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(VICTIM_BODY))
+        .mount(&origins.victim)
+        .await;
+
+    let rows = query(
+        provider_with_url_credentials(&origins, "/data").await,
+        "SELECT content FROM t",
+    )
+    .await
+    .expect("the redirect should be followed");
+    assert_eq!(rows, vec![VICTIM_BODY.to_string()]);
+
+    let to_victim = requests_to(&origins.victim, "/data").await;
+    assert_eq!(
+        header(&to_victim[0], "authorization"),
+        Some(URL_BASIC_AUTHORIZATION)
+    );
+    let to_attacker = requests_to(&origins.attacker, "/collect").await;
+    assert_eq!(to_attacker.len(), 1);
+    assert_eq!(header(&to_attacker[0], "authorization"), None);
+    let landing = requests_to(&origins.victim, "/landing").await;
+    assert_eq!(landing.len(), 1);
+    assert_eq!(header(&landing[0], "authorization"), None);
+}
