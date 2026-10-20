@@ -793,6 +793,7 @@ struct SortedFilterScratch {
     types: Option<Vec<arrow_schema::DataType>>,
     decoded: Vec<Vec<ArrayRef>>,
     order: Vec<usize>,
+    packed_pairs: Vec<(u128, usize)>,
     boundaries: Vec<usize>,
     states: Vec<u8>,
     candidates: Vec<(usize, TombstoneEntry)>,
@@ -937,8 +938,20 @@ fn sorted_deleted_rows_impl<C: KeyCompare>(
     cache.order.clear();
     let permuted = cache.boundaries.len() > (n / 16).max(1);
     if permuted {
-        cache.order.extend(0..n);
-        cache.order.sort_unstable_by(|&a, &b| same.compare(a, b));
+        if !same.packed_order(&mut cache.packed_pairs, &mut cache.order) {
+            let sort_columns: Vec<_> = columns
+                .iter()
+                .zip(converter.sort_fields())
+                .map(|(column, field)| arrow::compute::SortColumn {
+                    values: Arc::clone(column),
+                    options: Some(field.options),
+                })
+                .collect();
+            let order = arrow::compute::lexsort_to_indices(&sort_columns, None)?;
+            cache
+                .order
+                .extend(order.values().iter().map(|&row| row as usize));
+        }
         cache.boundaries.truncate(1);
         metrics.permuted_batches.add(1);
         metrics.permuted_rows.add(n);

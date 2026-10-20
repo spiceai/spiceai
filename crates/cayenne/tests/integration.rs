@@ -144,3 +144,5 @@ mod upsert_with_pending_deletions_test;
 mod vortex_compressible_test;
 mod vortex_task_cancellation;
 mod write_back_pk_shapes_test;
+
+mod write_sort_ordering_test;

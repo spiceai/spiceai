@@ -177,6 +177,8 @@ pub(crate) struct WritePolicy {
     pub(crate) fan_out: crate::provider::table::EncodeFanOut,
     pub(crate) encode_budget: EncodeBudgetUse,
     pub(crate) routing: ShardRouting,
+    /// The caller has established an order that the sink must preserve.
+    pub(crate) preserve_order: bool,
 }
 
 /// How a sharded write assigns its input to the shard encoders.
@@ -194,6 +196,7 @@ pub(crate) enum ShardRouting {
 impl WritePolicy {
     /// A fresh CDC/inline delta, free to shard — the hot ingest shape.
     pub(crate) const DELTA: Self = Self {
+        preserve_order: false,
         class: WriteClass::Delta,
         fan_out: crate::provider::table::EncodeFanOut::Sized,
         encode_budget: EncodeBudgetUse::Shared,
@@ -213,6 +216,7 @@ impl WritePolicy {
     /// A maintenance rewrite that may shard: compaction outputs and overwrites
     /// whose output shape carries nothing a reader depends on.
     pub(crate) const MAINTENANCE: Self = Self {
+        preserve_order: false,
         class: WriteClass::Maintenance,
         fan_out: crate::provider::table::EncodeFanOut::Sized,
         encode_budget: EncodeBudgetUse::Shared,
@@ -222,11 +226,19 @@ impl WritePolicy {
     /// A maintenance rewrite that must emit ONE sequence of files, whatever the
     /// table is configured for. See [`crate::provider::table::EncodeFanOut`].
     pub(crate) const MAINTENANCE_SERIAL: Self = Self {
+        preserve_order: true,
         class: WriteClass::Maintenance,
         fan_out: crate::provider::table::EncodeFanOut::Serial,
         encode_budget: EncodeBudgetUse::Shared,
         routing: ShardRouting::Key,
     };
+
+    pub(crate) const fn preserving_order(self) -> Self {
+        Self {
+            preserve_order: true,
+            ..self
+        }
+    }
 
     /// This policy, with an encode that takes no permit from the global budget.
     pub(crate) const fn without_encode_budget(self) -> Self {

@@ -1003,6 +1003,7 @@ impl CayenneTableProvider {
             fan_out: EncodeFanOut::PerCaller,
             encode_budget: write.write_policy.encode_budget,
             routing: ShardRouting::Key,
+            preserve_order: write.write_policy.preserve_order,
         };
         let in_flight = if self.context().is_coupled_writer() {
             1

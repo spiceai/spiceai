@@ -1048,3 +1048,184 @@ fn sorted_galloping_wide_ranges_match_hash_oracle() {
         )
     );
 }
+
+#[test]
+fn sorted_packed_integer_extremes_match_encoding() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![
+        i32::MIN,
+        -1,
+        0,
+        i32::MAX,
+        -1,
+        1,
+        0,
+        i32::MIN,
+    ]));
+    let b: ArrayRef = Arc::new(Int64Array::from(vec![
+        i64::MAX,
+        i64::MIN,
+        0,
+        -1,
+        1,
+        i64::MIN,
+        i64::MAX,
+        i64::MIN,
+    ]));
+    for columns in [
+        vec![Arc::clone(&a)],
+        vec![Arc::clone(&b)],
+        vec![Arc::clone(&a), Arc::clone(&b)],
+        vec![Arc::clone(&b), Arc::clone(&b)],
+        vec![
+            Arc::clone(&a),
+            Arc::clone(&a),
+            Arc::clone(&a),
+            Arc::clone(&a),
+        ],
+    ] {
+        for descending in [false, true] {
+            let fields: Vec<_> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    SortField::new_with_options(
+                        c.data_type().clone(),
+                        arrow::compute::SortOptions {
+                            descending: descending ^ (i % 2 == 1),
+                            nulls_first: true,
+                        },
+                    )
+                })
+                .collect();
+            let converter = RowConverter::new(fields.clone()).expect("packed converter");
+            let encoded = converter.convert_columns(&columns).expect("packed keys");
+            let mut expected: Vec<_> = (0..8).collect();
+            expected.sort_by_key(|&row| (encoded.row(row).as_ref().to_vec(), row));
+            let mut pairs = Vec::new();
+            let mut order = Vec::new();
+            let packed = match columns.len() {
+                1 => IntegerComparator::<1>::new(&columns, &columns, &fields)
+                    .expect("one integer")
+                    .packed_order(&mut pairs, &mut order),
+                4 => IntegerComparator::<4>::new(&columns, &columns, &fields)
+                    .expect("four integer tuple")
+                    .packed_order(&mut pairs, &mut order),
+                _ => IntegerComparator::<2>::new(&columns, &columns, &fields)
+                    .expect("integer tuple")
+                    .packed_order(&mut pairs, &mut order),
+            };
+            assert!(packed);
+            assert_eq!(
+                order, expected,
+                "descending={descending}, fields={fields:?}"
+            );
+            let index = KeyDeletionIndex::from_map(
+                [0, 2, 5]
+                    .map(|i| (encoded.row(i).as_ref().into(), 9))
+                    .into(),
+            );
+            let metrics = DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+            assert_eq!(
+                sorted_deleted_rows(
+                    &columns,
+                    &converter,
+                    &index,
+                    InsertRecordHandling::Apply,
+                    None,
+                    &metrics,
+                    &mut SortedFilterScratch::new()
+                )
+                .expect("packed kernel"),
+                hash_deleted_rows(
+                    &columns,
+                    &converter,
+                    &index,
+                    InsertRecordHandling::Apply,
+                    None
+                )
+            );
+            assert_eq!(metrics.permuted_batches.value(), 1);
+        }
+    }
+}
+
+#[test]
+#[ignore = "local permutation comparison microbenchmark"]
+#[expect(clippy::cast_precision_loss, reason = "diagnostic timing percentiles")]
+fn sorted_permutation_microbench() {
+    use arrow::compute::{SortColumn, lexsort_to_indices};
+    use std::time::Instant;
+    for shape in ["utf8_i64", "mixed", "binary_i64", "float_i64"] {
+        let n = 8192;
+        let ids: Vec<i64> = (0..n).map(|i| ((i * 7919) % n).into()).collect();
+        let mut columns: Vec<ArrayRef> = match shape {
+            "mixed" => vec![
+                Arc::new(Int32Array::from(
+                    ids.iter()
+                        .map(|&i| i32::try_from(i % 17).expect("small prefix"))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    ids.iter().map(|i| format!("cust-{i:010}")),
+                )),
+            ],
+            "binary_i64" => vec![Arc::new(BinaryArray::from_iter_values(
+                ids.iter().map(|i| i.to_be_bytes()),
+            ))],
+            "float_i64" => vec![Arc::new(arrow::array::Float64Array::from_iter_values(
+                ids.iter()
+                    .map(|&i| f64::from(i32::try_from(i).expect("small id"))),
+            ))],
+            _ => vec![Arc::new(StringArray::from_iter_values(
+                ids.iter().map(|i| format!("cust-{i:010}")),
+            ))],
+        };
+        columns.push(Arc::new(Int64Array::from(ids)));
+        let fields: Vec<_> = columns
+            .iter()
+            .map(|c| SortField::new(c.data_type().clone()))
+            .collect();
+        let comparator = TypedComparator::new(&columns, &columns, &fields).expect("comparator");
+        let sort: Vec<_> = columns
+            .iter()
+            .map(|c| SortColumn {
+                values: Arc::clone(c),
+                options: Some(arrow::compute::SortOptions::default()),
+            })
+            .collect();
+        let mut samples = [Vec::new(), Vec::new()];
+        for rep in 0..201 {
+            let mut results = [Vec::new(), Vec::new()];
+            for arm in if rep % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let start = Instant::now();
+                results[arm] = if arm == 0 {
+                    let mut rows: Vec<_> = (0..8192).collect();
+                    rows.sort_unstable_by(|&a, &b| comparator.compare(a, b));
+                    rows
+                } else {
+                    lexsort_to_indices(&sort, None)
+                        .expect("Arrow permutation")
+                        .values()
+                        .iter()
+                        .map(|&i| i as usize)
+                        .collect()
+                };
+                let elapsed = start.elapsed().as_nanos();
+                if rep > 0 {
+                    samples[arm].push(elapsed);
+                }
+            }
+            assert_eq!(results[0], results[1], "shape={shape}, rep={rep}");
+        }
+        for (arm, mut times) in samples.into_iter().enumerate() {
+            times.sort_unstable();
+            println!(
+                "PERMUTE shape={shape} arm={} n={} p99_us={:.3} max_us={:.3}",
+                if arm == 0 { "typed" } else { "arrow" },
+                times.len(),
+                times[times.len() * 99 / 100] as f64 / 1000.0,
+                times[times.len() - 1] as f64 / 1000.0
+            );
+        }
+    }
+}

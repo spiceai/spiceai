@@ -37,6 +37,9 @@ use std::cmp::Ordering;
 pub(super) trait KeyCompare: Sized {
     fn new(left: &[ArrayRef], right: &[ArrayRef], fields: &[SortField]) -> Result<Self>;
     fn compare(&self, a: usize, b: usize) -> Ordering;
+    fn packed_order(&self, _pairs: &mut Vec<(u128, usize)>, _order: &mut Vec<usize>) -> bool {
+        false
+    }
     fn adjacent_states(&self, states: &mut [u8]) {
         for (i, state) in states.iter_mut().enumerate() {
             *state = order_code(self.compare(i, i + 1));
@@ -484,6 +487,57 @@ impl<const N: usize> KeyCompare for IntegerComparator<N> {
         Ok(Self(columns.try_into().map_err(|_| {
             DataFusionError::Internal("Integer deletion comparator tuple width differs".into())
         })?))
+    }
+    fn packed_order(&self, pairs: &mut Vec<(u128, usize)>, order: &mut Vec<usize>) -> bool {
+        let width: usize = self
+            .0
+            .iter()
+            .map(|c| match c {
+                IntegerColumn::I32(_) => 32,
+                IntegerColumn::I64(_) => 64,
+            })
+            .sum();
+        if width > 128 {
+            return false;
+        }
+        let Some(first) = self.0.first() else {
+            return false;
+        };
+        let len = match first {
+            IntegerColumn::I32(p) => p.left.len(),
+            IntegerColumn::I64(p) => p.left.len(),
+        };
+        pairs.clear();
+        pairs.extend((0..len).map(|row| (0, row)));
+        for column in &self.0 {
+            match column {
+                IntegerColumn::I32(pair) => {
+                    for ((key, _), &value) in pairs.iter_mut().zip(pair.left.iter()) {
+                        let value = value.cast_unsigned() ^ (1_u32 << 31);
+                        let value = if pair.order.options.descending {
+                            !value
+                        } else {
+                            value
+                        };
+                        *key = (*key << 32) | u128::from(value);
+                    }
+                }
+                IntegerColumn::I64(pair) => {
+                    for ((key, _), &value) in pairs.iter_mut().zip(pair.left.iter()) {
+                        let value = value.cast_unsigned() ^ (1_u64 << 63);
+                        let value = if pair.order.options.descending {
+                            !value
+                        } else {
+                            value
+                        };
+                        *key = (*key << 64) | u128::from(value);
+                    }
+                }
+            }
+        }
+        pairs.sort_unstable();
+        order.extend(pairs.iter().map(|&(_, row)| row));
+        true
     }
     fn adjacent_states(&self, states: &mut [u8]) {
         for column in &self.0 {
