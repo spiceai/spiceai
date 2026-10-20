@@ -766,17 +766,82 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                     }
                 }
             }
-            // Predictor / columns / bits parameters change what each filter
-            // stage emits. We do not apply them, so fail closed rather than
-            // under-count a PNG-up Flate chain that PDFium would expand.
+            // A `/Predictor` (or `/P`) in DecodeParms inserts PNG-style row
+            // tags between Flate stages that we do not reverse, so a nested
+            // Flate chain can under-count. Fail closed when a predictor is
+            // declared; other DecodeParms values are skipped as usual.
             b"DecodeParms" | b"DP" => {
-                i += skip_value(&data[i..], depth + 1)?;
-                filters = Some(vec![PdfFilter::Unbounded]);
+                let value_start = i;
+                let value_len = skip_value(&data[i..], depth + 1)?;
+                if decode_parms_has_predictor(&data[value_start..value_start + value_len]) {
+                    filters = Some(vec![PdfFilter::Unbounded]);
+                }
+                i += value_len;
             }
             _ => {
                 i += skip_value(&data[i..], depth + 1)?;
             }
         }
+    }
+}
+
+/// True when a `/DecodeParms` value (a dictionary, or an array of them)
+/// declares `/Predictor` or `/P`. Those keys insert PNG-style row tags that
+/// this scanner does not reverse.
+fn decode_parms_has_predictor(data: &[u8]) -> bool {
+    decode_parms_has_predictor_at(data, 0)
+}
+
+fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
+    if depth > MAX_VALUE_DEPTH {
+        return false;
+    }
+    match data.first() {
+        Some(b'<') if data.get(1) == Some(&b'<') => {
+            let mut i = 2;
+            loop {
+                i += ws_len(&data[i..]);
+                if data.get(i..i + 2) == Some(b">>") {
+                    return false;
+                }
+                if data.get(i) != Some(&b'/') {
+                    return false;
+                }
+                let (name, name_len) = read_name(&data[i + 1..]);
+                i += 1 + name_len;
+                i += ws_len(&data[i..]);
+                if name.as_slice() == b"Predictor" || name.as_slice() == b"P" {
+                    return true;
+                }
+                // Nested DecodeParms arrays/dicts can still hold a predictor.
+                if decode_parms_has_predictor_at(&data[i..], depth + 1) {
+                    return true;
+                }
+                match skip_value(&data[i..], depth + 1) {
+                    Some(len) => i += len,
+                    None => return false,
+                }
+            }
+        }
+        Some(b'[') => {
+            let mut i = 1;
+            loop {
+                i += ws_len(&data[i..]);
+                match data.get(i) {
+                    Some(b']') | None => return false,
+                    Some(_) => {
+                        if decode_parms_has_predictor_at(&data[i..], depth + 1) {
+                            return true;
+                        }
+                        match skip_value(&data[i..], depth + 1) {
+                            Some(len) => i += len,
+                            None => return false,
+                        }
+                    }
+                }
+            }
+        }
+        _ => false,
     }
 }
 
@@ -1028,7 +1093,8 @@ fn skip_ws(data: &[u8]) -> &[u8] {
     &data[ws_len(data)..]
 }
 
-/// Test/helper view of [`stream_before`]: just the filter chain.
+/// Test helper view of [`stream_before`]: just the filter chain.
+#[cfg(test)]
 fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
     stream_before(raw, keyword_pos, 0).map(|info| info.filters)
 }
