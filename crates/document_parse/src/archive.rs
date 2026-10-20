@@ -372,7 +372,10 @@ fn decode_stage(filter: PdfFilter, data: &[u8], cap: u64) -> Vec<u8> {
 
 /// Every stream object in `raw`, each paired with its declared filter chain.
 /// A `stream` byte sequence that is not the keyword after a dictionary — the
-/// word inside content, or `endstream` — is not a stream object.
+/// word inside content, or `endstream` — is not a stream object. After each
+/// real stream is recorded, its payload is skipped (via `/Length`, or by
+/// finding `endstream`) so dictionary-like bytes inside the content cannot be
+/// mistaken for another stream declaration.
 fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
     const KEYWORD: &[u8] = b"stream";
     let mut streams = Vec::new();
@@ -383,7 +386,7 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
         if !is_stream_keyword(raw, pos) {
             continue;
         }
-        let Some(filters) = filters_before(raw, pos) else {
+        let Some(stream_info) = stream_before(raw, pos) else {
             continue;
         };
         // Stream data begins after the end-of-line that follows the keyword.
@@ -395,9 +398,11 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
             data += 1;
         }
         streams.push(PdfStream {
-            filters,
+            filters: stream_info.filters,
             data_start: data,
         });
+        // Do not resume the keyword search inside this stream's payload.
+        from = stream_payload_end(raw, data, stream_info.length);
     }
     streams
 }
@@ -409,16 +414,113 @@ fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
     pos == 0 || is_pdf_whitespace(raw[pos - 1]) || raw[pos - 1] == b'>'
 }
 
-/// The `/Filter` chain of the dictionary that ends just before the `stream`
-/// keyword at `keyword_pos`.
+/// Index just past a stream's payload: `/Length` bytes from `data_start` when
+/// known, otherwise the `endstream` keyword that terminates it. Falling back to
+/// `endstream` covers missing or indirect lengths we cannot resolve.
+fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
+    if let Some(len) = length {
+        let end = data_start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+        return after_endstream(raw, end.min(raw.len()));
+    }
+    find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
+}
+
+/// If `endstream` sits at or just after `at` (with optional whitespace), return
+/// the index past that keyword; otherwise `at`.
+fn after_endstream(raw: &[u8], at: usize) -> usize {
+    let mut i = at;
+    i += ws_len(&raw[i..]);
+    if raw[i..].starts_with(b"endstream")
+        && (i + b"endstream".len() == raw.len()
+            || is_pdf_whitespace(raw[i + b"endstream".len()])
+            || is_pdf_delimiter(raw[i + b"endstream".len()]))
+    {
+        return i + b"endstream".len();
+    }
+    at
+}
+
+fn find_endstream(raw: &[u8], from: usize) -> Option<usize> {
+    const KEYWORD: &[u8] = b"endstream";
+    let mut cursor = from;
+    while let Some(rel) = find(&raw[cursor..], KEYWORD) {
+        let pos = cursor + rel;
+        let boundary_before = pos == 0 || is_pdf_whitespace(raw[pos - 1]);
+        let after = pos + KEYWORD.len();
+        let boundary_after =
+            after == raw.len() || is_pdf_whitespace(raw[after]) || is_pdf_delimiter(raw[after]);
+        if boundary_before && boundary_after {
+            return Some(pos);
+        }
+        cursor = pos + 1;
+    }
+    None
+}
+
+struct StreamInfo {
+    filters: Vec<PdfFilter>,
+    /// Direct `/Length` in bytes, or the resolved value of an indirect
+    /// `/Length N G R`. `None` when the length is absent or unresolved.
+    length: Option<u64>,
+}
+
+/// The `/Filter` chain and `/Length` of the dictionary that ends just before
+/// the `stream` keyword at `keyword_pos`.
 ///
 /// `None` when `stream` is not preceded by a dictionary (content, not a stream
-/// object). `Some` is the chain: empty when `/Filter` is absent (stored
-/// uncompressed), and a single [`PdfFilter::Unbounded`] stage when a dictionary
-/// is there but its chain cannot be determined, so the document fails closed.
-fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
+/// object). When a dictionary is there but its chain cannot be determined, the
+/// filters are a single [`PdfFilter::Unbounded`] stage so the document fails
+/// closed.
+fn stream_before(raw: &[u8], keyword_pos: usize) -> Option<StreamInfo> {
     let close = dict_closer_before(raw, keyword_pos)?;
-    Some(filters_of_dict(raw, close).unwrap_or_else(|| vec![PdfFilter::Unbounded]))
+    let parsed = filters_of_dict(raw, close).unwrap_or(ParsedDict {
+        consumed: 0,
+        filters: vec![PdfFilter::Unbounded],
+        length: None,
+        length_ref: None,
+    });
+    let length = parsed.length.or_else(|| {
+        parsed
+            .length_ref
+            .and_then(|(obj, generation)| resolve_indirect_int(raw, obj, generation))
+    });
+    Some(StreamInfo {
+        filters: parsed.filters,
+        length,
+    })
+}
+
+/// Resolves an indirect object `obj gen R` whose body is an integer, used for
+/// `/Length N G R`. Looks for the `obj gen obj` definition in `raw`.
+fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
+    let needle = format!("{obj} {generation} obj");
+    let mut cursor = 0usize;
+    while let Some(rel) = find(&raw[cursor..], needle.as_bytes()) {
+        let pos = cursor + rel;
+        let before_ok = pos == 0 || is_pdf_whitespace(raw[pos - 1]);
+        let after = pos + needle.len();
+        let after_ok = after < raw.len() && is_pdf_whitespace(raw[after]);
+        if before_ok && after_ok {
+            let rest = skip_ws(&raw[after..]);
+            return parse_u64(rest);
+        }
+        cursor = pos + 1;
+    }
+    None
+}
+
+fn parse_u64(data: &[u8]) -> Option<u64> {
+    let mut i = 0;
+    let mut value: u64 = 0;
+    let mut digits = 0usize;
+    while i < data.len() && data[i].is_ascii_digit() {
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(data[i] - b'0'))?;
+        digits += 1;
+        i += 1;
+    }
+    (digits > 0).then_some(value)
 }
 
 /// Index just past the `>>` that closes the dictionary before `keyword_pos`,
@@ -473,9 +575,14 @@ const DICT_LOOKBACK_BYTES: usize = 1024 * 1024;
 /// when none match is safe.
 const MAX_DICT_CANDIDATES: usize = 64;
 
-/// The top-level `/Filter` chain of the dictionary that closes at `close`.
-/// `None` when no candidate opening parses as that dictionary.
-fn filters_of_dict(raw: &[u8], close: usize) -> Option<Vec<PdfFilter>> {
+/// Deepest nesting of arrays/dictionaries accepted while skipping a value.
+/// Past this the parse fails closed rather than overflowing the stack on an
+/// attacker-controlled nest.
+const MAX_VALUE_DEPTH: usize = 32;
+
+/// The top-level `/Filter` chain and `/Length` of the dictionary that closes
+/// at `close`. `None` when no candidate opening parses as that dictionary.
+fn filters_of_dict(raw: &[u8], close: usize) -> Option<ParsedDict> {
     let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES);
     let mut tried = 0usize;
     let mut j = close;
@@ -484,10 +591,10 @@ fn filters_of_dict(raw: &[u8], close: usize) -> Option<Vec<PdfFilter>> {
         if raw[j] == b'<' && raw[j - 1] == b'<' {
             tried += 1;
             let start = j - 1;
-            if let Some(parsed) = parse_dictionary(&raw[start..close])
+            if let Some(parsed) = parse_dictionary(&raw[start..close], 0)
                 && parsed.consumed == close - start
             {
-                return Some(parsed.filters);
+                return Some(parsed);
             }
         }
     }
@@ -498,23 +605,32 @@ struct ParsedDict {
     consumed: usize,
     /// Empty when the dictionary declares no `/Filter`.
     filters: Vec<PdfFilter>,
+    /// Direct integer `/Length`, when declared as a number.
+    length: Option<u64>,
+    /// Indirect `/Length N G R`, when declared as a reference.
+    length_ref: Option<(u32, u32)>,
 }
 
-/// Parses one `<< … >>` dictionary starting at `data[0]`, recording only its
-/// top-level `/Filter`. Nested dictionaries, strings, and arrays are skipped
-/// as values, so a `/Filter` inside one of them cannot shadow the real key.
-fn parse_dictionary(data: &[u8]) -> Option<ParsedDict> {
-    if data.len() < 4 || &data[..2] != b"<<" {
+/// Parses one `<< … >>` dictionary starting at `data[0]`, recording its
+/// top-level `/Filter` and `/Length`. Nested dictionaries, strings, and arrays
+/// are skipped as values, so a `/Filter` inside one of them cannot shadow the
+/// real key. `depth` bounds how deep nested values may go.
+fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
+    if depth > MAX_VALUE_DEPTH || data.len() < 4 || &data[..2] != b"<<" {
         return None;
     }
     let mut i = 2;
     let mut filters: Option<Vec<PdfFilter>> = None;
+    let mut length: Option<u64> = None;
+    let mut length_ref: Option<(u32, u32)> = None;
     loop {
         i += ws_len(&data[i..]);
         if data.get(i..i + 2) == Some(b">>") {
             return Some(ParsedDict {
                 consumed: i + 2,
                 filters: filters.unwrap_or_default(),
+                length,
+                length_ref,
             });
         }
         if data.get(i) != Some(&b'/') {
@@ -523,40 +639,79 @@ fn parse_dictionary(data: &[u8]) -> Option<ParsedDict> {
         let (name, name_len) = read_name(&data[i + 1..]);
         i += 1 + name_len;
         i += ws_len(&data[i..]);
-        if name.as_slice() == b"Filter" {
-            let (value, value_len) = parse_filter_value(&data[i..])?;
-            i += value_len;
-            // A duplicate key is undefined in PDF. Fail closed rather than
-            // guess which value a reader applies.
-            filters = Some(if filters.is_some() {
-                vec![PdfFilter::Unbounded]
-            } else {
-                value
-            });
-        } else {
-            i += skip_value(&data[i..])?;
+        match name.as_slice() {
+            b"Filter" => {
+                let (value, value_len) = parse_filter_value(&data[i..], depth)?;
+                i += value_len;
+                // A duplicate key is undefined in PDF. Fail closed rather than
+                // guess which value a reader applies.
+                filters = Some(if filters.is_some() {
+                    vec![PdfFilter::Unbounded]
+                } else {
+                    value
+                });
+            }
+            b"Length" => {
+                let (value, value_len) = parse_length_value(&data[i..])?;
+                i += value_len;
+                match value {
+                    LengthValue::Direct(n) => {
+                        length = Some(n);
+                        length_ref = None;
+                    }
+                    LengthValue::Indirect { obj, generation } => {
+                        length = None;
+                        length_ref = Some((obj, generation));
+                    }
+                }
+            }
+            _ => {
+                i += skip_value(&data[i..], depth + 1)?;
+            }
         }
     }
 }
 
+enum LengthValue {
+    Direct(u64),
+    Indirect { obj: u32, generation: u32 },
+}
+
+/// A `/Length` value: a direct integer, or an `N G R` indirect reference.
+fn parse_length_value(data: &[u8]) -> Option<(LengthValue, usize)> {
+    let n_len = skip_number(data)?;
+    let n = parse_u64(data)?;
+    let gen_at = n_len + ws_len(&data[n_len..]);
+    if let Some(gen_len) = skip_number(&data[gen_at..]) {
+        let r_at = gen_at + gen_len + ws_len(&data[gen_at + gen_len..]);
+        if data.get(r_at) == Some(&b'R') && token_ends(data, r_at + 1) {
+            let generation = parse_u64(&data[gen_at..])?;
+            let obj = u32::try_from(n).ok()?;
+            let generation = u32::try_from(generation).ok()?;
+            return Some((LengthValue::Indirect { obj, generation }, r_at + 1));
+        }
+    }
+    Some((LengthValue::Direct(n), n_len))
+}
+
 /// The `/Filter` value at `data[0]` (already past whitespace): a name, an array
 /// of names, or something whose chain cannot be resolved.
-fn parse_filter_value(data: &[u8]) -> Option<(Vec<PdfFilter>, usize)> {
+fn parse_filter_value(data: &[u8], depth: usize) -> Option<(Vec<PdfFilter>, usize)> {
     match data.first() {
         Some(b'/') => {
             let (name, name_len) = read_name(&data[1..]);
             Some((vec![classify_filter(&name)], 1 + name_len))
         }
-        Some(b'[') => parse_filter_array(data),
+        Some(b'[') => parse_filter_array(data, depth),
         Some(_) => {
-            let consumed = skip_value(data)?;
+            let consumed = skip_value(data, depth + 1)?;
             Some((vec![PdfFilter::Unbounded], consumed))
         }
         None => None,
     }
 }
 
-fn parse_filter_array(data: &[u8]) -> Option<(Vec<PdfFilter>, usize)> {
+fn parse_filter_array(data: &[u8], depth: usize) -> Option<(Vec<PdfFilter>, usize)> {
     let mut i = 1;
     let mut filters = Vec::new();
     let mut unresolved = false;
@@ -578,7 +733,7 @@ fn parse_filter_array(data: &[u8]) -> Option<(Vec<PdfFilter>, usize)> {
             }
             Some(_) => {
                 unresolved = true;
-                i += skip_value(&data[i..])?;
+                i += skip_value(&data[i..], depth + 1)?;
             }
             None => return None,
         }
@@ -586,8 +741,13 @@ fn parse_filter_array(data: &[u8]) -> Option<(Vec<PdfFilter>, usize)> {
 }
 
 /// Bytes consumed by one PDF value: a name, string, hex string, nested
-/// dictionary, array, keyword, number, or indirect reference.
-fn skip_value(data: &[u8]) -> Option<usize> {
+/// dictionary, array, keyword, number, or indirect reference. `depth` counts
+/// nested arrays and dictionaries; past [`MAX_VALUE_DEPTH`] the value is
+/// rejected rather than recursing.
+fn skip_value(data: &[u8], depth: usize) -> Option<usize> {
+    if depth > MAX_VALUE_DEPTH {
+        return None;
+    }
     match data.first() {
         Some(b'/') => {
             let (_, name_len) = read_name(&data[1..]);
@@ -596,12 +756,12 @@ fn skip_value(data: &[u8]) -> Option<usize> {
         Some(b'(') => skip_literal_string(data),
         Some(b'<') => {
             if data.get(1) == Some(&b'<') {
-                parse_dictionary(data).map(|parsed| parsed.consumed)
+                parse_dictionary(data, depth + 1).map(|parsed| parsed.consumed)
             } else {
                 skip_hex_string(data)
             }
         }
-        Some(b'[') => skip_array(data),
+        Some(b'[') => skip_array(data, depth),
         Some(b't') => skip_keyword(data, b"true"),
         Some(b'f') => skip_keyword(data, b"false"),
         Some(b'n') => skip_keyword(data, b"null"),
@@ -610,13 +770,16 @@ fn skip_value(data: &[u8]) -> Option<usize> {
     }
 }
 
-fn skip_array(data: &[u8]) -> Option<usize> {
+fn skip_array(data: &[u8], depth: usize) -> Option<usize> {
+    if depth > MAX_VALUE_DEPTH {
+        return None;
+    }
     let mut i = 1;
     loop {
         i += ws_len(&data[i..]);
         match data.get(i) {
             Some(b']') => return Some(i + 1),
-            Some(_) => i += skip_value(&data[i..])?,
+            Some(_) => i += skip_value(&data[i..], depth + 1)?,
             None => return None,
         }
     }
@@ -751,6 +914,15 @@ fn ws_len(data: &[u8]) -> usize {
         }
     }
     i
+}
+
+fn skip_ws(data: &[u8]) -> &[u8] {
+    &data[ws_len(data)..]
+}
+
+/// Test/helper view of [`stream_before`]: just the filter chain.
+fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
+    stream_before(raw, keyword_pos).map(|info| info.filters)
 }
 
 /// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
@@ -1479,5 +1651,82 @@ mod tests {
         let streams = pdf_streams(raw);
         assert_eq!(streams.len(), 1);
         assert_eq!(streams[0].filters, vec![PdfFilter::Flate]);
+    }
+
+    /// Unfiltered page content that happens to contain the word `stream` (and
+    /// even a decoy `/Filter /LZWDecode`) must stay one stream with an empty
+    /// filter chain. Scanning inside the payload would invent a second,
+    /// unbounded stream and reject a legitimate document.
+    #[test]
+    fn accepts_content_that_mentions_stream_inside_the_payload() {
+        let content = b"BT (<< /Filter /LZWDecode >>stream) Tj ET";
+        // Build a loadable single-page PDF whose content stream is stored
+        // (no `/Filter`) and whose `/Length` covers the whole payload.
+        let mut content_obj = Vec::new();
+        content_obj.extend_from_slice(b"<< /Length ");
+        content_obj.extend_from_slice(content.len().to_string().as_bytes());
+        content_obj.extend_from_slice(b" >>\nstream\n");
+        content_obj.extend_from_slice(content);
+        content_obj.extend_from_slice(b"\nendstream");
+        let objs: [&[u8]; 4] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>",
+            content_obj.as_slice(),
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objs.len());
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        let n = objs.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF")
+                .as_bytes(),
+        );
+        let pdf = Bytes::from(out);
+
+        let streams = pdf_streams(&pdf);
+        assert_eq!(
+            streams.len(),
+            1,
+            "payload text must not invent a second stream"
+        );
+        assert!(
+            streams[0].filters.is_empty(),
+            "an unfiltered content stream must stay unfiltered, got {:?}",
+            streams[0].filters
+        );
+        ensure_pdf_within_budget(&pdf)
+            .expect("ordinary text that mentions stream must not be rejected");
+    }
+
+    /// Attacker-controlled nesting in a skipped value must fail closed without
+    /// overflowing the stack. A nest past [`MAX_VALUE_DEPTH`] makes the
+    /// dictionary unparsable, so the stream is unbounded and the document is
+    /// rejected.
+    #[test]
+    fn rejects_a_dictionary_with_excessive_value_nesting() {
+        let mut dict = b"<< /Filter /FlateDecode /Note ".to_vec();
+        let depth = MAX_VALUE_DEPTH + 8;
+        dict.extend(std::iter::repeat_n(b'[', depth));
+        dict.extend(std::iter::repeat_n(b']', depth));
+        dict.extend_from_slice(b" >>");
+        let pdf = {
+            let mut out = b"%PDF-1.7\n1 0 obj\n".to_vec();
+            out.extend_from_slice(&dict);
+            out.extend_from_slice(b"\nstream\nhello\nendstream\nendobj\n");
+            Bytes::from(out)
+        };
+        assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
     }
 }
