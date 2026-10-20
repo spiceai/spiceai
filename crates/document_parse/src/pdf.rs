@@ -189,14 +189,17 @@ mod tests {
     /// A nested `[/FlateDecode /FlateDecode]` stream whose inner payload exceeds
     /// the budget must be rejected through the parser, before `PDFium` applies
     /// the chain and expands it unbounded. A single-pass scan would only see the
-    /// small intermediate and let it through.
+    /// small intermediate and let it through. The fixture is a loadable
+    /// single-page PDF (Catalog/Pages/Page/xref), so `PDFium` would expand the
+    /// chain if the preflight missed it.
     #[tokio::test]
     async fn rejects_a_nested_flate_bomb_before_loading_pdfium() {
+        use crate::archive::test_support::loadable_pdf_with_content_stream;
         use flate2::{Compression, write::ZlibEncoder};
         use std::io::Write;
 
-        let over = usize::try_from(crate::archive::MAX_PACKAGE_BYTES).expect("fits usize")
-            + 1024 * 1024;
+        let over =
+            usize::try_from(crate::archive::MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
         let mut inner = ZlibEncoder::new(Vec::new(), Compression::best());
         let chunk = vec![b' '; 1024 * 1024];
         let mut left = over;
@@ -210,13 +213,63 @@ mod tests {
         outer.write_all(&inner).expect("deflate outer");
         let data = outer.finish().expect("finish outer deflate");
 
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.7\n1 0 obj\n<< /Length ");
-        pdf.extend_from_slice(data.len().to_string().as_bytes());
-        pdf.extend_from_slice(b" /Filter [/FlateDecode /FlateDecode] >>\nstream\n");
-        pdf.extend_from_slice(&data);
-        pdf.extend_from_slice(b"\nendstream\nendobj\n");
-        let raw = Bytes::from(pdf);
+        let raw = loadable_pdf_with_content_stream(b"[/FlateDecode /FlateDecode]", &data);
+        assert!(
+            raw.len() < 2 * 1024 * 1024,
+            "the bomb should be small on the wire, was {} bytes",
+            raw.len()
+        );
+        assert!(
+            raw.windows(b"xref".len()).any(|w| w == b"xref"),
+            "the fixture must be a loadable PDF with an xref"
+        );
+
+        let Err(crate::Error::DocumentTooLarge {
+            format: DocumentType::Pdf,
+            ..
+        }) = PdfParser::default().parse(&raw).await
+        else {
+            panic!("a nested-Flate PDF whose streams exceed the budget must be rejected");
+        };
+    }
+
+    /// Same loadable shape with an ASCII85 wrapper around Flate: a single-pass
+    /// inflate of the raw stream bytes cannot see the bomb, but budgeting the
+    /// declared chain must still reject it before `PDFium` runs.
+    #[tokio::test]
+    async fn rejects_an_ascii85_wrapped_flate_bomb_before_loading_pdfium() {
+        use crate::archive::test_support::loadable_pdf_with_content_stream;
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let over =
+            usize::try_from(crate::archive::MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        let chunk = vec![b' '; 1024 * 1024];
+        let mut left = over;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            encoder.write_all(&chunk[..n]).expect("deflate chunk");
+            left -= n;
+        }
+        let deflated = encoder.finish().expect("finish deflate");
+
+        // ASCII85-encode the deflated payload (same encoding the archive tests use).
+        let mut ascii85 = Vec::new();
+        for chunk in deflated.chunks(4) {
+            let mut buf = [0u8; 4];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let mut value = u32::from_be_bytes(buf);
+            let mut group = [0u8; 5];
+            for slot in group.iter_mut().rev() {
+                *slot = (value % 85) as u8 + b'!';
+                value /= 85;
+            }
+            ascii85.extend_from_slice(&group[..=chunk.len()]);
+        }
+        ascii85.extend_from_slice(b"~>");
+
+        let raw = loadable_pdf_with_content_stream(b"[/ASCII85Decode /FlateDecode]", &ascii85);
         assert!(
             raw.len() < 2 * 1024 * 1024,
             "the bomb should be small on the wire, was {} bytes",
@@ -228,7 +281,7 @@ mod tests {
             ..
         }) = PdfParser::default().parse(&raw).await
         else {
-            panic!("a nested-Flate PDF whose streams exceed the budget must be rejected");
+            panic!("an ASCII85+Flate PDF whose streams exceed the budget must be rejected");
         };
     }
 

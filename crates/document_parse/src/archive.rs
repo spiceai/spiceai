@@ -986,11 +986,55 @@ pub(crate) mod test_support {
         }
         Bytes::from(zip.finish().expect("finish zip").into_inner())
     }
+
+    /// A structurally complete single-page PDF whose page `/Contents` stream
+    /// carries `filter_decl` and `data`. Catalog, Pages, Page, xref, and trailer
+    /// are all present, so `PDFium` would load and expand the stream if the
+    /// preflight did not reject it first — the shape Copilot asked for as a
+    /// loadable chained-filter regression fixture.
+    pub(crate) fn loadable_pdf_with_content_stream(filter_decl: &[u8], data: &[u8]) -> Bytes {
+        let mut content = Vec::new();
+        content.extend_from_slice(b"<< /Length ");
+        content.extend_from_slice(data.len().to_string().as_bytes());
+        content.extend_from_slice(b" /Filter ");
+        content.extend_from_slice(filter_decl);
+        content.extend_from_slice(b" >>\nstream\n");
+        content.extend_from_slice(data);
+        content.extend_from_slice(b"\nendstream");
+
+        let objs: [&[u8]; 4] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>",
+            content.as_slice(),
+        ];
+
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objs.len());
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        let n = objs.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF")
+                .as_bytes(),
+        );
+        Bytes::from(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{Part, deflated_package};
+    use super::test_support::{Part, deflated_package, loadable_pdf_with_content_stream};
     use super::*;
 
     const LIMITS: Limits = Limits {
@@ -1138,18 +1182,6 @@ mod tests {
         out
     }
 
-    fn pdf_with_stream(filter_decl: &str, data: &[u8]) -> Bytes {
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.7\n1 0 obj\n<< /Length ");
-        pdf.extend_from_slice(data.len().to_string().as_bytes());
-        pdf.extend_from_slice(b" /Filter ");
-        pdf.extend_from_slice(filter_decl.as_bytes());
-        pdf.extend_from_slice(b" >>\nstream\n");
-        pdf.extend_from_slice(data);
-        pdf.extend_from_slice(b"\nendstream\nendobj\n");
-        Bytes::from(pdf)
-    }
-
     /// Builds a one-stream PDF whose dictionary carries `dict_entries` verbatim
     /// (between the `/Length` entry and the `>>`), so a test can supply an
     /// escaped key, a comment, or an indirect `/Filter` reference.
@@ -1219,16 +1251,22 @@ mod tests {
 
     /// A single-stage Flate scan measures only the first expansion, so a
     /// `[/FlateDecode /FlateDecode]` stream whose inner payload exceeds the
-    /// budget must be caught by applying the whole chain.
+    /// budget must be caught by applying the whole chain. The fixture is a
+    /// loadable single-page PDF (Catalog/Pages/Page/xref), so `PDFium` would
+    /// expand the chain if the preflight missed it.
     #[test]
     fn rejects_a_nested_flate_bomb() {
         let over = usize::try_from(MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
         let data = deflate(&deflate_spaces(over));
-        let pdf = pdf_with_stream("[/FlateDecode /FlateDecode]", &data);
+        let pdf = loadable_pdf_with_content_stream(b"[/FlateDecode /FlateDecode]", &data);
         assert!(
             pdf.len() < 2 * 1024 * 1024,
             "the bomb should be small on the wire, was {} bytes",
             pdf.len()
+        );
+        assert!(
+            pdf.windows(b"xref".len()).any(|w| w == b"xref"),
+            "the fixture must be a loadable PDF with an xref"
         );
         assert_eq!(
             pdf_too_large_reason(&pdf),
@@ -1238,16 +1276,22 @@ mod tests {
 
     /// An ASCII85 wrapper makes the inner Flate data unreadable to a scan that
     /// only tries to inflate the raw stream bytes; decoding the chain in order
-    /// still reaches the bomb.
+    /// still reaches the bomb. Same loadable single-page shape as the nested
+    /// Flate fixture.
     #[test]
     fn rejects_an_ascii85_wrapped_flate_bomb() {
         let over = usize::try_from(MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
         let data = ascii85_encode(&deflate_spaces(over));
-        let pdf = pdf_with_stream("[/ASCII85Decode /FlateDecode]", &data);
+        let pdf = loadable_pdf_with_content_stream(b"[/ASCII85Decode /FlateDecode]", &data);
         assert!(
             pdf.len() < 2 * 1024 * 1024,
             "the bomb should be small on the wire, was {} bytes",
             pdf.len()
+        );
+        assert!(
+            pdf.windows(b"/Type /Catalog".len())
+                .any(|w| w == b"/Type /Catalog"),
+            "the fixture must be a loadable PDF with a Catalog"
         );
         assert_eq!(
             pdf_too_large_reason(&pdf),
@@ -1260,7 +1304,7 @@ mod tests {
     #[test]
     fn accepts_a_small_chained_stream() {
         let data = ascii85_encode(&deflate(b"hello world"));
-        let pdf = pdf_with_stream("[/ASCII85Decode /FlateDecode]", &data);
+        let pdf = loadable_pdf_with_content_stream(b"[/ASCII85Decode /FlateDecode]", &data);
         ensure_pdf_within_budget(&pdf).expect("a small chained stream is within the budget");
     }
 
