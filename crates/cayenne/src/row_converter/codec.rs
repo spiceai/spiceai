@@ -57,7 +57,7 @@ pub(crate) trait ColumnCodec: Debug + Send + Sync {
 /// struct holds the built codecs and performs the version-agnostic framing.
 #[derive(Debug)]
 pub struct RowCodec {
-    fields: Arc<[SortField]>,
+    pub(crate) fields: Arc<[SortField]>,
     codecs: Vec<Box<dyn ColumnCodec>>,
 }
 

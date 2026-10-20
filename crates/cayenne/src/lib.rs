@@ -155,3 +155,6 @@ pub use provider::{
     try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
+
+#[doc(hidden)]
+pub use provider::delete::filter_exec::experiment_set_sorted_key_deletes;

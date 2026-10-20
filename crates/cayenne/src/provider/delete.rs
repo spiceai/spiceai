@@ -40,7 +40,7 @@ limitations under the License.
 //! - [`filter_exec`]: Query-time deletion filters - execution plans that exclude deleted rows during scans
 //! - [`sink`]: Deletion orchestration - scans for matching rows, persists deletion vectors, updates caches
 
-mod filter_exec;
+pub(crate) mod filter_exec;
 mod sink;
 pub(crate) mod vector_io;
 
@@ -52,7 +52,8 @@ pub(crate) use sink::{
 
 // Crate-internal types used by table.rs
 pub(crate) use filter_exec::{
-    InsertRecordHandling, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec, is_pk_visible_i64,
+    DeletionFilterSource, InsertRecordHandling, Int64PkDeletionFilterExec,
+    KeyBasedDeletionFilterExec, is_pk_visible_i64,
 };
 pub(crate) use vector_io::{
     DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,

@@ -27,8 +27,8 @@ limitations under the License.
 //! merge-on-read delete application.
 //!
 //! - **`KeyBasedDeletionFilterExec`**: For tables with composite or non-integer primary keys.
-//!   Uses Arrow's `RowConverter` to create deterministic byte keys, then probes a
-//!   [`KeyDeletionIndex`] for each row.
+//!   Searches decoded sorted deletion keys against native PK columns in monotone
+//!   scan runs, with row encoding and hash probes as a fallback and debug oracle.
 //!
 //! # Position-Based Deletion (No Filter Exec)
 //!
@@ -65,6 +65,14 @@ limitations under the License.
 //! pushed through (the execs need their PK columns, and being row-reducing a
 //! child limit could under-produce). See the OLAP-under-load audit, finding R1,
 //! and the SOTA scan (`ClickHouse` PREWHERE / Iceberg-V3 deletion-vector layering).
+
+static SORTED_KEY_DELETES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Select the native sorted deletion experiment for subsequently executed streams.
+#[doc(hidden)]
+pub fn experiment_set_sorted_key_deletes(enabled: bool) {
+    SORTED_KEY_DELETES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
 
 use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
@@ -103,6 +111,14 @@ struct DeletionFilterMetrics {
     baseline: BaselineMetrics,
     /// Rows removed because their key was an applicable (visible) deletion.
     rows_deleted: Count,
+    sorted_path_rows: Count,
+    sorted_path_batches: Count,
+    fallback_rows: Count,
+    fallback_batches: Count,
+    fallback_no_sorted_set_rows: Count,
+    sorted_runs: Count,
+    sorted_candidates: Count,
+    sorted_path_compute: datafusion_physical_plan::metrics::Time,
     /// Rows in batches that took the disjoint-range fast path (PK range entirely
     /// outside the deleted-key range) and skipped the per-row probe entirely.
     /// Near-zero on hash-clustered data (every batch spans the deleted range);
@@ -114,6 +130,17 @@ impl DeletionFilterMetrics {
     fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             baseline: BaselineMetrics::new(metrics, partition),
+            sorted_path_rows: MetricBuilder::new(metrics).counter("sorted_path_rows", partition),
+            sorted_path_batches: MetricBuilder::new(metrics)
+                .counter("sorted_path_batches", partition),
+            fallback_rows: MetricBuilder::new(metrics).counter("fallback_rows", partition),
+            fallback_batches: MetricBuilder::new(metrics).counter("fallback_batches", partition),
+            fallback_no_sorted_set_rows: MetricBuilder::new(metrics)
+                .counter("fallback_no_sorted_set_rows", partition),
+            sorted_runs: MetricBuilder::new(metrics).counter("sorted_runs", partition),
+            sorted_candidates: MetricBuilder::new(metrics).counter("sorted_candidates", partition),
+            sorted_path_compute: MetricBuilder::new(metrics)
+                .subset_time("sorted_path_compute", partition),
             rows_deleted: MetricBuilder::new(metrics).counter("rows_deleted", partition),
             rows_range_skipped: MetricBuilder::new(metrics)
                 .counter("rows_range_skipped", partition),
@@ -333,6 +360,27 @@ fn net_table_deletions(
 // Key-based deletion filter (for tables WITH primary key)
 // ============================================================================
 
+/// Scan branch to which key deletions are applied.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum DeletionFilterSource {
+    Main,
+    Cold,
+    ProtectedSnapshot,
+    #[default]
+    Other,
+}
+
+impl DeletionFilterSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Cold => "cold",
+            Self::ProtectedSnapshot => "protected_snapshot",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Execution plan that filters out deleted rows based on primary key matching.
 ///
 /// This wraps another execution plan and removes rows whose primary key values
@@ -371,6 +419,7 @@ fn net_table_deletions(
 /// through: the exec needs its PK columns, and because it can reduce row count a
 /// child limit could under-produce. See audit finding R1.
 pub struct KeyBasedDeletionFilterExec {
+    source: DeletionFilterSource,
     input: Arc<dyn ExecutionPlan>,
     /// Fused tombstone index of PK bytes -> (delete, insert) sequence numbers.
     tombstones: Arc<KeyDeletionIndex>,
@@ -390,6 +439,11 @@ pub struct KeyBasedDeletionFilterExec {
 }
 
 impl KeyBasedDeletionFilterExec {
+    pub(crate) fn with_source(mut self, source: DeletionFilterSource) -> Self {
+        self.source = source;
+        self
+    }
+
     /// Create a new key-based deletion filter execution plan.
     ///
     /// # Arguments
@@ -409,6 +463,7 @@ impl KeyBasedDeletionFilterExec {
     ) -> Self {
         let properties = Arc::clone(input.properties());
         Self {
+            source: DeletionFilterSource::Other,
             input,
             tombstones,
             insert_record_handling,
@@ -431,8 +486,9 @@ impl DisplayAs for KeyBasedDeletionFilterExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "KeyBasedDeletionFilterExec: filtered_keys={}",
-            self.tombstones.delete_len()
+            "KeyBasedDeletionFilterExec: filtered_keys={}, source={}",
+            self.tombstones.delete_len(),
+            self.source.label()
         )
     }
 }
@@ -526,14 +582,17 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
                 "KeyBasedDeletionFilterExec requires exactly 1 child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            Arc::clone(&self.tombstones),
-            self.insert_record_handling,
-            self.pk_column_indices.clone(),
-            Arc::clone(&self.row_converter),
-            self.min_delete_seq_to_apply,
-        )))
+        Ok(Arc::new(
+            Self::new(
+                Arc::clone(&children[0]),
+                Arc::clone(&self.tombstones),
+                self.insert_record_handling,
+                self.pk_column_indices.clone(),
+                Arc::clone(&self.row_converter),
+                self.min_delete_seq_to_apply,
+            )
+            .with_source(self.source),
+        ))
     }
 
     /// Forward parent filters to the child scan (filter-pushdown transparency).
@@ -574,6 +633,28 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         partition: usize,
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let verify = match std::env::var("SPICE_CAYENNE_SORTED_DELETE_VERIFY").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => cfg!(debug_assertions),
+        };
+        self.execute_sorted_options(
+            partition,
+            context,
+            SORTED_KEY_DELETES.load(std::sync::atomic::Ordering::Relaxed),
+            verify,
+        )
+    }
+}
+
+impl KeyBasedDeletionFilterExec {
+    fn execute_sorted_options(
+        &self,
+        partition: usize,
+        context: Arc<datafusion_execution::TaskContext>,
+        sorted_enabled: bool,
+        sorted_verify: bool,
+    ) -> datafusion_common::Result<SendableRecordBatchStream> {
         let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
         let row_scratch = RowEncodingScratch::new(
             context.memory_pool(),
@@ -594,6 +675,9 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             pk_column_indices,
             row_converter,
             row_scratch,
+            sorted_enabled,
+            sorted_verify,
+            sorted_decode_cache: SortedDecodeCache::new(),
             min_delete_seq_to_apply,
             schema,
             metrics,
@@ -680,6 +764,9 @@ pub struct KeyBasedDeletionFilterStream {
     pk_column_indices: Vec<usize>,
     row_converter: Arc<RowConverter>,
     row_scratch: RowEncodingScratch,
+    sorted_enabled: bool,
+    sorted_verify: bool,
+    sorted_decode_cache: SortedDecodeCache,
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
@@ -701,6 +788,159 @@ pub struct KeyBasedDeletionFilterStream {
     /// stream's lifetime instead of once per batch.
     hashes_scratch: Vec<u128>,
     candidates_scratch: Vec<u32>,
+}
+
+type SortedDecodeCache =
+    std::collections::HashMap<(usize, Vec<arrow_schema::DataType>), Vec<ArrayRef>>;
+
+type NativeComparator = Box<dyn Fn(usize, usize) -> std::cmp::Ordering + Send + Sync>;
+
+// Arrow dispatches once to typed primitive, Boolean, byte, view, and fixed-size
+// comparators. Its primitive float comparator uses total_cmp; null ordering is
+// independent of descending value order. Other supported types share this API.
+fn native_comparators(
+    left: &[ArrayRef],
+    right: &[ArrayRef],
+    converter: &RowConverter,
+) -> datafusion_common::Result<Vec<NativeComparator>> {
+    if left.len() != converter.sort_fields().len() || right.len() != left.len() {
+        return Err(datafusion_common::DataFusionError::Internal(
+            "Sorted deletion primary key column count differs from the row converter".into(),
+        ));
+    }
+    left.iter()
+        .zip(right)
+        .zip(converter.sort_fields())
+        .map(|((l, r), field)| {
+            let r = if l.data_type() == r.data_type() {
+                Arc::clone(r)
+            } else {
+                arrow::compute::cast(r, l.data_type())?
+            };
+            Ok(arrow::array::make_comparator(
+                l.as_ref(),
+                r.as_ref(),
+                field.options,
+            )?)
+        })
+        .collect()
+}
+
+fn compare_native(comparators: &[NativeComparator], a: usize, b: usize) -> std::cmp::Ordering {
+    comparators
+        .iter()
+        .map(|c| c(a, b))
+        .find(|o| !o.is_eq())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Returns `None` when the batch has too many monotone runs for native search.
+fn sorted_deleted_rows(
+    columns: &[ArrayRef],
+    converter: &RowConverter,
+    tombstones: &KeyDeletionIndex,
+    handling: InsertRecordHandling,
+    cutoff: Option<i64>,
+    metrics: &DeletionFilterMetrics,
+    cache: &mut SortedDecodeCache,
+) -> datafusion_common::Result<Option<Vec<usize>>> {
+    let n = columns.first().map_or(0, |c| c.len());
+    if n == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let same = native_comparators(columns, columns, converter)?;
+    let mut boundaries = vec![0];
+    for i in 1..n {
+        if compare_native(&same, i - 1, i).is_gt() {
+            boundaries.push(i);
+        }
+    }
+    metrics.sorted_runs.add(boundaries.len());
+    if boundaries.len() > (n / 16).max(1) {
+        return Ok(None);
+    }
+    boundaries.push(n);
+    let mut candidates = BooleanBufferBuilder::new(n);
+    candidates.append_n(n, false);
+    let mut deleted = Vec::new();
+    let Some(runs) = tombstones.sorted_runs() else {
+        return Ok(None);
+    };
+    for run in runs {
+        if run.len() == 0 {
+            continue;
+        }
+        let cache_key = (
+            Arc::as_ptr(run) as usize,
+            columns.iter().map(|c| c.data_type().clone()).collect(),
+        );
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(cache_key.clone()) {
+            let decoded = run.decoded(converter)?;
+            let cast = columns
+                .iter()
+                .zip(decoded)
+                .map(|(batch, tomb)| {
+                    if batch.data_type() == tomb.data_type() {
+                        Ok(Arc::clone(tomb))
+                    } else {
+                        arrow::compute::cast(tomb, batch.data_type())
+                    }
+                })
+                .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()?;
+            entry.insert(cast);
+        }
+        let decoded = cache.get(&cache_key).ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(
+                "Sorted deletion cast cache was not initialized".into(),
+            )
+        })?;
+        let cross = native_comparators(columns, decoded, converter)?;
+        for bounds in boundaries.windows(2) {
+            let (a, b) = (bounds[0], bounds[1]);
+            let mut lo = 0;
+            let mut hi = run.len();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if compare_native(&cross, a, mid).is_gt() {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let mut pos = a;
+            for t in lo..run.len() {
+                if compare_native(&cross, b - 1, t).is_lt() {
+                    break;
+                }
+                let mut end = b;
+                while pos < end {
+                    let mid = pos + (end - pos) / 2;
+                    if compare_native(&cross, mid, t).is_lt() {
+                        pos = mid + 1;
+                    } else {
+                        end = mid;
+                    }
+                }
+                while pos < b && compare_native(&cross, pos, t).is_eq() {
+                    if !candidates.get_bit(pos) {
+                        candidates.set_bit(pos, true);
+                        metrics.sorted_candidates.add(1);
+                        if tombstones
+                            .get_by_hash_with_min_seq(run.hash(t), cutoff)
+                            .is_some_and(|tombstone| {
+                                !tombstone_visible(tombstone, handling, cutoff)
+                            })
+                        {
+                            deleted.push(pos);
+                        }
+                    }
+                    pos += 1;
+                }
+            }
+        }
+    }
+    deleted.sort_unstable();
+    Ok(Some(deleted))
 }
 
 impl futures::Stream for KeyBasedDeletionFilterStream {
@@ -766,61 +1006,94 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         this.pk_columns_scratch.push(Arc::clone(column));
                     }
 
-                    // Convert PK columns to row bytes (single batched conversion).
-                    let rows = match this
-                        .row_converter
-                        .convert_columns_reusing(&this.pk_columns_scratch, this.row_scratch.take())
-                    {
-                        Ok(rows) => rows,
-                        Err(e) => {
-                            this.row_scratch.clear();
+                    let sorted = if this.sorted_enabled && this.tombstones.sorted_runs().is_some() {
+                        let _sorted_timer = this.metrics.sorted_path_compute.timer();
+                        match sorted_deleted_rows(
+                            &this.pk_columns_scratch,
+                            &this.row_converter,
+                            &this.tombstones,
+                            this.insert_record_handling,
+                            this.min_delete_seq_to_apply,
+                            &this.metrics,
+                            &mut this.sorted_decode_cache,
+                        ) {
+                            Ok(result) => result,
+                            Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                        }
+                    } else {
+                        None
+                    };
+                    if sorted.is_some() {
+                        this.metrics.sorted_path_rows.add(batch_size);
+                        this.metrics.sorted_path_batches.add(1);
+                    } else if this.tombstones.sorted_runs().is_none() {
+                        this.metrics.fallback_no_sorted_set_rows.add(batch_size);
+                    } else {
+                        this.metrics.fallback_rows.add(batch_size);
+                        this.metrics.fallback_batches.add(1);
+                    }
+                    if sorted.is_none() || this.sorted_verify {
+                        // Convert PK columns to row bytes (single batched conversion).
+                        let rows = match this.row_converter.convert_columns_reusing(
+                            &this.pk_columns_scratch,
+                            this.row_scratch.take(),
+                        ) {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                this.row_scratch.clear();
+                                return std::task::Poll::Ready(Some(Err(
+                                    datafusion_common::DataFusionError::ArrowError(
+                                        Box::new(e),
+                                        None,
+                                    ),
+                                )));
+                            }
+                        };
+
+                        // Hash fallback and verification oracle: encode every PK once,
+                        // sweep the bloom, then resolve fused tombstones for survivors.
+                        // Reuse the stream's encoding and hash buffers across batches.
+                        this.deleted_scratch.clear();
+                        this.deleted_scratch.reserve(batch_size);
+                        let insert_record_handling = this.insert_record_handling;
+                        let min_delete_seq_to_apply = this.min_delete_seq_to_apply;
+                        let deleted_scratch = &mut this.deleted_scratch;
+                        this.tombstones.get_batch_with_scratch(
+                            rows.iter(),
+                            &mut this.hashes_scratch,
+                            &mut this.candidates_scratch,
+                            |i, tombstone| {
+                                if !tombstone_visible(
+                                    tombstone,
+                                    insert_record_handling,
+                                    min_delete_seq_to_apply,
+                                ) {
+                                    deleted_scratch.push(i);
+                                }
+                            },
+                        );
+                        // Retention is optional: an oversized encoding or a full pool
+                        // drops the buffers after probing instead of failing the query.
+                        this.row_scratch.retain(rows);
+                    }
+                    if let Some(sorted) = sorted {
+                        if this.sorted_verify && sorted != this.deleted_scratch {
+                            let row = (0..batch_size)
+                                .find(|i| {
+                                    sorted.binary_search(i).is_ok()
+                                        != this.deleted_scratch.binary_search(i).is_ok()
+                                })
+                                .unwrap_or(0);
                             return std::task::Poll::Ready(Some(Err(
-                                datafusion_common::DataFusionError::ArrowError(Box::new(e), None),
+                                datafusion_common::DataFusionError::Internal(format!(
+                                    "Sorted deletion verification differs at row {row}: sorted_deleted={}, hash_deleted={}",
+                                    sorted.binary_search(&row).is_ok(),
+                                    this.deleted_scratch.binary_search(&row).is_ok()
+                                )),
                             )));
                         }
-                    };
-
-                    // Single-hash batched probe. The previous code hashed every
-                    // row's PK key TWICE — once in a standalone bloom
-                    // `might_contain` sweep, then again in the per-row `get` — on
-                    // this hot loop (the dominant query-side CPU cost under
-                    // merge-on-read). `KeyDeletionIndex::get_batch_with_scratch`
-                    // does what the sweep+probe did but hashes each key ONCE: it
-                    // runs the bloom sweep over the precomputed XXH3-128 hashes
-                    // and walks the delta/base tiers only for bloom survivors
-                    // (probed by hash identity), using this stream's own
-                    // `hashes_scratch`/`candidates_scratch` buffers instead of
-                    // allocating a fresh pair per batch. It is proven equivalent
-                    // to the per-row `get` by `get_batch_matches_per_row_get_composite`
-                    // (and to the allocating `get_batch` by
-                    // `get_batch_with_scratch_reuse_does_not_leak_across_calls`),
-                    // and only calls back for rows that have a real tombstone —
-                    // a row with no tombstone is visible, exactly as
-                    // `is_pk_visible_row_key` returns `true` on `get() == None`.
-                    // The bloom-empty / all-visible fast path is preserved below
-                    // via `deleted_scratch`.
-                    this.deleted_scratch.clear();
-                    this.deleted_scratch.reserve(batch_size);
-                    let insert_record_handling = this.insert_record_handling;
-                    let min_delete_seq_to_apply = this.min_delete_seq_to_apply;
-                    let deleted_scratch = &mut this.deleted_scratch;
-                    this.tombstones.get_batch_with_scratch(
-                        rows.iter(),
-                        &mut this.hashes_scratch,
-                        &mut this.candidates_scratch,
-                        |i, tombstone| {
-                            if !tombstone_visible(
-                                tombstone,
-                                insert_record_handling,
-                                min_delete_seq_to_apply,
-                            ) {
-                                deleted_scratch.push(i);
-                            }
-                        },
-                    );
-                    // Retention is optional: an oversized encoding or a full pool
-                    // drops the buffers after probing instead of failing the query.
-                    this.row_scratch.retain(rows);
+                        this.deleted_scratch = sorted;
+                    }
                     let keep_count = batch_size - this.deleted_scratch.len();
 
                     tracing::trace!(
@@ -1830,6 +2103,9 @@ mod tests {
             insert_record_handling: InsertRecordHandling::Apply,
             pk_column_indices: Vec::new(),
             row_converter,
+            sorted_enabled: true,
+            sorted_verify: true,
+            sorted_decode_cache: SortedDecodeCache::new(),
             row_scratch: RowEncodingScratch::new(
                 datafusion_execution::TaskContext::default().memory_pool(),
                 1,
@@ -2297,6 +2573,9 @@ mod tests {
             insert_record_handling: handling,
             pk_column_indices: vec![0],
             row_converter,
+            sorted_enabled: true,
+            sorted_verify: true,
+            sorted_decode_cache: SortedDecodeCache::new(),
             row_scratch: RowEncodingScratch::new(
                 datafusion_execution::TaskContext::default().memory_pool(),
                 1,
@@ -2469,3 +2748,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sorted_filter_differential_tests.rs"]
+mod sorted_filter_differential_tests;

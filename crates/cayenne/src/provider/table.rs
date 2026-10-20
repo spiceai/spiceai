@@ -36,7 +36,7 @@ use super::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 use super::delete::{
-    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionIdentifier,
+    CaptureLocks, CayenneDeletionSink, DeleteScanSource, DeletionFilterSource, DeletionIdentifier,
     DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,
     FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
@@ -21993,7 +21993,12 @@ impl CayenneTableProvider {
         };
         let deletion_snapshot = self.pk_deletion_snapshot();
         let pk_indices = self.pk_column_indices.clone();
-        let with_deletes = match self.apply_deletion_filter(plan, &pk_indices, &deletion_snapshot) {
+        let with_deletes = match self.apply_deletion_filter(
+            plan,
+            &pk_indices,
+            &deletion_snapshot,
+            DeletionFilterSource::Other,
+        ) {
             Ok(p) => p,
             Err(source) => {
                 cleanup_all.await;
@@ -40855,14 +40860,17 @@ impl CayenneTableProvider {
                         return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                     }
 
-                    Ok(Arc::new(KeyBasedDeletionFilterExec::new(
-                        plan,
-                        Arc::clone(tombstones),
-                        InsertRecordHandling::Ignore,
-                        pk_indices_in_projection.to_vec(),
-                        Arc::clone(row_converter),
-                        Some(min_delete_seq_to_apply),
-                    )))
+                    Ok(Arc::new(
+                        KeyBasedDeletionFilterExec::new(
+                            plan,
+                            Arc::clone(tombstones),
+                            InsertRecordHandling::Ignore,
+                            pk_indices_in_projection.to_vec(),
+                            Arc::clone(row_converter),
+                            Some(min_delete_seq_to_apply),
+                        )
+                        .with_source(DeletionFilterSource::ProtectedSnapshot),
+                    ))
                 } else {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
                 }
@@ -40880,6 +40888,7 @@ impl CayenneTableProvider {
         plan: Arc<dyn ExecutionPlan>,
         pk_indices_in_projection: &[usize],
         deletion_snapshot: &PkDeletionSnapshot,
+        source: DeletionFilterSource,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         match deletion_snapshot {
             PkDeletionSnapshot::Int64Pk { tombstones } => {
@@ -40916,14 +40925,17 @@ impl CayenneTableProvider {
                 if let Some(ref row_converter) = self.pk_row_converter
                     && tombstones.has_deletions()
                 {
-                    return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
-                        plan,
-                        Arc::clone(tombstones),
-                        InsertRecordHandling::Ignore,
-                        pk_indices_in_projection.to_vec(),
-                        Arc::clone(row_converter),
-                        None,
-                    )));
+                    return Ok(Arc::new(
+                        KeyBasedDeletionFilterExec::new(
+                            plan,
+                            Arc::clone(tombstones),
+                            InsertRecordHandling::Ignore,
+                            pk_indices_in_projection.to_vec(),
+                            Arc::clone(row_converter),
+                            None,
+                        )
+                        .with_source(source),
+                    ));
                 }
             }
             PkDeletionSnapshot::PositionBased => {
@@ -40995,14 +41007,17 @@ impl CayenneTableProvider {
                         self.table_metadata.table_name
                     );
 
-                    return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
-                        plan,
-                        Arc::clone(tombstones),
-                        InsertRecordHandling::Apply,
-                        pk_indices_in_projection.to_vec(),
-                        Arc::clone(row_converter),
-                        None,
-                    )));
+                    return Ok(Arc::new(
+                        KeyBasedDeletionFilterExec::new(
+                            plan,
+                            Arc::clone(tombstones),
+                            InsertRecordHandling::Apply,
+                            pk_indices_in_projection.to_vec(),
+                            Arc::clone(row_converter),
+                            None,
+                        )
+                        .with_source(DeletionFilterSource::Main),
+                    ));
                 }
             }
             PkDeletionSnapshot::PositionBased => {
@@ -42439,7 +42454,12 @@ impl CayenneTableProvider {
             })
             .await?
             .map(|cold| {
-                self.apply_deletion_filter(cold, &pk_indices_in_projection, &deletion_snapshot)
+                self.apply_deletion_filter(
+                    cold,
+                    &pk_indices_in_projection,
+                    &deletion_snapshot,
+                    DeletionFilterSource::Cold,
+                )
             })
             .transpose()?;
 
@@ -42560,6 +42580,7 @@ impl CayenneTableProvider {
                 main_plan,
                 &pk_indices_in_projection,
                 &deletion_snapshot,
+                DeletionFilterSource::Main,
             )?;
 
             let mut all_plans = vec![filtered_main_plan];

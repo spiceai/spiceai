@@ -158,6 +158,10 @@ impl RowConverter {
         }
     }
 
+    pub(crate) fn sort_fields(&self) -> &[SortField] {
+        &self.codec().fields
+    }
+
     fn codec(&self) -> &RowCodec {
         match self {
             Self::Version1(codec) => codec,

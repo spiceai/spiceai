@@ -109,7 +109,7 @@ async fn check_load(
         for row in 0..4096_i64 {
             rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             let region = format!("r{}", (rng >> 32) % 4);
-            let id = i64::try_from((rng >> 40) % 8192).expect("key fits i64");
+            let id = i64::try_from((rng >> 40) % 8192)?;
             let payload = batch_index * 4096 + row;
             if !batch_keys.insert((region.clone(), id)) {
                 within_batch_dropped += 1;
@@ -172,7 +172,7 @@ async fn check_load(
     );
     assert_eq!(
         superseded.get(SupersededReason::Arrival),
-        u64::try_from(input_rows - model.len()).expect("dropped rows fit u64"),
+        u64::try_from(input_rows - model.len())?,
         "seed={SEED:#x}"
     );
     assert_eq!(superseded.get(SupersededReason::Older), 0, "seed={SEED:#x}");

@@ -389,6 +389,10 @@ where
     K: Copy + Eq + Hash + Ord,
     S: BuildHasher + Default + Clone,
 {
+    fn contains_key(&self, key: &K) -> bool {
+        self.active.contains_key(key) || self.runs.iter().any(|run| run.map.contains_key(key))
+    }
+
     fn empty() -> Self {
         Self {
             runs: Vec::new(),
@@ -1576,14 +1580,139 @@ fn bloom_half(hash: u128) -> u64 {
     (hash >> 64) as u64
 }
 
+#[derive(Debug, Clone, Default)]
+struct SortedKeySet {
+    runs: Vec<Arc<SortedKeyRun>>,
+    tail: Option<Arc<SortedKeyRun>>,
+}
+
+impl SortedKeySet {
+    fn from_keys(keys: impl Iterator<Item = Vec<u8>>) -> Self {
+        Self {
+            runs: vec![Arc::new(SortedKeyRun::new(keys))],
+            tail: None,
+        }
+    }
+
+    fn extended(&self, keys: impl Iterator<Item = Vec<u8>>) -> Self {
+        const TAIL_CAP: usize = 4096;
+        let added = SortedKeyRun::new(keys);
+        let mut result = self.clone();
+        let tail = self
+            .tail
+            .as_ref()
+            .map_or_else(|| added.clone(), |tail| tail.merged(&added));
+        if tail.len() <= TAIL_CAP {
+            result.tail = Some(Arc::new(tail));
+        } else {
+            result.tail = None;
+            result.runs.push(Arc::new(tail));
+            while result.runs.len() >= 2 {
+                let n = result.runs.len();
+                if result.runs[n - 1].len() < result.runs[n - 2].len().div_ceil(2) {
+                    break;
+                }
+                let merged = result.runs[n - 2].merged(&result.runs[n - 1]);
+                result.runs.truncate(n - 2);
+                result.runs.push(Arc::new(merged));
+            }
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SortedKeyRun {
+    data: Vec<u8>,
+    offsets: Vec<usize>,
+    hashes: Vec<u128>,
+    decoded: std::sync::OnceLock<Vec<arrow::array::ArrayRef>>,
+}
+
+impl SortedKeyRun {
+    fn new(keys: impl Iterator<Item = Vec<u8>>) -> Self {
+        let mut keys: Vec<_> = keys.collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Self::from_sorted(keys.iter().map(Vec::as_slice))
+    }
+
+    fn from_sorted<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Self {
+        let mut result = Self {
+            data: Vec::new(),
+            offsets: vec![0],
+            hashes: Vec::new(),
+            decoded: std::sync::OnceLock::new(),
+        };
+        for key in keys {
+            result.data.extend_from_slice(key);
+            result.offsets.push(result.data.len());
+            result.hashes.push(hash_key_128(key));
+        }
+        result
+    }
+
+    fn merged(&self, other: &Self) -> Self {
+        let (mut a, mut b) = (0, 0);
+        let mut keys = Vec::with_capacity(self.len() + other.len());
+        while a < self.len() || b < other.len() {
+            if b == other.len() || (a < self.len() && self.key_bytes(a) < other.key_bytes(b)) {
+                keys.push(self.key_bytes(a));
+                a += 1;
+            } else if a == self.len() || other.key_bytes(b) < self.key_bytes(a) {
+                keys.push(other.key_bytes(b));
+                b += 1;
+            } else {
+                keys.push(self.key_bytes(a));
+                a += 1;
+                b += 1;
+            }
+        }
+        Self::from_sorted(keys.into_iter())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.hashes.len()
+    }
+    pub(crate) fn hash(&self, i: usize) -> u128 {
+        self.hashes[i]
+    }
+    pub(crate) fn key_bytes(&self, i: usize) -> &[u8] {
+        &self.data[self.offsets[i]..self.offsets[i + 1]]
+    }
+    pub(crate) fn decoded(
+        &self,
+        converter: &crate::row_converter::RowConverter,
+    ) -> Result<&[arrow::array::ArrayRef], arrow_schema::ArrowError> {
+        if self.decoded.get().is_none() {
+            let columns = converter.convert_rows(
+                (0..self.len()).map(|i| crate::row_converter::Row::from_encoded(self.key_bytes(i))),
+            )?;
+            let _ = self.decoded.set(columns);
+        }
+        self.decoded.get().map(Vec::as_slice).ok_or_else(|| {
+            arrow_schema::ArrowError::ComputeError(
+                "Sorted deletion key decoding was not initialized".into(),
+            )
+        })
+    }
+    fn bytes(&self) -> usize {
+        self.data.capacity()
+            + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.hashes.capacity() * std::mem::size_of::<u128>()
+            + self.decoded.get().map_or(0, |arrays| {
+                arrays.iter().map(|a| a.get_array_memory_size()).sum()
+            })
+    }
+}
+
 /// Frozen deletion index for tables with a composite or non-integer primary key.
 /// Probe keys are the byte-encoded form produced by `crate::row_converter::RowConverter`.
 ///
 /// Entries are keyed by the **seeded XXH3-128 hash of the key bytes**
 /// ([`hash_key_128`]) rather than the bytes themselves: the hash is the key's
-/// identity and the bytes are not retained. This fixes the per-entry footprint
-/// at 32 bytes regardless of composite-key width, removes byte comparisons
-/// from probes, and (via [`PrehashedBuildHasher`]) lets the maps reuse the
+/// identity. A separate sorted set retains key bytes for native scan searches.
+/// Hash lookup removes byte comparisons from probes and (via [`PrehashedBuildHasher`]) lets the maps reuse the
 /// hash's own entropy instead of re-hashing per probe — one hash computation
 /// serves the bloom filter and the maps together.
 ///
@@ -1597,6 +1726,7 @@ fn bloom_half(hash: u128) -> u64 {
 #[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
     core: LayeredRuns<u128, PrehashedBuildHasher>,
+    sorted_keys: Option<SortedKeySet>,
 }
 
 impl Default for KeyDeletionIndex {
@@ -1606,11 +1736,45 @@ impl Default for KeyDeletionIndex {
 }
 
 impl KeyDeletionIndex {
+    pub(crate) fn sorted_runs(&self) -> Option<impl Iterator<Item = &Arc<SortedKeyRun>>> {
+        self.sorted_keys
+            .as_ref()
+            .map(|s| s.runs.iter().chain(s.tail.iter()))
+    }
+
+    /// Resident bytes retained by the native-search key set.
+    #[must_use]
+    pub fn sorted_key_set_bytes(&self) -> usize {
+        self.sorted_runs()
+            .map_or(0, |runs| runs.map(|r| r.bytes()).sum())
+    }
+
+    /// Number of keys across sorted runs, including overlap between runs.
+    #[must_use]
+    pub fn sorted_key_set_len(&self) -> usize {
+        self.sorted_runs()
+            .map_or(0, |runs| runs.map(|r| r.len()).sum())
+    }
+
+    fn filtered_sorted_keys(
+        &self,
+        core: &LayeredRuns<u128, PrehashedBuildHasher>,
+    ) -> Option<SortedKeySet> {
+        self.sorted_runs().map(|runs| {
+            SortedKeySet::from_keys(runs.flat_map(|r| {
+                (0..r.len())
+                    .filter(|&i| core.contains_key(&r.hash(i)))
+                    .map(|i| r.key_bytes(i).to_vec())
+            }))
+        })
+    }
+
     /// An empty index.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             core: LayeredRuns::empty(),
+            sorted_keys: Some(SortedKeySet::default()),
         }
     }
 
@@ -1638,7 +1802,14 @@ impl KeyDeletionIndex {
         deleted: HashMap<Box<[u8]>, i64>,
         insert_records: HashMap<Box<[u8]>, i64>,
     ) -> Self {
+        let sorted_keys = Some(SortedKeySet::from_keys(
+            deleted
+                .keys()
+                .chain(insert_records.keys())
+                .map(|k| k.to_vec()),
+        ));
         Self {
+            sorted_keys,
             core: LayeredRuns::from_iters(
                 deleted
                     .into_iter()
@@ -1686,8 +1857,8 @@ impl KeyDeletionIndex {
     /// Approximate resident bytes for memory accounting. Base entries are
     /// flat-table slots (`u128 -> (i64, i64)` payload plus `SwissTable` load
     /// factor and control bytes); delta entries carry HAMT node/bitmap/Arc
-    /// overhead. Key bytes are not retained (hash-keyed identity), so the
-    /// estimate no longer depends on composite-key width. Shared structure
+    /// overhead. The sorted search set includes encoded keys and decoded arrays.
+    /// Shared structure
     /// retained by older reader-pinned generations is intentionally not
     /// charged to the latest snapshot again.
     #[must_use]
@@ -1696,6 +1867,7 @@ impl KeyDeletionIndex {
         const APPROX_KEY_DELTA_ENTRY_BYTES: usize = 88;
         self.core
             .approx_bytes(APPROX_KEY_BASE_ENTRY_BYTES, APPROX_KEY_DELTA_ENTRY_BYTES)
+            + self.sorted_key_set_bytes()
     }
 
     /// Whether the index has no entries at all.
@@ -1712,12 +1884,9 @@ impl KeyDeletionIndex {
 
     // NOTE: there is deliberately NO `deleted_key_range()` here. The core's
     // `min_deleted_key`/`max_deleted_key` are over the XXH3-128 *hash* of the
-    // PK bytes (the original bytes are not retained — see the module docs), so a
-    // min/max over them is meaningless for PK value-range pruning and could
-    // wrongly report a hash-window as disjoint from a scan's value window. The
-    // composite-PK read-tax is instead attacked by the batch-level bloom sweep
-    // in `KeyBasedDeletionFilterStream` (b3 sub-lever 2), which is sound because
-    // `might_contain` has no false negatives.
+    // PK bytes, so min/max over them cannot prune PK value ranges. Sorted
+    // searches use the retained encoded keys; hash fallback uses the bloom
+    // sweep, whose `might_contain` check has no false negatives.
 
     /// Bloom-filter check against deletion membership; see
     /// [`DeletionIndex::might_contain`].
@@ -1747,7 +1916,14 @@ impl KeyDeletionIndex {
     #[inline]
     #[must_use]
     pub fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
-        let key_hash = hash_key_128(key);
+        self.get_by_hash_with_min_seq(hash_key_128(key), min_delete_seq)
+    }
+
+    pub(crate) fn get_by_hash_with_min_seq(
+        &self,
+        key_hash: u128,
+        min_delete_seq: Option<i64>,
+    ) -> Option<Tombstone> {
         let bloom_hash = bloom_half(key_hash);
         // Global bloom is a safe superset over every run's deletion keys, so a
         // miss means no tombstone at any sequence — `None` for any cutoff,
@@ -1854,7 +2030,7 @@ impl KeyDeletionIndex {
 
     /// Build a new index from `self`'s entries plus delete-only `additions`,
     /// taking the per-key max sequence on conflict. Keys are borrowed — the
-    /// index stores their XXH3-128 hash, never the bytes.
+    /// hash lookup uses XXH3-128 identity; the sorted set retains key bytes.
     ///
     /// See [`DeletionIndex::extend_max_deletes`] for the layering,
     /// amortization, and shared-filter safety argument.
@@ -1863,7 +2039,15 @@ impl KeyDeletionIndex {
         &self,
         additions: impl IntoIterator<Item = (K, i64)>,
     ) -> Self {
+        let additions: Vec<_> = additions
+            .into_iter()
+            .map(|(k, s)| (k.as_ref().to_vec(), s))
+            .collect();
         Self {
+            sorted_keys: self
+                .sorted_keys
+                .as_ref()
+                .map(|set| set.extended(additions.iter().map(|(k, _)| k.clone()))),
             core: self.core.extend(
                 additions.into_iter().map(|(key, delete_seq)| {
                     (hash_key_128(key.as_ref()), delete_seq, SEQUENCE_ABSENT)
@@ -1882,7 +2066,12 @@ impl KeyDeletionIndex {
         delete_sequence: i64,
         insert_sequence: i64,
     ) -> Self {
+        let keys: Vec<_> = keys.into_iter().map(|k| k.as_ref().to_vec()).collect();
         Self {
+            sorted_keys: self
+                .sorted_keys
+                .as_ref()
+                .map(|set| set.extended(keys.iter().cloned())),
             core: self.core.extend(
                 keys.into_iter()
                     .map(|key| (hash_key_128(key.as_ref()), delete_sequence, insert_sequence)),
@@ -1900,7 +2089,23 @@ impl KeyDeletionIndex {
         pure: impl IntoIterator<Item = (K, i64)>,
         conflicts: impl IntoIterator<Item = (K, i64, i64)>,
     ) -> Self {
+        let pure: Vec<_> = pure
+            .into_iter()
+            .map(|(k, s)| (k.as_ref().to_vec(), s))
+            .collect();
+        let conflicts: Vec<_> = conflicts
+            .into_iter()
+            .map(|(k, d, i)| (k.as_ref().to_vec(), d, i))
+            .collect();
+        let sorted_keys = self.sorted_keys.as_ref().map(|set| {
+            set.extended(
+                pure.iter()
+                    .map(|(k, _)| k.clone())
+                    .chain(conflicts.iter().map(|(k, _, _)| k.clone())),
+            )
+        });
         Self {
+            sorted_keys,
             core: self.core.extend(
                 pure.into_iter()
                     .map(|(key, delete_seq)| {
@@ -1918,10 +2123,12 @@ impl KeyDeletionIndex {
     /// see [`DeletionIndex::prune_deletes_at_or_below`].
     #[must_use]
     pub fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
+        let core = self
+            .core
+            .prune_deletes_at_or_below(cutoff, |key_hash| bloom_half(*key_hash));
         Self {
-            core: self
-                .core
-                .prune_deletes_at_or_below(cutoff, |key_hash| bloom_half(*key_hash)),
+            sorted_keys: self.filtered_sorted_keys(&core),
+            core,
         }
     }
 
@@ -1940,7 +2147,10 @@ impl KeyDeletionIndex {
     pub fn with_pruned_prefix(&self, prefix: &PrunedKeyDeletionPrefix) -> Option<Self> {
         self.core
             .with_pruned_prefix(&prefix.core, |key_hash| bloom_half(*key_hash))
-            .map(|core| Self { core })
+            .map(|core| Self {
+                sorted_keys: self.filtered_sorted_keys(&core),
+                core,
+            })
     }
 }
 
@@ -3790,5 +4000,63 @@ mod tests {
         assert_eq!(collected[&5].delete_sequence(), Some(50), "delta wins");
         assert_eq!(collected[&200].delete_sequence(), Some(60));
         assert_eq!(collected[&6].delete_sequence(), Some(1), "base preserved");
+    }
+}
+
+#[cfg(test)]
+mod sorted_key_tests {
+    use super::*;
+
+    #[test]
+    fn sorted_key_set_superset_after_random_mutations() {
+        let seed = std::env::var("SORTED_FILTER_SEED")
+            .ok()
+            .map_or(0x9876_5432_10ab, |s| {
+                s.parse::<u64>().expect("SORTED_FILTER_SEED must be u64")
+            });
+        let mut random = seed.max(1);
+        let keys: Vec<_> = (0..256_u64).map(|i| i.to_be_bytes().to_vec()).collect();
+        let mut index = KeyDeletionIndex::from_maps(
+            keys[..32]
+                .iter()
+                .map(|k| (k.clone().into_boxed_slice(), 1))
+                .collect(),
+            keys[16..48]
+                .iter()
+                .map(|k| (k.clone().into_boxed_slice(), 2))
+                .collect(),
+        );
+        for seq in 2..500_i64 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let key = &keys[usize::try_from(random % 256).expect("bounded index")];
+            match random % 5 {
+                0 => index = index.extend_max_deletes([(key, seq)]),
+                1 => index = index.extend_max_conflicts([key], seq, seq + 1),
+                2 => index = index.extend_max([(key, seq)], [(key, seq, seq + 1)]),
+                3 => index = index.prune_deletes_at_or_below(seq / 2),
+                _ => {
+                    let prefix = index.prune_frozen_prefix(seq / 2);
+                    index = index
+                        .with_pruned_prefix(&prefix)
+                        .expect("unchanged prefix applies");
+                }
+            }
+            let retained: HashSet<_> = index.iter_entries().map(|(hash, _)| hash).collect();
+            let sorted: HashSet<_> = index
+                .sorted_runs()
+                .expect("sorted set available")
+                .flat_map(|run| (0..run.len()).map(|i| run.key_bytes(i).to_vec()))
+                .collect();
+            for key in &keys {
+                if retained.contains(&hash_key_128(key)) {
+                    assert!(
+                        sorted.contains(key),
+                        "seed={seed}, seq={seq}, missing key={key:?}"
+                    );
+                }
+            }
+        }
     }
 }
