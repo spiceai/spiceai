@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod archive;
 mod docx;
 mod pdf;
 mod pdfium;
@@ -53,6 +54,16 @@ pub enum Error {
         See: https://spiceai.org/docs/features/document-processing"
     ))]
     PdfiumUnavailable { reason: String },
+
+    #[snafu(display(
+        "Failed to parse {format} document: {reason}. \
+        Documents this large are not supported, and the file may be maliciously crafted (for example, a decompression bomb). \
+        See: https://spiceai.org/docs/features/document-processing"
+    ))]
+    DocumentTooLarge {
+        format: DocumentType,
+        reason: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -104,7 +115,7 @@ pub trait Document {
     fn type_(&self) -> DocumentType;
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentType {
     Pdf,
     Docx,

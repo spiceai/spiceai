@@ -22,6 +22,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+    archive::{Limits, ensure_text_within_limit, rebuild_package},
 };
 
 pub struct DocxParserFactory {}
@@ -52,7 +53,9 @@ impl DocxParser {
 #[async_trait::async_trait]
 impl DocumentParser for DocxParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        let doc = read_docx(raw).boxed().context(InternalParsingSnafu {
+        // `read_docx` decompresses every part it reads without a size limit.
+        let package = rebuild_package(raw, DocumentType::Docx, Limits::DEFAULT)?;
+        let doc = read_docx(&package).boxed().context(InternalParsingSnafu {
             format: DocumentType::Docx,
         })?;
         Ok(Arc::new(DocxDocument { doc }))
@@ -65,7 +68,9 @@ struct DocxDocument {
 
 impl Document for DocxDocument {
     fn as_flat_utf8(&self) -> Result<String> {
-        Ok(self.doc.document.render_ascii())
+        let text = self.doc.document.render_ascii();
+        ensure_text_within_limit(text.len() as u64, DocumentType::Docx)?;
+        Ok(text)
     }
 
     fn type_(&self) -> DocumentType {
@@ -76,6 +81,7 @@ impl Document for DocxDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::test_support::{Part, deflated_package};
     use docx_rs::{Paragraph, Run, Table, TableCell, TableRow};
     use std::io::Cursor;
 
@@ -99,6 +105,69 @@ mod tests {
             .expect("the in-memory .docx parses")
             .as_flat_utf8()
             .expect("flat utf8 text")
+    }
+
+    const CONTENT_TYPES: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    const PACKAGE_RELS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+    const DOCUMENT_RELS: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>"#;
+    const DOCUMENT_PREFIX: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>"#;
+    const DOCUMENT_SUFFIX: &[u8] = b"</w:t></w:r></w:p></w:body></w:document>";
+
+    /// A minimal hand-built `.docx` whose single `<w:t>` holds `text_len`
+    /// repetitions of `x`, written by a plain zip writer rather than `docx-rs`
+    /// so the package has exactly the parts a hostile file would carry.
+    fn single_run_docx(text_len: usize) -> Bytes {
+        deflated_package(&[
+            ("[Content_Types].xml", Part::Bytes(CONTENT_TYPES)),
+            ("_rels/.rels", Part::Bytes(PACKAGE_RELS)),
+            ("word/_rels/document.xml.rels", Part::Bytes(DOCUMENT_RELS)),
+            (
+                "word/document.xml",
+                Part::Repeated {
+                    prefix: DOCUMENT_PREFIX,
+                    byte: b'x',
+                    len: text_len,
+                    suffix: DOCUMENT_SUFFIX,
+                },
+            ),
+        ])
+    }
+
+    /// The hand-built package parses at a normal size, so the rejection below
+    /// is the decompression limit and not a malformed package.
+    #[tokio::test]
+    async fn the_minimal_single_run_docx_parses() {
+        let text = extracted_text(&single_run_docx(5)).await;
+        assert_eq!(text, "xxxxx");
+    }
+
+    /// Regression test for a decompression bomb: a `.docx` of well under a
+    /// megabyte whose `word/document.xml` inflates past the per-entry limit must
+    /// fail with a size error instead of being decompressed in full.
+    #[tokio::test]
+    async fn rejects_a_document_part_that_decompresses_past_the_entry_limit() {
+        let text_len = usize::try_from(crate::archive::MAX_ENTRY_BYTES).expect("fits usize");
+        let raw = single_run_docx(text_len);
+        assert!(
+            raw.len() < 1024 * 1024,
+            "the bomb should be small on the wire, was {} bytes",
+            raw.len()
+        );
+
+        let Err(err) = DocxParser::default().parse(&raw).await else {
+            panic!("a document part past the decompression limit must be rejected");
+        };
+        let crate::Error::DocumentTooLarge {
+            format: DocumentType::Docx,
+            reason,
+        } = &err
+        else {
+            panic!("expected a DOCX size-limit error, got: {err}");
+        };
+        assert_eq!(
+            reason,
+            "archive entry 'word/document.xml' decompresses to more than 64 MiB, the per-entry limit"
+        );
     }
 
     /// Where the newlines land when a `.docx` becomes text, which is what decides

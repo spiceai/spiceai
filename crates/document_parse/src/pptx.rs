@@ -18,12 +18,13 @@ use bytes::Bytes;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use snafu::ResultExt;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use zip::ZipArchive;
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+    archive::{DecompressionBudget, Limits, ensure_text_within_limit},
 };
 
 pub struct PptxParserFactory {}
@@ -54,13 +55,6 @@ impl PptxParser {
 #[async_trait::async_trait]
 impl DocumentParser for PptxParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        // Cap the decompressed size of each slide entry to defend against
-        // decompression ("zip") bombs: a small malicious .pptx whose slide
-        // XML inflates to many gigabytes would otherwise drive an unbounded
-        // `read_to_string` and OOM the process. 64 MiB is far above any
-        // legitimate slide.
-        const MAX_SLIDE_BYTES: u64 = 64 * 1024 * 1024;
-
         let cursor = Cursor::new(raw.clone());
         let mut archive = ZipArchive::new(cursor)
             .boxed()
@@ -81,6 +75,10 @@ impl DocumentParser for PptxParser {
             .collect();
         slide_paths.sort_by_key(|p| slide_index(p).unwrap_or(usize::MAX));
 
+        // Only slide parts are read, so embedded media (often far larger than
+        // any slide) never counts against the budget.
+        let mut budget = DecompressionBudget::new(DocumentType::Pptx, Limits::DEFAULT);
+        let mut text_len: u64 = 0;
         let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
         for path in slide_paths {
             let entry = archive
@@ -89,24 +87,15 @@ impl DocumentParser for PptxParser {
                 .context(InternalParsingSnafu {
                     format: DocumentType::Pptx,
                 })?;
-            let mut xml = String::new();
-            let read = entry
-                .take(MAX_SLIDE_BYTES + 1)
-                .read_to_string(&mut xml)
+            let xml = String::from_utf8(budget.read_entry(&path, entry)?)
                 .boxed()
                 .context(InternalParsingSnafu {
                     format: DocumentType::Pptx,
                 })?;
-            if read as u64 > MAX_SLIDE_BYTES {
-                return Err(std::io::Error::other(format!(
-                    "PPTX slide '{path}' exceeds the {MAX_SLIDE_BYTES}-byte decompression limit (possible decompression bomb)"
-                )))
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pptx,
-                });
-            }
-            slides.push(extract_slide_text(&xml)?);
+            let text = extract_slide_text(&xml)?;
+            text_len += text.len() as u64;
+            ensure_text_within_limit(text_len, DocumentType::Pptx)?;
+            slides.push(text);
         }
 
         Ok(Arc::new(PptxDocument { slides }))
@@ -232,16 +221,16 @@ mod tests {
             panic!("a slide exceeding the decompression cap should be rejected");
         };
         // The cap itself rejected the slide — not a zip or XML failure on the way.
-        let crate::Error::InternalParsingError {
+        let crate::Error::DocumentTooLarge {
             format: DocumentType::Pptx,
-            source,
+            reason,
         } = &err
         else {
-            panic!("expected a PPTX parsing error, got: {err}");
+            panic!("expected a PPTX size-limit error, got: {err}");
         };
         assert_eq!(
-            source.to_string(),
-            "PPTX slide 'ppt/slides/slide1.xml' exceeds the 67108864-byte decompression limit (possible decompression bomb)"
+            reason,
+            "archive entry 'ppt/slides/slide1.xml' decompresses to more than 64 MiB, the per-entry limit"
         );
     }
 
