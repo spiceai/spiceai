@@ -14379,22 +14379,24 @@ impl CayenneTableProvider {
     }
 
     /// Delete the files at `locations` from an unpublished snapshot, and release
-    /// what the Vortex caches hold for them: the fold reads them first.
+    /// what the Vortex caches hold for them (the fold reads them first) and the
+    /// directory's cached listing.
     pub(crate) async fn remove_snapshot_files(
         &self,
         snapshot_id: &str,
         locations: Vec<ObjectStorePath>,
     ) -> Result<()> {
         let table_name = self.table_metadata.table_name.clone();
-        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
-        ))
-        .map_err(|err| Error::Internal {
-            table: table_name.clone(),
-            message: format!("invalid snapshot URL: {err}"),
-        })?;
+        );
+        let table_url =
+            ListingTableUrl::parse(&snapshot_dir_url).map_err(|err| Error::Internal {
+                table: table_name.clone(),
+                message: format!("invalid snapshot URL: {err}"),
+            })?;
         let store = self
             .context
             .runtime_env()
@@ -14425,6 +14427,14 @@ impl CayenneTableProvider {
             }
         }
         self.invalidate_retired_paths(removed).await;
+        // The query that found the superseded copies listed this directory
+        // through the shared list-files cache, and nothing else is guaranteed to
+        // evict that listing: on network storage the rewrite runs through the
+        // direct compaction writer, whose own `RuntimeEnv` takes the eviction
+        // `DataFusion` makes when it plans the write. Evict it here, once the
+        // files are gone and whatever the deletes' outcome, so the published
+        // snapshot is never listed with them (spiceai/spiceai#15298).
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
         match first_error {
             Some(source) => Err(Error::ObjectStore {
                 operation: "delete superseded files",
