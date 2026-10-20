@@ -240,6 +240,34 @@ jobs:
             echo 'verify=false' >> "$GITHUB_OUTPUT"
           fi
 
+      # `cargo verus` compiles the verified crates' dependency graph (proc
+      # macros included) through the driver, and rustc links through `cc`. The
+      # stock dev-runner image carries no C toolchain, so install it here
+      # rather than rely on the image, as `object_store_wal.yml` does.
+      - name: Set up the C toolchain
+        if: steps.gate.outputs.verify == 'true'
+        uses: ./.github/actions/setup-cc
+
+      # The tools the steps below call, checked up front so a runner image that
+      # lacks one fails here by name instead of as exit 127 mid-step. `gh`
+      # comes from the dev-runner image (ghcr.io/spicehq/arc-runner, built in
+      # spicehq/ai-platform infra/docker/arc-runner).
+      - name: Check runner prerequisites
+        if: steps.gate.outputs.verify == 'true'
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in gh unzip jq sha256sum; do
+            command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::This runner image is missing: ${missing[*]}." \
+                 "The spiceai-dev-runners image must provide them" \
+                 "(spicehq/ai-platform infra/docker/arc-runner)."
+            exit 1
+          fi
+          gh --version | head -1
+
       # Every verified crate must depend on exactly the `vstd` this verifier
       # ships with. Read from the manifests as cargo resolves them rather than
       # grepped, so a crate that inherits the workspace pin and one that
