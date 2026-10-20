@@ -36,6 +36,7 @@ use std::{
 
 use serde_json::{Value, json};
 mod ai_udf;
+mod anthropic;
 mod bedrock;
 mod embedding;
 pub(crate) mod hf;

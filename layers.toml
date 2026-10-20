@@ -256,6 +256,7 @@ object_store_spawn = "foundation"
 otel-arrow = "foundation"
 podswatcher = "foundation"
 repl = "foundation"
+result-compare = "foundation"
 runtime-api-types = "foundation"
 runtime-async = "foundation"
 # Interface crate: the accelerator (runtime side) satisfies CheckpointStore; a

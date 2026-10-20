@@ -777,6 +777,9 @@ impl ClusterTlsConfig {
     }
 }
 
+/// Logged when a cluster node is started with `--allow-insecure-connections`.
+const INSECURE_CONNECTIONS_DEPRECATION_WARNING: &str = "`--allow-insecure-connections` is deprecated and no longer allows insecure cluster connections: without cluster mTLS, cluster RPCs are refused, so executors cannot join a scheduler. Set `--node-mtls-ca-certificate-file`, `--node-mtls-certificate-file` and `--node-mtls-key-file`; create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`. The flag will be removed in a future release.";
+
 fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
 }
@@ -866,20 +869,31 @@ impl ResolvedClusterConfig {
             let mut missing_flags = Vec::new();
 
             if tls_config.is_none() && !config.allow_insecure_connections {
-                missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --allow-insecure-connections)");
+                missing_flags.push(
+                    "--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
+                );
             }
             if config.node_advertise_address.is_none() {
                 missing_flags.push("--node-advertise-address");
             }
 
             if !missing_flags.is_empty() {
+                let certificate_hint = if tls_config.is_none() {
+                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`."
+                } else {
+                    ""
+                };
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "Cluster mode requires the following flags: {}",
+                        "Cluster mode requires the following flags: {}.{certificate_hint}",
                         missing_flags.join(", ")
                     ),
                 ));
+            }
+
+            if config.allow_insecure_connections {
+                tracing::warn!("{INSECURE_CONNECTIONS_DEPRECATION_WARNING}");
             }
         }
 
@@ -2638,6 +2652,64 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn cluster_roles_require_cluster_mtls_files() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        let advertised = || ClusterConfig {
+            node_advertise_address: Some("127.0.0.1".to_string()),
+            ..ClusterConfig::default()
+        };
+        for (node, config) in [
+            ("scheduler", advertised().with_role(ClusterRole::Scheduler)),
+            ("executor", advertised().with_role(ClusterRole::Executor)),
+            (
+                "executor implied by --scheduler-address",
+                ClusterConfig {
+                    scheduler_address: Some("https://127.0.0.1:50052".to_string()),
+                    ..advertised()
+                },
+            ),
+        ] {
+            let Err(err) = ResolvedClusterConfig::try_new(config) else {
+                panic!("a {node} without cluster mTLS files must not start");
+            };
+            assert_eq!(
+                err.to_string(),
+                "Cluster mode requires the following flags: --node-mtls-ca-certificate-file, \
+                 --node-mtls-certificate-file, --node-mtls-key-file. Create cluster certificates \
+                 with `spice cluster tls init` and `spice cluster tls add <node-name>`.",
+                "{node}"
+            );
+        }
+    }
+
+    /// The deprecated flag still parses and still lets a node start without cluster mTLS
+    /// files; the node then refuses every cluster RPC.
+    #[test]
+    fn deprecated_insecure_connections_flag_still_starts_a_node() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole};
+        use clap::Parser;
+
+        let config = ClusterConfig::try_parse_from([
+            "spiced",
+            "--role",
+            "scheduler",
+            "--node-advertise-address",
+            "127.0.0.1",
+            "--allow-insecure-connections",
+        ])
+        .expect("--allow-insecure-connections should still parse");
+        assert!(config.allow_insecure_connections);
+        assert_eq!(config.role, Some(ClusterRole::Scheduler));
+
+        let resolved = ResolvedClusterConfig::try_new(config)
+            .expect("a node started with the deprecated flag should still start");
+        assert!(!resolved.tls_enabled());
+    }
 
     #[test]
     fn cluster_grpc_client_config_from_params() {

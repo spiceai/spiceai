@@ -514,6 +514,12 @@ path = "tests/cayenne_runtime_tuning.rs"
 name = "results_cache_growth"
 path = "tests/results_cache_growth.rs"
 
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "chat_tool_use"
+path = "tests/chat_tool_use.rs"
+required-features = ["models"]
+
 # Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
 [[test]]
 name = "retention_oom"

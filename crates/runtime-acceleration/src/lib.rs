@@ -39,7 +39,7 @@ pub use cayenne_workload::{CayenneAccelerationDemand, CayenneWorkload};
 pub use engine::Engine;
 pub use schema_change::OnSchemaChange;
 pub use sidecar::{AcceleratorSidecar, OpenOption};
-pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll};
+pub use snapshot::{SnapshotDownloadInfo, SnapshotPoll, SnapshotPollOutcome};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

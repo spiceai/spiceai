@@ -749,6 +749,9 @@ pub struct Runtime {
     /// The dataset loads still retrying, so a Spicepod change can stop the load
     /// of a configuration it replaces or removes.
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// The model loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    model_loads: Arc<init::model::ModelLoads>,
     /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
     view_loads: Arc<init::view_loads::ViewLoads>,
 
@@ -2338,10 +2341,19 @@ impl Runtime {
         // milliseconds. Waited on alongside the connection drain, under the same
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
-        let (unfinished_sources, _) = tokio::join!(
+        //
+        // Snapshot writer leases are resigned alongside, so a replacement instance
+        // need not wait for them to lapse.
+        let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
+            tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
         );
+        if leases_released.is_err() {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
+            );
+        }
         if unfinished_sources > 0 {
             tracing::warn!(
                 "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"
