@@ -160,27 +160,66 @@ pub(super) fn metric_value(
     labels: &BTreeMap<String, String>,
 ) -> Option<f64> {
     let mut sum = None;
-    for line in text.lines().filter(|l| !l.starts_with('#')) {
-        let (series, value) = line.rsplit_once(' ')?;
-        let (series_name, series_labels) = match series.split_once('{') {
-            Some((n, rest)) => (n, rest.trim_end_matches('}')),
-            None => (series, ""),
-        };
-        if series_name != name {
+    for line in text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
+        let Some((series_name, series_labels, value)) = parse_sample(line) else {
             continue;
-        }
-        let has = |k: &String, v: &String| {
-            series_labels
-                .split(',')
-                .any(|pair| pair.trim() == format!("{k}=\"{v}\""))
         };
-        if labels.iter().all(|(k, v)| has(k, v))
+        if series_name == name
+            && labels.iter().all(|(k, v)| series_labels.get(k) == Some(v))
             && let Ok(v) = value.parse::<f64>()
         {
             *sum.get_or_insert(0.0) += v;
         }
     }
     sum
+}
+
+/// One exposition line, `name{key="value",…} value [timestamp]`: a label value
+/// is quoted and may hold commas and the escapes `\\`, `\"` and `\n`.
+fn parse_sample(line: &str) -> Option<(&str, BTreeMap<String, String>, &str)> {
+    let end = line.find(['{', ' ']).unwrap_or(line.len());
+    let (name, mut rest) = line.split_at(end);
+    let mut labels = BTreeMap::new();
+    if let Some(body) = rest.strip_prefix('{') {
+        let mut chars = body.char_indices().peekable();
+        loop {
+            while chars
+                .next_if(|(_, c)| *c == ',' || c.is_whitespace())
+                .is_some()
+            {}
+            if let Some((i, '}')) = chars.peek().copied() {
+                rest = &body[i + 1..];
+                break;
+            }
+            let mut key = String::new();
+            for (_, c) in chars.by_ref() {
+                if c == '=' {
+                    break;
+                }
+                key.push(c);
+            }
+            if chars.next()?.1 != '"' {
+                return None;
+            }
+            let mut value = String::new();
+            loop {
+                match chars.next()?.1 {
+                    '\\' => match chars.next()?.1 {
+                        'n' => value.push('\n'),
+                        other => value.push(other),
+                    },
+                    '"' => break,
+                    c => value.push(c),
+                }
+            }
+            labels.insert(key.trim().to_string(), value);
+        }
+    }
+    let value = rest.split_whitespace().next()?;
+    Some((name, labels, value))
 }
 
 /// Polls `/metrics` until the condition holds. With `drive`, writes new data
@@ -311,5 +350,48 @@ pub(super) async fn assert_status(instance: &mut Instance, step: &StatusStep) ->
             return outcome;
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::metric_value;
+
+    #[test]
+    fn metric_labels_are_read_as_quoted_escaped_values() {
+        let exposition = concat!(
+            "# HELP m A metric.\n",
+            "m{dataset=\"orders,archive\",kind=\"a\"} 7\n",
+            "\n",
+            "m{dataset=\"say \\\"hi\\\"\",kind=\"b\"} 2 1700000000000\n",
+            "m{dataset=\"back\\\\slash\"} 3\n",
+            "m 4\n",
+            "other{dataset=\"orders,archive\"} 100\n",
+        );
+        let with = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        assert_eq!(
+            metric_value(exposition, "m", &with(&[("dataset", "orders,archive")])),
+            Some(7.0)
+        );
+        assert_eq!(
+            metric_value(exposition, "m", &with(&[("dataset", "say \"hi\"")])),
+            Some(2.0)
+        );
+        assert_eq!(
+            metric_value(exposition, "m", &with(&[("dataset", "back\\slash")])),
+            Some(3.0)
+        );
+        assert_eq!(metric_value(exposition, "m", &with(&[])), Some(16.0));
+        assert_eq!(
+            metric_value(exposition, "m", &with(&[("dataset", "orders")])),
+            None
+        );
     }
 }

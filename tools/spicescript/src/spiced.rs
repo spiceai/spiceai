@@ -163,6 +163,11 @@ impl Spiced {
     }
 
     /// The runtime's HTTP endpoint, as the `spice` CLI takes it.
+    /// The Flight endpoint, as the `spice` CLI's `--endpoint` takes it.
+    pub fn flight_endpoint(&self) -> String {
+        format!("{}://127.0.0.1:{}", self.scheme(), self.flight)
+    }
+
     pub fn http_endpoint(&self) -> String {
         format!("{}://127.0.0.1:{}", self.scheme(), self.http)
     }

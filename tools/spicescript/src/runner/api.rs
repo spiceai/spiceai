@@ -155,9 +155,14 @@ pub(super) async fn spice_cli(
         .iter()
         .map(|a| instance.sql(a))
         .collect::<Result<Vec<_>>>()?;
+    // `spice sql` reaches the runtime over Flight, which it addresses
+    // separately from HTTP.
+    let flight = (args.first().map(String::as_str) == Some("sql"))
+        .then(|| ["--endpoint".to_string(), instance.spiced.flight_endpoint()]);
     let out = tokio::process::Command::new(&instance.spice_cli)
         .args(&args)
         .args(["--http-endpoint", &instance.spiced.http_endpoint()])
+        .args(flight.iter().flatten())
         .stdin(std::process::Stdio::null())
         .output()
         .await
