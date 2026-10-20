@@ -26,7 +26,7 @@ limitations under the License.
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -577,11 +577,12 @@ impl Inbox {
         self.wait_for_spiced(None, what, within, matches)
     }
 
-    /// [`Self::wait_for`] for records a `spiced` in `dir` sends: a timeout
-    /// also shows what that `spiced` printed, which says why nothing came.
+    /// [`Self::wait_for`] for records `spiced` sends: a timeout also reports
+    /// whether it is still running and what it printed, which says why nothing
+    /// came.
     fn wait_for_spiced(
         &self,
-        dir: Option<&Path>,
+        spiced: Option<&mut Spiced>,
         what: &str,
         within: Duration,
         matches: impl Fn(&Received) -> bool,
@@ -593,9 +594,9 @@ impl Inbox {
             }
             assert!(
                 Instant::now() < deadline,
-                "no record {what} within {within:?}; received: {:#?}\nspiced printed:\n{}",
+                "no record {what} within {within:?}; received: {:#?}\n{}",
                 self.all().iter().map(|r| &r.body).collect::<Vec<_>>(),
-                dir.map(stdout_of).unwrap_or_default()
+                spiced.map(Spiced::report).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -720,32 +721,58 @@ fn unused_local_addr() -> SocketAddr {
 /// A `spiced` process, killed when the test ends if it has not stopped, so a
 /// failing test cannot leave a runtime holding its ports and its instance
 /// directory for the next one.
-struct Spiced(Child);
+/// A running `spiced`, with the directory [`spiced_in`] keeps its output in.
+struct Spiced {
+    child: Child,
+    dir: PathBuf,
+}
+
+impl Spiced {
+    /// Whether `spiced` is still running (or the status or signal it ended
+    /// with), then its stdout and stderr: what a failure message needs to say
+    /// why `spiced` sent nothing.
+    fn report(&mut self) -> String {
+        let state = match self.child.try_wait() {
+            Ok(Some(status)) => format!("exited: {status}"),
+            Ok(None) => "still running".to_string(),
+            Err(error) => format!("state unknown: {error}"),
+        };
+        let read = |name: &str| std::fs::read_to_string(self.dir.join(name)).unwrap_or_default();
+        format!(
+            "spiced {state}\nspiced stdout:\n{}\nspiced stderr:\n{}",
+            read(STDOUT_LOG),
+            read(STDERR_LOG)
+        )
+    }
+}
 
 impl Drop for Spiced {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
 
-/// A `spiced` command on the Spicepod in `dir`, with its stdout kept in
-/// `dir/spiced.log` for the failure messages below.
+const STDOUT_LOG: &str = "spiced.log";
+const STDERR_LOG: &str = "spiced.stderr.log";
+
+/// A `spiced` command on the Spicepod in `dir`, with its stdout and stderr kept
+/// in `dir` for the failure messages below.
 ///
 /// It runs in `dir`, which is also its instance directory: two runtimes in one
 /// directory refuse to start, and tests run side by side.
 fn spiced_in(dir: &Path, http: SocketAddr) -> Command {
-    let log = std::fs::File::create(dir.join("spiced.log")).expect("create the log file");
+    let log = |name: &str| std::fs::File::create(dir.join(name)).expect("create a log file");
     let mut command = Command::new(env!("CARGO_BIN_EXE_spiced"));
     command
         .arg(dir)
         .args(["--http", &http.to_string()])
         .args(["--flight", &unused_local_addr().to_string()])
         .current_dir(dir)
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(log(STDOUT_LOG)))
+        .stderr(Stdio::from(log(STDERR_LOG)));
     command
 }
 
@@ -754,23 +781,27 @@ fn start_spiced(dir: &Path, http: SocketAddr) -> Spiced {
 }
 
 fn spawn(command: &mut Command) -> Spiced {
-    Spiced(command.spawn().expect("start spiced"))
-}
-
-fn stdout_of(dir: &Path) -> String {
-    std::fs::read_to_string(dir.join("spiced.log")).unwrap_or_default()
+    let dir = command
+        .get_current_dir()
+        .expect("spiced_in sets the working directory")
+        .to_path_buf();
+    Spiced {
+        child: command.spawn().expect("start spiced"),
+        dir,
+    }
 }
 
 /// Waits for `spiced` to exit; the guard kills it if it has not after `within`.
 fn exit_status(spiced: &mut Spiced, within: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + within;
     loop {
-        if let Some(status) = spiced.0.try_wait().expect("poll spiced") {
+        if let Some(status) = spiced.child.try_wait().expect("poll spiced") {
             return status;
         }
         assert!(
             Instant::now() < deadline,
-            "spiced did not exit within {within:?}"
+            "spiced did not exit within {within:?}\n{}",
+            spiced.report()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -780,7 +811,7 @@ fn exit_status(spiced: &mut Spiced, within: Duration) -> std::process::ExitStatu
 /// it to exit.
 #[cfg(unix)]
 fn terminate(spiced: &mut Spiced) -> std::process::ExitStatus {
-    let pid = libc::pid_t::try_from(spiced.0.id()).expect("a pid fits pid_t");
+    let pid = libc::pid_t::try_from(spiced.child.id()).expect("a pid fits pid_t");
     // SAFETY: `kill` only sends a signal to the child this test started.
     assert_eq!(
         unsafe { libc::kill(pid, libc::SIGTERM) },
@@ -841,7 +872,7 @@ datasets:
     let mut child = start_spiced(dir.path(), http);
 
     let listening = inbox.wait_for_spiced(
-        Some(dir.path()),
+        Some(&mut child),
         "saying the HTTP server is listening",
         STARTUP,
         |r| r.body == format!("Spice Runtime HTTP listening on {http}"),
@@ -855,7 +886,7 @@ datasets:
         ("runtime::http", 9, "INFO")
     );
     let registered =
-        inbox.wait_for_spiced(Some(dir.path()), "registering the dataset", STARTUP, |r| {
+        inbox.wait_for_spiced(Some(&mut child), "registering the dataset", STARTUP, |r| {
             r.body.starts_with("Dataset trips registered")
         });
     assert!(
@@ -884,7 +915,7 @@ datasets:
     );
 
     let failed = inbox.wait_for_spiced(
-        Some(dir.path()),
+        Some(&mut child),
         "for the failed query",
         Duration::from_secs(30),
         |r| r.body.starts_with("Query failed: ") && r.trace_id == PINNED,
@@ -943,10 +974,10 @@ datasets:
     assert!(
         status.success(),
         "spiced exits cleanly: {status}\n{}",
-        stdout_of(dir.path())
+        child.report()
     );
     inbox.wait_for_spiced(
-        Some(dir.path()),
+        Some(&mut child),
         "saying goodbye",
         Duration::from_secs(5),
         |r| r.body == "Goodbye!",
@@ -998,10 +1029,10 @@ runtime:
         taken.local_addr().expect("the held port's address"),
     );
     let status = exit_status(&mut child, STARTUP);
-    assert_eq!(status.code(), Some(1), "{}", stdout_of(dir.path()));
+    assert_eq!(status.code(), Some(1), "{}", child.report());
 
     let fatal = inbox.wait_for_spiced(
-        Some(dir.path()),
+        Some(&mut child),
         "for the error that ended spiced",
         Duration::from_secs(5),
         |r| r.severity_text == "ERROR",
@@ -1015,7 +1046,7 @@ runtime:
         "{fatal:?}"
     );
     inbox.wait_for_spiced(
-        Some(dir.path()),
+        Some(&mut child),
         "saying goodbye",
         Duration::from_secs(5),
         |r| r.body == "Goodbye!",
@@ -1097,11 +1128,11 @@ catalogs:
     };
 
     let scheduler_cluster = unused_local_addr();
-    let _scheduler = spawn(
+    let mut scheduler_process = spawn(
         node("scheduler", &scheduler_dir, scheduler_cluster).env("OTEL_LOGS_TEST_TOKEN", TOKEN),
     );
     let scheduler = inbox.wait_for_spiced(
-        Some(&scheduler_dir),
+        Some(&mut scheduler_process),
         "from the scheduler starting export",
         STARTUP,
         exporting("scheduler"),
@@ -1119,7 +1150,7 @@ catalogs:
             .env_remove("OTEL_LOGS_TEST_TOKEN"),
     );
     let joined = inbox.wait_for_spiced(
-        Some(&executor_dir),
+        Some(&mut executor),
         "from the executor starting export",
         STARTUP,
         exporting("executor"),
@@ -1135,7 +1166,7 @@ catalogs:
     // 30 s wait for connections to drain has run out.
     let stopped = terminate(&mut executor);
     inbox.wait_for_spiced(
-        Some(&executor_dir),
+        Some(&mut executor),
         &format!("from the executor saying goodbye (it exited {stopped})"),
         Duration::from_secs(5),
         |r| r.service == "executor" && r.body == "Goodbye!",

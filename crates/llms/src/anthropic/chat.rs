@@ -507,23 +507,11 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
             cache_control,
             messages,
 
-            tool_choice: match value.tool_choice {
-                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => Some(
-                    ToolChoiceParam::auto(!value.parallel_tool_calls.unwrap_or_default()),
-                ),
-                Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => Some(
-                    ToolChoiceParam::any(!value.parallel_tool_calls.unwrap_or_default()),
-                ),
-                Some(ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
-                    function: FunctionName { name },
-                    ..
-                })) => Some(ToolChoiceParam::tool(
-                    name,
-                    !value.parallel_tool_calls.unwrap_or_default(),
-                )),
-                // AllowedTools or Custom not supported, None and ToolChoiceOptions::None both map to None
-                _ => None,
-            },
+            tool_choice: tool_choice_param(
+                value.tool_choice,
+                value.parallel_tool_calls,
+                value.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+            ),
             tools: value
                 .tools
                 .map(|t| t.iter().filter_map(tool_from_completion_tools).collect()),
@@ -603,6 +591,37 @@ fn system_message_from_messages(messages: &[ChatCompletionRequestMessage]) -> Op
         None
     } else {
         Some(system_messages.join("\n"))
+    }
+}
+
+/// Anthropic's `tool_choice` for an `OpenAI` `tool_choice` and `parallel_tool_calls`.
+///
+/// `parallel_tool_calls` defaults to `true`, as on `OpenAI`.
+///
+/// `auto` with parallel tool calls is Anthropic's default, so it is sent as no `tool_choice`: an
+/// unset choice and `auto` give the same request, and a tool loop that sets `auto` after its
+/// first round keeps Anthropic's prompt cache, which does not hold across a change of
+/// `tool_choice`. To ask for one tool call at a time without a `tool_choice`, a request that
+/// offers tools gets `auto`. Without tools, there is no tool choice.
+fn tool_choice_param(
+    tool_choice: Option<ChatCompletionToolChoiceOption>,
+    parallel_tool_calls: Option<bool>,
+    offers_tools: bool,
+) -> Option<ToolChoiceParam> {
+    let disable_parallel_tool_use = !parallel_tool_calls.unwrap_or(true);
+    match tool_choice {
+        None | Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto)) => {
+            (disable_parallel_tool_use && offers_tools).then(|| ToolChoiceParam::auto(true))
+        }
+        Some(ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required)) => {
+            Some(ToolChoiceParam::any(disable_parallel_tool_use))
+        }
+        Some(ChatCompletionToolChoiceOption::Function(ChatCompletionNamedToolChoice {
+            function: FunctionName { name },
+            ..
+        })) => Some(ToolChoiceParam::tool(name, disable_parallel_tool_use)),
+        // AllowedTools and Custom are not supported; ToolChoiceOptions::None maps to None.
+        _ => None,
     }
 }
 
@@ -785,5 +804,71 @@ mod tests {
         assert_eq!(with_top_p.top_p, Some(0.9));
         assert_eq!(with_top_p.temperature, None);
         assert_eq!(with_top_p.top_k, None);
+    }
+
+    /// The `tool_choice` that `tool_choice` and `parallel_tool_calls` are sent to Anthropic as.
+    fn anthropic_tool_choice(
+        tool_choice: Option<ChatCompletionToolChoiceOption>,
+        parallel_tool_calls: Option<bool>,
+    ) -> serde_json::Value {
+        serde_json::to_value(tool_choice_param(tool_choice, parallel_tool_calls, true))
+            .expect("a tool choice should serialize")
+    }
+
+    /// `parallel_tool_calls` defaults to `true`, as on `OpenAI`: an unset value never asks
+    /// Anthropic for one tool call at a time.
+    #[test]
+    fn an_unset_parallel_tool_calls_allows_parallel_tool_use() {
+        let required = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Required,
+        ));
+
+        assert_eq!(
+            anthropic_tool_choice(required, None),
+            json!({ "type": "any", "disable_parallel_tool_use": false })
+        );
+    }
+
+    /// An unset `tool_choice` and `auto` give the same request, so a round that sets `auto`
+    /// reads the round before it from Anthropic's prompt cache.
+    #[test]
+    fn auto_is_sent_as_no_tool_choice() {
+        let auto = Some(ChatCompletionToolChoiceOption::Mode(
+            ToolChoiceOptions::Auto,
+        ));
+
+        assert_eq!(anthropic_tool_choice(None, None), serde_json::Value::Null);
+        assert_eq!(
+            anthropic_tool_choice(auto.clone(), None),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            anthropic_tool_choice(auto, Some(true)),
+            serde_json::Value::Null
+        );
+    }
+
+    /// `parallel_tool_calls: false` reaches Anthropic with or without a `tool_choice`.
+    #[test]
+    fn parallel_tool_calls_false_disables_parallel_tool_use() {
+        assert_eq!(
+            anthropic_tool_choice(None, Some(false)),
+            json!({ "type": "auto", "disable_parallel_tool_use": true })
+        );
+        assert_eq!(
+            anthropic_tool_choice(
+                Some(ChatCompletionToolChoiceOption::Mode(
+                    ToolChoiceOptions::Auto
+                )),
+                Some(false)
+            ),
+            json!({ "type": "auto", "disable_parallel_tool_use": true })
+        );
+    }
+
+    /// A request without tools gets no tool choice, whatever `parallel_tool_calls` says.
+    #[test]
+    fn a_request_without_tools_gets_no_tool_choice() {
+        assert!(tool_choice_param(None, Some(false), false).is_none());
     }
 }

@@ -34,6 +34,7 @@ members = [
     "crates/event_stream",
     "crates/flight_client",
     "crates/repl",
+    "crates/result-compare",
     "crates/google-genai",
     "crates/hash-index",
     "crates/key-index",
@@ -429,7 +430,7 @@ cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f5557381f79f1535014e0dc0555c53ac8de1cafc" } # branch: spiceai-59
-sqlparser = "0.59.0"
+sqlparser = "0.62.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
@@ -541,6 +542,16 @@ split-debuginfo = "packed"
 
 [profile.lint]
 debug = "line-tables-only"
+# Keeps the `spiced` that tests start loadable on Apple Silicon. Its image is
+# mapped from 0x100000000, and dyld maps the system shared cache at
+# 0x180000000: an image that reaches past that once ASLR slides it leaves dyld
+# unable to map the cache, so the process aborts with SIGABRT before `main`
+# (`syscall to map cache into shared region failed`). The debug map (stabs) the
+# linker writes for line-tables-only debug info is ~190 MiB of `__LINKEDIT`;
+# dropping it took the image from 20 MiB to 207 MiB below the shared cache, and
+# launches from 110 aborts in 160 to none (#15229, #15264). Function names stay
+# in the symbol table and panic messages keep their file and line.
+strip = "debuginfo"
 # Deliberate: the two halves of the lint-profile gate want opposite things.
 # A local `make signoff` (or `RUST_PROFILE=lint make lint-rust`) reuses its own
 # target directory, where incremental compilation is the larger win. Plain
