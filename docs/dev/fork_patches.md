@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
-| [datafusion](#datafusion) | `e8d8abae940522df5aaba74aa8dc8ade5029e7c3` | `spiceai-55` |
+| [datafusion](#datafusion) | `2e8b24f72e4dffb694fa2dbe3e1f9bd56ea528e7` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a` | `spiceai-55` |
@@ -210,8 +210,11 @@ fractional-second precision, and #257, which writes a join key that matches NULL
 as `IS NOT DISTINCT FROM`, #258, the `IoWaitHook` patch
 ([#15049](https://github.com/spiceai/spiceai/issues/15049)), #259, which keeps placeholder type
 inference linear in the depth of an expression, #260, which carries an eliminated sort's
-fetch through a single-input repartition, and #266, which charges each slice of a batch a
-sort shares with its producer for the slice's own rows; the pin is #266's merge commit. None changes a
+fetch through a single-input repartition, #266, which charges each slice of a batch a
+sort shares with its producer for the slice's own rows, #261, which keeps a union input's own
+`ORDER BY` and `LIMIT` inside that input, #262, which keeps a cast that drops decimal digits out
+of `unwrap_cast`, the unparser fixes #246, #247 and #264, and #268, which narrows #266's copy to
+batches whose rows are slices of larger buffers; the pin is #268's merge commit. None changes a
 manifest except the `IoWaitHook` patch, which adds `pin-project-lite` to `common-runtime`'s. #240 threads its metadata filters through the listing calls in
 `catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
 code, and removes no line of it. The branch also carries
@@ -255,6 +258,10 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Unparser: a `RightMark` join swaps its inputs like `RightSemi` and `RightAnti`, so the outer query reads the relation the join returns (fork PR #230) | The outer `FROM` names the build side, the mark column is absent and there is no `EXISTS` at all — `SELECT t1.c, t1.d FROM t1` for a join that returns `t2`'s rows — SQL that binds and answers from the wrong relation ([#13022](https://github.com/spiceai/spiceai/issues/13022)) | silent (wrong data) | `…::a_right_mark_join_reads_the_relation_it_returns` |
 | Unparser: a `FULL JOIN` input that is itself a join keeps each filtered scan's filter in that scan's own derived table (fork PR #231) | The filter is lifted to the enclosing query's `WHERE`, which SQL evaluates after the `FULL JOIN`, so the null-extended rows the join preserves are discarded — 1 row where the plan returns 2 ([#12593](https://github.com/spiceai/spiceai/issues/12593)); a predicate on such an input that no scan applies is refused rather than emitted where it would discard rows | silent (wrong data) | `…::a_full_join_input_that_is_a_join_keeps_its_scan_filters_scoped` |
 | Unparser: an `EXISTS`-style join refuses a build-side key that only the build projection binds (fork PR #232) | `SELECT 1` replaces the build projection, so a key the projection renamed onto the probe's qualifier binds to the probe instead — `WHERE (p.c = p.c)`, always true: a semi join returns every row and an anti join none ([#13493](https://github.com/spiceai/spiceai/issues/13493)) | silent (wrong data) | `…::an_exists_refuses_a_build_key_only_the_build_projection_binds` |
+| Unparser: a union input's own `ORDER BY` and `LIMIT` stay inside that input's derived table instead of being written on the union's query after its last operand, and each input keeps its own quantifier and statement clauses (spiceai/datafusion#261) | The input's bound applies to the whole `UNION ALL`, so `u UNION ALL (SELECT … FROM v ORDER BY a DESC LIMIT 1)` federated to `DuckDB` returns one row instead of `u`'s rows plus one ([#14737](https://github.com/spiceai/spiceai/issues/14737)) | silent (wrong data) | **GAP** — the guard, `crates/runtime/tests/duckdb/mod.rs::duckdb_federated_union_keeps_each_inputs_own_bound`, lands with [#15248](https://github.com/spiceai/spiceai/pull/15248); see [Open gaps](#open-gaps) |
+| Unparser: the dangling-qualifier sweep keeps a qualifier that an `UNNEST` or `LATERAL FLATTEN` alias, the last part of a schema-qualified table, or the column a struct field path is rooted at binds (spiceai/datafusion#246) | The sweep strips a qualifier that does bind: two `UNNEST` aliases sharing a column name give `SELECT c1, c1 …`, and a join of two schema-qualified tables gives `SELECT v, v FROM s.a INNER JOIN s.b …`, which `DuckDB` rejects as ambiguous; `test."metadata".product` is cut to `product` ([#13442](https://github.com/spiceai/spiceai/issues/13442)) | silent (query failure) | **GAP** — no guard here yet; in the fork, the `plan_to_sql.rs` cases #246 fixes; see [Open gaps](#open-gaps) |
+| Unparser: a sort key that reads a projection output that cannot be repeated, through a larger expression, puts the projection in a derived table so the `ORDER BY` reads the output by name (spiceai/datafusion#247) | `ORDER BY (r + 1.0)` over `random() AS r` is emitted as `ORDER BY (random() + 1.0)`, a second draw: the rows are ordered by a value the `SELECT` list never showed, and under a `LIMIT` a different row is selected than the one whose `r` comes back ([#14109](https://github.com/spiceai/spiceai/issues/14109)) | silent (wrong data) | **GAP** — no guard here yet; in the fork, the cases #247 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
+| Unparser: a join input that lists no columns of its own, such as a bare or filtered table scan, contributes `q.*` for each relation it reads; a column-less input contributes nothing beside another relation; an aggregate no projection takes lists its group keys before its aggregates (spiceai/datafusion#264) | The join's `SELECT` list no longer matches the plan's schema: `SELECT FROM t WHERE EXISTS (…)`, which `DuckDB` rejects, and `SELECT u.a, (u.a * 2) AS d FROM t INNER JOIN u …`, which returns two columns where the plan has three, so a consumer reading by position gets one input's columns under another's names ([#14738](https://github.com/spiceai/spiceai/issues/14738)) | silent (wrong data / query failure) | **GAP** — no guard here yet; in the fork, the join-input cases #264 adds to `plan_to_sql.rs`; see [Open gaps](#open-gaps) |
 | Unparser: empty `Projection` emits `SELECT 1` | A projection with no expressions unparses to `SELECT FROM …`, which is not valid SQL, so the federated query fails outright | silent (query failure) | `…::an_empty_projection_does_not_unparse_to_an_empty_select_list` |
 | Unparser: `AT TIME ZONE` faithfully unparsed (fork PR #160), and suppressed for fixed-offset timezones on DuckDB (fork PR #195) | The timezone is dropped from the SQL, so the remote engine evaluates the expression in its own session timezone | silent (wrong data) | `…::a_timezone_survives_unparsing_except_where_the_engine_cannot_resolve_it` |
 | BigQuery dialect: `FLOAT64` not `DOUBLE`, timestamp literal format, `date_field_extract_style` / `interval_style` overrides, `date_trunc` support, no column alias inside a table alias (fork PRs #144, #146, #147, #148, #169). The #144 override is no longer on the branch — the upstream `Dialect` default now renders an accepted format, which the guard pins either way | Federated BigQuery queries are rejected by BigQuery, or silently coerce types. Losing the `date_trunc` week mapping is quieter still: DataFusion truncates a week to Monday and BigQuery's bare `WEEK` is Sunday-based, so the week starts on the wrong day — one day out for a Monday-to-Saturday timestamp, six for a Sunday one — and the query returns wrong rows with no error | silent (wrong data / query failure) | `…::bigquery_names_the_float_type_the_way_bigquery_does`, `…::bigquery_attaches_a_timestamp_offset_to_the_time`, `…::bigquery_extracts_date_fields_and_spells_intervals_the_standard_way`, `…::bigquery_inlines_a_derived_tables_column_aliases`, `…::bigquery_truncates_a_timestamp_the_way_bigquery_does` |
@@ -280,7 +287,8 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Bloom-filter replacement readers reuse the version discovered on the listing-table scan (fork PR #213) | A predicate scan whose bloom-filter reader is built separately still sends the listed ETag as `If-Match`. A replaced object therefore 412s instead of mixing generations; the query retries or fails | silent (query failure / extra retry) | `crates/data-connector-api/src/listing/connector.rs::a_second_reader_for_the_same_file_keeps_the_version_the_first_one_pinned` for the factory, which is where the patch lives, and `crates/runtime/tests/s3_parquet_overwrite/mod.rs::a_predicate_scan_of_bloom_filtered_parquet_pins_one_generation` for the scan that builds that second reader — the wire assertion is guarded by the plan's bloom-filter metric so it cannot pass by never taking the branch |
 | Placeholder type inference (`Expr::infer_placeholder_types`, incl. `CASE`, `LIMIT`/`OFFSET` `Int64`, name/metadata preservation) (fork PRs #87, #88, #89, #167, and commit `d37a426e`) | A parameterised query fails to plan, or infers the wrong type for `$1` | silent (query failure) | `crates/runtime/src/datafusion/query.rs::every_shape_the_fork_patches_cover_infers_its_parameter_type`, `…::a_limit_and_an_offset_placeholder_are_both_int64`, `…::a_comparison_of_two_placeholders_still_plans`, `…::a_placeholder_inferred_from_a_column_keeps_the_columns_metadata` |
 | Placeholder type inference stays linear in the depth of an expression: an expression without a placeholder is returned before the walk, and an operand's field is looked up only beside an untyped placeholder (spiceai/datafusion#259) | Planning a wide disjunction, such as a batched primary-key lookup, becomes quadratic in its width again, with or without a placeholder. A lookup of 100 four-column keys spent ~147 ms in logical planning without the patch and ~2 ms with it | silent (perf) | `crates/runtime/src/datafusion/query.rs::a_wide_disjunction_plans_in_time_linear_in_its_width` (400 branches must plan in under 8× the time of 100) |
-| A sort admits a slice of a batch it shares with its producer as a copy of the slice's own rows when the shared buffers hold at least twice the copy, reserving the copy before making it (`ExternalSorter::insert_batch`, `sorts/batch_compaction.rs`; spiceai/datafusion#266) | A grouped aggregate hands its groups on as slices of one batch, and the sort charges every slice for the whole batch, so sorting G groups reserves memory quadratic in G. The sort spills long before its rows fill the pool and fails when one slice's charge does not fit; at 1000 warehouses CH-benCHmark Q10 failed on every run, three of its sorters holding 12.9, 12.4 and 7.1 GB, and starved concurrent queries of memory | silent (query failure / memory) | `crates/runtime/src/datafusion/query_memory_pool.rs::a_sort_over_a_grouped_aggregate_is_charged_for_its_rows` (a million groups sorted in Spice's query pool with spilling disabled); in the fork, the `sorts::sort::tests::test_slices_of_*` and `test_compacted_slice_*` tests |
+| A sort admits a slice of a batch it shares with its producer as a copy of the slice's own rows when the buffers its rows are sliced out of hold at least twice the rows' own bytes and the shared buffers hold at least twice the copy, reserving the copy before making it; a batch whose views are its own is admitted as it is, even when they point into data buffers it shares (`ExternalSorter::insert_batch`, `sorts/batch_compaction.rs`; spiceai/datafusion#266, narrowed by spiceai/datafusion#268) | A grouped aggregate hands its groups on as slices of one batch, and the sort charges every slice for the whole batch, so sorting G groups reserves memory quadratic in G. The sort spills long before its rows fill the pool and fails when one slice's charge does not fit; at 1000 warehouses CH-benCHmark Q10 failed on every run, three of its sorters holding 12.9, 12.4 and 7.1 GB, and starved concurrent queries of memory. Losing #268 alone keeps the fix but copies a Parquet scan's string-view batches too, so `ORDER BY` a string column is slower with no memory pressure (3.638–4.336 s against 3.391–4.010 s over 33,554,432 rows in #268's benchmark) | silent (query failure / memory; perf for #268) | `crates/runtime/src/datafusion/query_memory_pool.rs::a_sort_over_a_grouped_aggregate_is_charged_for_its_rows` (a million groups sorted in Spice's query pool with spilling disabled); in the fork, the `sorts::sort::tests::test_slices_of_*` and `test_compacted_slice_*` tests, and for #268's narrowing `sorts::sort::tests::test_view_batch_sharing_only_its_data_buffer_is_admitted_as_it_is` |
+| `unwrap_cast` keeps a cast that drops decimal digits — a decimal with fractional digits cast to an integer, or a decimal cast to a smaller scale — on the column instead of moving it onto the literal, in the logical and physical simplifiers (`is_decimal_scale_narrowing_cast`; spiceai/datafusion#262; upstream tracks the class as apache/datafusion#23095) | `CAST(price AS BIGINT) = 173665` over a `DECIMAL(15, 2)` column is rewritten to `price = 173665.00`, which holds for one value where every price in [173665, 173666) should match, and a range on the same cast returns a row outside it; on TPC-H SF1, `orders WHERE CAST(o_totalprice AS BIGINT) = 173665` returned 0 rows instead of 4 ([#14969](https://github.com/spiceai/spiceai/issues/14969)) | silent (wrong data) | **GAP** — the guard, `crates/runtime-datafusion/src/fork_backport_guards.rs::a_filter_on_a_decimal_cast_that_drops_digits_keeps_the_cast`, lands with [#15207](https://github.com/spiceai/spiceai/pull/15207); see [Open gaps](#open-gaps) |
 | BigQuery dialect: temporal typing and naming — a tz-naive timestamp cast is `DATETIME` not `TIMESTAMP`, a timestamp literal's cast target follows the offset it renders with, sub-second digits are truncated to six, a comparison BigQuery has no supertype for is brought to one, `date - date` is `DATE_DIFF`, `CAST(date AS INT64)` is `UNIX_DATE`, `btrim`/`now`/`to_unixtime`/`unix_seconds`/`to_timestamp` are renamed or type-directed, `median`/`approx_percentile_cont` are rendered by ordering the group, a constant `GROUP BY` key is cast to its own type, and `array_element` subscripts with `SAFE_ORDINAL` (fork PR #212) | BigQuery puts no timezone qualifier on a timestamp type, so a tz-naive value typed `TIMESTAMP` becomes an instant with no supertype against a `DATETIME` column and the statement is refused; the name and cast rows are refused outright too. Two are quieter: `array_element` is 1-based where a bare BigQuery subscript is 0-based, so the neighbouring element is read with no error, and dropping a constant grouping key turns a grouped aggregate into a global one, returning one row of zeros where the grouped form returns none | silent (query failure; wrong data for the subscript and the dropped grouping key) | `crates/runtime-datafusion/src/dialect/bigquery.rs::the_wrapper_forwards_every_bigquery_specific_rendering` (the four `#212` arms: `DATE_DIFF`, `UNIX_DATE`, `DATETIME`, cast `GROUP BY`) and `::array_element_federates_only_for_a_non_negative_integer_index`; in the fork, the per-rendering tests in `plan_to_sql.rs` and, restored by fork PR #214 after #212 deleted them, `rewrite.rs`'s own; real-engine guard: `test/scripts/bigquery-pushdown.sh` |
 | Spark concat coerces an untyped NULL argument to a string type (fork PR #217). Upstream adopted the behaviour in DataFusion 55 (`ConcatFunc` coercion, apache/datafusion#22244), so the merge took upstream's `coerce_types`; the fork keeps its tests | A string array concatenated with an untyped NULL reaches an unsupported kernel branch | silent (panic) | `crates/runtime/src/datafusion/builder.rs::tests::the_built_session_concatenates_an_untyped_null` |
 | Substrait VarChar literals decode as UTF-8 strings (fork PR #215) | Plans containing VarChar literals fail to decode | silent (query failure) | `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs::tests::decode_plan_executes_a_varchar_literal`; `tools/substrait-compliance/src/mode_a.rs::varchar_literal_lowers_to_utf8` (Isthmus TPC-H plans emit `VarChar` literals such as `EUROPE`, length 25; the Mode A harness `spice-substrait-compliance` exercises them on q02/q03/q05/q11/q12/q16/q17/q19–q22) |
@@ -710,7 +718,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**28 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**33 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -728,15 +736,26 @@ They are not equal in consequence; this is the order to close them in.
    a minimal repro built here.
 2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
+3. `datafusion` fixes the pin to spiceai/datafusion#268 carries ahead of their
+   guards, five rows. #261 (a union input's own bound) and #262 (a decimal cast
+   that drops digits) have guards in
+   [#15248](https://github.com/spiceai/spiceai/pull/15248) and
+   [#15207](https://github.com/spiceai/spiceai/pull/15207), which replace their
+   **GAP** markers when they land. The unparser fixes #246, #247 and #264
+   ([#13442](https://github.com/spiceai/spiceai/issues/13442),
+   [#14109](https://github.com/spiceai/spiceai/issues/14109),
+   [#14738](https://github.com/spiceai/spiceai/issues/14738)) have none: each needs
+   a federated query whose pushed SQL a real engine answers differently without
+   the patch, as the other unparser guards in `crates/data_components/src/federation.rs` do.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-3. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+4. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #36, #61–#63) — #36 is the quiet half, a `FetchFailed`
    that reaches the scheduler buried in `Shared(Arc(ArrowError(ExternalError(…))))`
    and is read as a non-retryable execution error, so the recovery that reruns
    the offending map stage never runs.
-4. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
+5. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
    and #59: a missing partition file read as an empty partition; shuffle-fetch
    clients pooled per peer; the reconciliation sweep that revives a lost stage or
    finishes a job whose graph already succeeded; job-graph persistence moved off
@@ -749,18 +768,18 @@ They are not equal in consequence; this is the order to close them in.
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-5. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+6. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-6. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+7. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+8. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-8. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+9. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -768,7 +787,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-9. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+10. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -779,7 +798,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-10. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+11. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
@@ -790,7 +809,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-11. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+12. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
