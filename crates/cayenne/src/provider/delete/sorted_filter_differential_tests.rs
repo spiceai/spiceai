@@ -230,7 +230,7 @@ async fn sorted_filter_randomized_differential() {
                     handling,
                     cutoff,
                     &metrics,
-                    &mut SortedDecodeCache::new(),
+                    &mut SortedFilterScratch::new(),
                 )
                 .expect("native kernel");
                 let hash = hash_deleted_rows(&batch_columns, &converter, &index, handling, cutoff);
@@ -345,7 +345,7 @@ fn sorted_float_total_order_and_sort_options() {
                     InsertRecordHandling::Ignore,
                     None,
                     &metrics,
-                    &mut SortedDecodeCache::new()
+                    &mut SortedFilterScratch::new()
                 )
                 .expect("float kernel"),
                 vec![0, 2, 4, 6],
@@ -374,7 +374,7 @@ fn sorted_endpoints_duplicates_and_reinsert_markers() {
     let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
         0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
     ]))];
-    let mut cache = SortedDecodeCache::new();
+    let mut cache = SortedFilterScratch::new();
     for (handling, cutoff, expected) in [
         (InsertRecordHandling::Apply, None, vec![4, 5]),
         (InsertRecordHandling::Ignore, None, vec![2, 3, 4, 5]),
@@ -413,7 +413,7 @@ fn sorted_decode_error_is_returned() {
         InsertRecordHandling::Ignore,
         None,
         &metrics,
-        &mut SortedDecodeCache::new(),
+        &mut SortedFilterScratch::new(),
     )
     .expect_err("malformed encoded key must return an error");
     let datafusion_common::DataFusionError::ArrowError(source, _) = error else {
@@ -486,7 +486,7 @@ fn sorted_entries_fuse_across_several_runs() {
             handling,
             cutoff,
             &metrics,
-            &mut SortedDecodeCache::new(),
+            &mut SortedFilterScratch::new(),
         )
         .expect("fused sorted kernel");
         assert_eq!(
@@ -701,7 +701,7 @@ fn sorted_typed_comparators_match_row_encoding() {
                                 InsertRecordHandling::Ignore,
                                 None,
                                 &metrics,
-                                &mut SortedDecodeCache::new()
+                                &mut SortedFilterScratch::new()
                             )
                             .expect("typed sorted kernel"),
                             hash_deleted_rows(
@@ -771,7 +771,7 @@ fn sorted_integer_tuple_comparator_is_monomorphised() {
                 InsertRecordHandling::Ignore,
                 None,
                 &metrics,
-                &mut SortedDecodeCache::new()
+                &mut SortedFilterScratch::new()
             )
             .expect("integer tuple kernel"),
             vec![0, 4]
@@ -878,5 +878,103 @@ fn sorted_fixed_binary_comparator_matches_arrow() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn sorted_vectorized_states_and_sparse_scratch_reuse() {
+    for descending in [false, true] {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1; 96])),
+            Arc::new(Int64Array::from(vec![2; 96])),
+            Arc::new(Int32Array::from_iter_values((0..96).map(|i| (i * 31) % 17))),
+        ];
+        let fields: Vec<_> = columns
+            .iter()
+            .map(|c| {
+                SortField::new_with_options(
+                    c.data_type().clone(),
+                    arrow::compute::SortOptions {
+                        descending,
+                        nulls_first: false,
+                    },
+                )
+            })
+            .collect();
+        let converter = RowConverter::new(fields.clone()).expect("integer converter");
+        let same =
+            IntegerComparator::<3>::new(&columns, &columns, &fields).expect("integer comparator");
+        let mut states = vec![0; 95];
+        same.adjacent_states(&mut states);
+        let typed = TypedComparator::new(&columns, &columns, &fields)
+            .expect("typed first-column prepass comparator");
+        let mut typed_states = vec![0; 95];
+        typed.adjacent_states(&mut typed_states);
+        assert_eq!(typed_states, states, "descending={descending}");
+        for (i, &state) in states.iter().enumerate() {
+            let cmp = same.compare(i, i + 1);
+            assert_eq!(
+                state,
+                if cmp.is_lt() {
+                    1
+                } else if cmp.is_gt() {
+                    2
+                } else {
+                    0
+                },
+                "descending={descending} row={i}"
+            );
+        }
+        let rows = converter.convert_columns(&columns).expect("encode keys");
+        let index = KeyDeletionIndex::from_map(
+            rows.iter()
+                .enumerate()
+                .filter(|(i, _)| i % 3 == 0)
+                .map(|(_, row)| (row.as_ref().into(), 7))
+                .collect(),
+        );
+        let metrics = DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let mut scratch = SortedFilterScratch::new();
+        for length in [96, 17, 96, 1, 0, 48] {
+            let batch: Vec<_> = columns.iter().map(|c| c.slice(0, length)).collect();
+            let actual = sorted_deleted_rows(
+                &batch,
+                &converter,
+                &index,
+                InsertRecordHandling::Apply,
+                None,
+                &metrics,
+                &mut scratch,
+            )
+            .expect("sorted kernel");
+            let encoded = converter.convert_columns(&batch).expect("oracle keys");
+            let expected: Vec<_> = encoded
+                .iter()
+                .enumerate()
+                .filter_map(|(row, key)| {
+                    index
+                        .get_with_min_seq(key.as_ref(), None)
+                        .filter(|t| !tombstone_visible(*t, InsertRecordHandling::Apply, None))
+                        .map(|_| row)
+                })
+                .collect();
+            assert_eq!(actual, expected, "descending={descending} length={length}");
+        }
+        let changed: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![2])),
+            Arc::new(Int32Array::from(vec![3])),
+        ];
+        let error = sorted_deleted_rows(
+            &changed,
+            &converter,
+            &index,
+            InsertRecordHandling::Apply,
+            None,
+            &metrics,
+            &mut scratch,
+        )
+        .expect_err("changed PK types must fail");
+        assert!(error.to_string().contains("types changed"));
     }
 }

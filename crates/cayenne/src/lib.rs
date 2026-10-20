@@ -157,4 +157,6 @@ pub use provider::{
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};
 
 #[doc(hidden)]
-pub use provider::delete::filter_exec::experiment_set_sorted_key_deletes;
+pub use provider::delete::filter_exec::{
+    InsertRecordHandling, KeyBasedDeletionFilterExec, experiment_set_sorted_key_deletes,
+};

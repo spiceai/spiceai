@@ -37,6 +37,16 @@ use std::cmp::Ordering;
 pub(super) trait KeyCompare: Sized {
     fn new(left: &[ArrayRef], right: &[ArrayRef], fields: &[SortField]) -> Result<Self>;
     fn compare(&self, a: usize, b: usize) -> Ordering;
+    fn adjacent_states(&self, states: &mut [u8]) {
+        for (i, state) in states.iter_mut().enumerate() {
+            *state = order_code(self.compare(i, i + 1));
+        }
+    }
+}
+
+#[inline]
+fn order_code(order: Ordering) -> u8 {
+    (u8::from(order.is_gt()) << 1) | u8::from(order.is_lt())
 }
 
 struct NullOrder {
@@ -93,12 +103,17 @@ impl NullOrder {
 
 trait NativeValue: ArrowNativeType {
     fn compare(self, other: Self) -> Ordering;
+    fn adjacent_code(self, other: Self) -> u8;
 }
 
 macro_rules! integer_values {
     ($($t:ty),*) => { $(impl NativeValue for $t {
         #[inline]
         fn compare(self, other: Self) -> Ordering { self.cmp(&other) }
+        #[inline]
+        fn adjacent_code(self, other: Self) -> u8 {
+            (u8::from(self > other) << 1) | u8::from(self < other)
+        }
     })* };
 }
 integer_values!(i8, i16, i32, i64, u8, u16, u32, u64);
@@ -107,11 +122,19 @@ impl NativeValue for f32 {
     fn compare(self, other: Self) -> Ordering {
         self.total_cmp(&other)
     }
+    #[inline]
+    fn adjacent_code(self, other: Self) -> u8 {
+        order_code(self.total_cmp(&other))
+    }
 }
 impl NativeValue for f64 {
     #[inline]
     fn compare(self, other: Self) -> Ordering {
         self.total_cmp(&other)
+    }
+    #[inline]
+    fn adjacent_code(self, other: Self) -> u8 {
+        order_code(self.total_cmp(&other))
     }
 }
 
@@ -144,6 +167,36 @@ impl<V: NativeValue> NativePair<V> {
     fn compare(&self, a: usize, b: usize) -> Ordering {
         self.order
             .compare(a, b, || self.left[a].compare(self.right[b]))
+    }
+}
+
+impl<V: NativeValue> NativePair<V> {
+    fn update_adjacent(&self, states: &mut [u8]) -> bool {
+        if self.order.options.descending {
+            self.update_adjacent_order::<true>(states)
+        } else {
+            self.update_adjacent_order::<false>(states)
+        }
+    }
+
+    fn update_adjacent_order<const DESCENDING: bool>(&self, states: &mut [u8]) -> bool {
+        let values: &[V] = self.left.as_ref();
+        let mut undecided = 0_u8;
+        for ((&a, &b), state) in values
+            .iter()
+            .zip(values.iter().skip(1))
+            .zip(states.iter_mut())
+        {
+            let cmp = a.adjacent_code(b);
+            let cmp = if DESCENDING {
+                ((cmp & 1) << 1) | ((cmp & 2) >> 1)
+            } else {
+                cmp
+            };
+            *state |= cmp & 0_u8.wrapping_sub(u8::from(*state == 0));
+            undecided |= u8::from(*state == 0);
+        }
+        undecided != 0
     }
 }
 
@@ -254,6 +307,33 @@ column_comparator!(
 );
 
 impl ColumnComparator {
+    fn primitive_adjacent(&self, states: &mut [u8]) -> Option<bool> {
+        macro_rules! update {
+            ($pair:ident) => {
+                if $pair.order.nulls.is_none() {
+                    Some($pair.update_adjacent(states))
+                } else {
+                    None
+                }
+            };
+        }
+        match self {
+            Self::I8(pair) => update!(pair),
+            Self::I16(pair) => update!(pair),
+            Self::I32(pair) => update!(pair),
+            Self::I64(pair) => update!(pair),
+            Self::U8(pair) => update!(pair),
+            Self::U16(pair) => update!(pair),
+            Self::U32(pair) => update!(pair),
+            Self::U64(pair) => update!(pair),
+            Self::F32(pair) => update!(pair),
+            Self::F64(pair) => update!(pair),
+            _ => None,
+        }
+    }
+}
+
+impl ColumnComparator {
     fn new(left: &dyn Array, right: &dyn Array, options: SortOptions) -> Result<Self> {
         if left.data_type() != right.data_type() {
             return Err(DataFusionError::Internal(
@@ -306,6 +386,18 @@ impl ColumnComparator {
 }
 
 pub(super) struct TypedComparator(Vec<ColumnComparator>);
+impl TypedComparator {
+    #[inline]
+    fn compare_from(&self, start: usize, a: usize, b: usize) -> Ordering {
+        for column in &self.0[start..] {
+            let order = column.compare(a, b);
+            if !order.is_eq() {
+                return order;
+            }
+        }
+        Ordering::Equal
+    }
+}
 impl KeyCompare for TypedComparator {
     fn new(left: &[ArrayRef], right: &[ArrayRef], fields: &[SortField]) -> Result<Self> {
         if left.len() != fields.len() || right.len() != fields.len() {
@@ -323,13 +415,25 @@ impl KeyCompare for TypedComparator {
     }
     #[inline]
     fn compare(&self, a: usize, b: usize) -> Ordering {
-        for column in &self.0 {
-            let order = column.compare(a, b);
-            if !order.is_eq() {
-                return order;
+        self.compare_from(0, a, b)
+    }
+
+    fn adjacent_states(&self, states: &mut [u8]) {
+        match self.0.first().and_then(|c| c.primitive_adjacent(states)) {
+            Some(false) => {}
+            Some(true) => {
+                for (i, state) in states.iter_mut().enumerate() {
+                    if *state == 0 {
+                        *state = order_code(self.compare_from(1, i, i + 1));
+                    }
+                }
+            }
+            None => {
+                for (i, state) in states.iter_mut().enumerate() {
+                    *state = order_code(self.compare(i, i + 1));
+                }
             }
         }
-        Ordering::Equal
     }
 }
 
@@ -338,6 +442,12 @@ enum IntegerColumn {
     I64(NativePair<i64>),
 }
 impl IntegerColumn {
+    fn update_adjacent(&self, states: &mut [u8]) -> bool {
+        match self {
+            Self::I32(pair) => pair.update_adjacent(states),
+            Self::I64(pair) => pair.update_adjacent(states),
+        }
+    }
     #[inline]
     fn compare(&self, a: usize, b: usize) -> Ordering {
         match self {
@@ -374,6 +484,13 @@ impl<const N: usize> KeyCompare for IntegerComparator<N> {
         Ok(Self(columns.try_into().map_err(|_| {
             DataFusionError::Internal("Integer deletion comparator tuple width differs".into())
         })?))
+    }
+    fn adjacent_states(&self, states: &mut [u8]) {
+        for column in &self.0 {
+            if !column.update_adjacent(states) {
+                break;
+            }
+        }
     }
     #[inline]
     fn compare(&self, a: usize, b: usize) -> Ordering {

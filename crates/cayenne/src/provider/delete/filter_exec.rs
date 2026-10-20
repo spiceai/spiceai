@@ -675,7 +675,7 @@ impl KeyBasedDeletionFilterExec {
             row_scratch,
             sorted_enabled,
             sorted_verify,
-            sorted_decode_cache: SortedDecodeCache::new(),
+            sorted_scratch: SortedFilterScratch::new(),
             min_delete_seq_to_apply,
             schema,
             metrics,
@@ -764,7 +764,7 @@ pub struct KeyBasedDeletionFilterStream {
     row_scratch: RowEncodingScratch,
     sorted_enabled: bool,
     sorted_verify: bool,
-    sorted_decode_cache: SortedDecodeCache,
+    sorted_scratch: SortedFilterScratch,
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
@@ -788,22 +788,54 @@ pub struct KeyBasedDeletionFilterStream {
     candidates_scratch: Vec<u32>,
 }
 
-type SortedDecodeCache =
-    std::collections::HashMap<(usize, Vec<arrow_schema::DataType>), Vec<ArrayRef>>;
+#[derive(Default)]
+struct SortedFilterScratch {
+    types: Option<Vec<arrow_schema::DataType>>,
+    decoded: Vec<Vec<ArrayRef>>,
+    order: Vec<usize>,
+    boundaries: Vec<usize>,
+    states: Vec<u8>,
+    candidates: Vec<(usize, TombstoneEntry)>,
+    deleted: Vec<usize>,
+}
+
+impl SortedFilterScratch {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+trait RowMapping {
+    fn row(&self, position: usize) -> usize;
+}
+struct IdentityRows;
+impl RowMapping for IdentityRows {
+    #[inline]
+    fn row(&self, position: usize) -> usize {
+        position
+    }
+}
+struct PermutedRows<'a>(&'a [usize]);
+impl RowMapping for PermutedRows<'_> {
+    #[inline]
+    fn row(&self, position: usize) -> usize {
+        self.0[position]
+    }
+}
 
 #[path = "sorted_comparator.rs"]
 mod sorted_comparator;
 use sorted_comparator::{IntegerComparator, KeyCompare, TypedComparator};
 
-fn sorted_deleted_rows(
+fn sorted_deleted_rows_into(
     columns: &[ArrayRef],
     converter: &RowConverter,
     tombstones: &KeyDeletionIndex,
     handling: InsertRecordHandling,
     cutoff: Option<i64>,
     metrics: &DeletionFilterMetrics,
-    cache: &mut SortedDecodeCache,
-) -> datafusion_common::Result<Vec<usize>> {
+    cache: &mut SortedFilterScratch,
+) -> datafusion_common::Result<()> {
     let integers = columns.iter().all(|c| {
         c.null_count() == 0
             && matches!(
@@ -827,29 +859,20 @@ fn sorted_deleted_rows(
     )
 }
 
-fn sorted_scan_order<C: KeyCompare>(
+#[cfg(test)]
+fn sorted_deleted_rows(
     columns: &[ArrayRef],
     converter: &RowConverter,
+    tombstones: &KeyDeletionIndex,
+    handling: InsertRecordHandling,
+    cutoff: Option<i64>,
     metrics: &DeletionFilterMetrics,
-) -> datafusion_common::Result<(Vec<usize>, Vec<usize>)> {
-    let n = columns.first().map_or(0, |c| c.len());
-    let same = C::new(columns, columns, converter.sort_fields())?;
-    let mut boundaries = vec![0];
-    for i in 1..n {
-        if same.compare(i - 1, i).is_gt() {
-            boundaries.push(i);
-        }
-    }
-    metrics.sorted_runs.add(boundaries.len());
-    let mut order: Vec<_> = (0..n).collect();
-    if boundaries.len() > (n / 16).max(1) {
-        order.sort_unstable_by(|&a, &b| same.compare(a, b));
-        boundaries.truncate(1);
-        metrics.permuted_batches.add(1);
-        metrics.permuted_rows.add(n);
-    }
-    boundaries.push(n);
-    Ok((order, boundaries))
+    cache: &mut SortedFilterScratch,
+) -> datafusion_common::Result<Vec<usize>> {
+    sorted_deleted_rows_into(
+        columns, converter, tombstones, handling, cutoff, metrics, cache,
+    )?;
+    Ok(cache.deleted.clone())
 }
 
 fn sorted_deleted_rows_impl<C: KeyCompare>(
@@ -859,92 +882,170 @@ fn sorted_deleted_rows_impl<C: KeyCompare>(
     handling: InsertRecordHandling,
     cutoff: Option<i64>,
     metrics: &DeletionFilterMetrics,
-    cache: &mut SortedDecodeCache,
-) -> datafusion_common::Result<Vec<usize>> {
+    cache: &mut SortedFilterScratch,
+) -> datafusion_common::Result<()> {
+    cache.deleted.clear();
+    cache.candidates.clear();
+    if let Some(types) = &cache.types {
+        if types.len() != columns.len()
+            || types.iter().zip(columns).any(|(t, c)| t != c.data_type())
+        {
+            return Err(datafusion_common::DataFusionError::Internal(
+                "Sorted deletion primary key types changed within a stream".into(),
+            ));
+        }
+    } else {
+        cache.decoded = tombstones
+            .sorted_runs()
+            .map(|run| {
+                if run.len() == 0 {
+                    return Ok(Vec::new());
+                }
+                run.decoded(converter)?
+                    .iter()
+                    .zip(columns)
+                    .map(|(tomb, batch)| {
+                        if tomb.data_type() == batch.data_type() {
+                            Ok(Arc::clone(tomb))
+                        } else {
+                            arrow::compute::cast(tomb, batch.data_type())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()
+            })
+            .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()?;
+        cache.types = Some(columns.iter().map(|c| c.data_type().clone()).collect());
+    }
     let n = columns.first().map_or(0, |c| c.len());
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let (order, boundaries) = sorted_scan_order::<C>(columns, converter, metrics)?;
-    let mut candidates: Vec<Option<TombstoneEntry>> = vec![None; n];
-    for run in tombstones.sorted_runs() {
-        if run.len() == 0 {
-            continue;
+    let same = C::new(columns, columns, converter.sort_fields())?;
+    cache.states.resize(n - 1, 0);
+    cache.states.fill(0);
+    same.adjacent_states(&mut cache.states);
+    cache.boundaries.clear();
+    cache.boundaries.push(0);
+    cache.boundaries.extend(
+        cache
+            .states
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &state)| (state == 2).then_some(i + 1)),
+    );
+    metrics.sorted_runs.add(cache.boundaries.len());
+    cache.order.clear();
+    let permuted = cache.boundaries.len() > (n / 16).max(1);
+    if permuted {
+        cache.order.extend(0..n);
+        cache.order.sort_unstable_by(|&a, &b| same.compare(a, b));
+        cache.boundaries.truncate(1);
+        metrics.permuted_batches.add(1);
+        metrics.permuted_rows.add(n);
+    }
+    cache.boundaries.push(n);
+    let mut search = SortedSearch {
+        columns,
+        converter,
+        tombstones,
+        decoded: &cache.decoded,
+        boundaries: &cache.boundaries,
+        candidates: &mut cache.candidates,
+    };
+    let contributing = if permuted {
+        search.apply::<C, _>(&PermutedRows(&cache.order))?
+    } else {
+        search.apply::<C, _>(&IdentityRows)?
+    };
+    if contributing > 1 {
+        cache.candidates.sort_unstable_by_key(|&(row, _)| row);
+    }
+    cache.candidates.dedup_by(|later, previous| {
+        if later.0 == previous.0 {
+            previous.1 = previous.1.fused_with(later.1);
+            true
+        } else {
+            false
         }
-        let cache_key = (
-            Arc::as_ptr(run) as usize,
-            columns.iter().map(|c| c.data_type().clone()).collect(),
-        );
-        if let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(cache_key.clone()) {
-            let decoded = run.decoded(converter)?;
-            let cast = columns
-                .iter()
-                .zip(decoded)
-                .map(|(batch, tomb)| {
-                    if batch.data_type() == tomb.data_type() {
-                        Ok(Arc::clone(tomb))
+    });
+    metrics.sorted_candidates.add(cache.candidates.len());
+    cache
+        .deleted
+        .extend(cache.candidates.iter().filter_map(|(row, entry)| {
+            Tombstone::from_entry(entry)
+                .filter(|t| !tombstone_visible(*t, handling, cutoff))
+                .map(|_| *row)
+        }));
+    if permuted && contributing <= 1 {
+        cache.deleted.sort_unstable();
+    }
+    Ok(())
+}
+
+struct SortedSearch<'a> {
+    columns: &'a [ArrayRef],
+    converter: &'a RowConverter,
+    tombstones: &'a KeyDeletionIndex,
+    decoded: &'a [Vec<ArrayRef>],
+    boundaries: &'a [usize],
+    candidates: &'a mut Vec<(usize, TombstoneEntry)>,
+}
+impl SortedSearch<'_> {
+    fn apply<C: KeyCompare, R: RowMapping>(
+        &mut self,
+        mapping: &R,
+    ) -> datafusion_common::Result<usize> {
+        let Self {
+            columns,
+            converter,
+            tombstones,
+            decoded,
+            boundaries,
+            candidates,
+        } = self;
+        let mut contributing = 0;
+        for (run, decoded) in tombstones.sorted_runs().zip(decoded.iter()) {
+            if run.len() == 0 {
+                continue;
+            }
+            let before = candidates.len();
+            let cross = C::new(columns, decoded, converter.sort_fields())?;
+            for bounds in boundaries.windows(2) {
+                let (a, b) = (bounds[0], bounds[1]);
+                let (mut lo, mut hi) = (0, run.len());
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if cross.compare(mapping.row(a), mid).is_gt() {
+                        lo = mid + 1;
                     } else {
-                        arrow::compute::cast(tomb, batch.data_type())
+                        hi = mid;
                     }
-                })
-                .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()?;
-            entry.insert(cast);
-        }
-        let decoded = cache.get(&cache_key).ok_or_else(|| {
-            datafusion_common::DataFusionError::Internal(
-                "Sorted deletion cast cache was not initialized".into(),
-            )
-        })?;
-        let cross = C::new(columns, decoded, converter.sort_fields())?;
-        for bounds in boundaries.windows(2) {
-            let (a, b) = (bounds[0], bounds[1]);
-            let (mut lo, mut hi) = (0, run.len());
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if cross.compare(order[a], mid).is_gt() {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+                }
+                let mut pos = a;
+                for t in lo..run.len() {
+                    if cross.compare(mapping.row(b - 1), t).is_lt() {
+                        break;
+                    }
+                    let mut end = b;
+                    while pos < end {
+                        let mid = pos + (end - pos) / 2;
+                        if cross.compare(mapping.row(mid), t).is_lt() {
+                            pos = mid + 1;
+                        } else {
+                            end = mid;
+                        }
+                    }
+                    while pos < b && cross.compare(mapping.row(pos), t).is_eq() {
+                        let row = mapping.row(pos);
+                        candidates.push((row, run.entry(t)));
+                        pos += 1;
+                    }
                 }
             }
-            let mut pos = a;
-            for t in lo..run.len() {
-                if cross.compare(order[b - 1], t).is_lt() {
-                    break;
-                }
-                let mut end = b;
-                while pos < end {
-                    let mid = pos + (end - pos) / 2;
-                    if cross.compare(order[mid], t).is_lt() {
-                        pos = mid + 1;
-                    } else {
-                        end = mid;
-                    }
-                }
-                while pos < b && cross.compare(order[pos], t).is_eq() {
-                    let row = order[pos];
-                    if candidates[row].is_none() {
-                        metrics.sorted_candidates.add(1);
-                    }
-                    let addition = run.entry(t);
-                    candidates[row] =
-                        Some(candidates[row].map_or(addition, |entry| entry.fused_with(addition)));
-                    pos += 1;
-                }
-            }
+            contributing += usize::from(candidates.len() > before);
         }
+        Ok(contributing)
     }
-    Ok(candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(i, entry)| {
-            entry
-                .as_ref()
-                .and_then(Tombstone::from_entry)
-                .filter(|tombstone| !tombstone_visible(*tombstone, handling, cutoff))
-                .map(|_| i)
-        })
-        .collect())
 }
 
 impl futures::Stream for KeyBasedDeletionFilterStream {
@@ -1017,16 +1118,16 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
 
                     let sorted = if this.sorted_enabled {
                         let _sorted_timer = this.metrics.sorted_path_compute.timer();
-                        match sorted_deleted_rows(
+                        match sorted_deleted_rows_into(
                             &this.pk_columns_scratch,
                             &this.row_converter,
                             &this.tombstones,
                             this.insert_record_handling,
                             this.min_delete_seq_to_apply,
                             &this.metrics,
-                            &mut this.sorted_decode_cache,
+                            &mut this.sorted_scratch,
                         ) {
-                            Ok(result) => Some(result),
+                            Ok(()) => Some(()),
                             Err(error) => return std::task::Poll::Ready(Some(Err(error))),
                         }
                     } else {
@@ -1080,8 +1181,9 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         // drops the buffers after probing instead of failing the query.
                         this.row_scratch.retain(rows);
                     }
-                    if let Some(sorted) = sorted {
-                        if this.sorted_verify && sorted != this.deleted_scratch {
+                    if sorted.is_some() {
+                        let sorted = &this.sorted_scratch.deleted;
+                        if this.sorted_verify && *sorted != this.deleted_scratch {
                             let row = (0..batch_size)
                                 .find(|i| {
                                     sorted.binary_search(i).is_ok()
@@ -1096,7 +1198,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                                 )),
                             )));
                         }
-                        this.deleted_scratch = sorted;
+                        std::mem::swap(&mut this.deleted_scratch, &mut this.sorted_scratch.deleted);
                     }
                     let keep_count = batch_size - this.deleted_scratch.len();
 
@@ -2109,7 +2211,7 @@ mod tests {
             row_converter,
             sorted_enabled: true,
             sorted_verify: true,
-            sorted_decode_cache: SortedDecodeCache::new(),
+            sorted_scratch: SortedFilterScratch::new(),
             row_scratch: RowEncodingScratch::new(
                 datafusion_execution::TaskContext::default().memory_pool(),
                 1,
@@ -2579,7 +2681,7 @@ mod tests {
             row_converter,
             sorted_enabled: true,
             sorted_verify: true,
-            sorted_decode_cache: SortedDecodeCache::new(),
+            sorted_scratch: SortedFilterScratch::new(),
             row_scratch: RowEncodingScratch::new(
                 datafusion_execution::TaskContext::default().memory_pool(),
                 1,
