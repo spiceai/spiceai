@@ -92,7 +92,9 @@ reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
-runtime-request-context = { path = "../runtime-request-context" }
+runtime-request-context = { path = "../runtime-request-context", features = [
+  "datafusion",
+] }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }

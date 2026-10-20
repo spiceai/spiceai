@@ -122,12 +122,27 @@ function gh_wget() {
 
 getLatestRelease() {
     local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases/latest"
+    local response=""
     local latest_release=""
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(gh_curl -s $spiceReleaseUrl | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        response=$(gh_curl -s $spiceReleaseUrl)
     else
-        latest_release=$(gh_wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        response=$(gh_wget -q --header="Accept: application/json" -O - $spiceReleaseUrl)
+    fi
+    latest_release=$(echo "$response" | grep \"tag_name\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+
+    # Without a tag the download URL becomes .../releases/download//<artifact>,
+    # which fetches an error page and fails later as a corrupt archive.
+    if [ -z "$latest_release" ]; then
+        local api_message
+        api_message=$(echo "$response" | grep \"message\" | awk -F'"' 'NR==1{print $4}')
+        echo "Failed to resolve the latest Spice.ai CLI release from $spiceReleaseUrl"
+        if [ -n "$api_message" ]; then
+            echo "GitHub API responded: $api_message"
+        fi
+        echo "If the GitHub API rate limit was exceeded, set GITHUB_TOKEN or pass a version to install, e.g. 'bash -s 1.0.0'."
+        exit 1
     fi
 
     ret_val=$latest_release
@@ -153,13 +168,15 @@ downloadFile() {
     echo "Downloading $DOWNLOAD_URL ..."
 
     # Download the binary directly
+    # `--fail` keeps an HTTP error page from being saved as the archive.
+    local download_status=0
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        gh_curl -SsL "$DOWNLOAD_URL" -o "$ARTIFACT_TMP_FILE"
+        gh_curl --fail -SsL "$DOWNLOAD_URL" -o "$ARTIFACT_TMP_FILE" || download_status=$?
     else
-        gh_wget -q -O "$ARTIFACT_TMP_FILE" "$DOWNLOAD_URL"
+        gh_wget -q -O "$ARTIFACT_TMP_FILE" "$DOWNLOAD_URL" || download_status=$?
     fi
 
-    if [ ! -f "$ARTIFACT_TMP_FILE" ]; then
+    if [ "$download_status" != "0" ] || [ ! -f "$ARTIFACT_TMP_FILE" ]; then
         echo "Failed to download $DOWNLOAD_URL"
         exit 1
     fi

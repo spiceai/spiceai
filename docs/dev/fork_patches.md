@@ -118,7 +118,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `ddd5c8ce628355fe860e097b092083a78d439d31` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `432924cd9644117729c7e010efc60a8cec8f0119` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `109661cc833e7f8919e1b3c65011ed9db0883312` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `54d90109c5db98d0420e0545a820f8bba8cc930c` | `spiceai-55` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -426,7 +426,9 @@ previous one. Between `2fc4617` and `109661c` (spiceai/datafusion-federation#93 
 federated-scan rows below (`sql/executor.rs`, `sql/mod.rs`, `schema_cast/mod.rs`) and their
 tests. Between `ef2e590` and `54d9010` (spiceai/datafusion-table-providers#91 and #92,
 squash-merged), `datafusion-table-providers` adds only the `SqlTable` opt-in row below and
-its test, and moves its own federation pin:
+its test, and moves its own federation pin. Between `54d9010` and `c5bcad1`
+(spiceai/datafusion-table-providers#94), it changes only the MySQL row-to-Arrow
+conversion (`arrow_sql_gen/mysql.rs`, `mysqlconn.rs`), which no row below covers:
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|

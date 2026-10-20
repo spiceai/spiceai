@@ -26,13 +26,14 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
+    ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCall, FunctionObject, PromptTokensDetails, ResponseFormat,
+    ToolChoiceAllowedMode, ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -212,6 +213,9 @@ impl ToolUsingChat {
     /// so, run them locally and create the messages that tell the model about the calls and
     /// their results.
     ///
+    /// `assistant_text` is the text the model wrote beside the tool calls. It is replayed with the
+    /// calls: a model that does not see it does not know it already said it, and says it again.
+    ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
     ///   requested.
@@ -220,6 +224,7 @@ impl ToolUsingChat {
     ///   reprocessed by the model.
     async fn process_tool_calls_and_run_spice_tools(
         &self,
+        assistant_text: &str,
         requested_tools: Vec<ChatCompletionMessageToolCall>,
     ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
         let spiced_tools = requested_tools
@@ -241,16 +246,17 @@ impl ToolUsingChat {
         }
 
         // Tell model the assistant has these tools
-        let assistant_message: ChatCompletionRequestMessage =
-            ChatCompletionRequestAssistantMessageArgs::default()
-                .tool_calls(
-                    spiced_tools
-                        .iter()
-                        .map(|t| ChatCompletionMessageToolCalls::Function(t.clone()))
-                        .collect::<Vec<_>>(),
-                ) // TODO - should this include non-spiced tools?
-                .build()?
-                .into();
+        let mut assistant_message = ChatCompletionRequestAssistantMessageArgs::default();
+        assistant_message.tool_calls(
+            spiced_tools
+                .iter()
+                .map(|t| ChatCompletionMessageToolCalls::Function(t.clone()))
+                .collect::<Vec<_>>(),
+        ); // TODO - should this include non-spiced tools?
+        if !assistant_text.is_empty() {
+            assistant_message.content(assistant_text);
+        }
+        let assistant_message: ChatCompletionRequestMessage = assistant_message.build()?.into();
 
         let mut tool_and_response_content = vec![];
         for t in spiced_tools.clone() {
@@ -330,6 +336,12 @@ impl ToolUsingChat {
                 .choices
                 .first()
                 .and_then(|c| c.message.tool_calls.clone());
+            let text = resp
+                .choices
+                .first()
+                .and_then(|c| c.message.content.clone())
+                .unwrap_or_default();
+            let logprobs = resp.choices.first().and_then(|c| c.logprobs.clone());
 
             // Extract inner ChatCompletionMessageToolCall from the ChatCompletionMessageToolCalls enum
             let tool_calls: Vec<ChatCompletionMessageToolCall> = tools_used
@@ -342,7 +354,7 @@ impl ToolUsingChat {
                 .collect();
 
             match self
-                .process_tool_calls_and_run_spice_tools(tool_calls)
+                .process_tool_calls_and_run_spice_tools(&text, tool_calls)
                 .await?
             {
                 // New messages means we have run spice tools locally, ready to recall model.
@@ -358,6 +370,7 @@ impl ToolUsingChat {
 
                     let mut response = next.response;
                     response.usage = combine_usage(usage, response.usage);
+                    prepend_text(&mut response, &text, logprobs, &inner_req);
                     let mut hidden_messages = round;
                     hidden_messages.extend(next.hidden_messages);
                     Ok(ToolLoopResponse {
@@ -614,6 +627,62 @@ fn next_round_tool_choice(
     }
 }
 
+/// What goes between the text a model wrote beside a tool call and the first text of the answer
+/// that follows the tool results, which the client receives as one message: a paragraph break,
+/// unless either side already has whitespace where they meet.
+fn paragraph_break(before: &str, after: &str) -> Option<&'static str> {
+    let separated = before.ends_with(char::is_whitespace) || after.starts_with(char::is_whitespace);
+    (!before.is_empty() && !after.is_empty() && !separated).then_some("\n\n")
+}
+
+/// Puts `text_before`, the text a model wrote beside the tool calls of an earlier round, ahead of
+/// the answer in `resp`, so a response carries the same text whether or not it is streamed.
+///
+/// A response to a `req` with a JSON `response_format` is the answer a client parses, so it
+/// carries only the answer. When `req` asks for log probabilities, `logprobs_before` are that
+/// text's, and the response carries the text as the model wrote it: both rounds' tokens, and no
+/// paragraph break, which has no token of its own.
+fn prepend_text(
+    resp: &mut CreateChatCompletionResponse,
+    text_before: &str,
+    logprobs_before: Option<ChatChoiceLogprobs>,
+    req: &CreateChatCompletionRequest,
+) {
+    let wants_text = matches!(req.response_format, None | Some(ResponseFormat::Text));
+    if text_before.is_empty() || !wants_text {
+        return;
+    }
+    let wants_logprobs = req.logprobs == Some(true);
+    let Some(choice) = resp.choices.first_mut() else {
+        return;
+    };
+    let answer = choice.message.content.take().unwrap_or_default();
+    let separator = if wants_logprobs {
+        ""
+    } else {
+        paragraph_break(text_before, &answer).unwrap_or_default()
+    };
+    choice.message.content = Some(format!("{text_before}{separator}{answer}"));
+    if wants_logprobs {
+        choice.logprobs = concat_logprobs(logprobs_before, choice.logprobs.take());
+    }
+}
+
+/// The log probabilities of two rounds' text written one after the other, or `None` when either
+/// round has none: tokens that cover only part of the text would misdescribe it.
+fn concat_logprobs(
+    before: Option<ChatChoiceLogprobs>,
+    after: Option<ChatChoiceLogprobs>,
+) -> Option<ChatChoiceLogprobs> {
+    let (before, after) = (before?, after?);
+    let mut content = before.content?;
+    content.extend(after.content?);
+    Some(ChatChoiceLogprobs {
+        content: Some(content),
+        refusal: after.refusal,
+    })
+}
+
 pub fn combine_usage(
     u1: Option<CompletionUsage>,
     u2: Option<CompletionUsage>,
@@ -818,6 +887,7 @@ fn make_a_stream(
         .as_ref()
         .and_then(|o| o.include_usage)
         .unwrap_or(false);
+    let wants_logprobs = req.logprobs == Some(true);
 
     tokio::spawn(
         request_context
@@ -918,8 +988,17 @@ fn make_a_stream(
                             }
                         };
 
+                        // The text the model wrote this round: what was streamed before the
+                        // finish, and any text on the finish itself.
+                        let mut round_text = chat_output.clone();
+                        round_text
+                            .push_str(chat_choice.delta.content.as_deref().unwrap_or_default());
+
                         let round = match model
-                            .process_tool_calls_and_run_spice_tools(tool_calls_to_process)
+                            .process_tool_calls_and_run_spice_tools(
+                                &round_text,
+                                tool_calls_to_process,
+                            )
                             .await
                         {
                             Ok(Some(round)) => round,
@@ -976,6 +1055,15 @@ fn make_a_stream(
                             .await
                         {
                             Ok(mut s) => {
+                                // The client receives this round's text and the answer's as one
+                                // message, so the answer's first text is set apart from it. A
+                                // client that asked for log probabilities gets the text as
+                                // written: a paragraph break has no token of its own.
+                                let mut text_before = if wants_logprobs {
+                                    String::new()
+                                } else {
+                                    round_text
+                                };
                                 while let Some(resp) = s.next().await {
                                     let resp = match resp {
                                         Ok(mut chunk) => {
@@ -985,6 +1073,20 @@ fn make_a_stream(
                                                     usage_chunk = Some(chunk);
                                                     continue;
                                                 }
+                                            }
+                                            if !text_before.is_empty()
+                                                && let Some(answer) = chunk
+                                                    .choices
+                                                    .first_mut()
+                                                    .and_then(|c| c.delta.content.as_mut())
+                                                    .filter(|answer| !answer.is_empty())
+                                            {
+                                                answer.insert_str(
+                                                    0,
+                                                    paragraph_break(&text_before, answer)
+                                                        .unwrap_or_default(),
+                                                );
+                                                text_before.clear();
                                             }
                                             Ok(chunk)
                                         }
@@ -1150,6 +1252,336 @@ mod tests {
             )),
             ChoiceDisposition::Drop
         );
+    }
+
+    const ANSWER: &str = "There are 3 rows.";
+
+    /// A `sql` Spice tool that counts its calls.
+    struct CountingSql(AtomicUsize);
+
+    #[async_trait]
+    impl SpiceModelTool for CountingSql {
+        fn name(&self) -> Cow<'_, str> {
+            "sql".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!([{ "rows": 3 }]))
+        }
+    }
+
+    /// A model that writes `preamble` and calls `sql` in its first round, and answers with
+    /// [`ANSWER`] in every round after. Streamed, it sends what the Anthropic adapter sends: a
+    /// text block's empty opening chunk, the text in chunks with no finish, the call, then a
+    /// `tool_calls` finish that carries no text. A request that asks for log probabilities gets
+    /// one token per piece of text. It records every request.
+    struct PreambleChat {
+        preamble: &'static str,
+        requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
+    }
+
+    impl PreambleChat {
+        fn new(preamble: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                preamble,
+                requests: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Records `req`, and returns its round.
+        fn next_round(&self, req: CreateChatCompletionRequest) -> usize {
+            let mut requests = self.requests.lock();
+            requests.push(req);
+            requests.len() - 1
+        }
+
+        /// The messages of request `round`.
+        fn messages(&self, round: usize) -> Value {
+            serde_json::to_value(&self.requests.lock()[round].messages)
+                .expect("serializable messages")
+        }
+    }
+
+    fn preamble_sql_call() -> Value {
+        json!({
+            "id": "call_sql", "type": "function",
+            "function": { "name": "sql", "arguments": "{\"query\":\"SELECT 3\"}" }
+        })
+    }
+
+    /// The `logprobs` of a choice carrying `text`: one token for all of it when `wanted`.
+    fn logprobs(text: &str, wanted: bool) -> Value {
+        if !wanted || text.is_empty() {
+            return Value::Null;
+        }
+        json!({
+            "content": [{ "token": text, "logprob": -0.5, "bytes": null, "top_logprobs": [] }],
+            "refusal": null,
+        })
+    }
+
+    fn chunk(delta: &Value, finish_reason: Option<&str>) -> CreateChatCompletionStreamResponse {
+        chunk_with_logprobs(delta, &Value::Null, finish_reason)
+    }
+
+    fn chunk_with_logprobs(
+        delta: &Value,
+        logprobs: &Value,
+        finish_reason: Option<&str>,
+    ) -> CreateChatCompletionStreamResponse {
+        serde_json::from_value(json!({
+            "id": "scripted", "object": "chat.completion.chunk", "created": 0, "model": "scripted",
+            "choices": [{
+                "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish_reason,
+            }],
+        }))
+        .expect("a valid stream chunk")
+    }
+
+    /// A chunk carrying `text`, with its log probabilities when `wanted`.
+    fn text_chunk(text: &str, wanted: bool) -> CreateChatCompletionStreamResponse {
+        chunk_with_logprobs(&json!({ "content": text }), &logprobs(text, wanted), None)
+    }
+
+    #[async_trait]
+    impl Chat for PreambleChat {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn chat_stream(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            let (first, second) = self.preamble.split_at(self.preamble.len() / 2);
+            let wanted = req.logprobs == Some(true);
+            let chunks = if self.next_round(req) == 0 {
+                let mut call = preamble_sql_call();
+                call["index"] = json!(0);
+                vec![
+                    chunk(&json!({ "role": "assistant", "content": "" }), None),
+                    text_chunk(first, wanted),
+                    text_chunk(second, wanted),
+                    chunk(&json!({ "tool_calls": [call] }), None),
+                    chunk(&json!({}), Some("tool_calls")),
+                ]
+            } else {
+                vec![
+                    chunk(&json!({ "role": "assistant", "content": "" }), None),
+                    text_chunk(ANSWER, wanted),
+                    chunk(&json!({}), Some("stop")),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+
+        async fn chat_request(
+            &self,
+            req: CreateChatCompletionRequest,
+        ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+            let wanted = req.logprobs == Some(true);
+            let (text, message, finish_reason) = if self.next_round(req) == 0 {
+                (
+                    self.preamble,
+                    json!({ "role": "assistant", "content": self.preamble, "tool_calls": [preamble_sql_call()] }),
+                    "tool_calls",
+                )
+            } else {
+                (
+                    ANSWER,
+                    json!({ "role": "assistant", "content": ANSWER }),
+                    "stop",
+                )
+            };
+            Ok(serde_json::from_value(json!({
+                "id": "scripted", "object": "chat.completion", "created": 0, "model": "scripted",
+                "choices": [{
+                    "index": 0, "message": message, "logprobs": logprobs(text, wanted),
+                    "finish_reason": finish_reason,
+                }],
+            }))
+            .expect("a valid response"))
+        }
+    }
+
+    fn tool_using_chat(provider: &Arc<PreambleChat>, tool: &Arc<CountingSql>) -> ToolUsingChat {
+        ToolUsingChat::new(
+            Arc::clone(provider) as Arc<dyn Chat>,
+            vec![Arc::clone(tool) as Arc<dyn SpiceModelTool>],
+            None,
+        )
+    }
+
+    fn chat_request(stream: bool) -> CreateChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "scripted", "stream": stream,
+            "messages": [{ "role": "user", "content": "How many rows are there?" }],
+        }))
+        .expect("a valid request")
+    }
+
+    fn chat_request_with_logprobs(stream: bool) -> CreateChatCompletionRequest {
+        let mut req = chat_request(stream);
+        req.logprobs = Some(true);
+        req
+    }
+
+    fn tokens(logprobs: Option<&ChatChoiceLogprobs>) -> Vec<String> {
+        logprobs
+            .and_then(|l| l.content.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|t| t.token.clone())
+            .collect()
+    }
+
+    /// The messages of the round after the tool call: the question, the model's turn as it wrote
+    /// it (its text and its call), then the call's result.
+    fn follow_up_messages(preamble: &str) -> Value {
+        json!([
+            { "role": "user", "content": "How many rows are there?" },
+            { "role": "assistant", "content": preamble, "tool_calls": [preamble_sql_call()] },
+            { "role": "tool", "content": "[{\"rows\":3}]", "tool_call_id": "call_sql" },
+        ])
+    }
+
+    /// The text and the finish reasons the client receives for a streamed request.
+    async fn stream_through_spice(preamble: &'static str) -> (String, Vec<String>, Value) {
+        let provider = PreambleChat::new(preamble);
+        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
+        let chunks: Vec<CreateChatCompletionStreamResponse> = tool_using_chat(&provider, &tool)
+            .chat_stream(chat_request(true))
+            .await
+            .expect("a response stream")
+            .map(|chunk| chunk.expect("a chunk, not an error"))
+            .collect()
+            .await;
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.requests.lock().len(), 2);
+
+        let choices = chunks.iter().flat_map(|c| &c.choices).collect_vec();
+        let text = choices
+            .iter()
+            .filter_map(|c| c.delta.content.as_deref())
+            .collect();
+        let finish_reasons = choices
+            .iter()
+            .filter_map(|c| c.finish_reason.map(|r| format!("{r:?}")))
+            .collect();
+        (text, finish_reasons, provider.messages(1))
+    }
+
+    #[tokio::test]
+    async fn test_streamed_text_beside_a_tool_call_is_replayed_and_set_apart_from_the_answer() {
+        let (text, finish_reasons, follow_up) = stream_through_spice("Let me check.").await;
+
+        assert_eq!(text, "Let me check.\n\nThere are 3 rows.");
+        assert_eq!(finish_reasons, ["Stop"]);
+        assert_eq!(follow_up, follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_streamed_text_that_ends_in_whitespace_gets_no_paragraph_break() {
+        let (text, _, follow_up) = stream_through_spice("Let me check.\n").await;
+
+        assert_eq!(text, "Let me check.\nThere are 3 rows.");
+        assert_eq!(follow_up, follow_up_messages("Let me check.\n"));
+    }
+
+    #[tokio::test]
+    async fn test_text_beside_a_tool_call_is_replayed_and_returned_ahead_of_the_answer() {
+        let provider = PreambleChat::new("Let me check.");
+        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
+        let response = tool_using_chat(&provider, &tool)
+            .chat_request(chat_request(false))
+            .await
+            .expect("a response");
+
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.requests.lock().len(), 2);
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("Let me check.\n\nThere are 3 rows.")
+        );
+        assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_streamed_logprobs_cover_exactly_the_streamed_text() {
+        let provider = PreambleChat::new("Let me check.");
+        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
+        let chunks: Vec<CreateChatCompletionStreamResponse> = tool_using_chat(&provider, &tool)
+            .chat_stream(chat_request_with_logprobs(true))
+            .await
+            .expect("a response stream")
+            .map(|chunk| chunk.expect("a chunk, not an error"))
+            .collect()
+            .await;
+        let choices = chunks.iter().flat_map(|c| &c.choices).collect_vec();
+        let text: String = choices
+            .iter()
+            .filter_map(|c| c.delta.content.as_deref())
+            .collect();
+        let tokens = choices
+            .iter()
+            .flat_map(|c| tokens(c.logprobs.as_ref()))
+            .collect_vec();
+
+        assert_eq!(tokens, ["Let me", " check.", "There are 3 rows."]);
+        assert_eq!(text, tokens.concat());
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_a_json_response_carries_only_the_answer() {
+        let provider = PreambleChat::new("Let me check.");
+        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
+        let mut req = chat_request(false);
+        req.response_format = Some(ResponseFormat::JsonObject);
+        let response = tool_using_chat(&provider, &tool)
+            .chat_request(req)
+            .await
+            .expect("a response");
+
+        assert_eq!(
+            response.choices[0].message.content.as_deref(),
+            Some("There are 3 rows.")
+        );
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_logprobs_cover_exactly_the_returned_text() {
+        let provider = PreambleChat::new("Let me check.");
+        let tool = Arc::new(CountingSql(AtomicUsize::new(0)));
+        let response = tool_using_chat(&provider, &tool)
+            .chat_request(chat_request_with_logprobs(false))
+            .await
+            .expect("a response");
+        let choice = &response.choices[0];
+
+        assert_eq!(
+            tokens(choice.logprobs.as_ref()),
+            ["Let me check.", "There are 3 rows."]
+        );
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some("Let me check.There are 3 rows.")
+        );
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
     }
 
     fn create_system_message(content: &str) -> ChatCompletionRequestMessage {

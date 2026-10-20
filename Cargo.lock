@@ -1656,9 +1656,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.18.1"
+version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -1667,9 +1667,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.45.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
 dependencies = [
  "cc",
  "cmake",
@@ -7451,7 +7451,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=54d90109c5db98d0420e0545a820f8bba8cc930c#54d90109c5db98d0420e0545a820f8bba8cc930c"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a#c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18316,6 +18316,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
  "axum",
+ "base64 0.22.1",
  "bb8",
  "blake3",
  "bytes",
@@ -18330,7 +18331,9 @@ dependencies = [
  "nix 0.30.1",
  "object_store 0.13.2",
  "object_store_spawn",
+ "rand 0.10.1",
  "reqwest 0.13.4",
+ "secrecy",
  "serde",
  "serde_json",
  "smb",
@@ -18440,6 +18443,7 @@ dependencies = [
  "app",
  "async-trait",
  "axum",
+ "datafusion",
  "futures",
  "headers",
  "http 1.4.1",
@@ -21777,11 +21781,9 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
- "hf-hub",
  "insta",
  "itertools 0.14.0",
  "parking_lot",
- "parquet",
  "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",

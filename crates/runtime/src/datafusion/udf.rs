@@ -1484,7 +1484,7 @@ body: \"{body}\"
         // Any hasher works — the key only has to be the same on every lookup.
         let key = cache::key::CacheKey::Query(sql, None)
             .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
-        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql)
+        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql, None)
             .await
             .expect("the query over myscale should plan");
         plans.checkpoint().await;
@@ -1514,7 +1514,7 @@ body: \"{body}\"
         let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
 
         let cached = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect("the cached plan should come back");
         assert_eq!(
@@ -1536,7 +1536,7 @@ body: \"{body}\"
         );
 
         let replanned = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect("the same SQL should re-plan after the reload");
         assert_eq!(
@@ -1576,7 +1576,7 @@ body: \"{body}\"
         // outcome: the user removed the function. The point is that the query
         // no longer silently answers from the copy the cached plan held.
         let err = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect_err("the removed function must not resolve after the reload");
         assert!(
