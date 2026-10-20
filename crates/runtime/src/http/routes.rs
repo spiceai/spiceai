@@ -137,6 +137,9 @@ use tower_http::limit::RequestBodyLimitLayer;
         DatasetQueryParams,
         DatasetFilter,
         Format,
+        // `async_openai`'s `CompoundFilter` is `no_recursion` (it contains itself through
+        // `Filter`), so `utoipa` does not collect the schemas of its fields.
+        async_openai::types::responses::CompoundType,
         evaluate_api::openai::DecisionRequest,
         evaluate_api::openai::DecisionInput,
         evaluate_api::openai::DecisionInputMessage,
