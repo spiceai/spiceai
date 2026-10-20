@@ -380,13 +380,19 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
     const KEYWORD: &[u8] = b"stream";
     let mut streams = Vec::new();
     let mut from = 0;
+    // Lexical scans for strings/comments start after the last validated payload
+    // so binary stream bytes (e.g. a `0x28` in an image) cannot look like `(`.
+    let mut lex_from = 0;
     while let Some(rel) = find(&raw[from..], KEYWORD) {
         let pos = from + rel;
         from = pos + KEYWORD.len();
-        if !is_stream_keyword(raw, pos) || in_literal_string_at(raw, pos) {
+        if !is_stream_keyword(raw, pos)
+            || in_comment_at(raw, pos)
+            || in_literal_string_at(raw, pos, lex_from)
+        {
             continue;
         }
-        let Some(stream_info) = stream_before(raw, pos) else {
+        let Some(stream_info) = stream_before(raw, pos, lex_from) else {
             continue;
         };
         // Stream data begins after the end-of-line that follows the keyword.
@@ -401,8 +407,10 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
             filters: stream_info.filters,
             data_start: data,
         });
-        // Do not resume the keyword search inside this stream's payload.
+        // Do not resume the keyword search inside this stream's payload, and
+        // do not let that payload participate in later string detection.
         from = stream_payload_end(raw, data, stream_info.length);
+        lex_from = from;
     }
     streams
 }
@@ -483,9 +491,9 @@ struct StreamInfo {
 /// object). When a dictionary is there but its chain cannot be determined, the
 /// filters are a single [`PdfFilter::Unbounded`] stage so the document fails
 /// closed.
-fn stream_before(raw: &[u8], keyword_pos: usize) -> Option<StreamInfo> {
+fn stream_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<StreamInfo> {
     let close = dict_closer_before(raw, keyword_pos)?;
-    let parsed = filters_of_dict(raw, close).unwrap_or(ParsedDict {
+    let parsed = filters_of_dict(raw, close, lex_from).unwrap_or(ParsedDict {
         consumed: 0,
         filters: vec![PdfFilter::Unbounded],
         length: None,
@@ -586,10 +594,12 @@ fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
 }
 
 /// Whether `at` sits inside a PDF literal string `(…)`, decided by a forward
-/// scan that also skips `%` comments. Used so a string such as
-/// `(<< /Length 999999999 >>stream)` cannot invent a phantom stream object.
-fn in_literal_string_at(raw: &[u8], at: usize) -> bool {
-    let mut i = 0;
+/// scan from `scan_from` that also skips `%` comments. `scan_from` is the end
+/// of the previous validated stream payload so binary content (e.g. a `0x28`
+/// image byte) is not treated as a string opener. Used so a Catalog string
+/// such as `(<< /Length 999999999 >>stream)` cannot invent a phantom stream.
+fn in_literal_string_at(raw: &[u8], at: usize, scan_from: usize) -> bool {
+    let mut i = scan_from.min(at);
     while i < at {
         match raw.get(i) {
             Some(b'%') => {
@@ -610,6 +620,11 @@ fn in_literal_string_at(raw: &[u8], at: usize) -> bool {
     false
 }
 
+/// Whether `at` sits inside a `%` comment on its line.
+fn in_comment_at(raw: &[u8], at: usize) -> bool {
+    comment_open_before(raw, at).is_some()
+}
+
 /// How far back from a dictionary closer its opening `<<` is looked for.
 /// Stream dictionaries are a few hundred bytes; past this the chain cannot be
 /// attributed and the stream fails closed.
@@ -628,8 +643,8 @@ const MAX_VALUE_DEPTH: usize = 32;
 
 /// The top-level `/Filter` chain and `/Length` of the dictionary that closes
 /// at `close`. `None` when no candidate opening parses as that dictionary.
-fn filters_of_dict(raw: &[u8], close: usize) -> Option<ParsedDict> {
-    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES);
+fn filters_of_dict(raw: &[u8], close: usize, lex_from: usize) -> Option<ParsedDict> {
+    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES).max(lex_from);
     let mut tried = 0usize;
     let mut j = close;
     while j > window_start + 1 && tried < MAX_DICT_CANDIDATES {
@@ -638,7 +653,9 @@ fn filters_of_dict(raw: &[u8], close: usize) -> Option<ParsedDict> {
             let start = j - 1;
             // A `<<` inside a `%` comment or a literal string is not a
             // dictionary opener.
-            if comment_open_before(raw, start).is_some() || in_literal_string_at(raw, start) {
+            if comment_open_before(raw, start).is_some()
+                || in_literal_string_at(raw, start, lex_from)
+            {
                 continue;
             }
             tried += 1;
@@ -973,7 +990,7 @@ fn skip_ws(data: &[u8]) -> &[u8] {
 
 /// Test/helper view of [`stream_before`]: just the filter chain.
 fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
-    stream_before(raw, keyword_pos).map(|info| info.filters)
+    stream_before(raw, keyword_pos, 0).map(|info| info.filters)
 }
 
 /// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
@@ -1905,6 +1922,62 @@ mod tests {
         dict.extend_from_slice(data.len().to_string().as_bytes());
         dict.extend_from_slice(b" >>\n");
         assert_chain_budgeted(&dict, &data);
+    }
+
+    /// An earlier unfiltered stream whose payload contains a `(` byte must not
+    /// make the following Flate stream look like it sits inside a string.
+    #[test]
+    fn still_budgets_a_flate_stream_after_a_payload_with_a_paren_byte() {
+        let bomb = flate_bomb();
+        let image = b"\x28one pixel\x29"; // leading 0x28 == b'('
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
+        pdf.extend_from_slice(image.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" >>\nstream\n");
+        pdf.extend_from_slice(image);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert_eq!(pdf_streams(&raw).len(), 2);
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A Catalog comment that ends with the word `stream` is not a stream
+    /// object and must not consume the real Flate content stream.
+    #[test]
+    fn still_budgets_when_a_catalog_comment_mentions_stream() {
+        let bomb = flate_bomb();
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >> % stream\nendobj\n");
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert_eq!(pdf_streams(&raw).len(), 1);
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
     }
 
     /// A literal string that contains dictionary-like text and the word
