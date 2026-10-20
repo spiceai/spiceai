@@ -67,6 +67,7 @@ mod filtered_delete_scan_test;
 mod fixed_offset_timezone_test;
 mod float_nan_predicate_test;
 mod float_zero_predicate_test;
+mod fold_listing_cache_test;
 mod in_list_null_semantics_test;
 mod incremental_stats_test;
 mod ingest_fsync_regression_test;
