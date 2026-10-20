@@ -423,18 +423,24 @@ fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
 }
 
 /// Index just past a stream's payload: `/Length` bytes from `data_start` when
-/// known, otherwise the `endstream` keyword that terminates it.
+/// known *and* an `endstream` sits at that boundary; otherwise the first
+/// `endstream` after `data_start`.
 ///
-/// A resolved length (direct or a uniquely resolved indirect) is trusted: the
-/// payload may legally contain the ASCII bytes `endstream`, so discovery must
-/// not stop early inside it. Indirect references that cannot be resolved to a
-/// single object definition yield no length here and fall back to `endstream`,
-/// which is what defeats a Catalog-string decoy that invents a second
-/// `N 0 obj` with a huge integer.
+/// Trusting a bare length would let `/Length 999999999` on an empty stream
+/// skip to EOF and hide a later Flate bomb. Requiring `endstream` at the
+/// claimed boundary still allows a payload that embeds the ASCII bytes
+/// `endstream` mid-content, because the real terminator is the one at
+/// `data_start + Length`.
 fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
     if let Some(len) = length {
-        let by_length = data_start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
-        return after_endstream(raw, by_length.min(raw.len()));
+        let by_length = data_start
+            .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
+            .min(raw.len());
+        let after = after_endstream(raw, by_length);
+        if after > by_length {
+            return after;
+        }
+        // Claimed length has no matching endstream — treat as unverifiable.
     }
     find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
 }
@@ -506,28 +512,50 @@ fn stream_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<Stre
 }
 
 /// Resolves an indirect object `obj gen R` whose body is an integer, used for
-/// `/Length N G R`. Returns a value only when exactly one matching
-/// `obj gen obj` definition exists in `raw`: a Catalog string that embeds a
-/// second fake definition makes the reference ambiguous, so discovery falls
-/// back to `endstream` instead of trusting a decoy integer.
+/// `/Length N G R`. Returns a value only when exactly one matching object
+/// header exists in `raw` (PDF whitespace between the numbers is allowed, so
+/// `6\t0 obj` counts). A Catalog string that embeds a second fake definition
+/// makes the reference ambiguous, so discovery falls back to `endstream`
+/// instead of trusting a decoy integer.
 fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
-    let needle = format!("{obj} {generation} obj");
     let mut values = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(rel) = find(&raw[cursor..], needle.as_bytes()) {
-        let pos = cursor + rel;
-        let before_ok = pos == 0 || is_pdf_whitespace(raw[pos - 1]);
-        let after = pos + needle.len();
-        let after_ok = after < raw.len() && is_pdf_whitespace(raw[after]);
-        if before_ok && after_ok {
-            let rest = skip_ws(&raw[after..]);
-            if let Some(value) = parse_u64(rest) {
-                values.push(value);
-            }
+    let mut i = 0;
+    while i < raw.len() {
+        if i > 0 && !is_pdf_whitespace(raw[i - 1]) {
+            i += 1;
+            continue;
         }
-        cursor = pos + 1;
+        let Some((header_end, parsed_obj, parsed_gen)) = parse_object_header(&raw[i..]) else {
+            i += 1;
+            continue;
+        };
+        i += header_end;
+        if parsed_obj != obj || parsed_gen != generation {
+            continue;
+        }
+        let rest = skip_ws(&raw[i..]);
+        if let Some(value) = parse_u64(rest) {
+            values.push(value);
+        }
     }
     (values.len() == 1).then(|| values[0])
+}
+
+/// Parses an `obj gen obj` header at the start of `data`, allowing PDF
+/// whitespace between the tokens. Returns `(bytes_consumed, obj, generation)`.
+fn parse_object_header(data: &[u8]) -> Option<(usize, u32, u32)> {
+    let obj = parse_u64(data)?;
+    let after_obj = skip_number(data)?;
+    let gen_at = after_obj + ws_len(&data[after_obj..]);
+    let generation = parse_u64(&data[gen_at..])?;
+    let after_gen = gen_at + skip_number(&data[gen_at..])?;
+    let kw_at = after_gen + ws_len(&data[after_gen..]);
+    if !data[kw_at..].starts_with(b"obj") || !token_ends(data, kw_at + 3) {
+        return None;
+    }
+    let obj = u32::try_from(obj).ok()?;
+    let generation = u32::try_from(generation).ok()?;
+    Some((kw_at + 3, obj, generation))
 }
 
 fn parse_u64(data: &[u8]) -> Option<u64> {
@@ -737,6 +765,13 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
                         length_ref = Some((obj, generation));
                     }
                 }
+            }
+            // Predictor / columns / bits parameters change what each filter
+            // stage emits. We do not apply them, so fail closed rather than
+            // under-count a PNG-up Flate chain that PDFium would expand.
+            b"DecodeParms" | b"DP" => {
+                i += skip_value(&data[i..], depth + 1)?;
+                filters = Some(vec![PdfFilter::Unbounded]);
             }
             _ => {
                 i += skip_value(&data[i..], depth + 1)?;
@@ -1853,6 +1888,77 @@ mod tests {
         );
         ensure_pdf_within_budget(&pdf)
             .expect("ordinary text that mentions stream must not be rejected");
+    }
+
+    /// A direct `/Length 999999999` on an empty stream must not skip to EOF
+    /// and hide a later Flate bomb: the claimed length has no matching
+    /// `endstream`, so discovery falls back to the real terminator.
+    #[test]
+    fn still_budgets_after_a_direct_length_decoy() {
+        let bomb = flate_bomb();
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length 999999999 >>\nstream\nendstream\nendobj\n");
+        pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert_eq!(pdf_streams(&raw).len(), 2);
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// Object headers may use a tab between numbers (`6\t0 obj`). That form
+    /// must still resolve so a Catalog-string decoy spelled with spaces is
+    /// not the unique match.
+    #[test]
+    fn still_budgets_when_the_real_length_object_uses_a_tab() {
+        let bomb = flate_bomb();
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Note ( 6 0 obj\n99999999\nendobj) >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length 6 0 R >>\nstream\nendstream\nendobj\n");
+        pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        // Real length object uses a tab between obj and generation numbers.
+        pdf.extend_from_slice(b"6\t0 obj\n0\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert_eq!(pdf_streams(&raw).len(), 2);
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// `/DecodeParms` with a predictor changes what Flate emits between
+    /// stages. We do not reverse predictors, so such a stream is rejected
+    /// rather than under-counted.
+    #[test]
+    fn rejects_a_stream_with_decode_parms() {
+        let data = deflate(&flate_bomb());
+        let pdf = loadable_pdf_with_content_stream(
+            b"[/FlateDecode /FlateDecode] /DecodeParms << /Predictor 12 /Columns 1 >>",
+            &data,
+        );
+        assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
     }
 
     /// A Catalog string that contains the bytes of a fake `N 0 obj` /Length
