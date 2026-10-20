@@ -6329,13 +6329,27 @@ mod tests {
 
     /// Differential test for #15329: the indexed subtraction keeps exactly the incoming
     /// rows the pairwise comparison keeps, and claims exactly the same stored rows, over
-    /// seeded streams that repeat rows and mix nulls, `-0.0` and `0.0`, and `NaN`.
+    /// seeded streams that repeat rows and mix nulls, `-0.0` and `0.0`, `NaN`, dictionary
+    /// values whose keys differ from batch to batch, and empty, null and null-holding lists.
     #[test]
     fn overlap_index_matches_the_pairwise_comparison() {
+        use arrow::array::{DictionaryArray, ListArray};
+        use arrow::datatypes::Int32Type;
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, true),
             Field::new("name", DataType::Utf8, true),
             Field::new("score", DataType::Float64, true),
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
         ]));
         let names = [Some("a"), Some("b"), Some(""), None];
         let scores = [Some(0.0), Some(-0.0), Some(f64::NAN), Some(1.5), None];
@@ -6363,12 +6377,26 @@ mod tests {
                     (0..rows).map(|_| names[next(names.len())]).collect();
                 let row_scores: Vec<Option<f64>> =
                     (0..rows).map(|_| scores[next(scores.len())]).collect();
+                // Each batch builds its own dictionary, so equal values carry different
+                // keys in different batches.
+                let tags: DictionaryArray<Int32Type> =
+                    (0..rows).map(|_| names[next(names.len())]).collect();
+                let items = ListArray::from_iter_primitive::<Int32Type, _, _>((0..rows).map(
+                    |_| match next(4) {
+                        0 => None,
+                        1 => Some(vec![]),
+                        2 => Some(vec![Some(1), None]),
+                        _ => Some(vec![Some(1)]),
+                    },
+                ));
                 RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
                         Arc::new(Int32Array::from(ids)),
                         Arc::new(StringArray::from(row_names)),
                         Arc::new(Float64Array::from(row_scores)),
+                        Arc::new(tags),
+                        Arc::new(items),
                     ],
                 )
                 .expect("batch")
