@@ -12603,7 +12603,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12630,7 +12630,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "apodize",
@@ -12641,7 +12641,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-code-exec"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -12660,7 +12660,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -12766,7 +12766,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-flash-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12777,7 +12777,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -12788,7 +12788,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -12809,7 +12809,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-metal-compile"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "candle-metal-kernels",
  "objc2-metal 0.3.2",
@@ -12818,7 +12818,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -12836,7 +12836,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -12874,7 +12874,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-sandbox"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "anyhow",
  "itoa",
@@ -12891,7 +12891,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.9.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=01b2990da43d7d9488d37cd031d0ecd0b07479a6#01b2990da43d7d9488d37cd031d0ecd0b07479a6"
+source = "git+https://github.com/spiceai/mistral.rs?rev=e6b9f734922d6d9146a0938257c8cb70c9aa3e85#e6b9f734922d6d9146a0938257c8cb70c9aa3e85"
 dependencies = [
  "candle-core",
  "image 0.25.10",
