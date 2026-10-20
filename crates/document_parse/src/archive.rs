@@ -383,7 +383,7 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
     while let Some(rel) = find(&raw[from..], KEYWORD) {
         let pos = from + rel;
         from = pos + KEYWORD.len();
-        if !is_stream_keyword(raw, pos) {
+        if !is_stream_keyword(raw, pos) || in_literal_string_at(raw, pos) {
             continue;
         }
         let Some(stream_info) = stream_before(raw, pos) else {
@@ -558,11 +558,11 @@ fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
 
 /// Start index of a `%` comment on the same line whose body covers `pos`.
 ///
-/// Comment spans are decided from the start of the line forward: the first `%`
-/// that begins a comment token (at line start, or after whitespace/a delimiter)
-/// owns the rest of the line. Bytes inside that span — including `>>` or a
-/// second `%` — are comment text, not dictionary syntax, so a legal comment
-/// between `>>` and `stream` cannot hide the stream.
+/// Comment spans are decided from the start of the line forward with
+/// string-aware tokenization: literal strings (including a `%` inside
+/// `(100 % pure)` or `(% harmless)`) are skipped, and the first `%` outside a
+/// string owns the rest of the line. Bytes inside that span — including `>>`
+/// or a second `%` — are comment text, not dictionary syntax.
 fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
     if pos == 0 {
         return None;
@@ -573,16 +573,41 @@ fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
         .map_or(0, |newline| newline + 1);
     let mut i = line_start;
     while i < pos {
-        if raw[i] == b'%' {
-            let starts_comment =
-                i == line_start || is_pdf_whitespace(raw[i - 1]) || is_pdf_delimiter(raw[i - 1]);
-            if starts_comment {
-                return Some(i);
+        match raw[i] {
+            b'(' => {
+                let len = skip_literal_string(&raw[i..])?;
+                i += len;
             }
+            b'%' => return Some(i),
+            _ => i += 1,
         }
-        i += 1;
     }
     None
+}
+
+/// Whether `at` sits inside a PDF literal string `(…)`, decided by a forward
+/// scan that also skips `%` comments. Used so a string such as
+/// `(<< /Length 999999999 >>stream)` cannot invent a phantom stream object.
+fn in_literal_string_at(raw: &[u8], at: usize) -> bool {
+    let mut i = 0;
+    while i < at {
+        match raw.get(i) {
+            Some(b'%') => {
+                i += 1;
+                while i < at && raw[i] != b'\n' && raw[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            Some(b'(') => match skip_literal_string(&raw[i..]) {
+                Some(len) if i + len <= at => i += len,
+                // The string that starts here has not closed before `at`.
+                Some(_) | None => return true,
+            },
+            Some(_) => i += 1,
+            None => break,
+        }
+    }
+    false
 }
 
 /// How far back from a dictionary closer its opening `<<` is looked for.
@@ -611,8 +636,9 @@ fn filters_of_dict(raw: &[u8], close: usize) -> Option<ParsedDict> {
         j -= 1;
         if raw[j] == b'<' && raw[j - 1] == b'<' {
             let start = j - 1;
-            // A `<<` that sits inside a `%` comment is not a dictionary opener.
-            if comment_open_before(raw, start).is_some() {
+            // A `<<` inside a `%` comment or a literal string is not a
+            // dictionary opener.
+            if comment_open_before(raw, start).is_some() || in_literal_string_at(raw, start) {
                 continue;
             }
             tried += 1;
@@ -1720,6 +1746,14 @@ mod tests {
             b"<< /Note (100% pure) /Filter /FlateDecode >>\n",
             &single_flate(),
         );
+        assert_chain_budgeted(
+            b"<< /Note (100 % pure) /Filter /FlateDecode >>\n",
+            &single_flate(),
+        );
+        assert_chain_budgeted(
+            b"<< /Note (% harmless) /Filter /FlateDecode >>\n",
+            &single_flate(),
+        );
     }
 
     /// The word `stream` inside content is not a stream object, so it is not
@@ -1848,6 +1882,38 @@ mod tests {
         dict.extend_from_slice(data.len().to_string().as_bytes());
         dict.extend_from_slice(b" >>\n");
         assert_chain_budgeted(&dict, &data);
+    }
+
+    /// A literal string that contains dictionary-like text and the word
+    /// `stream` must not invent a phantom stream whose huge `/Length` hides
+    /// the real Flate page stream.
+    #[test]
+    fn still_budgets_when_a_string_contains_a_fake_stream() {
+        let bomb = flate_bomb();
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Note (<< /Length 999999999 >>stream) >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert_eq!(
+            pdf_streams(&raw).len(),
+            1,
+            "the string must not invent a second stream"
+        );
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
     }
 
     /// Attacker-controlled nesting in a skipped value must fail closed without
