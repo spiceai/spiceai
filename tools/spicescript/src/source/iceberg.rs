@@ -225,9 +225,9 @@ impl Source for Iceberg {
 
     async fn query(&self, namespace: &str, sql: &str) -> Result<TextResult> {
         let text = self
-            .duckdb(Some(namespace), sql, &duckdb_cli::list_output())
+            .duckdb(Some(namespace), &duckdb_cli::copy_to_stdout(sql), "")
             .await?;
-        Ok(duckdb_cli::parse(&text))
+        duckdb_cli::parse(&text)
     }
 
     fn dialect(&self) -> Dialect {

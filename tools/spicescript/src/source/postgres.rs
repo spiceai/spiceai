@@ -138,13 +138,7 @@ impl Source for Postgres {
             .into_iter()
             .map(Option::unwrap_or_default)
             .collect();
-        let rows = records
-            .map(|row| {
-                row.into_iter()
-                    .map(|cell| cell.as_deref().map(normalize))
-                    .collect()
-            })
-            .collect();
+        let rows = records.map(|row| row.into_iter().collect()).collect();
         Ok(TextResult { columns, rows })
     }
 
@@ -203,42 +197,4 @@ fn copy_text_row(buffer: &mut String, row: &[Option<String>]) {
         }
     }
     buffer.push('\n');
-}
-
-/// Postgres renders a zero UTC offset as `+00`; Arrow's parser wants `+00:00`.
-fn normalize(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let n = bytes.len();
-    if n > 3
-        && (bytes[n - 3] == b'+' || bytes[n - 3] == b'-')
-        && bytes[n - 2].is_ascii_digit()
-        && bytes[n - 1].is_ascii_digit()
-        && text[..n - 3].contains(':')
-    {
-        return format!("{text}:00");
-    }
-    text.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize;
-
-    #[test]
-    fn appends_minutes_to_bare_utc_offsets_only() {
-        assert_eq!(
-            normalize("2024-03-15 10:00:00+00"),
-            "2024-03-15 10:00:00+00:00"
-        );
-        assert_eq!(
-            normalize("2024-03-15 10:00:00-05"),
-            "2024-03-15 10:00:00-05:00"
-        );
-        assert_eq!(
-            normalize("2024-03-15 10:00:00+05:30"),
-            "2024-03-15 10:00:00+05:30"
-        );
-        assert_eq!(normalize("1234-56"), "1234-56");
-        assert_eq!(normalize("-12"), "-12");
-    }
 }

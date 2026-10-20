@@ -24,10 +24,6 @@ use tokio::io::AsyncWriteExt;
 
 use super::{Source, TextResult};
 
-/// Separates cells and marks NULL in the CLI's output; neither occurs in text.
-const SEPARATOR: char = '\u{1f}';
-const NULL: &str = "\u{1e}";
-
 /// The `duckdb` CLI of the release Spice embeds, for writers whose format
 /// Spice must read (a newer release writes a `DuckLake` format Spice cannot
 /// attach). The release is the `duckdb` crate's version in the workspace
@@ -101,9 +97,12 @@ pub async fn embedded(near: &std::path::Path, override_var: &str) -> Result<Stri
     Ok(binary.display().to_string())
 }
 
-/// Output settings that make [`parse`] able to read a query's answer.
-pub fn list_output() -> String {
-    format!(".mode list\n.headers on\n.separator \"{SEPARATOR}\"\n.nullvalue \"{NULL}\"\n")
+/// `sql` as a COPY to standard output in the convention PostgreSQL's COPY uses
+/// and [`parse`] reads: every value quoted, NULL an unquoted empty field. So
+/// an empty string, a value with a newline and the text `NULL` all survive.
+pub fn copy_to_stdout(sql: &str) -> String {
+    let select = sql.trim().trim_end_matches(';').trim_end();
+    format!("COPY ({select}) TO '/dev/stdout' (FORMAT csv, HEADER, NULLSTR '', FORCE_QUOTE *)")
 }
 
 /// Runs `prelude` with its output discarded, then `output` and `sql`, in the
@@ -135,22 +134,19 @@ pub async fn run(binary: &str, prelude: &str, output: &str, sql: &str) -> Result
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Reads an answer printed under [`list_output`]: a header, then one line per
-/// row.
-pub fn parse(text: &str) -> TextResult {
-    let mut lines = text.lines().filter(|l| !l.is_empty());
-    let columns: Vec<String> = lines
+/// Reads an answer printed by [`copy_to_stdout`]: a header, then the rows.
+pub fn parse(text: &str) -> Result<TextResult> {
+    let mut records = super::parse_csv(text)?.into_iter();
+    let columns = records
         .next()
-        .map(|h| h.split(SEPARATOR).map(str::to_string).collect())
-        .unwrap_or_default();
-    let rows = lines
-        .map(|line| {
-            line.split(SEPARATOR)
-                .map(|cell| (cell != NULL).then(|| cell.to_string()))
-                .collect()
-        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(Option::unwrap_or_default)
         .collect();
-    TextResult { columns, rows }
+    Ok(TextResult {
+        columns,
+        rows: records.collect(),
+    })
 }
 
 /// Writes a generated table's rows as Parquet under `staging`, then has the
@@ -189,4 +185,44 @@ pub async fn generate(
     };
     source.exec(namespace, &sql).await?;
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_to_stdout, parse};
+
+    #[test]
+    fn copy_output_keeps_empty_strings_newlines_and_the_word_null_apart_from_null() {
+        // DuckDB 1.5.5's CLI output for copy_to_stdout over
+        // VALUES (1, ''), (2, NULL), (3, 'a\nb'), (4, 'x,y'), (5, 'say "hi"'), (6, 'NULL').
+        let answer = parse(
+            "\"id\",\"s\"\n\"1\",\"\"\n\"2\",\n\"3\",\"a\nb\"\n\"4\",\"x,y\"\n\"5\",\"say \"\"hi\"\"\"\n\"6\",\"NULL\"\n",
+        )
+        .expect("parsed");
+        assert_eq!(answer.columns, vec!["id", "s"]);
+        let s: Vec<Option<&str>> = answer.rows.iter().map(|r| r[1].as_deref()).collect();
+        assert_eq!(
+            s,
+            vec![
+                Some(""),
+                None,
+                Some("a\nb"),
+                Some("x,y"),
+                Some("say \"hi\""),
+                Some("NULL")
+            ]
+        );
+        // A one-column table holding '' and NULL: a quoted empty line, then a
+        // blank one.
+        let one = parse("\"s\"\n\"\"\n\n").expect("parsed");
+        assert_eq!(one.rows, vec![vec![Some(String::new())], vec![None]]);
+    }
+
+    #[test]
+    fn copies_a_query_whatever_its_trailing_semicolon() {
+        assert_eq!(
+            copy_to_stdout("SELECT 1 ;\n"),
+            "COPY (SELECT 1) TO '/dev/stdout' (FORMAT csv, HEADER, NULLSTR '', FORCE_QUOTE *)"
+        );
+    }
 }

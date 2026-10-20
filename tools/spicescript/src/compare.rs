@@ -154,6 +154,15 @@ fn type_cells(cells: &[Option<&str>], data_type: &DataType) -> Result<ArrayRef> 
             let array: ArrayRef = Arc::new(DurationNanosecondArray::from(nanos));
             cast_with_options(&array, data_type, &strict)?
         }
+        // PostgreSQL prints a whole-hour UTC offset as `+05`, which Arrow only
+        // parses as `+05:00`. Only a column typed as a time-zone timestamp is
+        // read that way, so text of the same shape is left alone.
+        DataType::Timestamp(_, Some(_)) => {
+            let array: ArrayRef = Arc::new(StringArray::from_iter(
+                cells.iter().map(|c| c.map(complete_utc_offset)),
+            ));
+            cast_with_options(&array, data_type, &strict)?
+        }
         DataType::Boolean => {
             let array: ArrayRef = Arc::new(StringArray::from_iter(cells.iter().map(|c| {
                 c.map(|v| match v {
@@ -202,6 +211,21 @@ fn type_cells(cells: &[Option<&str>], data_type: &DataType) -> Result<ArrayRef> 
             cast_with_options(&array, data_type, &strict)?
         }
     })
+}
+
+/// `+05` → `+05:00` at the end of a timestamp; anything else unchanged.
+fn complete_utc_offset(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    if n > 3
+        && (bytes[n - 3] == b'+' || bytes[n - 3] == b'-')
+        && bytes[n - 2].is_ascii_digit()
+        && bytes[n - 1].is_ascii_digit()
+        && text[..n - 3].contains(':')
+    {
+        return format!("{text}:00");
+    }
+    text.to_string()
 }
 
 /// Splits a one-dimensional array literal into its elements: Postgres's
@@ -466,6 +490,50 @@ mod tests {
                 .map(|r| r.iter().map(|c| c.map(str::to_string)).collect())
                 .collect(),
         }
+    }
+
+    #[test]
+    fn completes_a_utc_offset_only_where_a_time_zone_timestamp_is_read() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let batch = type_oracle(
+            &text(&[
+                &[Some("ticket:batch-05"), Some("2024-01-01 00:00:00+05")],
+                &[Some("10:00-05"), Some("2024-01-01 00:00:00+05:30")],
+            ]),
+            &schema,
+        )
+        .expect("typed");
+        let rendered: Vec<Vec<String>> = (0..batch.num_rows())
+            .map(|row| {
+                (0..2)
+                    .map(|col| {
+                        array_value_to_string(batch.column(col), row)
+                            .expect("rendered")
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                vec![
+                    "ticket:batch-05".to_string(),
+                    "2023-12-31 19:00:00.000000".to_string()
+                ],
+                vec![
+                    "10:00-05".to_string(),
+                    "2023-12-31 18:30:00.000000".to_string()
+                ],
+            ]
+        );
     }
 
     #[test]

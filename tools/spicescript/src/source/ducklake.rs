@@ -126,9 +126,9 @@ impl Source for DuckLake {
 
     async fn query(&self, namespace: &str, sql: &str) -> Result<TextResult> {
         let text = self
-            .duckdb(namespace, sql, &duckdb_cli::list_output(), false)
+            .duckdb(namespace, &duckdb_cli::copy_to_stdout(sql), "", false)
             .await?;
-        Ok(duckdb_cli::parse(&text))
+        duckdb_cli::parse(&text)
     }
 
     fn dialect(&self) -> Dialect {
