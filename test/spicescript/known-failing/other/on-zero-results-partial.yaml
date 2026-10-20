@@ -1,0 +1,62 @@
+# Known failing (#14010): with a partly loaded acceleration, a filter only a
+# subquery can evaluate does not fall back to the source, so the row the
+# acceleration lacks is missing from the answer.
+name: on-zero-results-partial
+description: >
+  Subqueries over accelerations with on_zero_results answer as the source
+  does: populated, empty (with use_source the source answers, with
+  return_empty nothing does), and partly loaded (a filter that finds no
+  loaded row falls back), on DuckDB (memory and file) and Cayenne.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  contents: [populated, empty, partial]
+  action: [use_source, return_empty]
+
+variants:
+  duckdb-memory: { datasets: { '*': { acceleration: { engine: duckdb, mode: memory } } } }
+  duckdb-file: { datasets: { '*': { acceleration: { engine: duckdb, mode: file } } } }
+  cayenne: { datasets: { '*': { acceleration: { engine: cayenne, mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: on-zero-results
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        on_zero_results: '${matrix.action}'
+        refresh_sql: >-
+          SELECT * FROM items WHERE '${matrix.contents}' = 'populated'
+          OR ('${matrix.contents}' = 'partial' AND id <> 2)
+    - from: postgres:public.details
+      name: details
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        on_zero_results: '${matrix.action}'
+        refresh_sql: SELECT * FROM details WHERE '${matrix.contents}' <> 'empty'
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (id bigint PRIMARY KEY, v int);
+        INSERT INTO items VALUES (1, 10), (2, 20), (3, NULL), (4, 40);
+        CREATE TABLE details (item_id bigint, val int);
+        INSERT INTO details VALUES (1, 10), (1, 20), (2, 5), (NULL, 7);
+  - start: {}
+  # A predicate only a subquery can evaluate is declined by the scan, so the
+  # partly loaded acceleration is judged non-empty and the source never asked.
+  - query: SELECT id FROM items WHERE id IN (SELECT item_id FROM details WHERE val = 5)
+    when: { contents: partial, action: use_source }
+  - query: SELECT id FROM items WHERE EXISTS (SELECT 1 FROM details WHERE item_id = id AND val = 5)
+    when: { contents: partial, action: use_source }

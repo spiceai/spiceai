@@ -1,0 +1,224 @@
+{
+  "postgres-catalog-slot-per-database": [
+    {
+      "run": "postgres-catalog-slot-per-database",
+      "who": "tenant-a",
+      "key": "wait-ready: {\"timeout\":\"90s\"}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: []; see <path>",
+      "varies": true,
+      "group": "cdc-postgres",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-catalog-slot-per-database",
+      "who": "tenant-b",
+      "key": "wait-ready: {\"timeout\":\"90s\"}",
+      "kind": "status",
+      "signature": "spiced not ready after <duration>; dataset status: []; see <path>",
+      "varies": true,
+      "group": "cdc-postgres",
+      "may-pass": true
+    }
+  ],
+  "postgres-cdc-numeric-38-digits": [
+    {
+      "run": "postgres-cdc-numeric-38-digits[scale=10]",
+      "who": "default",
+      "key": "query: SELECT id, v FROM e #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 5, actual: 1 }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-numeric-38-digits[scale=10]",
+      "who": "default",
+      "key": "assert-status: {\"dataset\":\"e\",\"status\":\"Ready\"}",
+      "kind": "error",
+      "signature": "expected status Ready, saw status=Error ready=true message=External error: Failed to build deferred change batch: pgoutput decode error: column 'v': postgres_replication: numeric magnitude exceeds Decimal128 range",
+      "group": "cdc-postgres"
+    }
+  ],
+  "postgres-cdc-partial-row-images": [
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs #5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs #6",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT * FROM docs #7",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "key",
+      "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs #4",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs WHERE id > 1000 ORDER BY id NULLS LAST",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 20",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs #5",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs #6",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT * FROM docs #7",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"\\\"100\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "cdc-postgres"
+    },
+    {
+      "run": "postgres-cdc-partial-row-images[replica_identity=default]",
+      "who": "position",
+      "key": "query: SELECT count(*), count(body), count(blob), sum(length(body)), sum(version) FROM docs",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(docs.body)\", row_number: 1, expected: \"\\\"295\\\"\", actual: \"\\\"300\\\"\" }",
+      "group": "cdc-postgres"
+    }
+  ],
+  "postgres-cdc-unchanged-toast": [
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "default",
+      "key": "query: SELECT id, version, length(body) FROM docs #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"version\", row_number: 1, expected: \"\\\"2\\\"\", actual: \"\\\"1\\\"\" }",
+      "varies": true,
+      "group": "cdc-postgres",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "default",
+      "key": "query: SELECT id, version, length(body) FROM docs WHERE id = 3",
+      "kind": "empty",
+      "signature": "still failing after <n> attempts over <duration>: Spice returned no rows, expected 1",
+      "varies": true,
+      "group": "cdc-postgres",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "default",
+      "key": "query: SELECT id, version, length(body) FROM docs #3",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 3, actual: 2 }",
+      "group": "cdc-postgres",
+      "may-pass": true,
+      "varies": true
+    },
+    {
+      "run": "postgres-cdc-unchanged-toast",
+      "who": "default",
+      "key": "restart: {}",
+      "kind": "status",
+      "signature": "spiced not ready: a dataset is in Error: .*received Value::Unchanged \\(TOASTed column omitted\\)",
+      "pattern": "spiced not ready: a dataset is in Error: .*received Value::Unchanged \\(TOASTed column omitted\\)",
+      "group": "cdc-postgres",
+      "may-pass": true
+    }
+  ],
+  "upgrade-cdc-after-kill": [
+    {
+      "run": "upgrade-cdc-after-kill",
+      "who": "default",
+      "key": "assert-log: {\"lacks\":\"rebuilt the acceleration from the source\"}",
+      "kind": "other",
+      "signature": "1 log problem in <path>",
+      "group": "cdc-postgres"
+    }
+  ]
+}

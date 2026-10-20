@@ -1,0 +1,89 @@
+name: cluster-timestamp-boundary
+description: >
+  Known failing, on a cluster only (dynamodb-types.yaml passes on one
+  spiced). Over DynamoDB items accelerated into Cayenne, `col_timestamp_tz >
+  '2018-12-31 19:00:00.456Z'` returns the item whose value is exactly that
+  instant ('2019-01-01T00:00:00.456+05:00'): a strict comparison answered as
+  `>=`, i.e. a wrong row, when the acceleration is distributed.
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-timestamp-boundary
+  datasets:
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: t
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+      params: &ddb
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        unnest_depth: '1'
+        time_format: 2006-01-02T15:04:05.000Z07:00
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { t: id }
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        name = 't_${sources.ddb.namespace}'
+        c.create_table(TableName=name,
+            KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}, {'AttributeName': 'version', 'KeyType': 'RANGE'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'N'}, {'AttributeName': 'version', 'AttributeType': 'N'}],
+            BillingMode='PAY_PER_REQUEST')
+        c.get_waiter('table_exists').wait(TableName=name)
+        c.put_item(TableName=name, Item={
+            'id': {'N': '1'}, 'version': {'N': '2'},
+            'col_bool': {'BOOL': True},
+            'col_string': {'S': 'string 🚀😊'},
+            'col_number_int': {'N': '42'},
+            'col_number_float': {'N': '3.14159'},
+            'col_number_scientific': {'N': '1.23e10'},
+            'col_binary': {'B': b'blob'},
+            'col_string_set': {'SS': ['apple', 'banana']},
+            'col_number_set_int': {'NS': ['1', '2', '3']},
+            'col_number_set_float': {'NS': ['1.1', '2.2', '3.3']},
+            'col_binary_set': {'BS': [b'data1', b'data2']},
+            'col_list': {'L': [{'N': '1'}, {'S': 'foo'}, {'BOOL': True}]},
+            'col_map_fully_unnested': {'M': {'name': {'S': 'John'}, 'age': {'N': '30'}, 'is_active': {'BOOL': True}, 'balance': {'N': '1234.56'}}},
+            'col_map_partially_unnested': {'M': {'foo': {'S': 'bar'}, 'nested_lvl_1': {'M': {'foo': {'S': 'baz'}}}}},
+            'col_timestamp': {'S': '2019-01-01T00:00:00.123Z'},
+            'col_timestamp_tz': {'S': '2019-01-01T00:00:00.456+05:00'},
+            'col_date': {'S': '2019-01-01'},
+            'col_time': {'S': '12:34:56'},
+        })
+        nulls = ['col_bool', 'col_string', 'col_number_int', 'col_number_float', 'col_number_scientific', 'col_binary',
+                 'col_string_set', 'col_number_set_int', 'col_number_set_float', 'col_binary_set', 'col_list',
+                 'col_timestamp', 'col_date', 'col_time']
+        item = {'id': {'N': '2'}, 'version': {'N': '2'},
+                'col_map_fully_unnested': {'M': {}}, 'col_map_partially_unnested': {'M': {}}}
+        item.update({k: {'NULL': True} for k in nulls})
+        c.put_item(TableName=name, Item=item)
+        PY
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['2']] }
+    eventually: 60s
+  - query: SELECT id FROM t WHERE col_timestamp_tz > '2018-12-31 19:00:00.455Z'
+    expect: { rows: [['1']] }
+  - query: SELECT id FROM t WHERE col_timestamp_tz > '2018-12-31 19:00:00.456Z'
+    expect: { rows: [] }
+    expect-empty: true
+  - query: SELECT id FROM t WHERE col_timestamp_tz >= '2018-12-31 19:00:00.456Z'
+    expect: { rows: [['1']] }

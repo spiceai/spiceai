@@ -1,0 +1,75 @@
+name: retention-epoch-formats
+description: >
+  Known failing. Time retention over an epoch time column (`unix_seconds`,
+  `unix_millis`, `unix_nanos`) refuses to create the acceleration:
+  "Unsupported data type 'Int64' for time-based retention on column
+  't_unix_seconds'. Expected Timestamp, Date, or string (ISO 8601) type",
+  although the same `time_format` drives append refresh and
+  `refresh_data_window` (time-columns.yaml). Expected: retention by the
+  instant the column represents, as for the other formats
+  (time-columns-retention.yaml). The same instants are held in one column per
+  format, and PostgreSQL answers each check over the instant the format
+  represents (a date stands for its midnight).
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  format: [unix_seconds, unix_millis, unix_nanos]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: retention-epoch-formats
+  datasets:
+    - from: postgres:public.t
+      name: ret
+      params: ${sources.src.params}
+      time_column: t_${matrix.format}
+      time_format: ${matrix.format}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        refresh_check_interval: 1h
+        retention_check_enabled: true
+        retention_period: 2d
+        retention_check_interval: 1s
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  # Each row is an instant some seconds before now (negative: after now),
+  # held in every format; o_<format> is the instant that format represents.
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, v text,
+          t_timestamptz timestamptz, t_timestamp timestamp, t_unix_seconds bigint, t_unix_millis bigint,
+          t_unix_nanos bigint, t_iso8601 text, t_date date,
+          o_timestamptz timestamptz, o_timestamp timestamptz, o_unix_seconds timestamptz, o_unix_millis timestamptz,
+          o_unix_nanos timestamptz, o_iso8601 timestamptz, o_date timestamptz);
+        CREATE FUNCTION add_rows(seconds_ago numeric[]) RETURNS void LANGUAGE sql AS $$
+          INSERT INTO t SELECT (SELECT coalesce(max(id), 0) FROM t) + n, 'row' || n,
+            s, s AT TIME ZONE 'UTC', floor(extract(epoch FROM s))::bigint, floor(extract(epoch FROM s) * 1000)::bigint,
+            floor(extract(epoch FROM s) * 1000000)::bigint * 1000,
+            to_char(s AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), (s AT TIME ZONE 'UTC')::date,
+            s, s, date_trunc('second', s), date_trunc('milliseconds', s), s, date_trunc('milliseconds', s),
+            ((s AT TIME ZONE 'UTC')::date)::timestamp AT TIME ZONE 'UTC'
+          FROM unnest(seconds_ago) WITH ORDINALITY AS u(secs, n),
+            LATERAL (SELECT date_trunc('milliseconds', now()) - secs * INTERVAL '1 second') AS x(s)
+        $$;
+        SELECT add_rows(ARRAY[720000, 259200.5, 180000, 108000, 43200.25, 3600, -3600, -108000]);
+  - start: {}
+
+  - query: SELECT id FROM ret ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE o_${matrix.format} >= now() - INTERVAL '2 days' ORDER BY id
+    eventually: 30s
+  # Rows past the period arriving with a refresh are removed again.
+  - source-exec: { src: "SELECT add_rows(ARRAY[400000, 10])" }
+  - refresh: ret
+  - query: SELECT id FROM ret ORDER BY id
+    oracle-sql: SELECT id FROM t WHERE o_${matrix.format} >= now() - INTERVAL '2 days' ORDER BY id
+    eventually: 30s

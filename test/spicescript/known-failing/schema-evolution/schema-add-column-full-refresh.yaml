@@ -1,0 +1,50 @@
+# Known failing: under full refresh, a column added at the source is not adopted
+# by append_new_columns or sync_all_columns until a restart; and after a restart
+# block disables updates ("updates are disabled") while the refresh API still
+# answers success and the dataset reports Ready.
+# Move this script to test/spicescript/ once it passes.
+name: schema-add-column-full-refresh
+description: >
+  Under full refresh, a column added at the source is served by
+  append_new_columns and sync_all_columns after the next refresh, and block
+  keeps refreshing its registered columns after a restart.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  block: {}
+  append-new-columns: { datasets: { t: { on_schema_change: append_new_columns } } }
+  sync-all-columns: { datasets: { t: { on_schema_change: sync_all_columns } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: schema-add-column-full-refresh
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id integer PRIMARY KEY, v integer, s text); INSERT INTO t SELECT i, i, 's' || i FROM generate_series(1, 100) i" }
+  - start: {}
+  - source-exec:
+      src:
+        - ALTER TABLE t ADD COLUMN extra text
+        - UPDATE t SET extra = 'e' || id, v = v + 1000
+  - refresh: t
+  - query: SELECT * FROM t
+    only: [append-new-columns, sync-all-columns]
+  - restart: {}
+  - source-exec: { src: "UPDATE t SET v = v + 1" }
+  - refresh: t
+    only: block
+  - query: SELECT * FROM t
+    oracle-sql: SELECT id, v, s FROM t
+    only: block

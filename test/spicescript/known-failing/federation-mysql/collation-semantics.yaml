@@ -1,0 +1,86 @@
+# Known failing: Federated queries inherit the source's collation and accelerated ones
+# compare bytes, so accelerating a dataset changes string comparison and
+# grouping answers.
+# Move this script to test/spicescript/ once it passes.
+name: collation-semantics
+description: >
+  Comparing, grouping and ordering strings gives the same answer whether a
+  dataset is federated (evaluated by the source, under its collation) or
+  accelerated (evaluated by Spice). Fails today: see the corpus header.
+
+sources:
+  src: { kind: '${matrix.source}' }
+
+matrix:
+  source: [postgres, mysql]
+
+variants:
+  federated: {}
+  cayenne:
+    datasets: { '*': { acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: collation-semantics
+  datasets:
+    - from: '${matrix.source}:t'
+      name: t
+      params: ${sources.src.params}
+    - from: '${matrix.source}:u'
+      name: u
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (
+          id integer PRIMARY KEY, i integer, big bigint, d numeric(10, 2), f double precision,
+          s varchar(32), dt date, ts timestamp, b boolean
+        );
+        CREATE TABLE u (id integer PRIMARY KEY, t_id integer, label varchar(16));
+        INSERT INTO t
+          SELECT n,
+                 CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 101 - 50 END,
+                 n::bigint * 50000000,
+                 ((n * 7919) % 20001 - 10000) / 100.0,
+                 n * 0.25,
+                 (ARRAY['apple', 'Apple', 'APPLE', 'banana', 'O''Brien', 'naïve', '', 'under_score', 'b', NULL])[1 + n % 10],
+                 DATE '2024-01-01' + n,
+                 TIMESTAMP '2024-01-01 00:00:00' + n * INTERVAL '90 minutes',
+                 n % 3 = 0
+          FROM generate_series(1, 200) AS n;
+        INSERT INTO u
+          SELECT n, 1 + (n * 13) % 220, (ARRAY['red', 'blue', 'green'])[1 + n % 3]
+          FROM generate_series(1, 150) AS n;
+    when: { source: postgres }
+  - source-exec:
+      src: |
+        SET SESSION cte_max_recursion_depth = 10000;
+        CREATE TABLE t (
+          id INT PRIMARY KEY, i INT, big BIGINT, d DECIMAL(10, 2), f DOUBLE,
+          s VARCHAR(32), dt DATE, ts DATETIME, b BOOLEAN
+        );
+        CREATE TABLE u (id INT PRIMARY KEY, t_id INT, label VARCHAR(16));
+        INSERT INTO t
+          WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 200)
+          SELECT n,
+                 CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 101 - 50 END,
+                 n * 50000000,
+                 ((n * 7919) % 20001 - 10000) / 100.0,
+                 n * 0.25,
+                 ELT(1 + n % 10, 'apple', 'Apple', 'APPLE', 'banana', 'O''Brien', 'naïve', '', 'under_score', 'b', NULL),
+                 DATE '2024-01-01' + INTERVAL n DAY,
+                 TIMESTAMP '2024-01-01 00:00:00' + INTERVAL (n * 90) MINUTE,
+                 n % 3 = 0
+          FROM seq;
+        INSERT INTO u
+          WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 150)
+          SELECT n, 1 + (n * 13) % 220, ELT(1 + n % 3, 'red', 'blue', 'green') FROM seq;
+    when: { source: mysql }
+
+  - start: {}
+  - corpus: ../../corpus/collation.sql

@@ -1,0 +1,33 @@
+# Known failing: both instances derive one slot name from the catalog name
+# alone; the second never becomes ready. Move up a level once it passes.
+name: postgres-catalog-slot-per-database
+description: >
+  Two Spice instances, each with an accelerated catalog named `pg` on its own
+  database of one PostgreSQL server, both become ready and each follows its own
+  database's changes.
+sources: { src: { kind: postgres } }
+variants:
+  tenant-a: {}
+  tenant-b: {}
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: probe
+  catalogs:
+    - from: pg:postgres
+      name: pg
+      params: ${sources.src.params}
+      acceleration: { engine: cayenne, refresh_mode: changes }
+# The two tenants must be up at once: the second collides with the first's slot.
+defaults: { expect: { oracle: src }, compare-variants: false, run-variants: side-by-side }
+steps:
+  - source-exec: { src: "CREATE TABLE orders (id int PRIMARY KEY, v text); INSERT INTO orders SELECT i, '${variant.name} ' || i FROM generate_series(1, 100) i" }
+  - start: { ready: false }
+  - wait-ready: { timeout: 90s }
+  - query: SELECT * FROM pg.public.orders
+    oracle-sql: SELECT * FROM orders
+    eventually: 30s
+  - source-exec: { src: "UPDATE orders SET v = 'changed in ${variant.name}' WHERE id <= 5; DELETE FROM orders WHERE id > 95" }
+  - query: SELECT * FROM pg.public.orders
+    oracle-sql: SELECT * FROM orders
+    eventually: 30s

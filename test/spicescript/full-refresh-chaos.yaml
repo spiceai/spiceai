@@ -1,0 +1,87 @@
+name: full-refresh-chaos
+description: >
+  A Cayenne acceleration refreshed in full never serves a partial table
+  through faults, whatever the source: with the source down a refresh fails
+  and the last good rows stay served; when every row is replaced and spiced is
+  killed during the refresh that picks them up, it comes back with whole rows
+  and then catches up. Readers always see the full row count, and the table
+  ends equal to the same rows in PostgreSQL. Run over databases, lakehouse
+  tables, an object store and local files. (On ClickHouse, the refresh retried
+  as the source comes back sometimes loads 0 rows and serves an empty table
+  until the next refresh: an expected failure in recordings/.)
+
+sources:
+  src: { kind: '${matrix.src}' }
+  ref: { kind: postgres }
+
+matrix:
+  src: [postgres, mysql, clickhouse, iceberg, ducklake, rustfs, files]
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: full-refresh-chaos
+  datasets:
+    - from: '${sources.src.from_prefix}facts${sources.src.from_suffix}'
+      name: facts
+      params: ${sources.src.table_params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+
+defaults:
+  cluster-partition-by: { '*': id }
+  expect: { oracle: ref }
+  query-timeout: 30s
+
+steps:
+  # Every version of the table has 50,000 rows, so a reader can tell a
+  # partial one.
+  - generate:
+      src: &facts
+        table: facts
+        rows: 50000
+        seed: 41
+        files: 4
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: grp, int: [1, 200] }
+          - { name: amount, decimal: { range: [0, 1000], scale: 2 } }
+          - { name: label, choice: [alpha, beta, gamma, delta] }
+          - { name: note, text: [3, 20], nulls: 0.2 }
+    mirror: ref
+  - start: {}
+  - query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts
+  - background:
+      id: whole-table
+      concurrency: 2
+      query: SELECT count(*) AS n FROM facts
+      expect: { n: '50000' }
+
+  # The source down: a refresh fails and the last good rows stay served.
+  # (Local files have no server to stop.)
+  - stop-source: src
+    when: &stoppable { src: [postgres, mysql, clickhouse, iceberg, ducklake, rustfs] }
+  - refresh: facts
+    expect-error: true
+    when: *stoppable
+  - query: SELECT count(*) AS n, sum(amount) AS total FROM facts
+    when: *stoppable
+  - start-source: src
+    when: *stoppable
+
+  # Every row replaced, and spiced killed during the refresh that reads them.
+  - generate:
+      src:
+        <<: *facts
+        seed: 42
+        files: 3
+    mirror: ref
+  - refresh: { dataset: facts, wait: false }
+  - restart: { kill: KILL }
+  - refresh: facts
+  - query: SELECT count(*) AS n, sum(amount) AS total, count(note) AS notes FROM facts
+    eventually: 60s
+  - query: SELECT label, count(*) AS n, sum(amount) AS total FROM facts GROUP BY label ORDER BY label
+    eventually: 30s
+  - query: SELECT * FROM facts WHERE grp = 17 ORDER BY id
+
+  - stop-background: { id: whole-table, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }

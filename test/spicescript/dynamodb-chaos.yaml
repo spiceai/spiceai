@@ -1,0 +1,103 @@
+name: dynamodb-chaos
+description: >
+  A DynamoDB table followed by DynamoDB Streams into Cayenne stays equal to the
+  table through spiced faults: puts, updates and deletes made while spiced is
+  killed and across a clean restart are all applied, each once, and the
+  acceleration ends equal to the same rows in PostgreSQL. (LocalStack loses
+  its tables when it restarts, so the source itself is not restarted.)
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+  ref: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-chaos
+  datasets:
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: t
+      params:
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://localhost:${sources.ddb.port.4566}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes }
+
+defaults:
+  expect: { oracle: ref }
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        d = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        t = d.create_table(TableName='t_${sources.ddb.namespace}', KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'N'}], BillingMode='PAY_PER_REQUEST',
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'NEW_AND_OLD_IMAGES'})
+        t.wait_until_exists()
+        with t.batch_writer() as w:
+            for g in range(1, 301):
+                w.put_item(Item={'id': g, 'v': g % 7, 's': 'start'})
+        PY
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (id bigint PRIMARY KEY, v bigint, s text);
+        INSERT INTO t SELECT g, g % 7, 'start' FROM generate_series(1, 300) g;
+  - start: {}
+  - query: SELECT id, v, s FROM t
+    eventually: 60s
+  - background:
+      id: no-duplicates
+      query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
+      expect: { duplicates: '0' }
+
+  # Changed while spiced is down after a kill.
+  - kill-spiced: {}
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        t = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test').Table('t_${sources.ddb.namespace}')
+        with t.batch_writer() as w:
+            for g in range(301, 601):
+                w.put_item(Item={'id': g, 'v': g % 7, 's': 'while down'})
+        for g in range(1, 51):
+            t.update_item(Key={'id': g}, UpdateExpression='SET s = :s', ExpressionAttributeValues={':s': 'updated while down'})
+        for g in range(560, 601):
+            t.delete_item(Key={'id': g})
+        PY
+  - source-exec:
+      ref: >-
+        INSERT INTO t SELECT g, g % 7, 'while down' FROM generate_series(301, 600) g;
+        UPDATE t SET s = 'updated while down' WHERE id <= 50;
+        DELETE FROM t WHERE id >= 560;
+  - start: {}
+  - query: SELECT id, v, s FROM t
+    eventually: 90s
+
+  # A clean restart, then more.
+  - restart: {}
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        t = boto3.resource('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test').Table('t_${sources.ddb.namespace}')
+        t.put_item(Item={'id': 1000, 'v': 0, 's': 'after restart'})
+        for g in range(51, 61):
+            t.delete_item(Key={'id': g})
+        PY
+  - source-exec:
+      ref: >-
+        INSERT INTO t VALUES (1000, 0, 'after restart');
+        DELETE FROM t WHERE id BETWEEN 51 AND 60;
+  - query: SELECT id, v, s FROM t
+    eventually: 60s
+  - stop-background: { id: no-duplicates, allow: ['^[45][0-9][0-9] ', 'error sending request', 'connection', 'not ready'] }

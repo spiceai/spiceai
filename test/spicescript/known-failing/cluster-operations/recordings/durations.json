@@ -1,0 +1,10 @@
+{
+  "cluster-cdc-duplicates": 124,
+  "cluster-cdc-ready": 20,
+  "cluster-dataset-writes": 24,
+  "cluster-executor-loss-cayenne": 25,
+  "cluster-failed-dataset-empties-others": 24,
+  "cluster-http-caching": 7,
+  "cluster-refresh-status": 25,
+  "cayenne-catalog-recreate": 10
+}

@@ -1,0 +1,196 @@
+name: dynamodb-types
+description: >
+  Every DynamoDB attribute type through the connector against LocalStack:
+  scalars, NULLs, string, number and binary sets, heterogeneous lists, maps
+  unnested one level deep, ISO-8601 strings read as timestamps and dates,
+  and whole items folded into one JSON column. A table with a hash and a
+  range key, read federated and accelerated into Cayenne, with filters on
+  keys, NULLs, nested fields and timestamps.
+
+sources:
+  ddb:
+    kind: docker
+    image: docker.io/localstack/localstack:4.9
+    ports: [4566]
+    env: { SERVICES: dynamodb, AWS_DEFAULT_REGION: us-east-1 }
+    ready: awslocal dynamodb list-tables
+
+variants:
+  federated: {}
+  cayenne: { datasets: { t: { acceleration: { enabled: true, engine: cayenne, mode: file } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: dynamodb-types
+  datasets:
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: t
+      params: &ddb
+        dynamodb_aws_region: us-east-1
+        dynamodb_aws_auth: key
+        dynamodb_aws_access_key_id: test
+        dynamodb_aws_secret_access_key: test
+        endpoint_url: http://localhost:${sources.ddb.port.4566}
+        unnest_depth: '1'
+        time_format: 2006-01-02T15:04:05.000Z07:00
+    - from: dynamodb:t_${sources.ddb.namespace}
+      name: tj
+      params: *ddb
+      columns:
+        - name: id
+        - name: data_json
+          metadata: { json_object: '*' }
+
+defaults:
+  cluster-partition-by: { t: id }
+
+steps:
+  - source-exec:
+      ddb: |
+        python3 - <<'PY'
+        import boto3
+        c = boto3.client('dynamodb', endpoint_url='http://localhost:4566', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        name = 't_${sources.ddb.namespace}'
+        c.create_table(TableName=name,
+            KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}, {'AttributeName': 'version', 'KeyType': 'RANGE'}],
+            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'N'}, {'AttributeName': 'version', 'AttributeType': 'N'}],
+            BillingMode='PAY_PER_REQUEST')
+        c.get_waiter('table_exists').wait(TableName=name)
+        c.put_item(TableName=name, Item={
+            'id': {'N': '1'}, 'version': {'N': '2'},
+            'col_bool': {'BOOL': True},
+            'col_string': {'S': 'string 🚀😊'},
+            'col_number_int': {'N': '42'},
+            'col_number_float': {'N': '3.14159'},
+            'col_number_scientific': {'N': '1.23e10'},
+            'col_binary': {'B': b'blob'},
+            'col_string_set': {'SS': ['apple', 'banana']},
+            'col_number_set_int': {'NS': ['1', '2', '3']},
+            'col_number_set_float': {'NS': ['1.1', '2.2', '3.3']},
+            'col_binary_set': {'BS': [b'data1', b'data2']},
+            'col_list': {'L': [{'N': '1'}, {'S': 'foo'}, {'BOOL': True}]},
+            'col_map_fully_unnested': {'M': {'name': {'S': 'John'}, 'age': {'N': '30'}, 'is_active': {'BOOL': True}, 'balance': {'N': '1234.56'}}},
+            'col_map_partially_unnested': {'M': {'foo': {'S': 'bar'}, 'nested_lvl_1': {'M': {'foo': {'S': 'baz'}}}}},
+            'col_timestamp': {'S': '2019-01-01T00:00:00.123Z'},
+            'col_timestamp_tz': {'S': '2019-01-01T00:00:00.456+05:00'},
+            'col_date': {'S': '2019-01-01'},
+            'col_time': {'S': '12:34:56'},
+        })
+        nulls = ['col_bool', 'col_string', 'col_number_int', 'col_number_float', 'col_number_scientific', 'col_binary',
+                 'col_string_set', 'col_number_set_int', 'col_number_set_float', 'col_binary_set', 'col_list',
+                 'col_timestamp', 'col_date', 'col_time']
+        item = {'id': {'N': '2'}, 'version': {'N': '2'},
+                'col_map_fully_unnested': {'M': {}}, 'col_map_partially_unnested': {'M': {}}}
+        item.update({k: {'NULL': True} for k in nulls})
+        c.put_item(TableName=name, Item=item)
+        PY
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['2']] }
+    eventually: 60s
+
+  # The types inferred from the items, with each map unnested one level.
+  - query: >-
+      SELECT column_name, data_type FROM information_schema.columns
+      WHERE table_name = 't' ORDER BY column_name
+    expect:
+      rows:
+        - [col_binary, Binary]
+        - [col_binary_set, List(Binary)]
+        - [col_bool, Boolean]
+        - [col_date, Date32]
+        - [col_list, List(Utf8)]
+        - [col_map_fully_unnested.age, Int64]
+        - [col_map_fully_unnested.balance, Float64]
+        - [col_map_fully_unnested.is_active, Boolean]
+        - [col_map_fully_unnested.name, Utf8]
+        - [col_map_partially_unnested.foo, Utf8]
+        - [col_map_partially_unnested.nested_lvl_1, 'Struct("foo": Utf8)']
+        - [col_number_float, Float64]
+        - [col_number_int, Int64]
+        - [col_number_scientific, Int64]
+        - [col_number_set_float, List(Float64)]
+        - [col_number_set_int, List(Int64)]
+        - [col_string, Utf8]
+        - [col_string_set, List(Utf8)]
+        - [col_time, Utf8]
+        - [col_timestamp, 'Timestamp(ms, "+00:00")']
+        - [col_timestamp_tz, 'Timestamp(ms, "+05:00")']
+        - [id, Int64]
+        - [version, Int64]
+
+  - query: >-
+      SELECT id, version, col_bool, col_string, col_number_int, col_number_float, col_number_scientific,
+        col_binary, array_sort(col_binary_set), array_sort(col_string_set), array_sort(col_number_set_int),
+        array_sort(col_number_set_float), col_list
+      FROM t ORDER BY id
+    expect:
+      rows:
+        - ['1', '2', 'true', 'string 🚀😊', '42', '3.14159', '12300000000', '0x626c6f62', '[0x6461746131, 0x6461746132]',
+           '[apple, banana]', '[1, 2, 3]', '[1.1, 2.2, 3.3]', '[1, foo, true]']
+        - ['2', '2', null, null, null, null, null, null, null, null, null, null, null]
+
+  # Filters on the hash key, on the hash and range keys, and on NULLs.
+  - query: SELECT id, col_string, col_number_int, col_bool FROM t WHERE id = 1
+    expect: { rows: [['1', 'string 🚀😊', '42', 'true']] }
+  - query: SELECT id, col_string, col_number_int, col_bool FROM t WHERE id = 1 AND version > '0'
+    expect: { rows: [['1', 'string 🚀😊', '42', 'true']] }
+  - query: SELECT id, col_string, col_number_int FROM t WHERE col_string IS NULL
+    expect: { rows: [['2', null, null]] }
+  - query: SELECT id, col_string, col_number_int FROM t WHERE col_string IS NOT NULL
+    expect: { rows: [['1', 'string 🚀😊', '42']] }
+
+  # Temporal strings, read with `time_format`; the offset of a zoned one is kept.
+  - query: SELECT id, col_timestamp, col_timestamp_tz, col_date, col_time FROM t ORDER BY id
+    expect:
+      rows:
+        - ['1', '2019-01-01T00:00:00.123Z', '2019-01-01T00:00:00.456+05:00', '2019-01-01', '12:34:56']
+        - ['2', null, null, null, null]
+  - query: SELECT count(*) AS total, max(col_timestamp) AS ts, max(col_timestamp_tz) AS ts_tz FROM t
+    expect: { rows: [['2', '2019-01-01T00:00:00.123Z', '2019-01-01T00:00:00.456+05:00']] }
+  - query: SELECT id, col_timestamp, col_date FROM t WHERE col_timestamp > '2010-01-01'
+    expect: { rows: [['1', '2019-01-01T00:00:00.123Z', '2019-01-01']] }
+  - query: SELECT id FROM t WHERE col_timestamp > '2019-01-01T00:00:00.124Z'
+    expect: { rows: [] }
+    expect-empty: true
+  - query: >-
+      SELECT id FROM t WHERE col_timestamp_tz > '2018-12-31 19:00:00.455Z'
+      AND col_timestamp <= '2019-01-01 00:00:00.123Z'
+    expect: { rows: [['1']] }
+  - query: SELECT id FROM t WHERE col_timestamp_tz > '2018-12-31 19:00:00.456Z'
+    expect: { rows: [] }
+    expect-empty: true
+  # Timestamp filters go to DynamoDB as a scan filter, widened to `>=` and
+  # re-applied here.
+  - explain: >-
+      SELECT * FROM t WHERE col_timestamp_tz > '2024-12-01 12:34:56.123456789Z'
+      AND col_timestamp <= '2024-12-01 12:34:56.123456789Z'
+    contains: 'filter_expression: Some("#n0 >= :v0 AND #n1 <= :v1")'
+    only: federated
+
+  # Maps, unnested one level, and filtered on a nested field.
+  - query: >-
+      SELECT id, "col_map_fully_unnested.age", "col_map_fully_unnested.balance", "col_map_fully_unnested.is_active",
+        "col_map_fully_unnested.name", "col_map_partially_unnested.foo", "col_map_partially_unnested.nested_lvl_1"['foo'] AS nested_foo
+      FROM t ORDER BY id
+    expect:
+      rows:
+        - ['1', '30', '1234.56', 'true', John, bar, baz]
+        - ['2', null, null, null, null, null, null]
+  - query: >-
+      SELECT id, "col_map_partially_unnested.nested_lvl_1"['foo'] AS foo
+      FROM t WHERE "col_map_fully_unnested.age" = 30
+    expect: { rows: [['1', baz]] }
+  - query: SELECT id FROM t WHERE "col_map_fully_unnested.age" > 30
+    expect: { rows: [] }
+    expect-empty: true
+
+  # A whole item as one JSON column: everything but the declared `id`.
+  - query: SELECT id, data_json FROM tj ORDER BY id DESC
+    expect:
+      rows:
+        - ['2', '{"col_binary":null,"col_binary_set":null,"col_bool":null,"col_date":null,"col_list":null,"col_number_float":null,"col_number_int":null,"col_number_scientific":null,"col_number_set_float":null,"col_number_set_int":null,"col_string":null,"col_string_set":null,"col_time":null,"col_timestamp":null,"version":2.0}']
+        - ['1', '{"col_binary":"YmxvYg==","col_binary_set":["ZGF0YTE=","ZGF0YTI="],"col_bool":true,"col_date":"2019-01-01","col_list":[1.0,"foo",true],"col_map_fully_unnested.age":30.0,"col_map_fully_unnested.balance":1234.56,"col_map_fully_unnested.is_active":true,"col_map_fully_unnested.name":"John","col_map_partially_unnested.foo":"bar","col_map_partially_unnested.nested_lvl_1":{"foo":"baz"},"col_number_float":3.14159,"col_number_int":42.0,"col_number_scientific":12300000000.0,"col_number_set_float":["1.1","2.2","3.3"],"col_number_set_int":["1","2","3"],"col_string":"string 🚀😊","col_string_set":["apple","banana"],"col_time":"12:34:56","col_timestamp":"2019-01-01T00:00:00.123Z","col_timestamp_tz":"2019-01-01T00:00:00.456+05:00","version":2.0}']
+  - query: SELECT id, json_get_str(data_json, 'col_string') AS s FROM tj WHERE id = 1
+    expect: { rows: [['1', 'string 🚀😊']] }

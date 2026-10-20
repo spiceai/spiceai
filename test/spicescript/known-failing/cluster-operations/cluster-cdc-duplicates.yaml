@@ -1,0 +1,37 @@
+name: cluster-cdc-duplicates
+description: >
+  Known failing: wrong results, on a cluster of two executors. A CDC
+  (`refresh_mode: changes`) Cayenne dataset answers every row twice: each
+  executor creates its own replication slot, builds its acceleration from
+  the whole source table and applies every change, and a query reads both.
+  Count 200 for 100 rows; updates reach both copies. One executor answers
+  correctly; a full-refresh dataset on the same cluster is right.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-cdc-duplicates
+  datasets:
+    - from: postgres:public.acct
+      name: acct
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  cluster: { executors: 2 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE acct (id int PRIMARY KEY, bal int NOT NULL); INSERT INTO acct SELECT i, 1000 FROM generate_series(1, 100) i" }
+  - start: { ready: false }
+  - query: SELECT count(*) AS n, count(DISTINCT id) AS ids FROM acct
+    expect: { rows: [['100', '100']] }
+    eventually: 90s
+  - query: SELECT id, bal FROM acct
+  - source-exec: { src: "UPDATE acct SET bal = 0 WHERE id <= 10; INSERT INTO acct VALUES (1000, 5)" }
+  - query: SELECT id, bal FROM acct
+    eventually: 30s

@@ -1,0 +1,41 @@
+# Known failing: once rows are in Cayenne's files, a filter with arithmetic
+# between a decimal and an integer (`d * 2`, `d + 1`, `d * big`) is refused
+# ("Failed to bind the Vortex filter to the file's type: incompatible types
+# for arithmetic operation: decimal(10,2)? decimal(20,0)?"). A partitioned
+# table writes files from its first load; any table does once it flushes.
+name: cayenne-decimal-int-filter
+description: >
+  A filter with arithmetic between a decimal column and an integer answers on
+  a Cayenne acceleration as it does on PostgreSQL, whether the rows are in
+  memory or in files.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  partitioned: { datasets: { t: { acceleration: { partition_by: ['bucket(4, id)'] } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-decimal-int-filter
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: CREATE TABLE t (id int PRIMARY KEY, d numeric(10, 2), big bigint); INSERT INTO t SELECT i, (i % 200) - 100.25, i * 1000 FROM generate_series(1, 500) i;
+  - start: {}
+  # Controls: comparisons, and arithmetic with a decimal or in a projection.
+  - query: SELECT count(*) AS n FROM t WHERE d < big
+  - query: SELECT count(*) AS n FROM t WHERE d * 2.5 > 10
+  - query: SELECT sum(d * 2) AS s FROM t
+  - query: SELECT count(*) AS n FROM t WHERE d * 2 > 10
+  - query: SELECT count(*) AS n FROM t WHERE d + 1 > 10
+  - query: SELECT count(*) AS n FROM t WHERE d * big > 10

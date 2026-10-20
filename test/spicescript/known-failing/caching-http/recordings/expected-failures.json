@@ -1,0 +1,72 @@
+{
+  "http-caching-known": [
+    {
+      "run": "http-caching-known",
+      "who": "default",
+      "key": "source-query: {\"api\":\"count /v1/a\"}",
+      "kind": "other",
+      "signature": "the source answered [[Some(\"1\")]], expected [[Some(\"2\")]]",
+      "group": "caching-http"
+    },
+    {
+      "run": "http-caching-known",
+      "who": "default",
+      "key": "query: SELECT count(*) AS n FROM budget",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"1\\\"\", actual: \"\\\"3\\\"\" }",
+      "group": "caching-http"
+    },
+    {
+      "run": "http-caching-known",
+      "who": "default",
+      "key": "query: SELECT request_path FROM oldest_out",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"request_path\", row_number: 1, expected: \"\\\"/b\\\"\", actual: \"\\\"/a\\\"\" }",
+      "group": "caching-http"
+    }
+  ],
+  "http-caching-request-key": [
+    {
+      "run": "http-caching-request-key",
+      "who": "cayenne",
+      "key": "query: SELECT count(*) AS n FROM t",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: DataMismatch { column: \"n\", row_number: 1, expected: \"\\\"0\\\"\", actual: \"\\\"1\\\"\" }",
+      "group": "caching-http"
+    },
+    {
+      "run": "http-caching-request-key",
+      "who": "cayenne",
+      "key": "query: SELECT content FROM t WHERE request_path = '/three' ORDER BY content #2",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: RowCountMismatch { expected: 3, actual: 1 }",
+      "group": "caching-http"
+    },
+    {
+      "run": "http-caching-request-key",
+      "who": "cayenne",
+      "key": "source-query: {\"api\":\"count /v1/three\"}",
+      "kind": "other",
+      "signature": "the source answered [[Some(\"1\")]], expected [[Some(\"2\")]]",
+      "group": "caching-http"
+    }
+  ],
+  "http-headers-from-subquery": [
+    {
+      "run": "http-headers-from-subquery",
+      "who": "default",
+      "key": "query: SELECT content FROM api WHERE request_path = '/people/ada' AND request_headers IN (SELECT '{\"x-tenant\": \"' || name || '\"}' FROM tenants)",
+      "kind": "error",
+      "signature": "Spice rejected the query: Query execution failed. Internal error: Schema metadata mismatch: Expected original metadata: {\"spice.http_response_status\":\"1\",\"spice.inferred_primary_key\":\"[\\\"name\\\"]\",\"spice.inferred_sort_columns\":\"[{\\\"column\\\":\\\"name\\\",\\\"desc\\\":false}]\",\"spice.inferred_table_bytes\":\"163",
+      "group": "caching-http"
+    },
+    {
+      "run": "http-headers-from-subquery",
+      "who": "default",
+      "key": "query: SELECT content FROM tenant_people",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Query execution failed. Acceleration not ready; loading initial data for tenant_people: Acceleration not ready; loading initial data for tenant_people",
+      "group": "caching-http"
+    }
+  ]
+}

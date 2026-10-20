@@ -1,0 +1,49 @@
+name: mongodb-cdc-source-restart
+description: >
+  A MongoDB collection followed by change streams into Cayenne keeps following
+  it across a replica-set restart: changes made after MongoDB is back are
+  applied without restarting spiced. (Sometimes the change stream ends with
+  "interrupted at shutdown" when MongoDB stops, and nothing restarts it until
+  spiced restarts, so the acceleration stays behind.)
+
+sources:
+  mongo:
+    kind: docker
+    image: docker.io/library/mongo:8.0
+    ports: [27017]
+    command: [mongod, --replSet, rs0, --bind_ip_all]
+    ready: >-
+      mongosh --quiet --eval "try { rs.status().myState } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: mongodb-cdc-source-restart
+  datasets:
+    - from: mongodb:t
+      name: t
+      params:
+        mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false'
+        change_stream_batch_max_duration: 100ms
+        change_stream_max_await_time: 100ms
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: _id }
+
+steps:
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          db.t.insertMany([{ _id: 'k1', v: 'a' }, { _id: 'k2', v: 'b' }]);"
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['2']] }
+    eventually: 60s
+  - stop-source: mongo
+  - start-source: mongo
+  - source-exec:
+      mongo: >-
+        mongosh --quiet ${sources.mongo.namespace} --eval "
+          db.t.insertOne({ _id: 'k3', v: 'after source restart' });
+          db.t.updateOne({ _id: 'k1' }, { \$set: { v: 'updated after source restart' } });"
+  - query: SELECT _id, v FROM t ORDER BY _id
+    expect: { rows: [['k1', 'updated after source restart'], ['k2', 'b'], ['k3', 'after source restart']] }
+    eventually: 90s

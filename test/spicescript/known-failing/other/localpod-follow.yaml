@@ -1,0 +1,125 @@
+name: localpod-follow
+description: >
+  Known failing. `localpod:` children of a Cayenne parent do not follow it
+  in four cases (Cayenne, results cache off):
+  a grandchild (`localpod:child`) never takes a refresh that reached its
+  parent; after the parent's spicepod entry changes its refresh SQL, the
+  children keep the old rows (with an Arrow parent they follow); a
+  passthrough child keeps answering the old rows after the parent is
+  removed from the spicepod; and once it is added back, the children keep
+  the rows from before.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  no-results-cache: { spicepod: { runtime: { caching: { sql_results: { enabled: false } } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: localpod-follow
+  runtime:
+    caching: { sql_results: { enabled: true, item_ttl: 1h } }
+  datasets:
+    - &grandchild
+      from: localpod:child
+      name: grandchild
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - &parent
+      from: postgres:public.t
+      name: parent
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full, refresh_check_interval: 1h }
+    - &child
+      from: localpod:parent
+      name: child
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+    - &sibling
+      from: localpod:parent
+      name: sibling
+      acceleration: { enabled: true, engine: cayenne, mode: memory, refresh_mode: full }
+    - &passthrough
+      from: localpod:parent
+      name: passthrough
+
+defaults:
+  spiced-args: [--pods-watcher-enabled]
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t SELECT i, 'v' || i FROM generate_series(1, 5) i" }
+  - start: {}
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM sibling
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM passthrough
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM grandchild
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+
+  # A parent refresh reaches every child, through the results cache.
+  - source-exec: { src: "INSERT INTO t VALUES (6, 'v6'); UPDATE t SET v = 'changed' WHERE id = 1; DELETE FROM t WHERE id = 2" }
+  - refresh: parent
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, v FROM sibling
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, v FROM passthrough
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+  - query: SELECT id, v FROM grandchild
+    oracle-sql: SELECT id, v FROM t
+    eventually: 30s
+
+  # The parent's entry changes: the children follow its new rows.
+  - edit-spicepod:
+      datasets:
+        parent: { acceleration: { refresh_sql: SELECT * FROM parent WHERE id <= 4 } }
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t WHERE id <= 4
+    eventually: 60s
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t WHERE id <= 4
+    eventually: 60s
+  - query: SELECT id, v FROM grandchild
+    oracle-sql: SELECT id, v FROM t WHERE id <= 4
+    eventually: 60s
+
+  # The parent removed: its children cannot answer. Added back (with all of
+  # its rows again): they follow it.
+  - edit-spicepod:
+      spicepod:
+        datasets: [*grandchild, *child, *sibling, *passthrough]
+  - query: SELECT count(*) FROM parent
+    expect-error: parent
+    eventually: 60s
+  - query: SELECT count(*) FROM passthrough
+    expect-error: true
+    eventually: 60s
+  - source-exec: { src: "INSERT INTO t VALUES (7, 'v7')" }
+  - edit-spicepod:
+      spicepod:
+        datasets: [*grandchild, *parent, *child, *sibling, *passthrough]
+  - query: SELECT id, v FROM parent
+    oracle-sql: SELECT id, v FROM t
+    eventually: 60s
+  - query: SELECT id, v FROM child
+    oracle-sql: SELECT id, v FROM t
+    eventually: 60s
+  - query: SELECT id, v FROM passthrough
+    oracle-sql: SELECT id, v FROM t
+    eventually: 60s
+  - query: SELECT id, v FROM grandchild
+    oracle-sql: SELECT id, v FROM t
+    eventually: 60s

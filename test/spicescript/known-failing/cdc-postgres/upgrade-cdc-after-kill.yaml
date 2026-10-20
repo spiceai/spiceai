@@ -1,0 +1,161 @@
+name: upgrade-cdc-after-kill
+description: >
+  As postgres-cdc-upgrade.yaml and mysql-cdc-upgrade.yaml together, but the older runtime is killed (SIGKILL) rather than
+  stopped, 15 seconds after its last change: under the default
+  `cayenne_cdc_durability: memory`, which defers acknowledging the slot
+  until what it applied is checkpointed, the upgraded runtime resumes every
+  dataset where its checkpoint left off. Today PostgreSQL datasets are
+  rebuilt by re-reading their tables, because each slot was acknowledged
+  past the position recorded as applied ("rebuild_cause=acknowledged_past").
+
+sources:
+  src: { kind: postgres }
+  my: { kind: mysql }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: upgrade-cdc-after-kill
+  datasets:
+    - from: postgres:public.ta
+      name: pg_a
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'shared_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: postgres:public.tp
+      name: pg_p
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'shared_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: '(id, at)', on_conflict: { '(id, at)': upsert } }
+    - from: postgres:public.tc
+      name: pg_c
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:ma
+      name: my_a
+      params: ${sources.my.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+    - from: mysql:mb
+      name: my_b
+      params: ${sources.my.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+
+# `on_conflict` is deprecated for Cayenne, but older releases require it for
+# change capture.
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE ta (id int PRIMARY KEY, v text, n numeric(12, 2));
+        INSERT INTO ta SELECT g, 'v' || g, g * 1.5 FROM generate_series(1, 1000) g;
+        CREATE TABLE tp (id int, at date, v int, PRIMARY KEY (id, at));
+        INSERT INTO tp SELECT g % 100, DATE '2025-01-01' + g / 100, g FROM generate_series(0, 999) g;
+        CREATE TABLE tc (id int PRIMARY KEY, v text);
+        INSERT INTO tc SELECT g, 'c' || g FROM generate_series(1, 500) g;
+  - source-exec:
+      my: |
+        CREATE TABLE ma (id int PRIMARY KEY, v varchar(50), n decimal(12, 2));
+        INSERT INTO ma SELECT n, CONCAT('v', n), n * 1.5 FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 1000) SELECT n FROM s) s;
+        CREATE TABLE mb (id int PRIMARY KEY, v int);
+        INSERT INTO mb SELECT n, n FROM (WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 500) SELECT n FROM s) s;
+  - start: {}
+
+  # Following the source on the older runtime.
+  - source-exec:
+      src: |
+        UPDATE ta SET v = 'running' WHERE id % 7 = 0;
+        DELETE FROM ta WHERE id % 13 = 0;
+        UPDATE tp SET v = -v WHERE at = DATE '2025-01-03';
+        DELETE FROM tp WHERE id = 5;
+        INSERT INTO tc SELECT g, 'running' FROM generate_series(501, 600) g;
+  - source-exec:
+      my: |
+        UPDATE ma SET v = 'running' WHERE id % 7 = 0;
+        DELETE FROM ma WHERE id % 13 = 0;
+        INSERT INTO mb VALUES (501, -1), (502, -2);
+  - query: SELECT * FROM pg_a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM pg_p
+    oracle-sql: SELECT * FROM tp
+    eventually: 60s
+  - query: SELECT * FROM pg_c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    oracle-sql: SELECT * FROM ma
+    expect: { oracle: my }
+    eventually: 60s
+  - query: SELECT * FROM my_b
+    oracle-sql: SELECT * FROM mb
+    expect: { oracle: my }
+    eventually: 60s
+
+  # Down, every source changes; then up on the binary under test.
+  - sleep: 15s
+  - kill-spiced: {}
+  - source-exec:
+      src: |
+        UPDATE ta SET v = 'while down', n = -n WHERE id BETWEEN 100 AND 300;
+        DELETE FROM ta WHERE id BETWEEN 400 AND 450;
+        INSERT INTO ta SELECT g, 'while down', 0 FROM generate_series(2001, 2100) g;
+        UPDATE tp SET v = 0 WHERE id = 7;
+        DELETE FROM tp WHERE at = DATE '2025-01-05';
+        INSERT INTO tp VALUES (500, DATE '2026-01-01', 1), (500, DATE '2026-01-02', 2);
+        UPDATE tc SET v = 'while down' WHERE id <= 50;
+        DELETE FROM tc WHERE id > 590;
+  - source-exec:
+      my: |
+        UPDATE ma SET v = 'while down', n = -n WHERE id BETWEEN 100 AND 300;
+        DELETE FROM ma WHERE id BETWEEN 400 AND 450;
+        INSERT INTO ma VALUES (2001, 'while down', 0), (2002, 'while down', 0);
+        UPDATE mb SET v = 0 WHERE id <= 10;
+        DELETE FROM mb WHERE id = 501;
+  - upgrade: {}
+
+  - query: SELECT * FROM pg_a
+    oracle-sql: SELECT * FROM ta
+    eventually: 60s
+  - query: SELECT * FROM pg_p
+    oracle-sql: SELECT * FROM tp
+    eventually: 60s
+  - query: SELECT * FROM pg_c
+    oracle-sql: SELECT * FROM tc
+    eventually: 60s
+  - query: SELECT * FROM my_a
+    oracle-sql: SELECT * FROM ma
+    expect: { oracle: my }
+    eventually: 60s
+  - query: SELECT * FROM my_b
+    oracle-sql: SELECT * FROM mb
+    expect: { oracle: my }
+    eventually: 60s
+  # Resumed, not rebuilt.
+  - assert-log: { lacks: 'rebuilt the acceleration from the source' }
+  - assert-log: { count: { 'Resuming from existing replication slot': '>=4', 'resuming from persisted GTID position': '>=2' } }
+
+  # Each row once.
+  - query: SELECT (SELECT count(*) - count(DISTINCT id) FROM pg_a) + (SELECT count(*) - count(DISTINCT (id, at)) FROM pg_p) + (SELECT count(*) - count(DISTINCT id) FROM pg_c) + (SELECT count(*) - count(DISTINCT id) FROM my_a) + (SELECT count(*) - count(DISTINCT id) FROM my_b) AS duplicates
+    expect: { rows: [['0']] }
+
+  # And the upgraded runtime keeps following.
+  - source-exec: { src: "INSERT INTO ta VALUES (3000, 'after', 1); UPDATE tp SET v = 42 WHERE id = 1; DELETE FROM tc WHERE id = 1" }
+  - source-exec: { my: "INSERT INTO ma VALUES (3000, 'after', 1); UPDATE mb SET v = 42 WHERE id = 1" }
+  - query: SELECT * FROM pg_a
+    oracle-sql: SELECT * FROM ta
+    eventually: 30s
+  - query: SELECT * FROM pg_p
+    oracle-sql: SELECT * FROM tp
+    eventually: 30s
+  - query: SELECT * FROM pg_c
+    oracle-sql: SELECT * FROM tc
+    eventually: 30s
+  - query: SELECT * FROM my_a
+    oracle-sql: SELECT * FROM ma
+    expect: { oracle: my }
+    eventually: 30s
+  - query: SELECT * FROM my_b
+    oracle-sql: SELECT * FROM mb
+    expect: { oracle: my }
+    eventually: 30s

@@ -1,0 +1,169 @@
+name: kafka-sasl
+description: >
+  The Kafka connector against a Redpanda broker that requires SASL
+  (SCRAM-SHA-256): JSON topics load into Cayenne with the right credentials,
+  their schema inferred from every message or from the first few
+  (`schema_infer_max_records`), and nested objects flattened into dotted
+  columns (`flatten_json`); a wrong password or a client without SASL is
+  refused and the dataset says why.
+
+sources:
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --set, redpanda.enable_sasl=true, --set, 'redpanda.superusers=["kafka"]',
+      --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: kafka-sasl
+  datasets:
+    - from: kafka:orders_${sources.kafka.namespace}
+      name: orders
+      params: &sasl
+        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_security_protocol: SASL_PLAINTEXT
+        kafka_sasl_mechanism: SCRAM-SHA-256
+        kafka_sasl_username: kafka
+        kafka_sasl_password: kafka123
+      acceleration: &append { enabled: true, engine: cayenne, refresh_mode: append }
+    - from: kafka:infer_${sources.kafka.namespace}
+      name: infer
+      params:
+        <<: *sasl
+        schema_infer_max_records: '3'
+      acceleration: *append
+    - from: kafka:nested_${sources.kafka.namespace}
+      name: nested
+      params:
+        <<: *sasl
+        flatten_json: 'true'
+      acceleration: *append
+    - from: kafka:orders_${sources.kafka.namespace}
+      name: wrong_password
+      params:
+        <<: *sasl
+        kafka_sasl_password: wrong
+      acceleration: *append
+    - from: kafka:orders_${sources.kafka.namespace}
+      name: no_sasl
+      params:
+        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_security_protocol: PLAINTEXT
+      acceleration: *append
+
+defaults:
+  cluster-partition-by: { '*': order_id }
+
+steps:
+  - source-exec:
+      kafka: |
+        rpk acl user create kafka -p kafka123 --mechanism SCRAM-SHA-256 -X brokers=localhost:9092
+        for t in orders infer nested; do rpk topic create "$t"_${sources.kafka.namespace} --user kafka --password kafka123 --sasl-mechanism SCRAM-SHA-256; done
+        rpk topic produce orders_${sources.kafka.namespace} --user kafka --password kafka123 --sasl-mechanism SCRAM-SHA-256 <<'EOF'
+          {"order_id":"9e5c8a79-4f7b-4c30-9c27-1f0a4ddc1a16","custkey":482,"partkey":215,"suppkey":77,"quantity":42,"unit_price":28.9,"order_date":"2025-08-27","order_ts":"2025-08-27 16:02:11","shipped":false,"tags":["standard"]}
+          {"order_id":"0e1b8a8f-2c5b-4f1e-9e3c-0d2a3b4c5d6e","custkey":17,"partkey":499,"suppkey":263,"quantity":6,"unit_price":316,"order_date":"2025-08-27","order_ts":"2025-08-27 16:05:22","shipped":true,"tags":["express","gift"]}
+          {"order_id":"c3b2a1d4-7e8f-4c9b-92a3-5e6f7a8b9c01","custkey":901,"partkey":12,"suppkey":145,"quantity":87,"unit_price":742,"order_date":"2025-08-26","order_ts":"2025-08-26 11:20:00","shipped":false}
+          {"order_id":"f61a9b30-1a2b-426b-95a2-07e2b9b3b0aa","custkey":256,"partkey":333,"suppkey":12,"quantity":58,"unit_price":119.99,"order_date":"2025-08-26","order_ts":"2025-08-26 12:45:10","shipped":true}
+          {"order_id":"8b92c6fe-7ce5-4f99-9a74-d0d3de7dc1f2","custkey":774,"partkey":287,"suppkey":300,"quantity":13,"unit_price":987.5,"order_date":"2025-08-25","order_ts":"2025-08-25 09:15:45","shipped":false,"tags":[]}
+        EOF
+        rpk topic produce infer_${sources.kafka.namespace} --user kafka --password kafka123 --sasl-mechanism SCRAM-SHA-256 <<'EOF'
+          {"order_id":"f61a9b30-1a2b-426b-95a2-07e2b9b3b0aa","suppkey":12,"quantity":58,"unit_price":119}
+          {"order_id":"9e5c8a79-4f7b-4c30-9c27-1f0a4ddc1a16","custkey":482,"partkey":215,"unit_price":119.56,"tags":null,"order_date":"2025-08-27","order_ts":"2025-08-27 16:05:22","shipped":true}
+          {"order_id":"0e1b8a8f-2c5b-4f1e-9e3c-0d2a3b4c5d6e","custkey":17,"partkey":499,"suppkey":263,"quantity":6,"unit_price":316,"tags":["express","gift"]}
+          {"order_id":"c3b2a1d4-7e8f-4c9b-92a3-5e6f7a8b9c01","custkey":901,"partkey":12,"suppkey":145,"quantity":87,"unit_price":742,"order_date":"2025-08-26","order_ts":"2025-08-26 11:20:00","shipped":false}
+        EOF
+        rpk topic produce nested_${sources.kafka.namespace} --user kafka --password kafka123 --sasl-mechanism SCRAM-SHA-256 <<'EOF'
+          {"order_id":"a1f2c3d4-1111-2222-3333-444455556666","customer":{"id":101,"name":"Alice","vip":true,"contact":{"email":"alice@example.com","phone":"555-1234"}},"items":[{"sku":"P100","qty":2,"price":19.99},{"sku":"P200","qty":1,"price":5.49}],"shipping":{"address":{"city":"Seattle","zip":"98101"},"method":"ground"},"tags":["new","priority"],"discount":5.0,"order_ts":"2025-08-27T10:15:00Z","shipped":false}
+          {"order_id":"b2f3c4d5-aaaa-bbbb-cccc-111122223333","customer":{"id":202,"name":"Bob"},"shipping":{"address":{"city":"Portland","zip":"97201"},"method":"express"},"tags":[],"order_ts":"2025-08-27T11:45:30Z","shipped":true}
+          {"order_id":"c3d4e5f6-aaaa-4444-bbbb-555566667777","customer":{"id":303,"name":"Charlie","vip":false},"items":[],"order_ts":"2025-08-26T16:02:11Z","shipped":false}
+          {"order_id":"d4e5f6g7-eeee-ffff-gggg-888899990000","customer":{"id":404,"name":"Dana","contact":{"email":"dana@example.org"}},"items":[{"sku":"Z123","qty":3,"price":49.95}],"shipping":{"address":{"city":"Chicago","zip":"60601"},"method":"standard"},"tags":["gift"],"order_ts":"2025-08-25T08:30:00Z","shipped":true}
+          {"order_id":"e5f6g7h8-1111-9999-aaaa-bbbbccccdddd","customer":{"id":505,"name":"Eve","vip":true},"items":[{"sku":"M321","qty":1,"price":199.0}],"shipping":{"address":{"city":"New York","zip":"10001"},"method":"pickup"},"tags":null,"order_ts":"2025-08-24T14:05:45Z","shipped":false}
+        EOF
+  - start: { ready: false }
+  - query: SELECT count(*) AS n FROM orders
+    expect: { rows: [['5']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM infer
+    expect: { rows: [['4']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM nested
+    expect: { rows: [['5']] }
+    eventually: 60s
+
+  # Every column, typed from the messages, in first-seen order.
+  - query: SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'orders' ORDER BY ordinal_position
+    expect:
+      rows: [[order_id, Utf8], [custkey, Int64], [partkey, Int64], [suppkey, Int64], [quantity, Int64], [unit_price, Float64],
+             [order_date, Utf8], [order_ts, Utf8], [shipped, Boolean], [tags, List(Utf8)]]
+  - query: >-
+      SELECT order_id, custkey, partkey, suppkey, quantity, unit_price, order_date, order_ts, shipped, tags
+      FROM orders ORDER BY order_id
+    expect:
+      rows:
+        - [0e1b8a8f-2c5b-4f1e-9e3c-0d2a3b4c5d6e, '17', '499', '263', '6', '316.0', '2025-08-27', '2025-08-27 16:05:22', 'true', '[express, gift]']
+        - [8b92c6fe-7ce5-4f99-9a74-d0d3de7dc1f2, '774', '287', '300', '13', '987.5', '2025-08-25', '2025-08-25 09:15:45', 'false', '[]']
+        - [9e5c8a79-4f7b-4c30-9c27-1f0a4ddc1a16, '482', '215', '77', '42', '28.9', '2025-08-27', '2025-08-27 16:02:11', 'false', '[standard]']
+        - [c3b2a1d4-7e8f-4c9b-92a3-5e6f7a8b9c01, '901', '12', '145', '87', '742.0', '2025-08-26', '2025-08-26 11:20:00', 'false', null]
+        - [f61a9b30-1a2b-426b-95a2-07e2b9b3b0aa, '256', '333', '12', '58', '119.99', '2025-08-26', '2025-08-26 12:45:10', 'true', null]
+
+  # Inferred from the first three messages: the fourth's fields were all seen.
+  - query: SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'infer' ORDER BY ordinal_position
+    expect:
+      rows: [[order_id, Utf8], [suppkey, Int64], [quantity, Int64], [unit_price, Float64], [custkey, Int64], [partkey, Int64],
+             [tags, List(Utf8)], [order_date, Utf8], [order_ts, Utf8], [shipped, Boolean]]
+  - query: >-
+      SELECT order_id, suppkey, quantity, unit_price, custkey, partkey, tags, order_date, order_ts, shipped
+      FROM infer ORDER BY order_id
+    expect:
+      rows:
+        - [0e1b8a8f-2c5b-4f1e-9e3c-0d2a3b4c5d6e, '263', '6', '316.0', '17', '499', '[express, gift]', null, null, null]
+        - [9e5c8a79-4f7b-4c30-9c27-1f0a4ddc1a16, null, null, '119.56', '482', '215', null, '2025-08-27', '2025-08-27 16:05:22', 'true']
+        - [c3b2a1d4-7e8f-4c9b-92a3-5e6f7a8b9c01, '145', '87', '742.0', '901', '12', null, '2025-08-26', '2025-08-26 11:20:00', 'false']
+        - [f61a9b30-1a2b-426b-95a2-07e2b9b3b0aa, '12', '58', '119.0', null, null, null, null, null, null]
+
+  # Nested objects become dotted columns; arrays of objects stay lists of structs.
+  - query: SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'nested' ORDER BY ordinal_position
+    expect:
+      rows: [[order_id, Utf8], [customer.id, Int64], [customer.name, Utf8], [customer.vip, Boolean], [customer.contact.email, Utf8],
+             [customer.contact.phone, Utf8], [items, 'List(Struct("sku": Utf8, "qty": Int64, "price": Float64))'],
+             [shipping.address.city, Utf8], [shipping.address.zip, Utf8], [shipping.method, Utf8], [tags, List(Utf8)],
+             [discount, Float64], [order_ts, Utf8], [shipped, Boolean]]
+  - query: >-
+      SELECT order_id, "customer.id", "customer.name", "customer.vip", "customer.contact.email", "customer.contact.phone",
+        "shipping.address.city", "shipping.address.zip", "shipping.method", tags, discount, order_ts, shipped,
+        cardinality(items) AS n_items, items[1]['sku'] AS sku, items[1]['price'] AS price
+      FROM nested ORDER BY order_id
+    expect:
+      rows:
+        - [a1f2c3d4-1111-2222-3333-444455556666, '101', Alice, 'true', alice@example.com, 555-1234, Seattle, '98101', ground, '[new, priority]', '5.0', '2025-08-27T10:15:00Z', 'false', '2', P100, '19.99']
+        - [b2f3c4d5-aaaa-bbbb-cccc-111122223333, '202', Bob, null, null, null, Portland, '97201', express, '[]', null, '2025-08-27T11:45:30Z', 'true', null, null, null]
+        - [c3d4e5f6-aaaa-4444-bbbb-555566667777, '303', Charlie, 'false', null, null, null, null, null, null, null, '2025-08-26T16:02:11Z', 'false', '0', null, null]
+        - [d4e5f6g7-eeee-ffff-gggg-888899990000, '404', Dana, null, dana@example.org, null, Chicago, '60601', standard, '[gift]', null, '2025-08-25T08:30:00Z', 'true', '1', Z123, '49.95']
+        - [e5f6g7h8-1111-9999-aaaa-bbbbccccdddd, '505', Eve, 'true', null, null, New York, '10001', pickup, null, null, '2025-08-24T14:05:45Z', 'false', '1', M321, '199.0']
+
+  # More messages arrive under the same credentials.
+  - source-exec:
+      kafka: |
+        echo '{"order_id":"ffffffff-0000-0000-0000-000000000001","custkey":1,"quantity":1,"unit_price":1.5,"shipped":true}' |
+          rpk topic produce orders_${sources.kafka.namespace} --user kafka --password kafka123 --sasl-mechanism SCRAM-SHA-256
+  - query: SELECT order_id, custkey, partkey, unit_price, shipped, tags FROM orders WHERE custkey = 1
+    expect: { rows: [[ffffffff-0000-0000-0000-000000000001, '1', null, '1.5', 'true', null]] }
+    eventually: 30s
+
+  # A wrong password, or a client without SASL, is refused.
+  - http: { path: '/v1/datasets?status=true' }
+    expect:
+      status: 200
+      body-matches:
+        - '"name":"wrong_password"[^}]*"status":"Error","error":\{"category":"dataset","type":"auth"'
+        - '"name":"no_sasl"[^}]*"status":"Error"'
+  - query: SELECT count(*) FROM wrong_password
+    expect-error: true
+  - query: SELECT count(*) FROM no_sasl
+    expect-error: true

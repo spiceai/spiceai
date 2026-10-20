@@ -1,0 +1,102 @@
+name: full-refresh-outage
+description: >
+  A full refresh never serves partial or empty data when its source fails: a
+  refresh with the source down fails and the last good data stays served, a
+  restart with the source down serves the persisted data, the first refresh
+  after the source returns catches up, and a restart that adds a primary key
+  and an index to the persisted acceleration serves the same rows.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  cayenne: {}
+  # DuckDB and SQLite keep their files at an explicit path.
+  duckdb:
+    datasets: { '*': { acceleration: { engine: duckdb, params: { duckdb_file: '${instance.dir}/items.duckdb' } } } }
+  sqlite:
+    datasets: { '*': { acceleration: { engine: sqlite, params: { sqlite_file: '${instance.dir}/items.sqlite' } } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: full-refresh-outage
+  datasets:
+    - from: postgres:public.items
+      name: items
+      params: ${sources.src.params}
+      acceleration:
+        enabled: true
+        engine: cayenne
+        mode: file
+        refresh_mode: full
+        # Retries are unlimited by default, so a refresh with the source down
+        # would never end; one attempt makes the failure observable.
+        refresh_retry_max_attempts: 1
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE items (
+          id         integer PRIMARY KEY,
+          name       text NOT NULL,
+          price      numeric(12, 2),
+          tags       text,
+          in_stock   boolean,
+          updated_at timestamptz
+        );
+        INSERT INTO items
+          SELECT i, 'item ' || i, (i * 313 % 100000) / 100.0,
+                 CASE WHEN i % 7 = 0 THEN NULL ELSE 'tag' || (i % 13) END,
+                 i % 4 <> 0, TIMESTAMPTZ '2025-06-01 00:00:00+00' + i * INTERVAL '1 minute'
+          FROM generate_series(1, 5000) AS i;
+
+  - start: {}
+  - query: SELECT * FROM items
+
+  # A refresh picks up inserts, updates and deletes.
+  - source-exec:
+      src:
+        - INSERT INTO items SELECT i, 'new ' || i, 1.00, NULL, true, TIMESTAMPTZ '2025-07-01 12:00:00.123456+00' + i * INTERVAL '1 second' FROM generate_series(5001, 5200) AS i
+        - UPDATE items SET price = price * 2, tags = NULL WHERE id % 10 = 0
+        - DELETE FROM items WHERE id % 9 = 0
+  - refresh: items
+  - query: SELECT * FROM items
+    id: after-refresh
+
+  # The source goes away: the refresh fails and the last good data stays served.
+  - stop-source: src
+  - refresh: { dataset: items, expect-error: true }
+  - query: SELECT * FROM items
+    consistently: 10s
+    expect: { same-as: after-refresh }
+
+  # A restart with the source still down serves the persisted data.
+  - restart: {}
+  - query: SELECT * FROM items
+    expect: { same-as: after-refresh }
+
+  # The source returns, with changes made while Spice could not see it.
+  - start-source: src
+  - source-exec:
+      src:
+        - DELETE FROM items WHERE id > 5100
+        - UPDATE items SET in_stock = NOT in_stock WHERE id % 3 = 0
+  - refresh: items
+  - query: SELECT * FROM items
+    id: final
+  - query: SELECT in_stock, count(*), sum(price) FROM items GROUP BY in_stock ORDER BY in_stock NULLS LAST
+
+  # A restart that adds a composite primary key and an index to the existing
+  # acceleration serves the same rows, also with the source down.
+  - restart:
+      patch: { datasets: { items: { acceleration: { primary_key: '(id, name)', indexes: { price: enabled } } } } }
+  - query: SELECT * FROM items
+    expect: { same-as: final }
+  - stop-source: src
+  - query: SELECT * FROM items
+    consistently: 5s
+    expect: { same-as: final }

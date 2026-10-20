@@ -1,0 +1,33 @@
+name: http-float-specials
+description: >
+  A query answers over HTTP (`/v1/sql`, JSON) as it does over Flight, NaN and
+  the infinities included. It fails today: JSON has no NaN or Infinity and the
+  HTTP answer writes them as null, the same as a SQL NULL, so the two cannot
+  be told apart.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: http-float-specials
+  datasets:
+    - from: postgres:public.p
+      name: p
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+  also-http: true
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE p (id int PRIMARY KEY, f float8);
+        INSERT INTO p VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, NULL), (5, 1.5);
+  - start: {}
+  # The finite values and NULL agree.
+  - query: SELECT id, f FROM p WHERE id IN (4, 5)
+  - query: SELECT id, f FROM p
+  - query: SELECT max(f), min(f) FROM p

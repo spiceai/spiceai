@@ -1,0 +1,1271 @@
+{
+  "files-federated-stale": [
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"220000\\\"\", actual: \"\\\"200000\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1050\\\"\", actual: \"\\\"954\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 809, actual: 730 }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"6007\\\"\", actual: \"\\\"5468\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1100\\\"\", actual: \"\\\"993\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"54943\\\"\", actual: \"\\\"49950\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"1019838\", actual: \"199924\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"43920\\\"\", actual: \"\\\"39942\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id = 4242 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id IN (1, 77, 150000, 299999, 999999) #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, grp, amount FROM facts WHERE id BETWEEN 120000 AND 120050 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), min(id), max(id) FROM facts WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' AND ts < TIMESTAMP '2024-03-02 00:00:00' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts ORDER BY id LIMIT 20 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"220000\\\"\", actual: \"\\\"200000\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1050\\\"\", actual: \"\\\"954\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 809, actual: 730 }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"6007\\\"\", actual: \"\\\"5468\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1100\\\"\", actual: \"\\\"993\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"54943\\\"\", actual: \"\\\"49950\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"1019838\", actual: \"199924\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"43920\\\"\", actual: \"\\\"39942\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id = 4242 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id IN (1, 77, 150000, 299999, 999999) #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, grp, amount FROM facts WHERE id BETWEEN 120000 AND 120050 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), min(id), max(id) FROM facts WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' AND ts < TIMESTAMP '2024-03-02 00:00:00' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts ORDER BY id LIMIT 20 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "files-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE grp = 9999 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: the query did not return within <duration>",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Arrow error: Parquet argument error: EOF: Not enough bytes to decode\"",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 52\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pag",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected Pa",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: Unexp",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error: integer overflow decoding thrift value\": code: 'Internal error', message: \"Arrow error: Parquet argument error: Parquet error",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location <path> not found: No such file or directory (os error 2)\": code: 'Internal error', message: \"Parquet error: External: Object at locat",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not enough bytes to decode\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: EOF: Not en",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType 736\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected PageType <n>\": code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parq",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 14\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Parquet argument error: Parquet error: Unexpected struct field type 15\": code: 'Internal error', message: \"Parquet error: External: Parquet argument err"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    }
+  ],
+  "iceberg-equality-delete-nulls": [
+    {
+      "run": "iceberg-equality-delete-nulls",
+      "who": "default",
+      "key": "query: SELECT batch, b, i FROM t #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 1, actual: 2 }",
+      "group": "files-and-lakes"
+    }
+  ],
+  "s3-federated-stale": [
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"220000\\\"\", actual: \"\\\"200000\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1050\\\"\", actual: \"\\\"954\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 809, actual: 730 }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"6007\\\"\", actual: \"\\\"5468\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1100\\\"\", actual: \"\\\"993\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"54943\\\"\", actual: \"\\\"49950\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"1019838\", actual: \"199924\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"43920\\\"\", actual: \"\\\"39942\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id = 4242 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id IN (1, 77, 150000, 299999, 999999) #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, grp, amount FROM facts WHERE id BETWEEN 120000 AND 120050 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*), min(id), max(id) FROM facts WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' AND ts < TIMESTAMP '2024-03-02 00:00:00' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts ORDER BY id LIMIT 20 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=parquet]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"220000\\\"\", actual: \"\\\"200000\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1050\\\"\", actual: \"\\\"954\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: RowCountMismatch { expected: 809, actual: 730 }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"6007\\\"\", actual: \"\\\"5468\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"1100\\\"\", actual: \"\\\"993\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"54943\\\"\", actual: \"\\\"49950\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"id\", row_number: 1, expected: \"1019838\", actual: \"199924\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #2",
+      "kind": "wrong-answer",
+      "signature": "still failing after <n> attempts over <duration>: answer differs from the expected one: DataMismatch { column: \"count(*)\", row_number: 1, expected: \"\\\"43920\\\"\", actual: \"\\\"39942\\\"\" }",
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), count(DISTINCT grp), sum(amount), min(ts), max(ts) FROM facts #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id = 4242 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE id IN (1, 77, 150000, 299999, 999999) #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, grp, amount FROM facts WHERE id BETWEEN 120000 AND 120050 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), sum(amount) FROM facts WHERE grp = 17 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, label FROM facts WHERE grp IN (3, 99, 150) AND label = 'beta' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE grp BETWEEN 10 AND 20 AND amount > 500 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*), min(id), max(id) FROM facts WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' AND ts < TIMESTAMP '2024-03-02 00:00:00' #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT grp, count(*), sum(amount), max(ts) FROM facts GROUP BY grp #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT label, count(*), count(note) FROM facts GROUP BY label #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts ORDER BY id LIMIT 20 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT id, amount FROM facts WHERE grp = 42 ORDER BY id DESC LIMIT 10 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT count(*) FROM facts WHERE note IS NULL #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    },
+    {
+      "run": "s3-federated-stale[format=csv]",
+      "who": "federated",
+      "key": "query: SELECT * FROM facts WHERE grp = 9999 #3",
+      "kind": "error",
+      "signature": "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Object Store error: Object at location facts/part-<n>.csv not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.csv in <duration> - Server returned ",
+      "also": [
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for line 10238, expected 6 got 3\": code: 'Internal error', message: \"Arrow error: Csv error: incorrect number of fields for li",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Object at location facts/part-<n>.parquet not found: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <duration> - Ser",
+        "still failing after <n> attempts over <duration>: Spice rejected the query: Tonic error: code: 'Internal error', message: \"Parquet error: External: Request precondition failure for path facts/part-<n>.parquet: Error performing GET http://127.0.0.1:<port>/<namespace>/facts/part-<n>.parquet in <durati"
+      ],
+      "varies": true,
+      "group": "files-and-lakes"
+    }
+  ]
+}

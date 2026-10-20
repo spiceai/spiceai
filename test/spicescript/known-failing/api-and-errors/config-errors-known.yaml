@@ -1,0 +1,41 @@
+# Known failing (no issue filed yet): a dataset whose acceleration names an
+# unknown engine or an unparseable refresh_check_interval is missing from
+# /v1/datasets (the error is only logged, without the dataset in its text); a
+# dataset whose refresh_cron does not parse reports Ready and never refreshes
+# on a schedule; and a misspelled connector param is ignored with a warning
+# that does not name the dataset.
+name: config-errors-known
+description: >
+  Every configuration mistake leaves its dataset reported in Error, naming the
+  dataset and what to fix: an unknown acceleration engine, an unparseable
+  refresh_check_interval or refresh_cron, and a connector param the connector
+  does not have.
+
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: probe-config
+  datasets:
+    - { from: 'postgres:public.t', name: healthy, params: '${sources.src.params}' }
+    - { from: 'nosuchconnector:whatever', name: bad_connector }
+    - { from: 'postgres:public.t', name: bad_engine, params: '${sources.src.params}', acceleration: { enabled: true, engine: nosuchengine } }
+    - { from: 'postgres:public.t', name: bad_cron, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, refresh_cron: 'not a cron' } }
+    - { from: 'postgres:public.t', name: bad_interval, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, refresh_check_interval: 'soon' } }
+    - { from: 'postgres:public.t', name: bad_param, params: { $merge: '${sources.src.params}', pg_nosuchparam: x } }
+    - { from: 'file:/no/such/file.parquet', name: bad_file }
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
+  - start: { ready: false }
+  - query: SELECT * FROM healthy
+    expect: { rows: [['1', a]] }
+    eventually: 30s
+  - assert-status: { dataset: bad_engine, status: Error, message-contains: "Unknown acceleration engine 'nosuchengine'" }
+    eventually: 30s
+  - assert-status: { dataset: bad_interval, status: Error, message-contains: refresh_check_interval }
+    eventually: 30s
+  - assert-status: { dataset: bad_cron, status: Error, message-contains: "not a cron" }
+    eventually: 30s
+  - assert-status: { dataset: bad_param, status: Error, message-contains: pg_nosuchparam }
+    eventually: 30s

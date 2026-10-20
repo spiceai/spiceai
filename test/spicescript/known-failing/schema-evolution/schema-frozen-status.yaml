@@ -1,0 +1,42 @@
+# Known failing: after an incompatible source change and
+# a restart, block, append_new_columns and sync_all_columns stop updating the
+# dataset and say so only in a WARN line; its status is Ready. (Before the
+# restart its refreshes fail and its status is Error, naming the column.) Move
+# up a level once it passes.
+name: schema-frozen-status
+description: >
+  A dataset that can no longer refresh because its source schema changed in a
+  way its `on_schema_change` mode cannot evolve reports it in its status,
+  naming the column, rather than reporting Ready while serving frozen rows.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  block: {}
+  append-new-columns: { datasets: { cham: { on_schema_change: append_new_columns } } }
+  sync-all-columns: { datasets: { cham: { on_schema_change: sync_all_columns } } }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: schema-frozen-status
+  datasets:
+    - from: postgres:public.chameleon
+      name: cham
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: full }
+
+defaults:
+  compare-variants: false
+
+steps:
+  - source-exec: { src: "CREATE TABLE chameleon (id int PRIMARY KEY, town text, age int); INSERT INTO chameleon VALUES (1, 'a', 10)" }
+  - start: {}
+  - source-exec: { src: "ALTER TABLE chameleon DROP COLUMN age" }
+  - restart: {}
+  - refresh: { dataset: cham, wait: false }
+  - assert-log: { contains: 'The column `age` is missing' }
+    eventually: 30s
+  - assert-status: { dataset: cham, status: Error, message-contains: age }
+    eventually: 30s

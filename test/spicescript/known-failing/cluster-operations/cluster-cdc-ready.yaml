@@ -1,0 +1,33 @@
+# Known failing (no issue filed yet): on a cluster, a change-captured Cayenne
+# dataset serves correct and current rows, but the scheduler reports it
+# Refreshing forever and the runtime never becomes ready.
+name: cluster-cdc-ready
+description: >
+  On a cluster scheduler with one executor, a Cayenne acceleration kept
+  current by PostgreSQL change capture becomes Ready and the runtime ready,
+  and it serves the source's rows and changes.
+
+sources:
+  src: { kind: postgres }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-cdc-ready
+  datasets:
+    - from: postgres:public.t
+      name: t
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+defaults:
+  cluster: { executors: 1 }
+  expect: { oracle: src }
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY, v int); INSERT INTO t SELECT i, i FROM generate_series(1, 100) i" }
+  - start: { ready: false }
+  - assert-status: { dataset: t, status: Ready, ready: true }
+    eventually: 90s
+  - query: SELECT id, v FROM t
+    eventually: 60s
+  - source-exec: { src: "INSERT INTO t SELECT i, i FROM generate_series(101, 150) i; UPDATE t SET v = 0 WHERE id <= 10; DELETE FROM t WHERE id > 140" }
+  - query: SELECT id, v FROM t
+    eventually: 60s

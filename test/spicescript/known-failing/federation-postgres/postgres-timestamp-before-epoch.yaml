@@ -1,0 +1,48 @@
+name: postgres-timestamp-before-epoch
+description: >
+  A PostgreSQL `timestamp` (without time zone) before 1970-01-01 reads as
+  itself, as the same instant does in a `timestamptz` column. It fails today:
+  the row conversion appends nothing for a time before the epoch, so the
+  column comes up short and the read fails with "all columns in a record batch
+  must have the specified row count", which takes the whole table with it,
+  and every acceleration of it never loads.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+  duckdb: duckdb-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-timestamp-before-epoch
+  datasets:
+    - from: postgres:public.p
+      name: p
+      params: ${sources.src.params}
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE p (id int PRIMARY KEY, ts timestamp, tz timestamptz);
+        INSERT INTO p VALUES
+          (1, '1970-01-01 00:00:00', '1970-01-01 00:00:00+00'),
+          (2, '1969-12-31 23:59:59', '1969-12-31 23:59:59+00'),
+          (3, '1960-06-01 12:00:00.25', '1960-06-01 12:00:00.25+00'),
+          (4, '1900-01-01 00:00:00', '1900-01-01 00:00:00+00'),
+          (5, '2024-01-01 00:00:00', '2024-01-01 00:00:00+00');
+  - start: { ready: false }
+  # The same instants read from `timestamptz`, which takes another path.
+  - query: SELECT id, tz FROM p
+    only: federated
+  - query: SELECT id, ts FROM p
+    eventually: 30s
+  - query: SELECT id, ts FROM p WHERE ts < TIMESTAMP '1970-01-01 00:00:00'
+    eventually: 30s

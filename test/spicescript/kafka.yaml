@@ -1,0 +1,59 @@
+name: kafka
+description: >
+  The Kafka connector against Redpanda: JSON messages on a topic are
+  appended into a Cayenne acceleration and answer the corpus as PostgreSQL
+  does over the same rows, before and after more messages arrive.
+
+sources:
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+  ref: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: kafka
+  datasets:
+    - from: kafka:t_${sources.kafka.namespace}
+      name: t
+      params:
+        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_security_protocol: PLAINTEXT
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: append }
+
+defaults:
+  expect: { oracle: ref }
+
+steps:
+  - source-exec:
+      kafka: >-
+        rpk topic create t_${sources.kafka.namespace} -p 3 &&
+        for g in $(seq 1 300); do
+          if [ $((g % 10)) -eq 0 ]; then s=null; else s="\"$(echo apple banana cherry | cut -d' ' -f$((g % 3 + 1)))\""; fi;
+          echo "{\"id\": $g, \"i\": $((g % 17 - 8)), \"s\": $s, \"f\": $g.5}";
+        done | rpk topic produce t_${sources.kafka.namespace}
+  - source-exec:
+      ref: >-
+        CREATE TABLE t (id bigint PRIMARY KEY, i bigint, s text, f double precision);
+        INSERT INTO t SELECT g, g % 17 - 8, CASE WHEN g % 10 = 0 THEN NULL ELSE (ARRAY['apple', 'banana', 'cherry'])[g % 3 + 1] END, g + 0.5
+          FROM generate_series(1, 300) g;
+  - start: {}
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['300']] }
+    eventually: 60s
+  - corpus: corpus/kafka.sql
+  - source-exec:
+      kafka: >-
+        for g in $(seq 301 350); do echo "{\"id\": $g, \"i\": 1, \"s\": \"late\", \"f\": 0.5}"; done | rpk topic produce t_${sources.kafka.namespace}
+  - source-exec:
+      ref: INSERT INTO t SELECT g, 1, 'late', 0.5 FROM generate_series(301, 350) g;
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['350']] }
+    eventually: 60s
+  - corpus: corpus/kafka.sql

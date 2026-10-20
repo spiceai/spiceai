@@ -1,0 +1,71 @@
+# Known failing (no issue filed yet): on a cluster, the plan puts a
+# round-robin repartition under the global limit and fails "does not satisfy
+# distribution requirements: SinglePartition".
+name: cluster-limit-offset
+description: >
+  On a cluster, a query reading an ORDER BY … LIMIT … OFFSET subquery over a
+  filtered Cayenne table answers as PostgreSQL does.
+
+sources:
+  backend: { kind: '${matrix.backend}' }
+  ref: { kind: postgres }
+
+matrix:
+  backend: [postgres]
+
+variants:
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: query-coverage
+  datasets:
+    - from: '${matrix.backend}:t'
+      name: t
+      params: ${sources.backend.params}
+    - from: '${matrix.backend}:u'
+      name: u
+      params: ${sources.backend.params}
+
+defaults:
+  cluster: { executors: 1 }
+  # A cluster buckets each acceleration on this column (--cluster).
+  cluster-partition-by: { '*': id }
+  compare-variants: false
+
+steps:
+  - generate:
+      backend:
+        table: t
+        rows: 400
+        seed: 31
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: i, int: [-50, 50], nulls: 0.1 }
+          - { name: big, bigint: [0, 10000000000] }
+          - { name: d, decimal: { range: [-100, 100], scale: 2 } }
+          - { name: f, float: [0, 50] }
+          - { name: s, choice: [apple, Apple, APPLE, banana, "O'Brien", naïve, '', under_score, b], nulls: 0.1 }
+          - { name: dt, date: ['2024-01-01', '2024-12-31'] }
+          - { name: ts, timestamp: ['2024-01-01', '2024-12-31'] }
+          - { name: b, bool: 0.33 }
+    mirror: ref
+  - generate:
+      backend:
+        table: u
+        rows: 150
+        seed: 32
+        primary-key: id
+        columns:
+          - { name: id, sequence: 1 }
+          - { name: t_id, int: [1, 440] }
+          - { name: label, choice: [red, blue, green] }
+    mirror: ref
+  - start: {}
+  - query: >-
+      SELECT * FROM (SELECT c3372 AS c3376, c3373 AS c3377, c3374 AS c3378 FROM (SELECT c3366 AS c3372, c3369 AS c3373, coalesce(c3368, c3367) AS c3374 FROM (SELECT c3356 AS c3366, c3357 AS c3367, c3358 AS c3368, c3360 AS c3369, c3361 AS c3370 FROM (SELECT id AS c3356, i AS c3357, big AS c3358, d AS c3359, f AS c3360, s AS c3361, dt AS c3362, ts AS c3363, b AS c3364 FROM t) AS r3355 WHERE (c3363 >= TIMESTAMP '2024-04-14 09:00:00')) AS r3365 WHERE (coalesce(c3369, 41.2) <= 43.8)) AS r3371 ORDER BY c3372 ASC NULLS LAST LIMIT 16 OFFSET 2) AS r3375
+    oracle-sql: >-
+      SELECT * FROM (SELECT c3372 AS c3376, c3373 AS c3377, c3374 AS c3378 FROM (SELECT c3366 AS c3372, c3369 AS c3373, coalesce(c3368, c3367) AS c3374 FROM (SELECT c3356 AS c3366, c3357 AS c3367, c3358 AS c3368, c3360 AS c3369, c3361 AS c3370 FROM (SELECT id AS c3356, i AS c3357, big AS c3358, d AS c3359, f AS c3360, s AS c3361, dt AS c3362, ts AS c3363, b AS c3364 FROM t) AS r3355 WHERE (c3363 >= TIMESTAMP '2024-04-14 09:00:00')) AS r3365 WHERE (coalesce(c3369, 41.2) <= 43.8)) AS r3371 ORDER BY c3372 ASC NULLS LAST LIMIT 16 OFFSET 2) AS r3375
+    expect: { oracle: ref }

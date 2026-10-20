@@ -1,0 +1,33 @@
+name: cluster-failed-dataset-empties-others
+description: >
+  Known failing: wrong results, on a cluster only. One dataset that cannot
+  load (its source table does not exist) keeps the executor from ever
+  becoming ready, so partitions are never assigned and a healthy dataset
+  beside it holds the 0 rows the executor loaded before assignment. Queries
+  of the healthy dataset answer from that: `count(*)` is 0, with status
+  200, instead of its rows or an error. On one spiced the healthy dataset
+  loads and answers while the other reports its error.
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-failed-dataset-empties-others
+  datasets:
+    - { from: postgres:public.t, name: t, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
+    - { from: postgres:public.missing, name: bad, params: '${sources.src.params}', acceleration: { enabled: true, engine: cayenne, mode: file } }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t SELECT generate_series(1, 10)" }
+  - start: { ready: false }
+  - query: SELECT count(*) AS n FROM t
+    expect: { rows: [['10']] }
+    eventually: 120s
+  - query: SELECT * FROM t

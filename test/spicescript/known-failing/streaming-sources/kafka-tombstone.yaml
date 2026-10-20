@@ -1,0 +1,40 @@
+# Known failing (no issue filed yet): a tombstone in a Kafka topic stops the
+# dataset loading ("Unable to deserialize JSON message from Kafka: expected
+# value at line 1 column 1").
+name: kafka-tombstone
+description: >
+  A Kafka topic holding a tombstone (a message with no value) loads its other
+  messages.
+
+sources:
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: kafka-tombstone
+  datasets:
+    - from: kafka:tomb_${sources.kafka.namespace}
+      name: tomb
+      params:
+        kafka_bootstrap_servers: localhost:${sources.kafka.port.19092}
+        kafka_security_protocol: PLAINTEXT
+      acceleration: { enabled: true, engine: cayenne, refresh_mode: append }
+
+steps:
+  - source-exec:
+      kafka: >-
+        rpk topic create tomb_${sources.kafka.namespace} &&
+        printf '%s\n' '{"id": 1, "name": "one"}' '{"id": 2, "name": "two"}' | rpk topic produce tomb_${sources.kafka.namespace} -k k &&
+        rpk topic produce tomb_${sources.kafka.namespace} -k k --tombstone </dev/null
+  - start: { ready: false }
+  - query: SELECT id, name FROM tomb
+    expect: { rows: [['1', one], ['2', two]] }
+    eventually: 60s

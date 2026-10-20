@@ -1,0 +1,36 @@
+name: cluster-text-search
+description: >
+  Known failing: empty answers, on a cluster only. `text_search` over a
+  Cayenne dataset with a full-text index returns no rows, with no error,
+  although the dataset's rows are there and a plain query sees them; on one
+  spiced the same search finds every matching row (search.yaml).
+
+sources:
+  src: { kind: postgres }
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cluster-text-search
+  datasets:
+    - from: postgres:public.docs
+      name: docs
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file }
+      columns:
+        - name: body
+          full_text_search: { enabled: true, row_id: [id] }
+
+defaults:
+  cluster: { executors: 1 }
+  cluster-partition-by: { '*': id }
+
+steps:
+  - source-exec: { src: "CREATE TABLE docs (id int PRIMARY KEY, body text); INSERT INTO docs SELECT i, CASE WHEN i % 3 = 0 THEN 'the quick brown fox' ELSE 'a lazy dog sleeps' END FROM generate_series(1, 30) i" }
+  - start: {}
+  - query: SELECT count(*) AS n FROM docs
+    expect: { rows: [['30']] }
+  - query: SELECT id FROM text_search(docs, 'fox') ORDER BY id
+    oracle-sql: SELECT id FROM docs WHERE body LIKE '%fox%' ORDER BY id
+    expect: { oracle: src }
+    eventually: 30s

@@ -1,0 +1,43 @@
+# Known failing (no issue filed yet): PostgreSQL CDC fails to decode a
+# numeric(38, 10) value with 28 integer digits ("numeric magnitude exceeds
+# Decimal128 range"), and the dataset stops applying every later change.
+name: postgres-cdc-numeric-38-digits
+description: >
+  Through PostgreSQL CDC, numeric values that use every digit of their
+  declared precision arrive as the source holds them, whatever the scale, and
+  later changes keep arriving.
+
+sources:
+  src: { kind: postgres }
+
+matrix:
+  scale: ['0', '10', '4']
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: postgres-cdc-numeric-38-digits
+  datasets:
+    - from: postgres:public.e
+      name: e
+      params: ${sources.src.params}
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec: { src: "CREATE TABLE e (id int PRIMARY KEY, v numeric(38, ${matrix.scale})); INSERT INTO e VALUES (0, 1)" }
+  - start: {}
+  - query: SELECT id, v FROM e
+    eventually: 60s
+  - source-exec:
+      src: |
+        INSERT INTO e VALUES
+          (1, power(10::numeric, 38 - ${matrix.scale}) - power(10::numeric, -${matrix.scale})),
+          (2, -(power(10::numeric, 38 - ${matrix.scale}) - power(10::numeric, -${matrix.scale}))),
+          (3, power(10::numeric, 37 - ${matrix.scale}) + 0.5 * power(10::numeric, -${matrix.scale}) * 2);
+  - source-exec: { src: "INSERT INTO e VALUES (4, 4)" }
+  - query: SELECT id, v FROM e
+    eventually: 30s
+  - assert-status: { dataset: e, status: Ready }

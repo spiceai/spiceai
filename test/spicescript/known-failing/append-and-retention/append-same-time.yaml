@@ -1,0 +1,37 @@
+name: append-same-time
+description: >
+  Known failing: silent row loss. Append refresh reads rows strictly newer
+  than the stored maximum time, so a row committed after a refresh with the
+  same time value as the newest loaded row is never loaded — for epoch
+  seconds and for timestamps alike (two rows in one second are ordinary).
+  With `refresh_append_overlap` the same row loads once; dates already get
+  this treatment by default (an inclusive bound and a dedupe against loaded
+  rows), other time columns do not.
+sources:
+  src: { kind: postgres }
+variants:
+  secs: {}
+  tz: { datasets: { events: { time_column: ts, time_format: timestamptz } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: append-same-time
+  datasets:
+    - from: postgres:public.events
+      name: events
+      params: ${sources.src.params}
+      time_column: secs
+      time_format: unix_seconds
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: append }
+defaults:
+  expect: { oracle: src }
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE events (id int NOT NULL, ts timestamptz NOT NULL, secs bigint NOT NULL);
+        INSERT INTO events VALUES (1, '2031-05-01 10:00:00Z', 1935396000), (2, '2031-05-01 10:00:05Z', 1935396005);
+  - start: {}
+  - query: SELECT * FROM events
+  - source-exec: { src: "INSERT INTO events VALUES (3, '2031-05-01 10:00:05Z', 1935396005), (4, '2031-05-01 10:00:06Z', 1935396006)" }
+  - refresh: events
+  - query: SELECT * FROM events

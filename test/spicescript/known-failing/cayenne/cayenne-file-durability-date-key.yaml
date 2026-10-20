@@ -1,0 +1,47 @@
+name: cayenne-file-durability-date-key
+description: >
+  Change capture into Cayenne with `cayenne_cdc_durability: file` applies
+  deletes and updates to a table keyed on (int, date) as it does in the
+  default memory durability. Today the file path refuses the key ("Primary
+  key type not yet supported: Date32"), drops the dataset's change stream,
+  and the acceleration keeps serving the rows it had.
+sources:
+  src: { kind: postgres }
+variants:
+  memory: {}
+  file: { datasets: { '*': { acceleration: { params: { cayenne_cdc_durability: file } } } } }
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: cayenne-file-durability-date-key
+  datasets:
+    - from: postgres:public.tp
+      name: p
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 'p_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: '(id, at)' }
+    - from: postgres:public.ts
+      name: s
+      params: { $merge: '${sources.src.params}', pg_replication_slot: 's_${sources.src.namespace}' }
+      acceleration: { enabled: true, engine: cayenne, mode: file, refresh_mode: changes, primary_key: id }
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE tp (id int, at date, v int, PRIMARY KEY (id, at));
+        INSERT INTO tp SELECT g % 100, DATE '2025-01-01' + g / 100, g FROM generate_series(0, 999) g;
+        CREATE TABLE ts (id int PRIMARY KEY, v int);
+        INSERT INTO ts SELECT g, g FROM generate_series(1, 1000) g;
+  - start: {}
+  - source-exec: { src: "DELETE FROM tp WHERE id = 5; DELETE FROM ts WHERE id % 100 = 5" }
+  - query: SELECT count(*) AS n FROM p
+    oracle-sql: SELECT count(*) AS n FROM tp
+    eventually: 30s
+  - query: SELECT count(*) AS n FROM s
+    oracle-sql: SELECT count(*) AS n FROM ts
+    eventually: 30s
+  - source-exec: { src: "UPDATE tp SET v = -v WHERE at = DATE '2025-01-03'" }
+  - query: SELECT * FROM p
+    oracle-sql: SELECT * FROM tp
+    eventually: 30s

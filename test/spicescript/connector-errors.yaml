@@ -1,0 +1,98 @@
+name: connector-errors
+description: >
+  Beyond PostgreSQL (config-errors.yaml), a dataset whose source cannot be
+  reached, rejects its credentials, or lacks the table is reported in Error
+  with a message naming the dataset and its connector — MySQL, ClickHouse,
+  S3, MongoDB and Kafka — while a healthy dataset of each connector serves.
+  (Gaps: known-failing/api-and-errors/connector-errors-gaps.yaml.)
+
+sources:
+  my: { kind: mysql }
+  ch: { kind: clickhouse }
+  lake: { kind: rustfs }
+  mongo:
+    kind: docker
+    image: docker.io/library/mongo:8.0
+    ports: [27017]
+    command: [mongod, --replSet, rs0, --bind_ip_all]
+    ready: >-
+      mongosh --quiet --eval "try { rs.status().myState } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}); 0 }" | grep -qx 1
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: connector-errors
+  datasets:
+    - { from: 'mysql:t', name: my_healthy, params: '${sources.my.params}' }
+    - { from: 'mysql:t', name: my_bad_host, params: { $merge: '${sources.my.params}', mysql_host: no-such-host.invalid } }
+    - { from: 'mysql:t', name: my_bad_password, params: { $merge: '${sources.my.params}', mysql_pass: wrong } }
+    - { from: 'mysql:no_such_table', name: my_bad_table, params: '${sources.my.params}' }
+    - { from: 'clickhouse:t', name: ch_healthy, params: '${sources.ch.params}' }
+    - { from: 'clickhouse:t', name: ch_bad_host, params: { $merge: '${sources.ch.params}', clickhouse_host: no-such-host.invalid } }
+    - { from: 'clickhouse:t', name: ch_bad_password, params: { $merge: '${sources.ch.params}', clickhouse_pass: wrong } }
+    - { from: 's3://${sources.lake.bucket}/t/', name: s3_healthy, params: { $merge: '${sources.lake.params}', file_format: parquet } }
+    - { from: 's3://${sources.lake.bucket}/t/', name: s3_bad_host, params: { $merge: '${sources.lake.params}', file_format: parquet, s3_endpoint: 'http://no-such-host.invalid:9000' } }
+    - { from: 's3://${sources.lake.bucket}/t/', name: s3_bad_secret, params: { $merge: '${sources.lake.params}', file_format: parquet, s3_secret: wrong } }
+    - { from: 's3://no-such-bucket/t/', name: s3_bad_bucket, params: { $merge: '${sources.lake.params}', file_format: parquet } }
+    - { from: 's3://${sources.lake.bucket}/no_such_prefix/', name: s3_bad_prefix, params: { $merge: '${sources.lake.params}', file_format: parquet } }
+    - { from: 'mongodb:t', name: mg_healthy, params: { mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
+    - { from: 'mongodb:t', name: mg_bad_host, params: { mongodb_connection_string: 'mongodb://no-such-host.invalid:27017/x?tls=false' } }
+    - { from: 'mongodb:t', name: mg_bad_password, params: { mongodb_connection_string: 'mongodb://u:wrong@localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&tls=false' } }
+    - { from: 'mongodb:no_such_collection', name: mg_bad_table, params: { mongodb_connection_string: 'mongodb://localhost:${sources.mongo.port.27017}/${sources.mongo.namespace}?directConnection=true&replicaSet=rs0&tls=false' } }
+    - { from: 'kafka:no_such_host_topic', name: kf_bad_host, params: { kafka_bootstrap_servers: 'no-such-host.invalid:9092', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
+
+steps:
+  - source-exec: { my: "CREATE TABLE t (id int PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'a')" }
+  - source-exec: { ch: "CREATE TABLE t (id Int32, v String) ENGINE = MergeTree ORDER BY id; INSERT INTO t VALUES (1, 'a')" }
+  - source-exec: { mongo: "mongosh --quiet ${sources.mongo.namespace} --eval 'db.t.insertOne({id: 1, v: \"a\"})'" }
+  - generate:
+      lake: { table: t, rows: 1, seed: 1, files: 1, format: parquet, columns: [{ name: id, sequence: 1 }] }
+  - start: { ready: false }
+  - query: SELECT count(*) AS n FROM my_healthy
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM ch_healthy
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM s3_healthy
+    expect: { rows: [['1']] }
+    eventually: 60s
+  - query: SELECT count(*) AS n FROM mg_healthy
+    expect: { rows: [['1']] }
+    eventually: 60s
+
+  - assert-status: { dataset: my_bad_host, status: Error, message-contains: "Cannot connect to the dataset my_bad_host (mysql) on no-such-host.invalid:" }
+    eventually: 30s
+  - assert-status: { dataset: my_bad_password, status: Error, message-contains: "Cannot connect to the dataset my_bad_password (mysql). Authentication failed. Ensure that the username and password are correctly configured" }
+    eventually: 30s
+  - assert-status: { dataset: my_bad_table, status: Error, message-contains: "Failed to load the dataset my_bad_table (mysql). The table, 'no_such_table', was not found." }
+    eventually: 30s
+  - assert-status: { dataset: ch_bad_host, status: Error, message-contains: "Cannot connect to the dataset ch_bad_host (clickhouse) on no-such-host.invalid:" }
+    eventually: 30s
+  - assert-status: { dataset: ch_bad_password, status: Error, message-contains: "Failed to load the dataset ch_bad_password (clickhouse)" }
+    eventually: 30s
+  - assert-status: { dataset: s3_bad_host, status: Error, message-contains: "Cannot connect to the dataset s3_bad_host (s3)" }
+    eventually: 30s
+  - assert-status: { dataset: s3_bad_secret, status: Error, message-contains: "Cannot connect to the dataset s3_bad_secret (s3)" }
+    eventually: 30s
+  - assert-status: { dataset: s3_bad_bucket, status: Error, message-contains: "Cannot connect to the dataset s3_bad_bucket (s3)" }
+    eventually: 30s
+  - assert-status: { dataset: s3_bad_prefix, status: Error, message-contains: "No data files are yet available for the dataset s3_bad_prefix (s3)" }
+    eventually: 30s
+  - assert-status: { dataset: mg_bad_password, status: Error, message-contains: "Cannot connect to the dataset mg_bad_password (mongodb). Authentication failed." }
+    eventually: 30s
+  - assert-status: { dataset: mg_bad_table, status: Error, message-contains: "Failed to load the dataset mg_bad_table (mongodb). Unable to infer schema. Collection empty or non-existent: no_such_collection" }
+    eventually: 30s
+  - assert-status: { dataset: kf_bad_host, status: Error, message-contains: "Failed to load the dataset kf_bad_host (kafka)" }
+    eventually: 30s
+  # The MongoDB driver gives up selecting a server after 30 seconds.
+  - assert-status: { dataset: mg_bad_host, status: Error, message-contains: "Cannot connect to the dataset mg_bad_host (mongodb)" }
+    eventually: 60s

@@ -1,0 +1,48 @@
+name: connector-errors-gaps
+description: >
+  What the other connectors already do when a source is misconfigured: a
+  ClickHouse table that does not exist puts the dataset in Error naming the
+  table (today it is Ready, and only queries fail); a Kafka topic that does
+  not exist is named (today: "BrokerTransportFailure (Local: Broker
+  transport failure)"); rejected S3 credentials and an unreachable MongoDB
+  host say so in the same words as PostgreSQL and MySQL (today: the S3 XML
+  error body, and the MongoDB driver's topology dump); and querying an
+  acceleration whose load failed does not report it as still loading.
+
+sources:
+  ch: { kind: clickhouse }
+  lake: { kind: rustfs }
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://127.0.0.1:9092,external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: connector-errors-gaps
+  datasets:
+    - { from: 'clickhouse:no_such_table', name: ch_bad_table, params: '${sources.ch.params}' }
+    - { from: 'clickhouse:no_such_table', name: ch_bad_table_acc, params: '${sources.ch.params}', acceleration: { enabled: true, engine: cayenne } }
+    - { from: 'kafka:no_such_topic', name: kf_bad_topic, params: { kafka_bootstrap_servers: 'localhost:${sources.kafka.port.19092}', kafka_security_protocol: PLAINTEXT }, acceleration: { enabled: true, engine: cayenne, refresh_mode: append } }
+    - { from: 's3://${sources.lake.bucket}/t/', name: s3_bad_secret, params: { $merge: '${sources.lake.params}', file_format: parquet, s3_secret: wrong } }
+    - { from: 'mongodb:t', name: mg_bad_host, params: { mongodb_connection_string: 'mongodb://no-such-host.invalid:27017/x?tls=false' } }
+
+steps:
+  - start: { ready: false }
+  - assert-status: { dataset: ch_bad_table, status: Error, message-contains: no_such_table }
+    eventually: 30s
+  - assert-status: { dataset: kf_bad_topic, status: Error, message-contains: no_such_topic }
+    eventually: 30s
+  - assert-status: { dataset: s3_bad_secret, status: Error, message-contains: Authentication failed }
+    eventually: 30s
+  - assert-status: { dataset: mg_bad_host, status: Error, message-contains: Ensure that the host and port are correctly configured }
+    eventually: 60s
+  - assert-status: { dataset: ch_bad_table_acc, status: Error }
+    eventually: 30s
+  - query: SELECT * FROM ch_bad_table_acc
+    expect-error: no_such_table

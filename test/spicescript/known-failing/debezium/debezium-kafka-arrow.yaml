@@ -1,0 +1,97 @@
+name: debezium-kafka-arrow
+description: >
+  An Arrow acceleration of a Debezium topic in Kafka (`from: debezium:`)
+  starts and answers as PostgreSQL does after the snapshot and later changes.
+  (It fails to start: "Unable to restart Kafka offsets Failed to set partition
+  in list: Set partition offset error: UnknownPartition", on every run; the
+  same topic accelerated into Cayenne starts.)
+
+sources:
+  src: { kind: postgres }
+  # Two listeners: Debezium, in a container, reaches the broker as
+  # host.docker.internal; spiced, on the host, as 127.0.0.1.
+  kafka:
+    kind: docker
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.6
+    ports: [9092, 19092]
+    command: [redpanda, start, --smp, '1', --overprovisioned, --node-id, '0', --mode, dev-container,
+      --kafka-addr, 'internal://0.0.0.0:9092,external://0.0.0.0:19092',
+      --advertise-kafka-addr, 'internal://host.docker.internal:${port.9092},external://127.0.0.1:${port.19092}']
+    ready: rpk cluster health | grep -E 'Healthy:.+true'
+  # One Debezium Server per instance, each with its own slot, publication,
+  # offsets and topic.
+  dbz:
+    kind: docker
+    image: quay.io/debezium/server:3.1
+    host-network: true
+    command: [sleep, infinity]
+    ready: 'true'
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: debezium-kafka
+  datasets:
+    - from: debezium:${sources.src.namespace}.public.t
+      name: t
+      params:
+        kafka_bootstrap_servers: 127.0.0.1:${sources.kafka.port.19092}
+        kafka_security_protocol: plaintext
+      acceleration: { enabled: true, engine: arrow, mode: memory, refresh_mode: changes, primary_key: id, on_conflict: { id: upsert } }
+
+defaults:
+  expect: { oracle: src }
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id bigint PRIMARY KEY, v text, n bigint);
+        ALTER TABLE t REPLICA IDENTITY FULL;
+        INSERT INTO t SELECT g, 'v' || g, g * 10 FROM generate_series(1, 500) g;
+  # Debezium first, so the topic and its schema exist when spiced starts.
+  - source-exec:
+      dbz: >-
+        mkdir -p /tmp/${sources.src.namespace};
+        cd /debezium;
+        DEBEZIUM_SINK_TYPE=kafka
+        DEBEZIUM_SINK_KAFKA_PRODUCER_BOOTSTRAP_SERVERS=${sources.dbz.host_from_container}:${sources.kafka.port.9092}
+        DEBEZIUM_SINK_KAFKA_PRODUCER_KEY_SERIALIZER=org.apache.kafka.common.serialization.StringSerializer
+        DEBEZIUM_SINK_KAFKA_PRODUCER_VALUE_SERIALIZER=org.apache.kafka.common.serialization.StringSerializer
+        DEBEZIUM_SOURCE_CONNECTOR_CLASS=io.debezium.connector.postgresql.PostgresConnector
+        DEBEZIUM_SOURCE_OFFSET_STORAGE_FILE_FILENAME=/tmp/${sources.src.namespace}/offsets.dat
+        DEBEZIUM_SOURCE_OFFSET_FLUSH_INTERVAL_MS=0
+        DEBEZIUM_SOURCE_DATABASE_HOSTNAME=${sources.dbz.host_from_container}
+        DEBEZIUM_SOURCE_DATABASE_PORT=${sources.src.params.pg_port}
+        DEBEZIUM_SOURCE_DATABASE_USER=${sources.src.params.pg_user}
+        DEBEZIUM_SOURCE_DATABASE_PASSWORD=${sources.src.params.pg_pass}
+        DEBEZIUM_SOURCE_DATABASE_DBNAME=${sources.src.params.pg_db}
+        DEBEZIUM_SOURCE_TOPIC_PREFIX=${sources.src.namespace}
+        DEBEZIUM_SOURCE_TABLE_INCLUDE_LIST=public.t
+        DEBEZIUM_SOURCE_PLUGIN_NAME=pgoutput
+        DEBEZIUM_SOURCE_SLOT_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_SOURCE_PUBLICATION_NAME=dbz_${sources.src.namespace}
+        DEBEZIUM_FORMAT_VALUE=json
+        DEBEZIUM_FORMAT_KEY=json
+        QUARKUS_HTTP_PORT=${instance.port}
+        QUARKUS_LOG_FILE_ENABLE=false
+        nohup /debezium/run.sh > /tmp/${sources.src.namespace}/debezium.log 2>&1 < /dev/null &
+  - source-query: { kafka: "for i in $(seq 1 60); do rpk topic list | grep -q '${sources.src.namespace}.public.t' && break; sleep 1; done; rpk topic list | grep -c '${sources.src.namespace}.public.t'" }
+    expect: { rows: [['1']] }
+  - start: {}
+  - query: SELECT * FROM t
+    eventually: 120s
+
+  - source-exec:
+      src: |
+        INSERT INTO t SELECT g, 'later ' || g, g FROM generate_series(501, 600) g;
+        UPDATE t SET v = 'updated', n = n + 1 WHERE id % 7 = 0;
+        DELETE FROM t WHERE id % 13 = 0;
+        BEGIN;
+        UPDATE t SET n = -n WHERE id BETWEEN 100 AND 110;
+        DELETE FROM t WHERE id BETWEEN 200 AND 205;
+        INSERT INTO t VALUES (1000, 'in a transaction', 1);
+        COMMIT;
+  - query: SELECT * FROM t
+    eventually: 60s
+  - query: SELECT count(*) - count(DISTINCT id) AS duplicates FROM t
+    expect: { rows: [['0']] }
