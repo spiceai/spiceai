@@ -102,6 +102,16 @@ pub enum Error {
         message: String,
     },
 
+    /// The endpoint redirected to another origin, which a GraphQL request does not follow
+    /// because it would replay the query and the endpoint's credentials there.
+    #[snafu(display(
+        "The GraphQL endpoint redirected the request (HTTP {status}) to '{target_origin}', which is not followed because it leaves the endpoint's origin. Update `from` to the URL the endpoint redirects to. See: https://spiceai.org/docs/components/data-connectors/graphql"
+    ))]
+    RedirectNotFollowed {
+        status: reqwest::StatusCode,
+        target_origin: String,
+    },
+
     #[snafu(display(
         "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
     ))]

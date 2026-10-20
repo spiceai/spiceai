@@ -20,8 +20,9 @@ use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
 
 use super::{
-    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RefusalKind,
-    ReqwestInternalSnafu, Result, error_retry_after, is_gateway_error, is_retriable_error,
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RedirectNotFollowedSnafu,
+    RefusalKind, ReqwestInternalSnafu, Result, error_retry_after, is_gateway_error,
+    is_retriable_error,
     response::{
         ResponseBodyFormat, classify_response_body, json_parse_failure_detail,
         retry_after_from_headers, unexpected_response_error,
@@ -1288,6 +1289,16 @@ impl GraphQLClient {
             self.record_adaptive_outcome(RequestOutcome::Success);
         }
 
+        // The client follows redirects only within the endpoint's origin, so a redirect
+        // that reaches here was not followed, and its body is not the query's result.
+        if let Some(target) = data_components::http::redirect::redirect_target(&response) {
+            return RedirectNotFollowedSnafu {
+                status,
+                target_origin: target.origin().ascii_serialization(),
+            }
+            .fail();
+        }
+
         // Read the raw body first so we can classify it before JSON decoding.
         let response_bytes = response.bytes().await.context(ReqwestInternalSnafu)?;
         let http_elapsed = http_started.elapsed();
@@ -2533,6 +2544,89 @@ mod tests {
             assert!(
                 err.to_string().contains("/data/healthCheckProbe"),
                 "the message names the path that did not resolve: {err}"
+            );
+        }
+    }
+
+    /// Redirects over two mock servers on different ports — two origins — with the
+    /// client the connector builds.
+    mod redirects {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, Schema};
+        use reqwest::StatusCode;
+        use serde_json::json;
+        use url::Url;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::graphql::Error;
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{GraphQLQuery, UnnestBehavior};
+
+        /// A cross-origin 307 is not followed, and the GraphQL-shaped body it carries is
+        /// not taken as the query's result.
+        #[tokio::test]
+        async fn a_redirect_to_another_origin_fails_instead_of_returning_its_body() {
+            let endpoint = MockServer::start().await;
+            let other_origin = MockServer::start().await;
+            Mock::given(path("/graphql"))
+                .respond_with(
+                    ResponseTemplate::new(307)
+                        .insert_header("Location", format!("{}/graphql", other_origin.uri()))
+                        .set_body_json(json!({"data": {"items": [{"id": "redirect-body"}]}})),
+                )
+                .mount(&endpoint)
+                .await;
+            Mock::given(path("/graphql"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"data": {"items": [{"id": "other-origin"}]}})),
+                )
+                .mount(&other_origin)
+                .await;
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", endpoint.uri())).expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some("/data/items"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .build(
+                data_connector_api::default_spice_client("application/json")
+                    .expect("client to build"),
+            )
+            .expect("GraphQL client to build");
+            let query = GraphQLQuery::try_from(Arc::<str>::from("query { items { id } }"))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/items"));
+
+            let error = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect_err("a redirect that is not followed must fail the query");
+            match &error {
+                Error::RedirectNotFollowed {
+                    status,
+                    target_origin,
+                } => {
+                    assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT);
+                    assert_eq!(*target_origin, other_origin.uri());
+                }
+                other => panic!("expected RedirectNotFollowed, got {other:?}"),
+            }
+            assert_eq!(
+                other_origin
+                    .received_requests()
+                    .await
+                    .expect("recorded requests")
+                    .len(),
+                0,
+                "the query must not be replayed to the other origin"
             );
         }
     }
