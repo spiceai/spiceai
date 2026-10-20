@@ -85,10 +85,7 @@ pub async fn read_bytes(mut response: Response, limit: usize) -> Result<Bytes> {
     body.extend_from_slice(&first);
     let mut next = Some(second);
     while let Some(chunk) = next {
-        ensure!(
-            chunk.len() <= limit - body.len(),
-            TooLargeSnafu { limit }
-        );
+        ensure!(chunk.len() <= limit - body.len(), TooLargeSnafu { limit });
         body.extend_from_slice(&chunk);
         next = response.chunk().await.context(ReadSnafu)?;
     }

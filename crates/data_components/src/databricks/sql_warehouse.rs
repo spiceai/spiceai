@@ -1147,7 +1147,12 @@ impl SqlWarehouseApi {
         )
         .await
         .context(HttpRequestFailedSnafu)?;
-        let value = read_json(response.error_for_status().context(HttpRequestFailedSnafu)?).await?;
+        let value = read_json(
+            response
+                .error_for_status()
+                .context(HttpRequestFailedSnafu)?,
+        )
+        .await?;
         drop(rate_controller_permit);
         Ok(value)
     }
@@ -1314,7 +1319,9 @@ impl SqlWarehouseApi {
         .context(HttpRequestFailedSnafu)?;
         let result = match http_body_limit::read_bytes(response, MAX_RESULT_CHUNK_BYTES).await {
             Ok(bytes) => Ok(bytes),
-            Err(http_body_limit::Error::Read { source }) => Err(Error::HttpRequestFailed { source }),
+            Err(http_body_limit::Error::Read { source }) => {
+                Err(Error::HttpRequestFailed { source })
+            }
             Err(source) => Err(Error::ResponseBody { source }),
         };
         drop(rate_controller_permit);

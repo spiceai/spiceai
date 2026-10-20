@@ -291,8 +291,7 @@ impl UnityCatalog {
             tracing::debug!("list_schemas: Response status: {}", response.status());
 
             if response.status().is_success() {
-                let api_response: UCSchemaEnvelope =
-                    Self::read_json(response).await?;
+                let api_response: UCSchemaEnvelope = Self::read_json(response).await?;
                 Ok(Some(api_response.schemas))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -329,8 +328,7 @@ impl UnityCatalog {
             tracing::debug!("list_tables: Response status: {}", response.status());
 
             if response.status().is_success() {
-                let api_response: UCTableEnvelope =
-                    Self::read_json(response).await?;
+                let api_response: UCTableEnvelope = Self::read_json(response).await?;
                 Ok(Some(api_response.tables))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -365,8 +363,7 @@ impl UnityCatalog {
                 .await?;
 
             if response.status().is_success() {
-                let envelope: UCPermissionsEnvelope =
-                    Self::read_json(response).await?;
+                let envelope: UCPermissionsEnvelope = Self::read_json(response).await?;
                 Ok(Some(envelope))
             } else if response.status().as_u16() == 404 {
                 Ok(None)

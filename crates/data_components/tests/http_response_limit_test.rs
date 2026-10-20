@@ -76,7 +76,11 @@ async fn query_content(server: &MockServer) -> datafusion::error::Result<Vec<Str
     let ctx = SessionContext::new();
     ctx.register_table("origin", Arc::new(provider))
         .expect("register the table");
-    let batches = ctx.sql("SELECT content FROM origin").await?.collect().await?;
+    let batches = ctx
+        .sql("SELECT content FROM origin")
+        .await?
+        .collect()
+        .await?;
     Ok(batches
         .iter()
         .flat_map(|batch| {
