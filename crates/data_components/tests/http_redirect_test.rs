@@ -373,3 +373,48 @@ async fn token_request_is_not_replayed_to_another_origin() {
         "the client secret should not reach the other origin"
     );
 }
+
+/// Once a `POST` has been turned into a bare `GET` by a cross-origin 302, there is no
+/// body left to replay, so a later cross-origin 307 is followed like any other.
+#[tokio::test]
+async fn cross_origin_307_after_a_body_was_dropped_is_followed() {
+    let origins = Origins::start().await;
+    origins.redirect("/post", 302, &origins.attacker_url()).await;
+    Mock::given(path("/collect"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", origins.victim_url("/landing").as_str()),
+        )
+        .with_priority(1)
+        .mount(&origins.attacker)
+        .await;
+    Mock::given(path("/landing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(VICTIM_BODY))
+        .mount(&origins.victim)
+        .await;
+
+    let provider = origins
+        .provider(origins.victim_url("/"))
+        .await
+        .with_allowed_paths(vec!["/post".to_string()])
+        .expect("allowed paths should be valid")
+        .enable_body_filters(DEFAULT_MAX_BODY_BYTES);
+    let rows = query(
+        provider,
+        r#"SELECT content FROM t WHERE request_path = '/post' AND request_body = '{"secret":"body"}'"#,
+    )
+    .await
+    .expect("the bare GET's redirect should be followed");
+    assert_eq!(rows, vec![VICTIM_BODY.to_string()]);
+
+    let to_attacker = requests_to(&origins.attacker, "/collect").await;
+    assert_eq!(to_attacker.len(), 1);
+    assert_eq!(to_attacker[0].method.as_str(), "GET");
+    assert!(to_attacker[0].body.is_empty());
+    assert_eq!(credential_headers(&to_attacker[0]), no_credentials());
+
+    let landing = requests_to(&origins.victim, "/landing").await;
+    assert_eq!(landing.len(), 1);
+    assert_eq!(landing[0].method.as_str(), "GET");
+    assert_eq!(credential_headers(&landing[0]), no_credentials());
+}

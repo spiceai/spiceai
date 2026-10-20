@@ -1870,6 +1870,7 @@ impl HttpTableProvider {
         let Some(guard) = self.redirect_guard else {
             return Ok(response);
         };
+        let mut has_body = has_body;
         for _ in 0..MAX_REDIRECTS {
             let Some(target) = cross_origin_redirect_target(&response) else {
                 break;
@@ -1884,6 +1885,7 @@ impl HttpTableProvider {
                 endpoint_label(&target),
             );
             response = self.client.get(target).send().await?;
+            has_body = false;
         }
         Ok(response)
     }
