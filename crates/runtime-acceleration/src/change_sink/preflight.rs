@@ -45,6 +45,38 @@ struct Scoped {
 
 type InputKeyScopes = HashMap<Vec<ScalarValue>, usize>;
 
+/// A scope the write replaces, resolved against the target schema.
+#[derive(Debug, Clone)]
+pub struct ReplacedScope {
+    pub scope: SetKey,
+    /// The scope's primary-key values, in key order, when deleting the rows
+    /// that hold this key deletes exactly what deleting the scope would. That
+    /// holds when the scope fixes every primary-key column and every stored row
+    /// holding the key lies in a replaced scope: trivially when the scope is the
+    /// key itself, otherwise because the scope's incoming rows carry the key and
+    /// the stored-key probe refused any row holding it outside the replaced
+    /// scopes. An empty replacement is never probed, so it keeps its predicate.
+    pub primary_key: Option<Vec<ScalarValue>>,
+}
+
+/// Schema indices of the table's primary-key columns, in key order.
+#[must_use]
+pub fn primary_key_columns(context: &ChangeSinkContext) -> Option<Vec<usize>> {
+    let fields = context.table.schema().fields().len();
+    context
+        .table
+        .constraints()?
+        .iter()
+        .find_map(|constraint| match constraint {
+            Constraint::PrimaryKey(columns)
+                if !columns.is_empty() && columns.iter().all(|&index| index < fields) =>
+            {
+                Some(columns.clone())
+            }
+            _ => None,
+        })
+}
+
 /// Incoming unique keys of one probe, each with the inputs that carry it.
 type ProbeKeys = HashMap<Vec<ScalarValue>, Vec<usize>>;
 
@@ -56,13 +88,15 @@ type ProbeKeys = HashMap<Vec<ScalarValue>, Vec<usize>>;
 /// applied one at a time in order.
 ///
 /// Returns the replaced scopes, resolved against the target schema, in input order.
+/// Each carries its primary key when a delete by that key is exact; see
+/// [`ReplacedScope::primary_key`].
 pub async fn validate_scoped_inputs(
     context: &ChangeSinkContext,
     batches: &[RecordBatch],
     inputs: &[ScopedInput],
     cap: usize,
     ctx: &SessionContext,
-) -> Result<Vec<SetKey>> {
+) -> Result<Vec<ReplacedScope>> {
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
@@ -116,10 +150,28 @@ pub async fn validate_scoped_inputs(
     {
         return Err(member_refusal(position, error));
     }
+    let primary_key = primary_key_columns(context);
     Ok(scopes
         .into_iter()
         .filter(|scoped| scoped.replaces)
-        .map(|scoped| scoped.scope)
+        .map(|scoped| {
+            let primary_key = primary_key.as_deref().and_then(|columns| {
+                let is_key = scoped
+                    .grouping_columns
+                    .iter()
+                    .all(|column| columns.contains(column));
+                let probed = batches[scoped.batches.clone()]
+                    .iter()
+                    .any(|batch| batch.num_rows() > 0);
+                (is_key || probed)
+                    .then(|| scoped.scope.values_of(columns))
+                    .flatten()
+            });
+            ReplacedScope {
+                scope: scoped.scope,
+                primary_key,
+            }
+        })
         .collect())
 }
 
