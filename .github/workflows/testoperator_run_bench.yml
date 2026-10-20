@@ -707,12 +707,13 @@ jobs:
             #   branches cannot be updated): carry on in the next branch,
             #   <base>-2, <base>-3, ..., which gets its own PR.
             # Any other rejection fails the step.
+            remote_tip() { git ls-remote --heads origin "refs/heads/$1" | cut -f1; }
             suffix=1
             pushed=false
             for attempt in 1 2 3 4 5 6 7 8; do
               git checkout -B "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
-              remote_tip="$(git ls-remote --heads origin "refs/heads/${BRANCH_NAME}" | cut -f1)"
-              if [ -n "${remote_tip}" ]; then
+              tip_before="$(remote_tip "${BRANCH_NAME}")"
+              if [ -n "${tip_before}" ]; then
                 git pull --rebase origin "${BRANCH_NAME}"
               fi
               # Non-interactive: a credential helper on the runner can otherwise intercept
@@ -730,9 +731,10 @@ jobs:
                 echo "::notice::${BRANCH_NAME} is locked by the merge queue; pushing these snapshots to ${BASE_BRANCH}-${suffix} instead."
                 BRANCH_NAME="${BASE_BRANCH}-${suffix}"
               elif grep -qE 'fetch first|non-fast-forward' <<<"${push_log}" \
-                || [ "$(git ls-remote --heads origin "refs/heads/${BRANCH_NAME}" | cut -f1)" != "${remote_tip}" ]; then
+                || [ "$(remote_tip "${BRANCH_NAME}")" != "${tip_before}" ]; then
                 echo "::notice::Another run pushed to ${BRANCH_NAME} first (attempt ${attempt}); rebasing onto it and pushing again."
-                sleep $((attempt * 5))
+                # Jittered, so runs that collided do not retry in lockstep.
+                if [ "${attempt}" -lt 8 ]; then sleep $((RANDOM % 5 + 1)); fi
               else
                 echo "::error::Pushing the benchmark snapshots to ${BRANCH_NAME} was rejected for a reason other than a concurrent push or a queued branch; see the git output above."
                 exit 1
