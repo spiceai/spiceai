@@ -510,11 +510,11 @@ pub(crate) fn routes(
                 post(v1::responses::post).layer(ModelContextLayer),
             )
             .route(
-                "/v1/messages",
+                v1::messages::MESSAGES_PATH,
                 post(v1::messages::post).layer(ModelContextLayer),
             )
             .route(
-                "/v1/messages/count_tokens",
+                v1::messages::COUNT_TOKENS_PATH,
                 post(v1::messages::count_tokens),
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
@@ -684,6 +684,9 @@ pub(crate) fn routes(
         .merge(authenticated_router)
         .route_layer(middleware::from_fn(super::mtls::mtls_request_layer))
         .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        // The Messages API needs every `/v1/messages` error in its error envelope, including the
+        // shutdown, mTLS, auth, and body-limit rejections above, so this wraps them.
+        .route_layer(middleware::from_fn(v1::messages::encode_layer_errors))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&rt.df),
             track_metrics,

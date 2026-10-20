@@ -28,8 +28,10 @@ use std::time::Duration;
 
 use axum::{
     Extension, Json,
-    body::Bytes,
-    http::{HeaderMap, StatusCode},
+    body::{Body, Bytes},
+    extract::{MatchedPath, Request},
+    http::{HeaderMap, StatusCode, header},
+    middleware::Next,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -91,10 +93,70 @@ impl MessagesModels {
     }
 }
 
+pub(crate) const MESSAGES_PATH: &str = "/v1/messages";
+pub(crate) const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
+
+/// Marks a response already in the Messages API's error envelope, which [`encode_layer_errors`]
+/// leaves alone.
+#[derive(Debug, Clone, Copy)]
+struct MessagesEncoded;
+
+/// Largest error body read back from a layer in front of the handlers to reuse as the message.
+const MAX_LAYER_ERROR_BODY_BYTES: usize = 64 * 1024;
+
 /// `error` as a response: its status and the Messages API's error envelope.
 fn error_response(error: &MessagesError) -> Response {
     let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(error.to_envelope())).into_response()
+    let mut response = (status, Json(error.to_envelope())).into_response();
+    response.extensions_mut().insert(MessagesEncoded);
+    response
+}
+
+/// Middleware for the Messages routes that re-encodes errors from the layers in front of the
+/// handlers (API key auth, the mTLS gate, the body limit, shutdown, extractor rejections) as the
+/// Messages API's error envelope, typed by status as Anthropic's are, since Anthropic SDKs read
+/// that envelope on every error response. Other routes, successes, and responses already in the
+/// envelope pass through unchanged.
+pub(crate) async fn encode_layer_errors(req: Request<Body>, next: Next) -> Response {
+    let is_messages_path = |path: &str| path == MESSAGES_PATH || path == COUNT_TOKENS_PATH;
+    let is_messages = req.extensions().get::<MatchedPath>().map_or_else(
+        || is_messages_path(req.uri().path()),
+        |path| is_messages_path(path.as_str()),
+    );
+    if !is_messages {
+        return next.run(req).await;
+    }
+    let response = next.run(req).await;
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error())
+        || response.extensions().get::<MessagesEncoded>().is_some()
+    {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let text = axum::body::to_bytes(body, MAX_LAYER_ERROR_BODY_BYTES)
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .unwrap_or_default();
+    let message = if text.is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("Request failed")
+            .to_string()
+    } else {
+        text
+    };
+    let mut encoded = error_response(&MessagesError::from_response(
+        status.as_u16(),
+        message.as_bytes(),
+    ));
+    // Keep headers such as `WWW-Authenticate`; the body and its type are replaced.
+    for (name, value) in &parts.headers {
+        if *name != header::CONTENT_TYPE && *name != header::CONTENT_LENGTH {
+            encoded.headers_mut().append(name, value.clone());
+        }
+    }
+    encoded
 }
 
 /// The error for a request naming a model that cannot answer it.

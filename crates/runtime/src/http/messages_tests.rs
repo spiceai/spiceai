@@ -18,6 +18,7 @@ limitations under the License.
 //! mock providers: an Anthropic model, which receives the request as sent, and an `OpenAI`
 //! model, which receives it as a chat completion.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use app::AppBuilder;
@@ -32,7 +33,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use spicepod::component::model::Model;
-use spicepod::component::runtime::CorsConfig;
+use spicepod::component::runtime::{ApiKey, CorsConfig};
 use tower::ServiceExt;
 
 use crate::{Runtime, config::Config};
@@ -128,7 +129,7 @@ fn anthropic_events(message: &Value) -> String {
     events.push(json!({"type": "message_stop"}));
     events.iter().fold(String::new(), |mut sse, event| {
         let name = event["type"].as_str().expect("a type");
-        sse.push_str(&format!("event: {name}\ndata: {event}\n\n"));
+        write!(sse, "event: {name}\ndata: {event}\n\n").expect("writing to a String");
         sse
     })
 }
@@ -299,6 +300,27 @@ async fn runtime_with(models: Vec<Model>) -> Router {
 }
 
 async fn runtime_with_cors(models: Vec<Model>, cors: &CorsConfig) -> Router {
+    runtime_with_options(models, cors, None).await
+}
+
+/// A runtime whose routes accept only requests carrying `api_key`, as `runtime.auth.api_key`
+/// configures.
+async fn runtime_with_api_key(models: Vec<Model>, api_key: &str) -> Router {
+    let auth =
+        runtime_auth::api_key::ApiKeyAuth::new(vec![ApiKey::parse_str(&format!("{api_key}:rw"))]);
+    runtime_with_options(
+        models,
+        &CorsConfig::default(),
+        Some(runtime_auth::layer::http::AuthLayer::new(Arc::new(auth))),
+    )
+    .await
+}
+
+async fn runtime_with_options(
+    models: Vec<Model>,
+    cors: &CorsConfig,
+    auth: Option<runtime_auth::layer::http::AuthLayer>,
+) -> Router {
     let mut app = AppBuilder::new("messages");
     for model in models {
         app = app.with_model(model);
@@ -314,7 +336,7 @@ async fn runtime_with_cors(models: Vec<Model>, cors: &CorsConfig) -> Router {
         &rt,
         Arc::new(Config::new()),
         search,
-        None,
+        auth,
         cors,
         false,
         #[cfg(feature = "mcp")]
@@ -769,6 +791,66 @@ async fn any_other_chat_model_answers_through_its_chat_completions() {
             json!({"role": "assistant", "tool_calls": [{"id": "call_w", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]}),
             json!({"role": "tool", "content": "18C, sunny", "tool_call_id": "call_w"}),
         ]
+    );
+}
+
+/// With `runtime.auth` on, both Messages routes refuse a request without a valid API key with the
+/// Messages API's `authentication_error` envelope, which Anthropic SDKs read on every error, and
+/// answer one with the key; other routes keep their own error bodies.
+#[tokio::test]
+async fn a_request_without_a_valid_api_key_is_refused_with_the_messages_error_envelope() {
+    let seen = Seen::default();
+    let endpoint = start_provider(&seen).await;
+    let routes = runtime_with_api_key(
+        vec![model(
+            "claude",
+            "anthropic:claude-sonnet-4-6",
+            &endpoint,
+            &[],
+        )],
+        "spice-api-key",
+    )
+    .await;
+    taken(&seen);
+    let request = json!({"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": "ping"}]});
+
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let refused: [&[(&str, &str)]; 3] = [
+            &[],
+            &[("x-api-key", "not-the-key")],
+            &[("authorization", "Bearer not-the-key")],
+        ];
+        for headers in refused {
+            let (status, response_headers, body) = send(&routes, path, headers, &request).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} {headers:?}");
+            assert_eq!(
+                response_headers[header::CONTENT_TYPE],
+                "application/json",
+                "{path} {headers:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).expect("an envelope"),
+                json!({"type": "error", "error": {"type": "authentication_error", "message": "Unauthorized"}}),
+                "{path} {headers:?}"
+            );
+        }
+        let (status, _, body) =
+            send(&routes, path, &[("x-api-key", "spice-api-key")], &request).await;
+        assert_eq!(status, StatusCode::OK, "{path} with the API key: {body}");
+    }
+    assert_eq!(
+        taken(&seen)
+            .iter()
+            .map(|received| received.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/v1/messages", "/v1/messages/count_tokens"],
+        "only the requests with the API key reach the provider"
+    );
+
+    let (status, _, body) = send(&routes, "/v1/chat/completions", &[], &request).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::UNAUTHORIZED, "Unauthorized")
     );
 }
 
