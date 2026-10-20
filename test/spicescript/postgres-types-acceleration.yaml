@@ -115,3 +115,9 @@ steps:
     only: federated
 
   - assert-log: { clean: true }
+    except: turso-memory
+  # The in-memory Turso accelerator sometimes reports a write-write conflict on
+  # an append refresh; the refresh is retried and the queries above check the
+  # rows it lands.
+  - assert-log: { clean: true, allow: ['Failed to (load data for|refresh) dataset append_t \(postgres\): Failed to refresh dataset from the data connector: External error: Write-write conflict\.'] }
+    only: turso-memory

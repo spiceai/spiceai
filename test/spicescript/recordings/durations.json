@@ -79,7 +79,6 @@
   "postgres-catalog-cdc": 34,
   "postgres-cdc-atomicity": 36,
   "postgres-cdc-edge-values": 65,
-  "postgres-cdc-kill-during-compaction": 124,
   "postgres-cdc-parity": 68,
   "postgres-cdc-partitioned-table": 8,
   "postgres-cdc-random-queries": 46,

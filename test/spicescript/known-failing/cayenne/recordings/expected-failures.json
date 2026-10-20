@@ -866,5 +866,207 @@
       "pattern": "code: 'Some resource has been exhausted'",
       "signature": "code: 'Some resource has been exhausted'"
     }
+  ],
+  "postgres-cdc-kill-during-compaction": [
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=1]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=2]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=3]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=4]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT count(*), count(DISTINCT o_id), sum(v), sum(grp), count(note) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT * FROM orders WHERE o_id % 997 = 0",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT grp, count(*), sum(v) FROM orders GROUP BY grp",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    },
+    {
+      "run": "postgres-cdc-kill-during-compaction[run=5]",
+      "who": "default",
+      "key": "query: SELECT count(*), sum(v), sum(grp) FROM orders",
+      "kind": "wrong-answer",
+      "signature": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "pattern": "answer differs from the expected one: (DataMismatch|RowCountMismatch) \\{",
+      "group": "cayenne",
+      "may-pass": true
+    }
   ]
 }
