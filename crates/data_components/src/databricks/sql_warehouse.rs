@@ -76,6 +76,22 @@ mod datatypes;
 const SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS: usize = 8;
 const SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES: usize = 3;
 const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
+/// The most one result chunk may hold. Databricks documents no per-chunk maximum, so
+/// this sits well above the shared response limit: it exists to bound a hostile or
+/// broken response, not to shape legitimate results.
+const MAX_RESULT_CHUNK_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Decode a JSON response body read under [`http_body_limit::MAX_RESPONSE_BODY_BYTES`].
+async fn read_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, Error> {
+    http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+        .await
+        .context(ResponseBodySnafu)?
+        .json()
+        .await
+        .context(JsonParsingFailedSnafu)
+}
 
 type SharedSqlWarehouseKey = (String, String);
 type SharedSqlWarehouseEntry = (Arc<Semaphore>, usize);
@@ -273,6 +289,9 @@ pub enum Error {
         format_reqwest_error_chain(source)
     ))]
     JsonParsingFailed { source: reqwest::Error },
+
+    #[snafu(display("Failed to read a response from Databricks SQL Warehouse: {source}"))]
+    ResponseBody { source: http_body_limit::Error },
 
     #[snafu(display(
         "Databricks SQL Warehouse response is missing expected field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
@@ -1044,13 +1063,11 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            let value: Value = self
+            let response = self
                 .check_permanent_http_error(response)
                 .error_for_status()
-                .context(HttpRequestFailedSnafu)?
-                .json()
-                .await
-                .context(JsonParsingFailedSnafu)?;
+                .context(HttpRequestFailedSnafu)?;
+            let value: Value = read_json(response).await?;
             self.metrics
                 .statements_executed_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1086,13 +1103,11 @@ impl SqlWarehouseApi {
         )
         .await
         .context(HttpRequestFailedSnafu)?;
-        let value: Value = self
+        let response = self
             .check_permanent_http_error(response)
             .error_for_status()
-            .context(HttpRequestFailedSnafu)?
-            .json()
-            .await
-            .context(JsonParsingFailedSnafu)?;
+            .context(HttpRequestFailedSnafu)?;
+        let value: Value = read_json(response).await?;
         drop(rate_controller_permit);
 
         let warehouse_type = value
@@ -1132,12 +1147,7 @@ impl SqlWarehouseApi {
         )
         .await
         .context(HttpRequestFailedSnafu)?;
-        let value = response
-            .error_for_status()
-            .context(HttpRequestFailedSnafu)?
-            .json()
-            .await
-            .context(JsonParsingFailedSnafu)?;
+        let value = read_json(response.error_for_status().context(HttpRequestFailedSnafu)?).await?;
         drop(rate_controller_permit);
         Ok(value)
     }
@@ -1211,10 +1221,8 @@ impl SqlWarehouseApi {
                         };
 
                         match resp.error_for_status().context(HttpRequestFailedSnafu) {
-                            Ok(response) => match response
-                                .json()
+                            Ok(response) => match read_json(response)
                                 .await
-                                .context(JsonParsingFailedSnafu)
                                 .and_then(Self::extract_external_links)
                             {
                                 Ok(next) => next,
@@ -1291,7 +1299,7 @@ impl SqlWarehouseApi {
         self.check_permanently_disabled()?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let rate_controller_permit = self.acquire_rate_controller_permit().await?;
-        let result = send_request_with_retry_and_concurrency_limit(
+        let response = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
             || self.client.get(url),
@@ -1303,10 +1311,12 @@ impl SqlWarehouseApi {
         // storage links). A 403/404 here typically means an expired link,
         // not broken credentials/warehouse configuration.
         .error_for_status()
-        .context(HttpRequestFailedSnafu)?
-        .bytes()
-        .await
-        .context(HttpRequestFailedSnafu);
+        .context(HttpRequestFailedSnafu)?;
+        let result = match http_body_limit::read_bytes(response, MAX_RESULT_CHUNK_BYTES).await {
+            Ok(bytes) => Ok(bytes),
+            Err(http_body_limit::Error::Read { source }) => Err(Error::HttpRequestFailed { source }),
+            Err(source) => Err(Error::ResponseBody { source }),
+        };
         drop(rate_controller_permit);
         if result.is_ok() {
             self.metrics

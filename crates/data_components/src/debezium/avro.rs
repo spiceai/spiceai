@@ -223,6 +223,13 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
         if !status.is_success() {
             return Ok(Err(format!("HTTP {status}")));
         }
+        let response =
+            match http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES).await
+            {
+                Ok(response) => response,
+                Err(http_body_limit::Error::Read { source }) => return Err(source),
+                Err(too_large) => return Ok(Err(too_large.to_string())),
+            };
         Ok::<_, reqwest::Error>(Ok(response.json::<serde_json::Value>().await?))
     };
 

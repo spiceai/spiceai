@@ -39,6 +39,9 @@ pub enum Error {
     #[snafu(display("Failed to parse JSON response: {source}"))]
     JsonParse { source: reqwest::Error },
 
+    #[snafu(display("Failed to read the Elasticsearch response: {source}"))]
+    ResponseBody { source: http_body_limit::Error },
+
     #[snafu(display("Elasticsearch error (HTTP {status}): {message}"))]
     ElasticsearchError { status: u16, message: String },
 
@@ -444,8 +447,7 @@ impl Client {
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
-        let body = resp
-            .text()
+        let body = error_text(resp)
             .await
             .unwrap_or_default()
             .replace(['\n', '\r'], " ");
@@ -647,8 +649,7 @@ impl Client {
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     if resp.status().is_client_error() || resp.status().is_server_error() {
         let status = resp.status();
-        let body = resp
-            .text()
+        let body = error_text(resp)
             .await
             .unwrap_or_default()
             .replace(['\n', '\r'], " ");
@@ -657,7 +658,30 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
             message: body.trim().to_string(),
         });
     }
-    Ok(resp)
+    buffer_body(resp).await
+}
+
+/// Read a successful response's body into memory under
+/// [`http_body_limit::MAX_RESPONSE_BODY_BYTES`], so decoding it cannot allocate without
+/// bound. A failed read is reported as `JsonParse`, as decoding the body directly would.
+async fn buffer_body(resp: reqwest::Response) -> Result<reqwest::Response> {
+    http_body_limit::buffer(resp, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+        .await
+        .map_err(|e| match e {
+            http_body_limit::Error::Read { source } => Error::JsonParse { source },
+            source @ http_body_limit::Error::TooLarge { .. } => Error::ResponseBody { source },
+        })
+}
+
+/// The text of an error response, or `None` when it cannot be read whole under
+/// [`http_body_limit::MAX_RESPONSE_BODY_BYTES`].
+async fn error_text(resp: reqwest::Response) -> Option<String> {
+    http_body_limit::buffer(resp, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()
 }
 
 /// Longest `error.type` this client will echo. Elasticsearch exception class names are
@@ -714,18 +738,18 @@ fn error_class_from_body(body: &str) -> Option<String> {
 /// shape, are all that survive.
 async fn check_status_without_body(resp: reqwest::Response) -> Result<reqwest::Response> {
     if !(resp.status().is_client_error() || resp.status().is_server_error()) {
-        return Ok(resp);
+        return buffer_body(resp).await;
     }
 
     let status = resp.status().as_u16();
     // Nothing derived from `body` other than the exception class escapes this scope.
-    let class = match resp.text().await {
-        Ok(body) => error_class_from_body(&body),
-        // The body could not be read — a truncated or interrupted response. The status is
-        // still the actionable signal, and there is nothing left to classify; surfacing the
-        // transport error instead would reclassify an HTTP-status failure as a transport one
-        // and change how `is_transient` treats it.
-        Err(_) => None,
+    let class = match error_text(resp).await {
+        Some(body) => error_class_from_body(&body),
+        // The body could not be read — a truncated or interrupted response, or one past the
+        // size limit. The status is still the actionable signal, and there is nothing left
+        // to classify; surfacing the read error instead would reclassify an HTTP-status
+        // failure as a transport one and change how `is_transient` treats it.
+        None => None,
     };
 
     Err(Error::ElasticsearchError {

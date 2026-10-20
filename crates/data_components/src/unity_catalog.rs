@@ -27,7 +27,8 @@ use token_provider::TokenProvider;
 use tracing::Instrument;
 
 use crate::resilient_http::{
-    RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
+    RetryConfig, configure_client_builder, read_bounded_error_body,
+    send_request_with_retry_and_concurrency_limit,
 };
 
 pub mod credential_vending;
@@ -44,6 +45,9 @@ pub enum Error {
         "Failed to connect to the Unity Catalog API. Check the Unity Catalog API endpoint is valid and accessible. The following connection error occurred: {source}"
     ))]
     ConnectionError { source: reqwest::Error },
+
+    #[snafu(display("Failed to read a response from the Unity Catalog API: {source}"))]
+    ResponseBody { source: http_body_limit::Error },
 
     #[snafu(display(
         "Failed to connect to the Unity Catalog API. Check the Unity Catalog API endpoint is valid and accessible. The following HTTP status code was received when connecting: {status}"
@@ -231,7 +235,7 @@ impl UnityCatalog {
             let response = self.send_get_with_retry("get table", &path).await?;
 
             if response.status().is_success() {
-                let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
+                let api_response: UCTable = Self::read_json(response).await?;
                 Ok(Some(api_response))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -258,7 +262,7 @@ impl UnityCatalog {
             tracing::debug!("get_catalog: Response status: {}", response.status());
 
             if response.status().is_success() {
-                let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
+                let api_response: UCCatalog = Self::read_json(response).await?;
                 Ok(Some(api_response))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -288,7 +292,7 @@ impl UnityCatalog {
 
             if response.status().is_success() {
                 let api_response: UCSchemaEnvelope =
-                    response.json().await.context(ConnectionSnafu)?;
+                    Self::read_json(response).await?;
                 Ok(Some(api_response.schemas))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -326,7 +330,7 @@ impl UnityCatalog {
 
             if response.status().is_success() {
                 let api_response: UCTableEnvelope =
-                    response.json().await.context(ConnectionSnafu)?;
+                    Self::read_json(response).await?;
                 Ok(Some(api_response.tables))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -362,7 +366,7 @@ impl UnityCatalog {
 
             if response.status().is_success() {
                 let envelope: UCPermissionsEnvelope =
-                    response.json().await.context(ConnectionSnafu)?;
+                    Self::read_json(response).await?;
                 Ok(Some(envelope))
             } else if response.status().as_u16() == 404 {
                 Ok(None)
@@ -404,10 +408,10 @@ impl UnityCatalog {
 
             let status = response.status();
             if status.is_success() {
-                response.json().await.context(ConnectionSnafu)
+                Self::read_json(response).await
             } else if matches!(status.as_u16(), 400 | 401 | 403 | 404) {
                 let message =
-                    Self::sanitize_response_body(&response.text().await.unwrap_or_default());
+                    Self::sanitize_response_body(&read_bounded_error_body(response, 1024).await);
                 CredentialVendingDeniedSnafu {
                     table_id: table_id.to_string(),
                     status,
@@ -506,6 +510,17 @@ impl UnityCatalog {
             .await
             .context(RateControlSnafu)
             .map(Some)
+    }
+
+    /// Decode a JSON response body read under
+    /// [`http_body_limit::MAX_RESPONSE_BODY_BYTES`].
+    async fn read_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+        http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+            .await
+            .context(ResponseBodySnafu)?
+            .json()
+            .await
+            .context(ConnectionSnafu)
     }
 
     /// Collapses whitespace (including newlines) and truncates an HTTP
