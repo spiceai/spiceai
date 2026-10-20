@@ -58,6 +58,10 @@ runs:
       if: steps.download.outputs.found != 'true'
       uses: ./.github/actions/setup-rust
 
+    - name: Setup cc
+      if: steps.download.outputs.found != 'true' && runner.os == 'Linux'
+      uses: ./.github/actions/setup-cc
+
     - name: Build
       if: steps.download.outputs.found != 'true'
       shell: bash
