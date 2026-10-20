@@ -87,13 +87,15 @@ pub fn remove_if_tracked(id: &str) {
 }
 
 pub fn track_process(pid: u32, http_port: u16) {
-    if SHUTTING_DOWN.load(Ordering::SeqCst) {
-        if let Ok(raw) = i32::try_from(pid) {
-            let _ = nix::sys::signal::kill(Pid::from_raw(raw), Signal::SIGKILL);
-        }
-        return;
-    }
+    // Registered before the check, as containers are: a teardown that set the
+    // flag either drains this entry or is seen here, never neither.
     PROCESSES.lock().insert(pid, http_port);
+    if SHUTTING_DOWN.load(Ordering::SeqCst)
+        && PROCESSES.lock().remove(&pid).is_some()
+        && let Ok(raw) = i32::try_from(pid)
+    {
+        let _ = nix::sys::signal::kill(Pid::from_raw(raw), Signal::SIGKILL);
+    }
 }
 
 pub fn untrack_process(pid: u32) {

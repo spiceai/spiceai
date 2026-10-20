@@ -215,6 +215,8 @@ fn unescape(cell: &str) -> String {
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
             Some('0') => out.push('\0'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
             Some(other) => out.push(other),
             None => out.push('\\'),
         }
@@ -228,7 +230,11 @@ mod tests {
 
     #[test]
     fn tsv_keeps_null_apart_from_text_and_unescapes() {
-        let parsed = parse_tsv("id\tv\n1\t\\N\n2\t\\\\N\n3\ta\\tb\\nc\n4\t\n");
+        // Row 5 is what ClickHouse 24.8 prints for
+        // concat('a', char(8), 'b', char(12), 'c', char(7), char(11), char(0), '\\', char(39)).
+        let parsed = parse_tsv(
+            "id\tv\n1\t\\N\n2\t\\\\N\n3\ta\\tb\\nc\n4\t\n5\ta\\bb\\fc\u{7}\u{b}\\0\\\\\\'\n",
+        );
         let s = |v: &str| Some(v.to_string());
         assert_eq!(parsed.columns, vec!["id", "v"]);
         assert_eq!(
@@ -238,6 +244,7 @@ mod tests {
                 vec![s("2"), s("\\N")],
                 vec![s("3"), s("a\tb\nc")],
                 vec![s("4"), s("")],
+                vec![s("5"), s("a\u{8}b\u{c}c\u{7}\u{b}\0\\'")],
             ]
         );
     }
