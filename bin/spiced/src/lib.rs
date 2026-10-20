@@ -148,6 +148,7 @@ pub use cloud_connect::{
 mod connection_report;
 pub mod crash_handler;
 mod log_capture;
+pub mod open_file_limit;
 mod runtime_lock;
 pub use runtime_lock::{InstanceClaim, claim_instance_directory};
 #[path = "tracing.rs"]
