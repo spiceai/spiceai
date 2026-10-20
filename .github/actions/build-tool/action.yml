@@ -37,7 +37,7 @@ runs:
         sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
         dir=$([ "${{ inputs.profile }}" = dev ] && echo debug || echo release)
         features="${{ inputs.features }}"
-        echo "object=spice-minio/artifacts/${{ inputs.package }}/${os}-$(uname -m)/${sha}${features:+-${features//,/_}}/${{ inputs.package }}" >> "$GITHUB_OUTPUT"
+        echo "object=spice-minio/artifacts/${{ inputs.package }}/${os}-$(uname -m)/${{ inputs.profile }}/${sha}${features:+-${features//,/_}}/${{ inputs.package }}" >> "$GITHUB_OUTPUT"
         echo "path=$GITHUB_WORKSPACE/target/$dir/${{ inputs.package }}" >> "$GITHUB_OUTPUT"
 
     - name: Download from MinIO

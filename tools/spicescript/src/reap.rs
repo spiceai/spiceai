@@ -113,49 +113,30 @@ pub fn reap(work_dir: &Path) {
     remove_docker_leftovers(me);
 }
 
-/// The runner pid in a container or network name, `spicescript-<script>-<n>-<pid>-…`
-/// (some sources spell the script name with `-` for `_`, so the pid is found
-/// as the second of the first two numeric parts in a row).
-fn owner_in_name(name: &str) -> Option<i32> {
-    let parts: Vec<&str> = name.strip_prefix("spicescript-")?.split('-').collect();
-    parts.windows(2).find_map(|w| {
-        (w[0].bytes().all(|b| b.is_ascii_digit()) && !w[0].is_empty())
-            .then(|| w[1].parse().ok())
-            .flatten()
-    })
-}
-
-/// Ids and names of the containers (`kind` = `container`) or networks named
-/// `spicescript-…`.
-fn docker_names(kind: &str) -> Vec<(String, String)> {
-    let args: &[&str] = if kind == "network" {
-        &[
-            "network",
-            "ls",
-            "--filter",
-            "name=spicescript-",
-            "--format",
-            "{{.ID}} {{.Name}}",
-        ]
-    } else {
-        &[
-            "container",
-            "ls",
-            "-a",
-            "--filter",
-            "name=spicescript-",
-            "--format",
-            "{{.ID}} {{.Names}}",
-        ]
-    };
-    let Ok(out) = std::process::Command::new("docker").args(args).output() else {
+/// Ids and runner pids of the containers (`kind` = `container`) or networks
+/// this harness created: those carrying [`crate::docker::RUNNER_LABEL`].
+fn docker_owners(kind: &str) -> Vec<(String, i32)> {
+    let label = crate::docker::RUNNER_LABEL;
+    let filter = format!("label={label}");
+    let format = format!("{{{{.ID}}}} {{{{.Label \"{label}\"}}}}");
+    let mut args = vec![kind, "ls"];
+    if kind == "container" {
+        args.push("-a");
+    }
+    args.extend(["--filter", &filter, "--format", &format]);
+    let Ok(out) = std::process::Command::new("docker").args(&args).output() else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
+    owners(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parses `docker … ls` lines of `<id> <runner pid>`.
+fn owners(listing: &str) -> Vec<(String, i32)> {
+    listing
         .lines()
         .filter_map(|l| {
-            l.split_once(' ')
-                .map(|(id, name)| (id.to_string(), name.to_string()))
+            let (id, pid) = l.split_once(' ')?;
+            Some((id.to_string(), pid.trim().parse().ok()?))
         })
         .collect()
 }
@@ -166,7 +147,7 @@ fn remove_docker_leftovers(me: i32) {
     remove_docker_where(|pid| pid != me && !alive(pid), "left by runs that are gone");
 }
 
-/// Removes this runner's own containers and networks by name: the last
+/// Removes this runner's own containers and networks: the last
 /// sweep of a shutdown, for any created while it was already under way.
 pub(crate) fn remove_own_docker(me: i32) {
     remove_docker_where(|pid| pid == me, "this run started");
@@ -174,9 +155,9 @@ pub(crate) fn remove_own_docker(me: i32) {
 
 fn remove_docker_where(owned: impl Fn(i32) -> bool, whose: &str) {
     for (kind, remove) in [("container", ["rm", "-f"]), ("network", ["network", "rm"])] {
-        let ids: Vec<String> = docker_names(kind)
+        let ids: Vec<String> = docker_owners(kind)
             .into_iter()
-            .filter(|(_, name)| owner_in_name(name).is_some_and(&owned))
+            .filter(|(_, pid)| owned(*pid))
             .map(|(id, _)| id)
             .collect();
         if ids.is_empty() {
@@ -195,21 +176,12 @@ mod tests {
     use super::runner_pid;
 
     #[test]
-    fn a_docker_name_names_its_runner() {
-        use super::owner_in_name;
+    fn a_docker_listing_names_each_resources_runner() {
+        use super::owners;
         assert_eq!(
-            owner_in_name("spicescript-iceberg_refresh-0-6422-ice"),
-            Some(6422)
+            owners("abc 555\ndef 2147483647\nghi \njkl x\n"),
+            vec![("abc".to_string(), 555), ("def".to_string(), 2_147_483_647)]
         );
-        assert_eq!(
-            owner_in_name("spicescript-iceberg-coverage-0-98781-ice-store"),
-            Some(98781)
-        );
-        assert_eq!(
-            owner_in_name("spicescript-kafka_sasl-0-23656-kafka"),
-            Some(23656)
-        );
-        assert_eq!(owner_in_name("other-0-1-x"), None);
     }
 
     #[test]

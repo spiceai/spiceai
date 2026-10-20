@@ -82,9 +82,11 @@ impl Container {
                 .await
                 .is_err()
         {
+            let pid = std::process::id().to_string();
             docker
                 .create_network(bollard::network::CreateNetworkOptions {
                     name: network.as_str(),
+                    labels: HashMap::from([(RUNNER_LABEL, pid.as_str())]),
                     ..Default::default()
                 })
                 .await
@@ -121,6 +123,12 @@ impl Container {
             .collect();
         let config = Config::<String> {
             image: Some(spec.image.clone()),
+            labels: Some(
+                runner_label()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            ),
             env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
             cmd: spec.command.clone(),
             exposed_ports: Some(exposed),
@@ -410,6 +418,14 @@ async fn pull_if_missing(docker: &Docker, image: &str) -> Result<()> {
 /// one could take a port between this check and the container or `spiced`
 /// binding it. Each runner starts at its own offset so runners on one host
 /// rarely probe the same ports.
+/// The label naming the runner process that created a container or network,
+/// which the reaper reads to tell a live run's resources from a dead one's.
+pub const RUNNER_LABEL: &str = "spicescript.runner";
+
+fn runner_label() -> HashMap<&'static str, String> {
+    HashMap::from([(RUNNER_LABEL, std::process::id().to_string())])
+}
+
 pub fn free_port() -> Result<u16> {
     const LOW: u16 = 20000;
     const HIGH: u16 = 32768;
