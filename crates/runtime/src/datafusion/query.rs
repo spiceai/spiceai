@@ -1234,13 +1234,15 @@ impl Query {
         request_context: &Arc<RequestContext>,
         interactive: &Handle,
     ) -> bool {
-        let sql = match &self.sql {
+        let (sql, parameters) = match &self.sql {
             QueryMethod::Plan(plan)
             | QueryMethod::Text {
                 pre_parsed_plan: Some(plan),
                 ..
             } => return super::point_lookup::is_bounded_key_lookup(plan),
-            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Text {
+                sql, parameters, ..
+            } => (Arc::clone(sql), parameters.clone()),
         };
         let df = Arc::clone(&self.df);
         let mut session = self.get_session_state(request_context);
@@ -1249,7 +1251,7 @@ impl Query {
             .set_extension(Arc::clone(request_context));
         let plan_key = Query::shared_plans_cache_key(&df, &sql, request_context);
         let classify = Arc::clone(request_context).scope(async move {
-            df.get_or_create_logical_plan(&session, plan_key.as_ref(), &sql)
+            df.get_or_create_logical_plan(&session, plan_key.as_ref(), &sql, parameters.as_ref())
                 .await
                 .is_ok_and(|plan| super::point_lookup::is_bounded_key_lookup(&plan))
         });
