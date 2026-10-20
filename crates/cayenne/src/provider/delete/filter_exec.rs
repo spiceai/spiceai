@@ -484,6 +484,7 @@ impl DeletionFilterSource {
 /// child limit could under-produce. See audit finding R1.
 pub struct KeyBasedDeletionFilterExec {
     source: DeletionFilterSource,
+    table_name: Arc<str>,
     input: Arc<dyn ExecutionPlan>,
     /// Fused tombstone index of PK bytes -> (delete, insert) sequence numbers.
     tombstones: Arc<KeyDeletionIndex>,
@@ -508,6 +509,11 @@ impl KeyBasedDeletionFilterExec {
         self
     }
 
+    pub(crate) fn with_table_name(mut self, name: &str) -> Self {
+        self.table_name = Arc::from(name);
+        self
+    }
+
     /// Create a new key-based deletion filter execution plan.
     ///
     /// # Arguments
@@ -528,6 +534,7 @@ impl KeyBasedDeletionFilterExec {
         let properties = Arc::clone(input.properties());
         Self {
             source: DeletionFilterSource::Other,
+            table_name: Arc::from("unknown"),
             input,
             tombstones,
             insert_record_handling,
@@ -655,7 +662,8 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
                 Arc::clone(&self.row_converter),
                 self.min_delete_seq_to_apply,
             )
-            .with_source(self.source),
+            .with_source(self.source)
+            .with_table_name(&self.table_name),
         ))
     }
 
@@ -737,6 +745,10 @@ impl KeyBasedDeletionFilterExec {
             sorted_enabled,
             sorted_verify,
             sorted_scratch: SortedFilterScratch::new(),
+            counters: crate::provider::experiment_counters::read(
+                Arc::clone(&self.table_name),
+                self.source.label(),
+            ),
             min_delete_seq_to_apply,
             schema,
             metrics,
@@ -826,6 +838,7 @@ pub struct KeyBasedDeletionFilterStream {
     sorted_enabled: bool,
     sorted_verify: bool,
     sorted_scratch: SortedFilterScratch,
+    counters: Arc<crate::provider::experiment_counters::Counters>,
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
@@ -856,6 +869,7 @@ struct SortedFilterScratch {
     order: Vec<usize>,
     packed_pairs: Vec<(u128, usize)>,
     boundaries: Vec<usize>,
+    input_runs: usize,
     states: Vec<u8>,
     candidates: Vec<(usize, TombstoneEntry)>,
     deleted: Vec<usize>,
@@ -999,6 +1013,7 @@ fn sorted_deleted_rows_impl<C: KeyCompare>(
     );
     metrics.sorted_runs.add(cache.boundaries.len());
     cache.order.clear();
+    cache.input_runs = cache.boundaries.len();
     let permuted = cache.boundaries.len() > (n / 16).max(1);
     if permuted {
         if !same.packed_order(&mut cache.packed_pairs, &mut cache.order) {
@@ -1237,7 +1252,6 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
 
                     let sorted = if this.sorted_enabled {
                         let started = std::time::Instant::now();
-                        let permuted_before = this.metrics.permuted_rows.value();
                         let _sorted_timer = this.metrics.sorted_path_compute.timer();
                         match sorted_deleted_rows_into(
                             &this.pk_columns_scratch,
@@ -1249,11 +1263,29 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             &mut this.sorted_scratch,
                         ) {
                             Ok(()) => {
+                                let ns = usize::try_from(started.elapsed().as_nanos())
+                                    .unwrap_or(usize::MAX);
+                                let permuted =
+                                    this.sorted_scratch.input_runs > (batch_size / 16).max(1);
+                                this.counters.add(0, 1);
+                                this.counters.add(1, batch_size);
+                                this.counters
+                                    .add(if permuted { 13 } else { 12 }, batch_size);
+                                this.counters.add(if permuted { 3 } else { 2 }, 1);
+                                this.counters.add(if permuted { 5 } else { 4 }, ns);
+                                if permuted {
+                                    this.counters.add(
+                                        match this.sorted_scratch.input_runs {
+                                            0..=2 => 6,
+                                            3..=16 => 7,
+                                            17..=256 => 8,
+                                            _ => 9,
+                                        },
+                                        1,
+                                    );
+                                }
                                 add_key_delete_counter(0, batch_size);
-                                add_key_delete_counter(
-                                    1,
-                                    this.metrics.permuted_rows.value() - permuted_before,
-                                );
+                                add_key_delete_counter(1, if permuted { batch_size } else { 0 });
                                 add_key_delete_counter(
                                     4,
                                     usize::try_from(started.elapsed().as_nanos())
@@ -1315,6 +1347,13 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         // drops the buffers after probing instead of failing the query.
                         this.row_scratch.retain(rows);
                         if sorted.is_none() {
+                            this.counters.add(0, 1);
+                            this.counters.add(1, batch_size);
+                            this.counters.add(10, 1);
+                            this.counters.add(
+                                11,
+                                usize::try_from(started.elapsed().as_nanos()).unwrap_or(usize::MAX),
+                            );
                             add_key_delete_counter(2, batch_size);
                             add_key_delete_counter(
                                 5,
@@ -1343,6 +1382,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
                     add_key_delete_counter(3, this.deleted_scratch.len());
                     log_key_delete_counters();
+                    crate::provider::experiment_counters::log();
                     let keep_count = batch_size - this.deleted_scratch.len();
 
                     tracing::trace!(
@@ -2355,6 +2395,7 @@ mod tests {
             sorted_enabled: true,
             sorted_verify: true,
             sorted_scratch: SortedFilterScratch::new(),
+            counters: crate::provider::experiment_counters::read(Arc::from("test"), "other"),
             row_scratch: RowEncodingScratch::new(
                 datafusion_execution::TaskContext::default().memory_pool(),
                 1,
@@ -2825,6 +2866,7 @@ mod tests {
             sorted_enabled: true,
             sorted_verify: true,
             sorted_scratch: SortedFilterScratch::new(),
+            counters: crate::provider::experiment_counters::read(Arc::from("test"), "other"),
             row_scratch: RowEncodingScratch::new(
                 datafusion_execution::TaskContext::default().memory_pool(),
                 1,

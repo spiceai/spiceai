@@ -9799,7 +9799,8 @@ impl CayenneTableProvider {
                 staging_snapshot_id,
                 target_partitions,
                 None,
-                super::delta_encoding::WritePolicy::DELTA,
+                super::delta_encoding::WritePolicy::DELTA
+                    .with_path("write_stream_to_staging_snapshot"),
             )
             .await?;
         Ok(row_count)
@@ -11252,6 +11253,7 @@ impl CayenneTableProvider {
 
         let super::delta_encoding::WritePolicy {
             class: write_class,
+            path: write_path,
             fan_out,
             encode_budget,
             routing,
@@ -11361,6 +11363,8 @@ impl CayenneTableProvider {
         // full default strategy. See `provider::delta_encoding`.
         let encoding_level =
             super::delta_encoding::effective_level(self.context.delta_encoding(), write_class);
+        let enforce_pk_sort =
+            sort_on_write_enabled() && !preserve_order && !self.pk_column_indices.is_empty();
         let shard_config = self
             .write_shard_config(
                 target_partitions,
@@ -11389,18 +11393,47 @@ impl CayenneTableProvider {
                     config.range_bounds_estimated =
                         range.bounds_estimated && config.range_bounds.is_some();
                 }
+                // Routing can lead with an observed non-PK column. Sort the
+                // coordinated input by the PK and keep each shard's stable
+                // subsequence; a native routing-key sort would undo that order.
+                if enforce_pk_sort && config.shard_key_columns != self.table_metadata.primary_key {
+                    config.run_sort_bytes = None;
+                }
                 config
             });
-        let pre_sort = sort_on_write_enabled()
-            && !preserve_order
-            && range
-                .as_ref()
-                .is_none_or(|range| range.run_sort_bytes.is_none())
-            && !self.pk_column_indices.is_empty()
+        let pre_sort = enforce_pk_sort
             && shard_config.as_ref().is_none_or(|config| {
                 config.run_sort_bytes.is_none()
                     || config.shard_key_columns != self.table_metadata.primary_key
             });
+        // Write-policy labels distinguish bulk, delta, serial rewrite and range
+        // writers without adding persisted or user-facing configuration.
+        let write_counters = super::experiment_counters::write(
+            &self.table_metadata.table_name,
+            &format!(
+                "warm/{write_path}/{write_class:?}/{routing:?}/{fan_out:?}/sort_key={:?}/preserve_order={preserve_order}",
+                shard_config
+                    .as_ref()
+                    .map(|config| &config.shard_key_columns),
+            ),
+        );
+        let sort_reason = if self.pk_column_indices.is_empty() {
+            3
+        } else if preserve_order {
+            2
+        } else if shard_config
+            .as_ref()
+            .is_some_and(|config| config.run_sort_bytes.is_some())
+        {
+            6
+        } else if range
+            .as_ref()
+            .is_some_and(|range| range.run_sort_bytes.is_some())
+        {
+            4
+        } else {
+            5
+        };
         let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
             Some(strategy) => self
                 .context
@@ -11424,6 +11457,15 @@ impl CayenneTableProvider {
                 as Arc<dyn VortexWriteObserver>),
             (Some((_, index)), None) => Some(Arc::clone(index) as Arc<dyn VortexWriteObserver>),
             (None, caller) => caller,
+        };
+        let observer = if !pre_sort && sort_reason == 6 {
+            Some(Arc::new(super::write_sort::NativeSortObserver {
+                counters: Arc::clone(&write_counters),
+                keys: self.table_metadata.primary_key.clone(),
+                inner: observer,
+            }) as Arc<dyn VortexWriteObserver>)
+        } else {
+            observer
         };
         let write_format = match observer {
             Some(observer) => Arc::new(write_format.with_write_observer(observer)),
@@ -11569,14 +11611,15 @@ impl CayenneTableProvider {
             tracked_stream,
         ));
         let tracked_stream = if pre_sort {
-            super::write_sort::sort_stream(
+            super::write_sort::sort_stream_counted(
                 tracked_stream,
                 &self.table_metadata.primary_key,
                 &session_state.task_ctx(),
                 OVERWRITE_RUN_SORT_BYTES,
+                Some(Arc::clone(&write_counters)),
             )?
         } else {
-            tracked_stream
+            super::write_sort::observe_stream(tracked_stream, write_counters, sort_reason)
         };
         // The Vortex sink performs intra-write sharding internally (see
         // `write_shard_format` / `ShardSpec`), so the writer input is a single
@@ -11738,7 +11781,8 @@ impl CayenneTableProvider {
                         &snapshot_id,
                         shard_target_partitions,
                         estimated_bytes,
-                        super::delta_encoding::WritePolicy::DELTA,
+                        super::delta_encoding::WritePolicy::DELTA
+                            .with_path("encode_snapshot_shards_concurrently"),
                     )
                     .await
             }));
@@ -21165,7 +21209,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 1,
                 None,
-                rewrite_write_policy(rewrite_is_sorted),
+                rewrite_write_policy(rewrite_is_sorted).with_path("sort_and_rewrite_data"),
             )
             .await?;
 
@@ -22133,7 +22177,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                write_policy,
+                write_policy.with_path("rewrite_current_snapshot_small_file_subset"),
             )
             .await;
 
@@ -25852,7 +25896,7 @@ impl CayenneTableProvider {
                 // Compaction consolidates into a single output file, so it needs
                 // no size estimate.
                 None,
-                write_policy,
+                write_policy.with_path("rewrite_current_snapshot_holding_bounded"),
             )
             .await;
 
@@ -26617,6 +26661,20 @@ impl CayenneTableProvider {
             write_format,
             &self.pk_deletion_strategy,
         )?;
+        let counters =
+            super::experiment_counters::write(&self.table_metadata.table_name, "cold_sink");
+        let reason = if self.pk_column_indices.is_empty() {
+            3
+        } else if preserve_order {
+            4
+        } else if write_format
+            .write_shard()
+            .is_some_and(|config| config.run_sort_bytes.is_some())
+        {
+            6
+        } else {
+            5
+        };
         let stream = if sort_on_write_enabled()
             && (!preserve_order
                 || (!self.context.has_cluster_by()
@@ -26626,14 +26684,15 @@ impl CayenneTableProvider {
                 config.run_sort_bytes.is_none()
                     || config.shard_key_columns != self.table_metadata.primary_key
             }) {
-            super::write_sort::sort_stream(
+            super::write_sort::sort_stream_counted(
                 stream,
                 &self.table_metadata.primary_key,
                 &session_state.task_ctx(),
                 OVERWRITE_RUN_SORT_BYTES,
+                Some(Arc::clone(&counters)),
             )?
         } else {
-            stream
+            super::write_sort::observe_stream(stream, counters, reason)
         };
         let input: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingExec::new(self.table_schema(), stream));
@@ -26695,9 +26754,28 @@ impl CayenneTableProvider {
             super::delta_encoding::ShardRouting::Key,
             None,
         );
+        let observe_native_sort = shard.as_ref().is_some_and(|config| {
+            config.run_sort_bytes.is_some()
+                && config.shard_key_columns == self.table_metadata.primary_key
+        }) && !self.pk_column_indices.is_empty();
+        // The cold factory creates a fresh write-only format with no observers.
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
+        let write_format = if observe_native_sort {
+            Arc::new(write_format.with_write_observer(Arc::new(
+                super::write_sort::NativeSortObserver {
+                    counters: super::experiment_counters::write(
+                        &self.table_metadata.table_name,
+                        "cold_sink",
+                    ),
+                    keys: self.table_metadata.primary_key.clone(),
+                    inner: None,
+                },
+            )))
+        } else {
+            write_format
+        };
 
         // Session context with the COLD object store registered when configured
         // (S3 cold; may be a different bucket/endpoint than the warm store). A
@@ -28251,7 +28329,7 @@ impl CayenneTableProvider {
                 // The SAME value the shard count above was derived from, so the
                 // bounds cannot be cut for a different number of encoders than
                 // this write creates.
-                write_policy,
+                write_policy.with_path("compact_protected_snapshots_subset_inner"),
                 range_bounds.as_deref().map(|bounds| RangePartitioning {
                     column: None,
                     bounds,
@@ -29036,7 +29114,8 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WritePolicy::MAINTENANCE,
+                super::delta_encoding::WritePolicy::MAINTENANCE
+                    .with_path("bake_seq_prefix_protected_snapshots_inner"),
                 range_plan.as_ref().map(OverwriteRangePlan::partitioning),
             )
             .await;
@@ -36468,7 +36547,9 @@ impl CayenneTableProvider {
                     &self.get_current_snapshot_id(),
                     ctx.state().config().target_partitions(),
                     estimated_bytes,
-                    super::delta_encoding::WritePolicy::DELTA.preserving_order(),
+                    super::delta_encoding::WritePolicy::DELTA
+                        .preserving_order()
+                        .with_path("checkpoint_mem_tier_inner"),
                 )
                 .await?;
             // Clear under the publish locks (inner to the held fence), uniform
@@ -36514,7 +36595,8 @@ impl CayenneTableProvider {
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WritePolicy::DELTA,
+                        super::delta_encoding::WritePolicy::DELTA
+                            .with_path("checkpoint_mem_tier_inner"),
                         range_plan.as_ref().map(OverwriteRangePlan::partitioning),
                     )
                     .await?;
@@ -38146,7 +38228,8 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WritePolicy::DELTA,
+                super::delta_encoding::WritePolicy::DELTA
+                    .with_path("insert_to_new_snapshot_with_sequence"),
             )
             .await?;
 
@@ -38340,7 +38423,8 @@ impl CayenneTableProvider {
                         &self.get_current_snapshot_id(),
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WritePolicy::DELTA,
+                        super::delta_encoding::WritePolicy::DELTA
+                            .with_path("checkpoint_inlined_data"),
                     )
                     .await?;
                 stats
@@ -41066,7 +41150,8 @@ impl CayenneTableProvider {
                             Arc::clone(row_converter),
                             Some(min_delete_seq_to_apply),
                         )
-                        .with_source(DeletionFilterSource::ProtectedSnapshot),
+                        .with_source(DeletionFilterSource::ProtectedSnapshot)
+                        .with_table_name(&self.table_metadata.table_name),
                     ))
                 } else {
                     Ok(Arc::new(CayenneAccelerationExec::new(plan)))
@@ -41131,7 +41216,8 @@ impl CayenneTableProvider {
                             Arc::clone(row_converter),
                             None,
                         )
-                        .with_source(source),
+                        .with_source(source)
+                        .with_table_name(&self.table_metadata.table_name),
                     ));
                 }
             }
@@ -41213,7 +41299,8 @@ impl CayenneTableProvider {
                             Arc::clone(row_converter),
                             None,
                         )
-                        .with_source(DeletionFilterSource::Main),
+                        .with_source(DeletionFilterSource::Main)
+                        .with_table_name(&self.table_metadata.table_name),
                     ));
                 }
             }

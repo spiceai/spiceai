@@ -764,7 +764,7 @@ impl CayenneTableProvider {
                     &new_snapshot_id,
                     target_partitions,
                     None,
-                    write_policy,
+                    write_policy.with_path("begin_overwrite"),
                     Some(range_plan.as_ref().map_or_else(
                         RangePartitioning::hashed_run_sorted,
                         OverwriteRangePlan::partitioning,
@@ -999,6 +999,7 @@ impl CayenneTableProvider {
         // keeps to one encode stream, so it folds one file at a time: its
         // siblings fold alongside.
         let policy = WritePolicy {
+            path: write.write_policy.path,
             class: write.write_policy.class,
             fan_out: EncodeFanOut::PerCaller,
             encode_budget: write.write_policy.encode_budget,
@@ -1033,7 +1034,7 @@ impl CayenneTableProvider {
                             snapshot_id,
                             1,
                             None,
-                            policy,
+                            policy.with_path("fold_superseded_copies"),
                             None,
                         )
                         .await?;

@@ -163,7 +163,7 @@ impl CayenneTableProvider {
                 staging_snapshot_id,
                 write.target_partitions,
                 None,
-                write.write_policy,
+                write.write_policy.with_path("stage_resolving_repeats"),
                 None,
                 Some(Arc::clone(&file_stats) as _),
                 resolution.write_schema(),
@@ -230,7 +230,7 @@ impl CayenneTableProvider {
                     &new_snapshot_id,
                     write.target_partitions,
                     None,
-                    write.write_policy,
+                    write.write_policy.with_path("stage_resolved_append"),
                     None,
                     file_stats
                         .as_ref()

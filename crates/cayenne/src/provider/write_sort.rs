@@ -138,6 +138,7 @@ struct State {
     batch_size: Option<usize>,
     ended: bool,
     failed: bool,
+    counters: Option<Arc<super::experiment_counters::Counters>>,
 }
 impl State {
     async fn seal(&mut self) -> Result<()> {
@@ -167,6 +168,10 @@ impl State {
         loop {
             if let Some(run) = &mut self.sorted {
                 if let Some(batch) = run.next(self.batch_size.unwrap_or(8192))? {
+                    if let Some(counters) = &self.counters {
+                        counters.add(0, batch.num_rows());
+                    }
+                    super::experiment_counters::log();
                     return Ok(Some(batch));
                 }
                 self.sorted = None;
@@ -177,6 +182,10 @@ impl State {
                     .unwrap_or(8192)
                     .min(batch.num_rows() - *offset);
                 let result = batch.slice(*offset, rows);
+                if let Some(counters) = &self.counters {
+                    counters.add(1, rows);
+                }
+                super::experiment_counters::log();
                 *offset += rows;
                 if *offset == batch.num_rows() {
                     self.passthrough = None;
@@ -242,11 +251,22 @@ impl State {
 /// Emit stable PK-sorted runs, retaining at most `budget` input bytes plus one
 /// input batch. Pool refusal seals admitted rows and retries the pending batch;
 /// a batch that cannot be admitted alone passes through without sorting.
+#[cfg(test)]
 pub(crate) fn sort_stream(
     stream: SendableRecordBatchStream,
     keys: &[String],
     task: &Arc<TaskContext>,
     budget: u64,
+) -> Result<SendableRecordBatchStream> {
+    sort_stream_counted(stream, keys, task, budget, None)
+}
+
+pub(crate) fn sort_stream_counted(
+    stream: SendableRecordBatchStream,
+    keys: &[String],
+    task: &Arc<TaskContext>,
+    budget: u64,
+    counters: Option<Arc<super::experiment_counters::Counters>>,
 ) -> Result<SendableRecordBatchStream> {
     let schema = stream.schema();
     let indices: Vec<_> = keys
@@ -266,6 +286,7 @@ pub(crate) fn sort_stream(
         batch_size: None,
         ended: false,
         failed: false,
+        counters,
     };
     let output = futures::stream::unfold(state, |mut state| async move {
         if state.failed {
@@ -281,6 +302,75 @@ pub(crate) fn sort_stream(
         }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output)))
+}
+
+/// Count rows handed to a native shard sorter or excluded from the pre-sink sorter.
+pub(crate) fn observe_stream(
+    stream: SendableRecordBatchStream,
+    counters: Arc<super::experiment_counters::Counters>,
+    reason: usize,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream.map(move |result| {
+            if let Ok(batch) = &result {
+                counters.add(reason, batch.num_rows());
+            }
+            super::experiment_counters::log();
+            result
+        }),
+    ))
+}
+
+/// Inspect native shard-sort output at the sink's physical-position callback.
+/// This distinguishes successful sorting from input merely offered to a sorter.
+#[derive(Debug)]
+pub(crate) struct NativeSortObserver {
+    pub(crate) counters: Arc<super::experiment_counters::Counters>,
+    pub(crate) keys: Vec<String>,
+    pub(crate) inner: Option<Arc<dyn vortex_datafusion::VortexWriteObserver>>,
+}
+impl vortex_datafusion::VortexWriteObserver for NativeSortObserver {
+    fn batch_written(&self, path: &object_store::path::Path, position: u64, batch: &RecordBatch) {
+        let comparators = self
+            .keys
+            .iter()
+            .map(|key| {
+                let index = batch.schema().index_of(key)?;
+                let column = batch.column(index);
+                arrow::array::make_comparator(
+                    column.as_ref(),
+                    column.as_ref(),
+                    SortOptions {
+                        descending: false,
+                        nulls_first: true,
+                    },
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, arrow::error::ArrowError>>();
+        match comparators {
+            Ok(comparators) => {
+                let sorted = (1..batch.num_rows()).all(|row| {
+                    comparators
+                        .iter()
+                        .map(|compare| compare(row - 1, row))
+                        .find(|order| !order.is_eq())
+                        .is_none_or(|order| !order.is_gt())
+                });
+                self.counters
+                    .add(if sorted { 7 } else { 8 }, batch.num_rows());
+            }
+            Err(error) => {
+                self.counters.add(9, batch.num_rows());
+                tracing::info!(%error, "Cayenne prototype could not inspect native shard-sort output");
+            }
+        }
+        if let Some(inner) = &self.inner {
+            inner.batch_written(path, position, batch);
+        }
+        super::experiment_counters::log();
+    }
 }
 
 #[cfg(test)]

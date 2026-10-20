@@ -52,7 +52,7 @@ struct Advancer;
 impl SlotAdvancer for Advancer {
     async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
 }
-fn schema() -> Arc<Schema> {
+pub(super) fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("w", DataType::Int32, false),
         Field::new("d", DataType::Int32, false),
@@ -61,10 +61,10 @@ fn schema() -> Arc<Schema> {
         Field::new("v", DataType::Int64, false),
     ]))
 }
-fn keys() -> Vec<String> {
+pub(super) fn keys() -> Vec<String> {
     ["w", "d", "o", "line"].map(str::to_owned).to_vec()
 }
-fn batch(start: i32, n: i32) -> RecordBatch {
+pub(super) fn batch(start: i32, n: i32) -> RecordBatch {
     // Seeded shuffle varies all PK columns, including the last.
     let mut ids: Vec<_> = (start..start + n).collect();
     let mut state = 0x91ab_5234_7789_u64;
@@ -93,7 +93,7 @@ fn batch(start: i32, n: i32) -> RecordBatch {
     ];
     RecordBatch::try_new(schema(), columns).expect("audit input batch")
 }
-fn config() -> VortexConfig {
+pub(super) fn config() -> VortexConfig {
     VortexConfig {
         inline_max_rows: 0,
         inline_max_bytes: 0,
@@ -109,7 +109,7 @@ fn config() -> VortexConfig {
         ..VortexConfig::default()
     }
 }
-async fn table(
+pub(super) async fn table(
     f: &common::TestFixture,
     config: VortexConfig,
 ) -> (SessionContext, Arc<CayenneTableProvider>) {
@@ -189,12 +189,23 @@ async fn live_files(
     }
     files
 }
-async fn report(
+pub(super) async fn report(
     t: &Arc<CayenneTableProvider>,
     catalog: &CayenneCatalog,
     label: &str,
     enabled: bool,
     run_start: u64,
+) -> usize {
+    report_files(t, catalog, label, enabled, run_start, enabled).await
+}
+
+pub(super) async fn report_files(
+    t: &Arc<CayenneTableProvider>,
+    catalog: &CayenneCatalog,
+    label: &str,
+    enabled: bool,
+    run_start: u64,
+    require_sorted: bool,
 ) -> usize {
     t.drain_in_flight_maintenance()
         .await
@@ -271,7 +282,7 @@ async fn report(
         );
         total_rows += rows;
         assert!(rows > 0, "live data file is nonempty: {label} {path}");
-        if enabled {
+        if require_sorted {
             let counters = experiment_write_sort_counters();
             if label.starts_with("round_robin") && counters[4] >= 128 * 1024 * 1024 {
                 // Files can cross independently sorted run boundaries when
@@ -307,7 +318,7 @@ async fn report(
     }
     unsorted
 }
-async fn insert(t: &CayenneTableProvider, b: RecordBatch) {
+pub(super) async fn insert(t: &CayenneTableProvider, b: RecordBatch) {
     let rows = b.num_rows() as u64;
     assert_eq!(
         common::insert_batch(t, b).await.expect("audit append"),
@@ -322,7 +333,7 @@ async fn cdc_insert(t: &CayenneTableProvider, ctx: &SessionContext, batch: Recor
         .await
         .expect("CDC finalize");
 }
-async fn sql(ctx: &SessionContext, statement: &str) {
+pub(super) async fn sql(ctx: &SessionContext, statement: &str) {
     ctx.sql(statement)
         .await
         .expect("audit SQL")

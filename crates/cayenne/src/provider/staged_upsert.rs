@@ -530,7 +530,7 @@ impl CayenneTableProvider {
                 // Unknown size (the validation stream is consumed lazily); shard
                 // across the full write concurrency, matching `begin_staged_append`.
                 None,
-                WritePolicy::DELTA,
+                WritePolicy::DELTA.with_path("stage_upsert_data"),
             )
             .await
         {

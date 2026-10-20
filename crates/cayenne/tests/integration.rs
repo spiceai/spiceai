@@ -152,3 +152,5 @@ mod write_sort_ordering_test;
 mod composite_file_statistics_test;
 
 mod write_path_sortedness_audit;
+
+mod scan_sortedness;

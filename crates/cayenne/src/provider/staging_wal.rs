@@ -1257,7 +1257,7 @@ impl CayenneTableProvider {
                 // The prepared insert is a lazily-consumed stream of unknown
                 // size; shard across the full write concurrency (prior behavior).
                 None,
-                super::delta_encoding::WritePolicy::DELTA,
+                super::delta_encoding::WritePolicy::DELTA.with_path("begin_staged_append"),
             )
             .await
         {
