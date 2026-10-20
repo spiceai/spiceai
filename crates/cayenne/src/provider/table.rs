@@ -944,7 +944,7 @@ struct SnapshotScanListingRequest<'a> {
 /// The unpruned warm file set captured with a scan's inline and deletion views.
 /// Listing generations belong to this capture, never to a later live directory.
 #[derive(Clone)]
-struct CapturedSnapshotFiles {
+pub(crate) struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
@@ -1504,6 +1504,10 @@ struct RawScanInput {
     /// A checkpoint may add files to the same directory after capture; those files
     /// must not be unioned with this view's pre-checkpoint inline rows.
     warm_files: CapturedSnapshotFiles,
+    /// Each protected snapshot's files, keyed by the ids in
+    /// [`Self::protected_map`], captured under the same fence as
+    /// [`Self::warm_files`]. The protected-snapshot branches plan from these.
+    protected_files: Arc<HashMap<String, CapturedSnapshotFiles>>,
     /// Cold-tier manifest belonging to [`Self::current_snapshot_id`], resolved under
     /// the SAME held read fence (see
     /// [`CayenneTableProvider::cold_manifest_under_held_fence`]). `None` when the
@@ -14747,6 +14751,15 @@ impl CayenneTableProvider {
             state.config(),
         );
         let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+        // Listed under the fence (see `snapshot_file_list`); a file missed here
+        // only keeps its key deletes, but the listing would fill the cache entry
+        // queries read.
+        let captured = self
+            .capture_snapshot_files_under_fence(&snapshot_id)
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Position capture: failed to list snapshot files: {err}"),
+            })?;
         let listed = self
             .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
                 state: &state,
@@ -14758,7 +14771,7 @@ impl CayenneTableProvider {
                 limit: None,
                 scan_schema,
                 file_statistics_schema: self.table_schema(),
-                captured_files: None,
+                captured_files: Some(&captured),
             })
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -14952,22 +14965,24 @@ impl CayenneTableProvider {
     }
 
     /// Delete the files at `locations` from an unpublished snapshot, and release
-    /// what the Vortex caches hold for them: the fold reads them first.
+    /// what the Vortex caches hold for them (the fold reads them first) and the
+    /// directory's cached listing.
     pub(crate) async fn remove_snapshot_files(
         &self,
         snapshot_id: &str,
         locations: Vec<ObjectStorePath>,
     ) -> Result<()> {
         let table_name = self.table_metadata.table_name.clone();
-        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
-        ))
-        .map_err(|err| Error::Internal {
-            table: table_name.clone(),
-            message: format!("invalid snapshot URL: {err}"),
-        })?;
+        );
+        let table_url =
+            ListingTableUrl::parse(&snapshot_dir_url).map_err(|err| Error::Internal {
+                table: table_name.clone(),
+                message: format!("invalid snapshot URL: {err}"),
+            })?;
         let store = self
             .context
             .runtime_env()
@@ -14998,6 +15013,14 @@ impl CayenneTableProvider {
             }
         }
         self.invalidate_retired_paths(removed).await;
+        // The query that found the superseded copies listed this directory
+        // through the shared list-files cache, and nothing else is guaranteed to
+        // evict that listing: on network storage the rewrite runs through the
+        // direct compaction writer, whose own `RuntimeEnv` takes the eviction
+        // `DataFusion` makes when it plans the write. Evict it here, once the
+        // files are gone and whatever the deletes' outcome, so the published
+        // snapshot is never listed with them (spiceai/spiceai#15298).
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
         match first_error {
             Some(source) => Err(Error::ObjectStore {
                 operation: "delete superseded files",
@@ -33679,6 +33702,13 @@ impl CayenneTableProvider {
         // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
+        // The protected snapshots' file sets too: retention unlinks files in their
+        // directories, so they are listed under the fence like the current one
+        // (see `snapshot_file_list`), and every branch plans from this capture.
+        let protected_files = Arc::new(
+            self.capture_protected_snapshot_files(&protected_map)
+                .await?,
+        );
         // The secondary index answers for the files its runs cover, judged file
         // by file against this listing; retire what this listing no longer holds
         // before pinning it.
@@ -33746,6 +33776,7 @@ impl CayenneTableProvider {
             current_snapshot_id,
             lookup_index,
             warm_files,
+            protected_files,
             cold_files,
             structural_epoch,
             scan_guard,
@@ -33758,6 +33789,10 @@ impl CayenneTableProvider {
     /// Reuse an existing complete listing when its generations match; on a miss,
     /// enumerate file metadata only. Footer reads and query pruning stay outside
     /// the fence in `snapshot_files_with_stats`.
+    ///
+    /// The caller must hold `listing_fence.read()`: a miss lists through the
+    /// shared list-files cache (see [`Self::snapshot_file_list`]). A caller that
+    /// does not hold it uses [`Self::capture_snapshot_files_under_fence`].
     async fn capture_warm_files(
         &self,
         snapshot_id: &str,
@@ -33772,41 +33807,89 @@ impl CayenneTableProvider {
             Arc::clone(&cached.files)
         } else {
             let ctx = self.create_session_context();
-            let state = ctx.state();
-            let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
-                &self.table_metadata.path,
-                &self.table_metadata.table_id,
-                snapshot_id,
-            ))?;
-            let options = Self::create_listing_options(
-                self.context.file_format(),
-                &self.pk_deletion_strategy,
-                state.config(),
-            );
-            let request = SnapshotScanListingRequest {
-                state: &state,
-                table_url: &table_url,
-                options: &options,
-                partition_filters: &[],
-                data_filters: &[],
-                snapshot_id,
-                limit: None,
-                scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
-                file_statistics_schema: self.table_schema(),
-                captured_files: None,
-            };
-            let store = state.runtime_env().object_store(&table_url)?;
-            Arc::new(
-                self.snapshot_file_list(&request, &store)
-                    .await?
-                    .try_collect()
-                    .await?,
-            )
+            self.list_snapshot_dir_files(&ctx.state(), snapshot_id)
+                .await?
         };
         Ok(CapturedSnapshotFiles::new(
             dir_generation,
             listing_epoch,
             files,
+        ))
+    }
+
+    /// Every protected snapshot's unpruned file set, captured the way
+    /// [`Self::capture_warm_files`] captures the current snapshot's. The caller
+    /// must hold `listing_fence.read()`, for the same reason.
+    async fn capture_protected_snapshot_files(
+        &self,
+        protected: &HashMap<String, i64>,
+    ) -> datafusion_common::Result<HashMap<String, CapturedSnapshotFiles>> {
+        if protected.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
+        let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let mut captured = HashMap::with_capacity(protected.len());
+        for snapshot_id in protected.keys() {
+            let files = self.list_snapshot_dir_files(&state, snapshot_id).await?;
+            captured.insert(
+                snapshot_id.clone(),
+                CapturedSnapshotFiles::new(dir_generation, listing_epoch, files),
+            );
+        }
+        Ok(captured)
+    }
+
+    /// [`Self::capture_warm_files`] for a caller that does not hold the listing
+    /// fence: takes `listing_fence.read()` for the listing alone and releases it
+    /// before returning, so the caller plans and reads the captured files
+    /// without it. Must not be called with the fence already held — the fence
+    /// is fair, so a second read behind a queued writer deadlocks.
+    async fn capture_snapshot_files_under_fence(
+        &self,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<CapturedSnapshotFiles> {
+        let _fence = self.listing_fence.read().await;
+        self.capture_warm_files(snapshot_id).await
+    }
+
+    /// Lists `snapshot_id`'s data files, metadata only. The caller holds
+    /// `listing_fence.read()` (see [`Self::snapshot_file_list`]).
+    async fn list_snapshot_dir_files(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        ))?;
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        );
+        let request = SnapshotScanListingRequest {
+            state,
+            table_url: &table_url,
+            options: &options,
+            partition_filters: &[],
+            data_filters: &[],
+            snapshot_id,
+            limit: None,
+            scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
+            file_statistics_schema: self.table_schema(),
+            captured_files: None,
+        };
+        let store = state.runtime_env().object_store(&table_url)?;
+        Ok(Arc::new(
+            self.snapshot_file_list(&request, &store)
+                .await?
+                .try_collect()
+                .await?,
         ))
     }
 
@@ -39243,6 +39326,14 @@ impl CayenneTableProvider {
 
         for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
             let mut explain = super::lookup_index::LookupIndexExplain::not_applicable(None);
+            // Captured with the map under the scan's fence; listing the directory
+            // here, outside it, could cache a stale entry (see `snapshot_file_list`).
+            let captured_files = scan.protected_files.get(snapshot_id).ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Cayenne table {}: protected snapshot {snapshot_id} has no captured file set",
+                    self.table_metadata.table_name
+                ))
+            })?;
             let plan = self
                 .create_snapshot_scan_plan_with_config(
                     scan.state,
@@ -39264,7 +39355,7 @@ impl CayenneTableProvider {
                     // `target_partitions` ways: with tens of protected snapshots
                     // that multiplies file opens ~50× for no parallelism gain
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
-                    None,
+                    Some(captured_files),
                     scan.lookup_selection.clone(),
                     scan.pinned_lookup_index.clone(),
                     scan.lookup_selection.is_some().then_some(&mut explain),
@@ -39422,6 +39513,10 @@ impl CayenneTableProvider {
     /// Parquet listing scans on the new default, where the extra parallelism pays.
     const MAIN_SCAN_REPARTITION_OPT_OUT_BYTES: u64 = 10 * 1024 * 1024;
 
+    /// Plans an internal read of `snapshot_id`'s files: the PK keyset and bloom
+    /// builds, and compaction. Lists the directory under the listing fence and
+    /// plans from that capture without it (see [`Self::snapshot_file_list`]),
+    /// so it must not be called with the fence held.
     async fn create_snapshot_scan_plan(
         &self,
         state: &dyn Session,
@@ -39430,6 +39525,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let captured = self.capture_snapshot_files_under_fence(snapshot_id).await?;
         self.create_snapshot_scan_plan_with_config(
             state,
             snapshot_id,
@@ -39450,7 +39546,7 @@ impl CayenneTableProvider {
             // Internal reads (compaction, keyset) also benefit from keeping small
             // groups whole: merging N small runs otherwise pays N × tp footer opens.
             Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
-            None,
+            Some(&captured),
             None,
             None,
             None,
@@ -40238,6 +40334,22 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Lists a snapshot directory, from the manifest when the table scans from it
+    /// and otherwise through `DataFusion`'s list-files cache, which a miss fills
+    /// with what it read. That entry is the one every later scan of the directory
+    /// plans from, until a writer that changes the directory replaces or evicts it.
+    ///
+    /// So a listing that can miss must run under `listing_fence.read()` — even
+    /// when the caller itself tolerates a stale file set, as a PK bloom tolerates
+    /// a false positive. The hazard is the listing's side effect, not its result:
+    /// a writer changes the directory and evicts its entry under
+    /// `listing_fence.write()`, and an unfenced listing that read the directory
+    /// before the change caches it after the eviction. Every later scan then
+    /// plans over a file retention unlinked (failing to open it) or without one
+    /// an append published (silently missing its rows), and an append's
+    /// delta-apply merges onto that entry instead of correcting it. Hold the
+    /// fence only for the listing: capture the files under it and plan from the
+    /// capture (`captured_files`) without it.
     async fn snapshot_file_list<'a>(
         &'a self,
         request: &SnapshotScanListingRequest<'a>,
@@ -41407,18 +41519,27 @@ impl CayenneTableProvider {
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
-        let snapshot_id = self.get_current_snapshot_id();
-        let (store, files) = self
-            .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
-            .await?;
-        // A lookup reads the protected snapshots' files too (an upsert's rows
-        // stay there until compaction folds them in), so they are indexed with
-        // the current snapshot's.
-        let protected_map = self.protected_snapshots.load_full();
-        let (_, protected_files) = self
-            .lookup_index_protected_files(&protected_map)
-            .await
-            .ok()?;
+        // Listed under the fence even though the build tolerates a stale list —
+        // it re-lists the live files under the fence before publishing — because
+        // the listing fills the list-files cache entry queries read (see
+        // `snapshot_file_list`). The read-back that indexes the files runs after
+        // the fence is released.
+        let (store, files, protected_files) = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            let (store, files) = self
+                .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
+                .await?;
+            // A lookup reads the protected snapshots' files too (an upsert's rows
+            // stay there until compaction folds them in), so they are indexed with
+            // the current snapshot's.
+            let protected_map = self.protected_snapshots.load_full();
+            let (_, protected_files) = self
+                .lookup_index_protected_files(&protected_map)
+                .await
+                .ok()?;
+            (store, files, protected_files)
+        };
         let view = index_state.published();
         let mut seen: HashSet<String> = HashSet::new();
         let uncovered = files
@@ -41523,6 +41644,9 @@ impl CayenneTableProvider {
     /// are deliberately not applied: a file pruned away for one query still
     /// holds rows another query's key maps to, and an index built from a pruned
     /// subset would answer a later lookup with a false empty.
+    ///
+    /// Lists through `state`'s list-files cache; see [`Self::snapshot_file_list`]
+    /// for when the caller must hold `listing_fence.read()`.
     pub(crate) async fn snapshot_file_metadata(
         &self,
         state: &dyn Session,
@@ -42218,6 +42342,7 @@ impl CayenneTableProvider {
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
+        let protected_files = Arc::clone(&scan_view.raw.protected_files);
         let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
         // The inline rows are filtered against the file-side deletions captured with them.
         let captured_deletions = scan_view.raw.deletion_snapshot.clone();
@@ -42485,6 +42610,7 @@ impl CayenneTableProvider {
                 limit,
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
+                protected_files,
                 deletion_snapshot: &deletion_snapshot,
                 read_schema: Arc::clone(&read_schema),
                 file_statistics_schema: Arc::clone(&file_statistics_schema),
