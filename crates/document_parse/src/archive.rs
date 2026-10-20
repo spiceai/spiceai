@@ -544,24 +544,33 @@ fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
     (i >= 2 && &raw[i - 2..i] == b">>").then_some(i)
 }
 
-/// Start index of a `%` comment whose body reaches `pos`, if the comment is a
-/// real token (not a `%` inside a name or string) and no dictionary closer
-/// follows it before `pos`.
+/// Start index of a `%` comment on the same line whose body covers `pos`.
+///
+/// Comment spans are decided from the start of the line forward: the first `%`
+/// that begins a comment token (at line start, or after whitespace/a delimiter)
+/// owns the rest of the line. Bytes inside that span — including `>>` or a
+/// second `%` — are comment text, not dictionary syntax, so a legal comment
+/// between `>>` and `stream` cannot hide the stream.
 fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
+    if pos == 0 {
+        return None;
+    }
     let line_start = raw[..pos]
         .iter()
         .rposition(|&b| b == b'\n' || b == b'\r')
         .map_or(0, |newline| newline + 1);
-    let pct = raw[line_start..pos]
-        .iter()
-        .rposition(|&b| b == b'%')
-        .map(|offset| line_start + offset)?;
-    let token =
-        pct == line_start || is_pdf_whitespace(raw[pct - 1]) || is_pdf_delimiter(raw[pct - 1]);
-    if !token || raw[pct + 1..pos].windows(2).any(|pair| pair == b">>") {
-        return None;
+    let mut i = line_start;
+    while i < pos {
+        if raw[i] == b'%' {
+            let starts_comment =
+                i == line_start || is_pdf_whitespace(raw[i - 1]) || is_pdf_delimiter(raw[i - 1]);
+            if starts_comment {
+                return Some(i);
+            }
+        }
+        i += 1;
     }
-    Some(pct)
+    None
 }
 
 /// How far back from a dictionary closer its opening `<<` is looked for.
@@ -1596,6 +1605,70 @@ mod tests {
     fn rejects_a_chain_with_a_comment_before_stream() {
         let dict = b"<< /Filter [/FlateDecode /FlateDecode] >> % not a token\n";
         assert_chain_budgeted(dict, &double_flate());
+    }
+
+    /// A comment body may contain `>>` without ending the comment. That text
+    /// must not stop `dict_closer_before` from walking back to the real closer.
+    #[test]
+    fn rejects_a_chain_with_closer_text_inside_the_comment() {
+        let dict = b"<< /Filter [/FlateDecode /FlateDecode] >> % ignored >> ignored\n";
+        assert_chain_budgeted(dict, &double_flate());
+    }
+
+    /// A second `%` inside a comment is still comment text. Taking the last `%`
+    /// on the line would leave `ignored` as non-comment bytes and hide the
+    /// stream; the first comment-starting `%` owns the rest of the line.
+    #[test]
+    fn rejects_a_chain_with_a_percent_inside_the_comment() {
+        let dict = b"<< /Filter [/FlateDecode /FlateDecode] >> % ignored%again\n";
+        assert_chain_budgeted(dict, &double_flate());
+    }
+
+    /// Same closer-in-comment case as a loadable single-page PDF: Catalog /
+    /// Pages / Page / xref are present, and the comment sits between the
+    /// content dictionary's `>>` and `stream`.
+    #[test]
+    fn rejects_a_loadable_bomb_with_closer_text_inside_the_comment() {
+        let data = deflate(&flate_bomb());
+        let mut content = Vec::new();
+        content.extend_from_slice(b"<< /Length ");
+        content.extend_from_slice(data.len().to_string().as_bytes());
+        content.extend_from_slice(
+            b" /Filter [/FlateDecode /FlateDecode] >> % ignored >> ignored\nstream\n",
+        );
+        content.extend_from_slice(&data);
+        content.extend_from_slice(b"\nendstream");
+        let objs: [&[u8]; 4] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>",
+            content.as_slice(),
+        ];
+        let mut out = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(objs.len());
+        for (i, body) in objs.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_pos = out.len();
+        let n = objs.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF")
+                .as_bytes(),
+        );
+        let pdf = Bytes::from(out);
+        assert!(pdf.windows(b"xref".len()).any(|w| w == b"xref"));
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
     }
 
     /// NUL is PDF whitespace, so it cannot hide the dictionary from `stream`
