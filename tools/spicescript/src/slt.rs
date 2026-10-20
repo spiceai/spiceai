@@ -258,16 +258,25 @@ pub fn matches(query: &SltQuery, mut rows: Vec<Vec<String>>) -> bool {
         let digest = format!("{:x}", md5.finalize());
         return count == values.len().to_string() && hash == digest;
     }
-    // One value per line (SQLite's layout), or several per line separated by
-    // spaces (DataFusion's).
+    // One value per line (SQLite's layout), or one row per line with its
+    // values separated by spaces (DataFusion's). A text value may hold spaces
+    // itself, so a line is read as a row only when the record has several
+    // columns and the line splits into exactly one field per column.
     if query.expected.len() == values.len() {
         return query.expected == values;
     }
-    let split: Vec<&str> = query
-        .expected
-        .iter()
-        .flat_map(|line| line.split_whitespace())
-        .collect();
+    let columns = query.types.len();
+    if columns < 2 {
+        return false;
+    }
+    let mut split = Vec::with_capacity(values.len());
+    for line in &query.expected {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != columns {
+            return false;
+        }
+        split.extend(fields);
+    }
     split.len() == values.len() && split.iter().zip(&values).all(|(a, b)| a == b)
 }
 
@@ -361,5 +370,40 @@ mod tests {
             rows.clone()
         ));
         assert!(!matches(&query(SortMode::NoSort, &[&line], "IT"), rows));
+    }
+
+    #[test]
+    fn a_value_with_spaces_is_not_several_rows() {
+        let two_rows = vec![vec!["a".to_string()], vec!["b".to_string()]];
+        assert!(!matches(
+            &query(SortMode::NoSort, &["a b"], "T"),
+            two_rows.clone()
+        ));
+        assert!(matches(
+            &query(SortMode::NoSort, &["a", "b"], "T"),
+            two_rows
+        ));
+        let three_rows = vec![vec!["a".to_string()], vec!["b".into()], vec!["c".into()]];
+        assert!(!matches(
+            &query(SortMode::NoSort, &["a b", "c"], "T"),
+            three_rows
+        ));
+        // Several values per line must be one row per line.
+        let rows = vec![
+            vec!["1".to_string(), "2".into()],
+            vec!["3".into(), "4".into()],
+        ];
+        assert!(matches(
+            &query(SortMode::NoSort, &["1 2", "3 4"], "II"),
+            rows.clone()
+        ));
+        assert!(!matches(
+            &query(SortMode::NoSort, &["1 2 3 4"], "II"),
+            rows.clone()
+        ));
+        assert!(!matches(
+            &query(SortMode::NoSort, &["1", "2 3 4"], "II"),
+            rows
+        ));
     }
 }
