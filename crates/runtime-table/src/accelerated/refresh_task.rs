@@ -27,9 +27,10 @@ use crate::filter_converter::TimestampFilterConvert;
 use crate::filter_converter::create_timestamp_filter_convert;
 use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::{
-    array::{Array, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    array::{Array, ArrayRef, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
     datatypes::DataType,
     error::ArrowError,
+    row::{RowConverter, Rows, SortField},
 };
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
@@ -95,6 +96,7 @@ use snafu::{OptionExt, ResultExt};
 use spice_table::{LayerWalk, SpiceTable};
 use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
@@ -661,23 +663,16 @@ impl std::fmt::Debug for RefreshTask {
 /// Which stored rows an append's incoming rows are compared with, by the keep-newest
 /// selection and the exact-row dedupe.
 ///
-/// The stored side starts where the incoming rows can: after the high-water mark when
-/// the source was filtered by it, at the lowest incoming time otherwise. Widening it
-/// cannot cause a duplicate, but it is not free: the exact-row dedupe compares every
-/// incoming row with every stored row it selects, and on a time column where whole
-/// loads share one value, the stored rows *at* the high-water mark are the entire
-/// previous load (#15329).
+/// The comparison is always inclusive of the mark: widening the stored side can only
+/// add rows to compare with, never cause a duplicate, so the stored side needs no
+/// `>`/`>=` distinction of its own (the source filter keeps its strict `>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredRowsFrom {
     /// Nothing: a full load overwrites the stored rows, and an append into an empty
     /// acceleration has none.
     None,
-    /// The stored rows after the high-water mark the source filter used. That filter
-    /// is a strict `>` (widened on a day-granular column), so no incoming row holds the
-    /// mark itself, and this selects with the same filter.
-    After(u128),
-    /// The stored rows at or after a time an incoming row can hold: the lowest time
-    /// bound of the source files an append reads.
+    /// The stored rows at or after a mark: the high-water mark the source filter used,
+    /// or the lowest time the incoming rows can hold.
     From(u128),
     /// Every stored row, when no mark is safe.
     All,
@@ -686,7 +681,7 @@ enum StoredRowsFrom {
 impl StoredRowsFrom {
     /// The high-water mark an append read from the acceleration, when it has one.
     fn from_mark(mark: Option<u128>) -> Self {
-        mark.map_or(Self::None, Self::After)
+        mark.map_or(Self::None, Self::From)
     }
 
     fn from_seed(seed: SeedMark) -> Self {
@@ -700,7 +695,6 @@ impl StoredRowsFrom {
     fn filter(self, converter: &TimestampFilterConvert) -> Option<Expr> {
         match self {
             Self::None | Self::All => None,
-            Self::After(mark) => Some(converter.convert_high_water_mark(mark)),
             Self::From(mark) => Some(converter.convert_at_or_after_mark(mark)),
         }
     }
@@ -1930,9 +1924,6 @@ impl RefreshTask {
                     )
                 });
             let start = match stored_from {
-                StoredRowsFrom::After(value) if string_time => value
-                    .checked_sub(MAX_UTC_OFFSET_NANOS)
-                    .map_or(StoredRowsFrom::All, StoredRowsFrom::After),
                 StoredRowsFrom::From(value) if string_time => value
                     .checked_sub(MAX_UTC_OFFSET_NANOS)
                     .map_or(StoredRowsFrom::All, StoredRowsFrom::From),
@@ -2891,18 +2882,32 @@ impl RefreshTask {
         // and account for it. The normalized batches exist only for comparison: use their
         // de-duplication predicate to filter the original batch, then let the ordinary write
         // path perform its normal source-to-engine cast.
+        //
+        // The index is built with the first incoming batch, so an append that brings no
+        // rows does not encode the stored ones, and a stored column of the wrong type
+        // fails the refresh where the comparison would have.
+        let mut index: Option<Option<OverlapIndex>> = None;
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&output_schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
                     let source_batch = batch?;
                     let normalized_batch = try_cast_to(source_batch.clone(), Arc::clone(&filter_schema))
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let predicates = dedup_predicates(
-                        &normalized_batch,
-                        &existing_records,
-                        &filter_schema,
-                        &mut used,
-                    )
+                    if index.is_none() {
+                        index = Some(
+                            OverlapIndex::try_new(&existing_records, &filter_schema)
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                        );
+                    }
+                    let predicates = match index.as_mut().and_then(Option::as_mut) {
+                        Some(index) => index.predicates(&normalized_batch, &filter_schema, &mut used),
+                        None => dedup_predicates(
+                            &normalized_batch,
+                            &existing_records,
+                            &filter_schema,
+                            &mut used,
+                        ),
+                    }
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     let batch = filter_record_batch(&source_batch, &predicates.into())
                         .context(super::FailedToFilterUpdatesSnafu)
@@ -3749,7 +3754,10 @@ fn filter_records(
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
-    let predicates = dedup_predicates(update_data, existing_records, filter_schema, used)?;
+    let predicates = match OverlapIndex::try_new(existing_records, filter_schema)? {
+        Some(mut index) => index.predicates(update_data, filter_schema, used)?,
+        None => dedup_predicates(update_data, existing_records, filter_schema, used)?,
+    };
 
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
 }
@@ -3849,6 +3857,151 @@ fn dedup_predicates(
     }
 
     Ok(predicates)
+}
+
+/// The columns of `batch` that the de-duplication compares, in `filter_schema` order,
+/// each checked to hold the type the update stream was normalized to.
+fn dedup_columns(batch: &RecordBatch, filter_schema: &SchemaRef) -> super::Result<Vec<ArrayRef>> {
+    filter_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column_idx = batch
+                .schema()
+                .index_of(field.name())
+                .context(super::FailedToFilterUpdatesSnafu)?;
+            let column = batch.column(column_idx);
+            ensure_dedup_column_type(field.name(), field.data_type(), column.data_type())?;
+            Ok(Arc::clone(column))
+        })
+        .collect()
+}
+
+/// The stored rows of an append's overlap window, indexed so that an incoming row is
+/// compared only with the stored rows that encode the same, rather than with every one.
+///
+/// Each row is encoded with one [`RowConverter`]: two rows encode to equal bytes exactly
+/// when [`dedup_predicates`]'s comparator finds them equal (nulls equal to nulls, floats
+/// by their total order), and stored rows are bucketed by the hash of their encoding.
+/// That turns the subtraction from one comparison per (incoming, stored) pair, which
+/// never finished for a 600k-row load against 600k stored rows (#15329), into one hash
+/// lookup per incoming row. It is the same multiset subtraction: within a bucket the
+/// stored rows stay in stored order, and an incoming row claims the first unused one
+/// that encodes equal, as the pairwise comparison does.
+struct OverlapIndex {
+    converter: RowConverter,
+    hasher: RandomState,
+    /// The encoded rows of each stored batch, in `existing_records` order.
+    rows: Vec<Rows>,
+    buckets: HashMap<u64, OverlapBucket>,
+}
+
+/// The stored rows whose encodings share one hash, in stored order.
+#[derive(Default)]
+struct OverlapBucket {
+    positions: Vec<(usize, usize)>,
+    /// Every position before this one has been claimed, so a run of identical rows
+    /// is not rescanned from the start for each incoming copy.
+    first_unclaimed: usize,
+}
+
+impl OverlapIndex {
+    /// Indexes `existing_records`, or returns `None` when a compared column has a type
+    /// the row format cannot encode, which leaves the pairwise comparison to do it.
+    fn try_new(
+        existing_records: &[RecordBatch],
+        filter_schema: &SchemaRef,
+    ) -> super::Result<Option<Self>> {
+        let fields: Vec<SortField> = filter_schema
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect();
+        if !RowConverter::supports_fields(&fields) {
+            return Ok(None);
+        }
+        let converter = RowConverter::new(fields).context(super::FailedToFilterUpdatesSnafu)?;
+        let hasher = RandomState::new();
+        let mut rows = Vec::with_capacity(existing_records.len());
+        let mut buckets: HashMap<u64, OverlapBucket> = HashMap::new();
+        for (batch_idx, existing) in existing_records.iter().enumerate() {
+            let encoded = converter
+                .convert_columns(&dedup_columns(existing, filter_schema)?)
+                .context(super::FailedToFilterUpdatesSnafu)?;
+            for row_idx in 0..encoded.num_rows() {
+                buckets
+                    .entry(hasher.hash_one(encoded.row(row_idx)))
+                    .or_default()
+                    .positions
+                    .push((batch_idx, row_idx));
+            }
+            rows.push(encoded);
+        }
+        Ok(Some(Self {
+            converter,
+            hasher,
+            rows,
+            buckets,
+        }))
+    }
+
+    /// [`dedup_predicates`] for one incoming batch: `true` keeps a row the stored rows do
+    /// not hold, and each stored row cancels at most one incoming row across the stream,
+    /// recorded in `used`.
+    fn predicates(
+        &mut self,
+        update_data: &RecordBatch,
+        filter_schema: &SchemaRef,
+        used: &mut [Vec<bool>],
+    ) -> super::Result<Vec<bool>> {
+        if used.len() != self.rows.len()
+            || self
+                .rows
+                .iter()
+                .zip(used.iter())
+                .any(|(rows, used_rows)| rows.num_rows() != used_rows.len())
+        {
+            return Err(ArrowError::ComputeError(format!(
+                "append de-duplication state does not describe the rows being compared: \
+                 {} existing batches holding {} rows, against {} sets of {} claim flags",
+                self.rows.len(),
+                self.rows.iter().map(Rows::num_rows).sum::<usize>(),
+                used.len(),
+                used.iter().map(Vec::len).sum::<usize>(),
+            )))
+            .context(super::FailedToFilterUpdatesSnafu);
+        }
+
+        let incoming = self
+            .converter
+            .convert_columns(&dedup_columns(update_data, filter_schema)?)
+            .context(super::FailedToFilterUpdatesSnafu)?;
+        let mut predicates = Vec::with_capacity(incoming.num_rows());
+        for row in &incoming {
+            let claimed = self
+                .buckets
+                .get_mut(&self.hasher.hash_one(row))
+                .and_then(|bucket| {
+                    while let Some(&(batch_idx, row_idx)) =
+                        bucket.positions.get(bucket.first_unclaimed)
+                        && used[batch_idx][row_idx]
+                    {
+                        bucket.first_unclaimed += 1;
+                    }
+                    bucket.positions[bucket.first_unclaimed..]
+                        .iter()
+                        .copied()
+                        .find(|&(batch_idx, row_idx)| {
+                            !used[batch_idx][row_idx] && self.rows[batch_idx].row(row_idx) == row
+                        })
+                });
+            if let Some((batch_idx, row_idx)) = claimed {
+                used[batch_idx][row_idx] = true;
+            }
+            predicates.push(claimed.is_none());
+        }
+        Ok(predicates)
+    }
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
@@ -6170,6 +6323,84 @@ mod tests {
         assert_eq!(split, one_batch, "batching must not change the result");
     }
 
+    /// Differential test for #15329: the indexed subtraction keeps exactly the incoming
+    /// rows the pairwise comparison keeps, and claims exactly the same stored rows, over
+    /// seeded streams that repeat rows and mix nulls, `-0.0` and `0.0`, and NaN.
+    #[test]
+    fn overlap_index_matches_the_pairwise_comparison() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let names = [Some("a"), Some("b"), Some(""), None];
+        let scores = [Some(0.0), Some(-0.0), Some(f64::NAN), Some(1.5), None];
+
+        let (mut kept_total, mut cancelled_total) = (0_usize, 0_usize);
+        for seed in 1..=200_u64 {
+            let mut state = seed;
+            let mut next = move |bound: usize| {
+                // xorshift64
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                usize::try_from(state % u64::try_from(bound).expect("bound fits u64"))
+                    .expect("the remainder fits usize")
+            };
+            let batch = |next: &mut dyn FnMut(usize) -> usize| {
+                let rows = next(12);
+                let ids: Vec<Option<i32>> = (0..rows)
+                    .map(|_| match next(4) {
+                        0 => None,
+                        n => Some(i32::try_from(n).expect("small id")),
+                    })
+                    .collect();
+                let row_names: Vec<Option<&str>> =
+                    (0..rows).map(|_| names[next(names.len())]).collect();
+                let row_scores: Vec<Option<f64>> =
+                    (0..rows).map(|_| scores[next(scores.len())]).collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(ids)),
+                        Arc::new(StringArray::from(row_names)),
+                        Arc::new(Float64Array::from(row_scores)),
+                    ],
+                )
+                .expect("batch")
+            };
+            let existing: Vec<RecordBatch> = (0..3).map(|_| batch(&mut next)).collect();
+            let incoming: Vec<RecordBatch> = (0..4).map(|_| batch(&mut next)).collect();
+
+            let fresh = || -> Vec<Vec<bool>> {
+                existing.iter().map(|b| vec![false; b.num_rows()]).collect()
+            };
+            let (mut used_pairwise, mut used_indexed) = (fresh(), fresh());
+            let mut index = OverlapIndex::try_new(&existing, &schema)
+                .expect("index builds")
+                .expect("these types have a row encoding");
+            for update in &incoming {
+                let pairwise = dedup_predicates(update, &existing, &schema, &mut used_pairwise)
+                    .expect("pairwise");
+                let indexed = index
+                    .predicates(update, &schema, &mut used_indexed)
+                    .expect("indexed");
+                assert_eq!(indexed, pairwise, "kept rows differ for seed {seed}");
+                kept_total += pairwise.iter().filter(|keep| **keep).count();
+                cancelled_total += pairwise.iter().filter(|keep| !**keep).count();
+            }
+            assert_eq!(
+                used_indexed, used_pairwise,
+                "claimed stored rows differ for seed {seed}"
+            );
+        }
+        assert!(
+            kept_total > 0 && cancelled_total > 0,
+            "the streams must both keep and cancel rows to compare anything: \
+             kept {kept_total}, cancelled {cancelled_total}"
+        );
+    }
+
     /// End-to-end regression test for #12499 through the append dedup path: the accelerator
     /// holds one copy of a row inside the overlap window while the source now holds two, so
     /// exactly one copy must be appended.
@@ -6640,120 +6871,5 @@ mod tests {
             2,
             "the surviving row should be the new same-day row (id=2)"
         );
-    }
-
-    /// Regression test for #15329.
-    ///
-    /// When every row of a load shares one `time_column` value, the stored rows at the
-    /// high-water mark are the whole previous load. The source filter is a strict `>`,
-    /// so no incoming row can equal one of them, and reading them into the exact-row
-    /// dedupe only multiplies its pairwise comparisons: an append of 600k rows against
-    /// 600k stored rows never finished.
-    #[tokio::test]
-    async fn test_append_dedupe_does_not_compare_stored_rows_at_the_high_water_mark() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "created_at",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("id", DataType::Int32, false),
-        ]));
-        let loaded_at: i64 = 1_760_000_000_000_000_000;
-        let appended_at = loaded_at + 60_000_000_000;
-
-        let batch = |at: i64, ids: Vec<i32>| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(
-                        TimestampNanosecondArray::from(vec![at; ids.len()]).with_timezone("UTC"),
-                    ),
-                    Arc::new(Int32Array::from(ids)),
-                ],
-            )
-            .expect("batch")
-        };
-
-        let accelerator = Arc::new(
-            MemTable::try_new(
-                Arc::clone(&schema),
-                vec![vec![batch(loaded_at, vec![1, 2, 3])]],
-            )
-            .expect("accelerator mem table"),
-        ) as Arc<dyn TableProvider>;
-        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
-            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
-        )));
-        let task = RefreshTaskBuilder::new(
-            runtime_status::RuntimeStatus::new(),
-            TableReference::bare("test_append_single_time_load"),
-            federated,
-            None,
-            Arc::clone(&accelerator),
-            Handle::current(),
-            Arc::new(Mutex::new(())),
-        )
-        .build();
-        let refresh = Refresh::new(RefreshMode::Append)
-            .time_column("created_at".to_string())
-            .time_format(TimeFormat::Timestamptz);
-
-        let stored_from = high_water_mark(&task, &refresh).await;
-        let filter = stored_from
-            .filter(
-                &task
-                    .get_accelerator_filter_converter(&refresh)
-                    .expect("accelerator converter"),
-            )
-            .expect("a high-water mark selects the stored rows to compare");
-        let compared = SessionContext::new()
-            .read_table(Arc::clone(&accelerator))
-            .expect("read accelerator")
-            .filter(filter)
-            .expect("filter stored rows")
-            .count()
-            .await
-            .expect("count stored rows");
-        assert_eq!(
-            compared, 0,
-            "the three stored rows sit at the high-water mark, which the strict source filter \
-             never re-reads, so none of them belongs in the dedupe's comparison set"
-        );
-
-        // The next load, read by the source filter, is appended whole.
-        let update_stream: SendableRecordBatchStream = Box::pin(
-            MemoryStream::try_new(
-                vec![batch(appended_at, vec![4, 5, 6])],
-                Arc::clone(&schema),
-                None,
-            )
-            .expect("update stream"),
-        );
-        let collected = task
-            .except_existing_records_from(
-                &refresh,
-                StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                stored_from,
-            )
-            .await
-            .expect("dedupe")
-            .collect_data()
-            .await
-            .expect("collect");
-        let ids: Vec<i32> = collected
-            .data
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .expect("id column")
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        assert_eq!(ids, vec![4, 5, 6], "every row of the new load is appended");
     }
 }
