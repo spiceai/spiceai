@@ -50,6 +50,7 @@ use tokio::time::sleep;
 use url::Url;
 use util::fibonacci_backoff::{Backoff as _, FibonacciBackoffBuilder};
 
+use super::redirect::RedirectGuard;
 use crate::resilient_http::{
     configure_client_builder, read_bounded_error_body, send_request_with_retry,
 };
@@ -429,9 +430,13 @@ fn validate_token_url(url: &str) -> Result<()> {
     }
 }
 
+/// The token request carries the client secret or the refresh token, in the
+/// `Authorization` header or in a form body a 307 or 308 would replay, so it never
+/// follows a redirect off the token endpoint's origin.
 fn build_token_client() -> Result<Client> {
     configure_client_builder(ClientBuilder::new())
         .user_agent(util::spiceai_user_agent())
+        .redirect(RedirectGuard::same_origin_only().policy())
         .build()
         .context(BuildClientSnafu)
 }

@@ -40,6 +40,7 @@ use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, OAuth2Auth, OAuth2Config, OAuthGrant, TokenHeader,
 };
 use data_components::http::json_nest::HttpJsonNesting;
+use data_components::http::redirect::RedirectGuard;
 use data_components::rate_limit::RateLimiter;
 use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
 use secrecy::ExposeSecret;
@@ -76,6 +77,27 @@ const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 /// the GraphQL client's timeout for datasets that share an origin.
 pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// The redirect guard of every HTTP(S) dataset's client, and of the provider that
+/// re-issues the cross-origin redirects its policy stops at.
+const HTTP_REDIRECT_GUARD: RedirectGuard = RedirectGuard::new(is_internal_redirect_target);
+
+/// SSRF defense-in-depth: refuse to follow a redirect to an internal target. Reuses the
+/// URL-table SSRF classifier so the two guards stay in lock-step — covering loopback,
+/// private/RFC1918, link-local (incl. the cloud-metadata endpoint), unique-local, CGNAT,
+/// unspecified, multicast, and reserved ranges for both IPv4 and IPv6, including
+/// IPv4-mapped IPv6 forms like `::ffff:169.254.169.254`. Hostname redirects (e.g.
+/// `localhost`) can't be DNS-resolved in the synchronous redirect policy, so well-known
+/// internal names are rejected by literal match; reqwest resolves any remaining hostnames
+/// at connect time.
+fn is_internal_redirect_target(target: &Url) -> bool {
+    match target.host() {
+        Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
+        Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
+        None => false,
+    }
+}
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
@@ -976,32 +998,7 @@ impl Https {
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(connect_timeout)
             .timeout(client_timeout)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                const MAX_REDIRECTS: usize = 5;
-                if attempt.previous().len() >= MAX_REDIRECTS {
-                    return attempt.error("too many redirects");
-                }
-                // SSRF defense-in-depth: refuse to follow a redirect to an
-                // internal target. Reuses the URL-table SSRF classifier so the
-                // two guards stay in lock-step — covering loopback, private/
-                // RFC1918, link-local (incl. the cloud-metadata endpoint),
-                // unique-local, CGNAT, unspecified, multicast, and reserved
-                // ranges for both IPv4 and IPv6, including IPv4-mapped IPv6
-                // forms like `::ffff:169.254.169.254`. Hostname redirects (e.g.
-                // `localhost`) can't be DNS-resolved in this synchronous
-                // closure, so well-known internal names are rejected by literal
-                // match; reqwest resolves any remaining hostnames at connect time.
-                let to_internal = match attempt.url().host() {
-                    Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
-                    Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
-                    Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
-                    None => false,
-                };
-                if to_internal {
-                    return attempt.error("redirect to a private address is not allowed");
-                }
-                attempt.follow()
-            }))
+            .redirect(HTTP_REDIRECT_GUARD.policy())
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 
@@ -1307,6 +1304,7 @@ impl Https {
         .with_max_retry_duration(max_retry_duration)
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
+        .with_redirect_guard(HTTP_REDIRECT_GUARD)
         .with_max_request_partitions(max_request_partitions)
         .with_error_response_action(error_response_action)
         .with_dataset_name(dataset.name.to_string())
