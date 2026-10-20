@@ -215,28 +215,33 @@ fn deletion_vector_write_parallelizes_files_and_coalesces_dir_sync() {
     // The companion fsync — the parent directory — must still happen, so the
     // dirents for new deletion-vector files are durable before the catalog
     // is updated. It now lives in `DeletionVectorWriter::write`, ONCE per
-    // batch: the per-spec files are written CONCURRENTLY (`try_join_all`,
-    // overlapping their file fsyncs — on EBS this collapses N serialized
-    // ~1 ms barrier round-trips into ~1), and a single deletions/-dir sync
-    // after they all complete flushes every pending dirent at once. Same
-    // durability contract, 1/N the directory barriers.
+    // batch: the per-spec files are written CONCURRENTLY (a bounded
+    // `buffered` stream, overlapping their file fsyncs — on EBS this collapses
+    // N serialized ~1 ms barrier round-trips into ~1 per in-flight window),
+    // and a single deletions/-dir sync after they all complete flushes every
+    // pending dirent at once. Same durability contract, 1/N the directory
+    // barriers.
     let write_body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write")
         .expect("DeletionVectorWriter::write not found in delete/vector_io.rs");
-    // Accept either `join_all` or `try_join_all`: both poll every spec's write
-    // future concurrently (the property this guards). `write` uses `join_all`
-    // so that on error it waits for all sibling writers to finish before the
-    // cleanup unlinks their paths — `try_join_all` would short-circuit and let a
-    // still-running writer leak an orphan deletion vector past cleanup. What must
-    // never creep back is a serial `for … .await` loop over the specs.
-    // `contains("join_all")` alone already matches `try_join_all` (substring),
-    // but check both explicitly so the assertion visibly matches the "either is
-    // fine" intent above. A serial `for … .await` loop over the specs contains
-    // neither and correctly fails.
+    // Accept any combinator that polls the specs' write futures concurrently
+    // (the property this guards): `join_all`/`try_join_all`, or a
+    // `buffered`/`buffer_unordered` stream. `write` uses `StreamExt::buffered`
+    // capped at `DELETION_VECTOR_WRITE_CONCURRENCY`, so a checkpoint carrying
+    // thousands of delete sequences cannot occupy the whole blocking pool, and
+    // collects every result rather than short-circuiting, so that on error all
+    // sibling writers finish before the cleanup unlinks their paths. Match the
+    // call (`name(`), not the bare word, so a comment naming the combinator
+    // cannot satisfy the check. What must never creep back is a serial
+    // `for … .await` loop over the specs, which contains none of these calls
+    // and correctly fails.
     assert!(
-        write_body.contains("join_all") || write_body.contains("try_join_all"),
+        ["join_all(", "buffered(", "buffer_unordered("]
+            .iter()
+            .any(|call| write_body.contains(call)),
         "DeletionVectorWriter::write must write the batch's deletion-vector \
-         files concurrently (join_all/try_join_all) — serializing them \
-         re-introduces N fsync round-trips per batch on network-attached storage."
+         files concurrently (join_all, or a bounded buffered/buffer_unordered \
+         stream) — serializing them re-introduces N fsync round-trips per \
+         batch on network-attached storage."
     );
     // Exactly two dir syncs in `write`: the one-time snapshot-parent sync
     // (first deletion vector for the snapshot) and the per-batch coalesced
