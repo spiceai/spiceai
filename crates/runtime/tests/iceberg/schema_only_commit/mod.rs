@@ -290,6 +290,58 @@ fn column_names(batches: &[RecordBatch]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every row of `batches` (a `SELECT * … ORDER BY id`) is exactly the row
+/// [`write_table`] wrote, projected onto `change`'s current schema: `id = i`,
+/// field 2 = `3i` under its current name, `extra = 'x<i>'` while it survives,
+/// and the added `note` NULL.
+fn assert_rows_written(name: &str, change: Change, batches: &[RecordBatch]) -> anyhow::Result<()> {
+    let mut expected_id = 0_i64;
+    for batch in batches {
+        for (index, field) in batch.schema().fields().iter().enumerate() {
+            let column = batch.column(index);
+            for row in 0..batch.num_rows() {
+                let i = expected_id + i64::try_from(row)?;
+                match field.name().as_str() {
+                    "id" | "v" | "value" => {
+                        anyhow::ensure!(
+                            !column.is_null(row),
+                            "{name}: `{}` is NULL on row {i}",
+                            field.name()
+                        );
+                        let actual = column.as_primitive::<Int64Type>().value(row);
+                        let expected = if field.name() == "id" { i } else { i * 3 };
+                        anyhow::ensure!(
+                            actual == expected,
+                            "{name} ({change:?}): `{}` on row {i} is {actual}, expected {expected}",
+                            field.name()
+                        );
+                    }
+                    "extra" => {
+                        let actual =
+                            arrow::compute::cast(column, &arrow::datatypes::DataType::Utf8)?;
+                        let actual = actual.as_string::<i32>();
+                        anyhow::ensure!(
+                            !actual.is_null(row) && actual.value(row) == format!("x{i}"),
+                            "{name} ({change:?}): `extra` on row {i} must be 'x{i}'"
+                        );
+                    }
+                    "note" => anyhow::ensure!(
+                        column.is_null(row),
+                        "{name}: the added `note` must be NULL on row {i}"
+                    ),
+                    other => anyhow::bail!("{name}: unexpected column `{other}`"),
+                }
+            }
+        }
+        expected_id += i64::try_from(batch.num_rows())?;
+    }
+    anyhow::ensure!(
+        expected_id == ROWS,
+        "{name}: read {expected_id} rows, expected {ROWS}"
+    );
+    Ok(())
+}
+
 async fn scalar(rt: &Arc<Runtime>, sql: &str) -> anyhow::Result<i64> {
     let batches = run_query(rt, sql).await?;
     let column = batches
@@ -352,11 +404,7 @@ async fn a_schema_only_last_commit_reads_with_the_current_schema() -> anyhow::Re
                         change.columns(),
                         "SELECT * FROM {name} must return the current schema's columns"
                     );
-                    assert_eq!(
-                        all.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                        usize::try_from(ROWS)?,
-                        "SELECT * FROM {name} must return every row"
-                    );
+                    assert_rows_written(&name, change, &all)?;
 
                     let value = change.value_column();
                     assert_eq!(
