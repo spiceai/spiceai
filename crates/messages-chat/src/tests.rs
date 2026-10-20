@@ -383,20 +383,29 @@ async fn a_chunk_stream_becomes_a_message_event_stream() {
     );
 }
 
+/// A chunk stream that ends before the completion finishes is a message cut short: its end is an
+/// error, never a `message_stop`, which would present the partial message as whole.
 #[tokio::test]
-async fn an_empty_chunk_stream_is_still_a_whole_message() {
+async fn a_chunk_stream_that_ends_unfinished_ends_with_an_error() {
+    let incomplete = json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' ended its stream before finishing the message, so the message is incomplete."}});
+    let partial = events(vec![Ok(chunk(
+        &json!({"index": 0, "delta": {"content": "Partial"}, "finish_reason": null}),
+    ))])
+    .await;
     assert_eq!(
-        events(vec![])
-            .await
-            .into_iter()
+        partial
+            .iter()
             .map(|event| event["type"].clone())
             .collect::<Vec<_>>(),
         [
             json!("message_start"),
-            json!("message_delta"),
-            json!("message_stop")
+            json!("content_block_start"),
+            json!("content_block_delta"),
+            json!("error")
         ]
     );
+    assert_eq!(partial.last(), Some(&incomplete));
+    assert_eq!(events(vec![]).await, [incomplete]);
 }
 
 #[tokio::test]

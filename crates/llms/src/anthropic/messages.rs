@@ -215,16 +215,29 @@ impl Messages for AnthropicMessages {
 /// is the event's name.
 #[derive(Default)]
 struct SseDecoder {
+    /// The stream so far, its line endings written as LF.
     buffer: Vec<u8>,
+    /// Whether the last byte was a CR, whose CRLF a LF at the start of the next chunk completes.
+    after_cr: bool,
 }
 
 impl SseDecoder {
     /// Adds `chunk` and returns the data of each event it completes.
     fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        // A Messages API event's data is JSON, in which a carriage return is always escaped, so
-        // one in the stream only ever ends a line.
-        self.buffer
-            .extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
+        // A line ends with LF, CRLF or CR. Each is written as LF as soon as it arrives, so an
+        // event is dispatched at its blank line rather than when the next chunk shows whether a
+        // CR began a CRLF; the LF of a CRLF is then dropped, in whichever chunk it comes.
+        for &byte in chunk {
+            if std::mem::take(&mut self.after_cr) && byte == b'\n' {
+                continue;
+            }
+            if byte == b'\r' {
+                self.buffer.push(b'\n');
+                self.after_cr = true;
+            } else {
+                self.buffer.push(byte);
+            }
+        }
         let mut events = Vec::new();
         while let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\n\n") {
             let block: Vec<u8> = self.buffer.drain(..end + 2).collect();
@@ -345,6 +358,28 @@ mod tests {
             ]
         );
         assert!(decoder.buffer.is_empty());
+    }
+
+    /// An event ends at a blank line, whichever of LF, CRLF or CR ends its lines, even when a
+    /// CRLF is split across chunks.
+    #[test]
+    fn events_end_at_a_blank_line_with_any_line_ending() {
+        let event = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        for ending in ["\n", "\r\n", "\r"] {
+            let stream = event.replace('\n', ending);
+            for size in [1, 2, 3, stream.len()] {
+                let mut decoder = SseDecoder::default();
+                let mut events = Vec::new();
+                for chunk in stream.as_bytes().chunks(size) {
+                    events.extend(decoder.push(chunk));
+                }
+                assert_eq!(
+                    events,
+                    ["{\"type\":\"ping\"}"],
+                    "{ending:?} in chunks of {size}"
+                );
+            }
+        }
     }
 
     #[test]

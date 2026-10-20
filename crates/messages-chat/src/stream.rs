@@ -218,6 +218,23 @@ impl Translator {
         Ok(events)
     }
 
+    /// The events that end the stream when the chunks ran out: those of [`Self::finish`] when the
+    /// completion finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `api_error` when the chunks ran out before the completion finished: the message
+    /// was cut short, and ending it with `message_stop` would present it as whole.
+    pub fn end(self) -> Result<Vec<StreamEvent>, MessagesError> {
+        if self.finish_reason.is_none() {
+            return Err(MessagesError::api(format!(
+                "Model '{}' ended its stream before finishing the message, so the message is incomplete.",
+                self.model
+            )));
+        }
+        Ok(self.finish())
+    }
+
     /// The events that end the stream: the open block's stop, `message_delta` with the stop
     /// reason and the usage of the whole message, and `message_stop`.
     #[must_use]
@@ -297,10 +314,11 @@ pub fn message_stream(chunks: ChatCompletionResponseStream, model: String) -> Me
                     state.translator = None;
                     state.queue.push_back(Err(messages_error(error)));
                 }
-                None => {
-                    let events = state.translator.take().map(Translator::finish);
-                    state.queue(&events.unwrap_or_default());
-                }
+                None => match state.translator.take().map(Translator::end) {
+                    Some(Ok(events)) => state.queue(&events),
+                    Some(Err(error)) => state.queue.push_back(Err(error)),
+                    None => {}
+                },
             }
         }
     }))
