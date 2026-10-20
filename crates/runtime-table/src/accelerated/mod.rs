@@ -126,7 +126,7 @@ pub enum Error {
     /// `refresh_mode: snapshot`: the published snapshot is older than the loaded one and
     /// is refused.
     #[snafu(display(
-        "The snapshot published at '{location}' (id {published_id}) is older than the loaded snapshot (id {loaded_id}), so it was not loaded. Publish a newer snapshot, or restart Spice to load the published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        "The snapshot published at '{location}' (id {published_id}) is older than the loaded snapshot (id {loaded_id}), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
     ))]
     SnapshotOlderThanLoaded {
         location: String,

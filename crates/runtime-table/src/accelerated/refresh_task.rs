@@ -2375,7 +2375,10 @@ impl RefreshTask {
         loaded_id: u64,
         dataset_metrics_label_sets: &[Vec<KeyValue>],
     ) -> RefreshOutcome {
-        emit_refresh_errors(dataset_metrics_label_sets, refresh_error_reason(error));
+        emit_refresh_errors(
+            dataset_metrics_label_sets.to_vec(),
+            refresh_error_reason(error),
+        );
         tracing::warn!(
             "Dataset '{}' cannot refresh from its snapshot location, so it keeps serving snapshot {loaded_id}. Cause: {error}",
             self.dataset_name
@@ -3192,7 +3195,7 @@ impl RefreshTask {
 
     async fn record_refresh_error(&self, error: &super::Error, mode: &RefreshMode) {
         emit_refresh_errors(
-            &self.get_dataset_label_sets(mode).await,
+            self.get_dataset_label_sets(mode).await,
             refresh_error_reason(error),
         );
     }
@@ -3900,9 +3903,8 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     })
 }
 
-fn emit_refresh_errors(label_sets: &[Vec<KeyValue>], reason: &'static str) {
-    for label_set in label_sets {
-        let mut label_set = label_set.clone();
+fn emit_refresh_errors(label_sets: Vec<Vec<KeyValue>>, reason: &'static str) {
+    for mut label_set in label_sets {
         label_set.push(KeyValue::new(metrics::REFRESH_ERROR_REASON, reason));
         metrics::REFRESH_ERRORS.add(1, &label_set);
     }
@@ -4703,7 +4705,7 @@ mod tests {
             "a 412 must recover on retry: {recovered:?}"
         );
         if let Some(error) = terminal_refresh_error(&recovered, false) {
-            emit_refresh_errors(&generation_change_labels(), refresh_error_reason(error));
+            emit_refresh_errors(generation_change_labels(), refresh_error_reason(error));
         }
         let recovered_count = refresh_error_count(
             &registry,
@@ -4725,7 +4727,7 @@ mod tests {
         .await;
         let recorded = terminal_refresh_error(&exhausted, false)
             .expect("an exhausted generation-change is a refresh error");
-        emit_refresh_errors(&generation_change_labels(), refresh_error_reason(recorded));
+        emit_refresh_errors(generation_change_labels(), refresh_error_reason(recorded));
         let exhausted_count = refresh_error_count(
             &registry,
             "generation_change_metric_test",
@@ -4858,7 +4860,7 @@ mod tests {
         );
         assert_eq!(
             older.to_string(),
-            "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot, or restart Spice to load the published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+            "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
         );
     }
 
