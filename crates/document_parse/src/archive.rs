@@ -409,7 +409,7 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
         });
         // Do not resume the keyword search inside this stream's payload, and
         // do not let that payload participate in later string detection.
-        from = stream_payload_end(raw, data, stream_info.length);
+        from = stream_payload_end(raw, data, stream_info.length, stream_info.length_is_direct);
         lex_from = from;
     }
     streams
@@ -425,24 +425,29 @@ fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
 /// Index just past a stream's payload: `/Length` bytes from `data_start` when
 /// known, otherwise the `endstream` keyword that terminates it.
 ///
-/// A declared length is only trusted when it does not reach past the next
-/// `endstream`. An indirect `/Length` that resolved to a decoy integer (for
-/// example a number inside a Catalog string that happens to look like
-/// `N 0 obj`) would otherwise skip to EOF and leave a later Flate stream
-/// unchecked; preferring the earlier `endstream` keeps discovery on the real
-/// object boundary.
-fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
-    let endstream_at = find_endstream(raw, data_start);
+/// A *direct* `/Length` is trusted: the payload may legally contain the bytes
+/// `endstream` (an image that happens to encode that ASCII), so discovery must
+/// not stop early inside it. An *indirect* `/Length` is not trusted the same
+/// way — a Catalog string that looks like `N 0 obj` can resolve to a huge
+/// decoy — so for those we still prefer an earlier `endstream` when one sits
+/// before the claimed length.
+fn stream_payload_end(
+    raw: &[u8],
+    data_start: usize,
+    length: Option<u64>,
+    length_is_direct: bool,
+) -> usize {
     if let Some(len) = length {
         let by_length = data_start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
-        if let Some(es) = endstream_at
+        if !length_is_direct
+            && let Some(es) = find_endstream(raw, data_start)
             && es <= by_length
         {
             return es + b"endstream".len();
         }
         return after_endstream(raw, by_length.min(raw.len()));
     }
-    endstream_at.map_or(raw.len(), |pos| pos + b"endstream".len())
+    find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
 }
 
 /// If `endstream` sits at or just after `at` (with optional whitespace), return
@@ -482,6 +487,10 @@ struct StreamInfo {
     /// Direct `/Length` in bytes, or the resolved value of an indirect
     /// `/Length N G R`. `None` when the length is absent or unresolved.
     length: Option<u64>,
+    /// `true` when [`Self::length`] came from a direct integer in the stream
+    /// dictionary (trusted for payload bounds). `false` when it was resolved
+    /// from an indirect reference (may be a decoy).
+    length_is_direct: bool,
 }
 
 /// The `/Filter` chain and `/Length` of the dictionary that ends just before
@@ -499,14 +508,17 @@ fn stream_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<Stre
         length: None,
         length_ref: None,
     });
-    let length = parsed.length.or_else(|| {
-        parsed
-            .length_ref
-            .and_then(|(obj, generation)| resolve_indirect_int(raw, obj, generation))
-    });
+    let (length, length_is_direct) = if let Some(n) = parsed.length {
+        (Some(n), true)
+    } else if let Some((obj, generation)) = parsed.length_ref {
+        (resolve_indirect_int(raw, obj, generation), false)
+    } else {
+        (None, false)
+    };
     Some(StreamInfo {
         filters: parsed.filters,
         length,
+        length_is_direct,
     })
 }
 
@@ -531,6 +543,10 @@ fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
 
 fn parse_u64(data: &[u8]) -> Option<u64> {
     let mut i = 0;
+    // PDF integers may carry an optional leading `+` (ISO 32000-1 §7.3.3).
+    if data.first() == Some(&b'+') {
+        i = 1;
+    }
     let mut value: u64 = 0;
     let mut digits = 0usize;
     while i < data.len() && data[i].is_ascii_digit() {
@@ -1921,6 +1937,49 @@ mod tests {
         let mut dict = b"<< /Filter /FlateDecode % <<\n /Length ".to_vec();
         dict.extend_from_slice(data.len().to_string().as_bytes());
         dict.extend_from_slice(b" >>\n");
+        assert_chain_budgeted(&dict, &data);
+    }
+
+    /// A direct `/Length` that correctly covers a payload containing the bytes
+    /// `endstream` must still skip the whole payload. Stopping at the embedded
+    /// keyword would resume inside the image and hide the following Flate bomb.
+    #[test]
+    fn still_budgets_after_a_payload_with_embedded_endstream_bytes() {
+        let bomb = flate_bomb();
+        let image = b"aaa\nendstream\n(bbb";
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
+        pdf.extend_from_slice(image.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" >>\nstream\n");
+        pdf.extend_from_slice(image);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert_eq!(pdf_streams(&raw).len(), 2);
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A legal `/Length +N` (optional leading plus) must still be read as a
+    /// direct length so the stream is budgeted, not rejected as unboundable.
+    #[test]
+    fn budgets_a_stream_whose_length_has_a_leading_plus() {
+        let data = single_flate();
+        let mut dict = b"<< /Length +".to_vec();
+        dict.extend_from_slice(data.len().to_string().as_bytes());
+        dict.extend_from_slice(b" /Filter /FlateDecode >>\n");
         assert_chain_budgeted(&dict, &data);
     }
 
