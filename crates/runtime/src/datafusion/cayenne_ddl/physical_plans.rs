@@ -42,7 +42,9 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
+};
 use datafusion_ddl::arrow_datatype_to_sql;
 use futures::StreamExt;
 
@@ -1037,6 +1039,14 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
+    // One output partition forwards the whole input, so the input must arrive
+    // as one partition.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1088,7 +1098,6 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                     "INSERT on '{table_name}' cannot be forwarded: table has no partition expression"
                 )));
             };
-            let input_schema = input.schema();
             let child_stream = input.execute(partition, task_ctx)?;
             let row_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let row_counter = Arc::clone(&row_count);
@@ -1122,7 +1131,6 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 Arc::clone(&ctx),
                 io_runtime,
                 &table_name,
-                &input_schema,
                 counting_stream,
                 &[partition_expr],
             )
@@ -1361,4 +1369,61 @@ async fn validate_partition_compatibility(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::Int64Array;
+    use datafusion::config::ConfigOptions;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion::physical_plan::union::UnionExec;
+    use object_store::memory::InMemory;
+    use runtime_cluster::PartitionStore;
+    use runtime_cluster::cluster_state::ClusterStateStore;
+
+    /// An input of several partitions reaches the distributed insert as one,
+    /// so the insert forwards every row, not only its input's first partition.
+    #[tokio::test]
+    async fn a_distributed_insert_reads_its_whole_input() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let source = |ids: Vec<i64>| {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))])
+                    .expect("batch");
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("source") as Arc<dyn ExecutionPlan>
+        };
+        let input = UnionExec::try_new(vec![source(vec![1, 2]), source(vec![3])]).expect("union");
+        assert_eq!(input.output_partitioning().partition_count(), 2);
+
+        let cluster = Arc::new(ClusterStateStore::new(Arc::new(InMemory::new()), ""));
+        let registry = Arc::new(ExecutorRegistry::new(
+            Arc::new(PartitionStore::accelerations(Arc::clone(&cluster))),
+            Arc::new(PartitionStore::catalog(cluster)),
+        ));
+        let insert: Arc<dyn ExecutionPlan> = Arc::new(DistributedCayenneInsertExec::new(
+            datafusion::common::TableReference::bare("t"),
+            registry,
+            Arc::new(datafusion::prelude::SessionContext::new()),
+            tokio::runtime::Handle::current(),
+            input,
+        ));
+        let mut config = ConfigOptions::new();
+        config.execution.target_partitions = 4;
+
+        let planned = EnsureRequirements::new()
+            .optimize(insert, &config)
+            .expect("plan");
+        assert_eq!(
+            planned.children()[0]
+                .output_partitioning()
+                .partition_count(),
+            1
+        );
+    }
 }

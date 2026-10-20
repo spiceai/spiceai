@@ -30,3 +30,11 @@ pub mod trace_id;
 pub use trace_id::*;
 pub mod traceparent;
 pub use traceparent::*;
+#[cfg(feature = "datafusion")]
+pub mod session_config;
+#[cfg(feature = "datafusion")]
+pub use session_config::*;
+#[cfg(feature = "datafusion")]
+pub mod task_context;
+#[cfg(feature = "datafusion")]
+pub use task_context::*;

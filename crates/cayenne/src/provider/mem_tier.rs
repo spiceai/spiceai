@@ -263,15 +263,22 @@ impl SegmentTombstones {
     }
 
     /// The deleted `Int64Pk` keys in this segment (empty for the row-key strategy).
-    /// Test-only since the merged-scan-deletions lockstep that consumed it in
-    /// production was retired when the per-scan merge memos gave way to the
-    /// demand-driven scan-view cache.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used only by mem-tier tombstone tests")
-    )]
+    /// A scan-view build hides exactly these keys in the segments it reuses from
+    /// its previous build.
     pub(crate) fn int64_keys(&self) -> impl Iterator<Item = i64> + '_ {
         self.int64_pk.keys().copied()
+    }
+
+    /// The deleted row keys in this segment, in the encoding the visibility
+    /// filter compares (empty for the `Int64Pk` strategy).
+    pub(crate) fn row_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.row_keys.keys().map(AsRef::as_ref)
+    }
+
+    /// The delete sequence stamped on every key of this segment. Meaningful only
+    /// when the segment carries keys (an empty set is never stamped).
+    pub(crate) fn delete_sequence(&self) -> i64 {
+        self.delete_sequence
     }
 
     /// Whether this segment carries no `Int64Pk` tombstone keys.
@@ -282,6 +289,15 @@ impl SegmentTombstones {
     /// Whether this segment carries no row-key tombstone keys.
     pub(crate) fn is_row_keys_empty(&self) -> bool {
         self.row_keys.is_empty()
+    }
+
+    /// Whether `other` is this same set of tombstones: a clone of it, sharing its
+    /// key sets, at the same delete sequence. Two equal sets built separately are
+    /// not the same.
+    fn is_same(&self, other: &Self) -> bool {
+        self.delete_sequence == other.delete_sequence
+            && self.int64_pk.ptr_eq(&other.int64_pk)
+            && self.row_keys.ptr_eq(&other.row_keys)
     }
 }
 
@@ -344,6 +360,42 @@ fn segment_statistics(batches: &[RecordBatch]) -> Arc<Statistics> {
             )
         },
     )
+}
+
+impl MemSegment {
+    /// Whether `other` is this same segment — a clone of it, as every tier
+    /// version an append builds carries — rather than one rebuilt from it.
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.batches, &other.batches)
+            && self.data_sequence == other.data_sequence
+            && self.tombstones.is_same(&other.tombstones)
+    }
+}
+
+/// A checkpoint's fold of its survivors' tombstones, built ahead of the
+/// listing fence by [`MemTier::prepare_retain`].
+pub(crate) struct PreparedRetain {
+    /// The tier version the fold was built from.
+    base: Arc<MemTier>,
+    flushed_segment_count: usize,
+    /// `base.segments[flushed_segment_count..]` folded.
+    tombstones: InMemTombstones,
+}
+
+impl PreparedRetain {
+    /// Whether `tier` is this fold's base plus segments appended since, for a
+    /// checkpoint that flushed `flushed_segment_count` segments: the fold then
+    /// covers exactly `tier`'s survivors up to the base's length.
+    fn extends_to(&self, tier: &MemTier, flushed_segment_count: usize) -> bool {
+        let covered = self.base.segments.len();
+        self.flushed_segment_count == flushed_segment_count
+            && flushed_segment_count <= covered
+            && covered <= tier.segments.len()
+            && self.base.segments[flushed_segment_count..]
+                .iter()
+                .zip(&tier.segments[flushed_segment_count..covered])
+                .all(|(folded, live)| folded.is_same(live))
+    }
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -666,20 +718,74 @@ impl MemTier {
             empty.version = self.version + 1;
             return empty;
         }
-        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
         // Rebuild the survivor aggregate by folding each survivor's per-segment
         // tombstones (key set + its own stamped delete sequence) onto an empty
-        // aggregate map — this runs at checkpoint time under the phase-2 listing
-        // fence (NOT per-append), and the common interleaved-append case has
-        // exactly one survivor, so it is one `merge_segment` of a small key set.
-        // Each survivor folds at its OWN `delete_sequence` (segments do not share
-        // a sequence), preserving per-key max-sequence semantics exactly.
+        // aggregate map. Each survivor folds at its OWN `delete_sequence`
+        // (segments do not share a sequence), preserving per-key max-sequence
+        // semantics exactly. A checkpoint folds most of them ahead of its listing
+        // fence instead ([`Self::prepare_retain`]).
         let mut tombstones = InMemTombstones::default();
+        for segment in &self.segments[flushed_segment_count..] {
+            tombstones.merge_segment(&segment.tombstones);
+        }
+        self.retain_with(flushed_segment_count, tombstones)
+    }
+
+    /// Fold the tombstones of the segments a checkpoint of the first
+    /// `flushed_segment_count` segments leaves behind, ahead of the swap that
+    /// drops the rest. The fold is the costly part of [`Self::retain_after`] — it
+    /// grows with every segment appended while the checkpoint encoded and
+    /// committed — and the swap runs under the listing fence, so a checkpoint
+    /// builds it first and [`Self::retain_after_prepared`] folds only the segments
+    /// appended in between.
+    #[must_use]
+    pub(crate) fn prepare_retain(self: Arc<Self>, flushed_segment_count: usize) -> PreparedRetain {
+        let mut tombstones = InMemTombstones::default();
+        for segment in self.segments.iter().skip(flushed_segment_count) {
+            tombstones.merge_segment(&segment.tombstones);
+        }
+        PreparedRetain {
+            base: self,
+            flushed_segment_count,
+            tombstones,
+        }
+    }
+
+    /// [`Self::retain_after`], reusing the fold `prepared` built when this tier is
+    /// that fold's base plus segments appended since: every survivor the fold
+    /// covered is still here at its index, the same segment. Only the appended
+    /// segments are folded then. Otherwise — no preparation, a different flushed
+    /// count, or a tier that changed in any way but appends — every survivor is
+    /// folded, as `retain_after` does.
+    #[must_use]
+    pub(crate) fn retain_after_prepared(
+        &self,
+        flushed_segment_count: usize,
+        prepared: Option<PreparedRetain>,
+    ) -> Self {
+        let Some(prepared) = prepared.filter(|prepared| {
+            flushed_segment_count < self.segments.len()
+                && prepared.extends_to(self, flushed_segment_count)
+        }) else {
+            return self.retain_after(flushed_segment_count);
+        };
+        let covered = prepared.base.segments.len();
+        let mut tombstones = prepared.tombstones;
+        for segment in &self.segments[covered..] {
+            tombstones.merge_segment(&segment.tombstones);
+        }
+        self.retain_with(flushed_segment_count, tombstones)
+    }
+
+    /// The tier left after dropping the first `flushed_segment_count` segments,
+    /// with `tombstones` as the survivors' fold. `flushed_segment_count` must be
+    /// below the segment count.
+    fn retain_with(&self, flushed_segment_count: usize, tombstones: InMemTombstones) -> Self {
+        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
         let mut bytes = 0u64;
         let mut rows = 0u64;
         let mut superseded = 0u64;
         for segment in &survivors {
-            tombstones.merge_segment(&segment.tombstones);
             bytes = bytes.saturating_add(segment.bytes);
             rows = rows.saturating_add(segment.rows);
             superseded = superseded.saturating_add(segment.superseded);
@@ -1460,6 +1566,149 @@ mod tests {
         let clamped = grown.mark_sealed_through(999);
         assert_eq!(clamped.sealed_segments, grown.segments.len());
         assert!(!clamped.has_unsealed_segments());
+    }
+
+    /// A segment deleting `keys` at `sequence`.
+    fn deleting(
+        tier: &MemTier,
+        value: i64,
+        keys: &[i64],
+        sequence: i64,
+        superseded: u64,
+    ) -> MemTier {
+        let mut tombstones = SegmentTombstones::from_int64_keys(keys.iter().copied());
+        tombstones.stamp(sequence);
+        tier.append_segment(
+            Arc::new(vec![batch(&[value])]),
+            sequence + 1,
+            tombstones,
+            16,
+            1,
+            superseded,
+        )
+    }
+
+    fn deleted(tier: &MemTier) -> std::collections::BTreeMap<i64, i64> {
+        tier.tombstones
+            .int64_pk
+            .iter()
+            .map(|(&key, &sequence)| (key, sequence))
+            .collect()
+    }
+
+    /// The fold a checkpoint builds before its listing fence, extended by the
+    /// segments appended before its swap, is the fold `retain_after` computes in
+    /// the swap: over seeded histories whose segments delete overlapping keys at
+    /// rising sequences, for every flushed count.
+    #[test]
+    fn a_prepared_retain_matches_retain_after_over_random_appends() {
+        let mut extended = 0;
+        for seed in 0..300_u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            let mut sequence = 0_i64;
+            let mut append = |tier: &MemTier, next: &mut dyn FnMut(u64) -> u64| {
+                sequence += 2;
+                let keys: Vec<i64> = (0..next(12))
+                    .map(|_| i64::try_from(next(40)).expect("key"))
+                    .collect();
+                deleting(tier, sequence, &keys, sequence, next(3))
+            };
+            let mut tier = MemTier::empty();
+            let before = 1 + next(10);
+            for _ in 0..before {
+                tier = append(&tier, &mut next);
+            }
+            let flushed = usize::try_from(next(before + 1)).expect("count");
+            let tier = Arc::new(tier);
+            let prepared = Arc::clone(&tier).prepare_retain(flushed);
+            let mut live = (*tier).clone();
+            let after = next(6);
+            for _ in 0..after {
+                live = append(&live, &mut next);
+            }
+            assert!(
+                prepared.extends_to(&live, flushed),
+                "seed {seed}: appends keep the preparation usable"
+            );
+            if after > 0 && flushed < usize::try_from(before).expect("count") {
+                extended += 1;
+            }
+            let expected = live.retain_after(flushed);
+            let got = live.retain_after_prepared(flushed, Some(prepared));
+            assert_eq!(deleted(&got), deleted(&expected), "seed {seed}");
+            assert_eq!(
+                (
+                    got.segments.len(),
+                    got.bytes,
+                    got.rows,
+                    got.superseded,
+                    got.epoch,
+                    got.sealed_segments
+                ),
+                (
+                    expected.segments.len(),
+                    expected.bytes,
+                    expected.rows,
+                    expected.superseded,
+                    expected.epoch,
+                    expected.sealed_segments
+                ),
+                "seed {seed}"
+            );
+        }
+        assert!(
+            extended >= 100,
+            "most histories must fold appended segments onto a prepared survivor fold: {extended}"
+        );
+    }
+
+    /// A tier that changed other than by appends since the fold was prepared — a
+    /// survivor rebuilt, a different flushed count — must not reuse the fold,
+    /// which no longer describes its survivors.
+    #[test]
+    fn a_prepared_retain_is_not_reused_once_a_survivor_changed() {
+        let mut tier = MemTier::empty();
+        tier = deleting(&tier, 0, &[1, 2], 2, 0);
+        tier = deleting(&tier, 1, &[3], 4, 0);
+        tier = deleting(&tier, 2, &[4], 6, 0);
+        let tier = Arc::new(tier);
+        let stale = deleted(&tier.retain_after(1));
+
+        // The middle survivor rebuilt with different deletes.
+        let mut rebuilt_tombstones = SegmentTombstones::from_int64_keys([5]);
+        rebuilt_tombstones.stamp(4);
+        let mut segments: Vec<MemSegment> = tier.segments.as_ref().clone();
+        segments[1] = MemSegment {
+            tombstones: rebuilt_tombstones,
+            ..segments[1].clone()
+        };
+        let changed = MemTier {
+            segments: Arc::new(segments),
+            ..(*tier).clone()
+        };
+        let prepared = Arc::clone(&tier).prepare_retain(1);
+        assert!(!prepared.extends_to(&changed, 1));
+        let got = changed.retain_after_prepared(1, Some(prepared));
+        assert_eq!(deleted(&got), deleted(&changed.retain_after(1)));
+        assert_ne!(
+            deleted(&got),
+            stale,
+            "the prepared fold would have kept the rebuilt segment's old deletes"
+        );
+
+        // A different flushed count describes different survivors.
+        let prepared = Arc::clone(&tier).prepare_retain(0);
+        assert!(!prepared.extends_to(&tier, 1));
+        assert_eq!(
+            deleted(&tier.retain_after_prepared(1, Some(prepared))),
+            stale
+        );
     }
 
     /// A checkpoint's `retain_after` drops the flushed prefix and lowers the seal

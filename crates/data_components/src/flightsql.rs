@@ -60,21 +60,19 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use runtime_request_context::RequestContext;
+use runtime_request_context::resolve_request_context;
 use tonic::codegen::Bytes;
 use tonic::transport::{Channel, channel};
 
 use crate::Read;
 
-/// Build a W3C `traceparent` header value (`00-{trace_id}-{span_id}-01`)
-/// from the typed `Arc<RequestContext>` extension on the
-/// [`TaskContext`]'s session config, if one is present. The fixed `01`
-/// trace flag marks the trace as sampled.
+/// Build a W3C `traceparent` header value (`00-{trace_id}-{span_id}-{flags}`)
+/// from the request context of the [`TaskContext`], if it has one. See
+/// [`resolve_request_context`] for where the context comes from.
 #[must_use]
 pub fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
-    let request_context = context.session_config().get_extension::<RequestContext>()?;
-    let tp = request_context.trace_parent().as_ref()?;
-    Some(format!("00-{}-{}-01", tp.trace_id, tp.span_id))
+    let request_context = resolve_request_context(context, false)?;
+    Some(request_context.trace_parent().as_ref()?.to_string())
 }
 
 pub mod federation;
@@ -588,9 +586,8 @@ pub struct FlightSqlExec {
     metrics: ExecutionPlanMetricsSet,
     /// Optional W3C `traceparent` value (e.g. `00-{trace_id}-{span_id}-01`)
     /// to attach as a gRPC metadata header on outgoing `execute()` and
-    /// `do_get()` calls. When `None`, `execute()` falls back to reading
-    /// the typed `Arc<RequestContext>` extension from the `TaskContext`
-    /// session config and constructs a header from its `trace_parent()`.
+    /// `do_get()` calls. When `None`, `execute()` falls back to
+    /// [`trace_parent_from_task_context`].
     trace_parent: Option<String>,
     /// Statistics for the rows this scan produces. Defaults to unknown; the
     /// planner that builds the scan can supply real statistics (e.g. row

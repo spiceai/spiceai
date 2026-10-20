@@ -46,7 +46,7 @@ use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
 use tools::SpiceModelTool;
 
-use runtime_auth::AuthRequestContext;
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use runtime_query_engine::query_engine::{QueryEngine, QueryRequest};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -196,12 +196,22 @@ impl SpiceModelTool for FunctionAsTool {
 
 pub(crate) async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
-    AuthRequestContext::auth_principal(context.as_ref()).is_some_and(|principal| {
-        !principal
-            .groups()
-            .iter()
-            .any(|group| *group == "write" || *group == "read_write")
-    })
+    AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(|principal| !principal_has_write_access(principal))
+}
+
+/// Whether the request is authenticated as a principal with write access. A request with no
+/// principal does not have it.
+pub(crate) async fn current_principal_allows_write() -> bool {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    AuthRequestContext::auth_principal(context.as_ref()).is_some_and(principal_has_write_access)
+}
+
+fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
 }
 
 fn function_call_sql(function_name: &str, literals: &[String]) -> String {
