@@ -1872,6 +1872,29 @@ mod tests {
         );
     }
 
+    /// A `%` inside a literal string after whitespace, e.g. `( % literal)`, is
+    /// not a comment. Treating it as one would lose the dictionary before
+    /// `stream` and omit the Flate bomb.
+    #[test]
+    fn rejects_a_bomb_with_percent_after_space_inside_a_string() {
+        assert_chain_budgeted(
+            b"<< /Note ( % literal) /Filter /FlateDecode >>\n",
+            &single_flate(),
+        );
+    }
+
+    /// A comment may start immediately after a name (`/FlateDecode% …`) with no
+    /// whitespace. The `<<` that follows on the comment must not become the
+    /// dictionary opener.
+    #[test]
+    fn rejects_a_bomb_with_a_comment_glued_to_the_filter_name() {
+        let data = flate_bomb();
+        let mut dict = b"<< /Filter /FlateDecode% <<\n /Length ".to_vec();
+        dict.extend_from_slice(data.len().to_string().as_bytes());
+        dict.extend_from_slice(b" >>\n");
+        assert_chain_budgeted(&dict, &data);
+    }
+
     /// A `<<` that appears inside a `%` comment is not the dictionary opener.
     /// Taking it would parse a suffix with no `/Filter` and count the Flate
     /// stream as stored.
@@ -1886,34 +1909,39 @@ mod tests {
 
     /// A literal string that contains dictionary-like text and the word
     /// `stream` must not invent a phantom stream whose huge `/Length` hides
-    /// the real Flate page stream.
+    /// the real Flate page stream. Covers both a `/Length` decoy and a bare
+    /// `<< >>stream` with no length.
     #[test]
     fn still_budgets_when_a_string_contains_a_fake_stream() {
-        let bomb = flate_bomb();
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.7\n");
-        pdf.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Note (<< /Length 999999999 >>stream) >>\nendobj\n",
-        );
-        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-        pdf.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n",
-        );
-        pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
-        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
-        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
-        pdf.extend_from_slice(&bomb);
-        pdf.extend_from_slice(b"\nendstream\nendobj\n");
-        let raw = Bytes::from(pdf);
-        assert_eq!(
-            pdf_streams(&raw).len(),
-            1,
-            "the string must not invent a second stream"
-        );
-        assert_eq!(
-            pdf_too_large_reason(&raw),
-            "its compressed streams decompress to more than 256 MiB, the per-document limit"
-        );
+        for note in [
+            b" (<< /Length 99999999 >>stream\nplaceholder) ".as_slice(),
+            b" (<< >>stream) ".as_slice(),
+        ] {
+            let bomb = flate_bomb();
+            let mut pdf = Vec::new();
+            pdf.extend_from_slice(b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Note");
+            pdf.extend_from_slice(note);
+            pdf.extend_from_slice(b">>\nendobj\n");
+            pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+            pdf.extend_from_slice(
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n",
+            );
+            pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
+            pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+            pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+            pdf.extend_from_slice(&bomb);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+            let raw = Bytes::from(pdf);
+            assert_eq!(
+                pdf_streams(&raw).len(),
+                1,
+                "the string must not invent a second stream"
+            );
+            assert_eq!(
+                pdf_too_large_reason(&raw),
+                "its compressed streams decompress to more than 256 MiB, the per-document limit"
+            );
+        }
     }
 
     /// Attacker-controlled nesting in a skipped value must fail closed without
