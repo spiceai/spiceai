@@ -1347,12 +1347,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.cayenne_segment_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
+                      "query": "sum:spiceai.cayenne_segment_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_count()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spiceai.cayenne_segment_cache_accesses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_count()"
+                      "query": "sum:spiceai.cayenne_segment_cache_accesses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_count()"
                     }
                   ],
                   "response_format": "timeseries",
@@ -1411,12 +1411,12 @@
                     {
                       "data_source": "metrics",
                       "name": "query1",
-                      "query": "sum:spiceai.cayenne_segment_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_rate()"
+                      "query": "sum:spiceai.cayenne_segment_cache_hits.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_rate()"
                     },
                     {
                       "data_source": "metrics",
                       "name": "query2",
-                      "query": "sum:spiceai.cayenne_segment_cache_accesses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name}.as_rate()"
+                      "query": "sum:spiceai.cayenne_segment_cache_accesses.count{$instance,$env,$kube_namespace,$kube_cluster_name,$pod_name} by {service_instance_id,cache}.as_rate()"
                     }
                   ],
                   "response_format": "timeseries",
