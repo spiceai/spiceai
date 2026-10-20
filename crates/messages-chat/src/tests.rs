@@ -25,13 +25,14 @@ use async_trait::async_trait;
 use chat_api::Chat;
 use chat_api::SqlGeneration;
 use futures::StreamExt;
+use messages_api::stream::StreamEvent;
 use messages_api::{ErrorType, Messages, MessagesError, MessagesRequest};
 use serde_json::{Value, json};
 
 use crate::ChatMessages;
 use crate::request::chat_request;
 use crate::response::{message, messages_error};
-use crate::stream::message_stream;
+use crate::stream::{Translator, message_stream};
 
 fn typed(body: &Value) -> messages_api::types::CreateMessageRequest {
     serde_json::from_value(body.clone()).expect("a valid Messages API request")
@@ -408,8 +409,152 @@ async fn a_chunk_stream_that_ends_unfinished_ends_with_an_error() {
     assert_eq!(events(vec![]).await, [incomplete]);
 }
 
+/// The (type, index) of each event, and the `id` of each block it starts.
+fn shape(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .map(|event| {
+            let mut shape = json!([event["type"], event["index"]]);
+            if let Some(id) = event["content_block"]["id"].as_str() {
+                shape = json!([event["type"], event["index"], id]);
+            }
+            shape
+        })
+        .collect()
+}
+
+/// A model may interleave the argument chunks of parallel tool calls, and the Messages API streams
+/// one block at a time: a call that starts before the streaming call's arguments are whole is held
+/// back and given whole after it, so the stream carries the message the unstreamed answer does.
 #[tokio::test]
-async fn interleaved_tool_call_arguments_end_the_stream_with_an_error() {
+async fn interleaved_tool_calls_stream_the_message_the_unstreamed_answer_carries() {
+    let chat = Arc::new(ScriptedChat {
+        requests: Mutex::new(Vec::new()),
+        answer: completion(
+            &json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}},
+            ]}),
+            "tool_calls",
+        ),
+        chunks: vec![
+            chunk(&tool_call(0, Some("call_1"), Some("read_file"), "")),
+            chunk(&tool_call(1, Some("call_2"), Some("read_file"), "")),
+            chunk(&tool_call(0, None, None, "{\"path\":")),
+            chunk(&tool_call(1, None, None, "{\"path\":\"b.rs\"}")),
+            chunk(&tool_call(0, None, None, "\"a.rs\"}")),
+            chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"})),
+            usage_chunk(),
+        ],
+    });
+    let messages = ChatMessages::new(Arc::clone(&chat) as Arc<dyn Chat>);
+    let body = json!({"model": "gpt", "max_tokens": 100, "messages": [{"role": "user", "content": "Read a.rs and b.rs"}]});
+
+    let created = messages
+        .create(messages_request(&body))
+        .await
+        .expect("a message");
+    let streamed: Vec<Value> = messages
+        .create_stream(messages_request(&body))
+        .await
+        .expect("a stream")
+        .map(|event| event.expect("an event"))
+        .collect()
+        .await;
+
+    assert_eq!(accumulate(&streamed), created);
+    assert_eq!(
+        shape(&streamed),
+        [
+            json!(["message_start", null]),
+            json!(["content_block_start", 0, "call_1"]),
+            json!(["content_block_delta", 0]),
+            json!(["content_block_delta", 0]),
+            json!(["content_block_stop", 0]),
+            json!(["content_block_start", 1, "call_2"]),
+            json!(["content_block_delta", 1]),
+            json!(["content_block_stop", 1]),
+            json!(["message_delta", null]),
+            json!(["message_stop", null]),
+        ],
+        "call_1 streams as it arrives, and call_2 follows it whole"
+    );
+}
+
+/// Parallel tool calls streamed one after another, as `OpenAI` streams them, each stream as they
+/// arrive: a call that starts once the one before it is whole ends that one's block.
+#[test]
+fn a_tool_call_that_starts_after_a_whole_one_streams_as_it_arrives() {
+    let mut translator = Translator::new("gpt".to_string());
+    let values = |events: Result<Vec<StreamEvent>, MessagesError>| -> Vec<Value> {
+        events
+            .expect("events")
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("an event"))
+            .collect()
+    };
+    values(translator.chunk(chunk(&tool_call(
+        0,
+        Some("call_1"),
+        Some("read_file"),
+        "{\"path\":\"a.rs\"}",
+    ))));
+    assert_eq!(
+        values(translator.chunk(chunk(&tool_call(
+            1,
+            Some("call_2"),
+            Some("read_file"),
+            "{\"path\":",
+        )))),
+        [
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call_2", "name": "read_file", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+        ]
+    );
+    assert_eq!(
+        values(translator.chunk(chunk(&tool_call(1, None, None, "\"b.rs\"}")))),
+        [
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"b.rs\"}"}}),
+        ]
+    );
+}
+
+/// Tool calls held back are given before text that follows them, keeping the order the model
+/// wrote its blocks in.
+#[tokio::test]
+async fn held_back_tool_calls_come_before_the_text_after_them() {
+    let streamed = events(vec![
+        Ok(chunk(&tool_call(0, Some("call_1"), Some("read_file"), ""))),
+        Ok(chunk(&tool_call(
+            1,
+            Some("call_2"),
+            Some("read_file"),
+            "{\"path\":\"b.rs\"}",
+        ))),
+        Ok(chunk(&tool_call(0, None, None, "{\"path\":\"a.rs\"}"))),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {"content": "Reading both."}, "finish_reason": null}),
+        )),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}),
+        )),
+    ])
+    .await;
+    assert_eq!(
+        accumulate(&streamed)["content"],
+        json!([
+            {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "a.rs"}},
+            {"type": "tool_use", "id": "call_2", "name": "read_file", "input": {"path": "b.rs"}},
+            {"type": "text", "text": "Reading both."},
+        ])
+    );
+}
+
+/// A tool call continued after its block ended, here by text, cannot be streamed: the block's
+/// input was already given whole, so the stream ends with an error instead.
+#[tokio::test]
+async fn a_tool_call_continued_after_its_block_ended_ends_the_stream_with_an_error() {
     let streamed = events(vec![
         Ok(chunk(&tool_call(
             0,
@@ -417,12 +562,9 @@ async fn interleaved_tool_call_arguments_end_the_stream_with_an_error() {
             Some("read_file"),
             "{\"path\":",
         ))),
-        Ok(chunk(&tool_call(
-            1,
-            Some("call_2"),
-            Some("read_file"),
-            "{\"path\":\"b.rs\"}",
-        ))),
+        Ok(chunk(
+            &json!({"index": 0, "delta": {"content": "Reading."}, "finish_reason": null}),
+        )),
         Ok(chunk(&tool_call(0, None, None, "\"a.rs\"}"))),
         Ok(chunk(
             &json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}),
@@ -432,7 +574,7 @@ async fn interleaved_tool_call_arguments_end_the_stream_with_an_error() {
     assert_eq!(
         streamed.last(),
         Some(
-            &json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' streamed the arguments of its tool calls interleaved, which the Messages API cannot stream: each tool call has to be streamed whole before the next. Send the request without `stream`."}})
+            &json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' streamed more of a tool call after its content block had ended, which the Messages API cannot stream: it streams each content block whole before the next. Send the request without `stream`."}})
         )
     );
     assert_eq!(

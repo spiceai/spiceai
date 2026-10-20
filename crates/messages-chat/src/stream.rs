@@ -18,9 +18,10 @@ limitations under the License.
 //!
 //! A chunk's text extends the open text block, and a chunk's tool call the open `tool_use`
 //! block, so text and tool input reach the client as the model writes them. The Messages API
-//! sends one block at a time, start to stop, and a stream that interleaves the arguments of two
-//! tool calls cannot be told apart from one whose blocks were mixed up, so it ends with an
-//! error instead.
+//! sends one block at a time, start to stop, while a model may interleave the arguments of its
+//! parallel tool calls: a call that starts before the open call's arguments are whole is held
+//! back, and given whole once the open block ends, before any text that follows. A tool call
+//! continued after its block ended cannot be streamed, so it ends the stream with an error.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -50,6 +51,15 @@ impl OpenBlock {
     }
 }
 
+/// A tool call held back while another streams, to be given whole after it.
+#[derive(Debug)]
+struct HeldToolCall {
+    tool_call: u32,
+    id: String,
+    name: String,
+    arguments: String,
+}
+
 /// Turns chat completion chunks into Message events.
 #[derive(Debug)]
 pub struct Translator {
@@ -57,8 +67,12 @@ pub struct Translator {
     model: String,
     started: bool,
     open: Option<OpenBlock>,
+    /// The arguments the open `tool_use` block has streamed so far.
+    arguments: String,
+    /// The tool calls held back while the open one streams, in the order they started.
+    held: Vec<HeldToolCall>,
     next_index: usize,
-    /// The chat completion indexes of the tool calls that have a block.
+    /// The chat completion indexes of the tool calls seen, streamed or held back.
     tool_calls: HashSet<u32>,
     finish_reason: Option<FinishReason>,
     refused: bool,
@@ -72,6 +86,8 @@ impl Translator {
             model,
             started: false,
             open: None,
+            arguments: String::new(),
+            held: Vec::new(),
             next_index: 0,
             tool_calls: HashSet::new(),
             finish_reason: None,
@@ -105,6 +121,53 @@ impl Translator {
                 index: open.index(),
             });
         }
+        self.arguments.clear();
+    }
+
+    /// Ends the open block, then gives each held-back tool call whole, in the order they started.
+    fn release_held(&mut self, events: &mut Vec<StreamEvent>) {
+        self.close(events);
+        for held in std::mem::take(&mut self.held) {
+            let index = self.open(
+                ContentBlock::ToolUse {
+                    id: held.id,
+                    name: held.name,
+                    input: Value::Object(Map::new()),
+                },
+                events,
+            );
+            if !held.arguments.is_empty() {
+                events.push(StreamEvent::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::InputJsonDelta {
+                        partial_json: held.arguments,
+                    },
+                });
+            }
+            events.push(StreamEvent::ContentBlockStop { index });
+        }
+    }
+
+    /// Whether a tool call starting now has to be held back: calls before it are, or the open
+    /// tool call's arguments are not yet whole, so more of them are still to come.
+    fn must_hold(&self) -> bool {
+        !self.held.is_empty()
+            || (matches!(self.open, Some(OpenBlock::ToolUse { .. }))
+                && serde_json::from_str::<Value>(&self.arguments).is_err())
+    }
+
+    /// Streams `arguments` as more of the open `tool_use` block at `index`.
+    fn input_json(&mut self, index: usize, arguments: String, events: &mut Vec<StreamEvent>) {
+        if arguments.is_empty() {
+            return;
+        }
+        self.arguments.push_str(&arguments);
+        events.push(StreamEvent::ContentBlockDelta {
+            index,
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: arguments,
+            },
+        });
     }
 
     fn open(&mut self, block: ContentBlock, events: &mut Vec<StreamEvent>) -> usize {
@@ -122,6 +185,7 @@ impl Translator {
         let index = if let Some(OpenBlock::Text { index }) = self.open {
             index
         } else {
+            self.release_held(events);
             let index = self.open(
                 ContentBlock::Text {
                     text: String::new(),
@@ -141,8 +205,8 @@ impl Translator {
     ///
     /// # Errors
     ///
-    /// Returns an `api_error` when the chunk continues a tool call whose block has already been
-    /// closed, or starts a tool call without a name.
+    /// Returns an `api_error` when the chunk continues a tool call whose block has already ended,
+    /// or starts a tool call without a name.
     pub fn chunk(
         &mut self,
         chunk: CreateChatCompletionStreamResponse,
@@ -169,48 +233,60 @@ impl Translator {
                 .function
                 .map(|function| (function.name, function.arguments))
                 .unwrap_or_default();
-            let index = match self.open {
-                Some(OpenBlock::ToolUse { index, tool_call }) if tool_call == call.index => index,
-                _ if self.tool_calls.contains(&call.index) => {
-                    return Err(MessagesError::api(format!(
-                        "Model '{}' streamed the arguments of its tool calls interleaved, which the Messages API cannot stream: each tool call has to be streamed whole before the next. Send the request without `stream`.",
-                        self.model
-                    )));
-                }
-                _ => {
-                    let Some(name) = name.filter(|name| !name.is_empty()) else {
-                        return Err(MessagesError::api(format!(
-                            "Model '{}' streamed a tool call without the tool's name.",
-                            self.model
-                        )));
-                    };
-                    self.tool_calls.insert(call.index);
-                    let index = self.open(
-                        ContentBlock::ToolUse {
-                            id: call
-                                .id
-                                .filter(|id| !id.is_empty())
-                                .unwrap_or_else(tool_use_id),
-                            name,
-                            input: Value::Object(Map::new()),
-                        },
-                        &mut events,
-                    );
-                    self.open = Some(OpenBlock::ToolUse {
-                        index,
-                        tool_call: call.index,
-                    });
-                    index
-                }
-            };
-            if let Some(arguments) = arguments.filter(|arguments| !arguments.is_empty()) {
-                events.push(StreamEvent::ContentBlockDelta {
-                    index,
-                    delta: ContentBlockDelta::InputJsonDelta {
-                        partial_json: arguments,
-                    },
-                });
+            let arguments = arguments.unwrap_or_default();
+            if let Some(OpenBlock::ToolUse { index, tool_call }) = self.open
+                && tool_call == call.index
+            {
+                self.input_json(index, arguments, &mut events);
+                continue;
             }
+            if let Some(held) = self
+                .held
+                .iter_mut()
+                .find(|held| held.tool_call == call.index)
+            {
+                held.arguments.push_str(&arguments);
+                continue;
+            }
+            if self.tool_calls.contains(&call.index) {
+                return Err(MessagesError::api(format!(
+                    "Model '{}' streamed more of a tool call after its content block had ended, which the Messages API cannot stream: it streams each content block whole before the next. Send the request without `stream`.",
+                    self.model
+                )));
+            }
+            let Some(name) = name.filter(|name| !name.is_empty()) else {
+                return Err(MessagesError::api(format!(
+                    "Model '{}' streamed a tool call without the tool's name.",
+                    self.model
+                )));
+            };
+            self.tool_calls.insert(call.index);
+            let id = call
+                .id
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(tool_use_id);
+            if self.must_hold() {
+                self.held.push(HeldToolCall {
+                    tool_call: call.index,
+                    id,
+                    name,
+                    arguments,
+                });
+                continue;
+            }
+            let index = self.open(
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: Value::Object(Map::new()),
+                },
+                &mut events,
+            );
+            self.open = Some(OpenBlock::ToolUse {
+                index,
+                tool_call: call.index,
+            });
+            self.input_json(index, arguments, &mut events);
         }
         if choice.finish_reason.is_some() {
             self.finish_reason = choice.finish_reason;
@@ -235,13 +311,14 @@ impl Translator {
         Ok(self.finish())
     }
 
-    /// The events that end the stream: the open block's stop, `message_delta` with the stop
-    /// reason and the usage of the whole message, and `message_stop`.
+    /// The events that end the stream: the open block's stop, the tool calls held back, given
+    /// whole, `message_delta` with the stop reason and the usage of the whole message, and
+    /// `message_stop`.
     #[must_use]
     pub fn finish(mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
         self.start(None, &mut events);
-        self.close(&mut events);
+        self.release_held(&mut events);
         let stop_reason = if self.refused {
             StopReason::Refusal
         } else {
