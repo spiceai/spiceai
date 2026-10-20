@@ -6325,7 +6325,7 @@ mod tests {
 
     /// Differential test for #15329: the indexed subtraction keeps exactly the incoming
     /// rows the pairwise comparison keeps, and claims exactly the same stored rows, over
-    /// seeded streams that repeat rows and mix nulls, `-0.0` and `0.0`, and NaN.
+    /// seeded streams that repeat rows and mix nulls, `-0.0` and `0.0`, and `NaN`.
     #[test]
     fn overlap_index_matches_the_pairwise_comparison() {
         let schema = Arc::new(Schema::new(vec![
