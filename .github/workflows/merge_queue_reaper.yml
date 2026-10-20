@@ -42,7 +42,7 @@ jobs:
   test:
     name: Unit tests for reap_superseded_merge_queue_runs.py
     if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: spiceai-dev-runners
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -62,10 +62,9 @@ jobs:
   reap:
     name: Cancel superseded merge-queue runs
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    # This job takes a slot in the pool it reclaims, so while superseded runs
-    # fill that pool it waits like any other job. At most one run waits: a newer
-    # scheduled run cancels the older one in the concurrency group above.
-    runs-on: spiceai-dev-runners
+    # A GitHub-hosted runner on purpose: the pool this reclaims capacity in is
+    # the self-hosted one.
+    runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read
@@ -79,8 +78,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
-        # `python3`, not `python`: the script needs only the standard library,
-        # and the self-hosted image is not guaranteed to provide the
-        # unversioned name.
         run: |
-          python3 .github/scripts/reap_superseded_merge_queue_runs.py ${DRY_RUN}
+          python .github/scripts/reap_superseded_merge_queue_runs.py ${DRY_RUN}
