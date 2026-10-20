@@ -292,6 +292,9 @@ async fn seed_blobs_without_nan_counts(
     use vortex::expr::stats::{Precision as VortexPrecision, Stat};
     use vortex::flatbuffers::WriteFlatBufferExt;
 
+    // The scans persist in the background; seeding before they land would have
+    // them overwrite the seeded rows.
+    table.wait_for_scan_file_statistics_persistence().await;
     let table_id = table.table_id().to_string();
     let schema = table.schema();
     let files = fixture
@@ -400,6 +403,7 @@ async fn blobs_written_before_nan_was_accounted_for_are_not_trusted() {
 
         // Every seeded row was re-inferred and rewritten: a file holding a NaN has
         // no float bounds, and every other file's bounds carry a zero NaN count.
+        reopened.wait_for_scan_file_statistics_persistence().await;
         let table_id = reopened.table_id().to_string();
         let schema = datafusion::datasource::TableProvider::schema(reopened.as_ref());
         let mut unbounded_files = 0;

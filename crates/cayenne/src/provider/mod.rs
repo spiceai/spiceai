@@ -2478,6 +2478,7 @@ mod tests {
                 .expect("warm new-schema statistics");
             assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         }
+        provider.wait_for_scan_file_statistics_persistence().await;
         let before_release = catalog
             .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
             .await
@@ -2521,6 +2522,7 @@ mod tests {
             assert_eq!(old_values, vec![(1, 12_345_i128), (2, 67_890_i128)]);
         }
         eprintln!("DECIMAL_FILE_OLD_SCAN {old_values:?}");
+        provider.wait_for_scan_file_statistics_persistence().await;
         let persisted = catalog
             .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
             .await

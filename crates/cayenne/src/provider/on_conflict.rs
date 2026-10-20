@@ -1048,9 +1048,13 @@ pub(crate) enum PkDeletionSnapshot {
 /// pure delete and must be committed delete-only (a phantom reinsert marker
 /// would resurrect older durable copies on the main scan path). See
 /// `commit_mem_tier_checkpoint_metadata`.
+///
+/// Row keys are held as their [`hash_index::hash_key_128`] digests, the key
+/// identity the deletion index already uses, so the set costs no allocation per
+/// flushed row.
 pub(crate) enum CheckpointCorpusKeys {
     Int64(HashSet<i64>),
-    RowKeys(HashSet<Box<[u8]>>),
+    RowKeys(HashSet<u128, PrehashedBuildHasher>),
     None,
 }
 
@@ -1060,7 +1064,7 @@ impl CheckpointCorpusKeys {
     }
 
     pub(crate) fn contains_row_key(&self, key: &[u8]) -> bool {
-        matches!(self, Self::RowKeys(keys) if keys.contains(key))
+        matches!(self, Self::RowKeys(keys) if keys.contains(&hash_index::hash_key_128(key)))
     }
 }
 
@@ -1201,6 +1205,9 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     pub(crate) limit: Option<usize>,
     pub(crate) pk_indices_in_projection: &'a [usize],
     pub(crate) protected_snapshots: Arc<HashMap<String, i64>>,
+    /// Each protected snapshot's files, captured with `protected_snapshots`
+    /// under the scan's listing fence.
+    pub(crate) protected_files: Arc<HashMap<String, super::table::CapturedSnapshotFiles>>,
     pub(crate) deletion_snapshot: &'a PkDeletionSnapshot,
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
