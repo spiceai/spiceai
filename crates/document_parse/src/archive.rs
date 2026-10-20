@@ -415,14 +415,26 @@ fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
 }
 
 /// Index just past a stream's payload: `/Length` bytes from `data_start` when
-/// known, otherwise the `endstream` keyword that terminates it. Falling back to
-/// `endstream` covers missing or indirect lengths we cannot resolve.
+/// known, otherwise the `endstream` keyword that terminates it.
+///
+/// A declared length is only trusted when it does not reach past the next
+/// `endstream`. An indirect `/Length` that resolved to a decoy integer (for
+/// example a number inside a Catalog string that happens to look like
+/// `N 0 obj`) would otherwise skip to EOF and leave a later Flate stream
+/// unchecked; preferring the earlier `endstream` keeps discovery on the real
+/// object boundary.
 fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
+    let endstream_at = find_endstream(raw, data_start);
     if let Some(len) = length {
-        let end = data_start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
-        return after_endstream(raw, end.min(raw.len()));
+        let by_length = data_start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+        if let Some(es) = endstream_at
+            && es <= by_length
+        {
+            return es + b"endstream".len();
+        }
+        return after_endstream(raw, by_length.min(raw.len()));
     }
-    find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
+    endstream_at.map_or(raw.len(), |pos| pos + b"endstream".len())
 }
 
 /// If `endstream` sits at or just after `at` (with optional whitespace), return
@@ -598,8 +610,12 @@ fn filters_of_dict(raw: &[u8], close: usize) -> Option<ParsedDict> {
     while j > window_start + 1 && tried < MAX_DICT_CANDIDATES {
         j -= 1;
         if raw[j] == b'<' && raw[j - 1] == b'<' {
-            tried += 1;
             let start = j - 1;
+            // A `<<` that sits inside a `%` comment is not a dictionary opener.
+            if comment_open_before(raw, start).is_some() {
+                continue;
+            }
+            tried += 1;
             if let Some(parsed) = parse_dictionary(&raw[start..close], 0)
                 && parsed.consumed == close - start
             {
@@ -1781,6 +1797,57 @@ mod tests {
         );
         ensure_pdf_within_budget(&pdf)
             .expect("ordinary text that mentions stream must not be rejected");
+    }
+
+    /// A Catalog string that contains the bytes of a fake `N 0 obj` /Length
+    /// must not make discovery skip past a later Flate stream. The empty
+    /// stream's real length is 0; trusting the decoy would advance to EOF.
+    #[test]
+    fn still_budgets_a_stream_after_an_indirect_length_decoy() {
+        let bomb = flate_bomb();
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        // Object 1: Catalog with a decoy string that looks like object 6.
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Note ( 6 0 obj\n99999999\nendobj) >>\nendobj\n",
+        );
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
+        );
+        // Object 4: empty stored stream whose /Length is the real object 6 (0).
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length 6 0 R >>\nstream\nendstream\nendobj\n");
+        // Object 5: Flate bomb that must still be discovered and budgeted.
+        pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
+        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+        pdf.extend_from_slice(&bomb);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        // Object 6: the real /Length value is 0.
+        pdf.extend_from_slice(b"6 0 obj\n0\nendobj\n");
+        let raw = Bytes::from(pdf);
+        let streams = pdf_streams(&raw);
+        assert!(
+            streams.len() >= 2,
+            "the Flate stream after the empty one must still be discovered, got {} streams",
+            streams.len()
+        );
+        assert_eq!(
+            pdf_too_large_reason(&raw),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A `<<` that appears inside a `%` comment is not the dictionary opener.
+    /// Taking it would parse a suffix with no `/Filter` and count the Flate
+    /// stream as stored.
+    #[test]
+    fn rejects_a_bomb_when_a_comment_contains_a_dict_opener() {
+        let data = flate_bomb();
+        let mut dict = b"<< /Filter /FlateDecode % <<\n /Length ".to_vec();
+        dict.extend_from_slice(data.len().to_string().as_bytes());
+        dict.extend_from_slice(b" >>\n");
+        assert_chain_budgeted(&dict, &data);
     }
 
     /// Attacker-controlled nesting in a skipped value must fail closed without
