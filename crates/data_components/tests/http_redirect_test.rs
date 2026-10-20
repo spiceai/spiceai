@@ -19,7 +19,7 @@ limitations under the License.
 //! reached through the hostnames `victim.test` and `attacker.test`, because the redirect
 //! guard refuses a literal loopback address just as the runtime's does.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use arrow::array::{Array, StringArray};
 use data_components::http::{
@@ -680,4 +680,80 @@ async fn cross_origin_redirect_drops_url_credentials() {
     let landing = requests_to(&origins.victim, "/landing").await;
     assert_eq!(landing.len(), 1);
     assert_eq!(header(&landing[0], "authorization"), None);
+}
+
+/// A provider whose client has a total request timeout of `budget`, as the runtime builds
+/// one from `client_timeout`.
+fn provider_with_timeout(origins: &Origins, budget: Duration) -> HttpTableProvider {
+    let client = reqwest::Client::builder()
+        .redirect(GUARD.manual_policy())
+        .timeout(budget)
+        .resolve("victim.test", *origins.victim.address())
+        .build()
+        .expect("client should build");
+    HttpTableProvider::new(
+        origins.victim_url("/data"),
+        client,
+        "json".to_string(),
+        false,
+    )
+    .with_max_retries(0)
+    .with_redirect_guard(GUARD)
+    .with_request_timeout(budget)
+}
+
+/// The request timeout bounds the whole redirect chain, as it does when the client follows
+/// the redirects: two hops that each fit in it, but not together, time out.
+#[tokio::test]
+async fn request_timeout_covers_the_whole_redirect_chain() {
+    let budget = Duration::from_millis(400);
+
+    let fast = Origins::start().await;
+    fast.redirect("/data", 302, "/final").await;
+    Mock::given(path("/final"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(VICTIM_BODY))
+        .mount(&fast.victim)
+        .await;
+    let rows = query(
+        provider_with_timeout(&fast, budget),
+        "SELECT content FROM t",
+    )
+    .await
+    .expect("a fast redirect chain should fit in the timeout");
+    assert_eq!(rows, vec![VICTIM_BODY.to_string()]);
+
+    let slow = Origins::start().await;
+    let hop_delay = Duration::from_millis(250);
+    Mock::given(path("/data"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", "/final")
+                .set_delay(hop_delay),
+        )
+        .mount(&slow.victim)
+        .await;
+    Mock::given(path("/final"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(VICTIM_BODY)
+                .set_delay(hop_delay),
+        )
+        .mount(&slow.victim)
+        .await;
+    let error = query(
+        provider_with_timeout(&slow, budget),
+        "SELECT content FROM t",
+    )
+    .await
+    .expect_err("two 250 ms hops must not fit in a 400 ms timeout");
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let transport = std::iter::from_fn(|| {
+        let current = source?;
+        source = current.source();
+        Some(current)
+    })
+    .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+    .unwrap_or_else(|| panic!("the failure should come from the HTTP client: {error}"));
+    assert!(transport.is_timeout(), "{transport:?}");
+    assert_eq!(requests_to(&slow.victim, "/final").await.len(), 1);
 }

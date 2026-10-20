@@ -871,6 +871,9 @@ pub struct HttpTableProvider {
     /// Set when `client` was built with this guard's [`RedirectGuard::manual_policy`], so
     /// this provider follows the redirects itself.
     redirect_guard: Option<RedirectGuard>,
+    /// The client's total request timeout, which bounds a whole redirect chain the
+    /// provider follows rather than each hop of it.
+    request_timeout: Option<Duration>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
     /// When set, JSON response rows are decomposed into the declared
@@ -934,6 +937,7 @@ impl HttpTableProvider {
             pagination: None,
             auth: None,
             redirect_guard: None,
+            request_timeout: None,
             rate_limiter: None,
             rate_controller: None,
             json_nesting: None,
@@ -1285,6 +1289,15 @@ impl HttpTableProvider {
     #[must_use]
     pub fn with_redirect_guard(mut self, guard: RedirectGuard) -> Self {
         self.redirect_guard = Some(guard);
+        self
+    }
+
+    /// The total request timeout the client was built with. Redirects this provider
+    /// follows share it — every hop and the final response body together — as they do
+    /// when the client follows them; without it, each hop gets the client's timeout anew.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
         self
     }
 
@@ -1933,7 +1946,8 @@ impl HttpTableProvider {
     /// — as `reqwest` does when it follows one — without the payload headers once a 303,
     /// or a 301 or 302 to a `POST`, has dropped the body. Every target is
     /// checked against the guard, and the chain shares one budget, so the request fails at
-    /// its [`MAX_REDIRECTS`]th redirect whichever origins it visits. A redirect that is
+    /// its [`MAX_REDIRECTS`]th redirect whichever origins it visits, and within one
+    /// request timeout (see [`Self::with_request_timeout`]). A redirect that is
     /// not followed is returned as the response.
     async fn send_following_redirects(
         &self,
@@ -1941,6 +1955,7 @@ impl HttpTableProvider {
         body: Option<&str>,
         attached: Option<AttachedToRequest<'_>>,
     ) -> reqwest::Result<reqwest::Response> {
+        let started = Instant::now();
         let mut response = self
             .build_request(url, body, false, attached)
             .send()
@@ -1985,15 +2000,16 @@ impl HttpTableProvider {
             {
                 break;
             }
-            response = self
-                .build_request(
-                    &target,
-                    body,
-                    drop_payload_headers,
-                    attached.filter(|_| on_origin),
-                )
-                .send()
-                .await?;
+            let mut request = self.build_request(
+                &target,
+                body,
+                drop_payload_headers,
+                attached.filter(|_| on_origin),
+            );
+            if let Some(timeout) = self.request_timeout {
+                request = request.timeout(timeout.saturating_sub(started.elapsed()));
+            }
+            response = request.send().await?;
         }
         Ok(response)
     }

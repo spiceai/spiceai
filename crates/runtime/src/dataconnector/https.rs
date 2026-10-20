@@ -1307,6 +1307,7 @@ impl Https {
         .with_retry_jitter(retry_jitter)
         .with_headers(custom_headers)
         .with_redirect_guard(HTTP_REDIRECT_GUARD)
+        .with_request_timeout(self.configured_client_timeout())
         .with_max_request_partitions(max_request_partitions)
         .with_error_response_action(error_response_action)
         .with_dataset_name(dataset.name.to_string())
