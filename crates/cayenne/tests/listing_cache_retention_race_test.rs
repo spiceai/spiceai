@@ -189,17 +189,7 @@ async fn run(
             .is_some(),
         "premise: the default runtime env caches directory listings, as spiced's does"
     );
-    let store = Arc::new(PausedListStore {
-        inner: Arc::new(object_store::local::LocalFileSystem::new()),
-        armed: Arc::new(AtomicBool::new(false)),
-        only: parking_lot::Mutex::new(None),
-        listed: Arc::new(Notify::new()),
-        release: Arc::new(Notify::new()),
-    });
-    ctx.runtime_env().register_object_store(
-        &url::Url::parse("file:///")?,
-        Arc::clone(&store) as Arc<dyn ObjectStore>,
-    );
+    let store = PausedListStore::install(&ctx)?;
     let table = retention_table(&fixture, &ctx).await?;
     ctx.register_table("t", Arc::clone(&table) as _)?;
     for sql in [
@@ -217,13 +207,7 @@ async fn run(
     }
     let vortex_files_before = count_vortex_files(&fixture.data_path);
 
-    // The directory's listing is not cached, as after any evicting publish or
-    // an LRU eviction: the next lister reads the store and caches what it read.
-    ctx.runtime_env()
-        .cache_manager
-        .get_list_files_cache()
-        .expect("list-files cache")
-        .clear();
+    clear_list_files_cache(&ctx);
 
     store.armed.store(race, Ordering::Release);
     let build_table = Arc::clone(&table);
@@ -236,22 +220,10 @@ async fn run(
         None
     };
 
-    let mut write = tokio::spawn(writer.write(ctx.clone(), Arc::clone(&table)));
-    // While the paused listing holds the fence, the writer must wait for it.
-    // Keep the task alive when the timeout expires.
-    let (writer_waited_for_listing, written) = match pending_build {
-        Some(build) => {
-            let while_listing = tokio::time::timeout(Duration::from_millis(500), &mut write).await;
-            store.release.notify_one();
-            build.await?;
-            match while_listing {
-                Ok(written) => (false, written),
-                Err(_) => (true, write.await),
-            }
-        }
-        None => (false, write.await),
-    };
-    written??;
+    let write = tokio::spawn(writer.write(ctx.clone(), Arc::clone(&table)));
+    let (writer_waited_for_listing, written) =
+        write_while_listing(&store, pending_build, write).await?;
+    written?;
     let vortex_files_after = count_vortex_files(&fixture.data_path);
     assert_eq!(
         vortex_files_after.cast_signed() - vortex_files_before.cast_signed(),
@@ -260,21 +232,10 @@ async fn run(
     );
 
     if clear_listing_cache {
-        ctx.runtime_env()
-            .cache_manager
-            .get_list_files_cache()
-            .expect("list-files cache")
-            .clear();
+        clear_list_files_cache(&ctx);
     }
 
-    // Every query from here on, including after a later append.
-    let mut outcomes = Vec::new();
-    outcomes.push(query(&ctx, select).await);
-    ctx.sql("INSERT INTO t VALUES (5, to_timestamp_nanos(5))")
-        .await?
-        .collect()
-        .await?;
-    outcomes.push(query(&ctx, select).await);
+    let outcomes = outcomes_around_append(&ctx, select).await?;
     eprintln!(
         "writer={writer:?} race={race} writer_waited_for_listing={writer_waited_for_listing} \
          outcomes={outcomes:#?}"
@@ -308,17 +269,7 @@ async fn query_protected_listing_before_retention(
 
 async fn run_protected(fixture: TestFixture, race: bool) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let store = Arc::new(PausedListStore {
-        inner: Arc::new(object_store::local::LocalFileSystem::new()),
-        armed: Arc::new(AtomicBool::new(false)),
-        only: parking_lot::Mutex::new(None),
-        listed: Arc::new(Notify::new()),
-        release: Arc::new(Notify::new()),
-    });
-    ctx.runtime_env().register_object_store(
-        &url::Url::parse("file:///")?,
-        Arc::clone(&store) as Arc<dyn ObjectStore>,
-    );
+    let store = PausedListStore::install(&ctx)?;
     let table = upsert_retention_table(&fixture, &ctx).await?;
     ctx.register_table("t", Arc::clone(&table) as _)?;
     let select = "SELECT event_time FROM t ORDER BY event_time";
@@ -355,11 +306,7 @@ async fn run_protected(fixture: TestFixture, race: bool) -> Result<(), Box<dyn s
 
     // Every directory's listing is uncached, and the pause lands on the query's
     // listing of the upserted snapshot's directory.
-    ctx.runtime_env()
-        .cache_manager
-        .get_list_files_cache()
-        .expect("list-files cache")
-        .clear();
+    clear_list_files_cache(&ctx);
     *store.only.lock() = upserted.rsplit('/').next().map(str::to_string);
     store.armed.store(race, Ordering::Release);
     let query_ctx = ctx.clone();
@@ -374,34 +321,18 @@ async fn run_protected(fixture: TestFixture, race: bool) -> Result<(), Box<dyn s
         None
     };
 
-    let mut write = tokio::spawn(Writer::Retention.write(ctx.clone(), Arc::clone(&table)));
-    let (writer_waited_for_listing, written) = match pending_query {
-        Some(planning) => {
-            let while_listing = tokio::time::timeout(Duration::from_millis(500), &mut write).await;
-            store.release.notify_one();
-            // The racing query's own answer may predate retention either way.
-            let _ = planning.await?;
-            match while_listing {
-                Ok(written) => (false, written),
-                Err(_) => (true, write.await),
-            }
-        }
-        None => (false, write.await),
-    };
-    written??;
+    // The racing query's own answer may predate retention either way.
+    let write = tokio::spawn(Writer::Retention.write(ctx.clone(), Arc::clone(&table)));
+    let (writer_waited_for_listing, written) =
+        write_while_listing(&store, pending_query, write).await?;
+    written?;
     let after = protected_snapshot_dirs(&fixture, &table, &base_snapshot)?;
     assert!(
         after.contains(&(upserted.clone(), 1)) && after.len() == 2,
         "premise: retention unlinked one of the upserted snapshot's files, got {after:?}"
     );
 
-    let mut outcomes = Vec::new();
-    outcomes.push(query(&ctx, select).await);
-    ctx.sql("INSERT INTO t VALUES (5, to_timestamp_nanos(5))")
-        .await?
-        .collect()
-        .await?;
-    outcomes.push(query(&ctx, select).await);
+    let outcomes = outcomes_around_append(&ctx, select).await?;
     eprintln!(
         "protected race={race} writer_waited_for_listing={writer_waited_for_listing} \
          outcomes={outcomes:#?}"
@@ -509,6 +440,50 @@ async fn upsert_retention_table(
     ))
 }
 
+/// Runs `write` while `lister`, when racing, is paused in its LIST, then
+/// releases the LIST and waits for both. Returns whether the write had to wait
+/// for the listing, and the write's own result.
+async fn write_while_listing<T>(
+    store: &PausedListStore,
+    lister: Option<tokio::task::JoinHandle<T>>,
+    mut write: tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<(bool, Result<(), String>), tokio::task::JoinError> {
+    let Some(lister) = lister else {
+        return Ok((false, write.await?));
+    };
+    // Keep the write alive when the timeout expires.
+    let while_listing = tokio::time::timeout(Duration::from_millis(500), &mut write).await;
+    store.release.notify_one();
+    lister.await?;
+    match while_listing {
+        Ok(written) => Ok((false, written?)),
+        Err(_) => Ok((true, write.await?)),
+    }
+}
+
+/// What `select` reads now, and again after a later append of `event_time = 5`.
+async fn outcomes_around_append(
+    ctx: &SessionContext,
+    select: &str,
+) -> Result<Vec<Result<Vec<i64>, String>>, Box<dyn std::error::Error>> {
+    let before = query(ctx, select).await;
+    ctx.sql("INSERT INTO t VALUES (5, to_timestamp_nanos(5))")
+        .await?
+        .collect()
+        .await?;
+    Ok(vec![before, query(ctx, select).await])
+}
+
+/// Drops every cached directory listing, as after an evicting publish or an
+/// LRU eviction: the next lister reads the store and caches what it read.
+fn clear_list_files_cache(ctx: &SessionContext) {
+    ctx.runtime_env()
+        .cache_manager
+        .get_list_files_cache()
+        .expect("list-files cache")
+        .clear();
+}
+
 async fn query(ctx: &SessionContext, sql: &str) -> Result<Vec<i64>, String> {
     match ctx.sql(sql).await {
         Ok(df) => df
@@ -610,10 +585,28 @@ fn timestamps(batches: &[RecordBatch]) -> Vec<i64> {
 #[derive(Debug)]
 struct PausedListStore {
     inner: Arc<dyn ObjectStore>,
-    armed: Arc<AtomicBool>,
+    armed: AtomicBool,
     only: parking_lot::Mutex<Option<String>>,
     listed: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+impl PausedListStore {
+    /// Registers a new, disarmed store as `ctx`'s `file://` store.
+    fn install(ctx: &SessionContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let store = Arc::new(Self {
+            inner: Arc::new(object_store::local::LocalFileSystem::new()),
+            armed: AtomicBool::new(false),
+            only: parking_lot::Mutex::new(None),
+            listed: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        });
+        ctx.runtime_env().register_object_store(
+            &url::Url::parse("file:///")?,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        Ok(store)
+    }
 }
 
 impl fmt::Display for PausedListStore {
