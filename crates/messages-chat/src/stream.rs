@@ -34,7 +34,9 @@ use messages_api::types::{ContentBlock, Message, StopReason};
 use messages_api::{MessageStream, MessagesError};
 use serde_json::{Map, Value};
 
-use crate::response::{input_tokens, message_id, messages_error, stop_reason, tool_use_id};
+use crate::response::{
+    input_tokens, message_id, messages_error, stop_reason, tool_input, tool_use_id,
+};
 
 /// The content block an event stream has open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +69,8 @@ pub struct Translator {
     model: String,
     started: bool,
     open: Option<OpenBlock>,
+    /// The tool the open `tool_use` block calls.
+    tool_name: String,
     /// The arguments the open `tool_use` block has streamed so far.
     arguments: String,
     /// The tool calls held back while the open one streams, in the order they started.
@@ -86,6 +90,7 @@ impl Translator {
             model,
             started: false,
             open: None,
+            tool_name: String::new(),
             arguments: String::new(),
             held: Vec::new(),
             next_index: 0,
@@ -115,19 +120,37 @@ impl Translator {
         });
     }
 
-    fn close(&mut self, events: &mut Vec<StreamEvent>) {
+    /// Whether the completion ran out of tokens, so its last block may have been cut off.
+    fn cut_off(&self) -> bool {
+        self.finish_reason == Some(FinishReason::Length)
+    }
+
+    /// Ends the open block. A `tool_use` block's input has to be a JSON object, as in the
+    /// unstreamed answer, unless the completion ran out of tokens in the middle of it.
+    fn close(&mut self, events: &mut Vec<StreamEvent>) -> Result<(), MessagesError> {
         if let Some(open) = self.open.take() {
+            if matches!(open, OpenBlock::ToolUse { .. }) && !self.cut_off() {
+                tool_input(&self.model, &self.tool_name, &self.arguments)?;
+            }
             events.push(StreamEvent::ContentBlockStop {
                 index: open.index(),
             });
         }
         self.arguments.clear();
+        Ok(())
     }
 
     /// Ends the open block, then gives each held-back tool call whole, in the order they started.
-    fn release_held(&mut self, events: &mut Vec<StreamEvent>) {
-        self.close(events);
+    fn release_held(&mut self, events: &mut Vec<StreamEvent>) -> Result<(), MessagesError> {
+        self.close(events)?;
         for held in std::mem::take(&mut self.held) {
+            match tool_input(&self.model, &held.name, &held.arguments) {
+                Ok(_) => {}
+                // The completion ran out of tokens in the middle of the call's arguments: it is
+                // left out, as in the unstreamed answer, since it was never made whole.
+                Err(_) if self.cut_off() => continue,
+                Err(error) => return Err(error),
+            }
             let index = self.open(
                 ContentBlock::ToolUse {
                     id: held.id,
@@ -135,7 +158,7 @@ impl Translator {
                     input: Value::Object(Map::new()),
                 },
                 events,
-            );
+            )?;
             if !held.arguments.is_empty() {
                 events.push(StreamEvent::ContentBlockDelta {
                     index,
@@ -146,6 +169,7 @@ impl Translator {
             }
             events.push(StreamEvent::ContentBlockStop { index });
         }
+        Ok(())
     }
 
     /// Whether a tool call starting now has to be held back: calls before it are, or the open
@@ -170,28 +194,32 @@ impl Translator {
         });
     }
 
-    fn open(&mut self, block: ContentBlock, events: &mut Vec<StreamEvent>) -> usize {
-        self.close(events);
+    fn open(
+        &mut self,
+        block: ContentBlock,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<usize, MessagesError> {
+        self.close(events)?;
         let index = self.next_index;
         self.next_index += 1;
         events.push(StreamEvent::ContentBlockStart {
             index,
             content_block: block,
         });
-        index
+        Ok(index)
     }
 
-    fn text(&mut self, text: String, events: &mut Vec<StreamEvent>) {
+    fn text(&mut self, text: String, events: &mut Vec<StreamEvent>) -> Result<(), MessagesError> {
         let index = if let Some(OpenBlock::Text { index }) = self.open {
             index
         } else {
-            self.release_held(events);
+            self.release_held(events)?;
             let index = self.open(
                 ContentBlock::Text {
                     text: String::new(),
                 },
                 events,
-            );
+            )?;
             self.open = Some(OpenBlock::Text { index });
             index
         };
@@ -199,6 +227,7 @@ impl Translator {
             index,
             delta: ContentBlockDelta::TextDelta { text },
         });
+        Ok(())
     }
 
     /// The events for one chunk.
@@ -206,7 +235,7 @@ impl Translator {
     /// # Errors
     ///
     /// Returns an `api_error` when the chunk continues a tool call whose block has already ended,
-    /// or starts a tool call without a name.
+    /// starts a tool call without a name, or ends one whose arguments are not a JSON object.
     pub fn chunk(
         &mut self,
         chunk: CreateChatCompletionStreamResponse,
@@ -222,11 +251,11 @@ impl Translator {
         };
         let delta = choice.delta;
         if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
-            self.text(text, &mut events);
+            self.text(text, &mut events)?;
         }
         if let Some(refusal) = delta.refusal.filter(|text| !text.is_empty()) {
             self.refused = true;
-            self.text(refusal, &mut events);
+            self.text(refusal, &mut events)?;
         }
         for call in delta.tool_calls.into_iter().flatten() {
             let (name, arguments) = call
@@ -277,11 +306,12 @@ impl Translator {
             let index = self.open(
                 ContentBlock::ToolUse {
                     id,
-                    name,
+                    name: name.clone(),
                     input: Value::Object(Map::new()),
                 },
                 &mut events,
-            );
+            )?;
+            self.tool_name = name;
             self.open = Some(OpenBlock::ToolUse {
                 index,
                 tool_call: call.index,
@@ -294,13 +324,15 @@ impl Translator {
         Ok(events)
     }
 
-    /// The events that end the stream when the chunks ran out: those of [`Self::finish`] when the
-    /// completion finished.
+    /// The events that end the stream when the chunks ran out: the open block's stop, the tool
+    /// calls held back, given whole, `message_delta` with the stop reason and the usage of the
+    /// whole message, and `message_stop`.
     ///
     /// # Errors
     ///
     /// Returns an `api_error` when the chunks ran out before the completion finished: the message
-    /// was cut short, and ending it with `message_stop` would present it as whole.
+    /// was cut short, and ending it with `message_stop` would present it as whole. Also when a
+    /// tool call it ends has arguments that are not a JSON object.
     pub fn end(self) -> Result<Vec<StreamEvent>, MessagesError> {
         if self.finish_reason.is_none() {
             return Err(MessagesError::api(format!(
@@ -308,17 +340,13 @@ impl Translator {
                 self.model
             )));
         }
-        Ok(self.finish())
+        self.finish()
     }
 
-    /// The events that end the stream: the open block's stop, the tool calls held back, given
-    /// whole, `message_delta` with the stop reason and the usage of the whole message, and
-    /// `message_stop`.
-    #[must_use]
-    pub fn finish(mut self) -> Vec<StreamEvent> {
+    fn finish(mut self) -> Result<Vec<StreamEvent>, MessagesError> {
         let mut events = Vec::new();
         self.start(None, &mut events);
-        self.release_held(&mut events);
+        self.release_held(&mut events)?;
         let stop_reason = if self.refused {
             StopReason::Refusal
         } else {
@@ -344,7 +372,7 @@ impl Translator {
             usage,
         });
         events.push(StreamEvent::MessageStop);
-        events
+        Ok(events)
     }
 }
 

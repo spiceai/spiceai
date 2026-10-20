@@ -586,40 +586,66 @@ async fn held_back_tool_calls_come_before_the_text_after_them() {
     );
 }
 
-/// A tool call continued after its block ended, here by text, cannot be streamed: the block's
-/// input was already given whole, so the stream ends with an error instead.
+/// Text ends the open tool call's block, which then has to be whole: text in the middle of a
+/// call's arguments ends the stream with an error, and so does more of a call after its block
+/// ended, since its input was already given whole.
 #[tokio::test]
-async fn a_tool_call_continued_after_its_block_ended_ends_the_stream_with_an_error() {
-    let streamed = events(vec![
-        Ok(chunk(&tool_call(
-            0,
-            Some("call_1"),
-            Some("read_file"),
-            "{\"path\":",
-        ))),
+async fn a_tool_call_that_text_ended_is_checked_and_cannot_continue() {
+    let reading = || {
         Ok(chunk(
             &json!({"index": 0, "delta": {"content": "Reading."}, "finish_reason": null}),
-        )),
-        Ok(chunk(&tool_call(0, None, None, "\"a.rs\"}"))),
+        ))
+    };
+    let finish = || {
         Ok(chunk(
             &json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"}),
-        )),
-    ])
-    .await;
-    assert_eq!(
-        streamed.last(),
-        Some(
-            &json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' streamed more of a tool call after its content block had ended, which the Messages API cannot stream: it streams each content block whole before the next. Send the request without `stream`."}})
-        )
-    );
-    assert_eq!(
-        streamed
-            .iter()
-            .filter(|event| event["type"] == "message_stop")
-            .count(),
-        0,
-        "an errored stream does not also end as a whole message"
-    );
+        ))
+    };
+    let cases = [
+        (
+            vec![
+                Ok(chunk(&tool_call(
+                    0,
+                    Some("call_1"),
+                    Some("read_file"),
+                    "{\"path\":",
+                ))),
+                reading(),
+                Ok(chunk(&tool_call(0, None, None, "\"a.rs\"}"))),
+                finish(),
+            ],
+            "Model 'gpt' called the tool 'read_file' with arguments that are not a JSON object, which the Messages API cannot return: {\"path\":",
+        ),
+        (
+            vec![
+                Ok(chunk(&tool_call(
+                    0,
+                    Some("call_1"),
+                    Some("read_file"),
+                    "{\"path\":\"a.rs\"}",
+                ))),
+                reading(),
+                Ok(chunk(&tool_call(0, None, None, "{}"))),
+                finish(),
+            ],
+            "Model 'gpt' streamed more of a tool call after its content block had ended, which the Messages API cannot stream: it streams each content block whole before the next. Send the request without `stream`.",
+        ),
+    ];
+    for (chunks, message) in cases {
+        let streamed = events(chunks).await;
+        assert_eq!(
+            streamed.last(),
+            Some(&json!({"type": "error", "error": {"type": "api_error", "message": message}}))
+        );
+        assert_eq!(
+            streamed
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            0,
+            "{message}: an errored stream does not also end as a whole message"
+        );
+    }
 }
 
 #[tokio::test]
@@ -778,6 +804,111 @@ async fn a_streamed_and_an_unstreamed_answer_carry_the_same_message() {
             .collect::<Vec<_>>(),
         [(None, false), (Some(true), true)],
         "the unstreamed request is not marked as streaming, and the streamed one asks for usage"
+    );
+}
+
+/// The unstreamed and the streamed answer of a model that answers with `answer`, or streams
+/// `chunks`; a stream's error is its last event, as its envelope.
+async fn both_answers(
+    answer: CreateChatCompletionResponse,
+    chunks: Vec<CreateChatCompletionStreamResponse>,
+) -> (Result<Value, MessagesError>, Vec<Value>) {
+    let chat = Arc::new(ScriptedChat {
+        requests: Mutex::new(Vec::new()),
+        answer,
+        chunks,
+    });
+    let messages = ChatMessages::new(Arc::clone(&chat) as Arc<dyn Chat>);
+    let body = json!({"model": "gpt", "max_tokens": 100, "messages": [{"role": "user", "content": "Read a.rs"}]});
+    let created = messages.create(messages_request(&body)).await;
+    let streamed = messages
+        .create_stream(messages_request(&body))
+        .await
+        .expect("a stream")
+        .map(|event| event.unwrap_or_else(|error| error.to_envelope()))
+        .collect()
+        .await;
+    (created, streamed)
+}
+
+/// A tool call whose arguments are not a JSON object cannot be a `tool_use` block: the streamed
+/// answer ends with the error the unstreamed one is, whether the call streamed as it arrived or
+/// was held back behind another.
+#[tokio::test]
+async fn a_streamed_tool_call_whose_input_is_not_an_object_ends_with_the_unstreamed_error() {
+    let not_an_object = |id: &str| json!({"id": id, "type": "function", "function": {"name": "read_file", "arguments": "[]"}});
+    let cases = [
+        (
+            json!([not_an_object("call_1")]),
+            vec![
+                chunk(&tool_call(0, Some("call_1"), Some("read_file"), "[]")),
+                chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"})),
+            ],
+        ),
+        (
+            json!([
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                not_an_object("call_2"),
+            ]),
+            vec![
+                chunk(&tool_call(0, Some("call_1"), Some("read_file"), "")),
+                chunk(&tool_call(1, Some("call_2"), Some("read_file"), "[]")),
+                chunk(&tool_call(0, None, None, "{}")),
+                chunk(&json!({"index": 0, "delta": {}, "finish_reason": "tool_calls"})),
+            ],
+        ),
+    ];
+    for (tool_calls, chunks) in cases {
+        let (created, streamed) = both_answers(
+            completion(
+                &json!({"role": "assistant", "content": null, "tool_calls": tool_calls}),
+                "tool_calls",
+            ),
+            chunks,
+        )
+        .await;
+        let error = created.expect_err("an unstreamed error").to_envelope();
+        assert_eq!(
+            error,
+            json!({"type": "error", "error": {"type": "api_error", "message": "Model 'gpt' called the tool 'read_file' with arguments that are not a JSON object, which the Messages API cannot return: []"}})
+        );
+        assert_eq!(streamed.last(), Some(&error), "{tool_calls}");
+        assert!(
+            !streamed.iter().any(|event| event["type"] == "message_stop"),
+            "{tool_calls}: an errored stream does not also end as a whole message"
+        );
+    }
+}
+
+/// A completion cut off by `max_tokens` in the middle of a held-back call's arguments leaves the
+/// call out, as the unstreamed answer does, and ends with `max_tokens`.
+#[tokio::test]
+async fn a_held_back_tool_call_cut_off_by_max_tokens_is_left_out() {
+    let (created, streamed) = both_answers(
+        completion(
+            &json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}},
+            ]}),
+            "length",
+        ),
+        vec![
+            chunk(&tool_call(0, Some("call_1"), Some("read_file"), "")),
+            chunk(&tool_call(1, Some("call_2"), Some("read_file"), "{\"path\":")),
+            chunk(&tool_call(0, None, None, "{\"path\":\"a.rs\"}")),
+            chunk(&json!({"index": 0, "delta": {}, "finish_reason": "length"})),
+            usage_chunk(),
+        ],
+    )
+    .await;
+    let created = created.expect("an unstreamed message");
+    assert_eq!(accumulate(&streamed), created);
+    assert_eq!(
+        (&created["stop_reason"], &created["content"]),
+        (
+            &json!("max_tokens"),
+            &json!([{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "a.rs"}}])
+        )
     );
 }
 
