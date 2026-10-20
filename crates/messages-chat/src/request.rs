@@ -565,14 +565,30 @@ fn chat_tool(model: &str, tool: ToolParam) -> Result<ChatCompletionTools, Messag
             description,
             input_schema,
             strict,
-        }) => Ok(ChatCompletionTools::Function(ChatCompletionTool {
-            function: FunctionObject {
-                name,
-                description,
-                parameters: Some(input_schema),
-                strict,
-            },
-        })),
+            other,
+        }) => {
+            // `cache_control` and `eager_input_streaming` only change how a request is served.
+            if let Some(field) = other.keys().find(|field| {
+                !matches!(
+                    field.as_str(),
+                    "type" | "cache_control" | "eager_input_streaming"
+                )
+            }) {
+                return Err(unsupported(
+                    model,
+                    &format!("`{field}` on the tool '{name}'"),
+                    &format!("Remove `{field}`, or use a model with `from: anthropic`."),
+                ));
+            }
+            Ok(ChatCompletionTools::Function(ChatCompletionTool {
+                function: FunctionObject {
+                    name,
+                    description,
+                    parameters: Some(input_schema),
+                    strict,
+                },
+            }))
+        }
         ToolParam::Other { tool_type, .. } => Err(unsupported(
             model,
             &format!("the Anthropic-defined tool `{tool_type}`"),

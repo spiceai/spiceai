@@ -210,6 +210,41 @@ fn what_a_chat_completion_cannot_carry_is_refused_by_name() {
     }
 }
 
+/// A tool's `cache_control` and `eager_input_streaming` only change how a request is served, so
+/// the tool is translated without them; any other field of a tool, such as `defer_loading`, is
+/// refused by name, since dropping it would offer the model a tool the client meant otherwise.
+#[test]
+fn a_tools_serving_fields_are_accepted_and_its_other_fields_refused_by_name() {
+    let body = |tool: Value| json!({"model": "gpt", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}], "tools": [tool]});
+    let chat = translated(&body(json!({
+        "type": "custom", "name": "read_file", "description": "Reads a file.",
+        "input_schema": {"type": "object"}, "strict": true,
+        "cache_control": {"type": "ephemeral"}, "eager_input_streaming": true,
+    })))
+    .expect("a translated request");
+    assert_eq!(
+        chat["tools"],
+        json!([{"type": "function", "function": {"name": "read_file", "description": "Reads a file.", "parameters": {"type": "object"}, "strict": true}}])
+    );
+    for (field, value) in [
+        ("defer_loading", json!(true)),
+        ("input_examples", json!([{"path": "a.rs"}])),
+        ("allowed_callers", json!(["code_execution_20250825"])),
+    ] {
+        let mut tool = json!({"name": "read_file", "input_schema": {"type": "object"}});
+        tool[field] = value;
+        let error = translated(&body(tool)).expect_err("a refused tool");
+        assert_eq!(
+            (error.status, &error.error_type, error.message.as_str()),
+            (
+                400,
+                &ErrorType::InvalidRequest,
+                format!("Model 'gpt' serves the Messages API by translating requests into chat completions, which cannot carry `{field}` on the tool 'read_file'. Remove `{field}`, or use a model with `from: anthropic`. See: https://spiceai.org/docs/components/models").as_str()
+            )
+        );
+    }
+}
+
 #[test]
 fn a_request_that_is_not_a_messages_request_is_an_invalid_request() {
     let error = crate::parse(MessagesRequest::new(

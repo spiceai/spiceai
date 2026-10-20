@@ -344,6 +344,9 @@ pub struct CustomToolParam {
     pub description: Option<String>,
     pub input_schema: Value,
     pub strict: Option<bool>,
+    /// Every other field, `type` and `cache_control` included, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
