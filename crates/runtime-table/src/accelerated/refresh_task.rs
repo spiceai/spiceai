@@ -27,7 +27,7 @@ use crate::filter_converter::TimestampFilterConvert;
 use crate::filter_converter::create_timestamp_filter_convert;
 use arrow::compute::filter_record_batch;
 use arrow::{
-    array::{Array, ArrayRef, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray},
     datatypes::DataType,
     error::ArrowError,
     row::{RowConverter, Rows, SortField},
@@ -100,7 +100,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
-use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use std::{sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
     runtime::Handle,
@@ -2765,10 +2765,9 @@ impl RefreshTask {
         // appends of rows that have NULL in the time_column (a real consistency
         // bug on retry / repeated refresh / source re-emit), we additionally
         // collect *all* rows where the time column IS NULL. These "timeless"
-        // rows are then available to the exact-row StructArray comparator in
-        // filter_records, which treats two nulls in the same position as Equal
-        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
-        // rows are now correctly filtered.
+        // rows are then available to the exact-row comparison in `OverlapIndex`,
+        // whose row encoding treats two nulls in the same position as equal.
+        // Exact duplicate NULL-time rows are now correctly filtered.
         //
         // Devil's advocate / remaining edge case (being really sure):
         // This loads the *entire historical set* of NULL-time rows on every
@@ -3704,9 +3703,9 @@ fn include_source_to_table_name(name: &TableReference, source: Option<&str>) -> 
     }
 }
 
-/// `StructArray::from` panics when a column's data type does not match the filter
-/// schema field (e.g. a source type widening between the accelerated rows and the
-/// incoming update); surface it as a proper refresh error instead.
+/// Encoding a column whose data type does not match the filter schema field panics
+/// (e.g. a source type widening between the accelerated rows and the incoming update);
+/// surface it as a proper refresh error instead.
 fn ensure_dedup_column_type(
     name: &str,
     expected: &DataType,
@@ -3768,6 +3767,9 @@ fn dedup_predicates(
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<Vec<bool>> {
+    use arrow::array::{StructArray, make_comparator};
+    use std::cmp::Ordering;
+
     let mut predicates = vec![];
     let mut comparators = vec![];
 
@@ -6113,9 +6115,9 @@ mod tests {
             .expect("collecting filtered data should succeed for NULL-time edge case test");
 
         // After the ACID fix (collecting time IS NULL rows into existing_records for the
-        // StructArray comparator): the exact duplicate (ts=NULL, id=99) is now correctly
-        // filtered out because make_comparator returns Equal for two nulls in the time
-        // position + matching id. Only the genuinely new higher-time row remains.
+        // exact-row comparison): the exact duplicate (ts=NULL, id=99) is now correctly
+        // filtered out because the row encoding makes two nulls in the time position
+        // equal and the ids match. Only the genuinely new higher-time row remains.
         // This is the comprehensive regression test for the nullable time_column edge
         // case in append refresh dedup. Devil's advocate: we also need to consider
         // whether large numbers of NULL-time rows could cause memory pressure — in
@@ -6284,7 +6286,7 @@ mod tests {
         );
     }
 
-    /// `make_comparator` reports two NULLs in the same position as equal, so a NULL-bearing
+    /// The row encoding makes two NULLs in the same position equal, so a NULL-bearing
     /// row takes part in the subtraction like any other - cancelled once, not once per copy.
     #[test]
     fn filter_records_subtracts_a_null_bearing_row_once() {
