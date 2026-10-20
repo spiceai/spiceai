@@ -19,8 +19,9 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use data_components::cdc::ChangeBatch;
 use data_components::pk_filter_expr::{self, balanced_binary};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, col, lit};
 
 use super::cdc::select_rows;
 
@@ -72,6 +73,40 @@ pub fn build_batch_delete_expr_from_change_batch(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(balanced_binary(row_conditions, Expr::or))
+}
+
+/// Build a delete predicate for the primary keys in `keys`, a batch of the
+/// table's primary-key columns in key order: an `IN` list for a single-column
+/// key, a disjunction of one equality conjunction per key otherwise. These are
+/// the shapes an accelerator can read keys from without evaluating them.
+///
+/// # Errors
+/// Returns an error if a key value cannot be read.
+pub fn build_primary_key_delete_expr(keys: &RecordBatch) -> Result<Option<Expr>> {
+    if keys.num_rows() == 0 || keys.num_columns() == 0 {
+        return Ok(None);
+    }
+    let schema = keys.schema();
+    let value =
+        |column: usize, row: usize| ScalarValue::try_from_array(keys.column(column), row).map(lit);
+    let key_column = |column: usize| col(Column::from_name(schema.field(column).name()));
+    if keys.num_columns() == 1 {
+        let values = (0..keys.num_rows())
+            .map(|row| value(0, row))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(key_column(0).in_list(values, false)));
+    }
+    let conjunctions = (0..keys.num_rows())
+        .map(|row| {
+            let equalities = (0..keys.num_columns())
+                .map(|column| Ok(key_column(column).eq(value(column, row)?)))
+                .collect::<Result<Vec<_>>>()?;
+            balanced_binary(equalities, Expr::and).ok_or_else(|| {
+                DataFusionError::Internal("A primary key has no columns".to_string())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(balanced_binary(conjunctions, Expr::or))
 }
 
 /// Project only the keys required by `Index::delete_by_keys`.
