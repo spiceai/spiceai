@@ -23,7 +23,7 @@ limitations under the License.
 //! message, and [`replay_spice_tool_calls`] gives the model what it saw: the `tool_use` blocks in
 //! the assistant message, and their `tool_result` blocks in the user message after it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -131,6 +131,24 @@ fn replayed_tool_result(block: Value) -> Value {
     result
 }
 
+/// The results of a round's Spice calls, in call order, each taken from `results`: the one sent
+/// back, or one saying it was not, since every `tool_use` has to be answered in the user message
+/// right after it.
+fn round_results(calls: &mut Vec<String>, results: &mut HashMap<String, Value>) -> Vec<Value> {
+    calls
+        .drain(..)
+        .map(|id| {
+            results.remove(&id).unwrap_or_else(|| {
+                tool_result_block(
+                    Value::from(id),
+                    json!([{"type": "text", "text": RESULT_NOT_SENT_BACK}]),
+                    false,
+                )
+            })
+        })
+        .collect()
+}
+
 fn message(role: &str, content: Vec<Value>) -> Value {
     let mut message = Map::new();
     message.insert("role".to_string(), Value::from(role));
@@ -153,7 +171,8 @@ fn names_a_spice_mcp_server(body: &Map<String, Value>) -> bool {
 /// The request with each of Spice's tool calls given back as the model made it: in each
 /// assistant message, an `mcp_tool_use` block becomes the `tool_use` block it was, and the
 /// `mcp_tool_result` blocks after it become `tool_result` blocks in a user message, so the
-/// assistant message is split where they were. Results at the end of an assistant message go at
+/// assistant message is split where they were. Each round's calls are answered there in call
+/// order, a call whose result was not sent back by a result saying so. Results at the end of an assistant message go at
 /// the start of the next user message, beside the results of the client's own calls. Other
 /// blocks, a hosted MCP server's included, are unchanged.
 pub(crate) fn replay_spice_tool_calls(body: &mut Map<String, Value>) {
@@ -191,30 +210,42 @@ pub(crate) fn replay_spice_tool_calls(body: &mut Map<String, Value>) {
                 .filter_map(|block| block.get("id").and_then(Value::as_str))
                 .map(ToString::to_string)
                 .collect();
-            let call_order: Vec<String> = content
-                .iter()
-                .filter(|block| is_spice_tool_use(block))
-                .filter_map(|block| block.get("id").and_then(Value::as_str))
-                .map(ToString::to_string)
-                .collect();
-            let answered: HashSet<String> = content
-                .iter()
-                .filter(|block| is_spice_tool_result(block, &calls))
-                .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
-                .map(ToString::to_string)
+            // The results sent back, by call; `None` marks where one was, which ends a round.
+            let mut results: HashMap<String, Value> = HashMap::new();
+            let blocks: Vec<Option<Value>> = content
+                .into_iter()
+                .map(|block| {
+                    if !is_spice_tool_result(&block, &calls) {
+                        return Some(block);
+                    }
+                    if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
+                        results
+                            .entry(id.to_string())
+                            .or_insert_with(|| replayed_tool_result(block));
+                    }
+                    None
+                })
                 .collect();
             let mut assistant = Vec::new();
-            let mut results = Vec::new();
-            for block in content {
-                if is_spice_tool_result(&block, &calls) {
-                    results.push(replayed_tool_result(block));
+            let mut round_calls: Vec<String> = Vec::new();
+            let mut round_ended = false;
+            for block in blocks {
+                let Some(block) = block else {
+                    round_ended = true;
                     continue;
-                }
-                if !results.is_empty() {
+                };
+                if round_ended && !round_calls.is_empty() {
                     replayed.push(message("assistant", std::mem::take(&mut assistant)));
-                    replayed.push(message("user", std::mem::take(&mut results)));
+                    replayed.push(message(
+                        "user",
+                        round_results(&mut round_calls, &mut results),
+                    ));
                 }
+                round_ended = false;
                 if is_spice_tool_use(&block) {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        round_calls.push(id.to_string());
+                    }
                     assistant.push(replayed_tool_use(block));
                 } else {
                     assistant.push(block);
@@ -223,14 +254,7 @@ pub(crate) fn replay_spice_tool_calls(body: &mut Map<String, Value>) {
             if !assistant.is_empty() {
                 replayed.push(message("assistant", assistant));
             }
-            for id in call_order.iter().filter(|id| !answered.contains(*id)) {
-                results.push(tool_result_block(
-                    Value::from(id.as_str()),
-                    json!([{"type": "text", "text": RESULT_NOT_SENT_BACK}]),
-                    false,
-                ));
-            }
-            pending_results = results;
+            pending_results = round_results(&mut round_calls, &mut results);
             continue;
         }
         if !pending_results.is_empty() {
@@ -380,6 +404,36 @@ mod tests {
                     {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "Spice ran this call, but its result was not sent back with the conversation."}]},
                     {"type": "text", "text": "Thanks."},
                 ]},
+            ]})
+        );
+    }
+
+    /// Each `tool_use` has to be answered in the user message right after it, so a round's call
+    /// whose result was not sent back is answered there, before the text that followed the round.
+    #[test]
+    fn a_rounds_call_whose_result_was_not_sent_back_is_answered_in_that_round() {
+        let completed = ToolOutcome::Completed(json!([{"1": 1}]));
+        let received = json!({"messages": [
+            {"role": "user", "content": "How many?"},
+            {"role": "assistant", "content": [
+                mcp_tool_use(&sql_use("toolu_1")),
+                mcp_tool_use(&sql_use("toolu_2")),
+                mcp_tool_result("toolu_2", &completed),
+                {"type": "text", "text": "One."},
+            ]},
+            {"role": "user", "content": "Thanks."},
+        ]});
+        assert_eq!(
+            replay(&received),
+            json!({"messages": [
+                {"role": "user", "content": "How many?"},
+                {"role": "assistant", "content": [sql_use("toolu_1"), sql_use("toolu_2")]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "Spice ran this call, but its result was not sent back with the conversation."}]},
+                    tool_result("toolu_2", &completed),
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "One."}]},
+                {"role": "user", "content": "Thanks."},
             ]})
         );
     }
