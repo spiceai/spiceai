@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `2e2cc330c64ac8a9e44d2a5f2da171b391f775b8` | `spiceai-59` |
+| [arrow-rs](#arrow-rs) | `7f1a5e4ceef3e4df47eb90361ebce712f83575c4` | `spiceai-59` (TEMPORARY: spiceai/arrow-rs#32) |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
@@ -328,7 +328,10 @@ below was re-confirmed present at the pinned revision. Upstream deprecates
 `ParquetObjectReader` in 59 (apache/arrow-rs#10354); the Spice patches to it
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers), in
+path (`parquet/src/util/push_buffers.rs` and its callers), in the Thrift metadata
+decoder (`parquet/src/parquet_thrift.rs`,
+`parquet/src/file/metadata/thrift/mod.rs`,
+`parquet/src/file/page_index/offset_index.rs`), in
 `arrow-buffer/src/buffer/immutable.rs`, in the cast kernel
 (`arrow-cast/src/cast/mod.rs`), and in the Flight SQL client
 (`arrow-flight/src/sql/client.rs`).
@@ -342,6 +345,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564). Upstream adopted it in `60.0.0`, not in any 59 release, so it is still carried on this line; drop the row at the move to 60 | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/data-connector-api/src/listing/connector.rs::a_short_range_body_is_a_parquet_error_and_not_a_panic`, driven through `ParquetMetaDataPushDecoder`, which is the public surface `push_range` sits behind. The listing/overwrite harness cannot reach it: it 412s a pinned `If-Match` before a short *successful* range body is ever decoded |
 | `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
 | `FlightSqlServiceClient::do_get_flight_data` — a `DoGet` that returns the raw `FlightData` stream with the client's headers and bearer token applied, as `do_get` applies them | The Flight SQL connector can no longer replace a schema message before arrow decodes it. A server that declares a `MAP`'s `entries` field nullable (which arrow 59 refuses at decode) fails every read of that table with `The nullable should be set to false for the map entries field`, naming no column. Going through `inner_mut()` instead would drop the `traceparent` and bearer token, which are private to the client | build (the method) | `crates/data_components/src/flightsql.rs::tests::query_to_stream_corrects_a_servers_nullable_map_entries_declaration` |
+| Thrift list lengths in Parquet metadata are bounded by the bytes left in the input: `list_capacity` refuses a declared count the remaining bytes cannot encode, and caps the reservation where the input length is unknown ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)) | Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and the offset index's `page_locations` decodes into a `Vec` sized from the element count in its Thrift list header. A file of a few bytes can declare `i32::MAX` elements, so the reader reserves room for all of them before reading one — during schema inference at dataset initialization, and again on every refresh of that dataset | not silent (memory exhaustion takes the runtime down) | `crates/data-connector-api/src/listing/connector.rs::an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation` |
 
 ## datafusion-ballista
 

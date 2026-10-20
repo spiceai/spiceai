@@ -5833,6 +5833,38 @@ mod tests {
             .expect("a well-formed range is still accepted after a rejected one");
     }
 
+    /// A footer whose Thrift list header declares more elements than the file could hold is
+    /// refused before anything is reserved for that count.
+    ///
+    /// Every footer list (`schema`, `row_groups`, `key_value_metadata`, `column_orders`) and
+    /// the offset index's `page_locations` decodes into a `Vec` sized from the element count
+    /// in that header, so an unreadable file of a few bytes can ask for room for `i32::MAX`
+    /// elements before a single one is read. That happens during schema inference at dataset
+    /// initialization, and again on every refresh of the dataset, and the process is killed
+    /// for it. A Spice patch to the `spiceai/arrow-rs` fork bounds the count by the bytes left
+    /// in the input ([spiceai/arrow-rs#32](https://github.com/spiceai/arrow-rs/pull/32)).
+    ///
+    /// Driven through `ParquetMetaDataReader::decode_metadata`, the public surface the footer
+    /// decode sits behind. The error has to name the declared count: an oversized footer is a
+    /// malformed file, and an error that does not say so reads like a truncated download.
+    #[test]
+    fn an_oversized_footer_list_length_is_a_parquet_error_and_not_an_allocation() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataReader;
+
+        // Struct header, then field 2 (`schema`): a `list<SchemaElement>` declaring
+        // i32::MAX elements, with no element following it.
+        const FOOTER: &[u8] = &[0x29, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00];
+
+        let error = ParquetMetaDataReader::decode_metadata(FOOTER)
+            .expect_err("no file holds as many schema elements as this footer declares");
+        let message = error.to_string();
+        assert!(
+            message.contains("Thrift list declares 2147483647 elements"),
+            "the error has to name the declared count, or an oversized footer is \
+             indistinguishable from a truncated one: {message}"
+        );
+    }
+
     /// A second reader built for the *same* file has to stay on the generation the
     /// first one pinned.
     ///
