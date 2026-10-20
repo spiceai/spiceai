@@ -175,8 +175,13 @@ async fn generate(dir: &Path, scale: f64) -> Result<PathBuf> {
     static GENERATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = GENERATING.lock().await;
     let out = dir.join(format!("tpch-sf{scale}"));
-    if out.join("lineitem.tbl").exists() {
+    if is_complete(&out) {
         return Ok(out);
+    }
+    // Whatever an interrupted or failed run left is regenerated whole.
+    if out.exists() {
+        std::fs::remove_dir_all(&out)
+            .with_context(|| format!("Failed to remove incomplete {}", out.display()))?;
     }
     std::fs::create_dir_all(&out)?;
     let mut script = format!("INSTALL tpch; LOAD tpch; CALL dbgen(sf = {scale});\n");
@@ -195,7 +200,17 @@ async fn generate(dir: &Path, scale: f64) -> Result<PathBuf> {
     if !status.success() {
         bail!("duckdb dbgen failed: {status}");
     }
+    std::fs::write(out.join(COMPLETE), "")?;
     Ok(out)
+}
+
+/// Written once every table's file is, so a run that failed part way is
+/// never taken for a cache.
+const COMPLETE: &str = "complete";
+
+/// Whether `out` holds a whole generated data set.
+fn is_complete(out: &Path) -> bool {
+    out.join(COMPLETE).exists()
 }
 
 /// Creates the TPC-H tables in `source`'s namespace and loads them.
@@ -220,4 +235,22 @@ pub async fn load(source: &dyn Source, namespace: &str, work: &Path, scale: f64)
             .with_context(|| format!("Failed to load TPC-H table {table}"))?;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_complete;
+
+    #[test]
+    fn a_partly_written_data_set_is_not_complete() {
+        let dir = std::env::temp_dir().join(format!("spicescript-tpch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // What a COPY that failed part way through leaves.
+        std::fs::write(dir.join("lineitem.tbl"), "1|155190|7706|1|17|").expect("partial file");
+        assert!(!is_complete(&dir));
+        std::fs::write(dir.join(super::COMPLETE), "").expect("marker");
+        assert!(is_complete(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
