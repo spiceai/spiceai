@@ -129,6 +129,11 @@ impl Container {
                 port_bindings: Some(bindings),
                 init: Some(true),
                 network_mode: spec.network.clone(),
+                // On the host's network the container's loopback is the
+                // host's; this name then means the host on every platform,
+                // as it does under Docker Desktop.
+                extra_hosts: (spec.network.as_deref() == Some("host"))
+                    .then(|| vec!["host.docker.internal:127.0.0.1".to_string()]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -307,7 +312,12 @@ impl Container {
 
     /// Removes the network the container joined, once no container is on it.
     pub async fn remove_network(&self) -> Result<()> {
-        if let Some(network) = &self.network {
+        // Docker's own networks are shared by everything on the host.
+        if let Some(network) = self
+            .network
+            .as_ref()
+            .filter(|n| !matches!(n.as_str(), "host" | "bridge" | "none"))
+        {
             self.docker
                 .remove_network(network)
                 .await

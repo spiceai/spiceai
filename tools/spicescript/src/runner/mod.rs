@@ -700,8 +700,17 @@ async fn create_instances(
                 let namespace = format!("i{index}_{}", sanitize(variant_name));
                 let created = src.create_namespace(&namespace).await?;
                 let mut entry = created.extra;
-                entry.insert("params".into(), created.params);
                 entry.insert("namespace".into(), json!(namespace));
+                let kind = sources.kinds.get(name).map_or("", String::as_str);
+                let (from_prefix, from_suffix, file_based) = table_from(kind, &entry);
+                let mut table_params = created.params.clone();
+                if file_based && let Value::Object(map) = &mut table_params {
+                    map.entry("file_format").or_insert_with(|| json!("parquet"));
+                }
+                entry.insert("params".into(), created.params);
+                entry.insert("table_params".into(), table_params);
+                entry.insert("from_prefix".into(), json!(from_prefix));
+                entry.insert("from_suffix".into(), json!(from_suffix));
                 source_ctx.insert(name.clone(), Value::Object(entry));
                 namespaces.insert(name.clone(), namespace);
             }
@@ -710,7 +719,7 @@ async fn create_instances(
                 "matrix": combo,
                 "variant": { "name": variant_name },
                 "instance": { "name": label, "dir": dir.display().to_string(), "port": crate::docker::free_port()?,
-                    "executor_port": crate::docker::free_port()? },
+                    "executor_port": crate::docker::free_port()?, "http_port": crate::docker::free_port()? },
                 "script": { "dir": std::path::absolute(&script.dir)?.display().to_string() },
             });
             let mut spicepod = script.spicepod.clone();
@@ -785,6 +794,12 @@ async fn create_instances(
                 executors.push(executor);
             }
             let mut spiced = Spiced::new(first_binary, dir, env)?;
+            if let Some(port) = context["instance"]["http_port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+            {
+                spiced.set_http_port(port);
+            }
             spiced.set_api_key(script.defaults.api_key.clone())?;
             spiced.set_tls(script.defaults.tls.as_ref().map(|t| script.dir.join(&t.ca)))?;
             let args = template::substitute(&json!(script.defaults.spiced_args), &context)?;
@@ -1033,6 +1048,30 @@ fn record(report: &mut Report, run_label: &str, who: &str, step: &Step, outcome:
     }
 }
 
+/// How a dataset names table `t` of a source of this kind: `from:
+/// <prefix>t<suffix>`, plus whether it is a directory of files (which then
+/// needs a `file_format`), so one spicepod line serves a matrix over sources.
+fn table_from(kind: &str, entry: &Map<String, Value>) -> (String, String, bool) {
+    let field = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
+    match kind {
+        "postgres" => ("postgres:public.".into(), String::new(), false),
+        "mysql" | "clickhouse" => (format!("{kind}:"), String::new(), false),
+        "ducklake" => ("ducklake:main.".into(), String::new(), false),
+        "iceberg" => (
+            format!(
+                "iceberg:{}/v1/namespaces/{}/tables/",
+                field("catalog"),
+                field("namespace")
+            ),
+            String::new(),
+            false,
+        ),
+        "rustfs" => (format!("s3://{}/", field("bucket")), "/".into(), true),
+        "files" => (format!("file://{}/", field("path")), "/".into(), true),
+        _ => (String::new(), String::new(), false),
+    }
+}
+
 /// Whether a matrix combination satisfies a `when:`: each key's value equals
 /// the combination's, or, given as a list, contains it.
 fn when_matches(when: &Map<String, Value>, combo: &Map<String, Value>) -> bool {
@@ -1220,5 +1259,33 @@ mod tests {
             ]
         );
         assert_eq!(matrix_combinations(&IndexMap::new()), vec![Map::new()]);
+    }
+}
+
+#[cfg(test)]
+mod table_from_tests {
+    use super::*;
+
+    #[test]
+    fn each_source_kind_names_a_table_the_way_spice_reads_it() {
+        let entry = json!({ "catalog": "http://127.0.0.1:1", "namespace": "i0_x", "bucket": "b", "path": "/d" });
+        let entry = entry.as_object().expect("an object");
+        let named = |kind: &str| {
+            let (prefix, suffix, files) = table_from(kind, entry);
+            (format!("{prefix}t{suffix}"), files)
+        };
+        assert_eq!(named("postgres"), ("postgres:public.t".into(), false));
+        assert_eq!(named("mysql"), ("mysql:t".into(), false));
+        assert_eq!(named("clickhouse"), ("clickhouse:t".into(), false));
+        assert_eq!(named("ducklake"), ("ducklake:main.t".into(), false));
+        assert_eq!(
+            named("iceberg"),
+            (
+                "iceberg:http://127.0.0.1:1/v1/namespaces/i0_x/tables/t".into(),
+                false
+            )
+        );
+        assert_eq!(named("rustfs"), ("s3://b/t/".into(), true));
+        assert_eq!(named("files"), ("file:///d/t/".into(), true));
     }
 }

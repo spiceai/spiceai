@@ -86,6 +86,14 @@ pub struct SourceSpec {
     /// A shell command inside the container that succeeds once it is ready.
     #[serde(default)]
     pub ready: Option<String>,
+    /// `docker` sources: on Linux, share the host's network, so the
+    /// container reaches what listens on the host's loopback (`spiced`, the
+    /// other sources). Elsewhere Docker reaches the host through
+    /// `host.docker.internal`, and on Linux that name is mapped to the host's
+    /// loopback, so `${sources.<name>.host_from_container}` (that name) works
+    /// either way.
+    #[serde(default)]
+    pub host_network: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

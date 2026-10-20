@@ -129,7 +129,7 @@ steps:
 | `files` | A directory per instance (`${sources.<name>.path}`) holding generated Parquet or CSV part files. |
 | `iceberg` | An Iceberg REST catalog over rustfs. `source-exec` and oracle queries run through the `duckdb` CLI attached to the catalog, so a script writes Iceberg with plain SQL and checks Spice against DuckDB reading the same tables. |
 | `ducklake` | A DuckLake catalog written with the DuckDB CLI matching Spice's embedded DuckDB. |
-| `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. Used for MongoDB, Redpanda (Kafka) and LocalStack (DynamoDB). |
+| `docker` | Any image: `image`, `ports`, `env` (`${port.N}` is the host port of container port N), `command`, and `ready` (a shell command that succeeds once the container is ready). `source-exec` runs a shell command inside it and `source-query` returns the lines it prints. `host-network: true` lets the container reach `spiced` and the other sources on the host: on Linux it shares the host's network, elsewhere Docker routes to the host, and `${sources.<name>.host_from_container}` is the host's address from inside the container either way. Used for MongoDB, Redpanda (Kafka), LocalStack (DynamoDB) and Debezium Server. |
 | `mock-http` | An HTTP server whose routes the script sets with `source-exec`: `path`, and optionally `method`, `query`, `headers-match`, `status`, `headers`, `body`, `delay-ms` and `times`; `reset` removes them all. `source-query` reads what it received: `count <path>`, `log <path>`, `header <path> <name>`. |
 
 Files and object stores answer no queries themselves, so a script mirrors their
@@ -159,9 +159,10 @@ mapping's own keys winning: `params: { $merge: '${sources.lake.params}',
 file_format: parquet }`.
 
 **Placeholders**: `${sources.<name>.<field>}`, `${matrix.<key>}`,
-`${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`,
-`${script.dir}`. Spice's own `${secrets:…}` and `${env:…}` pass through to
-`spiced`.
+`${variant.name}`, `${instance.name}`, `${instance.dir}`, `${instance.port}`
+(a free port for the script's own use), `${instance.http_port}` (the port
+`spiced` serves HTTP on, for a container that posts to it), `${script.dir}`.
+Spice's own `${secrets:…}` and `${env:…}` pass through to `spiced`.
 
 ### Steps
 

@@ -44,9 +44,11 @@ impl Generic {
         let Some(image) = &spec.image else {
             bail!("a `docker` source needs an `image`");
         };
+        // On Linux a host-network container's ports are the host's own.
+        let shares_host = spec.host_network && cfg!(target_os = "linux");
         let mut host_ports = HashMap::new();
         for port in &spec.ports {
-            host_ports.insert(*port, free_port()?);
+            host_ports.insert(*port, if shares_host { *port } else { free_port()? });
         }
         let ports = |text: &str| {
             let mut text = text.to_string();
@@ -70,11 +72,19 @@ impl Generic {
                 image: image.clone(),
                 env,
                 command,
-                ports: spec.ports.clone(),
+                ports: if shares_host {
+                    Vec::new()
+                } else {
+                    spec.ports.clone()
+                },
                 healthcheck: spec.ready.as_deref().map(healthcheck),
-                network: None,
+                network: shares_host.then(|| "host".to_string()),
             },
-            host_ports.clone(),
+            if shares_host {
+                HashMap::new()
+            } else {
+                host_ports.clone()
+            },
         )
         .await?;
         Ok(Self {
@@ -97,6 +107,7 @@ impl Source for Generic {
     async fn create_namespace(&self, _namespace: &str) -> Result<super::Namespace> {
         let mut extra = serde_json::Map::new();
         extra.insert("host".into(), json!("127.0.0.1"));
+        extra.insert("host_from_container".into(), json!("host.docker.internal"));
         let ports: serde_json::Map<String, serde_json::Value> = self
             .host_ports
             .iter()

@@ -94,6 +94,12 @@ impl Spiced {
         })
     }
 
+    /// Serves HTTP on `port`, one a script was told in advance
+    /// (`${instance.http_port}`) so that a container can reach it.
+    pub fn set_http_port(&mut self, port: u16) {
+        self.http = port;
+    }
+
     fn scheme(&self) -> &'static str {
         if self.tls_ca.is_some() {
             "https"
