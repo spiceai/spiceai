@@ -3929,22 +3929,22 @@ impl OverlapIndex {
         let hasher = RandomState::new();
         let total_rows = existing_records.iter().map(RecordBatch::num_rows).sum();
         let mut rows = Vec::with_capacity(existing_records.len());
-        let mut hashed: Vec<(u64, usize, usize)> = Vec::with_capacity(total_rows);
+        let mut by_hash: Vec<(u64, usize, usize)> = Vec::with_capacity(total_rows);
         for (batch_idx, existing) in existing_records.iter().enumerate() {
             let encoded = converter
                 .convert_columns(&dedup_columns(existing, filter_schema)?)
                 .context(super::FailedToFilterUpdatesSnafu)?;
-            hashed.extend(
+            by_hash.extend(
                 (0..encoded.num_rows())
                     .map(|row_idx| (hasher.hash_one(encoded.row(row_idx)), batch_idx, row_idx)),
             );
             rows.push(encoded);
         }
         // A stable sort, so each group keeps its rows in stored order.
-        hashed.sort_by_key(|&(hash, _, _)| hash);
+        by_hash.sort_by_key(|&(hash, _, _)| hash);
 
         let mut groups: HashMap<u64, OverlapGroup> = HashMap::new();
-        for (idx, &(hash, _, _)) in hashed.iter().enumerate() {
+        for (idx, &(hash, _, _)) in by_hash.iter().enumerate() {
             groups
                 .entry(hash)
                 .and_modify(|group| group.end = idx + 1)
@@ -3953,7 +3953,7 @@ impl OverlapIndex {
                     end: idx + 1,
                 });
         }
-        let positions = hashed
+        let positions = by_hash
             .into_iter()
             .map(|(_, batch_idx, row_idx)| (batch_idx, row_idx))
             .collect();
