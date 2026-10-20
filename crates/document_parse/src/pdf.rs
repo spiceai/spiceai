@@ -21,6 +21,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use crate::{
     Document, DocumentParser, DocumentParserFactory, DocumentType, InternalParsingSnafu, Result,
+    archive::ensure_pdf_within_budget,
 };
 
 pub struct PdfParserFactory {}
@@ -51,6 +52,11 @@ impl PdfParser {
 #[async_trait::async_trait]
 impl DocumentParser for PdfParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+        // PDFium inflates `/FlateDecode` streams internally with no size limit,
+        // so bound the decompressed size before loading it or handing it the
+        // bytes: a bomb is rejected without provisioning the library at all.
+        ensure_pdf_within_budget(raw)?;
+
         // `liteparse` loads PDFium at runtime via `dlopen` and panics if it is
         // missing. Provision it first (found next to the binary in Docker, or
         // downloaded on demand for standalone installs) so an absent library
@@ -110,6 +116,77 @@ mod tests {
             text.contains("Spice"),
             "expected extracted text to contain 'Spice', got: {text:?}"
         );
+    }
+
+    /// A minimal PDF carrying one `/FlateDecode` stream whose deflate data
+    /// expands to `decompressed_len` bytes. Deflate of a single repeated byte is
+    /// ~1000:1, so the file stays tiny however large `decompressed_len` is. The
+    /// structure (header, one indirect object, the stream, `endstream`) is only
+    /// what the budget scanner walks — it never has to be a loadable document.
+    fn flate_bomb_pdf(decompressed_len: usize) -> Bytes {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        let chunk = vec![b' '; 1024 * 1024];
+        let mut left = decompressed_len;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            encoder.write_all(&chunk[..n]).expect("deflate chunk");
+            left -= n;
+        }
+        let deflated = encoder.finish().expect("finish deflate");
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        pdf.extend_from_slice(
+            format!(
+                "1 0 obj\n<< /Length {} /Filter /FlateDecode >>\nstream\n",
+                deflated.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&deflated);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        Bytes::from(pdf)
+    }
+
+    /// Regression test for a PDF content-stream decompression bomb: a small file
+    /// whose Flate stream decompresses past the per-document budget must be
+    /// rejected before `PDFium` (which decompresses with no limit) is ever loaded.
+    #[tokio::test]
+    async fn rejects_a_flate_stream_bomb_before_loading_pdfium() {
+        let over_budget =
+            usize::try_from(crate::archive::MAX_PACKAGE_BYTES).expect("fits usize") + 1024 * 1024;
+        let raw = flate_bomb_pdf(over_budget);
+        assert!(
+            raw.len() < 2 * 1024 * 1024,
+            "the bomb should be small on the wire, was {} bytes",
+            raw.len()
+        );
+
+        let Err(err) = PdfParser::default().parse(&raw).await else {
+            panic!("a PDF whose streams exceed the budget must be rejected");
+        };
+        let crate::Error::DocumentTooLarge {
+            format: DocumentType::Pdf,
+            reason,
+        } = &err
+        else {
+            panic!("expected a PDF size-limit error, got: {err}");
+        };
+        assert_eq!(
+            reason,
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
+    }
+
+    /// A legitimate PDF whose streams are well within the budget still parses,
+    /// so the scanner does not reject ordinary documents.
+    #[tokio::test]
+    async fn accepts_a_pdf_whose_streams_are_within_budget() {
+        ensure_pdf_within_budget(&Bytes::from_static(SAMPLE_PDF))
+            .expect("the sample PDF is within the decompression budget");
     }
 
     #[tokio::test]
