@@ -409,7 +409,7 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
         });
         // Do not resume the keyword search inside this stream's payload, and
         // do not let that payload participate in later string detection.
-        from = stream_payload_end(raw, data, stream_info.length, stream_info.length_is_direct);
+        from = stream_payload_end(raw, data, stream_info.length);
         lex_from = from;
     }
     streams
@@ -425,26 +425,15 @@ fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
 /// Index just past a stream's payload: `/Length` bytes from `data_start` when
 /// known, otherwise the `endstream` keyword that terminates it.
 ///
-/// A *direct* `/Length` is trusted: the payload may legally contain the bytes
-/// `endstream` (an image that happens to encode that ASCII), so discovery must
-/// not stop early inside it. An *indirect* `/Length` is not trusted the same
-/// way — a Catalog string that looks like `N 0 obj` can resolve to a huge
-/// decoy — so for those we still prefer an earlier `endstream` when one sits
-/// before the claimed length.
-fn stream_payload_end(
-    raw: &[u8],
-    data_start: usize,
-    length: Option<u64>,
-    length_is_direct: bool,
-) -> usize {
+/// A resolved length (direct or a uniquely resolved indirect) is trusted: the
+/// payload may legally contain the ASCII bytes `endstream`, so discovery must
+/// not stop early inside it. Indirect references that cannot be resolved to a
+/// single object definition yield no length here and fall back to `endstream`,
+/// which is what defeats a Catalog-string decoy that invents a second
+/// `N 0 obj` with a huge integer.
+fn stream_payload_end(raw: &[u8], data_start: usize, length: Option<u64>) -> usize {
     if let Some(len) = length {
         let by_length = data_start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
-        if !length_is_direct
-            && let Some(es) = find_endstream(raw, data_start)
-            && es <= by_length
-        {
-            return es + b"endstream".len();
-        }
         return after_endstream(raw, by_length.min(raw.len()));
     }
     find_endstream(raw, data_start).map_or(raw.len(), |pos| pos + b"endstream".len())
@@ -484,13 +473,10 @@ fn find_endstream(raw: &[u8], from: usize) -> Option<usize> {
 
 struct StreamInfo {
     filters: Vec<PdfFilter>,
-    /// Direct `/Length` in bytes, or the resolved value of an indirect
-    /// `/Length N G R`. `None` when the length is absent or unresolved.
+    /// Direct `/Length` in bytes, or the uniquely resolved value of an
+    /// indirect `/Length N G R`. `None` when the length is absent or when more
+    /// than one candidate object definition exists (ambiguous / decoy).
     length: Option<u64>,
-    /// `true` when [`Self::length`] came from a direct integer in the stream
-    /// dictionary (trusted for payload bounds). `false` when it was resolved
-    /// from an indirect reference (may be a decoy).
-    length_is_direct: bool,
 }
 
 /// The `/Filter` chain and `/Length` of the dictionary that ends just before
@@ -508,24 +494,25 @@ fn stream_before(raw: &[u8], keyword_pos: usize, lex_from: usize) -> Option<Stre
         length: None,
         length_ref: None,
     });
-    let (length, length_is_direct) = if let Some(n) = parsed.length {
-        (Some(n), true)
-    } else if let Some((obj, generation)) = parsed.length_ref {
-        (resolve_indirect_int(raw, obj, generation), false)
-    } else {
-        (None, false)
-    };
+    let length = parsed.length.or_else(|| {
+        parsed
+            .length_ref
+            .and_then(|(obj, generation)| resolve_indirect_int(raw, obj, generation))
+    });
     Some(StreamInfo {
         filters: parsed.filters,
         length,
-        length_is_direct,
     })
 }
 
 /// Resolves an indirect object `obj gen R` whose body is an integer, used for
-/// `/Length N G R`. Looks for the `obj gen obj` definition in `raw`.
+/// `/Length N G R`. Returns a value only when exactly one matching
+/// `obj gen obj` definition exists in `raw`: a Catalog string that embeds a
+/// second fake definition makes the reference ambiguous, so discovery falls
+/// back to `endstream` instead of trusting a decoy integer.
 fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
     let needle = format!("{obj} {generation} obj");
+    let mut values = Vec::new();
     let mut cursor = 0usize;
     while let Some(rel) = find(&raw[cursor..], needle.as_bytes()) {
         let pos = cursor + rel;
@@ -534,11 +521,13 @@ fn resolve_indirect_int(raw: &[u8], obj: u32, generation: u32) -> Option<u64> {
         let after_ok = after < raw.len() && is_pdf_whitespace(raw[after]);
         if before_ok && after_ok {
             let rest = skip_ws(&raw[after..]);
-            return parse_u64(rest);
+            if let Some(value) = parse_u64(rest) {
+                values.push(value);
+            }
         }
         cursor = pos + 1;
     }
-    None
+    (values.len() == 1).then(|| values[0])
 }
 
 fn parse_u64(data: &[u8]) -> Option<u64> {
@@ -1940,36 +1929,49 @@ mod tests {
         assert_chain_budgeted(&dict, &data);
     }
 
-    /// A direct `/Length` that correctly covers a payload containing the bytes
+    /// A `/Length` that correctly covers a payload containing the bytes
     /// `endstream` must still skip the whole payload. Stopping at the embedded
     /// keyword would resume inside the image and hide the following Flate bomb.
+    /// Covers both a direct length and a uniquely resolved indirect length.
     #[test]
     fn still_budgets_after_a_payload_with_embedded_endstream_bytes() {
         let bomb = flate_bomb();
         let image = b"aaa\nendstream\n(bbb";
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.7\n");
-        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-        pdf.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
-        );
-        pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
-        pdf.extend_from_slice(image.len().to_string().as_bytes());
-        pdf.extend_from_slice(b" >>\nstream\n");
-        pdf.extend_from_slice(image);
-        pdf.extend_from_slice(b"\nendstream\nendobj\n");
-        pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
-        pdf.extend_from_slice(bomb.len().to_string().as_bytes());
-        pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
-        pdf.extend_from_slice(&bomb);
-        pdf.extend_from_slice(b"\nendstream\nendobj\n");
-        let raw = Bytes::from(pdf);
-        assert_eq!(pdf_streams(&raw).len(), 2);
-        assert_eq!(
-            pdf_too_large_reason(&raw),
-            "its compressed streams decompress to more than 256 MiB, the per-document limit"
-        );
+        for length_decl in [
+            image.len().to_string(),
+            "6 0 R".to_owned(), // unique indirect → image.len()
+        ] {
+            let mut pdf = Vec::new();
+            pdf.extend_from_slice(b"%PDF-1.7\n");
+            pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+            pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+            pdf.extend_from_slice(
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << >> >>\nendobj\n",
+            );
+            pdf.extend_from_slice(b"4 0 obj\n<< /Length ");
+            pdf.extend_from_slice(length_decl.as_bytes());
+            pdf.extend_from_slice(b" >>\nstream\n");
+            pdf.extend_from_slice(image);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+            pdf.extend_from_slice(b"5 0 obj\n<< /Length ");
+            pdf.extend_from_slice(bomb.len().to_string().as_bytes());
+            pdf.extend_from_slice(b" /Filter /FlateDecode >>\nstream\n");
+            pdf.extend_from_slice(&bomb);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+            pdf.extend_from_slice(b"6 0 obj\n");
+            pdf.extend_from_slice(image.len().to_string().as_bytes());
+            pdf.extend_from_slice(b"\nendobj\n");
+            let raw = Bytes::from(pdf);
+            assert_eq!(
+                pdf_streams(&raw).len(),
+                2,
+                "length decl {length_decl:?} must still discover both streams"
+            );
+            assert_eq!(
+                pdf_too_large_reason(&raw),
+                "its compressed streams decompress to more than 256 MiB, the per-document limit"
+            );
+        }
     }
 
     /// A legal `/Length +N` (optional leading plus) must still be read as a
