@@ -150,10 +150,10 @@ impl Writer {
                 let retention = table
                     .delete_from(
                         &ctx.state(),
-                        vec![col("event_time").lt(lit(ScalarValue::TimestampNanosecond(
-                            Some(2),
-                            None,
-                        )))],
+                        vec![
+                            col("event_time")
+                                .lt(lit(ScalarValue::TimestampNanosecond(Some(2), None))),
+                        ],
                     )
                     .await
                     .map_err(|e| e.to_string())?;
@@ -344,7 +344,7 @@ async fn run_protected(fixture: TestFixture, race: bool) -> Result<(), Box<dyn s
         timestamps(&ctx.sql(select).await?.collect().await?),
         vec![1, 3, 3]
     );
-    let protected = protected_snapshot_dirs(&fixture, &table, &base_snapshot).await?;
+    let protected = protected_snapshot_dirs(&fixture, &table, &base_snapshot)?;
     let two_files: Vec<_> = protected.iter().filter(|(_, files)| *files == 2).collect();
     assert_eq!(
         (protected.len(), two_files.len()),
@@ -368,7 +368,9 @@ async fn run_protected(fixture: TestFixture, race: bool) -> Result<(), Box<dyn s
         tokio::time::timeout(Duration::from_secs(10), store.listed.notified()).await?;
         Some(planning)
     } else {
-        planning.await?.map_err(|e| format!("query before retention: {e}"))?;
+        planning
+            .await?
+            .map_err(|e| format!("query before retention: {e}"))?;
         None
     };
 
@@ -387,7 +389,7 @@ async fn run_protected(fixture: TestFixture, race: bool) -> Result<(), Box<dyn s
         None => (false, write.await),
     };
     written??;
-    let after = protected_snapshot_dirs(&fixture, &table, &base_snapshot).await?;
+    let after = protected_snapshot_dirs(&fixture, &table, &base_snapshot)?;
     assert!(
         after.contains(&(upserted.clone(), 1)) && after.len() == 2,
         "premise: retention unlinked one of the upserted snapshot's files, got {after:?}"
@@ -434,7 +436,7 @@ async fn current_snapshot_dir(
 
 /// Every snapshot directory other than `base` that holds data files, with its
 /// count of them.
-async fn protected_snapshot_dirs(
+fn protected_snapshot_dirs(
     fixture: &TestFixture,
     table: &CayenneTableProvider,
     base: &str,
@@ -484,11 +486,13 @@ async fn upsert_retention_table(
             table_name: "listing_cache_protected_race".to_string(),
             schema,
             primary_key: vec!["id".to_string()],
-            on_conflict: Some(datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
-                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                    "id".to_string(),
-                ]),
-            )),
+            on_conflict: Some(
+                datafusion_table_providers::util::on_conflict::OnConflict::Upsert(
+                    datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                        "id".to_string(),
+                    ]),
+                ),
+            ),
             base_path: fixture.data_path.to_string_lossy().into_owned(),
             partition_column: None,
             vortex_config: VortexConfig {
