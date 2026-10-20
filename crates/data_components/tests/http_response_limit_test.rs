@@ -17,6 +17,10 @@ limitations under the License.
 //! A dynamic HTTP dataset reads the body its origin sends under a cap on the
 //! *decoded* size, so a small compressed response cannot expand into an
 //! unbounded allocation.
+#![expect(
+    clippy::expect_used,
+    reason = "test helpers fail the test with a message when setup fails"
+)]
 
 use std::io::Write;
 use std::sync::Arc;
