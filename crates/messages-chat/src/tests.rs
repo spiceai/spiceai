@@ -42,8 +42,26 @@ fn translated(body: &Value) -> Result<Value, MessagesError> {
     chat_request(typed(body)).map(|request| serde_json::to_value(request).expect("serializable"))
 }
 
+/// `value` as pretty JSON with every object's keys in sorted order, so a snapshot does not depend
+/// on whether the workspace builds `serde_json` with `preserve_order`.
 fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).expect("serializable")
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| *key);
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), sorted(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_string_pretty(&sorted(value)).expect("serializable")
 }
 
 /// A request shaped like the ones a coding agent sends: a system prompt in blocks with cache
