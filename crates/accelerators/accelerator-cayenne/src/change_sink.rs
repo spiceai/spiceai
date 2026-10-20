@@ -137,9 +137,12 @@ impl CayenneChangeSinkBackend {
         }))
     }
 
-    /// A checkpoint must cover buffered work before durable writes can supersede
-    /// it. Rebuildable writes need no source callback; a real CDC callback must
-    /// finish its outstanding acknowledgements before being removed.
+    /// Only an installed source callback lets CDC writes buffer in the RAM tier,
+    /// so a checkpoint must cover that work, and finish its acknowledgements,
+    /// before a durable write supersedes it and the callback is removed. Without
+    /// a callback the tier is empty: checkpointing there would put the
+    /// checkpoint's maintenance, such as a maintained-aggregate rebuild, on every
+    /// durable write.
     async fn select_recovery_path(&self, recovery: Recovery) -> Result<()> {
         let buffered = self.table.is_cdc_memory_mode() && !self.table.is_memory_resident_mode();
         let observer = if recovery == Recovery::Replayable && buffered {
@@ -149,8 +152,7 @@ impl CayenneChangeSinkBackend {
         };
         if let Some(observer) = observer {
             self.table.install_slot_advancer(observer);
-        } else if buffered && (recovery != Recovery::Rebuildable || self.table.has_slot_advancer())
-        {
+        } else if self.table.has_slot_advancer() {
             self.table
                 .checkpoint_mem_tier()
                 .await
