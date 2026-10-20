@@ -21,6 +21,7 @@ limitations under the License.
 use std::io::Write;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use data_components::http::provider::HttpTableProvider;
 use datafusion::prelude::*;
 use http_body_limit::MAX_RESPONSE_BODY_BYTES;
@@ -93,9 +94,14 @@ async fn compressed_response_past_the_limit_fails_the_query_without_retrying() {
     assert!(body.len() < MIB, "the response is small on the wire");
     let server = origin("gzip", body).await;
 
-    let error = query_content(&server)
-        .await
-        .expect_err("a response that decodes past the limit fails the query");
+    let error = match query_content(&server).await {
+        Err(error) => error,
+        Ok(rows) => panic!(
+            "a response that decodes past the limit fails the query, but it returned rows \
+             of {:?} bytes",
+            rows.iter().map(String::len).collect::<Vec<_>>()
+        ),
+    };
     let message = error.to_string();
     assert!(
         message.contains(&format!(
