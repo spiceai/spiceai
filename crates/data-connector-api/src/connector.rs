@@ -50,6 +50,10 @@ pub const DEFAULT_SPICE_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Creates a default reqwest client with standard Spice settings.
 ///
+/// Its callers attach credentials under header names they choose, which `reqwest` does
+/// not strip on a cross-origin redirect, so the client follows only redirects that stay
+/// on the origin and returns any other as a 3xx.
+///
 /// # Errors
 ///
 /// Returns an error if the client cannot be built.
@@ -64,6 +68,7 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
         .connect_timeout(Duration::from_secs(10))
         .timeout(DEFAULT_SPICE_CLIENT_TIMEOUT)
         .default_headers(headers)
+        .redirect(data_components::http::redirect::RedirectGuard::same_origin_only().policy())
         .build()
 }
 
