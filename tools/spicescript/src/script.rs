@@ -726,7 +726,8 @@ impl Script {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read script {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut script = Self::parse_in(&text, base)
+        let shared = SharedVariants::find(base)?;
+        let mut script = Self::parse_in(&text, base, &shared)
             .with_context(|| format!("Invalid script {}", path.display()))?;
         script.dir = base.to_path_buf();
         script.file_stem = path
@@ -765,18 +766,19 @@ impl Script {
 
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
-        Self::parse_in(text, Path::new("."))
+        Self::parse_in(text, Path::new("."), &SharedVariants::default())
     }
 
-    /// Parses a script whose `corpus` paths are relative to `base`.
-    pub fn parse_in(text: &str, base: &Path) -> Result<Self> {
+    /// Parses a script whose `corpus` paths are relative to `base`, and
+    /// whose variants may name one of `shared`.
+    pub fn parse_in(text: &str, base: &Path, shared: &SharedVariants) -> Result<Self> {
         let mut root: Value = yaml::from_str(text)?;
         let steps = root
             .as_object_mut()
             .context("A script must be a YAML mapping")?
             .remove("steps")
             .context("A script needs `steps`")?;
-        expand_variant_presets(&mut root)?;
+        expand_shared_variants(&mut root, shared)?;
         let mut script: Script = serde_json::from_value(root)?;
         let Value::Array(steps) = steps else {
             bail!("`steps` must be a list");
@@ -872,36 +874,79 @@ impl Script {
     }
 }
 
-/// A variant written as a word instead of a patch: `federated` (the spicepod
-/// as written), or `<engine>` / `<engine>-<mode>`, which accelerates every
-/// dataset with that engine (and mode).
-fn expand_variant_presets(root: &mut Value) -> Result<()> {
-    const ENGINES: &[&str] = &["arrow", "cayenne", "duckdb", "sqlite", "turso", "postgres"];
+/// The file defining the variants scripts name instead of writing the patch:
+/// the one in a script's directory, or else the nearest directory above it.
+pub const VARIANTS_FILE: &str = "variants.yaml";
+
+/// Variant patches by name, from a [`VARIANTS_FILE`].
+#[derive(Debug, Default)]
+pub struct SharedVariants {
+    /// The file they came from; `None` when no directory had one.
+    path: Option<std::path::PathBuf>,
+    patches: IndexMap<String, Value>,
+}
+
+impl SharedVariants {
+    /// The variants of the [`VARIANTS_FILE`] in `dir` or the nearest
+    /// directory above it; none when there is no such file.
+    pub fn find(dir: &Path) -> Result<Self> {
+        let dir = std::path::absolute(dir)?;
+        let Some(path) = dir
+            .ancestors()
+            .map(|d| d.join(VARIANTS_FILE))
+            .find(|p| p.is_file())
+        else {
+            return Ok(Self::default());
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        Self::parse(&text, path.clone()).with_context(|| format!("Invalid {}", path.display()))
+    }
+
+    fn parse(text: &str, path: std::path::PathBuf) -> Result<Self> {
+        let patches: IndexMap<String, Value> = yaml::from_str(text)?;
+        for (name, patch) in &patches {
+            ensure!(
+                patch.is_object(),
+                "variant '{name}' must be a patch (a mapping), as a script writes one"
+            );
+            VariantSpec::deserialize(patch)
+                .with_context(|| format!("variant '{name}' is not a valid patch"))?;
+        }
+        Ok(Self {
+            path: Some(path),
+            patches,
+        })
+    }
+}
+
+/// Replaces each variant written as a name instead of a patch with that
+/// variant's patch from `shared`.
+fn expand_shared_variants(root: &mut Value, shared: &SharedVariants) -> Result<()> {
     let Some(Value::Object(variants)) = root.get_mut("variants") else {
         return Ok(());
     };
     for (name, variant) in variants.iter_mut() {
-        let Value::String(preset) = variant else {
+        let Value::String(shared_name) = variant else {
             continue;
         };
-        let (engine, mode) = match preset.split_once('-') {
-            Some((engine, mode)) => (engine, Some(mode)),
-            None => (preset.as_str(), None),
+        let patch = match (&shared.path, shared.patches.get(shared_name.as_str())) {
+            (_, Some(patch)) => patch.clone(),
+            (Some(path), None) => bail!(
+                "variant '{name}': '{shared_name}' is not defined in {}; define it there, or write the patch (it defines {})",
+                path.display(),
+                shared
+                    .patches
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            (None, None) => bail!(
+                "variant '{name}': '{shared_name}' names a shared variant, but there is no {VARIANTS_FILE} in the script's directory or above it; write the patch"
+            ),
         };
-        *variant = if preset == "federated" {
-            Value::Object(Map::new())
-        } else {
-            ensure!(
-                ENGINES.contains(&engine) && mode.is_none_or(|m| m == "memory" || m == "file"),
-                "variant '{name}': '{preset}' is not a preset; use `federated`, an engine ({}), or `<engine>-memory` / `<engine>-file`, or write the patch",
-                ENGINES.join(", ")
-            );
-            let mut acceleration = serde_json::json!({ "enabled": true, "engine": engine });
-            if let Some(mode) = mode {
-                acceleration["mode"] = Value::String(mode.to_string());
-            }
-            serde_json::json!({ "datasets": { "*": { "acceleration": acceleration } } })
-        };
+        *variant = patch;
     }
     Ok(())
 }
@@ -2076,11 +2121,17 @@ steps:
     }
 
     #[test]
-    fn variant_presets_expand_to_acceleration_patches() {
-        let script = Script::parse(
-            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, arrow: arrow }\nsteps: [ { start: {} } ]",
+    fn shared_variants_come_from_the_nearest_variants_file() {
+        // A known-failing group's script uses the suite's file, two levels up.
+        let group = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/spicescript/known-failing/cayenne");
+        let shared = SharedVariants::find(&group).expect("the suite's variants file parses");
+        let script = Script::parse_in(
+            "name: p\nspicepod: {}\nvariants: { federated: federated, cayenne: cayenne-file, arrow: arrow, own: { env: { A: b } } }\nsteps: [ { start: {} } ]",
+            &group,
+            &shared,
         )
-        .expect("presets parse");
+        .expect("shared variants parse");
         assert!(script.variants["federated"].datasets.is_empty());
         assert_eq!(
             script.variants["cayenne"].datasets["*"],
@@ -2090,14 +2141,39 @@ steps:
             script.variants["arrow"].datasets["*"],
             serde_json::json!({ "acceleration": { "enabled": true, "engine": "arrow" } })
         );
-        let err = Script::parse(
+        assert_eq!(script.variants["own"].env["A"], "b");
+        let err = Script::parse_in(
             "name: p\nspicepod: {}\nvariants: { x: cayenne-disk }\nsteps: [ { start: {} } ]",
+            &group,
+            &shared,
         )
-        .expect_err("an unknown mode is refused");
+        .expect_err("a name the file does not define is refused");
         assert!(
-            format!("{err:#}").contains("'cayenne-disk' is not a preset"),
+            format!("{err:#}").contains("'cayenne-disk' is not defined in")
+                && format!("{err:#}").contains("test/spicescript/variants.yaml"),
             "{err:#}"
         );
+        let err = Script::parse(
+            "name: p\nspicepod: {}\nvariants: { x: arrow }\nsteps: [ { start: {} } ]",
+        )
+        .expect_err("a name without a variants file is refused");
+        assert!(
+            format!("{err:#}").contains("there is no variants.yaml"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_shared_variant_must_be_a_valid_patch() {
+        for (text, message) in [
+            ("a: cayenne-file\n", "variant 'a' must be a patch"),
+            ("a: { datasets: [] }\n", "variant 'a' is not a valid patch"),
+            ("a: { dataset: {} }\n", "variant 'a' is not a valid patch"),
+        ] {
+            let err = SharedVariants::parse(text, "variants.yaml".into())
+                .expect_err("an invalid entry is refused");
+            assert!(format!("{err:#}").contains(message), "{text}: {err:#}");
+        }
     }
 
     #[test]

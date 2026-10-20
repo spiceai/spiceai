@@ -384,11 +384,13 @@ fn partition(scripts: &[script::Script], count: usize) -> Vec<usize> {
     share
 }
 
-/// The scripts directly in a directory, in name order.
+/// The scripts directly in a directory, in name order: every YAML file but
+/// the shared variants.
 fn scripts_in(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "yaml" || x == "yml"))
+        .filter(|p| p.file_name().is_none_or(|n| n != script::VARIANTS_FILE))
         .collect();
     entries.sort();
     Ok(entries)

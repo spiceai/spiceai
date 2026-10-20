@@ -101,7 +101,7 @@ matrix:                              # every combination is a separate run: ${ma
 variants:                            # instances that must give identical answers
   federated: { datasets: { '*': { acceleration: null } } }
   cayenne: {}
-  duckdb: duckdb-file                # a preset: every dataset accelerated by DuckDB, file mode
+  duckdb: duckdb-file                # a shared variant from variants.yaml: DuckDB, file mode
 spicepod:                            # the spicepod, as YAML
   version: v1
   kind: Spicepod
@@ -150,9 +150,14 @@ set `env:`, and `when: { <matrix key>: <value> }` to exist only in some
 combinations. Variants run in alphabetical order, and the first is the one the
 others are compared with.
 
-A variant may be a word instead of a patch: `federated` (the spicepod as
-written), `<engine>`, or `<engine>-memory` / `<engine>-file`, which sets
-`acceleration: { enabled: true, engine, mode }` on every dataset.
+A variant may name a shared variant instead of writing the patch:
+`cayenne: cayenne-file`. Shared variants are defined, each as its full patch, in
+the `variants.yaml` in the script's directory or the nearest directory above it
+([`test/spicescript/variants.yaml`](../../test/spicescript/variants.yaml) for the
+suite): `federated` (the spicepod as written), and an engine and mode that set
+`acceleration: { enabled: true, engine, mode }` on every dataset, such as
+`cayenne-file`, `duckdb-memory` or `arrow`. A name the file does not define
+fails `--check`. A variant used by one script only is written in that script.
 
 `$merge: '${…}'` spreads a mapping placeholder into a mapping, with the
 mapping's own keys winning: `params: { $merge: '${sources.lake.params}',
