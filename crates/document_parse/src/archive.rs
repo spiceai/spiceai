@@ -208,6 +208,13 @@ pub(crate) fn rebuild_package(raw: &Bytes, format: DocumentType, limits: Limits)
 /// an unrecognised filter, or a `/Filter` we cannot resolve (an indirect
 /// reference) is not decoded and cannot be bounded, so the document is rejected
 /// rather than forwarded to `PDFium` with an unchecked expansion.
+///
+/// The dictionary in front of each `stream` keyword is tokenised, not scanned
+/// for byte patterns. PDF whitespace (including NUL) and `%` comments between
+/// tokens cannot hide a key, and a `/Filter` that appears inside a string or a
+/// nested dictionary is not the stream's filter. A `stream` that does not
+/// follow a dictionary is content, not a stream; a dictionary that does follow
+/// one but cannot be parsed fails closed.
 pub(crate) fn ensure_pdf_within_budget(raw: &Bytes) -> Result<()> {
     let budget = MAX_PACKAGE_BYTES;
     let mut consumed: u64 = 0;
@@ -293,7 +300,11 @@ fn decoded_len_within(stream: &PdfStream, raw: &[u8], remaining: u64) -> Result<
             }
             _ => {}
         }
-        let input: &[u8] = if idx == 0 { &raw[stream.data_start..] } else { &buf };
+        let input: &[u8] = if idx == 0 {
+            &raw[stream.data_start..]
+        } else {
+            &buf
+        };
         // The final stage's bytes are never fed anywhere, so count them through a
         // sink instead of materializing: a bomb whose last stage is the one that
         // explodes then costs no memory to reject.
@@ -360,6 +371,8 @@ fn decode_stage(filter: PdfFilter, data: &[u8], cap: u64) -> Vec<u8> {
 }
 
 /// Every stream object in `raw`, each paired with its declared filter chain.
+/// A `stream` byte sequence that is not the keyword after a dictionary — the
+/// word inside content, or `endstream` — is not a stream object.
 fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
     const KEYWORD: &[u8] = b"stream";
     let mut streams = Vec::new();
@@ -367,11 +380,13 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
     while let Some(rel) = find(&raw[from..], KEYWORD) {
         let pos = from + rel;
         from = pos + KEYWORD.len();
-        // `endstream` also contains `stream`; skip it.
-        if pos >= 3 && &raw[pos - 3..pos] == b"end" {
+        if !is_stream_keyword(raw, pos) {
             continue;
         }
-        // Stream data begins after an end-of-line that is CRLF or a bare LF.
+        let Some(filters) = filters_before(raw, pos) else {
+            continue;
+        };
+        // Stream data begins after the end-of-line that follows the keyword.
         let mut data = from;
         if raw.get(data) == Some(&b'\r') {
             data += 1;
@@ -379,137 +394,352 @@ fn pdf_streams(raw: &[u8]) -> Vec<PdfStream> {
         if raw.get(data) == Some(&b'\n') {
             data += 1;
         }
-        if data >= raw.len() {
-            continue;
-        }
         streams.push(PdfStream {
-            filters: filters_before(raw, pos),
+            filters,
             data_start: data,
         });
     }
     streams
 }
 
+/// `stream` at `pos` is a keyword when a token boundary precedes it. `>` covers
+/// a dictionary closed flush against the keyword (`>>stream`); `/stream` is a
+/// name and `endstream` is a different keyword, so neither matches.
+fn is_stream_keyword(raw: &[u8], pos: usize) -> bool {
+    pos == 0 || is_pdf_whitespace(raw[pos - 1]) || raw[pos - 1] == b'>'
+}
+
 /// The `/Filter` chain of the dictionary that ends just before the `stream`
 /// keyword at `keyword_pos`.
 ///
-/// No dictionary (a `stream` keyword matched inside binary data) yields a lone
-/// [`PdfFilter::Flate`] stage, which inflates arbitrary bytes to ~0 and cannot
-/// be a bomb. An absent `/Filter` yields an empty chain (stored uncompressed).
-/// A `/Filter` that cannot be read as a name or an array of names — an indirect
-/// reference, or any token whose meaning we cannot determine — yields a single
-/// [`PdfFilter::Unbounded`] stage so the document fails closed rather than
-/// reaching `PDFium` with an unchecked expansion.
-fn filters_before(raw: &[u8], keyword_pos: usize) -> Vec<PdfFilter> {
-    let Some((open, close)) = dict_before(raw, keyword_pos) else {
-        return vec![PdfFilter::Flate];
-    };
-    let dict = &raw[open..close];
-    let Some(value) = filter_value(dict) else {
-        // A stream with no `/Filter` is stored uncompressed.
-        return Vec::new();
-    };
+/// `None` when `stream` is not preceded by a dictionary (content, not a stream
+/// object). `Some` is the chain: empty when `/Filter` is absent (stored
+/// uncompressed), and a single [`PdfFilter::Unbounded`] stage when a dictionary
+/// is there but its chain cannot be determined, so the document fails closed.
+fn filters_before(raw: &[u8], keyword_pos: usize) -> Option<Vec<PdfFilter>> {
+    let close = dict_closer_before(raw, keyword_pos)?;
+    Some(filters_of_dict(raw, close).unwrap_or_else(|| vec![PdfFilter::Unbounded]))
+}
 
-    let rest = skip_ws(value);
-    match rest.first() {
-        Some(b'/') => {
-            let (name, _) = read_name(&rest[1..]);
-            vec![classify_filter(&name)]
+/// Index just past the `>>` that closes the dictionary before `keyword_pos`,
+/// after PDF whitespace and comments. `None` when no dictionary closer sits
+/// there, which is what distinguishes a real stream from the word `stream`.
+fn dict_closer_before(raw: &[u8], keyword_pos: usize) -> Option<usize> {
+    let mut i = keyword_pos;
+    loop {
+        while i > 0 && is_pdf_whitespace(raw[i - 1]) {
+            i -= 1;
         }
-        Some(b'[') => {
-            let mut filters = Vec::new();
-            let mut cursor = &rest[1..];
-            loop {
-                cursor = skip_ws(cursor);
-                match cursor.first() {
-                    Some(b'/') => {
-                        let (name, consumed) = read_name(&cursor[1..]);
-                        filters.push(classify_filter(&name));
-                        cursor = &cursor[1 + consumed..];
-                    }
-                    // The closing `]` or the end of the dictionary ends the
-                    // chain.
-                    Some(b']') | None => break,
-                    // Any other token inside the array (an indirect reference, a
-                    // stray number, …) means we cannot read the chain; fail
-                    // closed rather than measure a truncated prefix of it.
-                    _ => {
-                        filters.push(PdfFilter::Unbounded);
-                        break;
-                    }
-                }
+        // A `%` comment runs to the end of its line. Consume one only when it
+        // sits in the gap before `stream`: a `%` earlier on the dictionary's
+        // own line has the closing `>>` after it, and is not this gap.
+        if let Some(comment) = comment_open_before(raw, i) {
+            i = comment;
+            continue;
+        }
+        break;
+    }
+    (i >= 2 && &raw[i - 2..i] == b">>").then_some(i)
+}
+
+/// Start index of a `%` comment whose body reaches `pos`, if the comment is a
+/// real token (not a `%` inside a name or string) and no dictionary closer
+/// follows it before `pos`.
+fn comment_open_before(raw: &[u8], pos: usize) -> Option<usize> {
+    let line_start = raw[..pos]
+        .iter()
+        .rposition(|&b| b == b'\n' || b == b'\r')
+        .map_or(0, |newline| newline + 1);
+    let pct = raw[line_start..pos]
+        .iter()
+        .rposition(|&b| b == b'%')
+        .map(|offset| line_start + offset)?;
+    let token =
+        pct == line_start || is_pdf_whitespace(raw[pct - 1]) || is_pdf_delimiter(raw[pct - 1]);
+    if !token || raw[pct + 1..pos].windows(2).any(|pair| pair == b">>") {
+        return None;
+    }
+    Some(pct)
+}
+
+/// How far back from a dictionary closer its opening `<<` is looked for.
+/// Stream dictionaries are a few hundred bytes; past this the chain cannot be
+/// attributed and the stream fails closed.
+const DICT_LOOKBACK_BYTES: usize = 1024 * 1024;
+
+/// Cap on opening-`<<` candidates tried per stream, nearest first. The match is
+/// the candidate whose token parse ends exactly on the closer; the rest are
+/// `<<` bytes inside strings. Stopping here bounds the scan, and failing closed
+/// when none match is safe.
+const MAX_DICT_CANDIDATES: usize = 64;
+
+/// The top-level `/Filter` chain of the dictionary that closes at `close`.
+/// `None` when no candidate opening parses as that dictionary.
+fn filters_of_dict(raw: &[u8], close: usize) -> Option<Vec<PdfFilter>> {
+    let window_start = close.saturating_sub(DICT_LOOKBACK_BYTES);
+    let mut tried = 0usize;
+    let mut j = close;
+    while j > window_start + 1 && tried < MAX_DICT_CANDIDATES {
+        j -= 1;
+        if raw[j] == b'<' && raw[j - 1] == b'<' {
+            tried += 1;
+            let start = j - 1;
+            if let Some(parsed) = parse_dictionary(&raw[start..close])
+                && parsed.consumed == close - start
+            {
+                return Some(parsed.filters);
             }
-            filters
         }
-        // `/Filter` present but neither a name nor an array (e.g. an indirect
-        // reference `5 0 R`). We cannot resolve the chain, so fail closed.
-        _ => vec![PdfFilter::Unbounded],
+    }
+    None
+}
+
+struct ParsedDict {
+    consumed: usize,
+    /// Empty when the dictionary declares no `/Filter`.
+    filters: Vec<PdfFilter>,
+}
+
+/// Parses one `<< … >>` dictionary starting at `data[0]`, recording only its
+/// top-level `/Filter`. Nested dictionaries, strings, and arrays are skipped
+/// as values, so a `/Filter` inside one of them cannot shadow the real key.
+fn parse_dictionary(data: &[u8]) -> Option<ParsedDict> {
+    if data.len() < 4 || &data[..2] != b"<<" {
+        return None;
+    }
+    let mut i = 2;
+    let mut filters: Option<Vec<PdfFilter>> = None;
+    loop {
+        i += ws_len(&data[i..]);
+        if data.get(i..i + 2) == Some(b">>") {
+            return Some(ParsedDict {
+                consumed: i + 2,
+                filters: filters.unwrap_or_default(),
+            });
+        }
+        if data.get(i) != Some(&b'/') {
+            return None;
+        }
+        let (name, name_len) = read_name(&data[i + 1..]);
+        i += 1 + name_len;
+        i += ws_len(&data[i..]);
+        if name.as_slice() == b"Filter" {
+            let (value, value_len) = parse_filter_value(&data[i..])?;
+            i += value_len;
+            // A duplicate key is undefined in PDF. Fail closed rather than
+            // guess which value a reader applies.
+            filters = Some(if filters.is_some() {
+                vec![PdfFilter::Unbounded]
+            } else {
+                value
+            });
+        } else {
+            i += skip_value(&data[i..])?;
+        }
     }
 }
 
-/// The bytes of `dict` from just after its `/Filter` entry's key, or `None` when
-/// the dictionary has no `/Filter`. Name tokens are matched with `#XX` escape
-/// handling, so an escaped key such as `/Fil#74er` is still recognised.
-fn filter_value(dict: &[u8]) -> Option<&[u8]> {
+/// The `/Filter` value at `data[0]` (already past whitespace): a name, an array
+/// of names, or something whose chain cannot be resolved.
+fn parse_filter_value(data: &[u8]) -> Option<(Vec<PdfFilter>, usize)> {
+    match data.first() {
+        Some(b'/') => {
+            let (name, name_len) = read_name(&data[1..]);
+            Some((vec![classify_filter(&name)], 1 + name_len))
+        }
+        Some(b'[') => parse_filter_array(data),
+        Some(_) => {
+            let consumed = skip_value(data)?;
+            Some((vec![PdfFilter::Unbounded], consumed))
+        }
+        None => None,
+    }
+}
+
+fn parse_filter_array(data: &[u8]) -> Option<(Vec<PdfFilter>, usize)> {
+    let mut i = 1;
+    let mut filters = Vec::new();
+    let mut unresolved = false;
+    loop {
+        i += ws_len(&data[i..]);
+        match data.get(i) {
+            Some(b']') => {
+                let filters = if unresolved {
+                    vec![PdfFilter::Unbounded]
+                } else {
+                    filters
+                };
+                return Some((filters, i + 1));
+            }
+            Some(b'/') => {
+                let (name, name_len) = read_name(&data[i + 1..]);
+                filters.push(classify_filter(&name));
+                i += 1 + name_len;
+            }
+            Some(_) => {
+                unresolved = true;
+                i += skip_value(&data[i..])?;
+            }
+            None => return None,
+        }
+    }
+}
+
+/// Bytes consumed by one PDF value: a name, string, hex string, nested
+/// dictionary, array, keyword, number, or indirect reference.
+fn skip_value(data: &[u8]) -> Option<usize> {
+    match data.first() {
+        Some(b'/') => {
+            let (_, name_len) = read_name(&data[1..]);
+            Some(1 + name_len)
+        }
+        Some(b'(') => skip_literal_string(data),
+        Some(b'<') => {
+            if data.get(1) == Some(&b'<') {
+                parse_dictionary(data).map(|parsed| parsed.consumed)
+            } else {
+                skip_hex_string(data)
+            }
+        }
+        Some(b'[') => skip_array(data),
+        Some(b't') => skip_keyword(data, b"true"),
+        Some(b'f') => skip_keyword(data, b"false"),
+        Some(b'n') => skip_keyword(data, b"null"),
+        Some(b'+' | b'-' | b'.' | b'0'..=b'9') => skip_number_or_reference(data),
+        _ => None,
+    }
+}
+
+fn skip_array(data: &[u8]) -> Option<usize> {
+    let mut i = 1;
+    loop {
+        i += ws_len(&data[i..]);
+        match data.get(i) {
+            Some(b']') => return Some(i + 1),
+            Some(_) => i += skip_value(&data[i..])?,
+            None => return None,
+        }
+    }
+}
+
+fn skip_keyword(data: &[u8], keyword: &[u8]) -> Option<usize> {
+    (data.starts_with(keyword) && token_ends(data, keyword.len())).then_some(keyword.len())
+}
+
+/// A number, or the `int int R` indirect reference that PDF writers use for
+/// `/Length`. Consuming the whole reference is what lets the key after it parse.
+fn skip_number_or_reference(data: &[u8]) -> Option<usize> {
+    let i = skip_number(data)?;
+    let gen_at = i + ws_len(&data[i..]);
+    if let Some(gen_len) = skip_number(&data[gen_at..]) {
+        let r_at = gen_at + gen_len + ws_len(&data[gen_at + gen_len..]);
+        if data.get(r_at) == Some(&b'R') && token_ends(data, r_at + 1) {
+            return Some(r_at + 1);
+        }
+    }
+    Some(i)
+}
+
+fn skip_number(data: &[u8]) -> Option<usize> {
     let mut i = 0;
-    while i < dict.len() {
-        match dict[i] {
-            b'%' => {
+    if matches!(data.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let mut digits = 0usize;
+    let mut dot = false;
+    while i < data.len() {
+        match data[i] {
+            b'0'..=b'9' => {
+                digits += 1;
                 i += 1;
-                while i < dict.len() && dict[i] != b'\n' && dict[i] != b'\r' {
+            }
+            b'.' if !dot => {
+                dot = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    (digits > 0).then_some(i)
+}
+
+fn skip_literal_string(data: &[u8]) -> Option<usize> {
+    let mut depth = 1i32;
+    let mut i = 1;
+    while i < data.len() && depth > 0 {
+        match data[i] {
+            b'\\' => {
+                i += 1;
+                if data.get(i).is_some_and(|b| is_octal(*b)) {
+                    i += 1;
+                    let mut extra = 1;
+                    while extra < 3 && i < data.len() && is_octal(data[i]) {
+                        i += 1;
+                        extra += 1;
+                    }
+                } else if data.get(i) == Some(&b'\r') {
+                    i += 1;
+                    if data.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                } else if i < data.len() {
                     i += 1;
                 }
             }
-            b'/' => {
-                let (name, consumed) = read_name(&dict[i + 1..]);
-                if name.as_slice() == b"Filter" {
-                    return Some(&dict[i + 1 + consumed..]);
-                }
-                i += 1 + consumed;
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
             }
             _ => i += 1,
         }
     }
-    None
+    (depth == 0).then_some(i)
 }
 
-/// The byte range `[open, close)` of the `<< … >>` dictionary whose closing
-/// `>>` sits (after optional whitespace) immediately before `keyword_pos`,
-/// balancing nested dictionaries such as `/DecodeParms << … >>`.
-fn dict_before(raw: &[u8], keyword_pos: usize) -> Option<(usize, usize)> {
-    let mut i = keyword_pos;
-    while i > 0 && raw[i - 1].is_ascii_whitespace() {
-        i -= 1;
-    }
-    if i < 2 || &raw[i - 2..i] != b">>" {
-        return None;
-    }
-    let close = i;
-    let mut depth = 0i32;
-    let mut j = close;
-    while j >= 2 {
-        if &raw[j - 2..j] == b">>" {
-            depth += 1;
-            j -= 2;
-        } else if &raw[j - 2..j] == b"<<" {
-            depth -= 1;
-            j -= 2;
-            if depth == 0 {
-                return Some((j, close));
-            }
-        } else {
-            j -= 1;
+fn skip_hex_string(data: &[u8]) -> Option<usize> {
+    let mut i = 1;
+    while i < data.len() {
+        match data[i] {
+            b'>' => return Some(i + 1),
+            b if b.is_ascii_hexdigit() || is_pdf_whitespace(b) => i += 1,
+            _ => return None,
         }
     }
     None
 }
 
-/// Skips PDF whitespace and `%`-to-end-of-line comments, both insignificant
-/// between tokens, so a comment cannot truncate a filter array.
-fn skip_ws(data: &[u8]) -> &[u8] {
+fn token_ends(data: &[u8], at: usize) -> bool {
+    data.get(at)
+        .is_none_or(|&b| is_pdf_whitespace(b) || is_pdf_delimiter(b))
+}
+
+/// PDF whitespace is NUL, tab, LF, form feed, CR, and space (ISO 32000-1
+/// §7.2.2). Rust's `is_ascii_whitespace` leaves NUL out, which would split a
+/// `/Filter` key from its value.
+fn is_octal(b: u8) -> bool {
+    matches!(b, b'0'..=b'7')
+}
+
+fn is_pdf_whitespace(b: u8) -> bool {
+    matches!(b, 0x00 | 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+
+fn is_pdf_delimiter(b: u8) -> bool {
+    matches!(
+        b,
+        b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+    )
+}
+
+/// Bytes of leading PDF whitespace and `%` comments.
+fn ws_len(data: &[u8]) -> usize {
     let mut i = 0;
     while i < data.len() {
-        if data[i].is_ascii_whitespace() {
+        if is_pdf_whitespace(data[i]) {
             i += 1;
         } else if data[i] == b'%' {
             i += 1;
@@ -520,19 +750,18 @@ fn skip_ws(data: &[u8]) -> &[u8] {
             break;
         }
     }
-    &data[i..]
+    i
 }
 
 /// A PDF name token (without its leading `/`), with `#XX` hex escapes decoded,
 /// and the number of raw bytes consumed. Decoding escapes is what makes an
 /// obfuscated `/Fl#61teDecode` classify as `FlateDecode`.
 fn read_name(data: &[u8]) -> (Vec<u8>, usize) {
-    const DELIMS: &[u8] = b"/[]<>(){}%";
     let mut name = Vec::new();
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
-        if b.is_ascii_whitespace() || DELIMS.contains(&b) {
+        if is_pdf_whitespace(b) || is_pdf_delimiter(b) {
             break;
         }
         if b == b'#'
@@ -624,9 +853,9 @@ fn ascii85_decode_bounded(data: &[u8], limit: u64) -> Vec<u8> {
                 group[count] = b - b'!';
                 count += 1;
                 if count == 5 {
-                    let value = group
-                        .iter()
-                        .fold(0u32, |acc, &d| acc.wrapping_mul(85).wrapping_add(u32::from(d)));
+                    let value = group.iter().fold(0u32, |acc, &d| {
+                        acc.wrapping_mul(85).wrapping_add(u32::from(d))
+                    });
                     out.extend_from_slice(&value.to_be_bytes());
                     count = 0;
                 }
@@ -638,9 +867,9 @@ fn ascii85_decode_bounded(data: &[u8], limit: u64) -> Vec<u8> {
         for slot in group.iter_mut().skip(count) {
             *slot = 84;
         }
-        let value = group
-            .iter()
-            .fold(0u32, |acc, &d| acc.wrapping_mul(85).wrapping_add(u32::from(d)));
+        let value = group.iter().fold(0u32, |acc, &d| {
+            acc.wrapping_mul(85).wrapping_add(u32::from(d))
+        });
         out.extend_from_slice(&value.to_be_bytes()[..count - 1]);
     }
     out.truncate(limit);
@@ -972,17 +1201,20 @@ mod tests {
         let single = b"<< /Length 3 /Filter /FlateDecode >>stream";
         assert_eq!(
             filters_before(single, single.len() - b"stream".len()),
-            vec![PdfFilter::Flate]
+            Some(vec![PdfFilter::Flate])
         );
 
         let chain = b"<< /Filter [/ASCII85Decode /FlateDecode] /DecodeParms << /x 1 >> >>stream";
         assert_eq!(
             filters_before(chain, chain.len() - b"stream".len()),
-            vec![PdfFilter::Ascii85, PdfFilter::Flate]
+            Some(vec![PdfFilter::Ascii85, PdfFilter::Flate])
         );
 
         let stored = b"<< /Length 3 >>stream";
-        assert!(filters_before(stored, stored.len() - b"stream".len()).is_empty());
+        assert_eq!(
+            filters_before(stored, stored.len() - b"stream".len()),
+            Some(vec![])
+        );
     }
 
     /// A single-stage Flate scan measures only the first expansion, so a
@@ -1032,8 +1264,7 @@ mod tests {
         ensure_pdf_within_budget(&pdf).expect("a small chained stream is within the budget");
     }
 
-    const UNVERIFIABLE_REASON: &str =
-        "it declares a stream filter whose decompressed size cannot be verified \
+    const UNVERIFIABLE_REASON: &str = "it declares a stream filter whose decompressed size cannot be verified \
          (an indirect, LZW, encrypted, or unrecognised /Filter)";
 
     fn flate_bomb() -> Vec<u8> {
@@ -1068,7 +1299,10 @@ mod tests {
     #[test]
     fn rejects_a_bomb_with_a_comment_in_the_filter_array() {
         let data = deflate(&flate_bomb());
-        let pdf = pdf_with_dict("/Filter [/FlateDecode %drop the rest\n /FlateDecode]", &data);
+        let pdf = pdf_with_dict(
+            "/Filter [/FlateDecode %drop the rest\n /FlateDecode]",
+            &data,
+        );
         assert_eq!(
             pdf_too_large_reason(&pdf),
             "its compressed streams decompress to more than 256 MiB, the per-document limit"
@@ -1104,5 +1338,102 @@ mod tests {
     fn accepts_a_terminal_image_codec() {
         let pdf = pdf_with_dict("/Filter /DCTDecode", b"\xff\xd8\xff\xe0 pretend jpeg bytes");
         ensure_pdf_within_budget(&pdf).expect("a terminal image codec stream is accepted");
+    }
+
+    /// Builds `<< /Length N <dict> stream\n <data>` and asserts the one real
+    /// stream's chain is actually budgeted: the final expansion exceeds
+    /// `remaining`, so a scan that drops a stage, treats the stream as stored,
+    /// or stops at a decoy image codec would accept it instead.
+    fn assert_chain_budgeted(dict: &[u8], data: &[u8]) {
+        let mut pdf = b"%PDF-1.7\n1 0 obj\n<< /Length ".to_vec();
+        pdf.extend_from_slice(data.len().to_string().as_bytes());
+        pdf.push(b' ');
+        pdf.extend_from_slice(dict);
+        pdf.extend_from_slice(b" stream\n");
+        pdf.extend_from_slice(data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let streams = pdf_streams(&pdf);
+        assert_eq!(streams.len(), 1, "expected exactly one stream object");
+        let err = decoded_len_within(&streams[0], &pdf, 8 * 1024)
+            .expect_err("the declared chain must exceed the budget");
+        match err {
+            Error::DocumentTooLarge { reason, .. } => assert!(
+                reason.contains("decompress to more than"),
+                "expected the size budget to fire, got: {reason}"
+            ),
+            other => panic!("expected DocumentTooLarge, got: {other}"),
+        }
+    }
+
+    fn double_flate() -> Vec<u8> {
+        deflate(&deflate_spaces(20_000))
+    }
+
+    fn single_flate() -> Vec<u8> {
+        deflate_spaces(20_000)
+    }
+
+    /// A comment between the dictionary closer and `stream` is whitespace. The
+    /// double-Flate chain must still be read; guessing one Flate stage would
+    /// only measure the small intermediate.
+    #[test]
+    fn rejects_a_chain_with_a_comment_before_stream() {
+        let dict = b"<< /Filter [/FlateDecode /FlateDecode] >> % not a token\n";
+        assert_chain_budgeted(dict, &double_flate());
+    }
+
+    /// NUL is PDF whitespace, so it cannot hide the dictionary from `stream`
+    /// nor split a `/Filter` key from its value.
+    #[test]
+    fn rejects_a_chain_with_nul_whitespace() {
+        let mut before_keyword = b"<< /Filter [/FlateDecode /FlateDecode] >>".to_vec();
+        before_keyword.push(0);
+        assert_chain_budgeted(&before_keyword, &double_flate());
+
+        let mut split_key = b"<< /Filter".to_vec();
+        split_key.push(0);
+        split_key.extend_from_slice(b"/FlateDecode >>\n");
+        assert_chain_budgeted(&split_key, &single_flate());
+    }
+
+    /// A `/Filter` inside a string or a nested dictionary is not the stream's
+    /// filter. The top-level Flate entry is.
+    #[test]
+    fn rejects_a_bomb_hidden_behind_a_decoy_filter() {
+        assert_chain_budgeted(
+            b"<< /Note (/Filter /DCTDecode) /Filter /FlateDecode >>\n",
+            &single_flate(),
+        );
+        assert_chain_budgeted(
+            b"<< /DecodeParms << /Filter /DCTDecode >> /Filter /FlateDecode >>\n",
+            &single_flate(),
+        );
+        assert_chain_budgeted(b"<< /Filter /FlateDecode /Note (<<) >>\n", &single_flate());
+        // A `%` inside a string on the dictionary's line is not a comment, so
+        // it must not hide the closer or the real `/Filter`.
+        assert_chain_budgeted(
+            b"<< /Note (100% pure) /Filter /FlateDecode >>\n",
+            &single_flate(),
+        );
+    }
+
+    /// The word `stream` inside content is not a stream object, so it is not
+    /// given a guessed filter and cannot reject the document on its own.
+    #[test]
+    fn a_stream_word_inside_content_is_not_a_stream() {
+        let pdf = pdf_with_dict("", b"hello stream world");
+        let streams = pdf_streams(&pdf);
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].filters.is_empty());
+    }
+
+    /// An indirect `/Length` is how most writers declare a stream. It must not
+    /// stop the dictionary parse before `/Filter` is read.
+    #[test]
+    fn reads_a_filter_after_an_indirect_length() {
+        let raw = b"<< /Length 4 0 R /Filter /FlateDecode >>stream";
+        let streams = pdf_streams(raw);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].filters, vec![PdfFilter::Flate]);
     }
 }
