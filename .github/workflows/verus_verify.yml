@@ -195,13 +195,16 @@ jobs:
             # the `vstd` pin and `[patch.crates-io]`, which can redirect it,
             # the lockfile selects its proc-macro crates, and cargo config can
             # replace the source or change how the driver is invoked. Last,
-            # the gate itself, and the two composite actions this job runs:
-            # one decides whether verification happens at all, the other
-            # installs the toolchain the driver requires.
+            # the gate itself, and the composite actions this job runs: one
+            # decides whether verification happens at all, the others install
+            # the Rust and C toolchains the driver requires (setup-cc runs
+            # configure-apt).
             for path in rust-toolchain.toml Cargo.toml Cargo.lock '.cargo/**' \
                         .github/workflows/verus_verify.yml \
                         '.github/actions/check-code-changes/**' \
-                        '.github/actions/setup-rust/**'; do
+                        '.github/actions/setup-rust/**' \
+                        '.github/actions/setup-cc/**' \
+                        '.github/actions/configure-apt/**'; do
               echo "  - '$path'"
             done
             echo 'EOF'
