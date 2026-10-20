@@ -186,6 +186,52 @@ mod tests {
         );
     }
 
+    /// A nested `[/FlateDecode /FlateDecode]` stream whose inner payload exceeds
+    /// the budget must be rejected through the parser, before `PDFium` applies
+    /// the chain and expands it unbounded. A single-pass scan would only see the
+    /// small intermediate and let it through.
+    #[tokio::test]
+    async fn rejects_a_nested_flate_bomb_before_loading_pdfium() {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+
+        let over = usize::try_from(crate::archive::MAX_PACKAGE_BYTES).expect("fits usize")
+            + 1024 * 1024;
+        let mut inner = ZlibEncoder::new(Vec::new(), Compression::best());
+        let chunk = vec![b' '; 1024 * 1024];
+        let mut left = over;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            inner.write_all(&chunk[..n]).expect("deflate chunk");
+            left -= n;
+        }
+        let inner = inner.finish().expect("finish inner deflate");
+        let mut outer = ZlibEncoder::new(Vec::new(), Compression::best());
+        outer.write_all(&inner).expect("deflate outer");
+        let data = outer.finish().expect("finish outer deflate");
+
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n1 0 obj\n<< /Length ");
+        pdf.extend_from_slice(data.len().to_string().as_bytes());
+        pdf.extend_from_slice(b" /Filter [/FlateDecode /FlateDecode] >>\nstream\n");
+        pdf.extend_from_slice(&data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let raw = Bytes::from(pdf);
+        assert!(
+            raw.len() < 2 * 1024 * 1024,
+            "the bomb should be small on the wire, was {} bytes",
+            raw.len()
+        );
+
+        let Err(crate::Error::DocumentTooLarge {
+            format: DocumentType::Pdf,
+            ..
+        }) = PdfParser::default().parse(&raw).await
+        else {
+            panic!("a nested-Flate PDF whose streams exceed the budget must be rejected");
+        };
+    }
+
     /// A legitimate PDF whose streams are well within the budget still parses,
     /// so the scanner does not reject ordinary documents.
     #[tokio::test]
