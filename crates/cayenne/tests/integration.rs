@@ -80,6 +80,7 @@ mod large_upsert_test;
 mod layout_pruning_ab_test;
 mod light_encode_roundtrip;
 mod limit_underdelivery_key_deletion_regression_test;
+mod listing_cache_retention_race_test;
 mod lookup_index_budget_test;
 mod lookup_index_composition_test;
 mod lookup_index_lifecycle_test;
