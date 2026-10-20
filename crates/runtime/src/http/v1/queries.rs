@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::Runtime;
 use crate::config::ClusterRole;
 use crate::datafusion::query::write_to_json_value;
+use crate::datafusion::sql_validator::validate_sql_query_read_only;
 use crate::jobs::{JobErrorCode, JobExecutor, JobState, JobStatus};
 
 /// Check if cluster mode with scheduler role is enabled.
@@ -316,6 +317,7 @@ pub struct CancelActiveQueryResponse {
     responses(
         (status = 202, description = "Query accepted for async execution", body = SubmitQueryResponse),
         (status = 400, description = "Invalid request"),
+        (status = 403, description = "API key does not allow the statement's write operation"),
         (status = 503, description = "Queries API requires cluster mode")
     )
 ))]
@@ -329,6 +331,9 @@ pub(crate) async fn submit(
         Ok(e) => e,
         Err(resp) => return resp,
     };
+    if read_only && let Some(response) = refuse_write_statement(&rt, &request.sql).await {
+        return response;
+    }
     let result = executor
         .submit(request, read_only, crate::jobs::current_job_owner().await)
         .await;
@@ -351,6 +356,28 @@ pub(crate) async fn submit(
         }
         Err(e) => error_to_response(&e),
     }
+}
+
+/// Refuses a write statement from a read-only caller before a job is created,
+/// with the 403 and message `POST /v1/sql` gives for the same statement.
+///
+/// A statement that fails to plan here is not refused: the job plans it again
+/// with `read_only` set and reports that error exactly as it would otherwise.
+async fn refuse_write_statement(rt: &Arc<Runtime>, sql: &str) -> Option<Response> {
+    let datafusion = rt.datafusion();
+    let session = datafusion.ctx.state();
+    let (plan, _) = datafusion
+        .create_logical_plan(&session, sql, None)
+        .await
+        .ok()?;
+    let error = validate_sql_query_read_only(&plan).err()?;
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    )
 }
 
 /// Get query status and first result chunk.
@@ -1035,6 +1062,147 @@ mod tests {
             .await
             .expect("response body should be readable");
         serde_json::from_slice(&body).expect("response body should be valid JSON")
+    }
+
+    /// A scheduler-role runtime serving the async queries API from an
+    /// in-memory job store, with an empty writable table `writable`.
+    async fn scheduler_runtime() -> (Arc<Runtime>, Arc<object_store::memory::InMemory>) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+
+        let cluster = crate::config::ClusterConfig {
+            role: Some(ClusterRole::Scheduler),
+            allow_insecure_connections: true,
+            node_advertise_address: Some("127.0.0.1".to_string()),
+            ..crate::config::ClusterConfig::default()
+        };
+        let rt = Arc::new(
+            Runtime::builder()
+                .with_resolved_cluster_config(
+                    crate::cluster::ResolvedClusterConfig::try_new(cluster)
+                        .expect("scheduler cluster config should resolve"),
+                )
+                .build()
+                .await,
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let table = MemTable::try_new(schema, vec![vec![]]).expect("table should build");
+        rt.datafusion()
+            .ctx
+            .register_table("writable", Arc::new(table))
+            .expect("table should register");
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let job_store = Arc::new(crate::jobs::JobStore::new(
+            Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
+            "test",
+            "node-1",
+        ));
+        rt.set_job_executor(Arc::new(JobExecutor::new(job_store, rt.datafusion())))
+            .await;
+        (rt, store)
+    }
+
+    async fn stored_object_count(store: &object_store::memory::InMemory) -> usize {
+        use futures::TryStreamExt;
+        use object_store::ObjectStore;
+
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("job store should list")
+            .len()
+    }
+
+    async fn submit_as(
+        rt: &Arc<Runtime>,
+        principal: Option<ApiKey>,
+        sql: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let context = Arc::new(RequestContextBuilder::new(Protocol::Http).build());
+        if let Some(principal) = principal {
+            context
+                .set_auth_principal(Arc::new(principal) as AuthPrincipalRef)
+                .expect("auth principal should be set");
+        }
+        let request = SubmitQueryRequest {
+            sql: sql.to_string(),
+            parameters: None,
+            timeout_seconds: None,
+            maximum_size: None,
+        };
+        let response = context
+            .scope(submit(Extension(Arc::clone(rt)), Json(request)))
+            .await;
+        let status = response.status();
+        (status, response_json(response).await)
+    }
+
+    fn read_only_key() -> Option<ApiKey> {
+        Some(ApiKey::ReadOnly {
+            key: "read-only".to_string(),
+        })
+    }
+
+    fn read_write_key() -> Option<ApiKey> {
+        Some(ApiKey::ReadWrite {
+            key: "read-write".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_read_only_write_without_creating_a_job() {
+        let (rt, store) = scheduler_runtime().await;
+
+        for (sql, expected) in [
+            (
+                "INSERT INTO writable VALUES (1)",
+                "Error during planning: Insert Into operations are not allowed in read-only SQL context.",
+            ),
+            (
+                "DELETE FROM writable WHERE id = 1",
+                "Error during planning: Delete operations are not allowed in read-only SQL context.",
+            ),
+            (
+                "CREATE VIEW v AS SELECT 1",
+                "Error during planning: DDL operation 'CreateView' is not allowed in read-only SQL context.",
+            ),
+        ] {
+            let (status, body) = submit_as(&rt, read_only_key(), sql).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{sql}: {body}");
+            assert_eq!(body, serde_json::json!({ "error": expected }), "{sql}");
+        }
+        assert_eq!(
+            stored_object_count(&store).await,
+            0,
+            "a refused statement must not create a job"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_accepts_statements_the_caller_may_run() {
+        for (principal, sql) in [
+            (read_only_key(), "SELECT id FROM writable"),
+            // Planning errors are reported by the job, as for any caller.
+            (read_only_key(), "SELEC 1"),
+            (read_write_key(), "INSERT INTO writable VALUES (1)"),
+            // Without `runtime.auth` there is no principal to restrict.
+            (None, "INSERT INTO writable VALUES (1)"),
+        ] {
+            let (rt, store) = scheduler_runtime().await;
+            let (status, body) = submit_as(&rt, principal, sql).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{sql}: {body}");
+            assert!(
+                body["query_id"].as_str().is_some_and(|id| !id.is_empty()),
+                "{sql}: {body}"
+            );
+            assert!(
+                stored_object_count(&store).await > 0,
+                "{sql}: an accepted statement must create a job"
+            );
+        }
     }
 
     #[tokio::test]
