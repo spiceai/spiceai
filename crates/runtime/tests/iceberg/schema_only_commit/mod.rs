@@ -43,7 +43,9 @@ use arrow::datatypes::Int64Type;
 use datafusion::prelude::SessionContext;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadata, TableMetadataBuilder, Type};
+use iceberg::spec::{
+    NestedField, PrimitiveType, Schema, TableMetadata, TableMetadataBuilder, Type,
+};
 use iceberg::{Catalog as _, CatalogBuilder, NamespaceIdent, TableCreation};
 use iceberg_datafusion::IcebergTableProvider;
 use runtime::Runtime;
