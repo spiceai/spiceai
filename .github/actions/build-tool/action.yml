@@ -1,0 +1,74 @@
+name: Build tool
+description: 'Builds a workspace tool binary once per commit: download it from MinIO if this commit built it already, otherwise build and upload it'
+
+# Requires the MinIO CLI (`setup-minio`) and a checkout of the commit to build.
+inputs:
+  package:
+    description: 'The cargo package, which is also the binary name'
+    required: true
+  features:
+    description: 'Cargo features to build with'
+    required: false
+    default: ''
+  profile:
+    description: 'Cargo profile: release or dev'
+    required: false
+    default: 'release'
+
+outputs:
+  path:
+    description: 'Path to the binary'
+    value: ${{ steps.paths.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Locate the binary
+      id: paths
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux) os=linux ;;
+          macOS) os=darwin ;;
+          *) echo "build-tool supports Linux and macOS runners, not $RUNNER_OS" >&2; exit 1 ;;
+        esac
+        # The checked-out commit, not github.sha: a pull_request run's
+        # github.sha is a merge commit, and a dispatch may check out a ref.
+        sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+        dir=$([ "${{ inputs.profile }}" = dev ] && echo debug || echo release)
+        features="${{ inputs.features }}"
+        echo "object=spice-minio/artifacts/${{ inputs.package }}/${os}-$(uname -m)/${sha}${features:+-${features//,/_}}/${{ inputs.package }}" >> "$GITHUB_OUTPUT"
+        echo "path=$GITHUB_WORKSPACE/target/$dir/${{ inputs.package }}" >> "$GITHUB_OUTPUT"
+
+    - name: Download from MinIO
+      id: download
+      shell: bash
+      run: |
+        if mc stat "${{ steps.paths.outputs.object }}" >/dev/null 2>&1; then
+          mkdir -p "$(dirname "${{ steps.paths.outputs.path }}")"
+          mc cp "${{ steps.paths.outputs.object }}" "${{ steps.paths.outputs.path }}"
+          chmod +x "${{ steps.paths.outputs.path }}"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "No ${{ inputs.package }} built for this commit yet; building it"
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Setup Rust
+      if: steps.download.outputs.found != 'true'
+      uses: ./.github/actions/setup-rust
+
+    - name: Build
+      if: steps.download.outputs.found != 'true'
+      shell: bash
+      env:
+        CARGO_INCREMENTAL: 0
+        CARGO_NET_GIT_FETCH_WITH_CLI: true
+      run: |
+        features="${{ inputs.features }}"
+        cargo build -p "${{ inputs.package }}" --profile "${{ inputs.profile }}" ${features:+--features "$features"}
+
+    - name: Upload to MinIO
+      if: steps.download.outputs.found != 'true'
+      shell: bash
+      run: mc cp "${{ steps.paths.outputs.path }}" "${{ steps.paths.outputs.object }}"

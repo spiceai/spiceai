@@ -1,0 +1,144 @@
+name: spicescript
+
+# Runs the scenario scripts in test/spicescript against a prebuilt spiced. A
+# change to a script, the runner or the comparator runs them against the latest
+# trunk build; the nightly run and a dispatch can name another build.
+#
+# Nothing here compiles the runtime: spiced and the spice CLI are the builds
+# build_and_release publishes per trunk commit, and the runner is built once
+# per commit (build-tool) and downloaded by every shard.
+
+on:
+  pull_request:
+    paths:
+      - 'test/spicescript/**'
+      - 'tools/spicescript/**'
+      - 'crates/result-compare/**'
+      - '.github/workflows/spicescript.yml'
+      - '.github/actions/build-tool/**'
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'The spiced build to test (defaults to the latest trunk build)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build spicescript
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+  scripts:
+    name: ${{ matrix.name }}
+    needs: build
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Scripts that pass: any failure fails the job.
+          - { name: 'Scripts (1/4)', partition: 1/4, args: test/spicescript }
+          - { name: 'Scripts (2/4)', partition: 2/4, args: test/spicescript }
+          - { name: 'Scripts (3/4)', partition: 3/4, args: test/spicescript }
+          - { name: 'Scripts (4/4)', partition: 4/4, args: test/spicescript }
+          # Scripts that reproduce open bugs: each must fail exactly as its
+          # group's recordings/expected-failures.json says, so a fix or a
+          # change in how a bug shows also fails the job.
+          - { name: 'Known failing (1/2)', partition: 1/2, args: --max-wait 30s test/spicescript/known-failing }
+          - { name: 'Known failing (2/2)', partition: 2/2, args: --max-wait 30s test/spicescript/known-failing }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download spicescript
+        id: spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+      - name: Setup spiced
+        id: spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      # `spice` steps drive the CLI from the same build as spiced.
+      - name: Download the spice CLI
+        env:
+          SPICED_COMMIT: ${{ steps.spiced.outputs.spiced_commit }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/spice"
+          mc cp "spice-minio/artifacts/spice/linux-x86_64/$SPICED_COMMIT/spice_linux_x86_64.tar.gz" "$RUNNER_TEMP/spice/"
+          tar -xzf "$RUNNER_TEMP/spice/spice_linux_x86_64.tar.gz" -C "$RUNNER_TEMP/spice"
+
+      # Object-store sources (rustfs) are managed with the aws CLI.
+      - name: Install the AWS CLI
+        run: |
+          if ! command -v aws >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install"
+          fi
+
+      # Iceberg sources and dbgen write and read through the DuckDB CLI. The
+      # DuckLake source fetches the release matching spiced's embedded DuckDB.
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      - name: Run scenario scripts
+        env:
+          SPICED_COMMIT: ${{ steps.spiced.outputs.spiced_commit }}
+        run: |
+          echo "spiced build: $SPICED_COMMIT"
+          "${{ steps.spicescript.outputs.path }}" --jobs 8 \
+            --partition ${{ matrix.partition }} \
+            --spiced "trunk=/usr/local/bin/spiced" \
+            --spice-cli "$RUNNER_TEMP/spice/spice" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            ${{ matrix.args }}
+
+      - name: Upload instance logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-logs-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/spicescript/**/spiced.log
+            ${{ runner.temp }}/spicescript/**/spicepod.yaml
+            ${{ runner.temp }}/spicescript/**/slt-*.txt
+          retention-days: 7
