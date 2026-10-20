@@ -700,8 +700,9 @@ jobs:
             # Every run dispatched for one spiced commit pushes to the same
             # branch, so the push can lose in two ways that say nothing about
             # the benchmark:
-            # - another run pushed first ("fetch first"): rebase onto the new
-            #   tip and push again;
+            # - another run pushed first ("fetch first", or any rejection after
+            #   which the branch tip has moved): rebase onto the new tip and
+            #   push again;
             # - the branch's PR is already in the merge queue (GH006: queued
             #   branches cannot be updated): carry on in the next branch,
             #   <base>-2, <base>-3, ..., which gets its own PR.
@@ -710,7 +711,8 @@ jobs:
             pushed=false
             for attempt in 1 2 3 4 5 6 7 8; do
               git checkout -B "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
-              if git ls-remote --exit-code --heads origin "${BRANCH_NAME}"; then
+              remote_tip="$(git ls-remote --heads origin "refs/heads/${BRANCH_NAME}" | cut -f1)"
+              if [ -n "${remote_tip}" ]; then
                 git pull --rebase origin "${BRANCH_NAME}"
               fi
               # Non-interactive: a credential helper on the runner can otherwise intercept
@@ -727,7 +729,8 @@ jobs:
                 suffix=$((suffix + 1))
                 echo "::notice::${BRANCH_NAME} is locked by the merge queue; pushing these snapshots to ${BASE_BRANCH}-${suffix} instead."
                 BRANCH_NAME="${BASE_BRANCH}-${suffix}"
-              elif grep -qE 'fetch first|non-fast-forward' <<<"${push_log}"; then
+              elif grep -qE 'fetch first|non-fast-forward' <<<"${push_log}" \
+                || [ "$(git ls-remote --heads origin "refs/heads/${BRANCH_NAME}" | cut -f1)" != "${remote_tip}" ]; then
                 echo "::notice::Another run pushed to ${BRANCH_NAME} first (attempt ${attempt}); rebasing onto it and pushing again."
                 sleep $((attempt * 5))
               else
