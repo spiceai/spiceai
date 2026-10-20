@@ -83,7 +83,7 @@
           "AI"
         ],
         "summary": "Create Chat Completion",
-        "description": "Creates a model response for the given chat conversation.",
+        "description": "Creates a model response for the given chat conversation.\n\nWhen a model writes text and calls a Spice tool in the same step, the message carries that\ntext, a blank line, then the answer the tool results produce, whether or not it is streamed.\nThere is no blank line when either side already has whitespace where they meet, or when the\nrequest sets `logprobs`, so that `content` is exactly the text its log probabilities cover. A\nresponse that is not streamed and has a `json_object` or `json_schema` `response_format`\ncarries only the answer.",
         "operationId": "post_chat_completions",
         "requestBody": {
           "description": "Create a chat completion request using a language model.",
