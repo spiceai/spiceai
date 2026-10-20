@@ -34,6 +34,7 @@ members = [
     "crates/event_stream",
     "crates/flight_client",
     "crates/repl",
+    "crates/result-compare",
     "crates/google-genai",
     "crates/hash-index",
     "crates/key-index",
@@ -429,7 +430,7 @@ cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f5557381f79f1535014e0dc0555c53ac8de1cafc" } # branch: spiceai-59
-sqlparser = "0.59.0"
+sqlparser = "0.62.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
