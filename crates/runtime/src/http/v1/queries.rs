@@ -1140,16 +1140,16 @@ mod tests {
         (status, response_json(response).await)
     }
 
-    fn read_only_key() -> Option<ApiKey> {
-        Some(ApiKey::ReadOnly {
+    fn read_only_key() -> ApiKey {
+        ApiKey::ReadOnly {
             key: "read-only".to_string(),
-        })
+        }
     }
 
-    fn read_write_key() -> Option<ApiKey> {
-        Some(ApiKey::ReadWrite {
+    fn read_write_key() -> ApiKey {
+        ApiKey::ReadWrite {
             key: "read-write".to_string(),
-        })
+        }
     }
 
     #[tokio::test]
@@ -1170,7 +1170,7 @@ mod tests {
                 "Error during planning: DDL operation 'CreateView' is not allowed in read-only SQL context.",
             ),
         ] {
-            let (status, body) = submit_as(&rt, read_only_key(), sql).await;
+            let (status, body) = submit_as(&rt, Some(read_only_key()), sql).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{sql}: {body}");
             assert_eq!(body, serde_json::json!({ "error": expected }), "{sql}");
         }
@@ -1184,10 +1184,10 @@ mod tests {
     #[tokio::test]
     async fn submit_accepts_statements_the_caller_may_run() {
         for (principal, sql) in [
-            (read_only_key(), "SELECT id FROM writable"),
+            (Some(read_only_key()), "SELECT id FROM writable"),
             // Planning errors are reported by the job, as for any caller.
-            (read_only_key(), "SELEC 1"),
-            (read_write_key(), "INSERT INTO writable VALUES (1)"),
+            (Some(read_only_key()), "SELEC 1"),
+            (Some(read_write_key()), "INSERT INTO writable VALUES (1)"),
             // Without `runtime.auth` there is no principal to restrict.
             (None, "INSERT INTO writable VALUES (1)"),
         ] {
