@@ -10576,7 +10576,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -10635,7 +10635,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10650,7 +10650,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -10673,7 +10673,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10689,7 +10689,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10699,7 +10699,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10718,7 +10718,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=1707b349584845e802a703adca1e71f544defc5f#1707b349584845e802a703adca1e71f544defc5f"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=a6b07b8b9625e552c502c3a7229fd4bb7725bd2e#a6b07b8b9625e552c502c3a7229fd4bb7725bd2e"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
