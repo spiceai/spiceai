@@ -50,8 +50,8 @@ tracing.workspace = true
 tracing-futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "e6b9f734922d6d9146a0938257c8cb70c9aa3e85", optional = true } # branch: lukim/deepseek41-decode-parity (spiceai/mistral.rs#48: DeepSeek-V4.1 decode and reference-parity fixes on #47)
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "e6b9f734922d6d9146a0938257c8cb70c9aa3e85", package = "mistralrs-core", optional = true } # branch: lukim/deepseek41-decode-parity (spiceai/mistral.rs#48: DeepSeek-V4.1 decode and reference-parity fixes on #47)
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "4450776632f7e92f5b8b1ac97f56fe3f72cf2618", optional = true } # branch: spiceai (spiceai/mistral.rs#48: DeepSeek-V4.1 decode and reference-parity fixes on #47)
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "4450776632f7e92f5b8b1ac97f56fe3f72cf2618", package = "mistralrs-core", optional = true } # branch: spiceai (spiceai/mistral.rs#48: DeepSeek-V4.1 decode and reference-parity fixes on #47)
 rand.workspace = true
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [

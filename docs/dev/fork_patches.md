@@ -124,7 +124,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `1707b349584845e802a703adca1e71f544defc5f` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `e6b9f734922d6d9146a0938257c8cb70c9aa3e85` | `lukim/deepseek41-decode-parity` (spiceai/mistral.rs#48, onto `spiceai`) |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `4450776632f7e92f5b8b1ac97f56fe3f72cf2618` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
@@ -624,8 +624,8 @@ Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) a
 
 The `mistral.rs` fork's tree is upstream tag `v0.9.4` (`440093545`) plus the Spice
 patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c06b`),
-and spiceai/mistral.rs#48 (`e6b9f734`) adds the DeepSeek-V4.1 decode fixes on top, so
-`git diff v0.9.4 e6b9f734` is the whole fork delta. #47 built it in
+and spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
+on top, so `git diff v0.9.4 44507766` is the whole fork delta. #47 built it in
 32 commits. The first replays the Spice patches from the `v0.9.0` line: `glm-dsa`
 GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
 multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
