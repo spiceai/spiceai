@@ -101,6 +101,12 @@ pub enum Error {
     #[snafu(display("Failed to parse OAuth2 token response: {source}"))]
     InvalidTokenResponse { source: reqwest::Error },
 
+    #[snafu(display("Failed to read the OAuth2 token response from {url}: {source}"))]
+    TokenResponseBody {
+        url: String,
+        source: http_body_limit::Error,
+    },
+
     #[snafu(display(
         "OAuth2 token endpoint returned unsupported token_type '{token_type}'; only 'Bearer' is supported."
     ))]
@@ -478,7 +484,15 @@ async fn exchange_token(
         });
     }
 
-    let raw: RawTokenResponse = response.json().await.context(InvalidTokenResponseSnafu)?;
+    let raw: RawTokenResponse =
+        http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+            .await
+            .context(TokenResponseBodySnafu {
+                url: config.token_url.clone(),
+            })?
+            .json()
+            .await
+            .context(InvalidTokenResponseSnafu)?;
 
     if let Some(token_type) = raw.token_type.as_deref()
         && !token_type.eq_ignore_ascii_case("bearer")

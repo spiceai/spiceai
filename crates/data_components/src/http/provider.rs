@@ -114,6 +114,17 @@ pub enum Error {
         endpoint: String,
         dataset: String,
     },
+
+    #[snafu(display(
+        "Failed to read the response from {endpoint} for {dataset}: {source}. Request less \
+        data per call, for example by paging the endpoint or narrowing each request with \
+        filters. See: https://spiceai.org/docs/components/data-connectors/https"
+    ))]
+    ResponseTooLarge {
+        endpoint: String,
+        dataset: String,
+        source: http_body_limit::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -135,6 +146,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// theirs to keep. Nothing is lost that the reader needs: every message built from this
 /// also names the dataset, which identifies the endpoint uniquely and is what an operator
 /// looks up to fix it.
+fn dataset_subject(dataset_name: Option<&str>) -> String {
+    dataset_name.map_or_else(
+        || "this dataset".to_string(),
+        |name| format!("dataset '{name}'"),
+    )
+}
+
 fn endpoint_label(url: &Url) -> String {
     // `Origin::ascii_serialization` renders scheme, host and a non-default port and can
     // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
@@ -321,6 +339,8 @@ impl From<Error> for DataFusionError {
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
+            // `Plan`, so a refresh does not re-ask: the response will be as large again.
+            err @ Error::ResponseTooLarge { .. } => DataFusionError::Plan(err.to_string()),
             Error::Pagination { message } => {
                 DataFusionError::External(Box::new(std::io::Error::other(message)))
             }
@@ -942,10 +962,7 @@ impl HttpTableProvider {
     /// How a message refers to the dataset: by name when there is one, and by a phrase
     /// that still reads as a sentence when there is not.
     fn dataset_subject(&self) -> String {
-        self.dataset_name.as_ref().map_or_else(
-            || "this dataset".to_string(),
-            |name| format!("dataset '{name}'"),
-        )
+        dataset_subject(self.dataset_name.as_deref())
     }
 
     /// Set what a response the origin did not mark successful becomes: a failed
@@ -1959,6 +1976,7 @@ impl HttpTableProvider {
             path_label,
             attempt_started,
             self.auth.as_ref().map(|auth| auth.header_name()),
+            self.dataset_name.as_deref(),
         )
         .await?;
 
@@ -1984,6 +2002,7 @@ impl HttpTableProvider {
         path_label: &str,
         attempt_started: Instant,
         auth_header_name: Option<&HeaderName>,
+        dataset_name: Option<&str>,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         let detected_format = Self::detect_file_format(&response, path_label);
         tracing::debug!(
@@ -2099,9 +2118,28 @@ impl HttpTableProvider {
         // truncated compressed body, so it is NOT a reliable "permanent" signal; this mirrors
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
+        //
+        // The body is read under a cap on its *decoded* size, and refused as soon as it
+        // passes it: with transparent decompression a few hundred kilobytes on the wire
+        // can expand to gigabytes. Too large is permanent — asking again gets the same
+        // body.
+        let response = http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+            .io_wait()
+            .await
+            .map_err(|e| match e {
+                http_body_limit::Error::Read { source } => {
+                    RetryError::transient(Error::http_request(endpoint, source))
+                }
+                too_large @ http_body_limit::Error::TooLarge { .. } => {
+                    RetryError::Permanent(Error::ResponseTooLarge {
+                        endpoint: endpoint_label(endpoint),
+                        dataset: dataset_subject(dataset_name),
+                        source: too_large,
+                    })
+                }
+            })?;
         let content = response
             .text()
-            .io_wait()
             .await
             .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
