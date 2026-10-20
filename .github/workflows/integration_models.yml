@@ -588,6 +588,7 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- bedrock_test
 
       - name: Run Bedrock decisions tests
+        if: ${{ !cancelled() }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           AWS_BEDROCK_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
