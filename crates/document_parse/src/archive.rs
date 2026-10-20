@@ -257,27 +257,50 @@ fn decoded_len_within(stream: &PdfStream, raw: &[u8], remaining: u64) -> Result<
     let cap = remaining.saturating_add(1);
     let mut buf: Vec<u8> = Vec::new();
     let mut size: u64 = 0;
+    let last = stream.filters.len().saturating_sub(1);
     for (idx, &filter) in stream.filters.iter().enumerate() {
         if filter == PdfFilter::Opaque {
             return Ok(size);
         }
-        let decoded = {
-            let input: &[u8] = if idx == 0 { &raw[stream.data_start..] } else { &buf };
-            decode_stage(filter, input, cap)
-        };
-        size = decoded.len() as u64;
-        if size > remaining {
-            return Err(Error::DocumentTooLarge {
-                format: DocumentType::Pdf,
-                reason: format!(
-                    "its compressed streams decompress to more than {}, the per-document limit",
-                    describe_bytes(MAX_PACKAGE_BYTES)
-                ),
-            });
+        let input: &[u8] = if idx == 0 { &raw[stream.data_start..] } else { &buf };
+        // The final stage's bytes are never fed anywhere, so count them through a
+        // sink instead of materializing: a bomb whose last stage is the one that
+        // explodes then costs no memory to reject.
+        if idx == last {
+            size = count_decode(filter, input, cap);
+            return ensure_within(size, remaining);
         }
+        let decoded = decode_stage(filter, input, cap);
+        size = decoded.len() as u64;
+        ensure_within(size, remaining)?;
         buf = decoded;
     }
     Ok(size)
+}
+
+fn ensure_within(size: u64, remaining: u64) -> Result<u64> {
+    if size > remaining {
+        return Err(Error::DocumentTooLarge {
+            format: DocumentType::Pdf,
+            reason: format!(
+                "its compressed streams decompress to more than {}, the per-document limit",
+                describe_bytes(MAX_PACKAGE_BYTES)
+            ),
+        });
+    }
+    Ok(size)
+}
+
+/// Counts the output of one filter stage without keeping it, reading no more
+/// than `cap` bytes. Used for the final stage, whose bytes feed nothing: Flate
+/// (the expanding filter that matters here) streams through a sink, so a bomb
+/// whose last stage explodes costs no memory to reject. The ASCII filters only
+/// shrink, so materializing them is already bounded by their input.
+fn count_decode(filter: PdfFilter, data: &[u8], cap: u64) -> u64 {
+    match filter {
+        PdfFilter::Flate => inflate_counting(data, cap),
+        other => decode_stage(other, data, cap).len() as u64,
+    }
 }
 
 /// Applies one filter stage, reading no more than `cap` output bytes. `Opaque`
@@ -449,6 +472,21 @@ fn inflate_bounded(data: &[u8], limit: u64) -> Vec<u8> {
     out.clear();
     let _ = DeflateDecoder::new(data).take(limit).read_to_end(&mut out);
     out
+}
+
+/// Inflates `data` as Flate (zlib, then raw deflate) and returns the number of
+/// bytes produced, reading no more than `limit` of them and discarding the
+/// output. Holds no more than one decoder block, so counting an 8 GiB bomb
+/// costs the CPU to inflate `limit` bytes and essentially no memory.
+fn inflate_counting(data: &[u8], limit: u64) -> u64 {
+    use flate2::read::{DeflateDecoder, ZlibDecoder};
+    use std::io::{Read, copy, sink};
+
+    let zlib = copy(&mut ZlibDecoder::new(data).take(limit), &mut sink()).unwrap_or(0);
+    if zlib > 0 {
+        return zlib;
+    }
+    copy(&mut DeflateDecoder::new(data).take(limit), &mut sink()).unwrap_or(0)
 }
 
 /// Decodes a PDF `/ASCII85Decode` stream up to `limit` output bytes. The output
