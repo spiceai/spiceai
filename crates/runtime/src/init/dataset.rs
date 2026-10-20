@@ -600,12 +600,14 @@ impl Runtime {
     /// accelerator schema is already a superset (e.g. a concurrent writer evolved it, or
     /// the change was a no-op) and the batch must still match its canonical field order.
     /// Returns `Ok(None)` when nothing was evolved — unknown dataset, no acceleration, a
-    /// `block`/`fail` policy, or an unsupported/incompatible change. In every `Ok(None)`
-    /// case the caller's write proceeds unchanged.
+    /// `block`/`fail` policy, an unsupported/incompatible change, or an evolution that would
+    /// leave the table with more than `max_columns` columns. In every `Ok(None)` case the
+    /// caller's write proceeds unchanged.
     pub async fn evolve_accelerated_schema_for_write(
         self: &Arc<Self>,
         table_ref: &TableReference,
         target_schema: &arrow_schema::SchemaRef,
+        max_columns: usize,
     ) -> std::result::Result<Option<arrow_schema::SchemaRef>, crate::datafusion::Error> {
         let Some(app) = self.read_app().await else {
             return Ok(None);
@@ -619,7 +621,12 @@ impl Runtime {
         };
 
         self.df
-            .evolve_and_rebind_accelerated_schema(&dataset, self.secrets(), target_schema)
+            .evolve_and_rebind_accelerated_schema(
+                &dataset,
+                self.secrets(),
+                target_schema,
+                max_columns,
+            )
             .await
     }
 

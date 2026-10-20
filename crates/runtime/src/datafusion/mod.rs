@@ -5442,18 +5442,20 @@ impl DataFusion {
     ///
     /// Returns `Ok(None)` when nothing was evolved — no acceleration, a `block`/`fail`
     /// policy, a non-sink source (the rebind is sink-specific), an engine without in-place
-    /// evolution, an `Incompatible` change, or a change the policy does not permit. In
-    /// every `Ok(None)` case the caller's write proceeds unchanged and rejects the batch
-    /// exactly as it does today.
+    /// evolution, an `Incompatible` change, a change the policy does not permit, or one that
+    /// adds columns past `max_columns`. In every `Ok(None)` case the caller's write proceeds
+    /// unchanged and rejects the batch exactly as it does today.
     ///
     /// Serialized per dataset (see `schema_evolve_locks`): the live provider schema is
     /// re-read *after* acquiring the lock, so two concurrent exports adding different
-    /// columns each observe the other's addition and evolve monotonically.
+    /// columns each observe the other's addition and evolve monotonically, and the column
+    /// limit holds however many of them are in flight.
     pub(crate) async fn evolve_and_rebind_accelerated_schema(
         &self,
         dataset: &Arc<Dataset>,
         secrets: Arc<TokioRwLock<Secrets>>,
         target_schema: &SchemaRef,
+        max_columns: usize,
     ) -> Result<Option<SchemaRef>> {
         let Some(acceleration) = dataset.acceleration.as_ref() else {
             return Ok(None);
@@ -5530,6 +5532,16 @@ impl DataFusion {
         // than on what it omits.
         let target_schema =
             arrow_tools::schema_evolution::retain_current_columns(&current, target_schema);
+
+        // `target_schema` holds every current column, so a longer one adds columns.
+        let target_columns = target_schema.fields().len();
+        if target_columns > current.fields().len() && target_columns > max_columns {
+            tracing::debug!(
+                dataset = %dataset.name,
+                "Write-time schema evolution refused: it would leave {target_columns} columns, more than the limit of {max_columns}",
+            );
+            return Ok(None);
+        }
 
         match arrow_tools::schema_evolution::classify(&current, &target_schema, &ctx) {
             // Another export already evolved to a superset (or nothing changed): the

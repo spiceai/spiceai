@@ -508,3 +508,206 @@ async fn many_concurrent_exports_adding_distinct_columns_all_land() -> Result<()
     rt.shutdown().await;
     Ok(())
 }
+
+/// Most attribute columns a metric table may have; mirrors the ingest's internal limit.
+const ATTRIBUTE_COLUMN_LIMIT: usize = 256;
+/// The value columns of a gauge's table, which are not attribute columns.
+const GAUGE_VALUE_COLUMNS: usize = 3;
+
+/// A gauge export for `metric` whose data points each carry one of `keys`, at consecutive
+/// times from `first_time_unix_nano` so the primary key keeps every row.
+fn gauge_export_one_key_per_data_point(
+    metric: &str,
+    first_time_unix_nano: u64,
+    keys: &[String],
+) -> ExportMetricsServiceRequest {
+    let mut request = gauge_export(metric, 1.0, first_time_unix_nano, Vec::new());
+    let Some(Data::Gauge(gauge)) = &mut request.resource_metrics[0].scope_metrics[0].metrics[0].data
+    else {
+        unreachable!("gauge_export builds a gauge");
+    };
+    let template = gauge.data_points[0].clone();
+    gauge.data_points = keys
+        .iter()
+        .zip(first_time_unix_nano..)
+        .map(|(key, time_unix_nano)| NumberDataPoint {
+            attributes: vec![string_attr(key, "v")],
+            time_unix_nano,
+            ..template.clone()
+        })
+        .collect();
+    request
+}
+
+fn keys(prefix: &str, count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("{prefix}{i:05}")).collect()
+}
+
+/// Attribute columns of `metric`'s table, as the runtime reports its schema.
+async fn attribute_columns(rt: &Arc<Runtime>, metric: &str) -> Result<usize, anyhow::Error> {
+    let schema = rt
+        .datafusion()
+        .get_arrow_schema(TableReference::bare(metric))
+        .await?;
+    Ok(schema.fields().len() - GAUGE_VALUE_COLUMNS)
+}
+
+/// One export whose data points each carry a new attribute key costs rows × keys to build and
+/// would widen the table by every key. Over the limit it must be refused with an error that
+/// says why, leaving the stored schema as it was; an export filling the table to exactly the
+/// limit must still land.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn export_over_the_attribute_limit_is_rejected_without_widening_the_table()
+-> Result<(), anyhow::Error> {
+    const METRIC: &str = "otel_attribute_limit";
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+
+    register_test_connectors().await;
+    let rt = start_runtime(METRIC, temp_dir.path()).await;
+
+    ingest(
+        &rt,
+        gauge_export(METRIC, 0.0, 100, vec![string_attr("region", "us")]),
+    )
+    .await?;
+    assert_eq!(attribute_columns(&rt, METRIC).await?, 1);
+
+    let service =
+        runtime::opentelemetry::build_metrics_service(rt.datafusion(), Some(Arc::downgrade(&rt)));
+    let status = service
+        .export(tonic::Request::new(gauge_export_one_key_per_data_point(
+            METRIC,
+            1_000,
+            &keys("k", ATTRIBUTE_COLUMN_LIMIT + 1),
+        )))
+        .await
+        .expect_err("an export over the attribute limit must be rejected");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().starts_with(
+            "Failed to ingest OpenTelemetry metric 'otel_attribute_limit': its data points \
+             carry more than 256 distinct attribute keys"
+        ),
+        "{}",
+        status.message()
+    );
+    assert_eq!(
+        attribute_columns(&rt, METRIC).await?,
+        1,
+        "a rejected export must not widen the table"
+    );
+    assert_eq!(row_count(&rt, METRIC).await?, 1, "nothing may be written");
+
+    // `region` plus 255 new keys fills the table to exactly the limit.
+    ingest(
+        &rt,
+        gauge_export_one_key_per_data_point(METRIC, 2_000, &keys("k", ATTRIBUTE_COLUMN_LIMIT - 1)),
+    )
+    .await?;
+    assert_eq!(
+        attribute_columns(&rt, METRIC).await?,
+        ATTRIBUTE_COLUMN_LIMIT
+    );
+    assert_eq!(row_count(&rt, METRIC).await?, ATTRIBUTE_COLUMN_LIMIT);
+
+    // The table is full: one more key is refused, a known one still lands.
+    let status = service
+        .export(tonic::Request::new(gauge_export_one_key_per_data_point(
+            METRIC,
+            3_000,
+            &["one_too_many".to_string()],
+        )))
+        .await
+        .expect_err("a new column on a full table must be rejected");
+    assert!(
+        status.message().contains(
+            "its table has 256 attribute columns and this export would add 1 more, exceeding \
+             the limit of 256"
+        ),
+        "{}",
+        status.message()
+    );
+    ingest(
+        &rt,
+        gauge_export(METRIC, 1.0, 4_000, vec![string_attr("region", "eu")]),
+    )
+    .await?;
+    assert_eq!(
+        attribute_columns(&rt, METRIC).await?,
+        ATTRIBUTE_COLUMN_LIMIT
+    );
+    assert_eq!(row_count(&rt, METRIC).await?, ATTRIBUTE_COLUMN_LIMIT + 1);
+
+    rt.shutdown().await;
+    Ok(())
+}
+
+/// Concurrent exports can each be under the limit against the schema they read and together
+/// exceed it. The limit must hold for the table however many are in flight: the ones that
+/// would take it past the limit are refused, not applied.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn concurrent_exports_cannot_widen_the_table_past_the_attribute_limit()
+-> Result<(), anyhow::Error> {
+    const METRIC: &str = "otel_attribute_limit_race";
+    const WRITERS: usize = 6;
+    // Any two of these together exceed the limit.
+    const KEYS_PER_WRITER: usize = 150;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+
+    register_test_connectors().await;
+    let rt = start_runtime(METRIC, temp_dir.path()).await;
+
+    ingest(
+        &rt,
+        gauge_export(METRIC, 0.0, 100, vec![string_attr("region", "us")]),
+    )
+    .await?;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for writer in 0..WRITERS {
+        let rt = Arc::clone(&rt);
+        tasks.spawn(async move {
+            let first_time = 10_000 * (u64::try_from(writer).expect("fits") + 1);
+            ingest(
+                &rt,
+                gauge_export_one_key_per_data_point(
+                    METRIC,
+                    first_time,
+                    &keys(&format!("w{writer}_"), KEYS_PER_WRITER),
+                ),
+            )
+            .await
+            .is_ok()
+        });
+    }
+    let landed = tokio::time::timeout(Duration::from_mins(2), tasks.join_all())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the concurrent exports"))?
+        .into_iter()
+        .filter(|landed| *landed)
+        .count();
+
+    let columns = attribute_columns(&rt, METRIC).await?;
+    assert!(
+        columns <= ATTRIBUTE_COLUMN_LIMIT,
+        "the table has {columns} attribute columns, more than the limit of \
+         {ATTRIBUTE_COLUMN_LIMIT}"
+    );
+    assert_eq!(
+        landed, 1,
+        "exactly one export fits under the limit; the others must be refused"
+    );
+    assert_eq!(columns, 1 + KEYS_PER_WRITER);
+    assert_eq!(row_count(&rt, METRIC).await?, 1 + KEYS_PER_WRITER);
+
+    rt.shutdown().await;
+    Ok(())
+}
