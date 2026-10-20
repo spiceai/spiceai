@@ -41,7 +41,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     compare,
-    script::{Action, RunVariants, Script, Step, Timing, VariantSpec},
+    script::{Action, RunVariants, Script, Step, Timing, VariantSpec, matrix_combinations},
     source::{self, Source},
     spiced::Spiced,
     template,
@@ -449,21 +449,7 @@ pub async fn run_script(script: &Script, options: &Options, slots: &Slots) -> Re
         .into_iter()
         .enumerate()
         .map(|(combo_index, combo)| async move {
-            let combo_label = combo
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{k}={}",
-                        v.as_str().map_or_else(|| v.to_string(), str::to_string)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            let run_label = if combo_label.is_empty() {
-                script.name.clone()
-            } else {
-                format!("{}[{combo_label}]", script.name)
-            };
+            let run_label = script.run_label(&combo);
             let run_id = format!(
                 "{}-{combo_index}-{}",
                 sanitize(&script.name),
@@ -1199,23 +1185,6 @@ fn compare_instances(
         }
     }
     Ok(())
-}
-
-fn matrix_combinations(matrix: &IndexMap<String, Vec<Value>>) -> Vec<Map<String, Value>> {
-    matrix
-        .iter()
-        .fold(vec![Map::new()], |combos, (key, values)| {
-            combos
-                .into_iter()
-                .flat_map(|combo| {
-                    values.iter().map(move |v| {
-                        let mut next = combo.clone();
-                        next.insert(key.clone(), v.clone());
-                        next
-                    })
-                })
-                .collect()
-        })
 }
 
 fn sanitize(s: &str) -> String {

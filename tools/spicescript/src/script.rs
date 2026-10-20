@@ -62,6 +62,56 @@ pub struct Script {
     /// The directory the script is in; `corpus` and `slt` files are relative to it.
     #[serde(skip)]
     pub dir: std::path::PathBuf,
+    /// The runs and variants `--matrix` and `--variant` left out (see
+    /// [`Script::select`]).
+    #[serde(skip)]
+    pub left_out: LeftOut,
+}
+
+/// `--matrix` and `--variant`: the matrix values and variants a run keeps.
+#[derive(Debug, Default)]
+pub struct Selection {
+    /// The values to keep, by matrix key, as `${matrix.<key>}` prints them.
+    pub matrix: BTreeMap<String, Vec<String>>,
+    pub variants: Vec<String>,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.matrix.is_empty() && self.variants.is_empty()
+    }
+
+    /// The selection as the command line spells it.
+    pub fn describe(&self) -> String {
+        self.matrix
+            .iter()
+            .flat_map(|(k, values)| values.iter().map(move |v| format!("--matrix {k}={v}")))
+            .chain(self.variants.iter().map(|v| format!("--variant {v}")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// What a [`Selection`] left out of a script: its ledger entries there are
+/// not expected to fail this run, and recording keeps them.
+#[derive(Debug, Default, Clone)]
+pub struct LeftOut {
+    /// Run labels (`name[key=value,…]`) of the combinations left out.
+    pub runs: std::collections::BTreeSet<String>,
+    pub variants: std::collections::BTreeSet<String>,
+}
+
+impl LeftOut {
+    /// Whether a check of `run` by `who` (an instance, `<binary>/<variant>`
+    /// with several binaries, `variants` for a comparison between them, or
+    /// empty) could have been left out.
+    pub fn covers(&self, run: &str, who: &str) -> bool {
+        let variant = who.rsplit_once('/').map_or(who, |(_, v)| v);
+        self.runs.contains(run)
+            || self.variants.contains(variant)
+            // A comparison between the variants that ran is not the one recorded.
+            || (who == "variants" && !self.variants.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -764,6 +814,66 @@ impl Script {
             .with_context(|| format!("Failed to write {}", path.display()))
     }
 
+    /// Keeps only the matrix values and variants `selection` names, and
+    /// records what it left out. `false` when the script has none of a
+    /// requested key's values, or none of the variants: it is not run.
+    pub fn select(&mut self, selection: &Selection) -> bool {
+        if selection.is_empty() {
+            return true;
+        }
+        let all_runs = self.run_labels();
+        for (key, keep) in &selection.matrix {
+            let Some(values) = self.matrix.get_mut(key) else {
+                return false;
+            };
+            values.retain(|v| keep.contains(&matrix_value_text(v)));
+            if values.is_empty() {
+                return false;
+            }
+        }
+        if !selection.variants.is_empty() {
+            let dropped: Vec<String> = self
+                .variants
+                .keys()
+                .filter(|n| !selection.variants.contains(n))
+                .cloned()
+                .collect();
+            if dropped.len() == self.variants.len() {
+                return false;
+            }
+            for name in dropped {
+                self.variants.shift_remove(&name);
+                self.left_out.variants.insert(name);
+            }
+        }
+        let kept: std::collections::BTreeSet<String> = self.run_labels().into_iter().collect();
+        self.left_out.runs = all_runs.into_iter().filter(|r| !kept.contains(r)).collect();
+        true
+    }
+
+    /// The label of each matrix combination's run, `name[key=value,…]`.
+    pub fn run_labels(&self) -> Vec<String> {
+        matrix_combinations(&self.matrix)
+            .iter()
+            .map(|combo| self.run_label(combo))
+            .collect()
+    }
+
+    /// A matrix combination's run, as failures and the ledger name it:
+    /// `name[key=value,…]`, or the name alone without a matrix.
+    pub fn run_label(&self, combo: &Map<String, Value>) -> String {
+        let combo_label = combo
+            .iter()
+            .map(|(k, v)| format!("{k}={}", matrix_value_text(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        if combo_label.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}[{combo_label}]", self.name)
+        }
+    }
+
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self> {
         Self::parse_in(text, Path::new("."), &SharedVariants::default())
@@ -872,6 +982,30 @@ impl Script {
         names.dedup();
         names
     }
+}
+
+/// Every combination of the matrix values, in declaration order.
+pub fn matrix_combinations(matrix: &IndexMap<String, Vec<Value>>) -> Vec<Map<String, Value>> {
+    matrix
+        .iter()
+        .fold(vec![Map::new()], |combos, (key, values)| {
+            combos
+                .into_iter()
+                .flat_map(|combo| {
+                    values.iter().map(move |v| {
+                        let mut next = combo.clone();
+                        next.insert(key.clone(), v.clone());
+                        next
+                    })
+                })
+                .collect()
+        })
+}
+
+/// A matrix value as run labels and `--matrix` spell it: a string as is,
+/// anything else as JSON.
+pub fn matrix_value_text(v: &Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), str::to_string)
 }
 
 /// The file defining the variants scripts name instead of writing the patch:
@@ -2161,6 +2295,62 @@ steps:
             format!("{err:#}").contains("there is no variants.yaml"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_selection_keeps_matrix_values_and_variants_and_records_the_rest() {
+        let text = "name: s\nmatrix: { src: [postgres, clickhouse], n: [1, 2] }\nvariants: { a: {}, b: {}, c: {} }\nspicepod: {}\nsteps: [ { start: {} } ]";
+        let mut script = Script::parse(text).expect("parses");
+        let selection = Selection {
+            matrix: BTreeMap::from([("src".to_string(), vec!["clickhouse".to_string()])]),
+            variants: vec!["b".into(), "c".into()],
+        };
+        assert!(script.select(&selection));
+        assert_eq!(
+            script.run_labels(),
+            ["s[n=1,src=clickhouse]", "s[n=2,src=clickhouse]"]
+        );
+        assert_eq!(script.variants.keys().collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!(
+            script.left_out.runs.iter().collect::<Vec<_>>(),
+            ["s[n=1,src=postgres]", "s[n=2,src=postgres]"]
+        );
+        assert!(script.left_out.covers("s[n=1,src=clickhouse]", "a"));
+        assert!(script.left_out.covers("s[n=1,src=clickhouse]", "trunk/a"));
+        assert!(script.left_out.covers("s[n=1,src=clickhouse]", "variants"));
+        assert!(script.left_out.covers("s[n=1,src=postgres]", "b"));
+        assert!(!script.left_out.covers("s[n=1,src=clickhouse]", "b"));
+        assert!(!script.left_out.covers("s[n=1,src=clickhouse]", ""));
+        // A number is selected as it prints. Labels list keys alphabetically.
+        let mut script = Script::parse(text).expect("parses");
+        let by_number = Selection {
+            matrix: BTreeMap::from([("n".to_string(), vec!["2".to_string()])]),
+            variants: Vec::new(),
+        };
+        assert!(script.select(&by_number));
+        assert_eq!(
+            script.run_labels(),
+            ["s[n=2,src=postgres]", "s[n=2,src=clickhouse]"]
+        );
+        assert!(!script.left_out.covers("s[n=2,src=postgres]", "variants"));
+        // A script without the key, value or any variant is not run.
+        for selection in [
+            Selection {
+                matrix: BTreeMap::from([("mode".to_string(), vec!["file".to_string()])]),
+                variants: Vec::new(),
+            },
+            Selection {
+                matrix: BTreeMap::from([("src".to_string(), vec!["mysql".to_string()])]),
+                variants: Vec::new(),
+            },
+            Selection {
+                matrix: BTreeMap::new(),
+                variants: vec!["d".into()],
+            },
+        ] {
+            let mut script = Script::parse(text).expect("parses");
+            assert!(!script.select(&selection), "{}", selection.describe());
+        }
     }
 
     #[test]

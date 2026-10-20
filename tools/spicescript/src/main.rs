@@ -117,6 +117,17 @@ struct Cli {
     /// otherwise wait out every limit in full.
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
+
+    /// Run only the matrix combinations with this value, as `KEY=VALUE`;
+    /// repeat a key for several values. Scripts without the key or any of its
+    /// values are skipped.
+    #[arg(long = "matrix", value_name = "KEY=VALUE", value_parser = parse_matrix_value)]
+    matrix: Vec<(String, String)>,
+
+    /// Run only this variant; repeat it for several. Scripts with none of
+    /// them are skipped.
+    #[arg(long = "variant", value_name = "NAME")]
+    variants: Vec<String>,
 }
 
 #[tokio::main]
@@ -143,6 +154,40 @@ async fn run(cli: Cli) -> Result<bool> {
         .iter()
         .map(|p| script::Script::load(p, cli.record_durations || cli.check))
         .collect::<Result<Vec<_>>>()?;
+    let mut selection = script::Selection::default();
+    for (key, value) in &cli.matrix {
+        selection
+            .matrix
+            .entry(key.clone())
+            .or_default()
+            .push(value.clone());
+    }
+    selection.variants.clone_from(&cli.variants);
+    if !selection.is_empty() {
+        anyhow::ensure!(
+            !cli.record_durations,
+            "--record-durations records whole scripts' run times; run it without {}",
+            selection.describe()
+        );
+        let before = scripts.len();
+        (paths, scripts) = paths
+            .into_iter()
+            .zip(scripts)
+            .filter_map(|(path, mut script)| script.select(&selection).then_some((path, script)))
+            .unzip();
+        anyhow::ensure!(
+            !scripts.is_empty(),
+            "No script has {}",
+            selection.describe()
+        );
+        if scripts.len() < before {
+            println!(
+                "{} of {before} scripts have {}; running those",
+                scripts.len(),
+                selection.describe()
+            );
+        }
+    }
     if let Some((index, count)) = cli.partition {
         let share = partition(&scripts, count);
         (paths, scripts) = paths
@@ -347,6 +392,13 @@ fn expected_failures_note(expected: usize) -> String {
         format!(" ({expected} expected failures)")
     } else {
         String::new()
+    }
+}
+
+fn parse_matrix_value(text: &str) -> Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(format!("`{text}` is not KEY=VALUE")),
     }
 }
 
