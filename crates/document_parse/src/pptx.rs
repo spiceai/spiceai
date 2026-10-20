@@ -55,51 +55,57 @@ impl PptxParser {
 #[async_trait::async_trait]
 impl DocumentParser for PptxParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        let cursor = Cursor::new(raw.clone());
-        let mut archive = ZipArchive::new(cursor)
+        let raw = raw.clone();
+        let doc = crate::parse_blocking(DocumentType::Pptx, move || parse_slides(&raw)).await?;
+        Ok(Arc::new(doc))
+    }
+}
+
+fn parse_slides(raw: &Bytes) -> Result<PptxDocument> {
+    let cursor = Cursor::new(raw.clone());
+    let mut archive = ZipArchive::new(cursor)
+        .boxed()
+        .context(InternalParsingSnafu {
+            format: DocumentType::Pptx,
+        })?;
+
+    // PPTX layout: slides live at `ppt/slides/slideN.xml`. Sort by
+    // numeric suffix so the rendered text follows presentation order
+    // rather than zip-entry order (which is alphanumeric and mis-orders
+    // slide10 before slide2). `file_names()` reads the central directory
+    // without setting up per-entry decompression, so the enumeration pass
+    // is cheap.
+    let mut slide_paths: Vec<String> = archive
+        .file_names()
+        .filter(|n| is_slide_path(n))
+        .map(String::from)
+        .collect();
+    slide_paths.sort_by_key(|p| slide_index(p).unwrap_or(usize::MAX));
+
+    // Only slide parts are read, so embedded media (often far larger than
+    // any slide) never counts against the budget.
+    let mut budget = DecompressionBudget::new(DocumentType::Pptx, Limits::DEFAULT);
+    let mut text_len: u64 = 0;
+    let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
+    for path in slide_paths {
+        let entry = archive
+            .by_name(&path)
             .boxed()
             .context(InternalParsingSnafu {
                 format: DocumentType::Pptx,
             })?;
-
-        // PPTX layout: slides live at `ppt/slides/slideN.xml`. Sort by
-        // numeric suffix so the rendered text follows presentation order
-        // rather than zip-entry order (which is alphanumeric and mis-orders
-        // slide10 before slide2). `file_names()` reads the central directory
-        // without setting up per-entry decompression, so the enumeration pass
-        // is cheap.
-        let mut slide_paths: Vec<String> = archive
-            .file_names()
-            .filter(|n| is_slide_path(n))
-            .map(String::from)
-            .collect();
-        slide_paths.sort_by_key(|p| slide_index(p).unwrap_or(usize::MAX));
-
-        // Only slide parts are read, so embedded media (often far larger than
-        // any slide) never counts against the budget.
-        let mut budget = DecompressionBudget::new(DocumentType::Pptx, Limits::DEFAULT);
-        let mut text_len: u64 = 0;
-        let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
-        for path in slide_paths {
-            let entry = archive
-                .by_name(&path)
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pptx,
-                })?;
-            let xml = String::from_utf8(budget.read_entry(&path, entry)?)
-                .boxed()
-                .context(InternalParsingSnafu {
-                    format: DocumentType::Pptx,
-                })?;
-            let text = extract_slide_text(&xml)?;
-            text_len += text.len() as u64;
-            ensure_text_within_limit(text_len, DocumentType::Pptx)?;
-            slides.push(text);
-        }
-
-        Ok(Arc::new(PptxDocument { slides }))
+        let xml = String::from_utf8(budget.read_entry(&path, entry)?)
+            .boxed()
+            .context(InternalParsingSnafu {
+                format: DocumentType::Pptx,
+            })?;
+        let text = extract_slide_text(&xml)?;
+        text_len += text.len() as u64;
+        ensure_text_within_limit(text_len, DocumentType::Pptx)?;
+        slides.push(text);
     }
+
+    Ok(PptxDocument { slides })
 }
 
 fn is_slide_path(name: &str) -> bool {

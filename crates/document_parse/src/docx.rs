@@ -53,12 +53,17 @@ impl DocxParser {
 #[async_trait::async_trait]
 impl DocumentParser for DocxParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        // `read_docx` decompresses every part it reads without a size limit.
-        let package = rebuild_package(raw, DocumentType::Docx, Limits::DEFAULT)?;
-        let doc = read_docx(&package).boxed().context(InternalParsingSnafu {
-            format: DocumentType::Docx,
-        })?;
-        Ok(Arc::new(DocxDocument { doc }))
+        let raw = raw.clone();
+        let doc = crate::parse_blocking(DocumentType::Docx, move || {
+            // `read_docx` decompresses every part it reads without a size limit.
+            let package = rebuild_package(&raw, DocumentType::Docx, Limits::DEFAULT)?;
+            let doc = read_docx(&package).boxed().context(InternalParsingSnafu {
+                format: DocumentType::Docx,
+            })?;
+            Ok(DocxDocument { doc })
+        })
+        .await?;
+        Ok(Arc::new(doc))
     }
 }
 

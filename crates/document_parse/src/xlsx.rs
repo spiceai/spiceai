@@ -64,36 +64,42 @@ impl DocumentParser for XlsxParser {
     /// renders to, which is checked against the text limit before anything is
     /// rendered, and once to render it.
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
-        // calamine decompresses every part it reads without a size limit.
-        let package = rebuild_package(raw, DocumentType::Xlsx, Limits::DEFAULT)?;
-        let mut wb: Xlsx<_> = open_workbook_from_rs(Cursor::new(package))
-            .boxed()
-            .context(InternalParsingSnafu {
-                format: DocumentType::Xlsx,
-            })?;
-        let mut text = String::new();
-        for name in wb.sheet_names() {
-            let separator = if text.is_empty() { "" } else { "\n\n" };
-            let extent = measure_sheet(&mut wb, &name)?;
-            let header_len = separator.len() + "# ".len() + name.len() + "\n".len();
-            let sheet_len = extent.as_ref().map_or(0, SheetExtent::rendered_len);
-            ensure_text_within_limit(
-                (text.len() as u64)
-                    .saturating_add(header_len as u64)
-                    .saturating_add(sheet_len),
-                DocumentType::Xlsx,
-            )?;
-
-            text.push_str(separator);
-            text.push_str("# ");
-            text.push_str(&name);
-            text.push('\n');
-            if let Some(extent) = extent {
-                render_sheet(&mut wb, &name, &extent, &mut text)?;
-            }
-        }
-        Ok(Arc::new(XlsxDocument { text }))
+        let raw = raw.clone();
+        let doc = crate::parse_blocking(DocumentType::Xlsx, move || render_workbook(&raw)).await?;
+        Ok(Arc::new(doc))
     }
+}
+
+fn render_workbook(raw: &Bytes) -> Result<XlsxDocument> {
+    // calamine decompresses every part it reads without a size limit.
+    let package = rebuild_package(raw, DocumentType::Xlsx, Limits::DEFAULT)?;
+    let mut wb: Xlsx<_> = open_workbook_from_rs(Cursor::new(package))
+        .boxed()
+        .context(InternalParsingSnafu {
+            format: DocumentType::Xlsx,
+        })?;
+    let mut text = String::new();
+    for name in wb.sheet_names() {
+        let separator = if text.is_empty() { "" } else { "\n\n" };
+        let extent = measure_sheet(&mut wb, &name)?;
+        let header_len = separator.len() + "# ".len() + name.len() + "\n".len();
+        let sheet_len = extent.as_ref().map_or(0, SheetExtent::rendered_len);
+        ensure_text_within_limit(
+            (text.len() as u64)
+                .saturating_add(header_len as u64)
+                .saturating_add(sheet_len),
+            DocumentType::Xlsx,
+        )?;
+
+        text.push_str(separator);
+        text.push_str("# ");
+        text.push_str(&name);
+        text.push('\n');
+        if let Some(extent) = extent {
+            render_sheet(&mut wb, &name, &extent, &mut text)?;
+        }
+    }
+    Ok(XlsxDocument { text })
 }
 
 fn parsing_error(source: impl std::error::Error + Send + Sync + 'static) -> crate::Error {

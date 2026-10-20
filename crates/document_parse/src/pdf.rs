@@ -54,8 +54,13 @@ impl DocumentParser for PdfParser {
     async fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
         // PDFium inflates `/FlateDecode` streams internally with no size limit,
         // so bound the decompressed size before loading it or handing it the
-        // bytes: a bomb is rejected without provisioning the library at all.
-        ensure_pdf_within_budget(raw)?;
+        // bytes: a bomb is rejected without provisioning the library at all. The
+        // scan inflates up to the budget, so it runs off the async runtime.
+        let scan_bytes = raw.clone();
+        crate::parse_blocking(DocumentType::Pdf, move || {
+            ensure_pdf_within_budget(&scan_bytes)
+        })
+        .await?;
 
         // `liteparse` loads PDFium at runtime via `dlopen` and panics if it is
         // missing. Provision it first (found next to the binary in Docker, or

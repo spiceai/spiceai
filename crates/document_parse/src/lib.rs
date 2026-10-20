@@ -68,6 +68,23 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Runs CPU-bound document parsing on the blocking thread pool so it cannot
+/// stall the async runtime (decompressing and parsing a large document can take
+/// well over the ~100µs budget a runtime thread may hold). A panic inside the
+/// closure, or runtime shutdown, surfaces as a structured parsing error for the
+/// given `format` rather than propagating the panic.
+pub(crate) async fn parse_blocking<T: Send + 'static>(
+    format: DocumentType,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|source| Error::InternalParsingError {
+            format,
+            source: Box::new(source),
+        })?
+}
+
 static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DocumentParserFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
