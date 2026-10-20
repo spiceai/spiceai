@@ -190,18 +190,19 @@ pub enum StateFeature {
     /// The startup check of a `runtime.state` location, which keeps
     /// `format.json` and its probe object in the location's `_spice/` folder.
     StartupCheck,
-    /// `mode: datalake` Cayenne tables without a `cayenne_datalake_location`,
-    /// each under `cayenne/<dataset>/`.
+    /// `mode: datalake` Cayenne tables, which share one catalog in the
+    /// location's `cayenne/` folder.
     Cayenne,
 }
 
 impl StateFeature {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scheduler,
         Self::RateControl,
         Self::ResultsCacheWarmup,
         Self::Snapshots,
         Self::StartupCheck,
+        Self::Cayenne,
     ];
 
     /// The feature's `feature` label on the state-store metrics. `None` for the
@@ -213,6 +214,7 @@ impl StateFeature {
             Self::RateControl => Some("rate_control"),
             Self::ResultsCacheWarmup => Some("results_cache_warmup"),
             Self::Snapshots => Some("snapshots"),
+            Self::Cayenne => Some("cayenne"),
             Self::StartupCheck => None,
         }
     }

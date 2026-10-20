@@ -31,7 +31,7 @@ use object_store::path::Path;
 use runtime_state_location::{
     CheckError, StateFeature, StateLocationCheck, build_object_store, check_location,
 };
-use spicepod::acceleration::SnapshotBehavior;
+use spicepod::acceleration::{Mode, SnapshotBehavior};
 use spicepod::component::runtime::{RuntimeState, runtime_state_folder, same_folder};
 use spicepod::component::snapshot::SNAPSHOTS_STATE_FOLDER;
 use tokio::sync::OnceCell;
@@ -98,6 +98,25 @@ pub(crate) fn snapshots_use_runtime_state(app: &App) -> bool {
                         .location
                         .as_deref()
                         .is_some_and(|location| same_folder(location, &folder))
+            })
+        })
+}
+
+/// Whether one of `app`'s datasets keeps a `mode: datalake` Cayenne table in
+/// `runtime.state`, rather than in a deprecated `cayenne_datalake_location`.
+pub(crate) fn cayenne_uses_runtime_state(app: &App) -> bool {
+    app.runtime.state.is_some()
+        && app.datasets.iter().any(|dataset| {
+            dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                acceleration.enabled
+                    && acceleration.engine.as_deref() == Some("cayenne")
+                    && acceleration.mode == Mode::Datalake
+                    && acceleration.params.as_ref().is_none_or(|params| {
+                        params
+                            .as_string_map()
+                            .get("cayenne_datalake_location")
+                            .is_none_or(|location| location.trim().is_empty())
+                    })
             })
         })
 }

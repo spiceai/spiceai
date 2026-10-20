@@ -2166,7 +2166,7 @@
           "const": "file_update"
         },
         {
-          "description": "Keep the whole table, catalog included, in object storage: at\n`cayenne_datalake_location`, or else under `runtime.state.location`.\nLocal disk is a cache, so a restart on a new volume loses nothing.\nSupported by the Cayenne engine.",
+          "description": "Keep the whole table, catalog included, in object storage under\n`runtime.state.location`. Local disk is a cache, so a restart on a new\nvolume loses nothing. Supported by the Cayenne engine.",
           "type": "string",
           "const": "datalake"
         }

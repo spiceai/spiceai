@@ -97,10 +97,9 @@ pub enum Mode {
     /// If the source schema is incompatible (non-additive change), snapshot (if enabled)
     /// and recreate the acceleration file from scratch.
     FileUpdate,
-    /// Keep the whole table, catalog included, in object storage: at
-    /// `cayenne_datalake_location`, or else under `runtime.state.location`.
-    /// Local disk is a cache, so a restart on a new volume loses nothing.
-    /// Supported by the Cayenne engine.
+    /// Keep the whole table, catalog included, in object storage under
+    /// `runtime.state.location`. Local disk is a cache, so a restart on a new
+    /// volume loses nothing. Supported by the Cayenne engine.
     Datalake,
 }
 

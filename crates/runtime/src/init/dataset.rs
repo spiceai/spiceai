@@ -1600,6 +1600,9 @@ impl Runtime {
                 };
                 tracing::warn!("{warning}");
             }
+            for warning in cayenne_datalake_param_warnings(&dataset_name, acceleration) {
+                tracing::warn!("{warning}");
+            }
             if let Some(KeyRule::NewestByTime(time_column)) = rule
                 && refresh_mode == RefreshMode::Append
                 && acceleration.refresh_append_overlap.is_none()
@@ -3395,6 +3398,76 @@ fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str)
     )
 }
 
+/// The warnings for a Cayenne dataset that sets the deprecated
+/// `cayenne_datalake_*` params, which fail to start in 3.0. A `mode: file`
+/// dataset keeps using them until then; `mode: datalake` reads only the
+/// location and its `cayenne_datalake_s3_*` credentials.
+fn cayenne_datalake_param_warnings(dataset_name: &str, acceleration: &Acceleration) -> Vec<String> {
+    const DOCS: &str = "https://spiceai.org/docs/components/data-accelerators/cayenne";
+    if acceleration.engine != Engine::Cayenne {
+        return Vec::new();
+    }
+    let mut params: Vec<&str> = acceleration
+        .params
+        .keys()
+        .map(String::as_str)
+        .filter(|key| key.starts_with("cayenne_datalake_"))
+        .collect();
+    if params.is_empty() {
+        return Vec::new();
+    }
+    params.sort_unstable();
+    let location = acceleration.cayenne_datalake_location();
+    match acceleration.mode {
+        Mode::Memory => Vec::new(),
+        Mode::Datalake => {
+            let mut warnings = Vec::new();
+            if location.is_some() {
+                warnings.push(format!(
+                    "Dataset '{dataset_name}' sets `cayenne_datalake_location`, which is deprecated and fails to start in 3.0. Remove it to store the table in `runtime.state.location`, which starts a new table. See: {DOCS}"
+                ));
+            }
+            let is_credential = |key: &str| key.starts_with("cayenne_datalake_s3_");
+            let ignored: Vec<&str> = params
+                .into_iter()
+                .filter(|key| {
+                    *key != "cayenne_datalake_location"
+                        && !(location.is_some() && is_credential(key))
+                })
+                .collect();
+            if !ignored.is_empty() {
+                let mut reasons = Vec::new();
+                if ignored.iter().any(|key| !is_credential(key)) {
+                    reasons.push("sizes the table's files itself");
+                }
+                if ignored.iter().any(|key| is_credential(key)) {
+                    reasons.push("reads credentials from `runtime.state.params`");
+                }
+                warnings.push(format!(
+                    "Dataset '{dataset_name}' sets {}, which `mode: datalake` ignores: it {}. Remove {}. See: {DOCS}",
+                    ignored
+                        .iter()
+                        .map(|key| format!("`{key}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    reasons.join(" and "),
+                    if ignored.len() == 1 { "it" } else { "them" },
+                ));
+            }
+            warnings
+        }
+        Mode::File | Mode::FileCreate | Mode::FileUpdate => {
+            let orphaned = location
+                .map(|location| format!(": losing the local disk orphans the data in '{location}'"))
+                .unwrap_or_default();
+            vec![format!(
+                "Dataset '{dataset_name}' sets `cayenne_datalake_*` params with `mode: {}`, which is deprecated and fails to start in 3.0{orphaned}. Set `mode: datalake` to keep the whole table in object storage. See: {DOCS}",
+                acceleration.mode
+            )]
+        }
+    }
+}
+
 /// Returns `true` when a dataset load failure cannot be cleared by retrying it.
 ///
 /// `load_dataset` retries with unbounded backoff and only short-circuits on
@@ -4096,6 +4169,91 @@ mod tests {
                     "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it. Set `mode: file` to preserve CDC data across restarts and resume replication."
                 );
             }
+        }
+    }
+
+    #[test]
+    fn deprecated_cayenne_datalake_params_warn_with_the_fix() {
+        let acceleration = |engine: &str, mode: Mode, params: &[(&str, &str)]| {
+            let mut acceleration = Acceleration::try_from(spicepod::acceleration::Acceleration {
+                engine: Some(engine.to_string()),
+                ..Default::default()
+            })
+            .expect("valid acceleration");
+            acceleration.mode = mode;
+            acceleration.params = params
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            acceleration
+        };
+        let location = ("cayenne_datalake_location", "s3://bucket/dl/");
+        let key = ("cayenne_datalake_s3_key", "AKIA");
+        let size = ("cayenne_datalake_target_file_size_mb", "64");
+        let gc = ("cayenne_datalake_gc_interval_ms", "1000");
+
+        for mode in [Mode::File, Mode::FileCreate, Mode::FileUpdate] {
+            assert_eq!(
+                cayenne_datalake_param_warnings(
+                    "events",
+                    &acceleration("cayenne", mode, &[location, key])
+                ),
+                vec![format!(
+                    "Dataset 'events' sets `cayenne_datalake_*` params with `mode: {mode}`, which is deprecated and fails to start in 3.0: losing the local disk orphans the data in 's3://bucket/dl/'. Set `mode: datalake` to keep the whole table in object storage. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                )]
+            );
+        }
+        // Without a location the tier is off, so there is nothing to orphan.
+        assert_eq!(
+            cayenne_datalake_param_warnings(
+                "events",
+                &acceleration("cayenne", Mode::File, &[size])
+            ),
+            vec![
+                "Dataset 'events' sets `cayenne_datalake_*` params with `mode: file`, which is deprecated and fails to start in 3.0. Set `mode: datalake` to keep the whole table in object storage. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            ]
+        );
+
+        assert_eq!(
+            cayenne_datalake_param_warnings(
+                "events",
+                &acceleration("cayenne", Mode::Datalake, &[location, key, size, gc])
+            ),
+            vec![
+                "Dataset 'events' sets `cayenne_datalake_location`, which is deprecated and fails to start in 3.0. Remove it to store the table in `runtime.state.location`, which starts a new table. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+                "Dataset 'events' sets `cayenne_datalake_gc_interval_ms`, `cayenne_datalake_target_file_size_mb`, which `mode: datalake` ignores: it sizes the table's files itself. Remove them. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ]
+        );
+        // Credentials without a location are the state location's to give.
+        assert_eq!(
+            cayenne_datalake_param_warnings(
+                "events",
+                &acceleration("cayenne", Mode::Datalake, &[key, size])
+            ),
+            vec![
+                "Dataset 'events' sets `cayenne_datalake_s3_key`, `cayenne_datalake_target_file_size_mb`, which `mode: datalake` ignores: it sizes the table's files itself and reads credentials from `runtime.state.params`. Remove them. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ]
+        );
+        assert_eq!(
+            cayenne_datalake_param_warnings(
+                "events",
+                &acceleration("cayenne", Mode::Datalake, &[location, key])
+            ),
+            vec![
+                "Dataset 'events' sets `cayenne_datalake_location`, which is deprecated and fails to start in 3.0. Remove it to store the table in `runtime.state.location`, which starts a new table. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ]
+        );
+
+        // Nothing to say without the params, in memory mode, or on another engine.
+        for (engine, mode, params) in [
+            ("cayenne", Mode::Datalake, &[][..]),
+            ("cayenne", Mode::Memory, &[location][..]),
+            ("duckdb", Mode::File, &[location][..]),
+        ] {
+            assert_eq!(
+                cayenne_datalake_param_warnings("events", &acceleration(engine, mode, params)),
+                Vec::<String>::new()
+            );
         }
     }
 
