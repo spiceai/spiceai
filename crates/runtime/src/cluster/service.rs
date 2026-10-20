@@ -305,7 +305,10 @@ impl ClusterServiceImpl {
 struct ControlStreamOutbound {
     inner: ReceiverStream<SchedulerControlMessage>,
     cancel: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    /// The task that reads the executor's messages. The response ends when it ends, so an
+    /// executor the scheduler no longer reads (it sent nothing for
+    /// `CONTROL_STREAM_IDLE_TIMEOUT` and was unregistered) sees its stream end and reconnects.
+    reader: Option<tokio::task::JoinHandle<()>>,
     _outbound_tx: mpsc::Sender<SchedulerControlMessage>,
 }
 
@@ -315,17 +318,27 @@ impl Stream for ControlStreamOutbound {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(message)) => Poll::Ready(Some(Ok(message))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(message)) => return Poll::Ready(Some(Ok(message))),
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => {}
+        }
+        match this.reader.as_mut().map(|reader| Pin::new(reader).poll(cx)) {
+            Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(_)) | None => {
+                this.reader = None;
+                Poll::Ready(None)
+            }
         }
     }
 }
 
+/// Dropped when the executor's connection ends, also without a shutdown message (a
+/// crash). Cancelling lets the task that reads the executor's messages unregister it
+/// before it ends; aborting that task would skip the unregister and keep the executor
+/// registered, so its partitions would never move.
 impl Drop for ControlStreamOutbound {
     fn drop(&mut self) {
         self.cancel.cancel();
-        self.task.abort();
     }
 }
 
@@ -581,7 +594,7 @@ impl ClusterService for ClusterServiceImpl {
         let outbound_tx_for_registry = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();
         let state_location = self.state_location().await;
-        let inbound_task = tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let (executor_id, process_id) = match inbound.next().await {
                 Some(Ok(msg)) => {
                     let executor_id = msg.executor_id.clone();
@@ -795,7 +808,7 @@ impl ClusterService for ClusterServiceImpl {
         let stream = ControlStreamOutbound {
             inner: ReceiverStream::new(outbound_rx),
             cancel,
-            task: inbound_task,
+            reader: Some(reader),
             _outbound_tx: outbound_tx,
         };
 
@@ -1937,12 +1950,12 @@ mod tests {
     }
 
     /// Serves `service` on a loopback port built like the internal cluster port and returns
-    /// a channel to it. Plain TCP stands in for the transport: the port's gate reads only
+    /// its address. Plain TCP stands in for the transport: the port's gate reads only
     /// whether the port runs cluster mTLS.
-    async fn serve_on_cluster_port(
+    async fn spawn_cluster_server(
         service: ClusterServiceImpl,
         mtls_enabled: bool,
-    ) -> (Channel, CancellationToken) {
+    ) -> (std::net::SocketAddr, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test cluster service listener should bind");
@@ -1962,6 +1975,15 @@ mod tests {
                 .expect("test cluster service server should run");
         });
 
+        (address, shutdown)
+    }
+
+    /// Serves `service` on a cluster port and returns a channel to it.
+    async fn serve_on_cluster_port(
+        service: ClusterServiceImpl,
+        mtls_enabled: bool,
+    ) -> (Channel, CancellationToken) {
+        let (address, shutdown) = spawn_cluster_server(service, mtls_enabled).await;
         let channel = Channel::from_shared(format!("http://{address}"))
             .expect("test cluster service address should be a valid URI")
             .connect()
@@ -2456,6 +2478,108 @@ mod tests {
         assert!(
             eventually(async || registry.connected_executors().await.is_empty()).await,
             "the executor is unregistered while its stream is open"
+        );
+
+        drop(tx);
+        shutdown.cancel();
+    }
+
+    /// An executor whose connection ends without a shutdown message, as when its process
+    /// is killed, is unregistered, so its partitions can move to other executors.
+    #[tokio::test]
+    async fn an_executor_whose_connection_drops_is_unregistered() {
+        use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat};
+
+        let service = make_test_service().await;
+        let registry = service.executor_registry();
+        let (scheduler, shutdown) = spawn_cluster_server(service, true).await;
+        // The executor reaches the scheduler through this relay, so the test can cut the
+        // connection as a killed process does, while its stream of messages stays open.
+        let relay = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the relay binds");
+        let relay_address = relay.local_addr().expect("the relay has an address");
+        let connection = tokio::spawn(async move {
+            let (mut executor_side, _) = relay.accept().await.expect("the relay accepts");
+            let mut scheduler_side = tokio::net::TcpStream::connect(scheduler)
+                .await
+                .expect("the relay reaches the scheduler");
+            let _ = tokio::io::copy_bidirectional(&mut executor_side, &mut scheduler_side).await;
+        });
+        let channel = Channel::from_shared(format!("http://{relay_address}"))
+            .expect("the relay address is a valid URI")
+            .connect()
+            .await
+            .expect("the executor connects");
+        let mut client = ClusterServiceClient::new(channel);
+        let (tx, rx) = mpsc::channel::<ExecutorControlMessage>(8);
+        tx.send(ExecutorControlMessage {
+            executor_id: "exec-1".to_string(),
+            message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                timestamp_ms: 0,
+            })),
+            process_id: "p1".to_string(),
+        })
+        .await
+        .expect("send heartbeat");
+        let _inbound = client
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("open the control stream");
+        assert!(
+            eventually(async || registry.connected_executors().await == ["exec-1"]).await,
+            "the executor registers"
+        );
+
+        connection.abort();
+        assert!(
+            eventually(async || registry.connected_executors().await.is_empty()).await,
+            "the executor is unregistered"
+        );
+
+        drop(tx);
+        shutdown.cancel();
+    }
+
+    /// An executor that sends nothing for longer than the idle timeout, while its connection
+    /// stays open (its process paused), is unregistered and its control stream ends, so it
+    /// reconnects when it resumes.
+    #[tokio::test(start_paused = true)]
+    async fn the_control_stream_of_an_idle_executor_ends() {
+        use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat};
+
+        let service = make_test_service().await;
+        let registry = service.executor_registry();
+        let (mut client, shutdown) = serve_test_service(service).await;
+        let (tx, rx) = mpsc::channel::<ExecutorControlMessage>(8);
+        tx.send(ExecutorControlMessage {
+            executor_id: "exec-1".to_string(),
+            message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                timestamp_ms: 0,
+            })),
+            process_id: "p1".to_string(),
+        })
+        .await
+        .expect("send heartbeat");
+        let mut inbound = client
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("open the control stream")
+            .into_inner();
+        assert!(
+            eventually(async || registry.connected_executors().await == ["exec-1"]).await,
+            "the executor registers"
+        );
+
+        tokio::time::sleep(CONTROL_STREAM_IDLE_TIMEOUT).await;
+        assert!(
+            eventually(async || registry.connected_executors().await.is_empty()).await,
+            "the idle executor is unregistered"
+        );
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next()).await;
+        assert!(
+            matches!(end, Ok(None)),
+            "the control stream ends, got {end:?}"
         );
 
         drop(tx);
