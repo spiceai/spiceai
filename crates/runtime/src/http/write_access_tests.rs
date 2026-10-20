@@ -72,7 +72,12 @@ const EMPTY_OBJECT: (&str, &str) = ("application/json", "{}");
 
 /// The runtime's HTTP routes, with API key authentication when `auth` is set.
 async fn routes(auth: bool) -> Router {
-    let rt = Arc::new(Runtime::builder().build().await);
+    let rt = Arc::new(
+        Runtime::builder()
+            .with_app(app::AppBuilder::new("write_access").build())
+            .build()
+            .await,
+    );
     let search = Arc::new(SearchEngine::new(
         Arc::clone(&rt.df) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
         parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
@@ -197,28 +202,30 @@ async fn read_write_caller_gets_the_unauthenticated_answer() {
         }
     }
 
-    for path in ["/v1/packages/generate", "/v1/datasets/missing/acceleration"] {
-        let method = if path == "/v1/packages/generate" {
-            Method::POST
-        } else {
-            Method::PATCH
-        };
-        let (status, text) = send(
+    for (path, field) in [
+        ("/v1/packages/generate", "from"),
+        (
+            "/v1/datasets/missing/acceleration/snapshots/current",
+            "snapshot_id",
+        ),
+    ] {
+        let answer = send(
             &authenticated,
-            &method,
+            &Method::POST,
             path,
             Some(READ_WRITE_KEY),
             EMPTY_OBJECT,
         )
         .await;
         assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "{method} {path} with a read-write key and `{{}}`: {text}"
-        );
-        assert!(
-            text.contains("missing field"),
-            "{method} {path} with a read-write key and `{{}}` must name the missing field: {text}"
+            answer,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "Failed to deserialize the JSON body into the target type: missing field `{field}` at line 1 column 2"
+                )
+            ),
+            "POST {path} with a read-write key and `{{}}`"
         );
     }
 }
