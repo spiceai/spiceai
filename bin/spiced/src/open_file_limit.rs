@@ -25,8 +25,8 @@ limitations under the License.
 
 use std::fmt;
 
-/// What raising the limit did. Reported after the startup banner, since the raise
-/// itself happens before anything may log.
+/// What raising the limit did. Logged once the runtime's subscriber is installed,
+/// since the raise itself happens before anything may log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenFileLimit {
     /// The soft limit was raised.
@@ -48,17 +48,23 @@ pub enum OpenFileLimit {
 /// `None` on a platform with no open file limit to raise.
 #[must_use]
 pub fn raise() -> Option<OpenFileLimit> {
-    imp::raise()
+    #[cfg(unix)]
+    {
+        Some(imp::raise())
+    }
+    // Windows has no per-process open file limit to raise: handles are bounded by
+    // memory, not by an rlimit.
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 impl OpenFileLimit {
-    /// Log the outcome. INFO when the limit is known, WARN when it could not be raised
-    /// or read, since then connections and acceleration files compete for a low budget.
+    /// Log the outcome at DEBUG. When the limit is reached, the error the user sees
+    /// (Cayenne's `TooManyOpenFiles`) names the effective limit itself.
     pub fn log(&self) {
-        match self {
-            Self::Raised { .. } | Self::Unchanged { .. } => tracing::info!("{self}"),
-            Self::NotRaised { .. } | Self::Unknown { .. } => tracing::warn!("{self}"),
-        }
+        tracing::debug!("{self}");
     }
 }
 
@@ -100,20 +106,20 @@ mod imp {
     use super::{OpenFileLimit, target_soft_limit};
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
-    pub(super) fn raise() -> Option<OpenFileLimit> {
+    pub(super) fn raise() -> OpenFileLimit {
         let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
             Ok(limits) => limits,
             Err(err) => {
-                return Some(OpenFileLimit::Unknown {
+                return OpenFileLimit::Unknown {
                     cause: err.to_string(),
-                });
+                };
             }
         };
         let target = target_soft_limit(hard, platform_max());
         if soft >= target {
-            return Some(OpenFileLimit::Unchanged { limit: soft });
+            return OpenFileLimit::Unchanged { limit: soft };
         }
-        Some(match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+        match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
             Ok(()) => OpenFileLimit::Raised {
                 from: soft,
                 to: target,
@@ -123,7 +129,7 @@ mod imp {
                 target,
                 cause: err.to_string(),
             },
-        })
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -153,17 +159,6 @@ mod imp {
 
     #[cfg(not(target_os = "macos"))]
     fn platform_max() -> Option<u64> {
-        None
-    }
-}
-
-#[cfg(not(unix))]
-mod imp {
-    use super::OpenFileLimit;
-
-    // Windows has no per-process open file limit to raise: handles are bounded by
-    // memory, not by an rlimit.
-    pub(super) fn raise() -> Option<OpenFileLimit> {
         None
     }
 }

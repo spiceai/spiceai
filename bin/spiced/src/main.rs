@@ -146,8 +146,9 @@ fn main() {
     }
 
     // Before the runtime opens a listener or an acceleration file, so every file
-    // and connection it holds counts against the raised limit.
-    let open_file_limit = spiced::open_file_limit::raise();
+    // and connection it holds counts against the raised limit. Logged by `run`
+    // once its subscriber, and the verbosity it is configured with, is installed.
+    args.open_file_limit = spiced::open_file_limit::raise();
 
     // Nothing may log before this: the banner dates the run and names the build, so
     // a line above it belongs to a build the reader cannot identify. Anything that
@@ -157,9 +158,6 @@ fn main() {
         log_startup_banner();
         if let Err(err) = &crash_reporting {
             tracing::warn!("{err}");
-        }
-        if let Some(open_file_limit) = &open_file_limit {
-            open_file_limit.log();
         }
     });
 

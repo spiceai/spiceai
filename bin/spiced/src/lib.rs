@@ -461,6 +461,10 @@ pub struct Args {
 
     #[arg(skip)]
     pub open_telemetry_deprecated: bool,
+
+    /// What raising the open file limit at startup did, set by `main`.
+    #[arg(skip)]
+    pub open_file_limit: Option<open_file_limit::OpenFileLimit>,
 }
 
 /// The raw `--token` argument: an unvalidated enrollment-key candidate.
@@ -890,6 +894,10 @@ pub async fn run(args: Args, app_bundle: AppBundle) -> Result<()> {
             telemetry_config.get().map(|c| &c.properties),
         )
         .await;
+    }
+
+    if let Some(open_file_limit) = &args.open_file_limit {
+        open_file_limit.log();
     }
 
     if args.open_telemetry_deprecated {
