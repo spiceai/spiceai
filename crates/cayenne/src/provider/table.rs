@@ -5799,7 +5799,19 @@ impl RewriteOrder {
 /// charge seals the run early rather than failing the write.
 pub(crate) const OVERWRITE_RUN_SORT_BYTES: u64 = 128 * 1024 * 1024;
 
-static SORT_ON_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SORT_ON_WRITE: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("SPICE_CAYENNE_EXPERIMENT_SORT_ON_WRITE").as_deref() != Ok("0"),
+        )
+    });
+
+fn sort_on_write_enabled() -> bool {
+    static LOG: std::sync::Once = std::sync::Once::new();
+    let enabled = SORT_ON_WRITE.load(Ordering::Relaxed);
+    LOG.call_once(|| tracing::info!(enabled, "Cayenne experiment sort_on_write"));
+    enabled
+}
 
 /// Enable bounded primary-key run sorting before or inside file sinks.
 #[doc(hidden)]
@@ -11379,7 +11391,7 @@ impl CayenneTableProvider {
                 }
                 config
             });
-        let pre_sort = SORT_ON_WRITE.load(Ordering::Relaxed)
+        let pre_sort = sort_on_write_enabled()
             && !preserve_order
             && range
                 .as_ref()
@@ -11726,7 +11738,7 @@ impl CayenneTableProvider {
                         &snapshot_id,
                         shard_target_partitions,
                         estimated_bytes,
-                        super::delta_encoding::WritePolicy::DELTA.preserving_order(),
+                        super::delta_encoding::WritePolicy::DELTA,
                     )
                     .await
             }));
@@ -12666,7 +12678,7 @@ impl CayenneTableProvider {
 
     fn sort_on_write_run_bytes(&self, shard_key: &[String]) -> Option<u64> {
         experiment_run_sort_bytes(
-            SORT_ON_WRITE.load(std::sync::atomic::Ordering::Relaxed),
+            sort_on_write_enabled(),
             shard_key,
             &self.table_metadata.primary_key,
         )
@@ -26605,8 +26617,10 @@ impl CayenneTableProvider {
             write_format,
             &self.pk_deletion_strategy,
         )?;
-        let stream = if SORT_ON_WRITE.load(Ordering::Relaxed)
-            && !preserve_order
+        let stream = if sort_on_write_enabled()
+            && (!preserve_order
+                || (!self.context.has_cluster_by()
+                    && !self.context.sort_columns_are_authoritative()))
             && !self.pk_column_indices.is_empty()
             && write_format.write_shard().is_none_or(|config| {
                 config.run_sort_bytes.is_none()
@@ -29022,7 +29036,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
-                super::delta_encoding::WritePolicy::MAINTENANCE.preserving_order(),
+                super::delta_encoding::WritePolicy::MAINTENANCE,
                 range_plan.as_ref().map(OverwriteRangePlan::partitioning),
             )
             .await;
@@ -29202,6 +29216,7 @@ impl CayenneTableProvider {
                 rows = total_rows,
                 new_snapshot_id = new_snapshot_id.as_str(),
                 prefix_cutoff,
+                range_sorted = range_plan.is_some(),
                 duration_ms = compaction_start.elapsed().as_millis(),
                 "Seq-prefix bake completed; pruned deletion index at or below T"
             );
@@ -36499,7 +36514,7 @@ impl CayenneTableProvider {
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
-                        super::delta_encoding::WritePolicy::DELTA.preserving_order(),
+                        super::delta_encoding::WritePolicy::DELTA,
                         range_plan.as_ref().map(OverwriteRangePlan::partitioning),
                     )
                     .await?;
@@ -82060,4 +82075,57 @@ mod tests {
 
     mod layered_upsert_state;
     mod repeated_keys;
+}
+
+#[cfg(test)]
+mod experiment_toggle_tests {
+    use super::*;
+    #[test]
+    fn sorted_toggle_env() {
+        if std::env::var("CAYENNE_TOGGLE_CHILD").is_ok() {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::io::stdout)
+                .init();
+            let expected =
+                std::env::var("CAYENNE_TOGGLE_EXPECTED").expect("child expectation") == "1";
+            assert_eq!(sort_on_write_enabled(), expected);
+            experiment_set_sort_on_write(!expected);
+            assert_eq!(sort_on_write_enabled(), !expected);
+            assert_eq!(sort_on_write_enabled(), !expected);
+            return;
+        }
+        for setting in [None, Some("0"), Some("1")] {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            child
+                .args([
+                    "--exact",
+                    "provider::table::experiment_toggle_tests::sorted_toggle_env",
+                    "--nocapture",
+                ])
+                .env("CAYENNE_TOGGLE_CHILD", "1")
+                .env(
+                    "CAYENNE_TOGGLE_EXPECTED",
+                    if setting == Some("0") { "0" } else { "1" },
+                );
+            if let Some(value) = setting {
+                child.env("SPICE_CAYENNE_EXPERIMENT_SORT_ON_WRITE", value);
+            } else {
+                child.env_remove("SPICE_CAYENNE_EXPERIMENT_SORT_ON_WRITE");
+            }
+            let output = child.output().expect("isolated toggle process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "setting={setting:?}: {stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                stdout.matches("Cayenne experiment sort_on_write").count(),
+                1,
+                "setting={setting:?}: {stdout}"
+            );
+        }
+    }
 }

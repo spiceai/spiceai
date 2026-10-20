@@ -131,7 +131,7 @@ pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
 pub(crate) mod write_budget;
 pub(crate) mod write_recovery;
-mod write_sort;
+pub(crate) mod write_sort;
 
 pub use write_recovery::RebuildableWrite;
 

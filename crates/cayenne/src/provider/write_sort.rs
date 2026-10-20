@@ -27,11 +27,27 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use futures::StreamExt;
 use std::sync::Arc;
 
+static COUNTERS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Admitted batches, refused charges, unsorted passthrough batches, sealed runs,
+/// maximum sealed input bytes and maximum sealed rows.
+#[doc(hidden)]
+#[must_use]
+pub fn experiment_write_sort_counters() -> [u64; 6] {
+    std::array::from_fn(|i| COUNTERS[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn count(index: usize) {
+    COUNTERS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 struct Buffered {
     batches: Vec<RecordBatch>,
     rows: usize,
     bytes: usize,
     reservation: MemoryReservation,
+    retained: arrow_tools::batch_bytes::RetainedBytes,
 }
 impl Buffered {
     fn new(pool: &Arc<dyn MemoryPool>) -> Self {
@@ -40,6 +56,7 @@ impl Buffered {
             rows: 0,
             bytes: 0,
             reservation: MemoryConsumer::new("Cayenne PK write run").register(pool),
+            retained: arrow_tools::batch_bytes::RetainedBytes::new(),
         }
     }
 }
@@ -124,6 +141,15 @@ struct State {
 }
 impl State {
     async fn seal(&mut self) -> Result<()> {
+        count(3);
+        COUNTERS[4].fetch_max(
+            u64::try_from(self.buffered.bytes).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        COUNTERS[5].fetch_max(
+            u64::try_from(self.buffered.rows).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let input = std::mem::replace(&mut self.buffered, Buffered::new(&self.pool));
         let keys = Arc::clone(&self.keys);
         // Move the reservation into the job: cancellation must not release the
@@ -176,7 +202,12 @@ impl State {
                 return Ok(Some(batch));
             }
             self.batch_size.get_or_insert(batch.num_rows().min(8192));
-            let bytes = batch.get_array_memory_size();
+            // MemorySource slices can share one large allocation. Bill retained
+            // buffers once across the run, while charging per-row sort scratch.
+            self.buffered.retained.add(&batch);
+            let retained_bytes =
+                usize::try_from(self.buffered.retained.total()).unwrap_or(usize::MAX);
+            let bytes = retained_bytes.saturating_sub(self.buffered.bytes);
             // Include key concatenation, one output batch, and conservative
             // lexsort/index/interleave scratch in the admission charge.
             let charge = bytes.saturating_mul(3).saturating_add(
@@ -187,18 +218,22 @@ impl State {
             if self.buffered.rows.saturating_add(batch.num_rows()) > u32::MAX as usize
                 || self.buffered.reservation.try_grow(charge).is_err()
             {
+                count(1);
                 if self.buffered.rows > 0 {
                     self.pending = Some(batch);
                     self.seal().await?;
                 } else {
                     // No sort memory was admitted. Preserve the arriving batch
                     // without allocating a sorted copy or failing the write.
+                    self.buffered.retained = arrow_tools::batch_bytes::RetainedBytes::new();
+                    count(2);
                     self.passthrough = Some((batch, 0));
                 }
                 continue;
             }
+            count(0);
             self.buffered.rows += batch.num_rows();
-            self.buffered.bytes = self.buffered.bytes.saturating_add(bytes);
+            self.buffered.bytes = retained_bytes;
             self.buffered.batches.push(batch);
         }
     }
@@ -321,6 +356,75 @@ mod tests {
             }
             assert_eq!(actual, expected, "refused={refused}");
             assert_eq!(context.runtime_env().memory_pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn write_sort_realistic_pool_pressure() {
+        use arrow::array::Int32Array;
+        for held_mb in [0, 63] {
+            let pool = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)) as Arc<dyn MemoryPool>;
+            let other = MemoryConsumer::new("concurrent query").register(&pool);
+            other
+                .try_grow(held_mb * 1024 * 1024)
+                .expect("concurrent reservation");
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build_arc()
+                .expect("bounded runtime");
+            let context = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+            let schema = Arc::new(Schema::new(
+                (0..4)
+                    .map(|i| Field::new(format!("k{i}"), DataType::Int32, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let batch_schema = Arc::clone(&schema);
+            let batches = (0..8).map(move |part| {
+                let arrays: Vec<ArrayRef> = (0..4)
+                    .map(|_| {
+                        Arc::new(Int32Array::from_iter_values(
+                            (part * 8192..(part + 1) * 8192).rev(),
+                        )) as ArrayRef
+                    })
+                    .collect();
+                RecordBatch::try_new(Arc::clone(&batch_schema), arrays).expect("pressure batch")
+            });
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches.map(Ok)),
+            ));
+            let output: Vec<_> = sort_stream(
+                input,
+                &["k0".into(), "k1".into(), "k2".into(), "k3".into()],
+                &context.task_ctx(),
+                128 * 1024 * 1024,
+            )
+            .expect("pressure sorter")
+            .try_collect()
+            .await
+            .expect("pressure output");
+            let mut values = Vec::new();
+            let mut unsorted_batches = 0;
+            for batch in output {
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("pressure keys");
+                unsorted_batches += usize::from(keys.values().windows(2).any(|p| p[0] > p[1]));
+                values.extend_from_slice(keys.values());
+            }
+            println!(
+                "WRITE_SORT_PRESSURE pool_mb=64 held_mb={held_mb} batches=8 unsorted_batches={unsorted_batches}"
+            );
+            assert_eq!(unsorted_batches, if held_mb == 0 { 0 } else { 8 });
+            values.sort_unstable();
+            assert_eq!(
+                values,
+                (0..65536).collect::<Vec<_>>(),
+                "pressure preserves every row held_mb={held_mb}"
+            );
+            assert_eq!(pool.reserved(), held_mb * 1024 * 1024);
         }
     }
 }

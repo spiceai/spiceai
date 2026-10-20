@@ -67,7 +67,73 @@ limitations under the License.
 //! child limit could under-produce). See the OLAP-under-load audit, finding R1,
 //! and the SOTA scan (`ClickHouse` PREWHERE / Iceberg-V3 deletion-vector layering).
 
-static SORTED_KEY_DELETES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SORTED_KEY_DELETES: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| {
+        std::sync::atomic::AtomicBool::new(
+            std::env::var("SPICE_CAYENNE_EXPERIMENT_SORTED_KEY_DELETES").as_deref() != Ok("0"),
+        )
+    });
+
+fn sorted_key_deletes_enabled() -> bool {
+    static LOG: std::sync::Once = std::sync::Once::new();
+    let enabled = SORTED_KEY_DELETES.load(std::sync::atomic::Ordering::Relaxed);
+    LOG.call_once(|| tracing::info!(enabled, "Cayenne experiment sorted_key_deletes"));
+    enabled
+}
+
+static KEY_DELETE_COUNTERS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Cumulative sorted rows, permuted rows, hash rows, deleted rows, sorted ns,
+/// and hash ns. Verification-oracle work is excluded from hash counters.
+#[doc(hidden)]
+#[must_use]
+pub fn experiment_key_delete_counters() -> [u64; 6] {
+    std::array::from_fn(|i| KEY_DELETE_COUNTERS[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn add_key_delete_counter(index: usize, value: usize) {
+    KEY_DELETE_COUNTERS[index].fetch_add(
+        u64::try_from(value).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn log_key_delete_counters() {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = START.elapsed().as_secs();
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) >= 60
+        && LAST
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        let [
+            sorted_rows,
+            permuted_rows,
+            hash_rows,
+            deleted,
+            sorted_ns,
+            hash_ns,
+        ] = experiment_key_delete_counters();
+        tracing::info!(
+            sorted_rows,
+            permuted_rows,
+            hash_rows,
+            deleted,
+            sorted_ns,
+            hash_ns,
+            "cayenne_key_delete_counters"
+        );
+    }
+}
 
 /// Select the native sorted deletion experiment for subsequently executed streams.
 #[doc(hidden)]
@@ -636,12 +702,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             Ok("0") => false,
             _ => cfg!(debug_assertions),
         };
-        self.execute_sorted_options(
-            partition,
-            context,
-            SORTED_KEY_DELETES.load(std::sync::atomic::Ordering::Relaxed),
-            verify,
-        )
+        self.execute_sorted_options(partition, context, sorted_key_deletes_enabled(), verify)
     }
 }
 
@@ -1175,6 +1236,8 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                     }
 
                     let sorted = if this.sorted_enabled {
+                        let started = std::time::Instant::now();
+                        let permuted_before = this.metrics.permuted_rows.value();
                         let _sorted_timer = this.metrics.sorted_path_compute.timer();
                         match sorted_deleted_rows_into(
                             &this.pk_columns_scratch,
@@ -1185,7 +1248,19 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                             &this.metrics,
                             &mut this.sorted_scratch,
                         ) {
-                            Ok(()) => Some(()),
+                            Ok(()) => {
+                                add_key_delete_counter(0, batch_size);
+                                add_key_delete_counter(
+                                    1,
+                                    this.metrics.permuted_rows.value() - permuted_before,
+                                );
+                                add_key_delete_counter(
+                                    4,
+                                    usize::try_from(started.elapsed().as_nanos())
+                                        .unwrap_or(usize::MAX),
+                                );
+                                Some(())
+                            }
                             Err(error) => return std::task::Poll::Ready(Some(Err(error))),
                         }
                     } else {
@@ -1196,6 +1271,7 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         this.metrics.sorted_path_batches.add(1);
                     }
                     if sorted.is_none() || this.sorted_verify {
+                        let started = std::time::Instant::now();
                         // Convert PK columns to row bytes (single batched conversion).
                         let rows = match this.row_converter.convert_columns_reusing(
                             &this.pk_columns_scratch,
@@ -1238,6 +1314,13 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         // Retention is optional: an oversized encoding or a full pool
                         // drops the buffers after probing instead of failing the query.
                         this.row_scratch.retain(rows);
+                        if sorted.is_none() {
+                            add_key_delete_counter(2, batch_size);
+                            add_key_delete_counter(
+                                5,
+                                usize::try_from(started.elapsed().as_nanos()).unwrap_or(usize::MAX),
+                            );
+                        }
                     }
                     if sorted.is_some() {
                         let sorted = &this.sorted_scratch.deleted;
@@ -1258,6 +1341,8 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         }
                         std::mem::swap(&mut this.deleted_scratch, &mut this.sorted_scratch.deleted);
                     }
+                    add_key_delete_counter(3, this.deleted_scratch.len());
+                    log_key_delete_counters();
                     let keep_count = batch_size - this.deleted_scratch.len();
 
                     tracing::trace!(
@@ -2916,3 +3001,58 @@ mod tests {
 #[cfg(test)]
 #[path = "sorted_filter_differential_tests.rs"]
 mod sorted_filter_differential_tests;
+
+#[cfg(test)]
+mod experiment_toggle_tests {
+    use super::*;
+    #[test]
+    fn sorted_toggle_env() {
+        if std::env::var("CAYENNE_TOGGLE_CHILD").is_ok() {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::io::stdout)
+                .init();
+            let expected =
+                std::env::var("CAYENNE_TOGGLE_EXPECTED").expect("child expectation") == "1";
+            assert_eq!(sorted_key_deletes_enabled(), expected);
+            experiment_set_sorted_key_deletes(!expected);
+            assert_eq!(sorted_key_deletes_enabled(), !expected);
+            assert_eq!(sorted_key_deletes_enabled(), !expected);
+            return;
+        }
+        for setting in [None, Some("0"), Some("1")] {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            child
+                .args([
+                    "--exact",
+                    "provider::delete::filter_exec::experiment_toggle_tests::sorted_toggle_env",
+                    "--nocapture",
+                ])
+                .env("CAYENNE_TOGGLE_CHILD", "1")
+                .env(
+                    "CAYENNE_TOGGLE_EXPECTED",
+                    if setting == Some("0") { "0" } else { "1" },
+                );
+            if let Some(value) = setting {
+                child.env("SPICE_CAYENNE_EXPERIMENT_SORTED_KEY_DELETES", value);
+            } else {
+                child.env_remove("SPICE_CAYENNE_EXPERIMENT_SORTED_KEY_DELETES");
+            }
+            let output = child.output().expect("isolated toggle process");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "setting={setting:?}: {stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                stdout
+                    .matches("Cayenne experiment sorted_key_deletes")
+                    .count(),
+                1,
+                "setting={setting:?}: {stdout}"
+            );
+        }
+    }
+}
