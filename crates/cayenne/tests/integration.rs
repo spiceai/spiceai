@@ -146,3 +146,5 @@ mod vortex_task_cancellation;
 mod write_back_pk_shapes_test;
 
 mod write_sort_ordering_test;
+
+mod composite_file_statistics_test;
