@@ -398,10 +398,11 @@ async fn a_failed_commit_is_resolved_by_its_durable_outcome() {
 }
 
 /// Cancelling a write after its commit began does not release the write lock
-/// early or abandon the commit: the next writer waits until the snapshot is
-/// published, and it survives reopening.
+/// or the mem-tier checkpoint lock early, or abandon the commit: the next writer
+/// and the next checkpoint wait until the snapshot is published, and it
+/// survives reopening.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
+async fn a_cancelled_append_publishes_before_releasing_its_locks() {
     use crate::provider::append_commit::test_seams;
 
     for mode in [DeletionMode::Key, DeletionMode::Position] {
@@ -443,6 +444,13 @@ async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
             provider.write_lock_arc().try_lock_owned().is_err(),
             "{mode:?}: the commit still holds the write lock"
         );
+        assert!(
+            provider
+                .mem_checkpoint_lock_for_writer()
+                .try_lock_owned()
+                .is_err(),
+            "{mode:?}: the commit still holds the mem-tier checkpoint off"
+        );
         assert_eq!(
             visible(&provider).await,
             (owned(&[(9, "old")]), 1),
@@ -455,8 +463,15 @@ async fn a_cancelled_append_publishes_before_releasing_the_write_lock() {
         )
         .await
         .expect("the commit releases the write lock");
+        let next_checkpoint = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            provider.mem_checkpoint_lock_for_writer().lock_owned(),
+        )
+        .await
+        .expect("the commit releases the mem-tier checkpoint lock");
         let expected = (owned(&[(9, "new"), (10, "new")]), 2);
         assert_eq!(visible(&provider).await, expected, "{mode:?}: published");
+        drop(next_checkpoint);
         drop(next_writer);
         let reopened = reopen(&catalog, &runtime_env).await;
         assert_eq!(visible(&reopened).await, expected, "{mode:?}: reopened");

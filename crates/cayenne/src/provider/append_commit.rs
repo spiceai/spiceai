@@ -34,12 +34,18 @@ use crate::CayenneCatalog;
 use crate::catalog::{CatalogResult, MetadataCatalog};
 use crate::metastore::MetastoreTransaction;
 
-/// Owns the write lock until durable publication, visibility, and maintenance
+/// Owns the write lock, and the mem-tier checkpoint lock a streaming write
+/// validated under, until durable publication, visibility, and maintenance
 /// bookkeeping are complete, including when the requesting task is cancelled.
 pub(super) struct PreparedResolvedAppend {
     pub table: CayenneTableProvider,
     pub context: Arc<CayenneContext>,
     pub _write_guard: OwnedMutexGuard<()>,
+    /// Holds the mem-tier checkpoint off until publication has acted on what
+    /// validation decided about where each replaced row lives
+    /// ([`CayenneTableProvider::lock_mem_tier_checkpoint_for_durable_write`]).
+    /// `None` for a transaction's staged upsert, which does not take it.
+    pub _checkpoint_guard: Option<OwnedMutexGuard<()>>,
     pub snapshot_id: String,
     pub rows: u64,
     pub stats: Arc<ColumnStatsAccumulator>,
