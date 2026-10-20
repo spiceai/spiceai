@@ -1249,18 +1249,6 @@
       "group": "duckdb"
     }
   ],
-  "full-refresh-chaos": [
-    {
-      "run": "full-refresh-chaos[src=clickhouse]",
-      "who": "default",
-      "key": "stop-background: {\"allow\":[\"^[45][0-9][0-9] \",\"error sending request\",\"connection\",\"not ready\"],\"id\":\"whole-table\"}",
-      "kind": "other",
-      "signature": "iterations failed; first: invariant broken: n = below expected Some\\(\"50000\"\\)",
-      "pattern": "iterations failed; first: invariant broken: n = below expected Some\\(\"50000\"\\)",
-      "group": "clickhouse",
-      "may-pass": true
-    }
-  ],
   "iceberg-coverage": [
     {
       "run": "iceberg-coverage[source=iceberg]",

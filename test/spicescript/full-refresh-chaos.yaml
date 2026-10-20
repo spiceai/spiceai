@@ -67,6 +67,11 @@ steps:
     when: *stoppable
   - start-source: src
     when: *stoppable
+  # The failed refresh retries until the source is back. Let it succeed
+  # before the rows are replaced: `generate` loads in batches, and a retry
+  # reading the source half-loaded would rightly serve a partial table.
+  - refresh: facts
+    when: *stoppable
 
   # Every row replaced, and spiced killed during the refresh that reads them.
   - generate:
