@@ -5795,6 +5795,23 @@ impl RewriteOrder {
 /// charge seals the run early rather than failing the write.
 pub(crate) const OVERWRITE_RUN_SORT_BYTES: u64 = 128 * 1024 * 1024;
 
+static SORT_ON_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Enable bounded primary-key run sorting for compatible sharded writes.
+#[doc(hidden)]
+pub fn experiment_set_sort_on_write(enabled: bool) {
+    SORT_ON_WRITE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn experiment_run_sort_bytes(
+    enabled: bool,
+    shard_key: &[String],
+    primary_key: &[String],
+) -> Option<u64> {
+    (enabled && !primary_key.is_empty() && shard_key == primary_key)
+        .then_some(OVERWRITE_RUN_SORT_BYTES)
+}
+
 /// Most-filtered columns considered when choosing a routing key, so a hot
 /// column of a type the router cannot split does not rule the others out.
 const DEFAULT_ROUTING_CANDIDATES: usize = 4;
@@ -11349,7 +11366,9 @@ impl CayenneTableProvider {
                     }
                     // Without bounds the write hashes the shard key; the run sort
                     // orders each shard by that key either way.
-                    config.run_sort_bytes = range.run_sort_bytes;
+                    config.run_sort_bytes = range
+                        .run_sort_bytes
+                        .or_else(|| self.sort_on_write_run_bytes(&config.shard_key_columns));
                     config.range_bounds_estimated =
                         range.bounds_estimated && config.range_bounds.is_some();
                 }
@@ -12602,6 +12621,7 @@ impl CayenneTableProvider {
             self.resolved_shard_key_columns()
         };
         let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
+        let run_sort_bytes = self.sort_on_write_run_bytes(&shard_key_columns);
         Some(WriteShardConfig {
             write_concurrency: shard_count,
             shard_key_columns,
@@ -12610,11 +12630,19 @@ impl CayenneTableProvider {
             // hashes the key instead, which is what every write did before range
             // partitioning existed.
             range_bounds: range_bounds.map(<[ScalarValue]>::to_vec),
-            // Run sorting and the estimated-bounds fallback are the caller's
-            // opt-in (see `write_to_snapshot_range_partitioned`).
-            run_sort_bytes: None,
+            // Sorting uses the routing key. Enable the experiment only when it
+            // is the full primary key in sort order, preserving file routing.
+            run_sort_bytes,
             range_bounds_estimated: false,
         })
+    }
+
+    fn sort_on_write_run_bytes(&self, shard_key: &[String]) -> Option<u64> {
+        experiment_run_sort_bytes(
+            SORT_ON_WRITE.load(std::sync::atomic::Ordering::Relaxed),
+            shard_key,
+            &self.primary_key_shard_key(&self.table_schema()),
+        )
     }
 
     /// The clustering key for intra-write sharding: the configured
@@ -55556,6 +55584,160 @@ mod tests {
                 shard.shard_key_columns,
             ),
             (whole_batch, false, expected_key),
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sort_append_preserves_rows_and_full_primary_key_order() {
+        run_sort_append_case(false).await;
+        run_sort_append_case(true).await;
+    }
+
+    async fn run_sort_append_case(refuse_sort: bool) {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sub", DataType::Int64, false),
+        ]));
+        let ctx = if refuse_sort {
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(GreedyMemoryPool::new(0)))
+                .build_arc()
+                .expect("exhausted-pool runtime");
+            SessionContext::new_with_config_rt(SessionConfig::new(), runtime)
+        } else {
+            SessionContext::new()
+        };
+        let key = vec!["id".to_string(), "sub".to_string()];
+        let (provider, _temp_dir) = create_cayenne_table_for_sharding(
+            "run_sort_append",
+            Arc::clone(&schema),
+            vec![],
+            key.clone(),
+            ctx.runtime_env(),
+        )
+        .await;
+        assert_eq!(experiment_run_sort_bytes(false, &key, &key), None);
+        assert_eq!(experiment_run_sort_bytes(true, &key[..1], &key), None);
+        assert_eq!(experiment_run_sort_bytes(true, &key, &[]), None);
+        let size = provider.context.target_file_size_bytes();
+        let config = provider
+            .write_shard_config(
+                4,
+                size,
+                None,
+                EncodeFanOut::Sized,
+                super::super::delta_encoding::ShardRouting::Key,
+                None,
+            )
+            .expect("keyed shard config");
+        assert_eq!(config.shard_key_columns, key);
+        assert_eq!(config.run_sort_bytes, Some(OVERWRITE_RUN_SORT_BYTES));
+        assert_eq!(config.write_concurrency, 4);
+        assert!(
+            provider
+                .write_shard_config(
+                    4,
+                    size,
+                    Some(1),
+                    EncodeFanOut::Sized,
+                    super::super::delta_encoding::ShardRouting::Key,
+                    None
+                )
+                .is_none(),
+            "small writes retain the single writer with no run sorter"
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..256).map(|i| ((i * 73) % 256) / 4),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..256).map(|i| ((i * 73) % 256) % 4),
+                )),
+            ],
+        )
+        .expect("scrambled composite keys");
+        let (rows, writers, _) = provider
+            .write_to_snapshot(
+                single_batch_stream(batch),
+                size,
+                &provider.current_snapshot_id(),
+                4,
+                None,
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+            )
+            .await
+            .expect("write key-sorted shards");
+        assert_eq!((rows, writers), (256, 4));
+        let files = provider
+            .list_snapshot_files_with_sizes(&provider.current_snapshot_id())
+            .await
+            .expect("list append files");
+        assert_eq!(files.len(), 4);
+        let reader =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut actual = Vec::new();
+        let mut saw_unsorted = false;
+        for (name, _) in files {
+            let path = provider
+                .snapshot_dir_path_for(&provider.current_snapshot_id())
+                .join(&name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(&schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing");
+            let batches = reader
+                .read_table(table)
+                .expect("read shard")
+                .collect()
+                .await
+                .expect("scan shard");
+            let mut pairs = Vec::new();
+            for batch in batches {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id array");
+                let subs = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("sub array");
+                pairs.extend(
+                    ids.values()
+                        .iter()
+                        .copied()
+                        .zip(subs.values().iter().copied()),
+                );
+            }
+            let mut ordered = pairs.clone();
+            ordered.sort_unstable();
+            saw_unsorted |= pairs != ordered;
+            if !refuse_sort {
+                assert_eq!(
+                    pairs, ordered,
+                    "shard {name} is sorted by the whole primary key"
+                );
+            }
+            actual.extend(pairs);
+        }
+        assert_eq!(
+            saw_unsorted, refuse_sort,
+            "pool refusal emits arrivals without dropping rows"
+        );
+        actual.sort_unstable();
+        let expected: Vec<_> = (0..256).map(|i| (i / 4, i % 4)).collect();
+        assert_eq!(
+            actual, expected,
+            "every input row is preserved exactly once"
         );
     }
 

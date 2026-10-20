@@ -990,6 +990,32 @@ struct SortedSearch<'a> {
     boundaries: &'a [usize],
     candidates: &'a mut Vec<(usize, TombstoneEntry)>,
 }
+/// Find the first false predicate after a position known to be true. Exponential
+/// probes skip long gaps before a binary search resolves the final interval.
+fn gallop_lower_bound(start: usize, end: usize, mut before: impl FnMut(usize) -> bool) -> usize {
+    let mut lo = start + 1;
+    let mut step = 1;
+    let mut hi = end;
+    while step < end - start {
+        let probe = start + step;
+        if !before(probe) {
+            hi = probe;
+            break;
+        }
+        lo = probe + 1;
+        step = step.saturating_mul(2);
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if before(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 impl SortedSearch<'_> {
     fn apply<C: KeyCompare, R: RowMapping>(
         &mut self,
@@ -1021,24 +1047,41 @@ impl SortedSearch<'_> {
                         hi = mid;
                     }
                 }
-                let mut pos = a;
-                for t in lo..run.len() {
-                    if cross.compare(mapping.row(b - 1), t).is_lt() {
-                        break;
+                let first = lo;
+                hi = run.len();
+                // Restrict the tombstone side to the inclusive batch key range.
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if cross.compare(mapping.row(b - 1), mid).is_lt() {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
                     }
-                    let mut end = b;
-                    while pos < end {
-                        let mid = pos + (end - pos) / 2;
-                        if cross.compare(mapping.row(mid), t).is_lt() {
-                            pos = mid + 1;
-                        } else {
-                            end = mid;
+                }
+                let (mut i, mut j) = (a, first);
+                while i < b && j < hi {
+                    match cross.compare(mapping.row(i), j) {
+                        std::cmp::Ordering::Less => {
+                            i = gallop_lower_bound(i, b, |position| {
+                                cross.compare(mapping.row(position), j).is_lt()
+                            });
                         }
-                    }
-                    while pos < b && cross.compare(mapping.row(pos), t).is_eq() {
-                        let row = mapping.row(pos);
-                        candidates.push((row, run.entry(t)));
-                        pos += 1;
+                        std::cmp::Ordering::Greater => {
+                            j = gallop_lower_bound(j, hi, |position| {
+                                cross.compare(mapping.row(i), position).is_gt()
+                            });
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let entry = run.entry(j);
+                            loop {
+                                candidates.push((mapping.row(i), entry));
+                                i += 1;
+                                if i == b || !cross.compare(mapping.row(i), j).is_eq() {
+                                    break;
+                                }
+                            }
+                            j += 1;
+                        }
                     }
                 }
             }

@@ -978,3 +978,73 @@ fn sorted_vectorized_states_and_sparse_scratch_reuse() {
         assert!(error.to_string().contains("types changed"));
     }
 }
+
+#[test]
+fn sorted_galloping_wide_ranges_match_hash_oracle() {
+    let converter = RowConverter::new(vec![SortField::new(arrow_schema::DataType::Int64)])
+        .expect("wide-range converter");
+    let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![
+        -1, 0, 0, 31, 20_000, 20_000, 49_999, 50_000, 100_000,
+    ]))];
+    for (count, stride) in [(50_000, 1), (5, 10_001)] {
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(
+            (0..count).map(|i| i * stride),
+        ))];
+        let encoded = converter.convert_columns(&keys).expect("tombstone keys");
+        let index = KeyDeletionIndex::from_map(
+            encoded.iter().map(|key| (key.as_ref().into(), 7)).collect(),
+        );
+        let metrics = DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let actual = sorted_deleted_rows(
+            &columns,
+            &converter,
+            &index,
+            InsertRecordHandling::Apply,
+            None,
+            &metrics,
+            &mut SortedFilterScratch::new(),
+        )
+        .expect("galloping intersection");
+        assert_eq!(
+            actual,
+            hash_deleted_rows(
+                &columns,
+                &converter,
+                &index,
+                InsertRecordHandling::Apply,
+                None
+            ),
+            "count={count}, stride={stride}"
+        );
+        assert_eq!(metrics.sorted_runs.value(), 1);
+        assert_eq!(metrics.permuted_batches.value(), 0);
+    }
+    // Dense batches against sparse tombstones exercise galloping the row side.
+    let dense: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..8192))];
+    let encoded = converter.convert_columns(&dense).expect("dense row keys");
+    let index = KeyDeletionIndex::from_map(
+        [0, 4095, 8191]
+            .map(|i| (encoded.row(i).as_ref().into(), 9))
+            .into(),
+    );
+    let metrics = DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+    assert_eq!(
+        sorted_deleted_rows(
+            &dense,
+            &converter,
+            &index,
+            InsertRecordHandling::Ignore,
+            None,
+            &metrics,
+            &mut SortedFilterScratch::new()
+        )
+        .expect("sparse tombstone intersection"),
+        hash_deleted_rows(
+            &dense,
+            &converter,
+            &index,
+            InsertRecordHandling::Ignore,
+            None
+        )
+    );
+}
