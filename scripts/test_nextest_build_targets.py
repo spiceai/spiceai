@@ -99,6 +99,11 @@ class SelectionTest(unittest.TestCase):
             ["integration", "metrics", "cli_integration", "cloud_integration", "dispatch",
              "acid_test", "odd_name", "vs_duckdb"]))
 
+    def test_a_glob_python_reads_differently_still_builds_its_targets(self) -> None:
+        cli = ["cli_integration", "cloud_integration"]
+        self.assertEqual(tests_of(run("package(=spice) & binary(#[^z]*)")), cli)
+        self.assertEqual(tests_of(run("package(=spice) & binary({cli,cloud}_*)")), cli)
+
     def test_extra_filter_intersection_narrows(self) -> None:
         self.assertEqual(tests_of(run("(kind(=test)) & (not package(cayenne))")), sorted(
             ["integration", "metrics", "cli_integration", "cloud_integration", "dispatch"]))

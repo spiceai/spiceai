@@ -90,6 +90,15 @@ def _not(a: Tri) -> Tri:
 Expr = Callable[[TestTarget], Tri]
 
 
+def _glob(value: str) -> Callable[[str], Tri]:
+    # nextest matches globs with `globset`. `fnmatch` agrees with it on `*` and
+    # `?`, but not on classes (`[^z]`), alternatives (`{a,b}`) or escapes, so a
+    # glob with any of those is "unknown" and the target is built.
+    if any(c in value for c in "[]{}\\"):
+        return lambda s: None
+    return lambda s: fnmatch.fnmatchcase(s, value)
+
+
 def _matcher(arg: str, default: str) -> Callable[[str], Tri]:
     if arg.startswith("="):
         value = arg[1:]
@@ -98,15 +107,14 @@ def _matcher(arg: str, default: str) -> Callable[[str], Tri]:
         value = arg[1:]
         return lambda s: value in s
     if arg.startswith("#"):
-        value = arg[1:]
-        return lambda s: fnmatch.fnmatchcase(s, value)
+        return _glob(arg[1:])
     if len(arg) >= 2 and arg.startswith("/") and arg.endswith("/"):
         # nextest matches with Rust's `regex` crate. Python's `re` reads some of
         # its syntax (`[[:alpha:]]`, for one) differently without an error, so a
         # regex is "unknown" and the target is built.
         return lambda s: None
     if default == "glob":
-        return lambda s: fnmatch.fnmatchcase(s, arg)
+        return _glob(arg)
     return lambda s: s == arg
 
 
