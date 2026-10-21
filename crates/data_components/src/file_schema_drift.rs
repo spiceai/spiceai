@@ -25,6 +25,8 @@ limitations under the License.
 //! with no error and the dataset still `Ready`.
 //!
 //! [`FileSchemaDriftGuard`] checks each scan's files for the projected registered columns.
+//! Only formats that declare each file's full schema in metadata are checked (see
+//! [`FileSchemaDriftGuard::supports_format`]).
 //! A column that no scanned file carries is reported:
 //!
 //! - in a scan that feeds an acceleration refresh (the refresh session carries
@@ -116,6 +118,15 @@ pub struct FileSchemaDriftGuard {
 }
 
 impl FileSchemaDriftGuard {
+    /// Whether scans of `format` can be checked: its files declare their full schema in
+    /// metadata (Parquet and ORC footers), so a column missing from a file's schema is absent
+    /// from every record. Formats whose schema is inferred from a sample of records (CSV,
+    /// JSON) cannot prove a column absent, so they are not checked.
+    #[must_use]
+    pub fn supports_format(format: &dyn FileFormat) -> bool {
+        matches!(format.get_ext().as_str(), "parquet" | "orc")
+    }
+
     #[must_use]
     pub fn new(
         dataset_name: impl Into<String>,
@@ -680,6 +691,18 @@ mod tests {
         query(&table, true, "SELECT count(*) FROM base")
             .await
             .expect("count(*) reads no column");
+    }
+
+    #[test]
+    fn only_metadata_schema_formats_are_checked() {
+        use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat};
+        assert!(FileSchemaDriftGuard::supports_format(
+            &ParquetFormat::default()
+        ));
+        assert!(!FileSchemaDriftGuard::supports_format(&CsvFormat::default()));
+        assert!(!FileSchemaDriftGuard::supports_format(
+            &JsonFormat::default()
+        ));
     }
 
     #[test]

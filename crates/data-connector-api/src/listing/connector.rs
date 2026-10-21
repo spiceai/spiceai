@@ -188,9 +188,11 @@ impl ListingTableTemplate {
     }
 
     /// The guard that checks this dataset's scans for registered columns missing from every
-    /// scanned file, or `None` when the check is off.
+    /// scanned file, or `None` when the check is off or the file format cannot be checked.
     fn schema_drift_guard(&self) -> Option<FileSchemaDriftGuard> {
-        self.check_schema_drift.then(|| {
+        (self.check_schema_drift
+            && FileSchemaDriftGuard::supports_format(self.options.format.as_ref()))
+        .then(|| {
             FileSchemaDriftGuard::new(
                 self.dataset_name.clone(),
                 Arc::clone(&self.schema),
