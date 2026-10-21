@@ -36,6 +36,7 @@ use std::{
 
 use serde_json::{Value, json};
 mod ai_udf;
+mod anthropic;
 mod bedrock;
 mod embedding;
 pub(crate) mod hf;
@@ -47,6 +48,7 @@ pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
 pub(crate) mod search;
+mod spice_tool_turns;
 mod tools;
 mod vector_search_top_k;
 

@@ -101,6 +101,7 @@ linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
 evaluate-chat = { path = "../evaluate-chat" }
+model-capabilities = { path = "../model-capabilities" }
 runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
 moka.workspace = true
@@ -117,12 +118,14 @@ opentelemetry-prometheus.workspace = true
 opentelemetry-proto = { version = "0.32", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
+    "logs",
     "metrics",
 ] }
-# OTLP/HTTP JSON bodies only (`POST /v1/metrics`). 0.33.1 fixed JSON decoding that
-# silently dropped fields; decoded requests are re-encoded and read with the 0.32 types above.
+# OTLP/HTTP JSON bodies only (`POST /v1/metrics`, `POST /v1/logs`). 0.33.1 fixed JSON decoding
+# that silently dropped fields; decoded requests are re-encoded and read with the 0.32 types above.
 opentelemetry-proto-json = { package = "opentelemetry-proto", version = "0.33.1", default-features = false, features = [
     "gen-tonic-messages",
+    "logs",
     "metrics",
     "with-serde",
 ] }
@@ -516,6 +519,12 @@ path = "tests/cayenne_runtime_tuning.rs"
 [[test]]
 name = "results_cache_growth"
 path = "tests/results_cache_growth.rs"
+
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
+[[test]]
+name = "chat_tool_use"
+path = "tests/chat_tool_use.rs"
+required-features = ["models"]
 
 # Runs as its own step in `integration.yml`, with a retry budget sized to fit it.
 [[test]]

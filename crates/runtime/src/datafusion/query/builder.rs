@@ -170,6 +170,14 @@ impl QueryBuilder {
         self
     }
 
+    /// Skip query admission for a read that serves a peer scheduler's query;
+    /// see [`QueryRuntimeBinding::QueryRuntimeUngated`].
+    #[must_use]
+    pub(crate) fn for_peer_scheduler_read(mut self) -> Self {
+        self.runtime_binding = QueryRuntimeBinding::QueryRuntimeUngated;
+        self
+    }
+
     /// Run this query on the current Tokio runtime without taking a query
     /// admission permit or emitting query metrics / task-history rows.
     ///
@@ -191,6 +199,7 @@ impl QueryBuilder {
         // `runtime.task_history.enabled` only controls what a built tracker reports.
         let tracker = self.emit_tracker.then(|| QueryTracker {
             task_history_enabled: self.df.task_history_enabled,
+            log_errors: self.df.query_error_logging,
             captured_output_enabled: self.df.task_history_captured_output,
             schema: None,
             query_duration_secs: None,

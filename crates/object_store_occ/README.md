@@ -14,7 +14,7 @@ A Rust library for storing and retrieving serializable structs in object storage
 ## Quick Start
 
 ```rust
-use object_store_occ::{ObjectState, WriteResult};
+use object_store_occ::{Change, ConflictRetry, ObjectState};
 use object_store::aws::AmazonS3Builder;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -36,21 +36,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state: ObjectState<Transaction> = ObjectState::new(Arc::new(store))
         .with_prefix("v1/transactions/");
 
-    // Insert or update with automatic conflict detection
-    let tx = Transaction { foo: "hello".into(), bar: 67 };
-    
-    match state.insert_or_update("customer_42", &tx).await? {
-        WriteResult::Inserted => println!("Created new record"),
-        WriteResult::Updated => println!("Successfully updated"),
-        WriteResult::Conflict { current } => {
-            // Another writer modified the object - decide how to resolve
-            if current.bar >= tx.bar {
-                println!("Remote version is newer, skipping update");
-            } else {
-                // Retry with merged state...
-            }
-        }
-    }
+    // Read, change and write back. When another writer changes the object
+    // first, the change is applied again to what that writer stored.
+    let total = state
+        .modify("customer_42", &ConflictRetry::default(), |current| {
+            let mut tx = current.unwrap_or(Transaction { foo: "hello".into(), bar: 0 });
+            tx.bar += 1;
+            let total = tx.bar;
+            Ok::<_, std::convert::Infallible>(Change::Write(tx, total))
+        })
+        .await?;
+    println!("bar is now {total}");
 
     // Read directly from object store (always fresh)
     let current: Option<Transaction> = state.get("customer_42").await?;
@@ -87,11 +83,14 @@ let state = ObjectState::new(store).with_prefix("v1/mytype/");
 /// Insert a new object. Fails if key already exists.
 async fn insert(&self, key: &str, value: &T) -> Result<InsertResult>;
 
-/// Update an existing object with OCC. Fails if key doesn't exist.
-async fn update(&self, key: &str, value: &T) -> Result<UpdateResult<T>>;
+/// Update an object only if it is still at `version`, from `get_with_version`.
+async fn update_with_version(&self, key: &str, value: &T, version: UpdateVersion) -> Result<UpdateResult<T>>;
 
-/// Insert a new object or update existing with OCC (convenience wrapper)
-async fn insert_or_update(&self, key: &str, value: &T) -> Result<WriteResult<T>>;
+/// Read, change and conditionally write back, retrying under `policy` when
+/// another writer changed the object first.
+async fn modify<R, E, F>(&self, key: &str, policy: &ConflictRetry, change: F) -> Result<R, ModifyError<E>>
+where
+    F: FnMut(Option<T>) -> Result<Change<T, R>, E>;
 ```
 
 #### Reading
@@ -99,6 +98,9 @@ async fn insert_or_update(&self, key: &str, value: &T) -> Result<WriteResult<T>>
 ```rust
 /// Get object from directly from object store (fresh read)
 async fn get(&self, key: &str) -> Result<Option<T>>;
+
+/// Get object and the version to pass to `update_with_version`
+async fn get_with_version(&self, key: &str) -> Result<Option<(T, UpdateVersion)>>;
 
 /// Get object from local cache (fast, may be stale). 
 fn get_cached(&self, key: &str) -> Option<&T>;
@@ -108,23 +110,6 @@ async fn list_keys(&self) -> Result<Vec<String>>;
 
 /// Refresh local cache from object store. Retrieves all keys, not just those currently cached. 
 async fn refresh(&self) -> Result<()>;
-```
-
-### `WriteResult<T>`
-
-Result of an `insert_or_update()` operation:
-
-```rust
-pub enum WriteResult<T> {
-    /// Object was newly created
-    Inserted,
-    
-    /// Object was successfully updated (ETag matched)
-    Updated,
-    
-    /// Concurrent modification detected - contains current remote value
-    Conflict { current: T },
-}
 ```
 
 ### `InsertResult`
@@ -143,7 +128,7 @@ pub enum InsertResult {
 
 ### `UpdateResult<T>`
 
-Result of an `update()` operation:
+Result of an `update_with_version()` operation:
 
 ```rust
 pub enum UpdateResult<T> {

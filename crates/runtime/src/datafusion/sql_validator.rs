@@ -1241,8 +1241,12 @@ mod tests {
         // distributed cluster it returns a standard `LogicalPlan::Dml`, still
         // covered by the read-only arm — but this exercises the Spice wrapper
         // rather than `SessionState::create_logical_plan` directly.
-        let plan = df
-            .create_logical_plan(&session, "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)")
+        let (plan, _) = df
+            .create_logical_plan(
+                &session,
+                "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)",
+                None,
+            )
             .await
             .expect("plan should be created via Spice planner");
 

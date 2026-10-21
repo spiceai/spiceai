@@ -152,7 +152,6 @@ pub async fn try_to_chat_model(
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
             Arc::new(ToolUsingChat::new(
                 Arc::clone(&model),
-                Arc::clone(&rt),
                 tools,
                 spice_recursion_limit,
             ))
@@ -438,6 +437,9 @@ async fn huggingface(
         params.nodes.as_deref(),
     )?;
 
+    let default_reasoning_effort =
+        default_reasoning_effort(component, ModelSource::HuggingFace.short_name());
+
     llms::chat::create_hf_model(
         &id,
         model_type,
@@ -445,8 +447,26 @@ async fn huggingface(
         hf_token,
         chat_template_literal,
         distributed,
+        llms::chat::ReasoningDefault {
+            model_name: &component.name,
+            effort: default_reasoning_effort.as_ref(),
+        },
     )
     .await
+}
+
+/// The model's `reasoning_effort` default from its `params`, in any accepted spelling, for
+/// the loader to check against the chat template. A value that doesn't parse is left to the
+/// request path, which reports it.
+#[cfg(feature = "models")]
+fn default_reasoning_effort(
+    component: &spicepod::component::model::Model,
+    prefix: &str,
+) -> Option<async_openai::types::chat::ReasoningEffort> {
+    get_openai_request_overrides(component, prefix)
+        .into_iter()
+        .find(|(key, _)| key == "reasoning_effort")
+        .and_then(|(_, value)| serde_json::from_value(value).ok())
 }
 
 /// Parse the optional multi-node distributed-inference params (`distributed_backend`,
@@ -794,6 +814,8 @@ async fn file(
     let paged_attention = params.paged_attention;
 
     let chat_template_literal = params.chat_template.as_deref();
+    let default_reasoning_effort =
+        default_reasoning_effort(component, ModelSource::File.short_name());
 
     llms::chat::create_local_model(
         model_weights.as_slice(),
@@ -806,6 +828,10 @@ async fn file(
             chat_template_literal,
             context_length,
             paged_attention,
+            reasoning: llms::chat::ReasoningDefault {
+                model_name: &component.name,
+                effort: default_reasoning_effort.as_ref(),
+            },
         },
     )
     .await

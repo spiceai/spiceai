@@ -44,6 +44,7 @@ rand.workspace = true
 rcgen = { version = "0.14", features = ["x509-parser"] }
 regex.workspace = true
 reqwest.workspace = true
+result-compare = { path = "../result-compare" }
 rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true

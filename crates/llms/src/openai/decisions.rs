@@ -36,19 +36,6 @@ use runtime_rate_control::RateController;
 
 use crate::provider::create_http_client;
 
-/// The model id of `OpenAI`'s decision model; a dated snapshot appends `-<suffix>`.
-const DECISION_MODEL_ID: &str = "gpt-6-luna";
-
-/// Whether an `OpenAI` model id supports the native Decisions API:
-/// `gpt-6-luna`, or a snapshot such as `gpt-6-luna-2026-10-01`, but
-/// not an unrelated id that merely starts the same way, such as `gpt-6-lunar`.
-#[must_use]
-pub fn is_decision_model_id(model_id: &str) -> bool {
-    model_id
-        .strip_prefix(DECISION_MODEL_ID)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
-}
-
 /// Whether `endpoint` is `OpenAI`'s own API, which needs an API key. An
 /// OpenAI-compatible endpoint, such as a gateway, may not, as with `OpenAI` chat models.
 #[must_use]
@@ -248,6 +235,13 @@ impl Evaluate for OpenAiDecisions {
             return Ok(());
         }
         let body = response.text().await.unwrap_or_default();
+        // Only a 404 says the account is not offered the model. Any other refusal, such as
+        // a bad key or an exhausted credit balance, keeps its own meaning.
+        if status != StatusCode::NOT_FOUND {
+            return Err(evaluate_api::Error::HealthCheckFailed {
+                source: Box::new(self.error_for(status, body)),
+            });
+        }
         Err(evaluate_api::Error::HealthCheckFailed {
             source: format!(
                 "OpenAI did not offer model '{}' to this account (HTTP {status}): {body}",
@@ -255,10 +249,6 @@ impl Evaluate for OpenAiDecisions {
             )
             .into(),
         })
-    }
-
-    fn is_decision_model(&self) -> bool {
-        true
     }
 }
 
@@ -401,6 +391,39 @@ mod tests {
                 .await
                 .expect_err("must fail");
             assert_eq!(err.to_string(), expected);
+        }
+    }
+
+    /// The health check names why `OpenAI` refused the model lookup; only a 404 says the
+    /// account is not offered the model.
+    #[tokio::test]
+    async fn health_names_the_refusal() {
+        for (status, body, expected) in [
+            (
+                403,
+                r#"{"error":{"message":"You exceeded your current quota.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#,
+                "Evaluation health check failed: Permission denied for evaluation model 'luna': You exceeded your current quota.",
+            ),
+            (
+                401,
+                r#"{"error":{"message":"Incorrect API key provided: sk-test.","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}"#,
+                "Evaluation health check failed: Authentication failed for evaluation model 'luna': Incorrect API key provided: sk-test.",
+            ),
+            (
+                404,
+                r#"{"error":{"message":"The model `gpt-6-luna` does not exist or you do not have access to it.","code":"model_not_found"}}"#,
+                r#"Evaluation health check failed: OpenAI did not offer model 'gpt-6-luna' to this account (HTTP 404 Not Found): {"error":{"message":"The model `gpt-6-luna` does not exist or you do not have access to it.","code":"model_not_found"}}"#,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/models/gpt-6-luna"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let err = client(&server).health().await.expect_err("must fail");
+            assert_eq!(err.to_string(), expected, "{status}");
         }
     }
 
@@ -575,14 +598,5 @@ mod tests {
             matches!(err, evaluate_api::Error::UnparseableResponse { .. }),
             "{err}"
         );
-    }
-
-    #[test]
-    fn decision_model_ids() {
-        assert!(is_decision_model_id("gpt-6-luna"));
-        assert!(is_decision_model_id("gpt-6-luna-2026-10-01"));
-        assert!(!is_decision_model_id("gpt-4o-mini"));
-        assert!(!is_decision_model_id("gpt-6-lunar"));
-        assert!(!is_decision_model_id("gpt-6-lunatic-preview"));
     }
 }

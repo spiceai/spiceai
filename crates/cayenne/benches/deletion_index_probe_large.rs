@@ -148,5 +148,65 @@ fn bench_row_keys_large(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_int64_large, bench_row_keys_large);
+/// The shape a changes-mode table's index takes under sustained upserts: a
+/// large base run, frozen runs of recent deletes and an active tier of the
+/// newest ones, probed with the batched sweep a deletion-filtered scan uses.
+/// `hit` keys are spread over every tier (most in the base and frozen runs, a
+/// few percent in the active tier), the mix a scan of an upsert-churned table
+/// probes; `miss` keys are absent.
+fn bench_row_keys_layered(c: &mut Criterion) {
+    const BASE: usize = 4_000_000;
+    const BATCHES: usize = 60;
+    const BATCH: usize = 50_000;
+
+    let mut group = c.benchmark_group("deletion_index_row_keys_probe_layered");
+    group.throughput(Throughput::Elements(PROBES_PER_BATCH as u64));
+    group.sample_size(50);
+
+    let key_bytes = |key: usize| (key as u64).to_be_bytes();
+    let mut index = KeyDeletionIndex::from_map(
+        (0..BASE)
+            .map(|key| (key_bytes(key).to_vec().into_boxed_slice(), 1_i64))
+            .collect::<HashMap<Box<[u8]>, i64>>(),
+    );
+    for batch in 0..BATCHES {
+        let start = BASE + batch * BATCH;
+        let sequence = 2 + i64::try_from(batch).unwrap_or(i64::MAX - 2);
+        index =
+            index.extend_max_deletes((start..start + BATCH).map(|key| (key_bytes(key), sequence)));
+    }
+    let total = BASE + BATCHES * BATCH;
+    let hit_keys: Vec<[u8; 8]> = (0..PROBES_PER_BATCH)
+        .map(|i| (spread_key(i, total) as u64).to_be_bytes())
+        .collect();
+    let miss_keys: Vec<[u8; 8]> = (0..PROBES_PER_BATCH)
+        .map(|i| ((spread_key(i, total) as u64) + 2 * (total as u64)).to_be_bytes())
+        .collect();
+    let mut hashes = Vec::new();
+    let mut candidates = Vec::new();
+
+    for (lane, keys) in [("hit", &hit_keys), ("miss", &miss_keys)] {
+        group.bench_function(BenchmarkId::new(lane, total), |b| {
+            b.iter(|| {
+                let mut found = 0_usize;
+                index.get_batch_with_scratch(
+                    black_box(keys).iter(),
+                    &mut hashes,
+                    &mut candidates,
+                    |_, _| found += 1,
+                );
+                black_box(found);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_int64_large,
+    bench_row_keys_large,
+    bench_row_keys_layered
+);
 criterion_main!(benches);

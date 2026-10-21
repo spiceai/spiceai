@@ -21,27 +21,53 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use app::App;
+use tokio::sync::RwLock;
+
 use arrow::datatypes::SchemaRef;
 use datafusion::{catalog::TableProvider, common::TableReference, datasource::DefaultTableSource};
 use datafusion_expr::TableScan;
-use runtime_cluster::{ExecutorRegistry, PartitionValue};
-use runtime_datafusion::analyzer_rule::TablePartitionProvider;
+use runtime_cluster::ExecutorRegistry;
+use runtime_datafusion::analyzer_rule::{PartitionProviders, TablePartitionProvider};
 
 use crate::accelerated::AcceleratedTable;
 
 /// Wraps an [`ExecutorRegistry`] with the `AcceleratedTable`-specific
 /// `should_partition` logic so it can be installed as a `TablePartitionProvider`.
 #[derive(Debug)]
-pub struct AcceleratedPartitionProvider(Arc<ExecutorRegistry>);
+pub struct AcceleratedPartitionProvider {
+    registry: Arc<ExecutorRegistry>,
+    /// The app whose partitioned datasets and views the scheduler discovers.
+    app: Option<Arc<RwLock<Option<Arc<App>>>>>,
+}
 
 impl AcceleratedPartitionProvider {
     #[must_use]
-    pub fn from_registry(registry: Arc<ExecutorRegistry>) -> Self {
-        Self(registry)
+    pub fn from_registry(
+        registry: Arc<ExecutorRegistry>,
+        app: Option<Arc<RwLock<Option<Arc<App>>>>>,
+    ) -> Self {
+        Self { registry, app }
+    }
+
+    /// Whether `table` is a dataset or view the app partitions with
+    /// `partition_by`, whose partitions the scheduler discovers. Assumed so
+    /// while the app is being replaced.
+    fn is_discovered(&self, table: &TableReference) -> bool {
+        let Some(app) = &self.app else {
+            return false;
+        };
+        let Ok(app) = app.try_read() else {
+            return true;
+        };
+        app.as_deref()
+            .is_some_and(|app| runtime_cluster::service::get_partition_config(app, table).is_some())
     }
 }
 
-/// Whether `table_provider` is (or wraps) an [`AcceleratedTable`].
+/// Whether `table_provider` is (or wraps) an [`AcceleratedTable`] whose rows the executors
+/// hold. A node-local table, such as `runtime.local_task_history`, holds this node's own rows
+/// and is read where it is.
 ///
 /// The registered provider for an accelerated dataset is decorated depending on its
 /// configuration: a `FederatedTableProviderAdaptor` (`PolyTableProvider` engines),
@@ -56,7 +82,7 @@ fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> boo
         table_provider.as_ref(),
         spice_table::LayerWalk::Read,
     )
-    .is_some()
+    .is_some_and(|table| !table.is_node_local())
 }
 
 impl TablePartitionProvider for AcceleratedPartitionProvider {
@@ -71,13 +97,14 @@ impl TablePartitionProvider for AcceleratedPartitionProvider {
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        self.0
-            .resolve_accelerated_partitions(table, schema)
+    ) -> datafusion::error::Result<PartitionProviders> {
+        Ok(self
+            .registry
+            .resolve_accelerated_partitions(table, schema, self.is_discovered(table))?
             .into_iter()
             // Executors only materialize data for their assigned partitions; bucket filters are
             // redundant and expensive to evaluate per-row.
             .map(|(provider, _)| (provider, vec![]))
-            .collect()
+            .collect())
     }
 }

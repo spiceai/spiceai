@@ -143,6 +143,7 @@ mod cayenne_catalog_tuning;
 mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
+mod cluster_task_history;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -161,6 +162,8 @@ mod odbc;
 mod oracle;
 #[cfg(not(windows))]
 mod otel_ingest_races;
+#[cfg(not(windows))]
+mod otel_logs;
 #[cfg(not(windows))]
 mod otel_restart;
 mod plan_capture;

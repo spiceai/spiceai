@@ -118,6 +118,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         rerankers: runtime.rerankers(),
         chat_models: runtime.completion_llms(),
         evaluate_models: runtime.evaluate_models(),
+        capabilities: runtime.model_capabilities(),
     };
     ctx.register_udf(
         RerankTableFunc::new(std::sync::Weak::clone(&weak_df), rerank_models.clone()).into(),
@@ -155,6 +156,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         ctx.register_udf(
             Ai::new(
                 runtime.completion_llms(),
+                runtime.model_capabilities(),
                 runtime.model_rate_controllers(),
                 runtime.status(),
             )
@@ -167,8 +169,12 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     // the decision and chat models in the evaluation store, with the planner rules that
     // place their model calls. Registered once per runtime, so the rules are appended
     // once.
-    runtime_decide::DecisionFunctions::new(runtime.evaluate_models(), runtime.status())
-        .register(ctx);
+    runtime_decide::DecisionFunctions::new(
+        runtime.evaluate_models(),
+        runtime.model_capabilities(),
+        runtime.status(),
+    )
+    .register(ctx);
 
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
@@ -1478,7 +1484,7 @@ body: \"{body}\"
         // Any hasher works — the key only has to be the same on every lookup.
         let key = cache::key::CacheKey::Query(sql, None)
             .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
-        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql)
+        df.get_or_create_logical_plan(&df.ctx.state(), Some(&key), sql, None)
             .await
             .expect("the query over myscale should plan");
         plans.checkpoint().await;
@@ -1508,7 +1514,7 @@ body: \"{body}\"
         let (runtime, df, plans, key) = runtime_with_cached_plan(&doubling, SQL).await;
 
         let cached = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect("the cached plan should come back");
         assert_eq!(
@@ -1530,7 +1536,7 @@ body: \"{body}\"
         );
 
         let replanned = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect("the same SQL should re-plan after the reload");
         assert_eq!(
@@ -1570,7 +1576,7 @@ body: \"{body}\"
         // outcome: the user removed the function. The point is that the query
         // no longer silently answers from the copy the cached plan held.
         let err = df
-            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL)
+            .get_or_create_logical_plan(&df.ctx.state(), Some(&key), SQL, None)
             .await
             .expect_err("the removed function must not resolve after the reload");
         assert!(

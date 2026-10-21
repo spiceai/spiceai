@@ -40,8 +40,10 @@ use std::{
     time::Duration,
 };
 
-use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
+use opentelemetry::{InstrumentationScope, global, trace::TracerProvider as _};
 use opentelemetry_sdk::{
+    Resource,
+    metrics::SdkMeterProvider,
     runtime::TokioCurrentThread,
     trace::{SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor},
 };
@@ -56,6 +58,95 @@ use arrow::array::RecordBatch;
 use chrono::Timelike;
 use futures::StreamExt;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
+
+/// The one `MeterProvider` for the test process, installed before any instrument
+/// exists: instruments bind to the provider installed when they are first used, so
+/// force this before building a runtime whose metrics a test reads.
+pub(crate) static PROMETHEUS: LazyLock<prometheus::Registry> =
+    LazyLock::new(install_prometheus_meter_provider);
+
+/// Installs a `MeterProvider` backed by a scrapable Prometheus registry, as
+/// `spiced` does for the `--metrics` endpoint.
+fn install_prometheus_meter_provider() -> prometheus::Registry {
+    let registry = prometheus::Registry::new();
+
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .without_scope_info()
+        .without_units()
+        .without_counter_suffixes()
+        .without_target_info()
+        .build()
+        .expect("to build the prometheus exporter");
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(Resource::builder().build())
+        .with_reader(exporter)
+        .build();
+    global::set_meter_provider(provider);
+
+    registry
+}
+
+/// The summed value of counter `name` over the series whose `label` is `value`; `0`
+/// before any is recorded.
+pub(crate) fn counter_with_label(
+    registry: &prometheus::Registry,
+    name: &str,
+    label: &str,
+    value: &str,
+) -> f64 {
+    metric_value(registry, name, &[(label, value)])
+}
+
+/// The sum of `name` over the series that carry every label in `labels`; a histogram
+/// counts its samples. `0` before any is recorded.
+pub(crate) fn metric_value(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> f64 {
+    metric_series(registry, name, labels)
+        .iter()
+        .map(|(_, value)| value)
+        .sum()
+}
+
+/// The series of `name` that carry every label in `labels`, as `(labels, value)`; a
+/// histogram's value is its sample count.
+pub(crate) fn metric_series(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Vec<(Vec<(String, String)>, f64)> {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .map(|metric| {
+            let metric_labels: Vec<(String, String)> = metric
+                .get_label()
+                .iter()
+                .map(|pair| (pair.name().to_string(), pair.value().to_string()))
+                .collect();
+            let value = match metric.get_histogram().as_ref() {
+                // Exact: a sample count is a small integer.
+                #[expect(clippy::cast_precision_loss)]
+                Some(histogram) => histogram.get_sample_count() as f64,
+                None => metric.get_counter().value(),
+            };
+            (metric_labels, value)
+        })
+        .filter(|(metric_labels, _)| {
+            labels.iter().all(|(name, value)| {
+                metric_labels
+                    .iter()
+                    .any(|(metric_name, metric_value)| metric_name == name && metric_value == value)
+            })
+        })
+        .collect()
+}
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
     Arc::new(

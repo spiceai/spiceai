@@ -104,7 +104,7 @@ pub static METRICS_STORE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// an infinity becomes `{"double": "NaN"}`, so neither reads as a string attribute carrying
 /// the same text. A key-value list can still render the same JSON, so `series_hash` hashes
 /// [`encode_attributes`] instead.
-fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
+pub(crate) fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
     let Some(value) = value.and_then(|v| v.value.as_ref()) else {
         return JsonValue::Null;
     };
@@ -135,7 +135,7 @@ fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
 
 /// Attributes as a JSON object with keys in sorted order, so equal attribute sets always
 /// serialize, and hash, the same way. A repeated key keeps its last value.
-fn attributes_to_json(attributes: &[KeyValue]) -> JsonValue {
+pub(crate) fn attributes_to_json(attributes: &[KeyValue]) -> JsonValue {
     sorted_attributes_to_json(&sorted_attributes(attributes))
 }
 

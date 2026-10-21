@@ -16,13 +16,12 @@ limitations under the License.
 
 use core::time;
 use std::{
-    collections::HashMap,
     convert::Infallible,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use crate::model::{LLMChatCompletionsModelStore, ResponsesApiSupport};
+use crate::model::LLMChatCompletionsModelStore;
 use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
@@ -47,6 +46,7 @@ use event_stream::get_event_stream;
 use futures::StreamExt;
 use http::HeaderValue;
 use llms::chat::{ApiErrorKind, Chat};
+use model_capabilities::{Capability, CapabilityStore, Refusal, require};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;
 use tokio::{
@@ -62,6 +62,13 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 /// Create Chat Completion
 ///
 /// Creates a model response for the given chat conversation.
+///
+/// When a model writes text and calls a Spice tool in the same step, the message carries that
+/// text, a blank line, then the answer the tool results produce, whether or not it is streamed.
+/// There is no blank line when either side already has whitespace where they meet, or when the
+/// request sets `logprobs`, so that `content` is exactly the text its log probabilities cover. A
+/// response that is not streamed and has a `json_object` or `json_schema` `response_format`
+/// carries only the answer.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -123,7 +130,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
-    Extension(responses_api_support): Extension<Arc<RwLock<HashMap<String, ResponsesApiSupport>>>>,
+    Extension(capabilities): Extension<Arc<RwLock<CapabilityStore>>>,
     Extension(status): Extension<Arc<RuntimeStatus>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
@@ -143,12 +150,16 @@ pub(crate) async fn post(
     let span_clone = span.clone();
     async move {
         let model_id = req.model.clone();
-        match llms.read().await.get(&model_id) {
-            Some(model) => {
+        let model = {
+            let capabilities = capabilities.read().await;
+            require(&capabilities, &*llms.read().await, &model_id, Capability::Chat)
+        };
+        match model {
+            Ok(model) => {
                 if req.stream.unwrap_or_default() {
                     let include_stream_events = headers.get(SPICE_COMPLETION_PROGRESS_HEADER)
                         .is_some_and(|v| v == HeaderValue::from_static("enabled"));
-                    handle_streaming(model, req, include_stream_events).instrument(span_clone).await
+                    handle_streaming(&model, req, include_stream_events).instrument(span_clone).await
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
@@ -172,18 +183,12 @@ pub(crate) async fn post(
                     }
                 }
             }
-            None => {
-                if matches!(
-                    responses_api_support.read().await.get(&model_id),
-                    Some(ResponsesApiSupport::EvaluateOnly { .. })
-                ) {
-                    evaluate_only_chat_response(&model_id)
-                } else {
-                    let message = status
-                        .unavailable_model_reason(&model_id)
-                        .unwrap_or_else(|| format!("model '{model_id}' not found"));
-                    (StatusCode::NOT_FOUND, message).into_response()
-                }
+            Err(Refusal::Unsupported(_)) => evaluate_only_chat_response(&model_id),
+            Err(Refusal::NotFound | Refusal::Unavailable) => {
+                let message = status
+                    .unavailable_model_reason(&model_id)
+                    .unwrap_or_else(|| format!("model '{model_id}' not found"));
+                (StatusCode::NOT_FOUND, message).into_response()
             }
         }
     }
@@ -389,8 +394,8 @@ impl OpenaiErrorEvent {
     }
 }
 
-/// Chat rejection for an evaluate-only model, in the same `OpenAI` JSON envelope
-/// as `/v1/responses`.
+/// Chat rejection for a model without chat, in the same `OpenAI` JSON envelope as
+/// `/v1/responses`.
 fn evaluate_only_chat_response(model_id: &str) -> Response {
     let message = llms::chat::Error::EvaluateOnlyModel {
         model: model_id.to_string(),
@@ -422,6 +427,7 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
                 Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
                 Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+                Some(ApiErrorKind::NotFound) => StatusCode::NOT_FOUND,
                 Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
                 Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
                 None => StatusCode::INTERNAL_SERVER_ERROR,
@@ -440,7 +446,7 @@ mod tests {
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::{LLMChatCompletionsModelStore, ResponsesApiSupport},
+        model::LLMChatCompletionsModelStore,
         status::{ComponentStatus, RuntimeStatus},
     };
     use async_openai::{
@@ -495,7 +501,7 @@ mod tests {
         let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
-        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
+        let capabilities = Arc::new(RwLock::new(HashMap::new()));
 
         let mut headers = HeaderMap::new();
         if let Some(v) = progress_header {
@@ -523,7 +529,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(responses_api_support),
+            Extension(capabilities),
             Extension(RuntimeStatus::new()),
             headers,
             Json(req_payload),
@@ -657,6 +663,10 @@ mod tests {
                 StatusCode::FORBIDDEN,
             ),
             (
+                api_error(Some("not_found_error"), Some("not_found")),
+                StatusCode::NOT_FOUND,
+            ),
+            (
                 api_error(Some("insufficient_quota"), Some("insufficient_quota")),
                 StatusCode::PAYMENT_REQUIRED,
             ),
@@ -715,15 +725,17 @@ mod tests {
         );
     }
 
-    /// Evaluate-only models return the `OpenAI` JSON error envelope, not plain text.
+    /// A model without chat returns the `OpenAI` JSON error envelope, not plain text.
     #[tokio::test]
     async fn evaluate_only_model_returns_openai_json_400() {
         let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
-        let responses_api_support = Arc::new(RwLock::new(HashMap::from([(
+        let capabilities = Arc::new(RwLock::new(HashMap::from([(
             "jev".to_string(),
-            ResponsesApiSupport::EvaluateOnly {
-                provider: "typesafe".to_string(),
-            },
+            model_capabilities::ModelCapabilities::of(&spicepod::component::model::Model::new(
+                "typesafe:jev",
+                "jev",
+            ))
+            .expect("a known provider"),
         )])));
 
         let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
@@ -736,7 +748,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(responses_api_support),
+            Extension(capabilities),
             Extension(RuntimeStatus::new()),
             HeaderMap::new(),
             Json(req_payload),
@@ -767,7 +779,7 @@ mod tests {
 
     async fn post_to_absent_model(status: Arc<RuntimeStatus>) -> (axum::http::StatusCode, String) {
         let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
-        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
+        let capabilities = Arc::new(RwLock::new(HashMap::new()));
         let req: CreateChatCompletionRequest = serde_json::from_value(json!({
             "model": "deepseek",
             "messages": [{"role": "user", "content": "hi"}]
@@ -776,7 +788,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(responses_api_support),
+            Extension(capabilities),
             Extension(status),
             HeaderMap::new(),
             Json(req),

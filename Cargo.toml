@@ -34,6 +34,7 @@ members = [
     "crates/event_stream",
     "crates/flight_client",
     "crates/repl",
+    "crates/result-compare",
     "crates/google-genai",
     "crates/hash-index",
     "crates/key-index",
@@ -43,6 +44,7 @@ members = [
     "crates/rerank-api",
     "crates/evaluate-api",
     "crates/evaluate-chat",
+    "crates/model-capabilities",
     "crates/ns_lookup",
     "crates/object_store_occ",
     "crates/object_store_spawn",
@@ -241,9 +243,9 @@ aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
 backoff = { path = "crates/backoff" }
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "a7c4c58502a16e2181a26fdb8e937ee005807e5e" } # branch: spiceai-55 (upstream 55.0.0-rc1, spiceai/datafusion-ballista#68)
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "a7c4c58502a16e2181a26fdb8e937ee005807e5e" }
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "a7c4c58502a16e2181a26fdb8e937ee005807e5e" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "432924cd9644117729c7e010efc60a8cec8f0119" } # branch: spiceai-55
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "432924cd9644117729c7e010efc60a8cec8f0119" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "432924cd9644117729c7e010efc60a8cec8f0119" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -251,12 +253,12 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-core" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-metal-kernels" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-nn" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6", package = "candle-transformers" } # branch: lukim/spiceai-0.11.0 (candle 0.11 + i-quant; refresh to merged SHA)
+candle = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-core" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-metal-kernels" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-nn" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb", package = "candle-transformers" } # branch: spiceai (spiceai/candle#18: huggingface/candle 66a8cf18, the rev mistral.rs v0.9.4 pins, + i-quant)
 charset = "0.1.5"
 # AEAD for the at-rest delivered-secrets cache. Already in the tree via `hpke`,
 # which uses the same primitive for the sealed-secret wire format.
@@ -276,7 +278,7 @@ datafusion-common-runtime = "55.2.0"
 datafusion-datasource = "55.2.0"
 datafusion-execution = "55.2.0"
 datafusion-expr = "55.2.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "2fc46179fa45b764e8c2996bf04aa58fc652d069", features = ["sql"] } # branch: spiceai-55
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "109661cc833e7f8919e1b3c65011ed9db0883312", features = ["sql"] } # branch: spiceai-55
 datafusion-functions = "55.2.0"
 datafusion-functions-aggregate = "55.2.0"
 datafusion-functions-aggregate-common = "55.2.0"
@@ -291,7 +293,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ef2e59053978a7f4f795065598999c5eb31f4c69" } # branch: spiceai-55
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "c5bcad1acdce0a4e3c8e9d488901f55fcf89bd3a" } # branch: spiceai-55
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
@@ -356,11 +358,13 @@ opendal = { version = "0.58", default-features = false, features = ["services-s3
 # Do not use datafusion-orc; the FileFormat lives in crates/dataformat-orc.
 orc-rust = { version = "0.9.0", default-features = false, features = ["async"] }
 opentelemetry = { version = "0.32", default-features = false, features = [
+    "logs",
     "metrics",
     "trace",
 ] }
 opentelemetry-http = { version = "0.32", default-features = false, features = ["reqwest"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "logs",
     "metrics",
     "grpc-tonic",
     "http-proto",
@@ -371,9 +375,11 @@ opentelemetry-zipkin = { version = "0.32", default-features = false, features = 
     "reqwest-client",
 ] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+    "logs",
     "metrics",
     "rt-tokio",
     "trace",
+    "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
     "experimental_metrics_periodicreader_with_async_runtime",
     "experimental_metrics_custom_reader",
@@ -426,7 +432,7 @@ cpu-budget = { path = "crates/cpu-budget" }
 runtime-cloud-connect = { path = "crates/runtime-cloud-connect" }
 spice-cloud-client = { path = "crates/spice-cloud-client" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "f5557381f79f1535014e0dc0555c53ac8de1cafc" } # branch: spiceai-59
-sqlparser = "0.59.0"
+sqlparser = "0.62.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
@@ -538,6 +544,16 @@ split-debuginfo = "packed"
 
 [profile.lint]
 debug = "line-tables-only"
+# Keeps the `spiced` that tests start loadable on Apple Silicon. Its image is
+# mapped from 0x100000000, and dyld maps the system shared cache at
+# 0x180000000: an image that reaches past that once ASLR slides it leaves dyld
+# unable to map the cache, so the process aborts with SIGABRT before `main`
+# (`syscall to map cache into shared region failed`). The debug map (stabs) the
+# linker writes for line-tables-only debug info is ~190 MiB of `__LINKEDIT`;
+# dropping it took the image from 20 MiB to 207 MiB below the shared cache, and
+# launches from 110 aborts in 160 to none (#15229, #15264). Function names stay
+# in the symbol table and panic messages keep their file and line.
+strip = "debuginfo"
 # Deliberate: the two halves of the lint-profile gate want opposite things.
 # A local `make signoff` (or `RUST_PROFILE=lint make lint-rust`) reuses its own
 # target directory, where incremental compilation is the larger win. Plain
@@ -560,41 +576,41 @@ lto = "off"
 adbc_core = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6e4119ac2007c6647702a1817505d6849b07e0e0" } # branch: spiceai-24 (ADBC 24)
 adbc_driver_manager = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6e4119ac2007c6647702a1817505d6849b07e0e0" }
 adbc_ffi = { git = "https://github.com/spiceai/arrow-adbc.git", rev = "6e4119ac2007c6647702a1817505d6849b07e0e0" }
-datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" } # branch: spiceai-55 (DataFusion 55.2.0-rc1, spiceai/datafusion#257)
-datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
-datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "bddf3056b560e7fe908272854f093221bfac9ca2" }
+datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" } # branch: spiceai-55 (DataFusion 55.2.0-rc1, spiceai/datafusion#260)
+datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-common-runtime = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-datasource = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-datasource-arrow = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-datasource-csv = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-datasource-json = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-datasource-parquet = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-doc = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-execution = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions-aggregate = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions-aggregate-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions-nested = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions-table = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions-window = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-functions-window-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-macros = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-physical-expr = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-physical-expr-adapter = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-physical-expr-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-physical-plan = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-proto = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-proto-common = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
+datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "cf084aa85dfdc27b4736208f5c132828020774ea" }
 
 # Local vendored fork of `mysql-common-derive` (path: vendor/mysql-common-derive)
 # that drops the unmaintained `proc-macro-error2` dependency (RUSTSEC-2026-0173).
@@ -609,11 +625,11 @@ backoff = { path = "crates/backoff" }
 
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" } # spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" } # spiceai
 # candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
 # point it at the spiceai fork, which builds against candle 0.11.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "75fc0b689b33a327907d36dd479f7d242640ca71" } # spiceai (candle 0.11)
@@ -625,34 +641,34 @@ duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "504debbf8269
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1707b349584845e802a703adca1e71f544defc5f" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1707b349584845e802a703adca1e71f544defc5f" } # branch: spiceai-0.11.0-df-55
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1707b349584845e802a703adca1e71f544defc5f" } # branch: spiceai-0.11.0-df-55
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1707b349584845e802a703adca1e71f544defc5f" } # branch: spiceai-0.11.0-df-55
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1707b349584845e802a703adca1e71f544defc5f" } # branch: spiceai-0.11.0-df-55
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "1707b349584845e802a703adca1e71f544defc5f" } # branch: spiceai-0.11.0-df-55
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "a6b07b8b9625e552c502c3a7229fd4bb7725bd2e" } # branch: spiceai-0.11.0-df-55
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
 # a duplicate-key error.
 
 # arrow-rs 59.3 with spice patches (spiceai-59-patches)
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }        # branch: spiceai-59 (arrow 59.3.0)
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }  # branch: spiceai-59 (arrow 59.3.0)
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }   # branch: spiceai-59 (arrow 59.3.0)
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }    # branch: spiceai-59 (arrow 59.3.0)
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" } # branch: spiceai-59 (arrow 59.3.0)
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "2e2cc330c64ac8a9e44d2a5f2da171b391f775b8" }      # branch: spiceai-59 (arrow 59.3.0)
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }        # branch: spiceai-59 (arrow 59.3.0)
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }  # branch: spiceai-59 (arrow 59.3.0)
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }  # branch: spiceai-59 (arrow 59.3.0)
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }   # branch: spiceai-59 (arrow 59.3.0)
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }    # branch: spiceai-59 (arrow 59.3.0)
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" } # branch: spiceai-59 (arrow 59.3.0)
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23" }      # branch: spiceai-59 (arrow 59.3.0)
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "806e48da24401eab673ef88ea93863cf8b1035e7" } # branch: spiceai-55 (vortex 0.86.1)

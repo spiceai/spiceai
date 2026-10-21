@@ -41,6 +41,7 @@ use tonic::{Request, Response, Status, Streaming};
 use async_stream::stream;
 
 use crate::{
+    accelerated::AcceleratedTable,
     cluster::partition,
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
@@ -223,6 +224,19 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
+    }
+
+    // The forwarding below assigns partition values apart from the assignments that reads
+    // of an accelerated dataset use, so a write that goes only to the acceleration is
+    // refused, as it is for SQL.
+    if let Some(table) = datafusion.get_table(&path).await
+        && let Some(refusal) = spice_table::find_layer::<AcceleratedTable>(
+            table.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .and_then(|accelerated| accelerated.scheduler_write_refusal("DoPut"))
+    {
+        return Err(Status::failed_precondition(refusal));
     }
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
@@ -558,6 +572,26 @@ fn create_response_stream(
                         Some(Ok(message)) => {
                             // Reset the idle timeout on each received message
                             deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+
+                            if message.app_metadata.as_ref() == crate::flight::ABANDON_APP_METADATA {
+                                let message = format!("The writer abandoned the write to dataset '{path}'.");
+                                tracing::warn!(dataset = %path, "{message}");
+                                // The write fails through its input and is driven until it has
+                                // discarded what it received, with no time limit: a write dropped
+                                // midway can still commit it, as a dual write's source insert does.
+                                let failed = batch_tx.send(Err(DataFusionError::Execution(message.clone())));
+                                let mut abandoned = std::pin::pin!(futures::future::join(failed, &mut write_future));
+                                let abandon_start = std::time::Instant::now();
+                                while tokio::time::timeout(std::time::Duration::from_secs(30), &mut abandoned).await.is_err() {
+                                    tracing::warn!(
+                                        dataset = %path,
+                                        waited_s = abandon_start.elapsed().as_secs(),
+                                        "DoPut abandoned write still pending",
+                                    );
+                                }
+                                yield Err(Status::aborted(message));
+                                break;
+                            }
 
                             // Skip keepalive messages — these are heartbeats from
                             // write-through forwarding to prevent the idle timeout.

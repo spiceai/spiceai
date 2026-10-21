@@ -75,17 +75,10 @@ pub(super) fn to_api_error(err: impl Into<String>) -> OpenAIError {
     })
 }
 
-/// Extract the content, refusal and tool calls from a `ContentBlock`.
-#[expect(clippy::type_complexity)]
+/// Extract the content and tool calls from a `ContentBlock`.
 pub(super) fn extract_from_content_block(
     blck: &ContentBlock,
-) -> Result<
-    (
-        (Option<String>, Option<String>),
-        Option<ChatCompletionMessageToolCall>,
-    ),
-    OpenAIError,
-> {
+) -> Result<(Option<String>, Option<ChatCompletionMessageToolCall>), OpenAIError> {
     match blck {
         ContentBlock::GuardContent(GuardrailConverseContentBlock::Text(
             GuardrailConverseTextBlock { text, .. },
@@ -93,8 +86,8 @@ pub(super) fn extract_from_content_block(
         | ContentBlock::ReasoningContent(ReasoningContentBlock::ReasoningText(
             ReasoningTextBlock { text, .. },
         ))
-        | ContentBlock::Text(text) => Ok(((Some(text.clone()), None), None)),
-        ContentBlock::ToolResult(ToolResultBlock { .. }) => Ok(((None, None), None)),
+        | ContentBlock::Text(text) => Ok((Some(text.clone()), None)),
+        ContentBlock::ToolResult(ToolResultBlock { .. }) => Ok((None, None)),
         ContentBlock::ToolUse(ToolUseBlock {
             tool_use_id,
             name,
@@ -104,7 +97,7 @@ pub(super) fn extract_from_content_block(
             let input: &Document = input;
 
             Ok((
-                (None, None),
+                None,
                 Some(ChatCompletionMessageToolCall {
                     id: tool_use_id.clone(),
                     function: FunctionCall {

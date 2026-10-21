@@ -17,11 +17,12 @@ limitations under the License.
 //! Logical changes and validated, nonunique replacement scopes.
 
 use arrow::{
-    array::{RecordBatch, StringArray},
-    compute::kernels::cmp::not_distinct,
-    datatypes::{DataType, SchemaRef},
+    array::{Array, ArrayRef, RecordBatch, StringArray},
+    compute::{cast, kernels::cmp::not_distinct},
+    datatypes::{DataType, Schema, SchemaRef},
 };
 use data_components::cdc;
+use data_components::pk_filter_expr::balanced_binary;
 use std::ops::{ControlFlow, Range};
 use std::sync::Arc;
 
@@ -36,7 +37,6 @@ use datafusion::{
 #[derive(Debug)]
 pub struct ChangeBatch {
     payload: ChangePayload,
-    replace_set: Option<SetKey>,
     append_ingress: Option<Arc<AppendIngress>>,
 }
 
@@ -49,20 +49,23 @@ pub enum ChangePayload {
     Rows {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
-        /// Validation-only scopes for fresh appends. They never authorize deletion.
-        append_validations: Vec<AppendValidation>,
+        /// Each input's scope, covering the chunks in order. Empty for an append
+        /// that imposes no uniqueness on grouping columns.
+        scoped_inputs: Vec<ScopedInput>,
     },
 }
 
-/// One fresh input's scope and exact range of unchanged Arrow chunks. Scoped
-/// inputs cover the chunk vector in order; an empty input retains an empty range.
+/// One input's scope and exact range of unchanged Arrow chunks. Scoped inputs
+/// cover the chunk vector in order; an empty input retains an empty range.
+/// A fresh input only appends. A replacing input deletes its scope first.
 #[derive(Debug)]
-pub struct AppendValidation {
+pub struct ScopedInput {
     scope: SetKey,
     batches: Range<usize>,
+    replaces: bool,
 }
 
-impl AppendValidation {
+impl ScopedInput {
     #[must_use]
     pub fn scope(&self) -> &SetKey {
         &self.scope
@@ -71,6 +74,12 @@ impl AppendValidation {
     #[must_use]
     pub fn batch_range(&self) -> Range<usize> {
         self.batches.clone()
+    }
+
+    /// Whether the scope's stored rows are deleted before this input's rows are appended.
+    #[must_use]
+    pub fn replaces(&self) -> bool {
+        self.replaces
     }
 }
 
@@ -136,7 +145,6 @@ impl ChangeBatch {
     pub fn cdc_with_ingress(rows: cdc::LazyChangeBatch, ingress: Option<Arc<CdcIngress>>) -> Self {
         Self {
             payload: ChangePayload::Cdc(CdcRows { rows, ingress }),
-            replace_set: None,
             append_ingress: None,
         }
     }
@@ -153,9 +161,8 @@ impl ChangeBatch {
             payload: ChangePayload::Rows {
                 schema,
                 batches,
-                append_validations: Vec::new(),
+                scoped_inputs: Vec::new(),
             },
-            replace_set: None,
             append_ingress: None,
         })
     }
@@ -175,19 +182,7 @@ impl ChangeBatch {
         for batch in &batches {
             scope.validate_batch(batch)?;
         }
-        let range = 0..batches.len();
-        Ok(Self {
-            payload: ChangePayload::Rows {
-                schema,
-                batches,
-                append_validations: vec![AppendValidation {
-                    scope,
-                    batches: range,
-                }],
-            },
-            replace_set: None,
-            append_ingress: None,
-        })
+        Ok(Self::scoped(scope, schema, batches, false))
     }
 
     /// Delete the scope once, then append all chunks as one ordered, non-atomic operation.
@@ -209,26 +204,36 @@ impl ChangeBatch {
         for batch in &batches {
             scope.validate_batch(batch)?;
         }
-        Ok(Self {
+        Ok(Self::scoped(scope, schema, batches, true))
+    }
+
+    fn scoped(scope: SetKey, schema: SchemaRef, batches: Vec<RecordBatch>, replaces: bool) -> Self {
+        let range = 0..batches.len();
+        Self {
             payload: ChangePayload::Rows {
                 schema,
                 batches,
-                append_validations: Vec::new(),
+                scoped_inputs: vec![ScopedInput {
+                    scope,
+                    batches: range,
+                    replaces,
+                }],
             },
-            replace_set: Some(scope),
             append_ingress: None,
-        })
+        }
     }
 
-    /// Opt an append into this producer lane's bounded owner batching. Clones
-    /// of one writer must retain the same ingress identity.
+    /// Opt rows into this producer lane's bounded owner batching. Clones of one
+    /// writer must retain the same ingress identity. A coalesced burst deletes
+    /// every replaced scope before it appends, so the owner admits a member only
+    /// while no replaced scope in the burst can hold another member's rows.
     ///
     /// # Errors
-    /// Returns an error for CDC input or a replacement rather than an append.
+    /// Returns an error for CDC input.
     pub fn with_append_ingress(mut self, ingress: Arc<AppendIngress>) -> Result<Self> {
-        if self.replace_set.is_some() || !matches!(self.payload, ChangePayload::Rows { .. }) {
+        if !matches!(self.payload, ChangePayload::Rows { .. }) {
             return Err(DataFusionError::Plan(
-                "Only Rows appends can join an append batching lane".into(),
+                "Only Rows writes can join an append batching lane".into(),
             ));
         }
         self.append_ingress = Some(ingress);
@@ -241,32 +246,30 @@ impl ChangeBatch {
     }
 
     pub(crate) fn can_merge_append(&self, other: &Self) -> bool {
-        if self.replace_set.is_some() || other.replace_set.is_some() {
-            return false;
-        }
         match (&self.payload, &other.payload) {
             (
                 ChangePayload::Rows {
                     schema,
                     batches,
-                    append_validations,
+                    scoped_inputs,
                 },
                 ChangePayload::Rows {
                     schema: other_schema,
                     batches: other_batches,
-                    append_validations: other_validations,
+                    scoped_inputs: other_inputs,
                 },
             ) => {
                 schema == other_schema
-                    && append_validations.is_empty() == other_validations.is_empty()
+                    && scoped_inputs.is_empty() == other_inputs.is_empty()
                     && batches.len().checked_add(other_batches.len()).is_some()
             }
             _ => false,
         }
     }
 
-    /// Extend only compatible appends. Each validation range keeps its input
-    /// identity; rows are neither concatenated nor deduplicated here.
+    /// Extend only compatible rows. Each scoped range keeps its input identity;
+    /// rows are neither concatenated nor deduplicated here. The caller decides
+    /// whether the members' scopes may share one burst.
     /// Returns `Break` with the unchanged input at a compatibility boundary.
     pub(crate) fn merge_append(&mut self, other: Self) -> ControlFlow<Self> {
         if !self.can_merge_append(&other) {
@@ -275,12 +278,12 @@ impl ChangeBatch {
         if let (
             ChangePayload::Rows {
                 batches,
-                append_validations,
+                scoped_inputs,
                 ..
             },
             ChangePayload::Rows {
                 batches: other_batches,
-                append_validations: other_validations,
+                scoped_inputs: other_inputs,
                 ..
             },
         ) = (&mut self.payload, other.payload)
@@ -289,12 +292,12 @@ impl ChangeBatch {
             // Preserve the sum of the inputs' charged vector capacities rather
             // than growing geometrically while the owner retains their claims.
             batches.reserve_exact(other_batches.len());
-            append_validations.reserve_exact(other_validations.len());
+            scoped_inputs.reserve_exact(other_inputs.len());
             batches.extend(other_batches);
-            append_validations.extend(other_validations.into_iter().map(|mut validation| {
-                validation.batches.start += offset;
-                validation.batches.end += offset;
-                validation
+            scoped_inputs.extend(other_inputs.into_iter().map(|mut input| {
+                input.batches.start += offset;
+                input.batches.end += offset;
+                input
             }));
         }
         ControlFlow::Continue(())
@@ -305,9 +308,90 @@ impl ChangeBatch {
         &self.payload
     }
 
+    /// Each input's scope and chunk range; empty for CDC and unscoped appends.
     #[must_use]
-    pub fn replacement_scope(&self) -> Option<&SetKey> {
-        self.replace_set.as_ref()
+    pub fn scoped_inputs(&self) -> &[ScopedInput] {
+        match &self.payload {
+            ChangePayload::Rows { scoped_inputs, .. } => scoped_inputs,
+            ChangePayload::Cdc(_) => &[],
+        }
+    }
+
+    /// Each scoped input as a batch of its own, in order, sharing the Arrow
+    /// buffers. `None` for CDC input and unscoped appends, which record no members.
+    pub(crate) fn scoped_members(&self) -> Option<Vec<Self>> {
+        let ChangePayload::Rows {
+            schema,
+            batches,
+            scoped_inputs,
+        } = &self.payload
+        else {
+            return None;
+        };
+        if scoped_inputs.is_empty() {
+            return None;
+        }
+        Some(
+            scoped_inputs
+                .iter()
+                .map(|input| Self {
+                    payload: ChangePayload::Rows {
+                        schema: Arc::clone(schema),
+                        batches: batches[input.batches.clone()].to_vec(),
+                        scoped_inputs: vec![ScopedInput {
+                            scope: input.scope.clone(),
+                            batches: 0..input.batches.len(),
+                            replaces: input.replaces,
+                        }],
+                    },
+                    append_ingress: None,
+                })
+                .collect(),
+        )
+    }
+
+    /// One batch holding every member in order, sharing the Arrow buffers.
+    /// `None` when there are no members.
+    pub(crate) fn coalesce_members(members: &[Self]) -> Option<Self> {
+        let (first, rest) = members.split_first()?;
+        let ChangePayload::Rows {
+            schema,
+            batches,
+            scoped_inputs,
+        } = &first.payload
+        else {
+            return None;
+        };
+        let mut merged = Self {
+            payload: ChangePayload::Rows {
+                schema: Arc::clone(schema),
+                batches: batches.clone(),
+                scoped_inputs: scoped_inputs
+                    .iter()
+                    .map(|input| ScopedInput {
+                        scope: input.scope.clone(),
+                        batches: input.batches.clone(),
+                        replaces: input.replaces,
+                    })
+                    .collect(),
+            },
+            append_ingress: None,
+        };
+        for member in rest {
+            let copy = Self::coalesce_members(std::slice::from_ref(member))?;
+            if merged.merge_append(copy).is_break() {
+                return None;
+            }
+        }
+        Some(merged)
+    }
+
+    /// Scopes whose stored rows are deleted before this batch's rows are appended.
+    pub fn replaced_scopes(&self) -> impl Iterator<Item = &SetKey> {
+        self.scoped_inputs()
+            .iter()
+            .filter(|input| input.replaces)
+            .map(|input| &input.scope)
     }
 
     #[must_use]
@@ -326,7 +410,7 @@ impl ChangeBatch {
         let Some(batch) = self.cdc_batch() else {
             return false;
         };
-        if self.replace_set.is_some() || batch.is_heartbeat() || batch.rebuild_from_this_batch() {
+        if batch.is_heartbeat() || batch.rebuild_from_this_batch() {
             return false;
         }
         let Some(operations) = batch
@@ -341,44 +425,41 @@ impl ChangeBatch {
             .all(|operation| matches!(operation, Some("c" | "r" | "u")))
     }
 
-    /// Keep the scope attached to the whole payload when transforming its chunks.
+    /// Scopes stay attached to their chunk ranges when transforming the payload.
     #[must_use]
-    pub fn into_parts(self) -> (ChangePayload, Option<SetKey>) {
-        (self.payload, self.replace_set)
+    pub fn into_payload(self) -> ChangePayload {
+        self.payload
     }
 
     /// Estimate retained Arrow buffers and scope values, not a bound on process memory.
     /// Shared buffers can be counted more than once.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        let rows = match &self.payload {
+        match &self.payload {
             ChangePayload::Cdc(rows) => rows.rows.encoded_len(),
             ChangePayload::Rows {
                 batches,
-                append_validations,
+                scoped_inputs,
                 ..
             } => {
                 let metadata = batches
                     .capacity()
                     .saturating_mul(std::mem::size_of::<RecordBatch>())
                     .saturating_add(
-                        append_validations
+                        scoped_inputs
                             .capacity()
-                            .saturating_mul(std::mem::size_of::<AppendValidation>()),
+                            .saturating_mul(std::mem::size_of::<ScopedInput>()),
                     );
-                let scoped = append_validations
+                let scoped = scoped_inputs
                     .iter()
-                    .map(|validation| validation.scope.estimated_bytes())
+                    .map(|input| input.scope.estimated_bytes())
                     .fold(metadata, usize::saturating_add);
                 batches
                     .iter()
                     .map(RecordBatch::get_array_memory_size)
                     .fold(scoped, usize::saturating_add)
             }
-        };
-        self.replace_set
-            .as_ref()
-            .map_or(rows, |scope| rows.saturating_add(scope.estimated_bytes()))
+        }
     }
 
     #[must_use]
@@ -498,6 +579,52 @@ impl SetKey {
         &self.schema
     }
 
+    /// Schema indices of the grouping columns, ascending.
+    pub fn column_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.values.iter().map(|(index, _)| *index)
+    }
+
+    /// The values this scope fixes for `columns`, in that order, or `None`
+    /// unless the scope fixes every one of them to a non-NULL value.
+    #[must_use]
+    pub fn values_of(&self, columns: &[usize]) -> Option<Vec<ScalarValue>> {
+        columns
+            .iter()
+            .map(|column| {
+                self.values
+                    .iter()
+                    .find(|(index, value)| index == column && !value.is_null())
+                    .map(|(_, value)| value.clone())
+            })
+            .collect()
+    }
+
+    /// The scope's columns and values when `ScalarValue` equality is exactly
+    /// `IS NOT DISTINCT FROM` for every value, so equal scopes hash equally.
+    #[must_use]
+    pub(crate) fn hash_identity(&self) -> Option<ScopeIdentity> {
+        self.values
+            .iter()
+            .all(|(index, _)| supports_key_equality(self.schema.field(*index).data_type()))
+            .then(|| self.values.iter().cloned().unzip())
+    }
+
+    /// Whether one row of `batch`, which carries this scope's columns by name,
+    /// lies in the scope under `IS NOT DISTINCT FROM`.
+    ///
+    /// # Errors
+    /// Returns an error if a grouping column is missing or cannot be compared.
+    pub(crate) fn contains_row(&self, batch: &RecordBatch, row: usize) -> Result<bool> {
+        for (index, value) in &self.values {
+            let field = self.schema.field(*index);
+            let column = row_column(batch, field.name(), field.data_type(), row)?;
+            if !not_distinct(&column.as_ref(), &value.to_scalar()?)?.value(0) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Build the conjunction's predicates without interpreting dots in column names.
     #[must_use]
     pub fn filters(&self) -> Vec<Expr> {
@@ -533,6 +660,86 @@ impl SetKey {
         }
         Ok(())
     }
+}
+
+/// The delete predicate for replacing `scopes`: one expression, a balanced
+/// disjunction of every scope's conjunction, so a provider never has to combine
+/// a filter list. `None` when nothing is replaced.
+#[must_use]
+pub fn replaced_scope_filters<'a>(
+    scopes: impl IntoIterator<Item = &'a SetKey>,
+) -> Option<Vec<Expr>> {
+    let per_scope = scopes
+        .into_iter()
+        .filter_map(|scope| balanced_binary(scope.filters(), Expr::and))
+        .collect();
+    balanced_binary(per_scope, Expr::or).map(|predicate| vec![predicate])
+}
+
+/// A scope's grouping column indices and their values, ascending by index.
+pub(crate) type ScopeIdentity = (Vec<usize>, Vec<ScalarValue>);
+
+/// Key types whose SQL equality matches `ScalarValue` equality and hashing.
+pub(crate) fn supports_key_equality(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+/// One row of a named column, cast to the type the target schema declares.
+fn row_column(
+    batch: &RecordBatch,
+    name: &str,
+    data_type: &DataType,
+    row: usize,
+) -> Result<ArrayRef> {
+    let column = batch.column_by_name(name).ok_or_else(|| {
+        DataFusionError::Internal(format!("Stored rows lack grouping column '{name}'"))
+    })?;
+    let value = column.slice(row, 1);
+    if value.data_type() == data_type {
+        Ok(value)
+    } else {
+        Ok(cast(&value, data_type)?)
+    }
+}
+
+/// One stored value, typed as `schema` declares the named column.
+///
+/// # Errors
+/// Returns an error if the column is missing from either schema or cannot be cast.
+pub(crate) fn row_scalar(
+    schema: &Schema,
+    batch: &RecordBatch,
+    name: &str,
+    row: usize,
+) -> Result<ScalarValue> {
+    let field = schema.field_with_name(name)?;
+    ScalarValue::try_from_array(&row_column(batch, name, field.data_type(), row)?, 0)
 }
 
 fn validate_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {

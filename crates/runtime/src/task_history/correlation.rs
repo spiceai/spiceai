@@ -57,6 +57,16 @@ pub const TRACE_SPAN_NAME: &str = "query";
 /// is already in scope.
 const TRACE_SPAN_TARGET: &str = "runtime::query::trace";
 
+/// The field of that span that holds the trace id, as 32 lowercase hex digits.
+pub const TRACE_ID_FIELD: &str = "trace_id";
+
+/// Whether `metadata` is that of the span [`begin_task_trace`] returns, which
+/// is how a log sink other than the console finds the id a record belongs to.
+#[must_use]
+pub fn is_task_trace_span(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target() == TRACE_SPAN_TARGET && metadata.name() == TRACE_SPAN_NAME
+}
+
 /// Puts `task_span` on the task's trace id — recording a client-pinned one, or
 /// joining a trace already returned to the client — then returns the span that
 /// carries the same id onto the log.
@@ -317,6 +327,7 @@ mod tests {
             .with_trace_parent(Some(TraceParent {
                 trace_id: other_trace,
                 span_id,
+                trace_flags: TraceFlags::SAMPLED,
             }))
             .build();
         assert_eq!(same_trace_parent_span(&conflicting, PINNED), None);
@@ -326,6 +337,7 @@ mod tests {
             .with_trace_parent(Some(TraceParent {
                 trace_id: other_trace,
                 span_id,
+                trace_flags: TraceFlags::SAMPLED,
             }))
             .build();
         assert_eq!(

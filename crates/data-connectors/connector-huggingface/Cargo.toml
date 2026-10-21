@@ -18,6 +18,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Hugging Face Hub datasets data connector for Spice.ai runtime"
 
 [dependencies]

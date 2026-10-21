@@ -522,6 +522,10 @@ name = "hll_ndv_hashing"
 
 [[bench]]
 harness = false
+name = "segment_null_count"
+
+[[bench]]
+harness = false
 name = "pk_keyset_present_path"
 
 [[bench]]
@@ -531,6 +535,10 @@ name = "scan_view_reuse_qps"
 [[bench]]
 harness = false
 name = "listing_after_overwrite"
+
+[[bench]]
+harness = false
+name = "protected_snapshot_scan_capture"
 
 [lints]
 workspace = true

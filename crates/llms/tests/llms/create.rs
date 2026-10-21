@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use anyhow::Context;
-use async_openai::error::OpenAIError;
+use async_openai::{config::OpenAIConfig, error::OpenAIError};
 use aws_config::Region;
 use aws_credential_types::Credentials;
 use aws_sdk_credential_bridge::default_aws_config;
@@ -27,7 +27,8 @@ use llms::{
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
     google::{Google, auth},
-    openai::new_openai_client,
+    openai::{Openai, new_openai_client},
+    responses::Responses,
     xai::Xai,
 };
 use secrecy::SecretString;
@@ -78,23 +79,39 @@ pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyh
     )) as Arc<dyn Chat>)
 }
 
-pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+fn xai(model_id: &str) -> Result<Xai, anyhow::Error> {
     let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
         return Err(anyhow::anyhow!("SPICE_XAI_API_KEY not set"));
     };
-    Ok(Arc::new(Xai::new(Some(model_id), api_key.as_str())))
+    Ok(Xai::new(Some(model_id), api_key.as_str()))
 }
 
-pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    Ok(Arc::new(xai(model_id)?))
+}
+
+pub(crate) fn create_xai_responses(model_id: &str) -> Result<Arc<dyn Responses>, anyhow::Error> {
+    Ok(Arc::new(xai(model_id)?))
+}
+
+fn openai(model_id: &str) -> Openai<OpenAIConfig> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
-    Arc::new(new_openai_client(
+    new_openai_client(
         model_id.to_string(),
         None,
         api_key.as_deref(),
         None,
         None,
         None,
-    ))
+    )
+}
+
+pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
+    Arc::new(openai(model_id))
+}
+
+pub(crate) fn create_openai_responses(model_id: &str) -> Arc<dyn Responses> {
+    Arc::new(openai(model_id))
 }
 
 pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
@@ -122,6 +139,7 @@ pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError
             .as_ref(),
         None,
         None,
+        llms::chat::ReasoningDefault::default(),
     )
     .await
 }
