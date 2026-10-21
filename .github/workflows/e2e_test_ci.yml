@@ -2890,6 +2890,118 @@ jobs:
         with:
           working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
 
+  # The runner for the scenario scripts in test/spicescript. Built beside spiced
+  # rather than after it, so it adds nothing to the run's critical path.
+  build_spicescript:
+    name: Build spicescript
+    needs: check_changes
+    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+  # Runs the scenario scripts against this run's spiced and spice CLI.
+  test_spicescript:
+    name: ${{ matrix.name }}
+    needs: [build, build_spicescript]
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Scripts that pass: any failure fails the job.
+          - { name: 'spicescript: scripts', args: test/spicescript }
+          # Scripts that reproduce open bugs: each must fail exactly as its
+          # group's recordings/expected-failures.json says, so a fix or a
+          # change in how a bug shows also fails the job.
+          - { name: 'spicescript: known failing', args: --max-wait 30s test/spicescript/known-failing }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download spicescript
+        id: spicescript
+        uses: ./.github/actions/build-tool
+        with:
+          package: spicescript
+
+      # Sources run in containers; log in so image pulls are not rate limited.
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Object-store sources (rustfs) are managed with the aws CLI.
+      - name: Install the AWS CLI
+        run: |
+          command -v unzip >/dev/null || { sudo apt-get update && sudo apt-get install -y unzip; }
+          if ! command -v aws >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/awscliv2.zip" https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install"
+          fi
+
+      # Iceberg sources and dbgen write and read through the DuckDB CLI. The
+      # DuckLake source fetches the release matching spiced's embedded DuckDB.
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/duckdb.zip" \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+          unzip -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+
+      - name: Run scenario scripts
+        run: |
+          "${{ steps.spicescript.outputs.path }}" --jobs 8 \
+            --spiced "$(command -v spiced)" \
+            --spice-cli "$(command -v spice)" \
+            --work-dir "$RUNNER_TEMP/spicescript" \
+            ${{ matrix.args }}
+
+      - name: Upload instance logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: spicescript-logs-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/spicescript/**/spiced.log
+            ${{ runner.temp }}/spicescript/**/spicepod.yaml
+            ${{ runner.temp }}/spicescript/**/slt-*.txt
+          retention-days: 7
+
   # Stable, matrix-proof summary check. It succeeds only if every E2E job above
   # succeeded (or was skipped), so the whole matrix is gated by one ruleset entry
   # rather than dozens of shifting matrix names. On a pull request it is skipped
@@ -2928,6 +3040,8 @@ jobs:
       - graceful_shutdown_test_append
       - graceful_shutdown_test_full
       - test_cold_start_unkeyed_append
+      - build_spicescript
+      - test_spicescript
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

@@ -1,0 +1,43 @@
+[package]
+description = "Runs YAML scenario scripts against a prebuilt spiced and checks every answer against an independent oracle"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "spicescript"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow = { workspace = true, features = ["csv"] }
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+async-trait.workspace = true
+axum.workspace = true
+bollard = "0.18.1"
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+flight_client = { path = "../../crates/flight_client" }
+futures.workspace = true
+hex.workspace = true
+md-5 = "0.10.6"
+humantime.workspace = true
+indexmap = { workspace = true, features = ["serde"] }
+nix = { workspace = true, features = ["signal"] }
+parking_lot.workspace = true
+parquet = { workspace = true, features = ["arrow"] }
+regex.workspace = true
+secrecy.workspace = true
+reqwest.workspace = true
+result-compare = { path = "../../crates/result-compare" }
+serde.workspace = true
+serde_json.workspace = true
+sqllogictest = "0.29.1"
+tokio = { workspace = true, features = ["full"] }
+tonic.workspace = true
+yaml = { path = "../../crates/yaml" }
+
+[lints]
+workspace = true
