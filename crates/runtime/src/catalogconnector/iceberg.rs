@@ -731,8 +731,10 @@ const S3_GLOBAL_ENDPOINT: &str = "https://s3.amazonaws.com";
 /// came from the catalog. The catalog also chooses every location the `FileIO`
 /// reads (metadata, manifests, data files). A `file://` location reads the local
 /// filesystem, so it is refused unless it is inside the `warehouse` the operator
-/// configured. A redirect from a catalog-vended endpoint is checked again before
-/// it is followed, and refused when the `Location` is internal. Vended
+/// configured. A redirect from a catalog-vended endpoint, or from a host a
+/// catalog region actually rewrites, is checked again before it is followed
+/// and refused when the `Location` is internal. An operator endpoint whose
+/// host that region does not change keeps its own redirect behavior. Vended
 /// credentials are passed through unchanged.
 #[derive(Debug, Serialize, Deserialize)]
 struct VendedEndpointGuard {
@@ -903,17 +905,32 @@ impl GuardedStorage {
 
     /// Catalog component when a redirect from this storage must be refused.
     ///
-    /// Absent when every endpoint is the operator's, and when
+    /// A catalog endpoint always qualifies. A catalog region qualifies only for
+    /// a location where bucket removal leaves the global AWS endpoint, which is
+    /// when the client substitutes that region into the host. An operator
+    /// endpoint such as a private S3-compatible URL stays outside the guard
+    /// when the region does not change it. Absent when
     /// `SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS` is set. Read on each call so the
     /// override applies without rebuilding the catalog.
-    fn redirect_component(&self) -> Option<String> {
-        if url_table::allow_private_hosts()
-            || (self.vended_endpoints.is_empty() && self.vended_s3_region.is_none())
-        {
+    fn redirect_component(&self, location: &str) -> Option<String> {
+        if url_table::allow_private_hosts() || !self.redirect_guard_applies(location) {
             None
         } else {
             Some(self.component.clone())
         }
+    }
+
+    fn redirect_guard_applies(&self, location: &str) -> bool {
+        if !self.vended_endpoints.is_empty() {
+            return true;
+        }
+        let Some(region) = &self.vended_s3_region else {
+            return false;
+        };
+        let Some(bucket) = s3_location_bucket(location) else {
+            return false;
+        };
+        s3_region_is_substituted(&region.endpoint, &bucket)
     }
 
     /// Refuses a catalog endpoint whose effective host is internal.
@@ -1031,22 +1048,22 @@ impl GuardedStorage {
 impl Storage for GuardedStorage {
     async fn exists(&self, path: &str) -> iceberg::Result<bool> {
         self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(), self.inner.exists(path)).await
+        vended_redirect::scope(self.redirect_component(path), self.inner.exists(path)).await
     }
 
     async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
         self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(), self.inner.metadata(path)).await
+        vended_redirect::scope(self.redirect_component(path), self.inner.metadata(path)).await
     }
 
     async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
         self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(), self.inner.read(path)).await
+        vended_redirect::scope(self.redirect_component(path), self.inner.read(path)).await
     }
 
     async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
         self.before_io(path).await?;
-        let component = self.redirect_component();
+        let component = self.redirect_component(path);
         let inner = vended_redirect::scope(component.clone(), self.inner.reader(path)).await?;
         Ok(Box::new(vended_redirect::ScopedFileRead {
             inner,
@@ -1056,12 +1073,12 @@ impl Storage for GuardedStorage {
 
     async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
         self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(), self.inner.write(path, bs)).await
+        vended_redirect::scope(self.redirect_component(path), self.inner.write(path, bs)).await
     }
 
     async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
         self.before_io(path).await?;
-        let component = self.redirect_component();
+        let component = self.redirect_component(path);
         let inner = vended_redirect::scope(component.clone(), self.inner.writer(path)).await?;
         Ok(Box::new(vended_redirect::ScopedFileWrite {
             inner,
@@ -1071,22 +1088,30 @@ impl Storage for GuardedStorage {
 
     async fn delete(&self, path: &str) -> iceberg::Result<()> {
         self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(), self.inner.delete(path)).await
+        vended_redirect::scope(self.redirect_component(path), self.inner.delete(path)).await
     }
 
     async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
         self.before_io(path).await?;
-        vended_redirect::scope(self.redirect_component(), self.inner.delete_prefix(path)).await
+        vended_redirect::scope(
+            self.redirect_component(path),
+            self.inner.delete_prefix(path),
+        )
+        .await
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> iceberg::Result<()> {
         let mut collected = Vec::new();
+        let mut component = None;
         while let Some(path) = paths.next().await {
             self.before_io(&path).await?;
+            if component.is_none() {
+                component = self.redirect_component(&path);
+            }
             collected.push(path);
         }
         vended_redirect::scope(
-            self.redirect_component(),
+            component,
             self.inner
                 .delete_stream(futures::stream::iter(collected).boxed()),
         )
@@ -3265,6 +3290,38 @@ mod tests {
             assert!(
                 !err.to_string().contains("redirected storage"),
                 "an operator endpoint redirect must be followed, got: {err}"
+            );
+            assert!(
+                !redirector.requests.lock().is_empty(),
+                "the operator endpoint was not contacted"
+            );
+            assert!(
+                !sentinel.requests.lock().is_empty(),
+                "the operator redirect was not followed: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn operator_endpoint_redirect_is_followed_when_catalog_region_does_not_change_the_host()
+         {
+            let sentinel = start_sentinel().await;
+            let redirector = start_redirector(&format!("{}/secret", sentinel.endpoint)).await;
+            let mut catalog_config = vended_config("http://127.0.0.1:9");
+            let config = catalog_config.as_object_mut().expect("config object");
+            config.remove("s3.endpoint");
+            config.insert("s3.region".to_string(), json!("us-west-2"));
+            let catalog_uri = start_rest_catalog(&catalog_config).await;
+            let mut props = HashMap::new();
+            props.insert("s3.endpoint".to_string(), redirector.endpoint.clone());
+            props.insert("s3.path-style-access".to_string(), "true".to_string());
+            props.insert("s3.access-key-id".to_string(), "AKIATEST".to_string());
+            props.insert("s3.secret-access-key".to_string(), "testsecret".to_string());
+            let err = read_manifest_list(catalog_uri, props)
+                .await
+                .expect_err("the sentinel answers 404");
+            assert!(
+                !err.to_string().contains("redirected storage"),
+                "a catalog region that does not change the operator endpoint must not refuse its redirect, got: {err}"
             );
             assert!(
                 !redirector.requests.lock().is_empty(),
