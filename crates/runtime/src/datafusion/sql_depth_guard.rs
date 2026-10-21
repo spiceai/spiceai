@@ -38,8 +38,9 @@ use std::ops::ControlFlow;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::parser::{CopyToSource, DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Array, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement as SQLStatement, Value,
-    Visit, Visitor,
+    AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments,
+    JsonPathElem, ListAggOnOverflow, Statement as SQLStatement, Subscript, Value, Visit, Visitor,
+    WindowFrameBound, WindowType,
 };
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 
@@ -288,32 +289,66 @@ fn max_paren_depth(s: &str) -> usize {
 
 /// Push the direct child expressions of `expr` onto `out`.
 ///
-/// Covers every `sqlparser` [`Expr`] variant that holds nested expressions; the
-/// unbounded attack shapes (binary/unary chains, nested casts, `CASE`, function
-/// arguments, collections) are enumerated explicitly. Variants that hold a
-/// subquery are deliberately not descended here — subquery nesting is already
-/// bounded by the parser's `recursion_limit`, and a subquery's own expressions
-/// are reached by the statement-level visitor.
+/// Every [`Expr`] variant that holds another expression is named. A wildcard
+/// would treat a new variant as a leaf, and the statement visitor would then
+/// walk that chain recursively — one frame per level, each measurement
+/// starting at depth 1 — which is the overflow this guard exists to prevent.
+/// Infix forms such as `AT TIME ZONE` parse iteratively, the same way a flat
+/// `OR` chain does, so they are not bounded by the parser's `recursion_limit`.
+///
+/// Subqueries are not descended. Their nesting is bounded by that recursion
+/// limit, and the statement visitor measures each subquery as its own tree.
 fn push_child_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match expr {
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString(_)
+        | Expr::Wildcard(_)
+        | Expr::QualifiedWildcard(_, _)
+        | Expr::MatchAgainst { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(_) => {}
+        Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Extract { expr: inner, .. }
+        | Expr::Ceil { expr: inner, .. }
+        | Expr::Floor { expr: inner, .. }
+        | Expr::IsNormalized { expr: inner, .. }
+        | Expr::Prefixed { value: inner, .. }
+        | Expr::Named { expr: inner, .. }
+        | Expr::OuterJoin(inner)
+        | Expr::Prior(inner)
+        | Expr::InSubquery { expr: inner, .. } => out.push(inner.as_ref()),
         Expr::BinaryOp { left, right, .. }
         | Expr::IsDistinctFrom(left, right)
-        | Expr::IsNotDistinctFrom(left, right) => {
+        | Expr::IsNotDistinctFrom(left, right)
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. } => {
             out.push(left.as_ref());
             out.push(right.as_ref());
         }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::Collate { expr, .. }
-        | Expr::IsFalse(expr)
-        | Expr::IsNotFalse(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsNotTrue(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsUnknown(expr)
-        | Expr::IsNotUnknown(expr) => out.push(expr.as_ref()),
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            out.push(timestamp.as_ref());
+            out.push(time_zone.as_ref());
+        }
+        Expr::Position { expr, r#in } => {
+            out.push(expr.as_ref());
+            out.push(r#in.as_ref());
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -332,6 +367,57 @@ fn push_child_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             out.push(expr.as_ref());
             out.extend(list.iter());
         }
+        Expr::InUnnest {
+            expr, array_expr, ..
+        } => {
+            out.push(expr.as_ref());
+            out.push(array_expr.as_ref());
+        }
+        Expr::Convert { expr, styles, .. } => {
+            out.push(expr.as_ref());
+            out.extend(styles.iter());
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            out.push(expr.as_ref());
+            if let Some(from) = substring_from {
+                out.push(from.as_ref());
+            }
+            if let Some(len) = substring_for {
+                out.push(len.as_ref());
+            }
+        }
+        Expr::Trim {
+            trim_what,
+            expr,
+            trim_characters,
+            ..
+        } => {
+            if let Some(what) = trim_what {
+                out.push(what.as_ref());
+            }
+            out.push(expr.as_ref());
+            if let Some(characters) = trim_characters {
+                out.extend(characters.iter());
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            out.push(expr.as_ref());
+            out.push(overlay_what.as_ref());
+            out.push(overlay_from.as_ref());
+            if let Some(len) = overlay_for {
+                out.push(len.as_ref());
+            }
+        }
         Expr::Case {
             operand,
             conditions,
@@ -349,29 +435,143 @@ fn push_child_exprs<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
                 out.push(e.as_ref());
             }
         }
-        Expr::Tuple(exprs) | Expr::Array(Array { elem: exprs, .. }) => out.extend(exprs.iter()),
-        Expr::Function(function) => {
-            if let FunctionArguments::List(list) = &function.args {
-                for arg in &list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                        | FunctionArg::Named {
-                            arg: FunctionArgExpr::Expr(e),
-                            ..
+        Expr::Tuple(exprs) | Expr::Struct { values: exprs, .. } => out.extend(exprs.iter()),
+        Expr::Array(array) => out.extend(array.elem.iter()),
+        Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
+            for set in sets {
+                out.extend(set.iter());
+            }
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            out.push(root.as_ref());
+            for access in access_chain {
+                match access {
+                    AccessExpr::Dot(field) => out.push(field),
+                    AccessExpr::Subscript(Subscript::Index { index }) => out.push(index),
+                    AccessExpr::Subscript(Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride,
+                    }) => {
+                        if let Some(bound) = lower_bound {
+                            out.push(bound);
                         }
-                        | FunctionArg::ExprNamed {
-                            arg: FunctionArgExpr::Expr(e),
-                            ..
-                        } => out.push(e),
-                        _ => {}
+                        if let Some(bound) = upper_bound {
+                            out.push(bound);
+                        }
+                        if let Some(bound) = stride {
+                            out.push(bound);
+                        }
                     }
                 }
             }
+        }
+        Expr::JsonAccess { value, path } => {
+            out.push(value.as_ref());
+            for element in &path.path {
+                match element {
+                    JsonPathElem::Dot { .. } => {}
+                    JsonPathElem::Bracket { key } | JsonPathElem::ColonBracket { key } => {
+                        out.push(key);
+                    }
+                }
+            }
+        }
+        Expr::Interval(interval) => out.push(interval.value.as_ref()),
+        Expr::Dictionary(fields) => {
+            for field in fields {
+                out.push(field.value.as_ref());
+            }
+        }
+        Expr::Map(map) => {
+            for entry in &map.entries {
+                out.push(entry.key.as_ref());
+                out.push(entry.value.as_ref());
+            }
+        }
+        Expr::Lambda(lambda) => out.push(lambda.body.as_ref()),
+        Expr::MemberOf(member) => {
+            out.push(member.value.as_ref());
+            out.push(member.array.as_ref());
+        }
+        Expr::Function(function) => {
+            push_function_arguments(&function.parameters, out);
+            push_function_arguments(&function.args, out);
             if let Some(filter) = &function.filter {
                 out.push(filter.as_ref());
             }
+            for order in &function.within_group {
+                out.push(&order.expr);
+            }
+            if let Some(WindowType::WindowSpec(spec)) = &function.over {
+                out.extend(spec.partition_by.iter());
+                for order in &spec.order_by {
+                    out.push(&order.expr);
+                }
+                if let Some(frame) = &spec.window_frame {
+                    push_window_bound(&frame.start_bound, out);
+                    if let Some(end) = &frame.end_bound {
+                        push_window_bound(end, out);
+                    }
+                }
+            }
         }
-        _ => {}
+    }
+}
+
+fn push_function_arguments<'a>(args: &'a FunctionArguments, out: &mut Vec<&'a Expr>) {
+    let FunctionArguments::List(list) = args else {
+        return;
+    };
+    for arg in &list.args {
+        match arg {
+            FunctionArg::Unnamed(arg) => push_function_arg_expr(arg, out),
+            FunctionArg::Named { arg, .. } => push_function_arg_expr(arg, out),
+            FunctionArg::ExprNamed { name, arg, .. } => {
+                out.push(name);
+                push_function_arg_expr(arg, out);
+            }
+        }
+    }
+    for clause in &list.clauses {
+        match clause {
+            FunctionArgumentClause::OrderBy(order) => {
+                for item in order {
+                    out.push(&item.expr);
+                }
+            }
+            FunctionArgumentClause::Limit(limit) => out.push(limit),
+            FunctionArgumentClause::Having(bound) => out.push(&bound.1),
+            FunctionArgumentClause::OnOverflow(ListAggOnOverflow::Truncate {
+                filler: Some(filler),
+                ..
+            }) => out.push(filler.as_ref()),
+            FunctionArgumentClause::IgnoreOrRespectNulls(_)
+            | FunctionArgumentClause::OnOverflow(_)
+            | FunctionArgumentClause::Separator(_)
+            | FunctionArgumentClause::JsonNullClause(_)
+            | FunctionArgumentClause::JsonReturningClause(_) => {}
+        }
+    }
+}
+
+fn push_function_arg_expr<'a>(arg: &'a FunctionArgExpr, out: &mut Vec<&'a Expr>) {
+    match arg {
+        FunctionArgExpr::Expr(expr) => out.push(expr),
+        FunctionArgExpr::Wildcard
+        | FunctionArgExpr::QualifiedWildcard(_)
+        | FunctionArgExpr::WildcardWithOptions(_) => {}
+    }
+}
+
+fn push_window_bound<'a>(bound: &'a WindowFrameBound, out: &mut Vec<&'a Expr>) {
+    match bound {
+        WindowFrameBound::CurrentRow => {}
+        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+            if let Some(expr) = expr {
+                out.push(expr.as_ref());
+            }
+        }
     }
 }
 
@@ -423,6 +623,53 @@ mod tests {
         let terms = vec!["1 = 1"; MAX_SQL_EXPR_DEPTH + 500];
         let sql = format!("SELECT * FROM t WHERE {}", terms.join(" AND "));
         let _ = depth_check(&sql).expect_err("deep AND chain is rejected");
+    }
+
+    /// `AT TIME ZONE` is an infix operator, so a long chain parses without
+    /// using the parser's recursion limit and is still a deep expression tree.
+    #[test]
+    fn rejects_deep_at_time_zone_chain() {
+        let zones = " AT TIME ZONE 'UTC'".repeat(MAX_SQL_EXPR_DEPTH + 50);
+        let sql = format!("SELECT TIMESTAMP '2020-01-01'{zones}");
+        let err = depth_check(&sql).expect_err("deep AT TIME ZONE chain is rejected");
+        assert!(
+            err.to_string().contains("nested more than"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A short `AT TIME ZONE` chain is a normal expression.
+    #[test]
+    fn allows_short_at_time_zone_chain() {
+        depth_check("SELECT TIMESTAMP '2020-01-01' AT TIME ZONE 'UTC' AT TIME ZONE 'UTC'")
+            .expect("a short AT TIME ZONE chain is under the cap");
+    }
+
+    /// Nested `TRIM` is a deep tree once the parser's recursion limit allows it.
+    /// The default limit is 50, below the expression cap, so this builds the
+    /// tree the parser would emit if that limit were raised.
+    #[test]
+    fn rejects_deep_trim_nesting() {
+        let mut expr = Expr::value(Value::SingleQuotedString("x".to_string()));
+        for _ in 0..(MAX_SQL_EXPR_DEPTH + 50) {
+            expr = Expr::Trim {
+                trim_where: None,
+                trim_what: None,
+                expr: Box::new(expr),
+                trim_characters: None,
+            };
+        }
+        let err = check_expr_depth(&expr).expect_err("deep TRIM nesting is rejected");
+        assert!(
+            err.to_string().contains("nested more than"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A shallow `TRIM` still parses and passes.
+    #[test]
+    fn allows_shallow_trim() {
+        depth_check("SELECT trim(both 'x' from trim('y'))").expect("a shallow TRIM passes");
     }
 
     /// A moderately long chain under the cap still passes the guard.
