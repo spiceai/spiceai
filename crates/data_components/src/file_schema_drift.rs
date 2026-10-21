@@ -1,0 +1,470 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Detects file datasets whose source files no longer carry a registered column.
+//!
+//! A file dataset's schema is resolved once, at registration. Every later scan reads the
+//! current files against that schema, and the scan fills a registered column that a file
+//! lacks with `NULL`. That is correct for added-column evolution, where older files predate
+//! a column that newer files carry. It is wrong when the column is gone from *every*
+//! scanned file, which is what an upstream rename or drop looks like: queries return `NULL`
+//! for the column and a full acceleration refresh overwrites the loaded data with `NULL`s,
+//! with no error and the dataset still `Ready`.
+//!
+//! [`FileSchemaDriftGuard`] checks each scan's files for the projected registered columns.
+//! A column that no scanned file carries is reported:
+//!
+//! - in a scan that feeds an acceleration refresh (the refresh session carries
+//!   [`AccelerationRefreshScan`]), the scan fails, so the refresh fails and keeps the last
+//!   loaded data;
+//! - in any other scan, a `WARN` names the dataset and the columns once per change, and the
+//!   query still returns `NULL` for them.
+
+use std::{
+    collections::{BTreeSet, hash_map::DefaultHasher},
+    fmt::Debug,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+
+use arrow_schema::SchemaRef;
+use async_trait::async_trait;
+use datafusion::{
+    catalog::{ScanArgs, ScanResult, Session},
+    common::{
+        Constraints, Statistics,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
+    datasource::{TableProvider, TableType, file_format::FileFormat},
+    error::{DataFusionError, Result as DFResult},
+    execution::{config::SessionConfig, object_store::ObjectStoreUrl},
+    logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
+    physical_plan::ExecutionPlan,
+    prelude::Expr,
+};
+use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
+use object_store::ObjectMeta;
+use parking_lot::Mutex;
+
+/// How many files' schemas are read per round while looking for a column. The newest file
+/// is read alone first because it normally carries every registered column.
+const SCHEMA_PROBE_CHUNK: usize = 64;
+
+/// `SessionConfig` extension marking a session whose scans feed an acceleration refresh.
+///
+/// [`FileSchemaDriftGuard`] fails such a scan, rather than warning, when a registered column
+/// is missing from every scanned file, so the refresh keeps the last loaded data instead of
+/// replacing it with `NULL`s.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AccelerationRefreshScan;
+
+/// Marks `config` as an acceleration refresh session. See [`AccelerationRefreshScan`].
+pub fn mark_acceleration_refresh(config: &mut SessionConfig) {
+    config.set_extension(Arc::new(AccelerationRefreshScan));
+}
+
+/// Whether `state` is an acceleration refresh session. See [`AccelerationRefreshScan`].
+#[must_use]
+pub fn is_acceleration_refresh(state: &dyn Session) -> bool {
+    state
+        .config()
+        .get_extension::<AccelerationRefreshScan>()
+        .is_some()
+}
+
+/// Registered columns missing from every file of one scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Drift {
+    missing: Vec<String>,
+    /// One scanned file, named in the message so the user can inspect it.
+    example_file: String,
+}
+
+#[derive(Debug, Default)]
+struct GuardState {
+    /// Fingerprint of the last checked (columns, files) pair and its result, so repeated
+    /// scans over unchanged files read no file footers.
+    last_check: Option<(u64, Option<Drift>)>,
+    /// The missing columns last reported by `WARN`; cleared when a scan finds none, so a
+    /// column that goes missing again is reported again.
+    last_warned: Option<Vec<String>>,
+}
+
+/// Checks a file dataset's scans for registered columns missing from every scanned file.
+/// See the [module docs](self).
+#[derive(Debug)]
+pub struct FileSchemaDriftGuard {
+    dataset_name: String,
+    /// The registered columns stored in the data files, without partition or metadata
+    /// columns.
+    file_schema: SchemaRef,
+    format: Arc<dyn FileFormat>,
+    state: Mutex<GuardState>,
+}
+
+impl FileSchemaDriftGuard {
+    #[must_use]
+    pub fn new(
+        dataset_name: impl Into<String>,
+        file_schema: SchemaRef,
+        format: Arc<dyn FileFormat>,
+    ) -> Self {
+        Self {
+            dataset_name: dataset_name.into(),
+            file_schema,
+            format,
+            state: Mutex::new(GuardState::default()),
+        }
+    }
+
+    /// Checks the files `plan` scans for the registered file columns `projection` selects
+    /// from `table_schema` (all of them when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DataFusionError::Plan`] naming the missing columns when `state` is an
+    /// acceleration refresh session ([`is_acceleration_refresh`]) and a projected registered
+    /// column is missing from every scanned file, or an error reading a file's schema.
+    pub async fn check_scan(
+        &self,
+        state: &dyn Session,
+        table_schema: &SchemaRef,
+        projection: Option<&[usize]>,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> DFResult<()> {
+        let columns = self.projected_file_columns(table_schema, projection);
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let Some((store_url, mut files)) = scanned_files(plan) else {
+            return Ok(());
+        };
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let fingerprint = fingerprint(&columns, &files);
+        let cached = self
+            .state
+            .lock()
+            .last_check
+            .as_ref()
+            .filter(|(fp, _)| *fp == fingerprint)
+            .map(|(_, drift)| drift.clone());
+        let drift = match cached {
+            Some(drift) => drift,
+            None => {
+                // Newest first: the registered schema was inferred from the newest file, so
+                // it normally carries every column and ends the probe after one footer.
+                files.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+                let store = state.runtime_env().object_store(&store_url)?;
+                let drift = self.find_drift(state, &store, columns, &files).await?;
+                self.state.lock().last_check = Some((fingerprint, drift.clone()));
+                drift
+            }
+        };
+
+        let Some(drift) = drift else {
+            self.state.lock().last_warned = None;
+            return Ok(());
+        };
+
+        if is_acceleration_refresh(state) {
+            return Err(DataFusionError::Plan(refresh_error_message(
+                &self.dataset_name,
+                &drift,
+            )));
+        }
+
+        let mut guard_state = self.state.lock();
+        if guard_state.last_warned.as_ref() != Some(&drift.missing) {
+            tracing::warn!("{}", read_warning_message(&self.dataset_name, &drift));
+            guard_state.last_warned = Some(drift.missing);
+        }
+        Ok(())
+    }
+
+    /// The registered file columns `projection` selects from `table_schema`, in table order.
+    fn projected_file_columns(
+        &self,
+        table_schema: &SchemaRef,
+        projection: Option<&[usize]>,
+    ) -> Vec<String> {
+        let is_file_column = |name: &str| self.file_schema.field_with_name(name).is_ok();
+        match projection {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|&i| table_schema.fields().get(i))
+                .map(|f| f.name().clone())
+                .filter(|name| is_file_column(name))
+                .collect(),
+            None => table_schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .filter(|name| is_file_column(name))
+                .collect(),
+        }
+    }
+
+    /// Reads the files' schemas, newest first, until every column in `columns` is found.
+    /// Returns the columns no file carries.
+    async fn find_drift(
+        &self,
+        state: &dyn Session,
+        store: &Arc<dyn object_store::ObjectStore>,
+        columns: Vec<String>,
+        files: &[ObjectMeta],
+    ) -> DFResult<Option<Drift>> {
+        let mut remaining: BTreeSet<String> = columns.into_iter().collect();
+        let (newest, rest) = files.split_at(files.len().min(1));
+        for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CHUNK)) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let schema = self.format.infer_schema(state, store, chunk).await?;
+            remaining.retain(|name| schema.field_with_name(name).is_err());
+            if remaining.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        // Keep the registered order so messages are stable.
+        let missing: Vec<String> = self
+            .file_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .filter(|name| remaining.contains(name))
+            .collect();
+        Ok(Some(Drift {
+            missing,
+            example_file: files
+                .first()
+                .map(|f| f.location.to_string())
+                .unwrap_or_default(),
+        }))
+    }
+}
+
+/// The object store and files of every file scan in `plan`, or `None` when `plan` scans no
+/// files (or scans more than one object store, which a listing table never does).
+fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> Option<(ObjectStoreUrl, Vec<ObjectMeta>)> {
+    let mut store_url = None;
+    let mut files: Vec<ObjectMeta> = Vec::new();
+    let mut mixed_stores = false;
+    let _ = plan.apply(|node| {
+        if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+            && let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>()
+        {
+            match &store_url {
+                None => store_url = Some(config.object_store_url.clone()),
+                Some(url) if *url != config.object_store_url => mixed_stores = true,
+                Some(_) => {}
+            }
+            for group in &config.file_groups {
+                files.extend(group.files().iter().map(|f| f.object_meta.clone()));
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if mixed_stores {
+        return None;
+    }
+    // A file split into byte ranges appears once per range.
+    files.sort_by(|a, b| a.location.cmp(&b.location));
+    files.dedup_by(|a, b| a.location == b.location);
+    store_url.map(|url| (url, files))
+}
+
+fn fingerprint(columns: &[String], files: &[ObjectMeta]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    columns.hash(&mut hasher);
+    for file in files {
+        file.location.as_ref().hash(&mut hasher);
+        file.size.hash(&mut hasher);
+        file.last_modified.hash(&mut hasher);
+        file.e_tag.hash(&mut hasher);
+        file.version.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn quoted(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn column_noun(columns: &[String]) -> &'static str {
+    if columns.len() == 1 { "column" } else { "columns" }
+}
+
+fn refresh_error_message(dataset: &str, drift: &Drift) -> String {
+    let noun = column_noun(&drift.missing);
+    format!(
+        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'). The source schema changed after the dataset was registered, for example a column was renamed or dropped. The refresh was stopped so the accelerated data is not replaced with NULL values; the last loaded data is still served. Restore the {noun} in the source files, or reload the dataset to adopt the new schema.",
+        cols = quoted(&drift.missing),
+        file = drift.example_file,
+    )
+}
+
+fn read_warning_message(dataset: &str, drift: &Drift) -> String {
+    let noun = column_noun(&drift.missing);
+    format!(
+        "Dataset '{dataset}': registered {noun} {cols} missing from every source file scanned (for example '{file}'), so queries return NULL for {them}. The source schema changed after the dataset was registered, for example a column was renamed or dropped. Restore the {noun} in the source files, or reload the dataset to adopt the new schema.",
+        cols = quoted(&drift.missing),
+        file = drift.example_file,
+        them = if drift.missing.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// A file dataset's table with its scans checked by a [`FileSchemaDriftGuard`]. Every other
+/// call passes through to `inner`.
+#[derive(Debug)]
+pub struct FileSchemaDriftCheckedTable {
+    inner: Arc<dyn TableProvider>,
+    guard: FileSchemaDriftGuard,
+}
+
+impl FileSchemaDriftCheckedTable {
+    #[must_use]
+    pub fn new(inner: Arc<dyn TableProvider>, guard: FileSchemaDriftGuard) -> Self {
+        Self { inner, guard }
+    }
+
+    /// The table this one checks.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+        &self.inner
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+#[async_trait]
+impl TableProvider for FileSchemaDriftCheckedTable {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<std::borrow::Cow<'_, LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let plan = self.inner.scan(state, projection, filters, limit).await?;
+        self.guard
+            .check_scan(
+                state,
+                &self.inner.schema(),
+                projection.map(Vec::as_slice),
+                &plan,
+            )
+            .await?;
+        Ok(plan)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DFResult<ScanResult> {
+        let projection = args.projection();
+        let result = self.inner.scan_with_args(state, args).await?;
+        self.guard
+            .check_scan(state, &self.inner.schema(), projection, result.plan())
+            .await?;
+        Ok(result)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
+}

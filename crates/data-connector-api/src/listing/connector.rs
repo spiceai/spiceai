@@ -17,6 +17,7 @@ limitations under the License.
 use crate::federated::FederatedTableProvider;
 use crate::parameters::ConnectorContext;
 use data_components::cdc::{AccelerationContents, ChangesStream};
+use data_components::file_schema_drift::{FileSchemaDriftCheckedTable, FileSchemaDriftGuard};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -109,6 +110,12 @@ pub struct ListingTableTemplate {
     object_store: Arc<dyn ObjectStore>,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
     extension: String,
+    /// The dataset name, for schema-drift messages.
+    dataset_name: String,
+    /// Whether scans are checked for registered columns missing from every scanned file
+    /// (see [`data_components::file_schema_drift`]). Off when `schema_source_path` names the
+    /// schema: its columns need not appear in the data files.
+    check_schema_drift: bool,
 }
 
 impl ListingTableTemplate {
@@ -163,7 +170,7 @@ impl ListingTableTemplate {
         table: Arc<ListingTable>,
         table_path: ListingTableUrl,
     ) -> Arc<dyn TableProvider> {
-        if has_location_metadata(table.options()) {
+        let table: Arc<dyn TableProvider> = if has_location_metadata(table.options()) {
             Arc::new(LocationPruningListingTable::new(
                 table,
                 Arc::clone(&self.object_store),
@@ -173,7 +180,23 @@ impl ListingTableTemplate {
             ))
         } else {
             table
+        };
+        match self.schema_drift_guard() {
+            Some(guard) => Arc::new(FileSchemaDriftCheckedTable::new(table, guard)),
+            None => table,
         }
+    }
+
+    /// The guard that checks this dataset's scans for registered columns missing from every
+    /// scanned file, or `None` when the check is off.
+    fn schema_drift_guard(&self) -> Option<FileSchemaDriftGuard> {
+        self.check_schema_drift.then(|| {
+            FileSchemaDriftGuard::new(
+                self.dataset_name.clone(),
+                Arc::clone(&self.schema),
+                Arc::clone(&self.options.format),
+            )
+        })
     }
 }
 
@@ -1572,6 +1595,10 @@ pub trait ListingTableConnector: DataConnector {
                 "Enabled single-file ETag/Version caching for {}",
                 dataset.name
             );
+            let cached_table = match template.schema_drift_guard() {
+                Some(guard) => cached_table.with_schema_drift_guard(guard),
+                None => cached_table,
+            };
             return Ok(Arc::new(cached_table));
         }
 
@@ -1788,6 +1815,10 @@ pub trait ListingTableConnector: DataConnector {
             schema: final_schema,
             object_store,
             extension: extension.to_string(),
+            dataset_name: dataset.name.to_string(),
+            // An `ORC` collection infers from the scan path and ignores `schema_source_path`.
+            check_schema_drift: (table_path.is_collection() && listing_extension_is_orc(extension))
+                || !dataset.params.contains_key("schema_source_path"),
         })
     }
 

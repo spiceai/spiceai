@@ -92,6 +92,8 @@ pub struct S3SingleFileCached {
     file_path: ObjectStorePath,
     cached_metadata: RwLock<Option<object_store::ObjectMeta>>,
     dataset_name: String,
+    /// Checks scans for registered columns the file no longer carries.
+    schema_drift_guard: Option<crate::file_schema_drift::FileSchemaDriftGuard>,
 }
 
 impl S3SingleFileCached {
@@ -125,7 +127,20 @@ impl S3SingleFileCached {
             file_path,
             cached_metadata: RwLock::new(None),
             dataset_name,
+            schema_drift_guard: None,
         })
+    }
+
+    /// Checks every scan with `guard`, so a registered column the file no longer carries
+    /// fails a refresh scan and warns on any other scan. See
+    /// [`crate::file_schema_drift`].
+    #[must_use]
+    pub fn with_schema_drift_guard(
+        mut self,
+        guard: crate::file_schema_drift::FileSchemaDriftGuard,
+    ) -> Self {
+        self.schema_drift_guard = Some(guard);
+        self
     }
 
     /// Fetches the current metadata (`ETag`, Version ID, size, `last_modified`) for the file from S3.
@@ -258,7 +273,18 @@ impl TableProvider for S3SingleFileCached {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Always delegate to inner ListingTable
         // The metadata check happens during refresh, not during scan
-        self.inner.scan(state, projection, filters, limit).await
+        let plan = self.inner.scan(state, projection, filters, limit).await?;
+        if let Some(guard) = &self.schema_drift_guard {
+            guard
+                .check_scan(
+                    state,
+                    &self.inner.schema(),
+                    projection.map(Vec::as_slice),
+                    &plan,
+                )
+                .await?;
+        }
+        Ok(plan)
     }
 
     async fn scan_with_args<'a>(
@@ -266,7 +292,14 @@ impl TableProvider for S3SingleFileCached {
         state: &dyn Session,
         args: datafusion::catalog::ScanArgs<'a>,
     ) -> DataFusionResult<datafusion::catalog::ScanResult> {
-        self.inner.scan_with_args(state, args).await
+        let projection = args.projection();
+        let result = self.inner.scan_with_args(state, args).await?;
+        if let Some(guard) = &self.schema_drift_guard {
+            guard
+                .check_scan(state, &self.inner.schema(), projection, result.plan())
+                .await?;
+        }
+        Ok(result)
     }
 
     async fn delete_from(
@@ -356,6 +389,7 @@ mod tests {
             file_path,
             cached_metadata: RwLock::new(cached_meta),
             dataset_name: "test_dataset".to_string(),
+            schema_drift_guard: None,
         }
     }
 
