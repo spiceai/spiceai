@@ -963,6 +963,13 @@ impl GuardedStorage {
         let Some(bucket) = s3_location_bucket(location) else {
             return Ok(());
         };
+        // Bucket removal can turn `https://{bucket}.s3.amazonaws.com` into the
+        // global template. Until that happens the region does not change the
+        // host, and an operator endpoint such as a private MinIO URL stays
+        // trusted.
+        if !s3_region_is_substituted(&region.endpoint, &bucket) {
+            return Ok(());
+        }
         let effective = s3_effective_endpoint(
             &region.endpoint,
             &bucket,
@@ -1251,28 +1258,14 @@ fn s3_backend_endpoint_with(props: &HashMap<String, String>, env_endpoint: Optio
     S3_GLOBAL_ENDPOINT.to_string()
 }
 
-fn normalized_s3_endpoint(endpoint: &str) -> String {
-    let mut endpoint = if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("https://{endpoint}")
-    };
-    if let Ok(url) = Url::parse(&endpoint) {
-        endpoint = url.to_string().trim_end_matches('/').to_string();
-    }
-    endpoint
-}
-
-fn s3_endpoint_is_global_template(endpoint: &str) -> bool {
-    normalized_s3_endpoint(endpoint) == S3_GLOBAL_ENDPOINT
-}
-
-/// A catalog region that will be substituted into the global AWS endpoint.
+/// A catalog region, and the endpoint the S3 backend starts from.
 ///
 /// `None` when the region is the operator's or comes only from the
-/// environment, when an explicit catalog `s3.endpoint` is already classified
-/// on its own, or when the endpoint the backend will use is not the global
-/// template (the region then does not change the host).
+/// environment, or when an explicit catalog `s3.endpoint` is already
+/// classified on its own. Whether the region changes the host is decided
+/// later, after `//{bucket}.` is removed: an operator endpoint such as
+/// `https://testbucket.s3.amazonaws.com` becomes the global template only
+/// once the location's bucket is known.
 fn catalog_controlled_s3_region(
     props: &HashMap<String, String>,
     operator_regions: &HashMap<String, String>,
@@ -1287,15 +1280,32 @@ fn catalog_controlled_s3_region(
     if operator_regions.get(key).map(String::as_str) == Some(value) {
         return None;
     }
-    let base = s3_backend_endpoint(props);
-    if !s3_endpoint_is_global_template(&base) {
-        return None;
-    }
     Some(VendedS3Region {
         key: key.to_string(),
         value: value.to_string(),
-        endpoint: normalized_s3_endpoint(&base),
+        endpoint: s3_backend_endpoint(props),
     })
+}
+
+/// The endpoint after OpenDAL removes `//{bucket}.` and normalizes the URL,
+/// before the region template is applied.
+fn s3_endpoint_after_bucket_removal(endpoint: &str, bucket: &str) -> String {
+    let mut endpoint = if endpoint.starts_with("http") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
+    };
+    endpoint = endpoint.replace(&format!("//{bucket}."), "//");
+    if let Ok(url) = Url::parse(&endpoint) {
+        endpoint = url.to_string().trim_end_matches('/').to_string();
+    }
+    endpoint
+}
+
+/// `true` when bucket removal leaves the global AWS endpoint, which is the
+/// only endpoint OpenDAL rewrites with the region.
+fn s3_region_is_substituted(endpoint: &str, bucket: &str) -> bool {
+    s3_endpoint_after_bucket_removal(endpoint, bucket) == S3_GLOBAL_ENDPOINT
 }
 
 /// Truthy values recognized by the Iceberg S3 property parser.
@@ -1349,16 +1359,8 @@ fn s3_effective_endpoint(
     virtual_host_style: bool,
     region: &str,
 ) -> String {
-    let mut endpoint = if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("https://{endpoint}")
-    };
-    endpoint = endpoint.replace(&format!("//{bucket}."), "//");
-    if let Ok(url) = Url::parse(&endpoint) {
-        endpoint = url.to_string().trim_end_matches('/').to_string();
-    }
-    if endpoint == "https://s3.amazonaws.com" {
+    let mut endpoint = s3_endpoint_after_bucket_removal(endpoint, bucket);
+    if endpoint == S3_GLOBAL_ENDPOINT {
         endpoint = format!("https://s3.{region}.amazonaws.com");
     }
     if virtual_host_style {
@@ -2129,9 +2131,10 @@ mod tests {
             check_vended_endpoints, check_vended_file_location,
             clear_vended_endpoint_resolver_override, effective_storage_endpoint,
             endpoint_targets_internal_host, get_rest_catalog, refusal_message_for_resolution,
-            s3_effective_endpoint, s3_region_with_fallback, set_vended_endpoint_resolver_override,
-            vended_endpoint_refused_message, vended_endpoint_rewritten_message,
-            vended_endpoint_unresolved_message, vended_file_location_refused_message,
+            s3_effective_endpoint, s3_region_is_substituted, s3_region_with_fallback,
+            set_vended_endpoint_resolver_override, vended_endpoint_refused_message,
+            vended_endpoint_rewritten_message, vended_endpoint_unresolved_message,
+            vended_file_location_refused_message,
         };
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -2573,10 +2576,26 @@ mod tests {
                 S3_ENDPOINT.to_string(),
                 "http://172.30.0.3:9000".to_string(),
             );
-            assert!(
+            let recorded =
                 catalog_controlled_s3_region(&with_endpoint, &HashMap::new(), &private_endpoint)
-                    .is_none(),
-                "a region does not change the host of an operator endpoint that is not the global template"
+                    .expect("a catalog region is recorded with the operator endpoint");
+            assert_eq!(recorded.endpoint, "http://172.30.0.3:9000");
+            assert!(
+                !s3_region_is_substituted(&recorded.endpoint, "warehouse"),
+                "a private operator endpoint is not the global template after bucket removal"
+            );
+            assert!(s3_region_is_substituted(
+                "https://testbucket.s3.amazonaws.com",
+                "testbucket"
+            ));
+            assert_eq!(
+                s3_effective_endpoint(
+                    "https://testbucket.s3.amazonaws.com",
+                    "testbucket",
+                    false,
+                    region,
+                ),
+                "https://s3.x@127.0.0.1:18074/.amazonaws.com/testbucket"
             );
 
             let client = HashMap::from([
@@ -2614,6 +2633,73 @@ mod tests {
                 vended_endpoint_rewritten_message("dataset 't'", "s3.region", &region, &effective)
             );
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn catalog_region_rewrites_a_bucket_qualified_operator_endpoint() {
+            let sentinel = start_sentinel().await;
+            let port = sentinel
+                .endpoint
+                .rsplit(':')
+                .next()
+                .expect("sentinel endpoint has a port");
+            let region = format!("x@127.0.0.1:{port}/");
+            let endpoint = "https://testbucket.s3.amazonaws.com";
+            let effective = format!("https://s3.x@127.0.0.1:{port}/.amazonaws.com/testbucket");
+            let config = json!({
+                "client.region": region,
+                "s3.access-key-id": "AKIATEST",
+                "s3.secret-access-key": "testsecret",
+                "s3.path-style-access": "true",
+            });
+            let catalog_uri = start_rest_catalog(&config).await;
+            let operator_props = HashMap::from([
+                (S3_ENDPOINT.to_string(), endpoint.to_string()),
+                ("s3.access-key-id".to_string(), "AKIATEST".to_string()),
+                ("s3.secret-access-key".to_string(), "testsecret".to_string()),
+                ("s3.path-style-access".to_string(), "true".to_string()),
+            ]);
+            let err = read_manifest_list(catalog_uri, operator_props)
+                .await
+                .expect_err("a bucket-qualified global endpoint must not be read");
+            assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid, "{err}");
+            assert_eq!(
+                err.message(),
+                vended_endpoint_rewritten_message(
+                    "dataset 't'",
+                    "client.region",
+                    &region,
+                    &effective
+                )
+            );
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn operator_private_endpoint_ignores_a_catalog_region_that_does_not_change_its_host()
+        {
+            let sentinel = start_sentinel().await;
+            let config = json!({
+                "s3.region": "x@127.0.0.1:9/",
+                "s3.access-key-id": "minio",
+                "s3.secret-access-key": "minio123",
+                "s3.path-style-access": "true",
+            });
+            let catalog_uri = start_rest_catalog(&config).await;
+            let operator_props = HashMap::from([
+                (S3_ENDPOINT.to_string(), sentinel.endpoint.clone()),
+                ("s3.access-key-id".to_string(), "minio".to_string()),
+                ("s3.secret-access-key".to_string(), "minio123".to_string()),
+                ("s3.path-style-access".to_string(), "true".to_string()),
+            ]);
+            let err = read_manifest_list(catalog_uri, operator_props)
+                .await
+                .expect_err("the sentinel answers 404");
+            assert_eq!(err.kind(), iceberg::ErrorKind::Unexpected, "{err}");
+            assert_eq!(
+                *sentinel.requests.lock(),
+                vec!["GET /testbucket/warehouse/db/t/metadata/snap-1.avro HTTP/1.1".to_string()]
+            );
         }
 
         #[tokio::test]
