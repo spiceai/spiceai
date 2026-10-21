@@ -796,26 +796,9 @@ mod tests {
     }
 
     impl MixedRedirectOverrides {
-        /// Adds `1.2.3.4/32` to loopback so a literal public address can be
-        /// served here. `1.2.3.4` is not in the internal-address set, and an
-        /// address this process can bind is the only way `reqwest` can follow
-        /// that hop without leaving the machine.
+        /// `1.2.3.4` is not in the internal-address set. The listener is
+        /// loopback; `send_once` rewrites that literal host onto it.
         fn prepare() -> Self {
-            let added = std::process::Command::new("sudo")
-                .args(["-n", "ip", "addr", "add", "1.2.3.4/32", "dev", "lo"])
-                .status()
-                .expect("add 1.2.3.4 to the loopback interface");
-            if !added.success() {
-                let listed = std::process::Command::new("ip")
-                    .args(["addr", "show", "dev", "lo"])
-                    .output()
-                    .expect("list loopback addresses");
-                let text = String::from_utf8_lossy(&listed.stdout);
-                assert!(
-                    text.contains("1.2.3.4"),
-                    "ip addr add 1.2.3.4/32 failed: {added}"
-                );
-            }
             let resolved = "mixed-target.vended.test";
             super::super::set_vended_endpoint_resolver_override(
                 resolved,
@@ -846,22 +829,19 @@ mod tests {
                 super::clear_vended_redirect_connect_override(host);
             }
             super::super::clear_vended_endpoint_resolver_override(&self.resolved);
-            let _ = std::process::Command::new("sudo")
-                .args(["-n", "ip", "addr", "del", "1.2.3.4/32", "dev", "lo"])
-                .status();
         }
     }
 
     #[tokio::test]
     async fn catalog_vended_mixed_redirect_keeps_the_rewritten_request() {
         let mut overrides = MixedRedirectOverrides::prepare();
-        let listener = tokio::net::TcpListener::bind("1.2.3.4:0")
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind the redirector on the local public address");
+            .expect("bind the redirector");
         let addr = listener.local_addr().expect("read the redirector address");
         let port = addr.port();
-        // Same port as the listener. A literal-IP redirect is dialed by
-        // `reqwest` itself, which does not use the connect override.
+        // The Location names the public literal. `send_once` rewrites it to
+        // this listener, so the test does not bind that address.
         let middle = format!("http://1.2.3.4:{port}/middle");
         let object = format!("http://mixed-target.vended.test:{port}/object");
         let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
