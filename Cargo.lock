@@ -20401,6 +20401,7 @@ dependencies = [
  "iceberg-storage-opendal",
  "libc",
  "mimalloc",
+ "nix 0.30.1",
  "opentelemetry 0.32.0",
  "opentelemetry-http",
  "opentelemetry-prometheus",
