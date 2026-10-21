@@ -733,7 +733,12 @@ pub enum AccelerationRefreshMode {
     Disabled,
     Full(Receiver<Option<RefreshOverrides>>),
     Append(Receiver<Option<RefreshOverrides>>),
-    Changes(ChangesStream),
+    /// A change stream, and for a stream scoped to a cluster executor's
+    /// partitions, the requests that reload those partitions.
+    Changes(
+        ChangesStream,
+        Option<Receiver<super::refresh_completion::RefreshRequestId>>,
+    ),
     Caching(Receiver<Option<RefreshOverrides>>),
     /// Snapshot mode: refreshes are driven by polling the snapshot store for
     /// snapshots newer than the currently loaded one.
@@ -1157,7 +1162,7 @@ impl Refresher {
                 | AccelerationRefreshMode::Snapshot(receiver),
                 _,
             ) => receiver,
-            (AccelerationRefreshMode::Changes(stream), _) => {
+            (AccelerationRefreshMode::Changes(stream, reload_requests), _) => {
                 let (snapshot_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
@@ -1197,9 +1202,11 @@ impl Refresher {
                 };
                 self.snapshot_task = snapshot_task;
 
-                return Ok(Some(
-                    self.start_changes_stream(stream, on_batch_process_callback),
-                ));
+                return Ok(Some(self.start_changes_stream(
+                    stream,
+                    on_batch_process_callback,
+                    reload_requests,
+                )));
             }
         };
 
@@ -1594,6 +1601,7 @@ impl Refresher {
         &mut self,
         changes_stream: ChangesStream,
         on_batch_process_callback: Option<SnapshotCallback>,
+        reload_requests: Option<Receiver<super::refresh_completion::RefreshRequestId>>,
     ) -> tokio::task::JoinHandle<()> {
         let refresh_task_builder = RefreshTask::builder(
             Arc::clone(&self.runtime_status),
@@ -1613,6 +1621,7 @@ impl Refresher {
         .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
         .with_cdc_param_overrides(self.cdc_param_overrides.clone())
+        .with_reload_requests(reload_requests)
         .with_change_sink(self.change_sink.clone())
         .with_cache_write_sender(self.cache_write_sender.clone());
 
