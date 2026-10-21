@@ -860,9 +860,14 @@ impl Script {
     }
 
     /// A matrix combination's run, as failures and the ledger name it:
-    /// `name[key=value,…]`, or the name alone without a matrix.
+    /// `name[key=value,…]` with the keys in alphabetical order, or the name
+    /// alone without a matrix. The keys are sorted here rather than taken in
+    /// the map's order, which `serde_json`'s `preserve_order` feature changes
+    /// whenever a build also links a crate that enables it.
     pub fn run_label(&self, combo: &Map<String, Value>) -> String {
-        let combo_label = combo
+        let mut pairs: Vec<(&String, &Value)> = combo.iter().collect();
+        pairs.sort_unstable_by_key(|(k, _)| *k);
+        let combo_label = pairs
             .iter()
             .map(|(k, v)| format!("{k}={}", matrix_value_text(v)))
             .collect::<Vec<_>>()
