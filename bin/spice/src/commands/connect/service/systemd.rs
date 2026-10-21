@@ -3392,7 +3392,13 @@ mod tests {
         let failure = preflight(ServiceScope::User);
         if let Err(failure) = failure {
             let message = Error::from(failure).to_string();
-            assert!(message.contains("spice cloud service install"), "{message}");
+            // No user manager names `spice cloud service install`. No systemd at
+            // all, as in a container, fails first and names that instead.
+            assert!(
+                message.contains("spice cloud service install")
+                    || message.contains("systemd is not running"),
+                "{message}"
+            );
         }
     }
 
