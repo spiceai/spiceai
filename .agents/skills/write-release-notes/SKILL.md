@@ -1,10 +1,13 @@
 ---
-name: writeReleaseNotes
+name: write-release-notes
 description: Write or update Spice release notes for a version from git history, in Simplified Technical English. Use this whenever the user asks to write, draft, cut, update, or refresh release notes, release candidate notes, or a changelog entry under docs/release_notes/ — including "notes for vX.Y.Z", "what shipped since <tag>", or "add the new PRs to the release notes".
-argument-hint: The new version tag and the previous version tag to diff against, or the literal word "update" to refresh an existing in-progress release notes file with new commits since it was last edited (e.g. "v2.0.0-rc.5 since v2.0.0-rc.4", or "update").
 ---
 
 Write or update release notes for the specified version based on all changes since the specified previous release.
+
+## Input
+
+The new version tag and the previous version tag to diff against (e.g. `v2.0.0-rc.5 since v2.0.0-rc.4`), or the literal word `update` to refresh an existing in-progress release notes file with new commits since it was last edited.
 
 ## Modes
 
@@ -21,7 +24,7 @@ To detect update mode and find the relevant commit range:
 
 Write every sentence you author in Simplified Technical English (ASD-STE100 writing rules). Release notes are read fast, by people deciding whether to upgrade, often in a second language or through a machine translator, and re-read months later by someone bisecting a behaviour change. A 50-word sentence with three subordinate clauses fails all of those readers. Short declarative sentences do not make the content less technical — they make each technical claim separately checkable.
 
-Read `.github/prompts/references/simplified_technical_english.md` before writing prose. It carries the full rules, the rewrite patterns, the terminology table, and worked before/after examples from real Spice releases. The short version:
+Read [references/simplified_technical_english.md](references/simplified_technical_english.md) before writing prose. It carries the full rules, the rewrite patterns, the terminology table, and worked before/after examples from real Spice releases. The short version:
 
 - **One idea per sentence, 25 words or fewer.** Split where the subject changes. The total gets longer; that is the trade.
 - **Active voice, named actor.** "The runtime derives memory budgets from its cgroup limit", not "Memory budgets are derived". Passive is acceptable only when the actor is genuinely unknown.
@@ -89,7 +92,7 @@ STE constrains sentence construction, never technical depth. Keep every setting 
 6. **Check the prose** before you report the file as finished:
 
    ```bash
-   python3 .github/prompts/scripts/check_ste.py docs/release_notes/v<version>.md
+   python3 .agents/skills/write-release-notes/scripts/check_ste.py docs/release_notes/v<version>.md
    ```
 
    The script reads only the authored prose and reports STE violations with line numbers. **Fix every error** — sentence length, semicolons, participle clauses, vague wording. **Read every warning and decide** — passive voice, noun stacks, paragraph length, and inconsistent terminology all have defensible exceptions, so judge each one rather than rewriting on reflex. If a fix would cost a technical fact, keep the fact and leave the warning; never delete information to satisfy the checker.
@@ -123,7 +126,7 @@ Default thematic order for highlights/subsections, top to bottom:
 - Use `## What's Changed` then `### Changelog` (not `## Changelog`) to match the GitHub auto-generated layout that prior releases mirror.
 - Verify each PR is referenced at most once in the changelog and at most once in the narrative `## What's New`. Use `grep -c '#<num>' <file>` to spot-check.
 - When updating an existing file, also update the **Contributors** list if the new commits introduce a new author. Skip bots and `claudespice`.
-- The terminology table in `.github/prompts/references/simplified_technical_english.md` fixes one term per concept (dataset, accelerator, the runtime, setting, flag, release). Hold each term for the whole document.
+- The terminology table in [references/simplified_technical_english.md](references/simplified_technical_english.md) fixes one term per concept (dataset, accelerator, the runtime, setting, flag, release). Hold each term for the whole document.
 
 ## Documentation links
 
