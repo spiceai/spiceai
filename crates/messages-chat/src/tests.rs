@@ -1197,6 +1197,10 @@ fn an_unknown_nested_field_is_refused_by_name() {
 
     let cases = [
         (
+            json!({"messages": [{"role": "user", "content": "q", "name": "ana"}]}),
+            "`name` on a message",
+        ),
+        (
             json!({"metadata": {"user_id": "u", "tier": 1}}),
             "`tier` in `metadata`",
         ),
@@ -1247,9 +1251,9 @@ fn an_unknown_nested_field_is_refused_by_name() {
         (
             json!({"messages": [
                 {"role": "user", "content": "q"},
-                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}, "caller": {"type": "direct"}}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}, "origin": "agent"}]},
             ]}),
-            "`caller` on a tool_use block",
+            "`origin` on a tool_use block",
         ),
         (
             json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok", "partial": true}]}]}),

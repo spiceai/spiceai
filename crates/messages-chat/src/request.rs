@@ -271,6 +271,7 @@ fn append_message(
     message: MessageParam,
     chat_messages: &mut Vec<ChatCompletionRequestMessage>,
 ) -> Result<(), MessagesError> {
+    refuse_other(model, &message.other, &[], "on a message")?;
     match (message.role, message.content) {
         (Role::System, MessageContent::Text(text)) => {
             chat_messages.push(ChatCompletionRequestMessage::System(

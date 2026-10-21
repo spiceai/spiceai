@@ -98,6 +98,9 @@ pub enum Role {
 pub struct MessageParam {
     pub role: Role,
     pub content: MessageContent,
+    /// Every other field, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 /// A message's content: a string, or content blocks.
