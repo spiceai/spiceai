@@ -143,6 +143,28 @@ impl S3SingleFileCached {
         self
     }
 
+    /// Checks a scan with the schema-drift guard, if any. A rejected scan forgets the cached
+    /// file metadata: the refresh-skip check already recorded this version of the file, and
+    /// the next refresh must check it again rather than skip it and report the dataset
+    /// up to date.
+    async fn check_schema_drift(
+        &self,
+        state: &dyn Session,
+        projection: Option<&[usize]>,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> DataFusionResult<()> {
+        let Some(guard) = &self.schema_drift_guard else {
+            return Ok(());
+        };
+        let checked = guard
+            .check_scan(state, &self.inner.schema(), projection, plan)
+            .await;
+        if checked.is_err() {
+            self.reset_skip_state().await;
+        }
+        checked
+    }
+
     /// Fetches the current metadata (`ETag`, Version ID, size, `last_modified`) for the file from S3.
     async fn fetch_current_metadata(&self) -> DataFusionResult<Option<object_store::ObjectMeta>> {
         match self.object_store.head(&self.file_path).await {
@@ -274,16 +296,8 @@ impl TableProvider for S3SingleFileCached {
         // Always delegate to inner ListingTable
         // The metadata check happens during refresh, not during scan
         let plan = self.inner.scan(state, projection, filters, limit).await?;
-        if let Some(guard) = &self.schema_drift_guard {
-            guard
-                .check_scan(
-                    state,
-                    &self.inner.schema(),
-                    projection.map(Vec::as_slice),
-                    &plan,
-                )
-                .await?;
-        }
+        self.check_schema_drift(state, projection.map(Vec::as_slice), &plan)
+            .await?;
         Ok(plan)
     }
 
@@ -294,11 +308,8 @@ impl TableProvider for S3SingleFileCached {
     ) -> DataFusionResult<datafusion::catalog::ScanResult> {
         let projection = args.projection();
         let result = self.inner.scan_with_args(state, args).await?;
-        if let Some(guard) = &self.schema_drift_guard {
-            guard
-                .check_scan(state, &self.inner.schema(), projection, result.plan())
-                .await?;
-        }
+        self.check_schema_drift(state, projection, result.plan())
+            .await?;
         Ok(result)
     }
 
@@ -391,6 +402,77 @@ mod tests {
             dataset_name: "test_dataset".to_string(),
             schema_drift_guard: None,
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_drift_scan_forgets_the_cached_file_version() {
+        use crate::file_schema_drift::{FileSchemaDriftGuard, mark_acceleration_refresh};
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field};
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("base.parquet");
+        // The source file renamed `amount_cents` to `amt`.
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amt", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(&path).expect("create");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, file_schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let registered = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("amount_cents", DataType::Int64, true),
+        ]));
+        let format = Arc::new(ParquetFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(ListingOptions::new(Arc::clone(&format) as _))
+            .with_schema(Arc::clone(&registered));
+        let listing = Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+        let table = S3SingleFileCached::try_new(listing, store, "base".to_string())
+            .expect("single file")
+            .with_schema_drift_guard(FileSchemaDriftGuard::new("base", registered, format));
+        *table.cached_metadata.write().await =
+            Some(make_meta("base.parquet", 1, 1, Some("e"), None));
+
+        let mut session = SessionConfig::new();
+        mark_acceleration_refresh(&mut session);
+        let ctx = SessionContext::new_with_config(session);
+        ctx.register_table("base", Arc::new(table) as Arc<dyn TableProvider>)
+            .expect("register");
+        let scanned = ctx
+            .sql("SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("plan")
+            .collect()
+            .await;
+        assert!(
+            matches!(scanned, Err(ref e) if e.to_string().contains("'amount_cents'")),
+            "the refresh scan must be rejected: {scanned:?}"
+        );
+
+        let provider = ctx.table_provider("base").await.expect("provider");
+        let table = provider
+            .downcast_ref::<S3SingleFileCached>()
+            .expect("the registered table");
+        assert!(
+            table.cached_metadata.read().await.is_none(),
+            "the next refresh must check the file again instead of skipping it"
+        );
     }
 
     #[derive(Debug)]
