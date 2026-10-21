@@ -95,21 +95,26 @@ impl ParseError {
 /// assert_eq!(parse_duration("42").unwrap(), Duration::from_secs(42));
 /// ```
 pub fn parse_duration(input: &str) -> Result<Duration, ParseError> {
+    // `trim` drops leading whitespace and the `+` branch drops a sign. Syntax
+    // positions are byte offsets into the caller's string, so keep that prefix.
+    // Trailing whitespace is not part of it.
+    let mut prefix = input.len() - input.trim_start().len();
     let input = input.trim();
     if input.is_empty() {
         return Err(ParseError::invalid_input("Empty input"));
     }
 
     // Handle sign prefix
-    let (input, _positive) = if let Some(rest) = input.strip_prefix('+') {
-        (rest, true)
+    let input = if let Some(rest) = input.strip_prefix('+') {
+        prefix += 1;
+        rest
     } else if input.strip_prefix('-').is_some() {
         // Negative durations are rejected since std::time::Duration can't represent them.
         return Err(ParseError::invalid_input(
             "Negative durations are not supported",
         ));
     } else {
-        (input, true)
+        input
     };
 
     if input.is_empty() {
@@ -122,7 +127,13 @@ pub fn parse_duration(input: &str) -> Result<Duration, ParseError> {
     }
 
     // Try to parse as a compound duration (e.g., "1h30m10s")
-    parse_compound_duration(input)
+    parse_compound_duration(input).map_err(|error| match error {
+        ParseError::Syntax { position, message } => ParseError::Syntax {
+            position: prefix + position,
+            message,
+        },
+        other @ ParseError::InvalidInput { .. } => other,
+    })
 }
 
 /// Parse a compound duration like "1h30m10s" or a single segment like "10s".
@@ -864,6 +875,32 @@ mod tests {
             fractional_err.to_string(),
             format!("at position {fractional_at}: Invalid fractional part")
         );
+    }
+
+    #[test]
+    fn test_syntax_position_includes_leading_prefix() {
+        // Leading `+` and whitespace are stripped before segment offsets are
+        // computed. Positions stay byte offsets into the original string.
+        // Trailing whitespace is not included in that prefix.
+        let message = "Expected a number, found '秒'";
+        for (input, position) in [
+            ("+1h30秒", 5),
+            ("  1h30秒", 6),
+            ("  1h30秒  ", 6),
+            ("\u{3000}1h30秒", 7),
+            ("\u{3000}+1h30秒", 8),
+            ("\u{3000}+1h30秒  ", 8),
+        ] {
+            assert_eq!(input.find('秒'), Some(position), "{input:?}");
+            assert_eq!(
+                parse_duration(input).expect_err(input),
+                ParseError::Syntax {
+                    position,
+                    message: message.to_string(),
+                },
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
