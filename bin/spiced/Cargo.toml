@@ -115,6 +115,10 @@ util = { path = "../../crates/util"}
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 vortex-utils.workspace = true
 
+# Raising the soft open file limit at startup (`open_file_limit.rs`).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["resource"] }
+
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
 iceberg.workspace = true
