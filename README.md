@@ -341,9 +341,11 @@ Configured as `.vectors.engine` on a column-level embedding.
 | `s3_vectors`    | Amazon S3 Vectors for petabyte-scale vector storage and querying     | Alpha  |
 | `duckdb`        | DuckDB with HNSW vector index                                        | Alpha  |
 | `elasticsearch`<sup>†</sup> | Elasticsearch with kNN                                  | Alpha  |
-| `qdrant`        | Qdrant with HNSW vector index                                        | Alpha  |
+| `qdrant`<sup>‡</sup> | Qdrant with HNSW vector index                                   | Alpha  |
 
 <sup>†</sup> Available in Spice.ai Enterprise; not included in the open-source release binaries. To use it with the open-source runtime, build with `make install SPICED_NON_DEFAULT_FEATURES=elasticsearch`.
+
+<sup>‡</sup> Not included in the release binaries or Docker images. To use it, build `spiced` from source with `make install SPICED_NON_DEFAULT_FEATURES=qdrant`.
 
 ## Change Forwarding to Drasi (Alpha)
 

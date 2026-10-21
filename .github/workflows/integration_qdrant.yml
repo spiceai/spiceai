@@ -38,7 +38,7 @@ env:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     timeout-minutes: 45
     outputs:
       relevant: ${{ steps.check.outputs.relevant_changes }}
