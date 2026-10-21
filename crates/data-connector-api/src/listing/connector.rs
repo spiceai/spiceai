@@ -6014,6 +6014,84 @@ mod tests {
             .expect("a well-formed range is still accepted after a rejected one");
     }
 
+    /// A Parquet page whose header declares more uncompressed bytes than its
+    /// compressed body can back is a scan error, raised before the reader allocates
+    /// the declared size.
+    ///
+    /// A Spice patch to `decode_page` in the `spiceai/arrow-rs` fork requires a page
+    /// above 64 MiB to carry at least 1/1000 of its declared size in compressed bytes
+    /// ([apache/arrow-rs#10734](https://github.com/apache/arrow-rs/issues/10734)).
+    /// Without it, a file of a few KiB whose pages each declare hundreds of MiB makes
+    /// every scan of it allocate that much per page, and concurrent scans of it can
+    /// exhaust memory. Driven through a `DataFusion` Parquet scan, the reader path a
+    /// file or object-store dataset takes.
+    #[tokio::test]
+    async fn a_page_declaring_more_than_its_compressed_bytes_can_back_is_an_error() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::parquet::basic::{Compression, ZstdLevel};
+        use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+        use datafusion::prelude::ParquetReadOptions;
+
+        // One value just past the 64 MiB that any page is allowed; zero bytes
+        // compress to a few KiB.
+        const VALUE_LEN: usize = 65 * 1024 * 1024;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
+        ]));
+        let value = vec![0u8; VALUE_LEN];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::BinaryArray::from_vec(vec![
+                value.as_slice(),
+            ]))],
+        )
+        .expect("builds a batch");
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
+            .build();
+        let dir = tempfile::tempdir().expect("creates a temporary directory");
+        let path = dir.path().join("page.parquet");
+        let file = std::fs::File::create(&path).expect("creates the file");
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+            .expect("parquet writer");
+        writer.write(&batch).expect("writes the batch");
+        writer.close().expect("closes the file");
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).expect("opens the file"))
+            .expect("reads the footer");
+        let column = reader.metadata().row_group(0).column(0);
+        assert!(
+            column.uncompressed_size() > 64 * 1024 * 1024
+                && column.compressed_size() * 1000 < column.uncompressed_size(),
+            "the page has to be past the bound for this guard to assert anything: \
+             {} compressed bytes for {} uncompressed",
+            column.compressed_size(),
+            column.uncompressed_size()
+        );
+
+        let scan = SessionContext::new()
+            .read_parquet(
+                path.to_str().expect("a UTF-8 path"),
+                ParquetReadOptions::default(),
+            )
+            .await
+            .expect("plans the scan")
+            .collect()
+            .await;
+        let Err(error) = scan else {
+            panic!("a page declaring {VALUE_LEN} bytes behind a few KiB of ZSTD was decoded");
+        };
+        assert!(
+            error.to_string().contains("exceeds the maximum allowed"),
+            "the scan failed, but not on the page-size bound: {error}"
+        );
+    }
+
     /// A second reader built for the *same* file has to stay on the generation the
     /// first one pinned.
     ///

@@ -584,6 +584,21 @@ impl SetKey {
         self.values.iter().map(|(index, _)| *index)
     }
 
+    /// The values this scope fixes for `columns`, in that order, or `None`
+    /// unless the scope fixes every one of them to a non-NULL value.
+    #[must_use]
+    pub fn values_of(&self, columns: &[usize]) -> Option<Vec<ScalarValue>> {
+        columns
+            .iter()
+            .map(|column| {
+                self.values
+                    .iter()
+                    .find(|(index, value)| index == column && !value.is_null())
+                    .map(|(_, value)| value.clone())
+            })
+            .collect()
+    }
+
     /// The scope's columns and values when `ScalarValue` equality is exactly
     /// `IS NOT DISTINCT FROM` for every value, so equal scopes hash equally.
     #[must_use]
