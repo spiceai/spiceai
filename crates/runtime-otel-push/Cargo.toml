@@ -1,0 +1,38 @@
+[package]
+description = "Pushes Spice runtime metrics to an OpenTelemetry collector over gRPC or HTTP."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-otel-push"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tonic.workspace = true
+tracing.workspace = true
+util = { path = "../util", default-features = false }
+
+[dev-dependencies]
+axum.workspace = true
+futures.workspace = true
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "gen-tonic",
+    "metrics",
+] }
+telemetry = { path = "../telemetry" }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
