@@ -31,8 +31,8 @@ use arrow::{
 };
 use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::Schema;
-use datafusion::common::metadata::ScalarAndMetadata;
-use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
+use datafusion_common::metadata::ScalarAndMetadata;
+use datafusion_common::{DataFusionError, ParamValues, ScalarValue};
 use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
