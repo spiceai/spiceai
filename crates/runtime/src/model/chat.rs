@@ -858,7 +858,7 @@ fn parse_context_length(params: &FileModelParams) -> Result<Option<usize>, LlmEr
 // Get OpenAI compatible request parameter overrides.
 // Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
 /// The model's `params` value for the request default `key`, by the documented spelling
-/// first: unprefixed for OpenAI, `{prefix}_` for every other provider. The other spellings
+/// first: unprefixed for `OpenAI`, `{prefix}_` for every other provider. The other spellings
 /// are deprecated aliases, read only when it is absent. Chat completions and the Responses
 /// API both read their defaults through this, so the two agree on which value applies.
 pub(crate) fn request_default<'a>(model: &'a Model, prefix: &str, key: &str) -> Option<&'a Value> {
