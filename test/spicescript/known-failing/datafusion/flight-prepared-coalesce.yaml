@@ -1,0 +1,46 @@
+# Known failing (no issue filed yet): over a Cayenne acceleration, a Flight
+# SQL prepared statement with a parameter in a projected COALESCE fails
+# server-side with "Cannot cast string 'name 1' to value of UInt64 type";
+# federated it answers, and so does the same query with HTTP parameters.
+name: flight-prepared-coalesce
+description: >
+  A Flight SQL prepared statement with a parameter in a projected COALESCE
+  answers as PostgreSQL does with the value written in, over a federated
+  table and a Cayenne acceleration.
+
+sources:
+  src: { kind: postgres }
+
+variants:
+  federated: {}
+  cayenne: cayenne-file
+
+spicepod:
+  version: v1
+  kind: Spicepod
+  name: flight-prepared-coalesce
+  datasets:
+    - { from: 'postgres:public.t', name: t, params: '${sources.src.params}' }
+
+defaults:
+  expect: { oracle: src }
+  compare-variants: false
+
+steps:
+  - source-exec:
+      src: |
+        CREATE TABLE t (id int PRIMARY KEY, name text, score double precision, n bigint, d date);
+        INSERT INTO t SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE 'name ' || i END, i * 1.5, i * 1000, DATE '2024-01-01' + i FROM generate_series(1, 200) i;
+  - start: {}
+  - query: SELECT id, COALESCE(name, 'missing') AS name FROM t WHERE id <= 21
+  - http: { method: POST, path: /v1/sql, headers: { content-type: application/json }, body: '{"sql": "SELECT id, COALESCE(name, $1) AS name FROM t WHERE id <= 21", "parameters": ["missing"]}' }
+    expect: { status: 200, body-contains: missing }
+  - query: SELECT id, COALESCE(name, $1) AS name FROM t WHERE id <= 21
+    parameters: [missing]
+    oracle-sql: SELECT id, COALESCE(name, 'missing') AS name FROM t WHERE id <= 21
+  - query: SELECT id, COALESCE($1, name) AS name FROM t WHERE id <= 21
+    parameters: [missing]
+    oracle-sql: SELECT id, COALESCE('missing', name) AS name FROM t WHERE id <= 21
+  - query: SELECT id, name FROM t WHERE COALESCE(name, $1) = $1 AND id <= 21
+    parameters: [missing]
+    oracle-sql: SELECT id, name FROM t WHERE COALESCE(name, 'missing') = 'missing' AND id <= 21
