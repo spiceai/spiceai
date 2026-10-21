@@ -34,7 +34,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
+use tonic::service::{Interceptor, InterceptorLayer};
 use tonic::transport::Server;
+use tower::layer::util::{Identity, Stack};
 
 type ClusterServerResult<T> = std::result::Result<T, Error>;
 
@@ -50,6 +53,33 @@ async fn bind_cluster_listener(bind_address: SocketAddr) -> Result<TcpListener, 
             Error::UnableToBindClusterListener { source }
         }
     })
+}
+
+/// Refuses every request on the internal cluster port unless the port runs cluster mTLS,
+/// whose handshake requires a client certificate signed by the cluster CA.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterMtlsGate {
+    mtls_enabled: bool,
+}
+
+impl Interceptor for ClusterMtlsGate {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if self.mtls_enabled {
+            Ok(request)
+        } else {
+            Err(Status::permission_denied(
+                "Cluster RPCs require cluster mTLS",
+            ))
+        }
+    }
+}
+
+/// The server builder for the internal cluster port. Every service added to it is behind
+/// [`ClusterMtlsGate`].
+pub(crate) fn internal_cluster_server(
+    mtls_enabled: bool,
+) -> Server<Stack<InterceptorLayer<ClusterMtlsGate>, Identity>> {
+    Server::builder().layer(InterceptorLayer::new(ClusterMtlsGate { mtls_enabled }))
 }
 
 /// Starts the internal cluster gRPC server for scheduler mode.
@@ -79,7 +109,7 @@ pub async fn start_internal_cluster_server(
 
     let cluster_server_config = rt.df.cluster_config.cluster_server_config();
     let mtls_enabled = cluster_server_config.is_some();
-    let mut server = Server::builder();
+    let mut server = internal_cluster_server(mtls_enabled);
 
     if mtls_enabled {
         tracing::info!("Cluster mTLS enabled for internal cluster server");
@@ -90,7 +120,7 @@ pub async fn start_internal_cluster_server(
         });
     } else {
         tracing::warn!(
-            "Cluster mTLS disabled for internal cluster server (--allow-insecure-connections flag is set)"
+            "Cluster mTLS disabled for internal cluster server (--allow-insecure-connections flag is set); cluster RPCs are refused"
         );
     }
 
@@ -123,7 +153,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
             executor_streams,
-            mtls_enabled,
         )
     } else {
         ClusterServiceImpl::new(
@@ -134,7 +163,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
-            mtls_enabled,
         )
     };
 

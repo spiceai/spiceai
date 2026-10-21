@@ -1249,6 +1249,8 @@ impl ExecutionPlan for CayenneAccelerationExec {
                     .unwrap_or("unknown");
                 DataFusionError::External(Box::new(super::Error::TooManyOpenFiles {
                     file_path: file_path.to_string(),
+                    open_file_limit: open_file_limit(),
+                    message: msg.clone(),
                 }))
             } else {
                 e
@@ -1521,6 +1523,25 @@ struct MemoryAccountedScanStream<S> {
     /// its pool, and those two numbers are what separate "this scan can never
     /// fit" from "this scan cannot fit right now".
     pool: Arc<dyn MemoryPool>,
+}
+
+/// The soft open file limit this process runs under, for the `TooManyOpenFiles`
+/// message. `None` where it cannot be read.
+fn open_file_limit() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid, writable `rlimit` that outlives the call.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+        (rc == 0).then_some(limit.rlim_cur)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// Explains a query-pool refusal in terms an operator can act on, and logs it.
@@ -2901,6 +2922,32 @@ mod tests {
         assert_eq!(
             cap_distinct_count_at_rows(Precision::Inexact(5), Precision::Absent),
             Precision::Inexact(5)
+        );
+    }
+
+    #[test]
+    fn too_many_open_files_message_keeps_the_cause_and_the_limit() {
+        let cause = "External error: Unable to open file /data/t/a.vortex: Too many open files (os error 24)";
+        let error = super::super::Error::TooManyOpenFiles {
+            file_path: "/data/t/a.vortex".to_string(),
+            open_file_limit: Some(1024),
+            message: cause.to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Failed to open Cayenne acceleration file '/data/t/a.vortex' because the process reached its open file limit of 1024, which client connections and all other open files also count against. Raise the limit where spiced is started (`ulimit -n`, or the container's `nofile` limit), or write fewer, larger acceleration files with `cayenne_target_file_size_mb`. See: https://spiceai.org/docs/components/data-accelerators/cayenne#params. Cause: External error: Unable to open file /data/t/a.vortex: Too many open files (os error 24)"
+        );
+
+        let unknown_limit = super::super::Error::TooManyOpenFiles {
+            file_path: "/data/t/a.vortex".to_string(),
+            open_file_limit: None,
+            message: cause.to_string(),
+        };
+        assert!(
+            unknown_limit
+                .to_string()
+                .contains("reached its open file limit, which client connections"),
+            "{unknown_limit}"
         );
     }
 }

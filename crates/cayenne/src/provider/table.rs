@@ -163,7 +163,9 @@ use vortex_datafusion::WriteShardConfig;
 
 use super::compaction::{CompactionCandidate, FileEntry, pick_candidates};
 use super::context::CayenneContext;
-use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
+use super::deletion_index::{
+    DeletionIndex, KeyDeletionIndex, PrunedDeletionPrefix, PrunedKeyDeletionPrefix,
+};
 use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
     PositionDeletionVector, RowConverterDeletionSnapshot,
@@ -185,6 +187,150 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// drain before giving up. A Stage-B finalize normally completes within
 /// milliseconds; the timeout only guards against a wedged background task.
 const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many times a seq-prefix bake splices its off-fence deletion-index prune
+/// over the live index and tries to swap it in, before splicing under the fence
+/// instead ([`CayenneTableProvider::prune_deletion_index_after_bake`]). A lost
+/// swap costs one splice, a pass over the index's newest entries.
+const BAKE_PRUNE_OFF_FENCE_ATTEMPTS: usize = 5;
+
+/// What a seq-prefix bake published, so its deferred deletion-index prune can
+/// confirm the swap is still in place before it lands
+/// ([`CayenneTableProvider::bake_output_is_live`]).
+struct BakeOutput<'a> {
+    snapshot_at_capture: &'a str,
+    merged_snapshot_id: &'a str,
+    input_ids: &'a [String],
+}
+
+/// An on-conflict deletion update with the deletion index it extends to, built
+/// before its publication's locks
+/// ([`CayenneTableProvider::prepare_on_conflict_deletion_update`]).
+pub(crate) struct PreparedOnConflictDeletion {
+    /// The update itself, folded under the locks if the index moved on.
+    update: OnConflictDeletionUpdate,
+    built: BuiltDeletionIndex,
+}
+
+/// The deletion snapshot a prepared extension was built from, and the result.
+enum BuiltDeletionIndex {
+    Nothing,
+    Int64Pk {
+        from: Arc<Int64PkDeletionSnapshot>,
+        to: Arc<Int64PkDeletionSnapshot>,
+    },
+    RowConverter {
+        from: Arc<RowConverterDeletionSnapshot>,
+        to: Arc<RowConverterDeletionSnapshot>,
+    },
+}
+
+/// `current` extended with an on-conflict delta's pure deletes and
+/// reinsertions, in one pass (a single Bloom rebuild) — see
+/// `DeletionIndex::extend_max`.
+fn extended_int64_snapshot(
+    current: &Int64PkDeletionSnapshot,
+    delta: &Int64DeletionDelta,
+) -> Int64PkDeletionSnapshot {
+    Int64PkDeletionSnapshot::from_index(
+        current.tombstones.extend_max(
+            delta
+                .pure
+                .iter()
+                .flat_map(|(delete_seq, pks)| pks.iter().map(move |&pk| (pk, *delete_seq))),
+            delta
+                .reinsert
+                .iter()
+                .flat_map(|(delete_seq, pks, insert_seq)| {
+                    pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
+                }),
+        ),
+    )
+}
+
+/// Row-key counterpart of [`extended_int64_snapshot`]; see
+/// `KeyDeletionIndex::extend_max`.
+fn extended_row_key_snapshot(
+    current: &RowConverterDeletionSnapshot,
+    delta: &RowKeyDeletionDelta,
+) -> RowConverterDeletionSnapshot {
+    RowConverterDeletionSnapshot::from_index(
+        current.tombstones.extend_max(
+            delta
+                .pure
+                .iter()
+                .flat_map(|(delete_seq, keys)| keys.iter().map(move |k| (&**k, *delete_seq))),
+            delta
+                .reinsert
+                .iter()
+                .flat_map(|(delete_seq, keys, insert_seq)| {
+                    keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
+                }),
+        ),
+    )
+}
+
+/// Background work a table still has in flight, so a caller can wait for it to
+/// finish.
+#[derive(Debug, Default)]
+struct PendingWork {
+    count: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl PendingWork {
+    /// Counts one piece of work in; it counts out when the guard drops.
+    fn start(self: &Arc<Self>) -> PendingWorkGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        PendingWorkGuard(Arc::clone(self))
+    }
+
+    /// Waits until nothing is in flight.
+    async fn drained(&self) {
+        loop {
+            // Registered before the check, so a guard dropped in between still
+            // wakes it.
+            let notified = self.drained.notified();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One piece of [`PendingWork`], counted out on drop.
+struct PendingWorkGuard(Arc<PendingWork>);
+
+impl Drop for PendingWorkGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
+    }
+}
+
+/// Outcome of one off-fence deletion-index prune attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffFencePrune {
+    /// The pruned index replaced the one it was built from.
+    Published,
+    /// The index had no deletion to prune.
+    NothingToPrune,
+    /// Writers kept replacing the index, and the splice under the fence could not
+    /// be swapped in either.
+    LostRace,
+    /// The bake's swap is no longer what scans see; nothing may be pruned.
+    OutputNotLive,
+}
+
+/// Builds the pruned frozen prefix `P` of a deletion index `T`
+/// ([`CayenneTableProvider::prune_deletion_snapshot_off_fence`]).
+type BuildPrunedPrefix<T, P> = Arc<dyn Fn(&T) -> P + Send + Sync>;
+
+/// Splices a pruned prefix `P` over the deletion index `T` live at that moment,
+/// or declines (`None`) when the index was rebuilt since the prefix was taken.
+type SplicePrunedPrefix<T, P> = Arc<dyn Fn(&T, &P) -> Option<T> + Send + Sync>;
+
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -798,7 +944,7 @@ struct SnapshotScanListingRequest<'a> {
 /// The unpruned warm file set captured with a scan's inline and deletion views.
 /// Listing generations belong to this capture, never to a later live directory.
 #[derive(Clone)]
-struct CapturedSnapshotFiles {
+pub(crate) struct CapturedSnapshotFiles {
     dir_generation: u64,
     listing_epoch: u64,
     files: Arc<Vec<PartitionedFile>>,
@@ -1358,6 +1504,10 @@ struct RawScanInput {
     /// A checkpoint may add files to the same directory after capture; those files
     /// must not be unioned with this view's pre-checkpoint inline rows.
     warm_files: CapturedSnapshotFiles,
+    /// Each protected snapshot's files, keyed by the ids in
+    /// [`Self::protected_map`], captured under the same fence as
+    /// [`Self::warm_files`]. The protected-snapshot branches plan from these.
+    protected_files: Arc<HashMap<String, CapturedSnapshotFiles>>,
     /// Cold-tier manifest belonging to [`Self::current_snapshot_id`], resolved under
     /// the SAME held read fence (see
     /// [`CayenneTableProvider::cold_manifest_under_held_fence`]). `None` when the
@@ -1660,6 +1810,24 @@ struct ScanViewCache {
     latest_complete: ArcSwapOption<CompletedScanView>,
     /// Builds still resolving. Self-trims on [`Self::drain_completed`].
     in_flight: ParkingMutex<Vec<InFlightScanView>>,
+    /// Admit a miss before capturing snapshots. The build's driver task owns
+    /// the permit until it has published the view, so cancelling its caller
+    /// cannot admit overlapping work and the next scan admitted sees the result.
+    build_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The previous build's merged (file ∪ mem-tier) deletion snapshot with the
+    /// inputs it was computed from, so the next build folds in only the
+    /// segments appended since instead of re-merging every resident tombstone.
+    merged_deletions: ParkingMutex<Option<Arc<MergedDeletions>>>,
+    /// The previous build's visible mem-tier rows, so the next build filters
+    /// only appended segments and removes from the rest only the rows the
+    /// appended segments' tombstones hide.
+    visible_segments: ParkingMutex<Option<Arc<VisibleSegmentsCache>>>,
+    /// Segments a build carried from the previous build's visible rows.
+    #[cfg(test)]
+    carried_segments: AtomicU64,
+    /// Builds that extended the previous build's merged deletions.
+    #[cfg(test)]
+    extended_merges: AtomicU64,
 }
 
 impl Default for ScanViewCache {
@@ -1667,8 +1835,175 @@ impl Default for ScanViewCache {
         Self {
             latest_complete: ArcSwapOption::empty(),
             in_flight: ParkingMutex::new(Vec::new()),
+            build_lock: Arc::new(tokio::sync::Mutex::new(())),
+            merged_deletions: ParkingMutex::new(None),
+            visible_segments: ParkingMutex::new(None),
+            #[cfg(test)]
+            carried_segments: AtomicU64::new(0),
+            #[cfg(test)]
+            extended_merges: AtomicU64::new(0),
         }
     }
+}
+
+/// Identity of one mem-tier shard's segment list, for reusing work across
+/// scan-view builds: the data sequences of its first and last segment and its
+/// length. Data sequences are unique and increase with every append, and a tier
+/// only ever appends at the end or drops a prefix (a checkpoint's
+/// [`MemTier::retain_after`](crate::provider::mem_tier::MemTier::retain_after));
+/// `retain_rows` keeps every segment and its tombstones. So a later list whose
+/// first segment and `len - 1`-th segment match this lineage begins with
+/// exactly these segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegmentLineage {
+    first: Option<i64>,
+    last: Option<i64>,
+    len: usize,
+}
+
+impl SegmentLineage {
+    fn of(segments: &[crate::provider::mem_tier::MemSegment]) -> Self {
+        Self {
+            first: segments.first().map(|segment| segment.data_sequence),
+            last: segments.last().map(|segment| segment.data_sequence),
+            len: segments.len(),
+        }
+    }
+
+    /// Where the segments appended after this lineage start in `segments`, or
+    /// `None` when `segments` does not begin with this lineage's segments.
+    fn appended_from(&self, segments: &[crate::provider::mem_tier::MemSegment]) -> Option<usize> {
+        if self.len == 0 {
+            return Some(0);
+        }
+        let prefix = segments.get(..self.len)?;
+        (prefix.first().map(|segment| segment.data_sequence) == self.first
+            && prefix.last().map(|segment| segment.data_sequence) == self.last)
+            .then_some(self.len)
+    }
+}
+
+/// The file-side deletion index the mem-tier visibility filter consults,
+/// held so a later build can tell whether it changed.
+#[derive(Clone)]
+enum FileDeletionIndex {
+    Int64(Arc<DeletionIndex>),
+    RowKeys(Arc<KeyDeletionIndex>),
+}
+
+impl FileDeletionIndex {
+    /// The key index `snapshot` holds, or `None` for the position-based strategy,
+    /// which keeps none.
+    fn of(snapshot: &PkDeletionSnapshot) -> Option<Self> {
+        match snapshot {
+            PkDeletionSnapshot::Int64Pk { tombstones } => Some(Self::Int64(Arc::clone(tombstones))),
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                Some(Self::RowKeys(Arc::clone(tombstones)))
+            }
+            PkDeletionSnapshot::PositionBased => None,
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int64(a), Self::Int64(b)) => Arc::ptr_eq(a, b),
+            (Self::RowKeys(a), Self::RowKeys(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    fn max_sequence_number(&self) -> Option<i64> {
+        match self {
+            Self::Int64(index) => index.max_sequence_number(),
+            Self::RowKeys(index) => index.max_sequence_number(),
+        }
+    }
+}
+
+/// One mem-tier segment's deletion-filtered rows from an earlier scan-view
+/// build, kept so a later build re-filters only the rows new tombstones touch.
+struct CachedVisibleSegment {
+    data_sequence: i64,
+    /// The segment's batches when they were filtered. Held rather than compared
+    /// by address: `retain_rows` replaces a segment's batches under the same
+    /// data sequence, and a held `Arc` cannot be reallocated at its address.
+    source: Arc<Vec<RecordBatch>>,
+    /// The visible rows of `source`, batch by batch; empty when all are hidden.
+    batches: Vec<RecordBatch>,
+    /// For the row-key strategy, each visible row's key digest
+    /// ([`hash_index::hash_key_128`] of its encoded primary key, the digest the
+    /// deletion index keys on), aligned with `batches`. Empty for `Int64Pk`,
+    /// whose key is the PK column itself.
+    digests: Vec<Arc<[u128]>>,
+}
+
+/// The visible mem-tier rows of the previous scan-view build and the
+/// file-side deletion index they were filtered against.
+struct VisibleSegmentsCache {
+    file: FileDeletionIndex,
+    /// Per shard, every segment of the captured tier in append order.
+    shards: Vec<Vec<CachedVisibleSegment>>,
+}
+
+/// The keys the appended segments' tombstones hide in every older segment of
+/// their shard: `Int64Pk` values, or row-key digests ([`hash_index::hash_key_128`]).
+enum AppendedKeys {
+    Int64(HashSet<i64, hash_index::XxHash3BuildHasher>),
+    Digests(HashSet<u128, PrehashedBuildHasher>),
+}
+
+impl AppendedKeys {
+    fn of(appended: &[crate::provider::mem_tier::MemSegment], digest_keys: bool) -> Self {
+        if digest_keys {
+            let mut keys = HashSet::with_hasher(PrehashedBuildHasher);
+            for segment in appended {
+                keys.extend(segment.tombstones.row_keys().map(hash_index::hash_key_128));
+            }
+            Self::Digests(keys)
+        } else {
+            let mut keys = HashSet::with_hasher(hash_index::XxHash3BuildHasher);
+            for segment in appended {
+                keys.extend(segment.tombstones.int64_keys());
+            }
+            Self::Int64(keys)
+        }
+    }
+}
+
+/// How the captured `segments` of a shard continue the previous build's list:
+/// `(start, carried)` where `segments[..carried]` are `previous[start..]`
+/// (the previous list minus a dropped prefix) and the rest were appended.
+/// `(0, 0)` when nothing is carried. Data sequences are unique and ascend in
+/// append order, so matching them identifies the same segment.
+fn carried_segments(
+    previous: &[CachedVisibleSegment],
+    segments: &[crate::provider::mem_tier::MemSegment],
+) -> (usize, usize) {
+    let Some(first) = segments.first() else {
+        return (0, 0);
+    };
+    let Ok(start) =
+        previous.binary_search_by_key(&first.data_sequence, |cached| cached.data_sequence)
+    else {
+        return (0, 0);
+    };
+    let carried = previous.len() - start;
+    let continues = segments.len() >= carried
+        && previous[start..]
+            .iter()
+            .zip(segments)
+            .all(|(cached, segment)| cached.data_sequence == segment.data_sequence);
+    if continues { (start, carried) } else { (0, 0) }
+}
+
+/// A merged deletion snapshot and the inputs it was computed from.
+struct MergedDeletions {
+    /// The file-side snapshot the merge started from. Held, not just compared
+    /// by pointer, so no later snapshot can be allocated at its address.
+    file: PkDeletionSnapshot,
+    /// The lineage of each shard's segments whose tombstones are merged in.
+    shards: Vec<SegmentLineage>,
+    merged: PkDeletionSnapshot,
 }
 
 /// Unpruned snapshot-directory listing with per-file footer statistics.
@@ -1723,12 +2058,23 @@ impl ScanViewCache {
     /// and `version_after`; this does not load `latest_complete` again, so a
     /// write that publishes after `version_after` cannot swap in a different
     /// view that this check would still accept.
+    ///
+    /// [`ScanViewReuse::WithinLag`] freshness is measured from `requested_at`,
+    /// the instant the scan asked for a view, not from `now`: a view captured
+    /// at most `lag` before the request satisfies it however long the request
+    /// then waited for build admission, and a view captured after the request
+    /// arrived is fresher than any lag requires. Measuring from `now` would make
+    /// every scan that queued behind a build longer than `lag` reject the view
+    /// that build produced and rebuild in turn. With a zero lag only a view
+    /// captured at or after the request qualifies, so a scan still never reuses
+    /// state captured before it was issued.
     fn try_serve_latest(
         reuse: ScanViewReuse,
         version_before: u64,
         version_after: u64,
         structural: u64,
         now: Instant,
+        requested_at: Instant,
         candidate: Option<Arc<CompletedScanView>>,
     ) -> Option<Arc<ScanView>> {
         // A live schema-evolution leaves the generation odd; never serve across it.
@@ -1742,11 +2088,11 @@ impl ScanViewCache {
                     && current.order == version_after
                     && current.view.structural_version == structural
             }
-            ScanViewReuse::WithinLag(lag) if !lag.is_zero() => {
-                now.saturating_duration_since(current.captured_at) <= lag
+            ScanViewReuse::WithinLag(lag) => {
+                // Zero when the view was captured at or after the request.
+                requested_at.saturating_duration_since(current.captured_at) <= lag
                     && current.view.structural_version == structural
             }
-            ScanViewReuse::WithinLag(_) => false,
         };
         if !servable {
             return None;
@@ -1893,6 +2239,9 @@ struct TestListingSeams {
 #[cfg(test)]
 type TestCheckpointUnionHook = Box<dyn FnOnce() + Send>;
 
+#[cfg(test)]
+type TestScanViewBuildHook = Box<dyn FnOnce() + Send>;
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -1999,6 +2348,12 @@ pub struct CayenneTableProvider {
     /// concurrent maintenance tasks cannot merge from the same cached base and
     /// overwrite each other's row-count or column-stat deltas.
     table_statistics_persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    /// When this table was opened. A data file modified later was written by this
+    /// process, so no earlier process persisted its scan statistics.
+    opened_at: chrono::DateTime<chrono::Utc>,
+    /// Scan-statistics rows still being persisted in the background
+    /// ([`Self::persist_scan_file_statistics`]).
+    scan_statistics_persistence: Arc<PendingWork>,
     /// Set when a durable `num_rows_exact` taint (or an authoritative `Set`) failed
     /// to persist, so the metastore's exactness bit is known to over-claim.
     ///
@@ -2116,6 +2471,17 @@ pub struct CayenneTableProvider {
     /// they commit under. Consumed on first fire.
     #[cfg(test)]
     test_pre_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired after a seq-prefix bake has built its deletion-index
+    /// prune off the listing fence and before it takes the fence to publish it, so
+    /// a test can scan, or republish table state, inside that window. Consumed on
+    /// first fire.
+    #[cfg(test)]
+    test_pre_bake_prune_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired after a mem-tier checkpoint has built its deletion-index
+    /// extension and before it takes the listing fence to publish it. Consumed on
+    /// first fire.
+    #[cfg(test)]
+    test_pre_checkpoint_deletion_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Test-only seam fired by `sort_and_rewrite_data` after its catalog commit
     /// and before its in-memory flip, so a test can commit an overwrite between
     /// the two. Consumed on first fire.
@@ -2167,6 +2533,26 @@ pub struct CayenneTableProvider {
     /// rebuild reads the table after that capture. Consumed on first fire.
     #[cfg(test)]
     test_post_keyset_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by the durable write after it publishes its rows
+    /// inline and before it records their keys, so a test can land a checkpoint
+    /// in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_post_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by the inline write after it commits its rows to the
+    /// metastore and before it publishes them, so a test can land a checkpoint in
+    /// that window. Consumed on first fire.
+    #[cfg(test)]
+    test_pre_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by a statement write after its validation checked out
+    /// the primary-key index and before it reads its first batch, so a test can land
+    /// a checkpoint in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_post_prepare_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by a write that fell back from inline to a new snapshot,
+    /// after it wrote the snapshot and before it publishes it with its deletions, so
+    /// a test can land a checkpoint in that window. Consumed on first fire.
+    #[cfg(test)]
+    test_pre_staged_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by `rebuild_maintained_aggregates_from_visible_state`
     /// after its scan has been read, so a test can land a write inside that scan's
     /// window. Consumed on first fire.
@@ -2178,6 +2564,18 @@ pub struct CayenneTableProvider {
     /// fire.
     #[cfg(test)]
     test_checkpoint_union_hook: Arc<ParkingMutex<Option<TestCheckpointUnionHook>>>,
+    /// One-shot pause inside the blocking scan-view build.
+    #[cfg(test)]
+    test_scan_view_build_hook: Arc<ParkingMutex<Option<TestScanViewBuildHook>>>,
+    /// One-shot signal before a scan waits for build admission.
+    #[cfg(test)]
+    test_pre_scan_view_admission_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired after a demand-cache capture passes its version
+    /// check and before the view is keyed and built, so a test can land a write
+    /// and queue another scan behind a capture that is already stamped.
+    /// Consumed on first fire.
+    #[cfg(test)]
+    test_post_scan_input_validation_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired after a current-snapshot rewrite — the full rewrite or
     /// the small-file subset rewrite — finishes its re-encode and before it takes
     /// the locks it commits under, so a test can land a write the rewrite's scan
@@ -5388,12 +5786,14 @@ impl RewriteOrder {
     }
 }
 
-/// In-memory bytes of rows each shard of a whole-table replace sorts by the
-/// routing key at a time (see `WriteShardConfig::run_sort_bytes`).
+/// In-memory bytes of rows each shard of a whole-table replace sorts by its
+/// key at a time (see `WriteShardConfig::run_sort_bytes`): the routing column,
+/// then the rest of the shard key.
 ///
 /// A file then holds a few key-sorted runs instead of arrival order, so an
 /// equality lookup reads about one zone per run rather than every zone of the
-/// key. This holds for a range-routed replace and for one that hashes the key
+/// key, including one that pins a composite key whose routing column has few
+/// values. This holds for a range-routed replace and for one that hashes the key
 /// (the first load of a table has no rows to sample split points from). One run
 /// per shard is resident at a time, charged to the query memory pool; a refused
 /// charge seals the run early rather than failing the write.
@@ -5424,10 +5824,10 @@ pub(crate) struct RangePartitioning<'a> {
 
 impl RangePartitioning<'_> {
     /// A whole-table replace with no split points to route on: the shard key
-    /// is hashed as before, and each shard's rows are still sorted by its
-    /// leading column, so the zone maps inside every file prune an equality on
-    /// the key. This is the shape of a table's first load, which has no rows
-    /// to sample split points from.
+    /// is hashed as before, and each shard's rows are still sorted by the key,
+    /// so the zone maps inside every file prune an equality on it. This is the
+    /// shape of a table's first load, which has no rows to sample split points
+    /// from.
     pub(crate) const fn hashed_run_sorted() -> Self {
         Self {
             column: None,
@@ -9925,6 +10325,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_pre_bake_prune_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_pre_checkpoint_deletion_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -9949,9 +10353,23 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_post_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_pre_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_prepare_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_pre_staged_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_checkpoint_union_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_scan_view_build_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_pre_scan_view_admission_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_post_scan_input_validation_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
@@ -9985,6 +10403,8 @@ impl CayenneTableProvider {
                 count_exact: table_statistics_count_exact,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+            opened_at: chrono::Utc::now(),
+            scan_statistics_persistence: Arc::new(PendingWork::default()),
             row_count_taint_pending: Arc::new(AtomicBool::new(false)),
             retention_filters,
             time_retention_filter_builder,
@@ -10594,6 +11014,24 @@ impl CayenneTableProvider {
         Arc::clone(&self.mem_checkpoint_lock)
     }
 
+    /// Hold the mem-tier checkpoint off for a durable write, from before its
+    /// validation checks out the primary-key index until the write has acted on
+    /// what that index said about where each replaced row lives.
+    ///
+    /// The checkpoint folds the published inline corpus into its snapshot, clears
+    /// the corpus, and relabels the inline keys as file keys, and at one shard it
+    /// takes no `write_lock`. A write that validated against the index from before
+    /// the fold would supersede a replaced row only in the inline corpus it no
+    /// longer occupies, and one that recorded its keys after the relabel would leave
+    /// them `Inlined` while their rows sit in a file; either way a later upsert of
+    /// the key leaves two live rows. Taken after `write_lock`, in the order the
+    /// spill and `begin_overwrite` already use.
+    pub(crate) async fn lock_mem_tier_checkpoint_for_durable_write(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.mem_checkpoint_lock_for_writer().lock_owned().await
+    }
+
     /// Durably record a newly written snapshot's sequence number in the catalog
     /// (syncing the snapshot directory first on local filesystems).
     ///
@@ -10914,7 +11352,7 @@ impl CayenneTableProvider {
                         lead_with_range_column(&mut config.shard_key_columns, column);
                     }
                     // Without bounds the write hashes the shard key; the run sort
-                    // then orders each shard by its leading column instead.
+                    // orders each shard by that key either way.
                     config.run_sort_bytes = range.run_sort_bytes;
                     config.range_bounds_estimated =
                         range.bounds_estimated && config.range_bounds.is_some();
@@ -12200,11 +12638,7 @@ impl CayenneTableProvider {
         let schema = self.table_schema();
         let configured = self.context.shard_key_columns();
         if configured.is_empty() {
-            return self
-                .pk_column_indices
-                .iter()
-                .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
-                .collect();
+            return self.primary_key_shard_key(&schema);
         }
         let missing: Vec<&String> = configured
             .iter()
@@ -12218,10 +12652,34 @@ impl CayenneTableProvider {
             missing = ?missing,
             "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
         );
-        self.pk_column_indices
+        self.primary_key_shard_key(&schema)
+    }
+
+    /// The primary key as a shard key: its columns in the table's sort order
+    /// where the sort order names them, then the rest in key order.
+    ///
+    /// A shard key's column order decides the column a range split routes on and
+    /// the order each write run is sorted in, so it decides which lookups prune.
+    /// The key's own column order is the order its row keys are encoded in, and
+    /// schema inference does not choose it for lookups: an inferred composite
+    /// key can come back in name order, leading with a column of a handful of
+    /// values that every lookup then reads all of. The sort order, where there is
+    /// one, is the source's key order or the operator's, which is the order
+    /// lookups pin the key in.
+    fn primary_key_shard_key(&self, schema: &SchemaRef) -> Vec<String> {
+        let mut key: Vec<String> = self
+            .pk_column_indices
             .iter()
             .filter_map(|&i| schema.fields().get(i).map(|f| f.name().clone()))
-            .collect()
+            .collect();
+        let sort = self.context.sort_columns();
+        // Stable, so the columns the sort order does not name keep key order.
+        key.sort_by_key(|column| {
+            sort.iter()
+                .position(|sorted| sorted == column)
+                .unwrap_or(usize::MAX)
+        });
+        key
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
@@ -12292,6 +12750,8 @@ impl CayenneTableProvider {
             listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
+            opened_at: self.opened_at,
+            scan_statistics_persistence: Arc::clone(&self.scan_statistics_persistence),
             row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
@@ -12316,6 +12776,12 @@ impl CayenneTableProvider {
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
             #[cfg(test)]
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
+            #[cfg(test)]
+            test_pre_bake_prune_publish_hook: Arc::clone(&self.test_pre_bake_prune_publish_hook),
+            #[cfg(test)]
+            test_pre_checkpoint_deletion_publish_hook: Arc::clone(
+                &self.test_pre_checkpoint_deletion_publish_hook,
+            ),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::clone(&self.test_post_catalog_commit_hook),
             #[cfg(test)]
@@ -12345,11 +12811,27 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
+            test_post_inline_publish_hook: Arc::clone(&self.test_post_inline_publish_hook),
+            #[cfg(test)]
+            test_pre_inline_publish_hook: Arc::clone(&self.test_pre_inline_publish_hook),
+            #[cfg(test)]
+            test_post_prepare_hook: Arc::clone(&self.test_post_prepare_hook),
+            #[cfg(test)]
+            test_pre_staged_publish_hook: Arc::clone(&self.test_pre_staged_publish_hook),
+            #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::clone(
                 &self.test_post_maintained_aggregate_scan_hook,
             ),
             #[cfg(test)]
             test_checkpoint_union_hook: Arc::clone(&self.test_checkpoint_union_hook),
+            #[cfg(test)]
+            test_scan_view_build_hook: Arc::clone(&self.test_scan_view_build_hook),
+            #[cfg(test)]
+            test_pre_scan_view_admission_hook: Arc::clone(&self.test_pre_scan_view_admission_hook),
+            #[cfg(test)]
+            test_post_scan_input_validation_hook: Arc::clone(
+                &self.test_post_scan_input_validation_hook,
+            ),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             #[cfg(test)]
@@ -13070,6 +13552,19 @@ impl CayenneTableProvider {
             return;
         }
         let mut index = index;
+        if restored.relocates_inlined()
+            && let CachedPkIndex::Exact(keyset) = &mut index
+        {
+            // A checkpoint moved the inline rows into files while the index was out
+            // (see `PendingPkKeys::relocate_inlined_after_flush`); a Bloom carries no
+            // locations. The relabeled keys keep OCC stamps from before the flush, which
+            // an off-lock transaction that planned against the inline copy would pass,
+            // so per-key OCC falls back to the per-table check, which the flush's
+            // sequence fails.
+            if keyset.relocate_inlined_to_file_unlocated() || restored.relocated_inline_keys() {
+                self.mark_pk_keyset_occ_degraded();
+            }
+        }
         let mut replayed_keys = 0_usize;
         let mut replay_over_budget = false;
         for (keys, location, sequence) in restored.batches() {
@@ -13451,16 +13946,22 @@ impl CayenneTableProvider {
     /// emits key-based deletes to both lists, so no change is needed.
     fn flip_inlined_keyset_entries_to_file_unlocated(&self) {
         let mut guard = self.pk_keyset_cache.lock();
-        if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
-            keyset.relocate_inlined_to_file_unlocated();
-        } else {
-            // An index checked out for validation is not in the cell, so its entries
-            // keep saying `Inlined` for rows this checkpoint just moved into files.
-            // An upsert of such a key would tombstone the inline copy only and leave
-            // the file copy live, so drop that index at its restore instead — the
-            // rebuild reads the post-checkpoint locations.
-            self.pk_keyset_pending.lock().invalidate();
+        if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut()
+            && keyset.relocate_inlined_to_file_unlocated()
+        {
+            // The relabeled keys keep OCC stamps from before the flush; see
+            // `store_cached_pk_index`.
+            self.mark_pk_keyset_occ_degraded();
         }
+        // An index checked out for validation is not in the cell, so its entries
+        // keep saying `Inlined` for rows this checkpoint just moved into files; an
+        // upsert of such a key would tombstone the inline copy only and leave the
+        // file copy live. Have its restore relabel it instead of discarding it: a
+        // discard costs the next apply a full-table keyset rebuild under
+        // `write_lock`, and a checkpoint landing inside that rebuild discards it
+        // again. A no-op when nothing is checked out. Why relabeling is sound for
+        // this index: `PendingPkKeys::relocate_inlined_after_flush`.
+        self.pk_keyset_pending.lock().relocate_inlined_after_flush();
         drop(guard);
         // The N>1 sharded cache carries the same per-key `RowLocation`s; flip them
         // in lockstep so a post-checkpoint upsert tombstones a flushed key by file,
@@ -14199,6 +14700,15 @@ impl CayenneTableProvider {
             state.config(),
         );
         let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+        // Listed under the fence (see `snapshot_file_list`); a file missed here
+        // only keeps its key deletes, but the listing would fill the cache entry
+        // queries read.
+        let captured = self
+            .capture_snapshot_files_under_fence(&snapshot_id)
+            .await
+            .map_err(|err| CatalogError::InvalidOperationNoSource {
+                message: format!("Position capture: failed to list snapshot files: {err}"),
+            })?;
         let listed = self
             .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
                 state: &state,
@@ -14210,7 +14720,7 @@ impl CayenneTableProvider {
                 limit: None,
                 scan_schema,
                 file_statistics_schema: self.table_schema(),
-                captured_files: None,
+                captured_files: Some(&captured),
             })
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
@@ -14404,22 +14914,24 @@ impl CayenneTableProvider {
     }
 
     /// Delete the files at `locations` from an unpublished snapshot, and release
-    /// what the Vortex caches hold for them: the fold reads them first.
+    /// what the Vortex caches hold for them (the fold reads them first) and the
+    /// directory's cached listing.
     pub(crate) async fn remove_snapshot_files(
         &self,
         snapshot_id: &str,
         locations: Vec<ObjectStorePath>,
     ) -> Result<()> {
         let table_name = self.table_metadata.table_name.clone();
-        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+        let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             snapshot_id,
-        ))
-        .map_err(|err| Error::Internal {
-            table: table_name.clone(),
-            message: format!("invalid snapshot URL: {err}"),
-        })?;
+        );
+        let table_url =
+            ListingTableUrl::parse(&snapshot_dir_url).map_err(|err| Error::Internal {
+                table: table_name.clone(),
+                message: format!("invalid snapshot URL: {err}"),
+            })?;
         let store = self
             .context
             .runtime_env()
@@ -14450,6 +14962,14 @@ impl CayenneTableProvider {
             }
         }
         self.invalidate_retired_paths(removed).await;
+        // The query that found the superseded copies listed this directory
+        // through the shared list-files cache, and nothing else is guaranteed to
+        // evict that listing: on network storage the rewrite runs through the
+        // direct compaction writer, whose own `RuntimeEnv` takes the eviction
+        // `DataFusion` makes when it plans the write. Evict it here, once the
+        // files are gone and whatever the deletes' outcome, so the published
+        // snapshot is never listed with them (spiceai/spiceai#15298).
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &snapshot_dir_url);
         match first_error {
             Some(source) => Err(Error::ObjectStore {
                 operation: "delete superseded files",
@@ -17948,6 +18468,38 @@ impl CayenneTableProvider {
         Ok(Some(results))
     }
 
+    /// Write one key-based deletion-vector file per `(delete_sequence, keys)`
+    /// group, each recorded at its own group's sequence, in a single
+    /// [`DeletionVectorWriter::write`]: the files are written concurrently and
+    /// the deletions directory is synced once, rather than a file write, a file
+    /// sync and a directory sync per group in turn. A mem-tier checkpoint
+    /// carries one group per appended segment that holds tombstones — thousands
+    /// on a table whose every CDC batch deletes, and a sequential pass over them
+    /// held such a checkpoint for minutes.
+    async fn write_key_deletion_vectors_by_sequence(
+        &self,
+        groups: Vec<(i64, Vec<Box<[u8]>>)>,
+    ) -> CatalogResult<Vec<crate::metadata::DeleteFile>> {
+        let specs: Vec<DeletionVectorWriteSpec> = groups
+            .into_iter()
+            .filter(|(_, row_keys)| !row_keys.is_empty())
+            .map(|(delete_sequence, row_keys)| {
+                DeletionVectorWriteSpec::new_key_based(row_keys)
+                    .with_sequence_number(delete_sequence)
+            })
+            .collect();
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let results = DeletionVectorWriter::new(&self.table_metadata)
+            .write(specs)
+            .await?;
+        Ok(results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect())
+    }
+
     /// Durably commit one mem-tier checkpoint's deletion metadata, splitting
     /// the tier's tombstones by flushed-corpus membership:
     ///
@@ -17996,30 +18548,24 @@ impl CayenneTableProvider {
                         }
                     }
 
-                    // Write the durable delete vectors per group. The in-memory
+                    // Write the durable delete vectors, one file per group. The in-memory
                     // fold is DEFERRED to the publish step (`commit_on_conflict_deletion_update`),
                     // which replays this delta under `rcu` against the live index —
                     // so no `load_full` of the deletion snapshot here.
-                    for (&delete_sequence, pks) in &pure_by_seq {
-                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys)
-                            .await?
-                        {
-                            pure_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
-                    for (&delete_sequence, pks) in &reinsert_by_seq {
-                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys)
-                            .await?
-                        {
-                            reinsert_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
+                    let int64_groups = |by_seq: &BTreeMap<i64, Vec<i64>>| {
+                        by_seq
+                            .iter()
+                            .map(|(&delete_sequence, pks)| {
+                                (delete_sequence, pks.iter().copied().map(i64_key).collect())
+                            })
+                            .collect()
+                    };
+                    pure_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(int64_groups(&pure_by_seq))
+                        .await?;
+                    reinsert_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(int64_groups(&reinsert_by_seq))
+                        .await?;
 
                     OnConflictDeletionUpdate::Int64Pk(Int64DeletionDelta {
                         pure: pure_by_seq.into_iter().collect(),
@@ -18051,26 +18597,20 @@ impl CayenneTableProvider {
                         }
                     }
 
-                    // Durable delete vectors per group; in-memory fold deferred to
-                    // the publish step's `rcu` (see the Int64 arm above).
-                    for (&delete_sequence, row_keys) in &pure_by_seq {
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys.clone())
-                            .await?
-                        {
-                            pure_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
-                    for (&delete_sequence, row_keys) in &reinsert_by_seq {
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys.clone())
-                            .await?
-                        {
-                            reinsert_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
+                    // Durable delete vectors, one file per group; in-memory fold
+                    // deferred to the publish step's `rcu` (see the Int64 arm above).
+                    let row_key_groups = |by_seq: &BTreeMap<i64, Vec<Box<[u8]>>>| {
+                        by_seq
+                            .iter()
+                            .map(|(&delete_sequence, row_keys)| (delete_sequence, row_keys.clone()))
+                            .collect()
+                    };
+                    pure_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(row_key_groups(&pure_by_seq))
+                        .await?;
+                    reinsert_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(row_key_groups(&reinsert_by_seq))
+                        .await?;
 
                     OnConflictDeletionUpdate::RowConverter(RowKeyDeletionDelta {
                         pure: pure_by_seq.into_iter().collect(),
@@ -19335,23 +19875,8 @@ impl CayenneTableProvider {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
                 {
-                    deletion_snapshot.rcu(|current| {
-                        // Fold the pure-delete and reinsert groups in ONE pass
-                        // (single bloom rebuild) instead of one `extend_max_*`
-                        // call per group — see `DeletionIndex::extend_max`.
-                        let updated = current.tombstones.extend_max(
-                            delta.pure.iter().flat_map(|(delete_seq, pks)| {
-                                pks.iter().map(move |&pk| (pk, *delete_seq))
-                            }),
-                            delta
-                                .reinsert
-                                .iter()
-                                .flat_map(|(delete_seq, pks, insert_seq)| {
-                                    pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
-                                }),
-                        );
-                        Arc::new(Int64PkDeletionSnapshot::from_index(updated))
-                    });
+                    deletion_snapshot
+                        .rcu(|current| Arc::new(extended_int64_snapshot(current, &delta)));
                 }
                 self.refresh_deletion_memory_accounting();
             }
@@ -19360,22 +19885,8 @@ impl CayenneTableProvider {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
                 {
-                    deletion_snapshot.rcu(|current| {
-                        // One-pass fold (single bloom rebuild) over both groups;
-                        // see `KeyDeletionIndex::extend_max`.
-                        let updated = current.tombstones.extend_max(
-                            delta.pure.iter().flat_map(|(delete_seq, keys)| {
-                                keys.iter().map(move |k| (&**k, *delete_seq))
-                            }),
-                            delta
-                                .reinsert
-                                .iter()
-                                .flat_map(|(delete_seq, keys, insert_seq)| {
-                                    keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
-                                }),
-                        );
-                        Arc::new(RowConverterDeletionSnapshot::from_index(updated))
-                    });
+                    deletion_snapshot
+                        .rcu(|current| Arc::new(extended_row_key_snapshot(current, &delta)));
                 }
                 self.refresh_deletion_memory_accounting();
             }
@@ -19473,6 +19984,132 @@ impl CayenneTableProvider {
                 self.notify_scan_input_change();
                 return;
             }
+        }
+    }
+
+    /// [`Self::commit_on_conflict_publish`] for a protected snapshot whose
+    /// deletion-index extension was built before the caller took its locks
+    /// ([`Self::prepare_on_conflict_deletion_update`]). The prepared index is
+    /// published only if it was built from the index still in place; otherwise
+    /// the extension is redone here, under the same guard.
+    pub(crate) async fn commit_on_conflict_publish_prepared(
+        &self,
+        inlined_tombstone_written: bool,
+        deletion: PreparedOnConflictDeletion,
+        protected_snapshot: (&str, i64),
+    ) {
+        let (snapshot_id, threshold) = protected_snapshot;
+        let mut deletion = Some(deletion);
+        loop {
+            let prepared = self.prepare_protected_snapshot_update(snapshot_id, threshold);
+            let _view_guard = self.scan_state_lock.write().await;
+            if self.try_commit_prepared_protected_snapshot(prepared) {
+                self.mark_maintained_aggregates_stale_on_checkpoint();
+                // As in `publish_on_conflict_update`.
+                if inlined_tombstone_written {
+                    self.bump_inlined_structural_epoch();
+                }
+                if let Some(deletion) = deletion.take() {
+                    self.commit_prepared_on_conflict_deletion(deletion);
+                }
+                self.notify_scan_input_change();
+                return;
+            }
+        }
+    }
+
+    /// Fold an on-conflict deletion update into a copy of the live deletion index
+    /// on a blocking thread, ahead of the locks its publication takes
+    /// ([`Self::commit_on_conflict_publish_prepared`]). The fold visits every key
+    /// the update supersedes and probes each tier of an index that can hold
+    /// millions of keys, so run under the listing fence it held every scan of the
+    /// table for as long.
+    async fn prepare_on_conflict_deletion_update(
+        &self,
+        update: OnConflictDeletionUpdate,
+    ) -> Result<PreparedOnConflictDeletion> {
+        match (update, &self.pk_deletion_strategy) {
+            (
+                OnConflictDeletionUpdate::Int64Pk(delta),
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                },
+            ) => {
+                let from = deletion_snapshot.load_full();
+                let input = Arc::clone(&from);
+                let (delta, to) = tokio::task::spawn_blocking(move || {
+                    let to = extended_int64_snapshot(&input, &delta);
+                    (delta, to)
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked {
+                    table: self.table_metadata.table_name.clone(),
+                    source,
+                })?;
+                Ok(PreparedOnConflictDeletion {
+                    update: OnConflictDeletionUpdate::Int64Pk(delta),
+                    built: BuiltDeletionIndex::Int64Pk {
+                        from,
+                        to: Arc::new(to),
+                    },
+                })
+            }
+            (
+                OnConflictDeletionUpdate::RowConverter(delta),
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                },
+            ) => {
+                let from = deletion_snapshot.load_full();
+                let input = Arc::clone(&from);
+                let (delta, to) = tokio::task::spawn_blocking(move || {
+                    let to = extended_row_key_snapshot(&input, &delta);
+                    (delta, to)
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked {
+                    table: self.table_metadata.table_name.clone(),
+                    source,
+                })?;
+                Ok(PreparedOnConflictDeletion {
+                    update: OnConflictDeletionUpdate::RowConverter(delta),
+                    built: BuiltDeletionIndex::RowConverter {
+                        from,
+                        to: Arc::new(to),
+                    },
+                })
+            }
+            (update, _) => Ok(PreparedOnConflictDeletion {
+                update,
+                built: BuiltDeletionIndex::Nothing,
+            }),
+        }
+    }
+
+    /// Publish a prepared deletion-index extension if the index it was built from
+    /// is still the live one, else fold its update into the live index here. The
+    /// caller holds `scan_state_lock.write()`.
+    fn commit_prepared_on_conflict_deletion(&self, deletion: PreparedOnConflictDeletion) {
+        let PreparedOnConflictDeletion { update, built } = deletion;
+        let published = match (built, &self.pk_deletion_strategy) {
+            (
+                BuiltDeletionIndex::Int64Pk { from, to },
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                },
+            ) => Arc::ptr_eq(&deletion_snapshot.compare_and_swap(&from, to), &from),
+            (
+                BuiltDeletionIndex::RowConverter { from, to },
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                },
+            ) => Arc::ptr_eq(&deletion_snapshot.compare_and_swap(&from, to), &from),
+            _ => false,
+        };
+        if published {
+            self.refresh_deletion_memory_accounting();
+        } else {
+            self.commit_on_conflict_deletion_update(update);
         }
     }
 
@@ -19807,6 +20444,175 @@ impl CayenneTableProvider {
         Ok((data, plan))
     }
 
+    /// Key-range split points for a mem-tier checkpoint's encode shards, cut
+    /// from the corpus it flushes, which is the whole input and so a fair sample
+    /// of itself (see [`Self::sampled_input_bounds`]).
+    ///
+    /// A hash split leaves every shard file spanning the whole key domain, so a
+    /// lookup on the key reads every file of every checkpoint not yet compacted
+    /// away. Cut into ranges, each file holds one slice of the routing key —
+    /// the leading primary-key column unless scans pin another column more
+    /// than twice as often (see [`Self::range_routing_candidates`]) — and
+    /// sorts its rows by it in runs, so a lookup reads one file per checkpoint
+    /// and the zones of its slice within it. `None` keeps the hash split: one
+    /// encode shard, a table with `cayenne_cluster_by` or authoritative sort
+    /// columns, or a key with too few distinct values, or too many NULLs, to
+    /// fill the shards.
+    fn checkpoint_range_plan(
+        &self,
+        batches: &[RecordBatch],
+        target_partitions: usize,
+        target_size_bytes: usize,
+        estimated_bytes: u64,
+    ) -> Option<OverwriteRangePlan> {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        // Places equal-count cuts within a fraction of a percent of their target
+        // for any shard count a write uses (as `overwrite_range_plan`).
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return None;
+        }
+        // The cuts are for the shard count this write will create: the sink keeps
+        // the ascending prefix of the bounds it is handed.
+        let shards = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            Some(estimated_bytes),
+            EncodeFanOut::Sized,
+        );
+        if shards < 2 {
+            return None;
+        }
+        let schema = self.table_schema();
+        let reservation = MemoryConsumer::new(format!(
+            "cayenne_checkpoint_range_sample:{}",
+            self.table_name()
+        ))
+        .register(&self.context.runtime_env().memory_pool);
+        self.range_routing_candidates(&schema)
+            .into_iter()
+            .find_map(|(column, _)| {
+                let key_index = schema.index_of(&column).ok()?;
+                let key_type = schema.field(key_index).data_type().clone();
+                Self::sampled_input_bounds(
+                    batches,
+                    key_index,
+                    &key_type,
+                    shards,
+                    true,
+                    MAX_SAMPLE_ROWS,
+                    &reservation,
+                )
+                .map(|bounds| OverwriteRangePlan {
+                    column,
+                    bounds,
+                    from_input_head: false,
+                })
+            })
+    }
+
+    /// Key-range split points for a seq-prefix bake's merged output, so each of its
+    /// files holds one slice of the routing key — the leading primary-key column
+    /// unless scans pin another more than twice as often (see
+    /// [`Self::range_routing_candidates`]) — and sorts its rows by it in runs.
+    /// Hashed, every output file spans the whole key domain, and a lookup on the
+    /// key opens every file of the merged snapshot; routed, it opens one.
+    ///
+    /// The split points are equal-count quantiles of a strided sample of the key
+    /// read from the bake's own inputs, the rows it merges. `None` keeps the hash:
+    /// one encode shard, a table with `cayenne_cluster_by` or authoritative sort
+    /// columns, or a key whose sample cannot fill the shards. Split points only
+    /// place rows: every row still reaches exactly one file, whose statistics
+    /// describe what it holds.
+    async fn bake_range_plan(
+        &self,
+        state: &dyn Session,
+        inputs: &[(String, i64)],
+        target_partitions: usize,
+        target_size_bytes: usize,
+        estimated_bytes: Option<u64>,
+    ) -> Option<OverwriteRangePlan> {
+        // As `overwrite_range_plan`.
+        const MAX_SAMPLE_ROWS: usize = 65_536;
+        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+            return None;
+        }
+        let shards = self.snapshot_shard_count(
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+            EncodeFanOut::Sized,
+        );
+        if shards < 2 {
+            return None;
+        }
+        let schema = self.table_schema();
+        for (column, _) in self.range_routing_candidates(&schema) {
+            let Ok(index) = schema.index_of(&column) else {
+                continue;
+            };
+            let key_type = schema.field(index).data_type().clone();
+            let sample = match self
+                .sample_snapshots_column(state, inputs, index, &key_type, MAX_SAMPLE_ROWS)
+                .await
+            {
+                Ok(Some(sample)) => sample,
+                Ok(None) => return None,
+                Err(error) => {
+                    // Placement only: hashing keeps the merge correct, just unclustered.
+                    tracing::debug!(
+                        table = self.table_name(),
+                        column = column.as_str(),
+                        %error,
+                        "Could not sample the routing key of a seq-prefix bake; hashing it instead"
+                    );
+                    return None;
+                }
+            };
+            if sample.null_count().saturating_mul(shards) > sample.len() {
+                continue;
+            }
+            let Some(bounds) = equal_count_bounds(&sample, shards) else {
+                continue;
+            };
+            if bounds.len() + 1 < shards {
+                continue;
+            }
+            return Some(OverwriteRangePlan {
+                column,
+                bounds,
+                from_input_head: false,
+            });
+        }
+        None
+    }
+
+    /// A strided sample of column `index` across the files of the `inputs`
+    /// snapshots; see [`Self::sample_plan_column`].
+    async fn sample_snapshots_column(
+        &self,
+        state: &dyn Session,
+        inputs: &[(String, i64)],
+        index: usize,
+        data_type: &DataType,
+        max_rows: usize,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        let projection = vec![index];
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(inputs.len());
+        for (snapshot_id, _) in inputs {
+            plans.push(
+                self.create_snapshot_scan_plan(state, snapshot_id, Some(&projection), &[], None)
+                    .await?,
+            );
+        }
+        let plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        Self::sample_plan_column(plan, state.task_ctx(), data_type, max_rows).await
+    }
+
     /// Equal-count split points for `shards` from the key column of an input's
     /// buffered head, or `None` when the head is not a fair sample of the key.
     /// See [`Self::input_range_plan`].
@@ -19893,11 +20699,18 @@ impl CayenneTableProvider {
     ///
     /// A configured `cayenne_shard_key_columns` is the only candidate: the
     /// operator named the key. Otherwise the leading primary-key column comes
-    /// first, unless scans filter on another column more than twice as often —
-    /// schema inference can supply a primary key the workload never looks rows up
-    /// by (an auto-increment surrogate), and a layout routed on it prunes
-    /// nothing. Join keys arrive as runtime filters, which are not observed, so
-    /// the primary key yields only to a column filtered on distinctly more often.
+    /// first, unless scans pin another column more than twice as often — schema
+    /// inference can supply a primary key the workload never looks rows up by (an
+    /// auto-increment surrogate), and a layout routed on it prunes nothing. A
+    /// filter counts for a column only where it pins it to a few values or bounds
+    /// it by a literal (`FilterColumnObservations::pinned_hits`), because only
+    /// such a filter skips files that each hold one range of the column: a lookup
+    /// that fixes the leading key and lists many values of another skips every
+    /// file but one when routed on the leading key, and none when routed on the
+    /// other. Pinned values outrank bounds, which decide only between columns no
+    /// scan pins: a lookup's witness bound (`count >= 1`) prunes nothing. Join
+    /// keys arrive as runtime filters, which are not observed, so the primary key
+    /// yields only to a column pinned distinctly more often.
     /// Whichever of the two is not preferred follows as the fallback.
     fn range_routing_candidates(&self, schema: &SchemaRef) -> Vec<(String, RangeKeySource)> {
         let routable = |column: &str| {
@@ -19918,13 +20731,14 @@ impl CayenneTableProvider {
         }
         let observations = &self.filter_column_observations;
         let hottest = observations
-            .top_columns(DEFAULT_ROUTING_CANDIDATES, schema.as_ref())
+            .top_pinned_columns(DEFAULT_ROUTING_CANDIDATES, schema.as_ref())
             .into_iter()
             .find(|column| routable(column));
         match (leading_key, hottest) {
             (Some(key), Some(hottest)) if hottest != key => {
-                let hottest_leads =
-                    observations.hits(&hottest) > observations.hits(&key).saturating_mul(2);
+                let hottest_leads = observations
+                    .pinned_hits(&hottest)
+                    .lead_more_than_twice(&observations.pinned_hits(&key));
                 let key = (key, RangeKeySource::PrimaryKey);
                 let hottest = (hottest, RangeKeySource::ObservedFilters);
                 if hottest_leads {
@@ -19953,11 +20767,23 @@ impl CayenneTableProvider {
         data_type: &DataType,
         max_rows: usize,
     ) -> DataFusionResult<Option<ArrayRef>> {
-        use arrow::array::UInt32Array;
-
         let ctx = self.create_session_context();
         let state = ctx.state();
         let plan = TableProvider::scan(self, &state, Some(&vec![index]), &[], None).await?;
+        Self::sample_plan_column(plan, ctx.task_ctx(), data_type, max_rows).await
+    }
+
+    /// A strided sample of at most about `max_rows` values of the single column
+    /// `plan` yields, cast to `data_type`. `None` when the plan yields no rows, or
+    /// far more than its statistics promised (rather than hold the column).
+    async fn sample_plan_column(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<datafusion::execution::TaskContext>,
+        data_type: &DataType,
+        max_rows: usize,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        use arrow::array::UInt32Array;
+
         let total_rows = datafusion_physical_plan::StatisticsContext::new()
             .compute(
                 plan.as_ref(),
@@ -19967,7 +20793,7 @@ impl CayenneTableProvider {
             .and_then(|stats| stats.num_rows.get_value().copied());
         // Without a row count, sample sparsely rather than hold the column.
         let stride = total_rows.map_or(16, |rows| rows.div_ceil(max_rows).max(1));
-        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
+        let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)?;
         let mut sampled: Vec<ArrayRef> = Vec::new();
         let mut sampled_rows = 0_usize;
         let mut position = 0_usize;
@@ -28105,14 +28931,24 @@ impl CayenneTableProvider {
             state.config().target_partitions(),
             total_input_bytes,
         );
+        // Boxed for the reason `snapshot_bytes_for_merge_budget` is.
+        let range_plan = Box::pin(self.bake_range_plan(
+            &state,
+            &selected,
+            target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+        ))
+        .await;
         let write_result = self
-            .write_to_snapshot(
+            .write_to_snapshot_range_partitioned(
                 stream,
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
                 super::delta_encoding::WritePolicy::MAINTENANCE,
+                range_plan.as_ref().map(OverwriteRangePlan::partitioning),
             )
             .await;
         let (total_rows, _writer_ops, _stats_acc) = match write_result {
@@ -28204,21 +29040,13 @@ impl CayenneTableProvider {
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
 
-        // Bring the in-memory protected set into agreement under the scan fence
-        // (readers capture deletion snapshot + protected set together). We hold
-        // the write fence across BOTH the protected-set swap AND the deletion
-        // index prune below, so no scan combines the post-swap protected set
-        // (M present, inputs gone) with a pre-prune deletion index (or vice
-        // versa). The clean-prefix assertion is evaluated under this same fence
-        // over the now-current live set.
-        // CLEAN-PREFIX GATE (resurrect-rows-critical) — re-evaluated here OUTSIDE
-        // the write fence so the per-snapshot manifest reads (metastore I/O) never
-        // stall concurrent scans, then enforced TOGETHER with the prune under the
-        // single write-fence hold below so no scan observes a torn (swapped-but-not-
-        // pruned, or the reverse) state. The merged output M is not yet in the
-        // protected set at this point (the rcu swap is below), so it is not among
-        // the live ids; its `<= T` rows are SURVIVORS the rewrite kept. See
-        // `bake_clean_prefix_holds` for the watermark-or-min soundness argument.
+        // CLEAN-PREFIX GATE (resurrect-rows-critical) — evaluated here, outside
+        // the write fence, so the per-snapshot manifest reads (metastore I/O) never
+        // stall concurrent scans; the prune below runs only when it holds. The
+        // merged output M is not yet in the protected set at this point (the rcu
+        // swap is below), so it is not among the live ids; its `<= T` rows are
+        // SURVIVORS the rewrite kept. See `bake_clean_prefix_holds` for the
+        // watermark-or-min soundness argument.
         let (clean_prefix_holds, violating_min) = self
             .bake_clean_prefix_holds(&selected_set, prefix_cutoff)
             .await;
@@ -28232,10 +29060,15 @@ impl CayenneTableProvider {
         let cold_cap = self.cold_tombstone_prune_cap().await;
         let prune_cutoff = cold_cap.map_or(prefix_cutoff, |cap| prefix_cutoff.min(cap));
 
-        // Publish the protected-set swap AND (when the clean-prefix invariant holds)
-        // the deletion-index prune together under ONE write-fence hold, so a scan
-        // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
-        // in-memory work runs here — no I/O — so the fence is held briefly.
+        // Publish the protected-set swap under the write fence, then (when the
+        // clean-prefix invariant holds) prune the deletion index after releasing
+        // it. A scan captures the protected set and the deletion snapshot in one
+        // read-fence hold, so it never pairs the retired inputs with a pruned
+        // index; pairing the merged output with the unpruned index is harmless,
+        // because no live row is old enough for a tombstone at or below the
+        // cutoff to hide it (see `prune_deletion_index_after_bake`). The prune
+        // rebuilds the whole index, which under the fence stalls every scan of
+        // the table for as long as it takes.
         {
             let fence = self.listing_fence.write().await;
             // OVERWRITE GUARD (resurrection-critical) — see the subset-merge
@@ -28267,9 +29100,23 @@ impl CayenneTableProvider {
                 new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
                 Arc::new(new_map)
             });
-            if clean_prefix_holds {
-                self.prune_deletion_index_at_or_below(prune_cutoff);
-            }
+        }
+        if clean_prefix_holds {
+            // Capped at the delete fence: every tombstone at or below it was in the
+            // index the merge applied, so it hides no row of the merged output, while
+            // one published after the capture with a sequence between the fence and
+            // the prefix cutoff may still hide one (the output applies deletions
+            // above the fence).
+            let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
+            // Boxed: the bake is one of the crate's largest futures (see
+            // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
+            Box::pin(self.prune_deletion_index_after_bake(
+                off_fence_cutoff,
+                &snapshot_at_capture,
+                &new_snapshot_id,
+                &old_ids,
+            ))
+            .await?;
         }
 
         if clean_prefix_holds {
@@ -29861,6 +30708,236 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Drop the deletion index's tombstones at or below `cutoff` after a
+    /// seq-prefix bake has published its protected-set swap, without holding the
+    /// listing fence while the pruned index is built.
+    ///
+    /// The swap retired every snapshot holding a row at or below `cutoff` (the
+    /// clean-prefix gate): the merged output applies only deletions above its
+    /// threshold, which is at least `cutoff`, and every other live snapshot and
+    /// the in-memory tier hold only newer rows. From the swap on, a tombstone at
+    /// or below `cutoff` hides no row a scan can read, so dropping it changes no
+    /// answer, and a scan that captured the protected set before the swap
+    /// captured the deletion snapshot in the same read-fence hold, so it never
+    /// pairs the retired inputs with the pruned index. The prune only reclaims
+    /// memory and probe work, and it may be published whenever it is ready.
+    ///
+    /// Pruning costs a pass over every entry of the index's frozen runs, which are
+    /// immutable, so that part runs once on a blocking thread however long it
+    /// takes; the result is spliced over the index then live — the runs frozen
+    /// since and the active tier (a mem-tier checkpoint publishes every few
+    /// seconds) pruned at the same cutoff in a pass over that tail alone, however
+    /// the runs were folded meanwhile — and swapped in by compare-and-swap. A
+    /// writer that wins the swap only costs a re-splice, and only an index rebuilt
+    /// meanwhile (a clear or a reload) costs a new prefix. It is the deletion
+    /// reservation's only shrink (see [`Self::deletion_index_over_memory_ceiling`]),
+    /// so after [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost swaps it splices once more
+    /// under the write fence, which holds the fence for that pass over the tail;
+    /// only when that cannot be swapped in either does it prune the whole index
+    /// under the fence.
+    ///
+    /// Every publication — the compare-and-swap and the fallbacks — happens under
+    /// the write fence and only while the bake's output is still live: the table
+    /// keeps the snapshot the bake captured, `merged_snapshot_id` is protected and
+    /// none of `input_ids` is. A recovery that read the catalog before the bake
+    /// committed can republish the inputs, with the index rebuilt from their
+    /// deletion vectors, after the swap; pruning that index would show the inputs'
+    /// deleted rows again, so the prune is dropped and the next bake reclaims it.
+    async fn prune_deletion_index_after_bake(
+        &self,
+        cutoff: i64,
+        snapshot_at_capture: &str,
+        merged_snapshot_id: &str,
+        input_ids: &[String],
+    ) -> Result<()> {
+        let bake = BakeOutput {
+            snapshot_at_capture,
+            merged_snapshot_id,
+            input_ids,
+        };
+        let outcome = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
+                let build: BuildPrunedPrefix<Int64PkDeletionSnapshot, PrunedDeletionPrefix> =
+                    Arc::new(move |snapshot: &Int64PkDeletionSnapshot| {
+                        snapshot.tombstones.prune_frozen_prefix(cutoff)
+                    });
+                let splice: SplicePrunedPrefix<Int64PkDeletionSnapshot, PrunedDeletionPrefix> =
+                    Arc::new(
+                        |snapshot: &Int64PkDeletionSnapshot, prefix: &PrunedDeletionPrefix| {
+                            snapshot
+                                .tombstones
+                                .with_pruned_prefix(prefix)
+                                .map(Int64PkDeletionSnapshot::from_index)
+                        },
+                    );
+                self.prune_deletion_snapshot_off_fence(
+                    deletion_snapshot,
+                    &bake,
+                    |snapshot| snapshot.tombstones.has_deletions(),
+                    build,
+                    splice,
+                )
+                .await?
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
+                let build: BuildPrunedPrefix<
+                    RowConverterDeletionSnapshot,
+                    PrunedKeyDeletionPrefix,
+                > = Arc::new(move |snapshot: &RowConverterDeletionSnapshot| {
+                    snapshot.tombstones.prune_frozen_prefix(cutoff)
+                });
+                let splice: SplicePrunedPrefix<
+                    RowConverterDeletionSnapshot,
+                    PrunedKeyDeletionPrefix,
+                > = Arc::new(
+                    |snapshot: &RowConverterDeletionSnapshot, prefix: &PrunedKeyDeletionPrefix| {
+                        snapshot
+                            .tombstones
+                            .with_pruned_prefix(prefix)
+                            .map(RowConverterDeletionSnapshot::from_index)
+                    },
+                );
+                self.prune_deletion_snapshot_off_fence(
+                    deletion_snapshot,
+                    &bake,
+                    |snapshot| snapshot.tombstones.has_deletions(),
+                    build,
+                    splice,
+                )
+                .await?
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
+        };
+        match outcome {
+            OffFencePrune::Published
+            | OffFencePrune::NothingToPrune
+            | OffFencePrune::OutputNotLive => return Ok(()),
+            OffFencePrune::LostRace => {}
+        }
+        let _fence = self.listing_fence.write().await;
+        if self.bake_output_is_live(&bake) {
+            self.prune_deletion_index_at_or_below(cutoff);
+        }
+        Ok(())
+    }
+
+    /// The off-fence prune of one deletion cell: `build` the pruned frozen prefix
+    /// of the index on a blocking thread, then up to
+    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] times `splice` it over the index live at
+    /// that moment (also off the fence) and, under the write fence and only while
+    /// the bake's output is live, swap the result in if `cell` still holds the
+    /// index it was spliced over. A lost swap re-splices; a declined splice (the
+    /// index was rebuilt since the prefix was taken) rebuilds the prefix. When
+    /// every swap is lost, the last splice is redone under the write fence.
+    async fn prune_deletion_snapshot_off_fence<T, P>(
+        &self,
+        cell: &ArcSwap<T>,
+        bake: &BakeOutput<'_>,
+        has_deletions: impl Fn(&T) -> bool,
+        build: BuildPrunedPrefix<T, P>,
+        splice: SplicePrunedPrefix<T, P>,
+    ) -> Result<OffFencePrune>
+    where
+        T: Send + Sync + 'static,
+        P: Send + Sync + 'static,
+    {
+        let table = &self.table_metadata.table_name;
+        let mut prefix: Option<Arc<P>> = None;
+        for _ in 0..BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
+            let current = cell.load_full();
+            if !has_deletions(&current) {
+                return Ok(OffFencePrune::NothingToPrune);
+            }
+            let pruned = if let Some(pruned) = &prefix {
+                Arc::clone(pruned)
+            } else {
+                let (input, build) = (Arc::clone(&current), Arc::clone(&build));
+                let pruned = Arc::new(
+                    tokio::task::spawn_blocking(move || build(&input))
+                        .await
+                        .map_err(|source| Error::TaskPanicked {
+                            table: table.clone(),
+                            source,
+                        })?,
+                );
+                prefix = Some(Arc::clone(&pruned));
+                pruned
+            };
+            // The build may have taken long enough for writers to move the index
+            // on; splice over the index live now.
+            let current = cell.load_full();
+            let (input, splice) = (Arc::clone(&current), Arc::clone(&splice));
+            let spliced = tokio::task::spawn_blocking(move || splice(&input, &pruned))
+                .await
+                .map_err(|source| Error::TaskPanicked {
+                    table: table.clone(),
+                    source,
+                })?;
+            let Some(spliced) = spliced else {
+                prefix = None;
+                continue;
+            };
+            #[cfg(test)]
+            self.run_test_pre_bake_prune_publish_hook().await;
+            let _fence = self.listing_fence.write().await;
+            if !self.bake_output_is_live(bake) {
+                return Ok(OffFencePrune::OutputNotLive);
+            }
+            let previous = cell.compare_and_swap(&current, Arc::new(spliced));
+            if Arc::ptr_eq(&previous, &current) {
+                // Still under the fence: refreshed after it, this smaller figure
+                // could overwrite the larger one a fenced writer (checkpoint,
+                // inline or staged publish) accounted for an index it grew since.
+                self.refresh_deletion_memory_accounting();
+                return Ok(OffFencePrune::Published);
+            }
+        }
+        // Writers kept winning the swap. Splice once more under the write fence,
+        // which no fenced writer of the index publishes through: the fence is held
+        // for one pass over the index's newest entries, not for a whole prune.
+        let Some(pruned) = prefix else {
+            return Ok(OffFencePrune::LostRace);
+        };
+        let _fence = self.listing_fence.write().await;
+        if !self.bake_output_is_live(bake) {
+            return Ok(OffFencePrune::OutputNotLive);
+        }
+        let current = cell.load_full();
+        let (input, splice) = (Arc::clone(&current), Arc::clone(&splice));
+        let spliced = tokio::task::spawn_blocking(move || splice(&input, &pruned))
+            .await
+            .map_err(|source| Error::TaskPanicked {
+                table: table.clone(),
+                source,
+            })?;
+        let Some(spliced) = spliced else {
+            return Ok(OffFencePrune::LostRace);
+        };
+        let previous = cell.compare_and_swap(&current, Arc::new(spliced));
+        if !Arc::ptr_eq(&previous, &current) {
+            return Ok(OffFencePrune::LostRace);
+        }
+        self.refresh_deletion_memory_accounting();
+        Ok(OffFencePrune::Published)
+    }
+
+    /// Whether a seq-prefix bake's swap is still what scans see: the table keeps
+    /// the snapshot the bake captured, its merged output is protected and none of
+    /// its inputs is. The caller holds the listing fence, so the answer holds
+    /// until it publishes.
+    fn bake_output_is_live(&self, bake: &BakeOutput<'_>) -> bool {
+        if self.get_current_snapshot_id() != bake.snapshot_at_capture {
+            return false;
+        }
+        let protected = self.protected_snapshots.load();
+        protected.contains_key(bake.merged_snapshot_id)
+            && !bake.input_ids.iter().any(|id| protected.contains_key(id))
+    }
+
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
     /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
     /// `delete_seq > cutoff` and upsert re-insertion records with
@@ -30013,6 +31090,28 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only hook between a bake's off-fence prune
+    /// build and its fenced publication, if one is installed. See
+    /// [`Self::test_pre_bake_prune_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_bake_prune_publish_hook(&self) {
+        let hook = self.test_pre_bake_prune_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only hook between a checkpoint's deletion-index
+    /// extension and its fenced publication, if one is installed. See
+    /// [`Self::test_pre_checkpoint_deletion_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_checkpoint_deletion_publish_hook(&self) {
+        let hook = self.test_pre_checkpoint_deletion_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Fire (and consume) the test-only post-catalog-commit hook, if one is
     /// installed. See [`Self::test_post_catalog_commit_hook`].
     #[cfg(test)]
@@ -30145,6 +31244,46 @@ impl CayenneTableProvider {
     #[cfg(test)]
     async fn run_test_post_keyset_capture_hook(&self) {
         let hook = self.test_post_keyset_capture_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-inline-publish hook, if one is
+    /// installed. See [`Self::test_post_inline_publish_hook`].
+    #[cfg(test)]
+    pub(super) async fn run_test_post_inline_publish_hook(&self) {
+        let hook = self.test_post_inline_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only pre-inline-publish hook, if one is
+    /// installed. See [`Self::test_pre_inline_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_inline_publish_hook(&self) {
+        let hook = self.test_pre_inline_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only post-prepare hook, if one is installed.
+    /// See [`Self::test_post_prepare_hook`].
+    #[cfg(test)]
+    pub(super) async fn run_test_post_prepare_hook(&self) {
+        let hook = self.test_post_prepare_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
+    /// Fire (and consume) the test-only pre-staged-publish hook, if one is
+    /// installed. See [`Self::test_pre_staged_publish_hook`].
+    #[cfg(test)]
+    pub(super) async fn run_test_pre_staged_publish_hook(&self) {
+        let hook = self.test_pre_staged_publish_hook.lock().take();
         if let Some(hook) = hook {
             hook().await;
         }
@@ -31304,6 +32443,9 @@ impl CayenneTableProvider {
             .map_err(|err| Error::Catalog { source: err })?;
         }
 
+        #[cfg(test)]
+        self.run_test_pre_inline_publish_hook().await;
+
         // Atomically publish both in-memory visibility changes: make the new inlined row visible (generation bump) and hide the superseded
         // file-backed row (deletion cache). Scans capture the (inlined view, deletion view) pair under `scan_state_lock.read()`,
         // so committing both halves here under one `.write()` closes the duplicate-PK window.
@@ -32301,6 +33443,60 @@ impl CayenneTableProvider {
         deletion_snapshot.with_mem_tier_tombstones_map(&union)
     }
 
+    /// [`Self::merged_deletion_snapshot_sharded`] for a scan-view build, extending
+    /// the previous build's merge when this build's inputs continue it: the same
+    /// file-side snapshot and, per shard, the same segments followed by newly
+    /// appended ones. A merge is a per-key max over delete sequences, and a
+    /// segment's tombstones never change once appended, so folding only the
+    /// appended segments' tombstones into the previous result equals merging
+    /// every resident tombstone again. Any other change — a checkpoint or
+    /// compaction replacing the file-side snapshot, a checkpoint dropping
+    /// flushed segments — takes the full merge.
+    fn merged_deletions_for_build(
+        &self,
+        file: &PkDeletionSnapshot,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> PkDeletionSnapshot {
+        let Some(file_ptr) = file.index_ptr() else {
+            return Self::merged_deletion_snapshot_sharded(file.clone(), shards);
+        };
+        let lineage: Vec<SegmentLineage> = shards
+            .iter()
+            .map(|shard| SegmentLineage::of(&shard.segments))
+            .collect();
+        let previous = self.scan_view_cache.merged_deletions.lock().clone();
+        let extended = previous.and_then(|previous| {
+            if previous.file.index_ptr() != Some(file_ptr) || previous.shards.len() != shards.len()
+            {
+                return None;
+            }
+            let mut appended = crate::provider::mem_tier::InMemTombstones::default();
+            for (lineage, shard) in previous.shards.iter().zip(shards) {
+                let start = lineage.appended_from(&shard.segments)?;
+                for segment in &shard.segments[start..] {
+                    appended.merge_segment(&segment.tombstones);
+                }
+            }
+            #[cfg(test)]
+            self.scan_view_cache
+                .extended_merges
+                .fetch_add(1, Ordering::Relaxed);
+            Some(if appended.is_empty() {
+                previous.merged.clone()
+            } else {
+                previous.merged.with_mem_tier_tombstones_map(&appended)
+            })
+        });
+        let merged = extended
+            .unwrap_or_else(|| Self::merged_deletion_snapshot_sharded(file.clone(), shards));
+        *self.scan_view_cache.merged_deletions.lock() = Some(Arc::new(MergedDeletions {
+            file: file.clone(),
+            shards: lineage,
+            merged: merged.clone(),
+        }));
+        merged
+    }
+
     /// Bound on the inline-view capture retry (see [`Self::capture_raw_scan_input`]).
     /// On the final attempt the freshest rebuilt view is accepted even if the live
     /// generation advanced again, so a durable-publish burst cannot starve capture.
@@ -32431,6 +33627,13 @@ impl CayenneTableProvider {
         // directory alone does not exclude files added there by a later checkpoint.
         let current_snapshot_id = self.get_current_snapshot_id();
         let warm_files = self.capture_warm_files(&current_snapshot_id).await?;
+        // The protected snapshots' file sets too: retention unlinks files in their
+        // directories, so they are listed under the fence like the current one
+        // (see `snapshot_file_list`), and every branch plans from this capture.
+        let protected_files = Arc::new(
+            self.capture_protected_snapshot_files(&protected_map)
+                .await?,
+        );
         // The secondary index answers for the files its runs cover, judged file
         // by file against this listing; retire what this listing no longer holds
         // before pinning it.
@@ -32498,6 +33701,7 @@ impl CayenneTableProvider {
             current_snapshot_id,
             lookup_index,
             warm_files,
+            protected_files,
             cold_files,
             structural_epoch,
             scan_guard,
@@ -32510,6 +33714,10 @@ impl CayenneTableProvider {
     /// Reuse an existing complete listing when its generations match; on a miss,
     /// enumerate file metadata only. Footer reads and query pruning stay outside
     /// the fence in `snapshot_files_with_stats`.
+    ///
+    /// The caller must hold `listing_fence.read()`: a miss lists through the
+    /// shared list-files cache (see [`Self::snapshot_file_list`]). A caller that
+    /// does not hold it uses [`Self::capture_snapshot_files_under_fence`].
     async fn capture_warm_files(
         &self,
         snapshot_id: &str,
@@ -32524,41 +33732,89 @@ impl CayenneTableProvider {
             Arc::clone(&cached.files)
         } else {
             let ctx = self.create_session_context();
-            let state = ctx.state();
-            let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
-                &self.table_metadata.path,
-                &self.table_metadata.table_id,
-                snapshot_id,
-            ))?;
-            let options = Self::create_listing_options(
-                self.context.file_format(),
-                &self.pk_deletion_strategy,
-                state.config(),
-            );
-            let request = SnapshotScanListingRequest {
-                state: &state,
-                table_url: &table_url,
-                options: &options,
-                partition_filters: &[],
-                data_filters: &[],
-                snapshot_id,
-                limit: None,
-                scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
-                file_statistics_schema: self.table_schema(),
-                captured_files: None,
-            };
-            let store = state.runtime_env().object_store(&table_url)?;
-            Arc::new(
-                self.snapshot_file_list(&request, &store)
-                    .await?
-                    .try_collect()
-                    .await?,
-            )
+            self.list_snapshot_dir_files(&ctx.state(), snapshot_id)
+                .await?
         };
         Ok(CapturedSnapshotFiles::new(
             dir_generation,
             listing_epoch,
             files,
+        ))
+    }
+
+    /// Every protected snapshot's unpruned file set, captured the way
+    /// [`Self::capture_warm_files`] captures the current snapshot's. The caller
+    /// must hold `listing_fence.read()`, for the same reason.
+    async fn capture_protected_snapshot_files(
+        &self,
+        protected: &HashMap<String, i64>,
+    ) -> datafusion_common::Result<HashMap<String, CapturedSnapshotFiles>> {
+        if protected.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let dir_generation = self.current_dir_generation.load(Ordering::Acquire);
+        let listing_epoch = self.listing_cache_epoch.load(Ordering::Acquire);
+        let ctx = self.create_session_context();
+        let state = ctx.state();
+        let mut captured = HashMap::with_capacity(protected.len());
+        for snapshot_id in protected.keys() {
+            let files = self.list_snapshot_dir_files(&state, snapshot_id).await?;
+            captured.insert(
+                snapshot_id.clone(),
+                CapturedSnapshotFiles::new(dir_generation, listing_epoch, files),
+            );
+        }
+        Ok(captured)
+    }
+
+    /// [`Self::capture_warm_files`] for a caller that does not hold the listing
+    /// fence: takes `listing_fence.read()` for the listing alone and releases it
+    /// before returning, so the caller plans and reads the captured files
+    /// without it. Must not be called with the fence already held — the fence
+    /// is fair, so a second read behind a queued writer deadlocks.
+    async fn capture_snapshot_files_under_fence(
+        &self,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<CapturedSnapshotFiles> {
+        let _fence = self.listing_fence.read().await;
+        self.capture_warm_files(snapshot_id).await
+    }
+
+    /// Lists `snapshot_id`'s data files, metadata only. The caller holds
+    /// `listing_fence.read()` (see [`Self::snapshot_file_list`]).
+    async fn list_snapshot_dir_files(
+        &self,
+        state: &dyn Session,
+        snapshot_id: &str,
+    ) -> datafusion_common::Result<Arc<Vec<PartitionedFile>>> {
+        let table_url = ListingTableUrl::parse(Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            snapshot_id,
+        ))?;
+        let options = Self::create_listing_options(
+            self.context.file_format(),
+            &self.pk_deletion_strategy,
+            state.config(),
+        );
+        let request = SnapshotScanListingRequest {
+            state,
+            table_url: &table_url,
+            options: &options,
+            partition_filters: &[],
+            data_filters: &[],
+            snapshot_id,
+            limit: None,
+            scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
+            file_statistics_schema: self.table_schema(),
+            captured_files: None,
+        };
+        let store = state.runtime_env().object_store(&table_url)?;
+        Ok(Arc::new(
+            self.snapshot_file_list(&request, &store)
+                .await?
+                .try_collect()
+                .await?,
         ))
     }
 
@@ -32692,14 +33948,19 @@ impl CayenneTableProvider {
         raw: RawScanInput,
         structural_version: u64,
     ) -> datafusion_common::Result<ScanView> {
-        // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
-        // its own copy so the view carries the file-side source for reference.
-        let merged_deletions = Self::merged_deletion_snapshot_sharded(
-            raw.deletion_snapshot.clone(),
-            &raw.mem_tier_shards,
-        );
+        #[cfg(test)]
+        {
+            let hook = self.test_scan_view_build_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // `raw` keeps its own copy of the file-side snapshot so the view carries
+        // the file-side source for reference.
+        let merged_deletions =
+            self.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
         let visible_segments =
-            self.visible_mem_tier_segments(&raw.mem_tier_shards, &raw.deletion_snapshot)?;
+            self.visible_mem_tier_segments_for_build(&raw.mem_tier_shards, &raw.deletion_snapshot)?;
         let union_tombstones =
             crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
         Ok(ScanView {
@@ -32711,10 +33972,8 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Cap on concurrent in-flight builds cached for dedup. Read-your-writes scans key
-    /// to the CURRENT state, so distinct in-flight identities are few in practice; this
-    /// bounds cache memory under pathological churn. Over the cap, a build still runs
-    /// (awaited locally) but is not cached for dedup — bounded memory, correct result.
+    /// Cap on completed or resolving builds retained for deduplication. The
+    /// build permit independently bounds snapshot capture and blocking work.
     const MAX_IN_FLIGHT_SCAN_VIEWS: usize = 8;
 
     /// Bound on capture retries across a live schema-evolution (odd/torn generation)
@@ -32789,16 +34048,22 @@ impl CayenneTableProvider {
         key: ScanViewKey,
         order: u64,
         captured_at: Instant,
+        build_permit: tokio::sync::OwnedMutexGuard<()>,
     ) -> ScanViewBuild {
         use futures::FutureExt;
         let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
             // Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the
-            // unit-test path): build inline and wrap the ready result. The
-            // awaiter publishes `latest_complete`.
+            // unit-test path): build inline and wrap the ready result, publishing
+            // it before `build_permit` drops at the end of this scope.
             let result = self
                 .build_scan_view(raw, structural_version)
                 .map(Arc::new)
                 .map_err(Arc::new);
+            if let Ok(view) = &result {
+                self.scan_view_cache
+                    .publish_completed(key, order, captured_at, Arc::clone(view));
+            }
+            drop(build_permit);
             return futures::future::ready(result).boxed().shared();
         };
         let build = async move {
@@ -32816,10 +34081,14 @@ impl CayenneTableProvider {
         .shared();
         // Independent driver: drives the shared build to completion and publishes
         // `latest_complete` even if the originating scan is cancelled, so the next
-        // hit is wait-free (no drain of `in_flight` required).
+        // hit is wait-free (no drain of `in_flight` required). It owns the build
+        // permit and releases it only after publishing: the next scan admitted
+        // then finds this view instead of racing the publish and rebuilding, and
+        // cancelling the originating scan cannot admit overlapping work.
         let driver_build = build.clone();
         let cache = Arc::clone(&self.scan_view_cache);
         task::spawn(async move {
+            let _build_permit = build_permit;
             if let Ok(view) = driver_build.await {
                 cache.publish_completed(key, order, captured_at, view);
             }
@@ -32827,21 +34096,14 @@ impl CayenneTableProvider {
         build
     }
 
-    /// Obtain the [`ScanView`] for this scan from the demand cache.
-    /// A hit is wait-free (`ArcSwap` load + atomic version validation). A miss
-    /// captures, then takes the in-flight mutex only long enough to dedup or
-    /// spawn; the build is awaited outside it.
-    ///
-    /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
-    /// `order == scan_input_version` and the structural generation matches.
-    /// [`ScanViewReuse::WithinLag`]: serve it when `now - captured_at <= lag`
-    /// and the structural generation matches. A zero lag recaptures every scan.
-    ///
-    /// On a miss, capture under the structural seqlock, then hit / await / build.
-    async fn scan_view_at_current_input(
+    /// Reuse a completed view only after validating its input and structural
+    /// versions, judging `WithinLag` freshness against `requested_at` (see
+    /// [`ScanViewCache::try_serve_latest`]).
+    fn try_reuse_scan_view(
         &self,
         reuse: ScanViewReuse,
-    ) -> datafusion_common::Result<Arc<ScanView>> {
+        requested_at: Instant,
+    ) -> Option<Arc<ScanView>> {
         // Bracket the candidate with both versions. Ordinary writes invalidate
         // UntilInvalidated; a structural event rejects either reuse mode when it
         // straddles selection. No drain, no mutex.
@@ -32859,9 +34121,55 @@ impl CayenneTableProvider {
                 version_after,
                 structural,
                 now,
+                requested_at,
                 candidate,
             )
         {
+            return Some(view);
+        }
+        None
+    }
+
+    /// Obtain the [`ScanView`] for this scan from the demand cache.
+    /// A hit is wait-free (`ArcSwap` load + atomic version validation). A miss
+    /// waits for build admission before capturing, then takes the in-flight
+    /// mutex only to dedup or spawn; the build is awaited outside it.
+    ///
+    /// [`ScanViewReuse::UntilInvalidated`]: serve `latest_complete` when
+    /// `order == scan_input_version` and the structural generation matches.
+    /// [`ScanViewReuse::WithinLag`]: serve it when `now - captured_at <= lag`
+    /// and the structural generation matches. A zero lag recaptures every scan.
+    ///
+    /// On a miss, capture under the structural seqlock, then hit / await / build.
+    async fn scan_view_at_current_input(
+        &self,
+        reuse: ScanViewReuse,
+    ) -> datafusion_common::Result<Arc<ScanView>> {
+        let requested_at = Instant::now();
+        if let Some(view) = self.try_reuse_scan_view(reuse, requested_at) {
+            return Ok(view);
+        }
+
+        #[cfg(test)]
+        {
+            let hook = self.test_pre_scan_view_admission_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        // Wait without pinning a raw snapshot. A queued query captures the
+        // current input after admission, and can reuse a view completed while
+        // it waited when the ordinary version check permits it and, for
+        // `WithinLag`, the view is fresh relative to when this query asked.
+        // A scan that arrived while a build ran is served by that build when
+        // its capture is within `lag` of the scan's arrival; otherwise the
+        // first such scan admitted rebuilds once, and because that capture
+        // happens after every scan still queued arrived, they are served by it
+        // rather than each rebuilding in turn.
+        let build_permit = Arc::clone(&self.scan_view_cache.build_lock)
+            .lock_owned()
+            .await;
+        if let Some(view) = self.try_reuse_scan_view(reuse, requested_at) {
             return Ok(view);
         }
 
@@ -32873,6 +34181,11 @@ impl CayenneTableProvider {
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
+            // Stamped BEFORE the capture, so it never postdates the state the
+            // capture read: freshness checks compare it with when a scan asked,
+            // and a stamp taken after the capture would let a write that
+            // completed in between pass for already included.
+            let captured_at = Instant::now();
             let order_before = self.scan_input_version.load(Ordering::Acquire);
             let (structural_version, raw) = match self
                 .structural_version
@@ -32913,9 +34226,16 @@ impl CayenneTableProvider {
                 continue;
             }
 
+            #[cfg(test)]
+            {
+                let hook = self.test_post_scan_input_validation_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+
             let key = raw.key(structural_version);
             let order = order_after;
-            let captured_at = Instant::now();
 
             // Another scan may have published while we captured — serve it
             // without taking the in-flight mutex.
@@ -32930,6 +34250,7 @@ impl CayenneTableProvider {
                 if let Some(view) = self.scan_view_cache.serve_if_key(&key, order, captured_at) {
                     ScanViewAction::Serve(view)
                 } else if let Some(pending) = in_flight.iter().find(|entry| entry.key == key) {
+                    drop(build_permit);
                     ScanViewAction::Await {
                         build: pending.build.clone(),
                         key: pending.key.clone(),
@@ -32945,9 +34266,10 @@ impl CayenneTableProvider {
                         key.clone(),
                         order,
                         captured_at,
+                        build_permit,
                     );
-                    // Cache the in-flight build for dedup, unless we are over the
-                    // churn cap (then build standalone — bounded memory, no dedup).
+                    // Retain the shared result for deduplication. The build
+                    // permit bounds work independently of this cache.
                     if in_flight.len() < Self::MAX_IN_FLIGHT_SCAN_VIEWS {
                         in_flight.push(InFlightScanView {
                             key: key.clone(),
@@ -33101,7 +34423,7 @@ impl CayenneTableProvider {
             }
             PkDeletionStrategyWithCache::RowConverterBased { .. } => {
                 let converter = self.build_pk_converter(&self.pk_column_indices)?;
-                let mut keys: HashSet<Box<[u8]>> = HashSet::new();
+                let mut keys = HashSet::with_hasher(PrehashedBuildHasher);
                 for batch in batches {
                     if batch.num_rows() == 0 {
                         continue;
@@ -33112,9 +34434,10 @@ impl CayenneTableProvider {
                         .map(|&idx| Arc::clone(batch.column(idx)))
                         .collect();
                     let rows = converter.convert_columns(&pk_columns)?;
-                    for row in &rows {
-                        keys.insert(Box::from(row.as_ref()));
-                    }
+                    keys.extend(
+                        rows.iter()
+                            .map(|row| hash_index::hash_key_128(row.as_ref())),
+                    );
                 }
                 Ok(CheckpointCorpusKeys::RowKeys(keys))
             }
@@ -34585,6 +35908,11 @@ impl CayenneTableProvider {
         let Some(mut guards) = self.try_acquire_capture_locks() else {
             return Ok(CheckpointAttempt::Busy);
         };
+        // A guaranteed checkpoint would wait for staged inline tombstones to publish
+        // (`wait_for_staged_inline_tombstones`); a best-effort one retries instead.
+        if self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+            return Ok(CheckpointAttempt::Busy);
+        }
         // Keep `guards` alive across `inner`; pass only the `write` guard.
         let write = guards.write.take();
         let rows = self.checkpoint_mem_tier_inner(write).await?;
@@ -34630,6 +35958,15 @@ impl CayenneTableProvider {
         if self.is_memory_resident_mode() {
             return Ok(0);
         }
+        // A staged change-stream upsert that superseded an inline row holds an
+        // unpublished tombstone for it until its publication (`CayenneCdcWrite::finish`).
+        // Folding the inline corpus before then would write the superseded row into this
+        // checkpoint's file and delete the tombstone meant to hide it, leaving two live
+        // rows once the write publishes. Every durable write takes `mem_checkpoint_lock`,
+        // which this checkpoint holds, before it stages such a tombstone, so none can
+        // appear while it runs; wait for the ones already staged, whose publication takes
+        // neither this lock nor `write_lock`.
+        self.wait_for_staged_inline_tombstones().await?;
         let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under ALL shard `mem_tier_publish_locks`
@@ -34861,16 +36198,11 @@ impl CayenneTableProvider {
         // lever — see `encode_snapshot_shards_concurrently`). Disjoint keys ⇒ the
         // groups concatenate, each shard applying its OWN tombstones (§2.3e). At N==1
         // this is exactly `[visible_mem_tier_batches(shard 0)]`.
-        let mut shard_groups: Vec<Vec<RecordBatch>> = Vec::new();
-        for shard in &shard_snapshots {
-            if shard.is_empty() || shard.segments.is_empty() {
-                continue;
-            }
-            let group = self.visible_mem_tier_batches(shard, None)?;
-            if !group.is_empty() {
-                shard_groups.push(group);
-            }
-        }
+        let shard_groups: Vec<Vec<RecordBatch>> = self
+            .visible_mem_tier_batches_by_shard(&shard_snapshots)?
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .collect();
         let flushed_mem_rows: usize = shard_groups
             .iter()
             .flat_map(|group| group.iter())
@@ -34941,6 +36273,7 @@ impl CayenneTableProvider {
                         || self
                             .mem_tier_shadow_present
                             .load(std::sync::atomic::Ordering::Acquire),
+                    Vec::new(),
                 )
                 .await?;
             } else {
@@ -34956,6 +36289,7 @@ impl CayenneTableProvider {
                         || self
                             .mem_tier_shadow_present
                             .load(std::sync::atomic::Ordering::Acquire),
+                    Vec::new(),
                 )
                 .await?;
             }
@@ -34990,12 +36324,24 @@ impl CayenneTableProvider {
         );
 
         let schema = self.table_schema();
+        let ctx = self.create_session_context();
+        // The single-stream encode's key ranges, cut from the corpus before it
+        // moves into the encode source (see `checkpoint_range_plan`).
+        let range_plan = (n == 1 && !self.pk_deletion_strategy.is_position_based())
+            .then(|| {
+                self.checkpoint_range_plan(
+                    &batches,
+                    ctx.state().config().target_partitions(),
+                    self.context.target_file_size_bytes(),
+                    estimated_flushed_bytes,
+                )
+            })
+            .flatten();
         let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
             &[batches],
             Arc::clone(&schema),
             None,
         )?;
-        let ctx = self.create_session_context();
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
         // Two-phase off-fence checkpoint: for the key/Int64 strategies
@@ -35048,6 +36394,7 @@ impl CayenneTableProvider {
                     || self
                         .mem_tier_shadow_present
                         .load(std::sync::atomic::Ordering::Acquire),
+                Vec::new(),
             )
             .await?;
             self.refresh_listing_table_under_held_fence().await?;
@@ -35068,16 +36415,17 @@ impl CayenneTableProvider {
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
             let (checkpoint_file_count, stats) = if n == 1 {
-                // N==1: the single coordinated encode over the merged corpus —
-                // byte-identical to the pre-sharding path.
+                // N==1: the single coordinated encode over the merged corpus,
+                // its shards cut into key ranges when it has more than one.
                 let (_rows, files, stats) = self
-                    .write_to_snapshot(
+                    .write_to_snapshot_range_partitioned(
                         stream,
                         target_size_bytes,
                         &new_snapshot_id,
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                         super::delta_encoding::WritePolicy::DELTA,
+                        range_plan.as_ref().map(OverwriteRangePlan::partitioning),
                     )
                     .await?;
                 (files, stats)
@@ -35114,7 +36462,10 @@ impl CayenneTableProvider {
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
 
-            let update = self
+            let OnConflictUpdate {
+                deletion_update,
+                inlined_tombstone_written,
+            } = self
                 .commit_mem_tier_checkpoint_metadata(
                     &snapshot,
                     Some(&new_snapshot_id),
@@ -35122,6 +36473,18 @@ impl CayenneTableProvider {
                     &corpus_keys,
                 )
                 .await?;
+            // Folding every key the corpus supersedes into the deletion index is
+            // the costly part of the publication below; built here, the fenced
+            // section only swaps it in (redoing it there if a writer moved the
+            // index on meanwhile).
+            let prepared_deletion =
+                Box::pin(self.prepare_on_conflict_deletion_update(deletion_update)).await?;
+            // Likewise the fold of the survivors' tombstones, which grows with
+            // every append made while this checkpoint encoded and committed: the
+            // fenced clear folds only what is appended from here on.
+            let prepared_retains = self.prepare_mem_tier_retains(&flushed_counts).await;
+            #[cfg(test)]
+            self.run_test_pre_checkpoint_deletion_publish_hook().await;
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
@@ -35149,8 +36512,12 @@ impl CayenneTableProvider {
             // union file on restart.
             {
                 let _fence = self.listing_fence.write().await;
-                self.commit_on_conflict_publish(update, Some((&new_snapshot_id, sequence_number)))
-                    .await;
+                self.commit_on_conflict_publish_prepared(
+                    inlined_tombstone_written,
+                    prepared_deletion,
+                    (&new_snapshot_id, sequence_number),
+                )
+                .await;
                 // Pair every flushed PK with this checkpoint's sequence on any
                 // PRE-EXISTING delete-only tombstone (a re-insert after an
                 // absorbed delete from an earlier checkpoint): the
@@ -35171,6 +36538,7 @@ impl CayenneTableProvider {
                         || self
                             .mem_tier_shadow_present
                             .load(std::sync::atomic::Ordering::Acquire),
+                    prepared_retains,
                 )
                 .await?;
                 self.refresh_listing_table_under_held_fence().await?;
@@ -35624,9 +36992,10 @@ impl CayenneTableProvider {
         &self,
         shard_id: usize,
         flushed_segment_count: usize,
+        prepared: Option<crate::provider::mem_tier::PreparedRetain>,
     ) -> u64 {
         let cur = self.mem_tier.shard(shard_id).load_full();
-        let survivors = cur.retain_after(flushed_segment_count);
+        let survivors = cur.retain_after_prepared(flushed_segment_count, prepared);
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.shard(shard_id).store(Arc::new(survivors));
         // A cached `ScanView` holds the pre-clear visible segments only until a fresh
@@ -35659,10 +37028,57 @@ impl CayenneTableProvider {
     /// locks — order: fence → publish) so the durable file becoming visible and the
     /// RAM rows clearing are indivisible w.r.t. scans. At N==1 this acquires the one
     /// publish lock and clears the one shard — byte-identical to the pre-shard path.
+    /// Wait until no staged inline tombstone is awaiting its publication; see
+    /// `checkpoint_mem_tier_inner`. Bounded by [`STAGED_WRITE_DRAIN_TIMEOUT`], as
+    /// [`Self::drain_inflight_staged_writes`] is, because a publication that never runs
+    /// would otherwise stall every checkpoint of the table without a word.
+    async fn wait_for_staged_inline_tombstones(&self) -> Result<()> {
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        while self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+            if Instant::now() >= deadline {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: "Timed out waiting for staged inline tombstones to publish before \
+                              checkpointing the in-memory tier"
+                        .to_string(),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// Fold each shard's checkpoint survivors ahead of the listing fence, off the
+    /// async runtime ([`crate::provider::mem_tier::MemTier::prepare_retain`]), so
+    /// the fenced clear folds only the segments appended after this. A fold that
+    /// fails to run costs only that: the clear then folds every survivor itself.
+    async fn prepare_mem_tier_retains(
+        &self,
+        flushed_counts: &[usize],
+    ) -> Vec<Option<crate::provider::mem_tier::PreparedRetain>> {
+        let tiers: Vec<(Arc<crate::provider::mem_tier::MemTier>, usize)> = flushed_counts
+            .iter()
+            .enumerate()
+            .map(|(shard_id, &flushed_count)| {
+                (self.mem_tier.shard(shard_id).load_full(), flushed_count)
+            })
+            .collect();
+        let shards = tiers.len();
+        tokio::task::spawn_blocking(move || {
+            tiers
+                .into_iter()
+                .map(|(tier, flushed_count)| Some(tier.prepare_retain(flushed_count)))
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|_| (0..shards).map(|_| None).collect())
+    }
+
     async fn clear_flushed_mem_tier_state_all_shards(
         &self,
         flushed_counts: &[usize],
         inlined_view_nonempty: bool,
+        prepared: Vec<Option<crate::provider::mem_tier::PreparedRetain>>,
     ) -> Result<()> {
         let mut released_total = 0u64;
         {
@@ -35672,10 +37088,14 @@ impl CayenneTableProvider {
             for lock in self.mem_tier_publish_locks.iter() {
                 guards.push(lock.lock().await);
             }
+            let mut prepared = prepared.into_iter();
             for (shard_id, &flushed_count) in flushed_counts.iter().enumerate() {
-                released_total = released_total.saturating_add(
-                    self.clear_mem_tier_flushed_prefix_for_shard(shard_id, flushed_count),
-                );
+                released_total =
+                    released_total.saturating_add(self.clear_mem_tier_flushed_prefix_for_shard(
+                        shard_id,
+                        flushed_count,
+                        prepared.next().flatten(),
+                    ));
             }
             drop(guards);
         }
@@ -35755,7 +37175,7 @@ impl CayenneTableProvider {
         // an overwrite's catalog commit), not here, so this must not also run the
         // checkpoint-time inline-metadata clear — which is also what makes this
         // step unable to fail.
-        self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false)
+        self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false, Vec::new())
             .await?;
         Ok(Some(source_epoch))
     }
@@ -36164,6 +37584,339 @@ impl CayenneTableProvider {
             }
         }
         Ok(out)
+    }
+
+    /// The live file-side deletion index the mem-tier visibility filter consults
+    /// (see [`Self::filter_inlined_batch_for_deletions`]), or `None` for the
+    /// position-based strategy, which keeps no key index.
+    fn live_file_deletion_index(&self) -> Option<FileDeletionIndex> {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => Some(FileDeletionIndex::Int64(Arc::clone(
+                &deletion_snapshot.load_full().tombstones,
+            ))),
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => Some(FileDeletionIndex::RowKeys(Arc::clone(
+                &deletion_snapshot.load_full().tombstones,
+            ))),
+            PkDeletionStrategyWithCache::PositionBased { .. } => None,
+        }
+    }
+
+    /// [`Self::visible_mem_tier_segments`] for a scan-view build, reusing the
+    /// previous build's visible rows instead of re-filtering every resident row.
+    ///
+    /// Per shard, the captured segments are the previous build's minus a
+    /// dropped prefix (a checkpoint's `retain_after`), followed by appended
+    /// segments. A tombstone hides only rows at or below its delete sequence, and
+    /// every appended segment's tombstones carry a sequence above the data
+    /// sequence of every segment before it, while a dropped segment's tombstones
+    /// only ever hid rows older than itself. So a carried segment's visible rows
+    /// are its previous visible rows minus those whose key an appended segment's
+    /// tombstones name; appended segments, and any segment whose batches
+    /// `retain_rows` replaced, are filtered in full. A file-side tombstone hides a
+    /// mem-tier row only at a delete sequence at or above the row's data
+    /// sequence, so carried rows stay valid across a changed file-side index only
+    /// when neither index holds a sequence that high; otherwise every segment is
+    /// filtered in full.
+    ///
+    /// Like [`Self::visible_mem_tier_segments`], the rows are filtered against
+    /// `captured`, the file-side deletion snapshot captured with the shards, never
+    /// the live one.
+    fn visible_mem_tier_segments_for_build(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+        captured: &PkDeletionSnapshot,
+    ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
+        let visible = match (FileDeletionIndex::of(captured), self.primary_key_indices()) {
+            (Some(file), Ok(Some(pk_indices))) => self
+                .visible_mem_tier_segments_incremental(shards, file, Some(captured), &pk_indices)
+                .map(|groups| groups.into_iter().flatten().collect::<Vec<_>>()),
+            _ => return self.visible_mem_tier_segments(shards, captured),
+        };
+        Ok(Arc::from(visible.map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                self.table_metadata.table_name
+            ))
+        })?))
+    }
+
+    /// `file` is the file-side index the rows are filtered against: `captured`'s,
+    /// or the live one when `captured` is `None`.
+    fn visible_mem_tier_segments_incremental(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+        file: FileDeletionIndex,
+        captured: Option<&PkDeletionSnapshot>,
+        pk_indices: &[usize],
+    ) -> Result<Vec<Vec<VisibleMemTierSegment>>> {
+        let previous = self
+            .scan_view_cache
+            .visible_segments
+            .lock()
+            .clone()
+            .filter(|previous| previous.shards.len() == shards.len());
+        // Per shard: where its carried segments start in the previous build's
+        // list, and how many of the captured segments are carried.
+        let mut plans: Vec<(usize, usize)> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, shard)| {
+                previous.as_ref().map_or((0, 0), |previous| {
+                    carried_segments(&previous.shards[i], &shard.segments)
+                })
+            })
+            .collect();
+        let oldest_carried = shards
+            .iter()
+            .zip(&plans)
+            .filter(|(_, (_, carried))| *carried > 0)
+            .filter_map(|(shard, _)| shard.segments.first().map(|s| s.data_sequence))
+            .min();
+        if let (Some(previous), Some(oldest_carried)) = (&previous, oldest_carried) {
+            let reusable = previous.file.same(&file)
+                || [&previous.file, &file].into_iter().all(|index| {
+                    index
+                        .max_sequence_number()
+                        .is_none_or(|max| max < oldest_carried)
+                });
+            if !reusable {
+                plans.fill((0, 0));
+            }
+        }
+        // Hiding a carried row by key alone requires every appended tombstone
+        // to sit at or above every carried row's data sequence. Appends within a
+        // shard follow sequence order, so this holds; a shard where it does not
+        // is filtered in full rather than trusted.
+        for (shard, plan) in shards.iter().zip(plans.iter_mut()) {
+            let carried = plan.1;
+            if carried == 0 {
+                continue;
+            }
+            let newest_carried = shard.segments[carried - 1].data_sequence;
+            let ordered = shard.segments[carried..].iter().all(|segment| {
+                let tombstones = &segment.tombstones;
+                (tombstones.is_int64_empty() && tombstones.is_row_keys_empty())
+                    || tombstones.delete_sequence() >= newest_carried
+            });
+            if !ordered {
+                *plan = (0, 0);
+            }
+        }
+
+        let digest_keys = matches!(file, FileDeletionIndex::RowKeys(_));
+        let mut visible = Vec::with_capacity(shards.len());
+        let mut cache_shards = Vec::with_capacity(shards.len());
+        for (i, shard) in shards.iter().enumerate() {
+            let (start, carried) = plans[i];
+            let segments = shard.segments.as_slice();
+            let aggregate = Self::mem_tier_deletion_maps(shard);
+            let hidden = (carried > 0).then(|| AppendedKeys::of(&segments[carried..], digest_keys));
+            let mut cached_segments = Vec::with_capacity(segments.len());
+            let mut shard_visible = Vec::new();
+            for (j, segment) in segments.iter().enumerate() {
+                let carried_segment = previous
+                    .as_ref()
+                    .filter(|_| j < carried)
+                    .map(|previous| &previous.shards[i][start + j])
+                    .filter(|cached| Arc::ptr_eq(&cached.source, &segment.batches));
+                let cached = match (carried_segment, &hidden) {
+                    (Some(cached), Some(hidden)) => {
+                        #[cfg(test)]
+                        self.scan_view_cache
+                            .carried_segments
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.hide_appended_keys(cached, hidden, pk_indices)?
+                    }
+                    _ => self.filter_segment_for_build(
+                        segment,
+                        &aggregate,
+                        captured,
+                        digest_keys,
+                        pk_indices,
+                    )?,
+                };
+                if !cached.batches.is_empty() {
+                    shard_visible.push(VisibleMemTierSegment {
+                        statistics: Arc::clone(&segment.statistics),
+                        batches: cached.batches.clone(),
+                    });
+                }
+                cached_segments.push(cached);
+            }
+            visible.push(shard_visible);
+            cache_shards.push(cached_segments);
+        }
+        *self.scan_view_cache.visible_segments.lock() = Some(Arc::new(VisibleSegmentsCache {
+            file,
+            shards: cache_shards,
+        }));
+        Ok(visible)
+    }
+
+    /// Visible mem-tier rows per shard for a checkpoint, from the incremental
+    /// computation scan-view builds use (see
+    /// [`Self::visible_mem_tier_segments_for_build`]), so a checkpoint filters only
+    /// what changed since the last build or checkpoint instead of every resident
+    /// row. Each group equals [`Self::visible_mem_tier_batches`] of its shard.
+    fn visible_mem_tier_batches_by_shard(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> Result<Vec<Vec<RecordBatch>>> {
+        if let (Some(file), Some(pk_indices)) =
+            (self.live_file_deletion_index(), self.primary_key_indices()?)
+        {
+            return Ok(self
+                .visible_mem_tier_segments_incremental(shards, file, None, &pk_indices)?
+                .into_iter()
+                .map(|segments| {
+                    segments
+                        .into_iter()
+                        .flat_map(|segment| segment.batches)
+                        .collect()
+                })
+                .collect());
+        }
+        shards
+            .iter()
+            .map(|shard| self.visible_mem_tier_batches(shard, None))
+            .collect()
+    }
+
+    /// Filter one segment in full against its shard's tombstones and the file-side
+    /// snapshot `captured` (the live one when `None`), recording each visible row's
+    /// key digest when the strategy keys on encoded rows.
+    fn filter_segment_for_build(
+        &self,
+        segment: &crate::provider::mem_tier::MemSegment,
+        aggregate: &InlinedDeletionMaps,
+        captured: Option<&PkDeletionSnapshot>,
+        digest_keys: bool,
+        pk_indices: &[usize],
+    ) -> Result<CachedVisibleSegment> {
+        let mut batches = Vec::with_capacity(segment.batches.len());
+        let mut digests = Vec::new();
+        for batch in segment.batches.iter() {
+            if let Some(visible) = self.filter_inlined_batch_against(
+                batch.clone(),
+                segment.data_sequence,
+                aggregate,
+                captured,
+            )? {
+                if digest_keys {
+                    digests.push(self.row_key_digests(&visible, pk_indices)?);
+                }
+                batches.push(visible);
+            }
+        }
+        Ok(CachedVisibleSegment {
+            data_sequence: segment.data_sequence,
+            source: Arc::clone(&segment.batches),
+            batches,
+            digests,
+        })
+    }
+
+    /// [`hash_index::hash_key_128`] of each row's encoded primary key — the
+    /// same encoding the row-key tombstones and the deletion index use.
+    fn row_key_digests(&self, batch: &RecordBatch, pk_indices: &[usize]) -> Result<Arc<[u128]>> {
+        let converter = self.build_pk_converter(pk_indices)?;
+        let pk_columns: Vec<ArrayRef> = pk_indices
+            .iter()
+            .map(|idx| Arc::clone(batch.column(*idx)))
+            .collect();
+        let rows = converter.convert_columns(&pk_columns)?;
+        Ok(rows
+            .iter()
+            .map(|row| hash_index::hash_key_128(row.data()))
+            .collect())
+    }
+
+    /// A carried segment's visible rows minus those whose key `hidden` names.
+    /// Batches with no hidden row are reused as they are.
+    fn hide_appended_keys(
+        &self,
+        cached: &CachedVisibleSegment,
+        hidden: &AppendedKeys,
+        pk_indices: &[usize],
+    ) -> Result<CachedVisibleSegment> {
+        let mut batches = Vec::with_capacity(cached.batches.len());
+        let mut digests = Vec::with_capacity(cached.digests.len());
+        for (position, batch) in cached.batches.iter().enumerate() {
+            let keep: Option<Vec<bool>> = match hidden {
+                AppendedKeys::Int64(keys) if !keys.is_empty() => {
+                    let pk_index = *pk_indices.first().ok_or_else(|| Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Int64 PK strategy requires a primary key column".to_string(),
+                    })?;
+                    let pks = batch
+                        .column(pk_index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| Error::Internal {
+                            table: self.table_metadata.table_name.clone(),
+                            message: "Expected an Int64 primary key column".to_string(),
+                        })?;
+                    pks.values()
+                        .iter()
+                        .any(|pk| keys.contains(pk))
+                        .then(|| pks.values().iter().map(|pk| !keys.contains(pk)).collect())
+                }
+                AppendedKeys::Digests(keys) if !keys.is_empty() => {
+                    let row_digests =
+                        cached
+                            .digests
+                            .get(position)
+                            .ok_or_else(|| Error::Internal {
+                                table: self.table_metadata.table_name.clone(),
+                                message: "Cached mem-tier batch has no key digests".to_string(),
+                            })?;
+                    row_digests
+                        .iter()
+                        .any(|digest| keys.contains(digest))
+                        .then(|| {
+                            row_digests
+                                .iter()
+                                .map(|digest| !keys.contains(digest))
+                                .collect()
+                        })
+                }
+                _ => None,
+            };
+            match keep {
+                None => {
+                    batches.push(batch.clone());
+                    if let Some(row_digests) = cached.digests.get(position) {
+                        digests.push(Arc::clone(row_digests));
+                    }
+                }
+                Some(keep) if keep.iter().any(|kept| *kept) => {
+                    if let Some(row_digests) = cached.digests.get(position) {
+                        digests.push(
+                            row_digests
+                                .iter()
+                                .zip(&keep)
+                                .filter_map(|(digest, kept)| kept.then_some(*digest))
+                                .collect(),
+                        );
+                    }
+                    batches.push(arrow::compute::filter_record_batch(
+                        batch,
+                        &BooleanArray::from(keep),
+                    )?);
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(CachedVisibleSegment {
+            data_sequence: cached.data_sequence,
+            source: Arc::clone(&cached.source),
+            batches,
+            digests,
+        })
     }
 
     /// Shared tail of the mem-tier scan plan: apply the effective projection and
@@ -37498,6 +39251,14 @@ impl CayenneTableProvider {
 
         for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
             let mut explain = super::lookup_index::LookupIndexExplain::not_applicable(None);
+            // Captured with the map under the scan's fence; listing the directory
+            // here, outside it, could cache a stale entry (see `snapshot_file_list`).
+            let captured_files = scan.protected_files.get(snapshot_id).ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Cayenne table {}: protected snapshot {snapshot_id} has no captured file set",
+                    self.table_metadata.table_name
+                ))
+            })?;
             let plan = self
                 .create_snapshot_scan_plan_with_config(
                     scan.state,
@@ -37519,7 +39280,7 @@ impl CayenneTableProvider {
                     // `target_partitions` ways: with tens of protected snapshots
                     // that multiplies file opens ~50× for no parallelism gain
                     Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
-                    None,
+                    Some(captured_files),
                     scan.lookup_selection.clone(),
                     scan.pinned_lookup_index.clone(),
                     scan.lookup_selection.is_some().then_some(&mut explain),
@@ -37677,6 +39438,10 @@ impl CayenneTableProvider {
     /// Parquet listing scans on the new default, where the extra parallelism pays.
     const MAIN_SCAN_REPARTITION_OPT_OUT_BYTES: u64 = 10 * 1024 * 1024;
 
+    /// Plans an internal read of `snapshot_id`'s files: the PK keyset and bloom
+    /// builds, and compaction. Lists the directory under the listing fence and
+    /// plans from that capture without it (see [`Self::snapshot_file_list`]),
+    /// so it must not be called with the fence held.
     async fn create_snapshot_scan_plan(
         &self,
         state: &dyn Session,
@@ -37685,6 +39450,7 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let captured = self.capture_snapshot_files_under_fence(snapshot_id).await?;
         self.create_snapshot_scan_plan_with_config(
             state,
             snapshot_id,
@@ -37705,7 +39471,7 @@ impl CayenneTableProvider {
             // Internal reads (compaction, keyset) also benefit from keeping small
             // groups whole: merging N small runs otherwise pays N × tp footer opens.
             Self::SMALL_GROUP_REPARTITION_OPT_OUT_BYTES,
-            None,
+            Some(&captured),
             None,
             None,
             None,
@@ -38493,6 +40259,22 @@ impl CayenneTableProvider {
         })
     }
 
+    /// Lists a snapshot directory, from the manifest when the table scans from it
+    /// and otherwise through `DataFusion`'s list-files cache, which a miss fills
+    /// with what it read. That entry is the one every later scan of the directory
+    /// plans from, until a writer that changes the directory replaces or evicts it.
+    ///
+    /// So a listing that can miss must run under `listing_fence.read()` — even
+    /// when the caller itself tolerates a stale file set, as a PK bloom tolerates
+    /// a false positive. The hazard is the listing's side effect, not its result:
+    /// a writer changes the directory and evicts its entry under
+    /// `listing_fence.write()`, and an unfenced listing that read the directory
+    /// before the change caches it after the eviction. Every later scan then
+    /// plans over a file retention unlinked (failing to open it) or without one
+    /// an append published (silently missing its rows), and an append's
+    /// delta-apply merges onto that entry instead of correcting it. Hold the
+    /// fence only for the listing: capture the files under it and plan from the
+    /// capture (`captured_files`) without it.
     async fn snapshot_file_list<'a>(
         &'a self,
         request: &SnapshotScanListingRequest<'a>,
@@ -38801,9 +40583,17 @@ impl CayenneTableProvider {
         let file_path = part_file.object_meta.location.to_string();
         let file_size_bytes = i64::try_from(part_file.object_meta.size).unwrap_or(i64::MAX);
 
+        // A file modified after this table was opened was written by this process:
+        // no earlier process persisted a row for it, and a row this one persisted
+        // is in the cache unless evicted, so its footer answers without the
+        // metastore. A misjudged clock only trades a catalog read for a footer
+        // read, or the reverse.
+        let written_since_open = part_file.object_meta.last_modified >= self.opened_at;
         // Schema validation and catalog reads share evolution's publication fence.
         // Footer I/O below remains outside this mutex.
-        let persisted = {
+        let persisted = if written_since_open {
+            None
+        } else {
             let _guard = self.table_statistics_persistence_lock.lock().await;
             if table_schema.as_ref() == self.table_schema().as_ref() {
                 self.catalog
@@ -38873,41 +40663,74 @@ impl CayenneTableProvider {
                     hook().await;
                 }
             }
-            let _guard = self.table_statistics_persistence_lock.lock().await;
-            // The footer statistics are adjusted for the file's position deletes as
-            // they stood at the read. A cache clear since then means that state may
-            // have changed, so persisting this answer would hand it to the next
-            // collection; leave the row for a collection that starts after the
-            // clear to read and persist.
-            if table_schema.as_ref() == self.table_schema().as_ref()
-                && self
-                    .scan_file_statistics_flights
-                    .is_current(request.generation)
-            {
-                match self
-                    .catalog
-                    .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
-                        table_id: self.table_metadata.table_id.clone(),
-                        snapshot_id: request.snapshot_id.to_string(),
-                        file_path,
-                        file_size_bytes,
-                        num_rows,
-                        statistics_blob: blob,
-                    })
-                    .await
-                {
-                    Ok(()) => self.scan_file_statistics_flights.record_persisted_upsert(),
-                    Err(error) => tracing::debug!(
-                        table = %self.table_metadata.table_name,
-                        error = %error,
-                        "Failed to persist per-file snapshot statistics; continuing with footer stats"
-                    ),
-                }
-            }
+            self.persist_scan_file_statistics(
+                SnapshotFileStatistics {
+                    table_id: self.table_metadata.table_id.clone(),
+                    snapshot_id: request.snapshot_id.to_string(),
+                    file_path,
+                    file_size_bytes,
+                    num_rows,
+                    statistics_blob: blob,
+                },
+                request.generation,
+                Arc::clone(table_schema),
+            );
         }
 
         self.publish_scan_file_statistics(request, &statistics);
         Ok(statistics)
+    }
+
+    /// Persists one file's scan statistics for the processes that open this table
+    /// after this one, in a background task rather than in the scan that collected
+    /// them: the row is only ever read by a later process, and writing it on the
+    /// scan's path made the scan wait on the metastore and on every other
+    /// collection holding the persistence lock.
+    ///
+    /// The task writes under that lock, and only while the schema and the cache
+    /// generation are still the ones the statistics were collected under. The
+    /// footer statistics are adjusted for the file's position deletes as they
+    /// stood at the read; a cache clear since then means that state may have
+    /// changed, so persisting this answer would hand it to the next collection —
+    /// the row is left for a collection that starts after the clear. A schema
+    /// evolved since would read the blob against columns it no longer describes.
+    fn persist_scan_file_statistics(
+        &self,
+        row: SnapshotFileStatistics,
+        generation: u64,
+        collected_under: SchemaRef,
+    ) {
+        let pending = self.scan_statistics_persistence.start();
+        let catalog = Arc::clone(&self.catalog);
+        let lock = Arc::clone(&self.table_statistics_persistence_lock);
+        let live_schema = Arc::clone(&self.table_schema);
+        let flights = Arc::clone(&self.scan_file_statistics_flights);
+        let table = self.table_metadata.table_name.clone();
+        tokio::spawn(async move {
+            let _pending = pending;
+            let _guard = lock.lock().await;
+            if collected_under.as_ref() != live_schema.load_full().as_ref()
+                || !flights.is_current(generation)
+            {
+                return;
+            }
+            match catalog.upsert_snapshot_file_statistics(&row).await {
+                Ok(()) => flights.record_persisted_upsert(),
+                Err(error) => tracing::debug!(
+                    table = %table,
+                    error = %error,
+                    "Failed to persist per-file snapshot statistics; continuing with footer stats"
+                ),
+            }
+        });
+    }
+
+    /// Waits until every scan-statistics row this table started persisting in the
+    /// background ([`Self::persist_scan_file_statistics`]) has been written or
+    /// dropped.
+    #[doc(hidden)]
+    pub async fn wait_for_scan_file_statistics_persistence(&self) {
+        self.scan_statistics_persistence.drained().await;
     }
 
     /// Cache a collected file's statistics, unless a cache clear began after the
@@ -39611,18 +41434,27 @@ impl CayenneTableProvider {
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
-        let snapshot_id = self.get_current_snapshot_id();
-        let (store, files) = self
-            .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
-            .await?;
-        // A lookup reads the protected snapshots' files too (an upsert's rows
-        // stay there until compaction folds them in), so they are indexed with
-        // the current snapshot's.
-        let protected_map = self.protected_snapshots.load_full();
-        let (_, protected_files) = self
-            .lookup_index_protected_files(&protected_map)
-            .await
-            .ok()?;
+        // Listed under the fence even though the build tolerates a stale list —
+        // it re-lists the live files under the fence before publishing — because
+        // the listing fills the list-files cache entry queries read (see
+        // `snapshot_file_list`). The read-back that indexes the files runs after
+        // the fence is released.
+        let (store, files, protected_files) = {
+            let _fence = self.listing_fence.read().await;
+            let snapshot_id = self.get_current_snapshot_id();
+            let (store, files) = self
+                .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
+                .await?;
+            // A lookup reads the protected snapshots' files too (an upsert's rows
+            // stay there until compaction folds them in), so they are indexed with
+            // the current snapshot's.
+            let protected_map = self.protected_snapshots.load_full();
+            let (_, protected_files) = self
+                .lookup_index_protected_files(&protected_map)
+                .await
+                .ok()?;
+            (store, files, protected_files)
+        };
         let view = index_state.published();
         let mut seen: HashSet<String> = HashSet::new();
         let uncovered = files
@@ -39727,6 +41559,9 @@ impl CayenneTableProvider {
     /// are deliberately not applied: a file pruned away for one query still
     /// holds rows another query's key maps to, and an index built from a pruned
     /// subset would answer a later lookup with a false empty.
+    ///
+    /// Lists through `state`'s list-files cache; see [`Self::snapshot_file_list`]
+    /// for when the caller must hold `listing_fence.read()`.
     pub(crate) async fn snapshot_file_metadata(
         &self,
         state: &dyn Session,
@@ -40422,6 +42257,7 @@ impl CayenneTableProvider {
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
         let protected_map = Arc::clone(&scan_view.raw.protected_map);
+        let protected_files = Arc::clone(&scan_view.raw.protected_files);
         let inlined_view = Arc::clone(&scan_view.raw.inlined_view);
         // The inline rows are filtered against the file-side deletions captured with them.
         let captured_deletions = scan_view.raw.deletion_snapshot.clone();
@@ -40689,6 +42525,7 @@ impl CayenneTableProvider {
                 limit,
                 pk_indices_in_projection: &pk_indices_in_projection,
                 protected_snapshots: protected_map,
+                protected_files,
                 deletion_snapshot: &deletion_snapshot,
                 read_schema: Arc::clone(&read_schema),
                 file_statistics_schema: Arc::clone(&file_statistics_schema),
@@ -52117,6 +53954,128 @@ mod tests {
         write.in_memory_epoch()
     }
 
+    /// A mem-tier checkpoint builds the deletion-index extension it publishes before
+    /// it takes the listing fence. A writer that publishes another tombstone in
+    /// between moves the index on: the checkpoint must not publish its stale
+    /// extension over that tombstone, and must still publish its own. Keys 7 and 9
+    /// sit in a checkpoint file; key 7 is upserted in the RAM tier; the writer hides
+    /// key 9.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_keeps_a_tombstone_published_while_it_built_its_own() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "prepared_deletions_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (9, 1)]).await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint keys 7 and 9 into a file");
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let published = Arc::clone(&published);
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() =
+                Some(Box::new(move || {
+                    Box::pin(async move {
+                        let extended = int64_tombstones(&provider_in_hook)
+                            .extend_max_deletes([(9, 1_000_000)]);
+                        store_int64_tombstones(&provider_in_hook, extended);
+                        published.store(true, Ordering::SeqCst);
+                    })
+                }));
+        }
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint key 7's upsert");
+        assert!(
+            published.load(Ordering::SeqCst),
+            "precondition: the writer published between the checkpoint's extension and its publication"
+        );
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(9).map(|t| t.delete_sequence),
+            Some(1_000_000),
+            "the other writer's tombstone must survive the checkpoint's publication"
+        );
+        assert!(
+            tombstones.get(7).is_some(),
+            "the checkpoint must publish the tombstone hiding key 7's file copy"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "prepared_deletions_race").await,
+            vec![(7, 2)],
+            "key 7 once, with its upserted value, and key 9 hidden"
+        );
+    }
+
+    /// A scan started while a mem-tier checkpoint builds its deletion-index
+    /// extension completes: the extension is built before the listing fence, and
+    /// the scan reads the RAM tier's upsert over the file copy it supersedes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_completes_while_a_checkpoint_builds_its_deletion_extension() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "prepared_deletions_scan",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (9, 1)]).await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint keys 7 and 9 into a file");
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+
+        let scanned = Arc::new(ParkingMutex::new(None::<Vec<(i64, i64)>>));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let ctx_in_hook = ctx.clone();
+            let scanned = Arc::clone(&scanned);
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() =
+                Some(Box::new(move || {
+                    Box::pin(async move {
+                        let rows = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            collect_id_value_pairs(
+                                &ctx_in_hook,
+                                &provider_in_hook,
+                                "prepared_deletions_scan",
+                            ),
+                        )
+                        .await
+                        .expect("a scan must not wait on the checkpoint's deletion extension");
+                        *scanned.lock() = Some(rows);
+                    })
+                }));
+        }
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint key 7's upsert");
+        assert_eq!(
+            scanned.lock().take(),
+            Some(vec![(7, 2), (9, 1)]),
+            "the scan in the window reads key 7's upsert and not its file copy"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "prepared_deletions_scan").await,
+            vec![(7, 2), (9, 1)],
+            "after the checkpoint: key 7 once with its upserted value, key 9 unchanged"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn buffered_cdc_writes_resolve_repeated_keys_in_single_and_sharded_tiers() {
         use datafusion_table_providers::util::column_reference::ColumnReference;
@@ -54128,9 +56087,120 @@ mod tests {
     }
 
     /// The routing key of a whole-table replace: a configured shard key alone;
-    /// otherwise the primary key, yielding the lead only to a column filtered on
-    /// more than twice as often, with the other kept as the fallback; never a
-    /// column the router cannot split.
+    /// otherwise the primary key, yielding the lead only to a column pinned more
+    /// than twice as often, with the other kept as the fallback; never a column
+    /// the router cannot split.
+    /// Only filters that pin a column to a few values or a bounded range count
+    /// toward its routing lead. A lookup that fixes the leading key column and
+    /// lists many values of another — a multi-row receipt lookup, one
+    /// conjunction per row — and a long `IN` list on that other column, as a
+    /// semi-join pushdown writes, leave the table routed on the leading key
+    /// however often they run, where counting every reference would hand the
+    /// lead to the listed column.
+    #[tokio::test]
+    async fn range_routing_counts_only_pinning_filters() {
+        use datafusion_expr::{col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("w", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (table, _dir) = create_cayenne_table_with_config(
+            "routing_pinning_filters",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec!["w".to_string(), "i".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let lookup = (0..15_i64)
+            .map(|k| col("w").eq(lit(7_i64)).and(col("i").eq(lit(k * 6151 + 1))))
+            .reduce(datafusion_expr::Expr::or)
+            .expect("fifteen rows");
+        let semi_join = col("i").in_list((0..100_i64).map(lit).collect(), false);
+        for _ in 0..10 {
+            table
+                .filter_column_observations
+                .record_filters(std::slice::from_ref(&lookup));
+        }
+        for _ in 0..25 {
+            table
+                .filter_column_observations
+                .record_filters(std::slice::from_ref(&semi_join));
+        }
+        let observations = &table.filter_column_observations;
+        assert_eq!(
+            (observations.hits("w"), observations.hits("i")),
+            (10, 35),
+            "precondition: every scan references the listed column"
+        );
+        assert_eq!(
+            (
+                observations.pinned_hits("w").values,
+                observations.pinned_hits("i").values
+            ),
+            (10, 0),
+            "the lookups pin the leading key; nothing pins the listed column"
+        );
+        let names: Vec<String> = table
+            .range_routing_candidates(&table.table_schema())
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(names, vec!["w"], "routed on the key the lookups pin");
+    }
+
+    /// A receipt lookup fixes the warehouse, lists a few items and bounds a
+    /// witness column in every branch — `(w = 4 AND i = k AND cnt >= 1) OR …` —
+    /// on a table whose inferred key leads with the item. The layout routes on
+    /// the warehouse the lookups pin, not on the witness they only bound, though
+    /// the witness is bounded as often and sorts first.
+    #[tokio::test]
+    async fn range_routing_follows_the_pinned_column_over_a_witness_bound() {
+        use datafusion_expr::{col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("cnt", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+            Field::new("w", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (table, _dir) = create_cayenne_table_with_config(
+            "routing_witness_bound",
+            Arc::clone(&schema),
+            VortexConfig::default(),
+            vec!["i".to_string(), "w".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let lookup = [11_368_i64, 21_466, 43_612, 46_726, 55_728, 56_103]
+            .into_iter()
+            .map(|item| {
+                col("w")
+                    .eq(lit(4_i64))
+                    .and(col("i").eq(lit(item)))
+                    .and(col("cnt").gt_eq(lit(1_i64)))
+            })
+            .reduce(datafusion_expr::Expr::or)
+            .expect("six rows");
+        for _ in 0..10 {
+            table
+                .filter_column_observations
+                .record_filters(std::slice::from_ref(&lookup));
+        }
+        let names: Vec<String> = table
+            .range_routing_candidates(&table.table_schema())
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["w", "i"],
+            "routed on the column the lookups pin, the inferred key kept as the fallback"
+        );
+    }
+
     #[tokio::test]
     async fn test_range_routing_candidates_order() {
         use datafusion_expr::{col, lit};
@@ -54344,7 +56414,25 @@ mod tests {
         files: usize,
         rows: usize,
     ) {
-        let snapshot_id = provider.current_snapshot_id();
+        assert_disjoint_sorted_key_range_files_in(
+            provider,
+            &provider.current_snapshot_id(),
+            schema,
+            files,
+            rows,
+        )
+        .await;
+    }
+
+    /// [`assert_disjoint_sorted_key_range_files`] for the snapshot `snapshot_id`.
+    async fn assert_disjoint_sorted_key_range_files_in(
+        provider: &CayenneTableProvider,
+        snapshot_id: &str,
+        schema: &SchemaRef,
+        files: usize,
+        rows: usize,
+    ) {
+        let snapshot_id = snapshot_id.to_string();
         let names: Vec<String> = provider
             .list_snapshot_files_with_sizes(&snapshot_id)
             .await
@@ -54987,6 +57075,402 @@ mod tests {
         prepared.apply_owned_txn().await.expect("apply_owned_txn");
         prepared.finish().await.expect("finish");
         assert_disjoint_sorted_key_range_files(&provider, &schema, SHARDS, ROWS).await;
+    }
+
+    /// A mem-tier checkpoint large enough for several encode shards cuts them
+    /// into key ranges from its own rows: every file of the checkpoint's
+    /// snapshot covers one slice of the key, in key order, so a lookup on the
+    /// key reads one file per checkpoint rather than all of them. Rows arrive in
+    /// a scrambled key order, which a hash split would scatter across every
+    /// file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_routes_rows_into_disjoint_sorted_key_range_files() {
+        use arrow::array::StringArray;
+
+        const ROWS: usize = 20_000;
+        const SHARDS: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "checkpoint_range_routed",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                write_concurrency: Some(SHARDS),
+                // A 1 MiB target makes every ~1 MiB of rows an encode shard, so
+                // the ~4 MiB corpus below fills all four.
+                target_vortex_file_size_mb: 1,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let order: Vec<i64> = (0..ROWS)
+            .map(|i| i64::try_from((i * 7919) % ROWS).expect("row fits i64"))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(order.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    order.iter().map(|id| format!("{id:0>200}")),
+                )),
+            ],
+        )
+        .expect("corpus batch");
+        provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("CDC upsert")
+            .finish()
+            .await
+            .expect("CDC upsert published");
+        assert_eq!(
+            provider.checkpoint_mem_tier().await.expect("checkpoint"),
+            u64::try_from(ROWS).expect("rows fit u64")
+        );
+
+        let snapshots: Vec<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        let [snapshot_id] = snapshots.as_slice() else {
+            panic!("one checkpoint registers one snapshot: {snapshots:?}");
+        };
+        assert_disjoint_sorted_key_range_files_in(&provider, snapshot_id, &schema, SHARDS, ROWS)
+            .await;
+    }
+
+    /// Checkpoints every `(d, o)` for `d` in 0..8 and `o` in 0..2500, scrambled,
+    /// into a table keyed on `(d, o)` with `sort_columns` inferred, and returns
+    /// each key-range file's `(d, o)` rows in file order.
+    async fn checkpointed_key_range_files(sort_columns: &[&str]) -> Vec<Vec<(i64, i64)>> {
+        use arrow::array::StringArray;
+
+        const ROWS: usize = 20_000;
+        const SHARDS: usize = 4;
+        const LEADING_VALUES: i64 = 8;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Int64, false),
+            Field::new("o", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "checkpoint_whole_key_sorted",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["d".to_string(), "o".to_string()],
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                write_concurrency: Some(SHARDS),
+                // A 1 MiB target makes every ~1 MiB of rows an encode shard, so
+                // the ~4 MiB corpus below fills all four.
+                target_vortex_file_size_mb: 1,
+                sort_columns: sort_columns.iter().map(ToString::to_string).collect(),
+                sort_columns_origin: crate::metadata::SortColumnsOrigin::Inferred,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "d".to_string(),
+                    "o".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        let keys: Vec<(i64, i64)> = (0..ROWS)
+            .map(|i| {
+                let key = i64::try_from((i * 7919) % ROWS).expect("key fits i64");
+                (key % LEADING_VALUES, key / LEADING_VALUES)
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(keys.iter().map(|(d, _)| *d))),
+                Arc::new(Int64Array::from_iter_values(keys.iter().map(|(_, o)| *o))),
+                Arc::new(StringArray::from_iter_values(
+                    keys.iter().map(|(d, o)| format!("{d}-{o:0>200}")),
+                )),
+            ],
+        )
+        .expect("corpus batch");
+        provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("CDC upsert")
+            .finish()
+            .await
+            .expect("CDC upsert published");
+        assert_eq!(
+            provider.checkpoint_mem_tier().await.expect("checkpoint"),
+            u64::try_from(ROWS).expect("rows fit u64")
+        );
+
+        let snapshots: Vec<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        let [snapshot_id] = snapshots.as_slice() else {
+            panic!("one checkpoint registers one snapshot: {snapshots:?}");
+        };
+        let names: Vec<String> = provider
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .expect("list snapshot files")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.len(), SHARDS, "one file per key range: {names:?}");
+        let file_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut files = Vec::with_capacity(names.len());
+        for name in &names {
+            let path = provider.snapshot_dir_path_for(snapshot_id).join(name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(&schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing table");
+            let pairs: Vec<(i64, i64)> = file_ctx
+                .read_table(table)
+                .expect("read file")
+                .collect()
+                .await
+                .expect("scan file")
+                .iter()
+                .flat_map(|batch| {
+                    let column = |index: usize| {
+                        batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("the key columns are Int64")
+                            .values()
+                            .to_vec()
+                    };
+                    column(0).into_iter().zip(column(1))
+                })
+                .collect();
+            files.push(pairs);
+        }
+        assert_eq!(
+            files.iter().map(Vec::len).sum::<usize>(),
+            ROWS,
+            "every row is written exactly once"
+        );
+        files
+    }
+
+    /// Each file must route on `leading` (no value of it spans two files) and
+    /// hold its rows in order of `order`. A file holds several rows of each
+    /// leading value, so sorting by the leading column alone, which leaves the
+    /// rest of the key in arrival order, fails the order check.
+    fn assert_routed_and_sorted(
+        files: &[Vec<(i64, i64)>],
+        leading: fn(&(i64, i64)) -> i64,
+        order: fn(&(i64, i64)) -> (i64, i64),
+    ) {
+        let mut leading_by_file = Vec::with_capacity(files.len());
+        for (index, rows) in files.iter().enumerate() {
+            let values: std::collections::BTreeSet<i64> = rows.iter().map(leading).collect();
+            assert!(
+                !values.is_empty() && rows.len() > values.len(),
+                "file {index}: a range file holds several rows of each leading value: {values:?}"
+            );
+            assert!(
+                rows.iter().map(order).collect::<Vec<_>>().is_sorted(),
+                "file {index}: a range file's rows are in order of the whole key"
+            );
+            leading_by_file.push(values);
+        }
+        for (index, values) in leading_by_file.iter().enumerate() {
+            for other in &leading_by_file[index + 1..] {
+                assert!(
+                    values.is_disjoint(other),
+                    "files route on the leading column, so no leading value spans two: \
+                     {leading_by_file:?}"
+                );
+            }
+        }
+    }
+
+    /// A checkpoint of a composite key whose leading column takes few values
+    /// routes on that column, so each key-range file holds every row of its
+    /// leading values. Those rows must come out in order of the whole key: sorted
+    /// by the leading column alone they would keep the rest of the key in arrival
+    /// order, and a lookup that pins all of it would read every zone of its
+    /// leading value instead of one.
+    #[tokio::test]
+    async fn a_checkpoint_sorts_each_key_range_file_by_its_whole_key() {
+        let files = checkpointed_key_range_files(&[]).await;
+        assert_routed_and_sorted(&files, |(d, _)| *d, |&(d, o)| (d, o));
+    }
+
+    /// The same key with an inferred sort order of `(o, d)`, as a source reports
+    /// for a key whose columns came back in name order: the checkpoint must route
+    /// on `o` and sort each file by `(o, d)`, the order lookups pin the key in,
+    /// rather than lead with `d`'s eight values.
+    #[tokio::test]
+    async fn a_checkpoint_routes_and_sorts_a_key_in_its_sort_order() {
+        let files = checkpointed_key_range_files(&["o", "d"]).await;
+        assert_routed_and_sorted(&files, |(_, o)| *o, |&(d, o)| (o, d));
+    }
+
+    /// A seq-prefix bake routes its merged output into key-range files: each file
+    /// holds one slice of the key in key order and the slices do not overlap, so a
+    /// lookup on the key opens one file of the merged snapshot rather than every
+    /// one. Five checkpoints of scrambled keys; the bake folds the oldest two into
+    /// an output large enough on disk — the padding is incompressible hex — for
+    /// several encode shards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bake_routes_its_merged_output_into_key_range_files() {
+        use arrow::array::StringArray;
+
+        const ROWS_PER_CHECKPOINT: usize = 10_000;
+        const CHECKPOINTS: usize = 5;
+        // Pseudo-random hex per key, so the file sizes the bake shards by stay large.
+        let pad = |id: i64| {
+            use std::fmt::Write as _;
+            let mut x = u64::try_from(id).expect("non-negative key") ^ 0x9E37_79B9_7F4A_7C15;
+            let mut hex = String::with_capacity(6 * 32);
+            for _ in 0..6 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                write!(hex, "{x:016x}{:016x}", x.rotate_left(29)).expect("write to a String");
+            }
+            hex
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "bake_range_routed",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                write_concurrency: Some(4),
+                // ~2 MiB of hex per checkpoint; the bake's merge of two fills at
+                // least two 1 MiB encode shards on disk.
+                target_vortex_file_size_mb: 1,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        for checkpoint in 0..CHECKPOINTS {
+            let base = checkpoint * ROWS_PER_CHECKPOINT;
+            let keys: Vec<i64> = (0..ROWS_PER_CHECKPOINT)
+                .map(|i| {
+                    i64::try_from(base + (i * 7919) % ROWS_PER_CHECKPOINT).expect("key fits i64")
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    Arc::new(StringArray::from_iter_values(
+                        keys.iter().map(|id| pad(*id)),
+                    )),
+                ],
+            )
+            .expect("checkpoint batch");
+            provider
+                .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                .await
+                .expect("CDC upsert")
+                .finish()
+                .await
+                .expect("CDC upsert published");
+            provider.checkpoint_mem_tier().await.expect("checkpoint");
+        }
+        let before: HashSet<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            before.len(),
+            CHECKPOINTS,
+            "precondition: one protected snapshot per checkpoint"
+        );
+
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake"),
+            "the oldest checkpoints bake"
+        );
+        let after: HashSet<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        let merged: Vec<&String> = after.difference(&before).collect();
+        let [merged] = merged.as_slice() else {
+            panic!("a bake publishes one merged snapshot: {after:?}");
+        };
+        let baked = CHECKPOINTS + 1 - after.len();
+        let files = provider
+            .list_snapshot_files_with_sizes(merged)
+            .await
+            .expect("list merged files")
+            .len();
+        assert!(
+            files >= 2,
+            "precondition: the merged output spans several encode shards ({files} files)"
+        );
+        assert_disjoint_sorted_key_range_files_in(
+            &provider,
+            merged,
+            &schema,
+            files,
+            baked * ROWS_PER_CHECKPOINT,
+        )
+        .await;
     }
 
     /// A whole-table replace of a keyed table routes its rows into key-range
@@ -57331,6 +59815,8 @@ mod tests {
             listed.iter().all(|paths| paths == &listed[0]),
             "every listing sees the same files"
         );
+        // Persistence runs in the background, off the listings' path: wait for it.
+        provider.wait_for_scan_file_statistics_persistence().await;
         let after = provider.scan_file_statistics_counters();
         assert_eq!(
             after.footer_reads - before.footer_reads,
@@ -58068,8 +60554,8 @@ mod tests {
         }
         // The inserts leave a post-write maintenance pass behind them, which
         // persists table statistics and rebuilds the snapshot manifest through
-        // the metastore. Finish it before the warmup, so it cannot run inside
-        // the measured window.
+        // the metastore. Finish it before the warmup, so it neither runs inside
+        // the measured window nor holds the warmup's statistics writes back.
         provider
             .flush_pending_maintenance()
             .await
@@ -58100,6 +60586,9 @@ mod tests {
             provider.cached_snapshot_listing.load_full().is_some(),
             "{mode}: warmup must populate the snapshot listing cache"
         );
+        // The warmup's cold lookups persist each file's statistics in the
+        // background; let those writes land before anything is measured.
+        provider.wait_for_scan_file_statistics_persistence().await;
 
         // One-worker baseline on the same fixture: 8 mutex-serialized workers
         // at ~307 µs/lookup would still beat a 10 ms serial budget. Require
@@ -59800,6 +62289,266 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
             vec![(1, 10), (2, 20), (3, 30), (4, 40)],
             "key 0 stays deleted after the bake (no resurrection), others preserved"
+        );
+    }
+
+    /// A seq-prefix bake builds its deletion-index prune without holding the
+    /// listing fence: a scan started while the pruned index is being built
+    /// completes, and it reads the swapped protected set with the still-unpruned
+    /// index — the same rows as before and after the bake. Five snapshots (ids
+    /// 0..5) pinned at seqs 10..50; the bake folds {0, 1} (`T = 20`); key 0 is
+    /// deleted at 15.
+    #[tokio::test]
+    async fn a_scan_completes_while_a_bake_builds_its_deletion_index_prune() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_prune_off_fence_scan",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+        let expected = vec![(1, 10), (2, 20), (3, 30), (4, 40)];
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_off_fence_scan").await,
+            expected,
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
+
+        let scanned_in_window = Arc::new(ParkingMutex::new(None::<Vec<(i64, i64)>>));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let ctx_in_hook = ctx.clone();
+            let scanned = Arc::clone(&scanned_in_window);
+            *provider.test_pre_bake_prune_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let rows = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        collect_id_value_pairs(
+                            &ctx_in_hook,
+                            &provider_in_hook,
+                            "bake_prune_off_fence_scan",
+                        ),
+                    )
+                    .await
+                    .expect("a scan must not wait on the bake's deletion-index prune");
+                    *scanned.lock() = Some(rows);
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert_eq!(
+            scanned_in_window.lock().take(),
+            Some(expected.clone()),
+            "a scan between the swap and the prune reads the merged output with the \
+             unpruned index: key 0 stays hidden, every other row is present"
+        );
+        assert_eq!(
+            int64_tombstones(&provider).delete_len(),
+            0,
+            "the prune still lands after the off-fence build"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_off_fence_scan").await,
+            expected,
+            "key 0 stays deleted after the bake, others preserved"
+        );
+    }
+
+    /// A recovery that read the catalog before the bake committed can republish
+    /// the bake's inputs after the bake swapped them out. A deletion-index prune
+    /// that lands after that would strip the tombstone hiding key 0's row in the
+    /// restored inputs, so the prune must be dropped: the index keeps it and key 0
+    /// stays hidden. The republished index is the same one the prune was built
+    /// from, so only the liveness check — not the compare-and-swap — stops it.
+    #[tokio::test]
+    async fn a_bake_prune_is_dropped_when_its_inputs_are_republished() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_prune_inputs_republished",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+
+        let pre_swap = Arc::new(ParkingMutex::new(None::<Arc<HashMap<String, i64>>>));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let pre_swap = Arc::clone(&pre_swap);
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    *pre_swap.lock() = Some(provider_in_hook.protected_snapshots.load_full());
+                })
+            }));
+        }
+        let republished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let pre_swap = Arc::clone(&pre_swap);
+            let republished = Arc::clone(&republished);
+            *provider.test_pre_bake_prune_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let inputs = pre_swap
+                        .lock()
+                        .take()
+                        .expect("the bake captured its pre-swap protected set");
+                    // What `publish_recovered_visibility` does with a stale read.
+                    let _fence = provider_in_hook.listing_fence.write().await;
+                    provider_in_hook.protected_snapshots.store(inputs);
+                    republished.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert!(
+            republished.load(Ordering::SeqCst),
+            "the inputs must be republished between the prune's build and its publication"
+        );
+        assert_eq!(
+            int64_tombstones(&provider)
+                .get(0)
+                .map(|t| t.delete_sequence),
+            Some(15),
+            "the tombstone the republished inputs need must survive the bake"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_inputs_republished").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "key 0 must stay hidden in the republished inputs"
+        );
+    }
+
+    /// Installs a bake-prune hook that publishes a tombstone for an absent key
+    /// (`100 + n`, delete sequence `60 + n`) before each of the first
+    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] off-fence swaps, so a writer wins every
+    /// one of them; `wins` counts the publications.
+    fn install_winning_writer_hook(provider: &CayenneTableProvider, wins: Arc<AtomicUsize>) {
+        let provider_in_hook = provider.clone_for_write();
+        *provider.test_pre_bake_prune_publish_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let n = i64::try_from(wins.fetch_add(1, Ordering::SeqCst)).expect("fits i64");
+                let extended =
+                    int64_tombstones(&provider_in_hook).extend_max_deletes([(100 + n, 60 + n)]);
+                store_int64_tombstones(&provider_in_hook, extended);
+                provider_in_hook.notify_scan_input_change();
+                if wins.load(Ordering::SeqCst) < BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
+                    install_winning_writer_hook(&provider_in_hook, wins);
+                }
+            })
+        }));
+    }
+
+    /// When a writer wins every off-fence swap, a seq-prefix bake splices its
+    /// deletion-index prune once more under the write fence: the prune lands, and
+    /// every tombstone the writers published meanwhile survives it. Five
+    /// snapshots (ids 0..5) pinned at seqs 10..50; the bake folds {0, 1}
+    /// (`T = 20`); key 0 is deleted at 15.
+    #[tokio::test]
+    async fn a_bake_prune_lands_under_the_fence_when_writers_win_every_swap() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_prune_fenced_splice",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+        let wins = Arc::new(AtomicUsize::new(0));
+        install_winning_writer_hook(&provider, Arc::clone(&wins));
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert_eq!(
+            wins.load(Ordering::SeqCst),
+            BAKE_PRUNE_OFF_FENCE_ATTEMPTS,
+            "precondition: a writer won every off-fence swap"
+        );
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(0).map(|t| t.delete_sequence),
+            None,
+            "the prune lands after every off-fence swap was lost"
+        );
+        for n in 0..i64::try_from(BAKE_PRUNE_OFF_FENCE_ATTEMPTS).expect("fits i64") {
+            assert_eq!(
+                tombstones.get(100 + n).map(|t| t.delete_sequence),
+                Some(60 + n),
+                "the tombstone writer {n} published during the prune survives it"
+            );
+        }
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_prune_fenced_splice").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "key 0 stays deleted after the bake, others preserved"
+        );
+    }
+
+    /// A tombstone published after a seq-prefix bake captured its deletion index
+    /// can carry a sequence between that index's newest delete (the bake's fence)
+    /// and the prefix cutoff `T`. The merged output applies deletions above the
+    /// fence, so that tombstone still hides a row in it, and the bake's prune must
+    /// keep it. Five snapshots (ids 0..5) pinned at seqs 10, 30, 40, 50, 60; the
+    /// bake folds {0, 1} (`T = 30`); key 0 is deleted at 15 (the fence) before the
+    /// bake and key 1 at 25 after its capture.
+    #[tokio::test]
+    async fn a_bake_keeps_a_tombstone_published_after_its_capture() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_keeps_late_tombstone",
+            ctx.runtime_env(),
+            &[10, 30, 40, 50, 60],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_late_tombstone").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
+        {
+            let provider_in_hook = provider.clone_for_write();
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let extended =
+                        int64_tombstones(&provider_in_hook).extend_max_deletes([(1, 25)]);
+                    store_int64_tombstones(&provider_in_hook, extended);
+                    // As a writer does on publishing, so the scan below does not
+                    // reuse the view the precondition scan cached.
+                    provider_in_hook.notify_scan_input_change();
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert_eq!(
+            int64_tombstones(&provider)
+                .get(1)
+                .map(|t| t.delete_sequence),
+            Some(25),
+            "a tombstone published after the bake's capture must survive its prune"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_late_tombstone").await,
+            vec![(2, 20), (3, 30), (4, 40)],
+            "a tombstone published after the bake's capture must keep hiding its row"
         );
     }
 
@@ -69556,6 +72305,551 @@ mod tests {
         pairs
     }
 
+    /// A cancelled SQL request must not free admission while its blocking build
+    /// still holds snapshots. A queued query captures writes and a checkpoint
+    /// committed during the wait, without starting another view build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scan_view_admission_survives_cancelled_query() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cancelled_query",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register real provider");
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("initial CDC rows")
+            .finish()
+            .await
+            .expect("initial CDC rows published");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *provider.test_scan_view_build_hook.lock() = Some(Box::new(move || {
+            entered_tx.send(()).expect("report blocking build entry");
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release blocking build");
+        }));
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            first_ctx
+                .sql("SELECT id, value FROM t")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("first query enters blocking build")
+            .expect("build entry signal");
+        first.abort();
+        assert!(first.await.expect_err("request cancelled").is_cancelled());
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 3], &[11, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("CDC upsert while build is paused")
+            .finish()
+            .await
+            .expect("CDC upsert published while build is paused");
+        tokio::time::timeout(Duration::from_secs(10), provider.checkpoint_mem_tier())
+            .await
+            .expect("checkpoint does not wait for scan-view admission")
+            .expect("checkpoint completes");
+
+        let (captured_tx, mut captured_rx) = tokio::sync::oneshot::channel();
+        *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                captured_tx.send(()).expect("report queued scan capture");
+            })
+        }));
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_scan_view_admission_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                admission_tx.send(()).expect("report queued scan admission");
+            })
+        }));
+        let second_ctx = ctx.clone();
+        let second = tokio::spawn(async move {
+            second_ctx
+                .sql("SELECT id, value FROM t")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), admission_rx)
+            .await
+            .expect("second query reaches build admission")
+            .expect("admission signal");
+        // Time itself is under test: the unfinished blocking build must retain
+        // admission even though its originating SQL request was cancelled.
+        let early_capture =
+            tokio::time::timeout(Duration::from_millis(100), &mut captured_rx).await;
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1], &[12])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("CDC upsert while second query waits")
+            .finish()
+            .await
+            .expect("CDC upsert published while second query waits");
+        release_tx.send(()).expect("release first build");
+        let rows = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("queued query completes")
+            .expect("query task joins")
+            .expect("query succeeds");
+        assert!(
+            early_capture.is_err(),
+            "a cancelled request must not admit another snapshot capture while its build runs"
+        );
+        tokio::time::timeout(Duration::from_secs(10), captured_rx)
+            .await
+            .expect("queued query captures after admission")
+            .expect("capture signal");
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&rows),
+            vec![(1, 12), (2, 20), (3, 30)],
+            "queued query must capture the committed checkpoint and latest CDC upsert"
+        );
+    }
+
+    /// A zero-lag scan must see every write that completed before it asked,
+    /// even when it queues behind a build whose capture predates that write.
+    /// The first scan pauses after its capture passes the version check, a
+    /// write completes, and a zero-lag scan queues for admission; once the first
+    /// build publishes, the queued scan must recapture rather than reuse it,
+    /// because that capture was stamped before the state it read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_lag_scan_sees_writes_completed_before_it_queued() {
+        let ctx = SessionContext::new();
+        let (mut provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "zero_lag_queued_scan",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        provider.scan_view_reuse = ScanViewReuse::WithinLag(Duration::ZERO);
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register real provider");
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("first write")
+            .finish()
+            .await
+            .expect("first write published");
+
+        let (validated_tx, validated_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_post_scan_input_validation_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                validated_tx.send(()).expect("report validated capture");
+                release_rx.await.expect("release validated capture");
+            })
+        }));
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            first_ctx
+                .sql("SELECT id, value FROM t ORDER BY id")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), validated_rx)
+            .await
+            .expect("first scan validates its capture")
+            .expect("validated signal");
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second write")
+            .finish()
+            .await
+            .expect("second write published");
+
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_scan_view_admission_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                admission_tx.send(()).expect("report queued scan admission");
+            })
+        }));
+        let second_ctx = ctx.clone();
+        let second = tokio::spawn(async move {
+            second_ctx
+                .sql("SELECT id, value FROM t ORDER BY id")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), admission_rx)
+            .await
+            .expect("second scan queues for admission")
+            .expect("admission signal");
+        release_tx.send(()).expect("release first scan");
+
+        let first_rows = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("first scan completes")
+            .expect("first scan task joins")
+            .expect("first scan succeeds");
+        let second_rows = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("second scan completes")
+            .expect("second scan task joins")
+            .expect("second scan succeeds");
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&first_rows),
+            vec![(1, 10)],
+            "the first scan's capture predates the second write"
+        );
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&second_rows),
+            vec![(1, 10), (2, 20)],
+            "a zero-lag scan must see a write that completed before it asked"
+        );
+    }
+
+    /// `SplitMix64`, so a differential case reproduces from its printed seed.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> i64 {
+            i64::try_from(self.next() % bound).expect("bound fits i64")
+        }
+    }
+
+    /// Every scan-view build and mem-tier checkpoint carries the previous one's
+    /// merged deletions and visible mem-tier rows forward. After each CDC
+    /// upsert, delete and checkpoint of a seeded history, the carried result
+    /// must equal a build from scratch — the same visible rows, per shard for a
+    /// checkpoint, including for a tier captured before the step and filtered
+    /// after a build of the newer one, and the same delete sequence for every
+    /// key ever written — and SQL must return exactly the modeled rows.
+    /// Runs for an `Int64` key and a composite key, and requires that builds
+    /// actually carried segments and extended a merge, so the fallback alone
+    /// cannot pass it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_scan_view_build_matches_full_build() {
+        for composite in [false, true] {
+            for seed in [0x5EED_0001_u64, 0x5EED_0002, 0x5EED_0003] {
+                incremental_scan_view_case(composite, seed).await;
+            }
+        }
+    }
+
+    async fn incremental_scan_view_case(composite: bool, seed: u64) {
+        let case = format!(
+            "{} key, seed {seed:#x}",
+            if composite { "composite" } else { "Int64" }
+        );
+        let ctx = SessionContext::new();
+        let key_names: Vec<&str> = if composite { vec!["a", "b"] } else { vec!["a"] };
+        let mut fields: Vec<Field> = key_names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int64, false))
+            .collect();
+        let key_schema = Arc::new(Schema::new(fields.clone()));
+        fields.push(Field::new("value", DataType::Int64, false));
+        let schema = Arc::new(Schema::new(fields));
+        let key_columns: Vec<String> = key_names.iter().map(ToString::to_string).collect();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            &format!("incremental_scan_view_{}_{seed:x}", key_names.len()),
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            key_columns.clone(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(
+                    key_columns,
+                ),
+            ),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register real provider");
+
+        let columns = |keys: &[(i64, i64)], values: Option<&[i64]>| -> Vec<ArrayRef> {
+            let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(
+                keys.iter().map(|k| k.0),
+            ))];
+            if composite {
+                columns.push(Arc::new(Int64Array::from_iter_values(
+                    keys.iter().map(|k| k.1),
+                )));
+            }
+            if let Some(values) = values {
+                columns.push(Arc::new(Int64Array::from(values.to_vec())));
+            }
+            columns
+        };
+        let mut rng = SplitMix64(seed);
+        let mut model: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+        let mut written: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+        for step in 0..48 {
+            // The tier as a checkpoint might have captured it before this step's
+            // write, to filter after a build of the newer tier.
+            let before = provider
+                .capture_raw_scan_input()
+                .await
+                .expect("capture before the step")
+                .mem_tier_shards;
+            let mut keys: std::collections::BTreeSet<(i64, i64)> =
+                std::collections::BTreeSet::new();
+            for _ in 0..=rng.below(12) {
+                keys.insert(if composite {
+                    (rng.below(4), rng.below(12))
+                } else {
+                    (rng.below(40), 0)
+                });
+            }
+            let keys: Vec<(i64, i64)> = keys.into_iter().collect();
+            match rng.below(10) {
+                0..=5 => {
+                    let values: Vec<i64> = keys.iter().map(|_| rng.below(1_000_000)).collect();
+                    let batch =
+                        RecordBatch::try_new(Arc::clone(&schema), columns(&keys, Some(&values)))
+                            .expect("upsert batch");
+                    provider
+                        .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                        .await
+                        .expect("CDC upsert")
+                        .finish()
+                        .await
+                        .expect("CDC upsert published");
+                    for (key, value) in keys.iter().zip(values) {
+                        model.insert(*key, value);
+                        written.insert(*key);
+                    }
+                }
+                6 | 7 => {
+                    let batch = RecordBatch::try_new(Arc::clone(&key_schema), columns(&keys, None))
+                        .expect("delete batch");
+                    provider
+                        .write_cdc_delete_keys_in_memory(&batch)
+                        .await
+                        .expect("CDC delete")
+                        .expect("the delete is absorbed in memory");
+                    for key in &keys {
+                        model.remove(key);
+                    }
+                }
+                8 => {
+                    provider.checkpoint_mem_tier().await.expect("checkpoint");
+                }
+                _ => {}
+            }
+
+            // The carried build against a from-scratch build of the same capture.
+            let raw = provider.capture_raw_scan_input().await.expect("capture");
+            let carried = provider
+                .visible_mem_tier_segments_for_build(&raw.mem_tier_shards, &raw.deletion_snapshot)
+                .expect("carried visibility");
+            let full = provider
+                .visible_mem_tier_segments(&raw.mem_tier_shards, &raw.deletion_snapshot)
+                .expect("full visibility");
+            let rows = |segments: &[VisibleMemTierSegment]| -> Vec<Vec<i64>> {
+                let mut rows: Vec<Vec<i64>> = segments
+                    .iter()
+                    .flat_map(|segment| segment.batches.iter())
+                    .flat_map(|batch| {
+                        (0..batch.num_rows()).map(move |row| {
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| {
+                                    column
+                                        .as_any()
+                                        .downcast_ref::<Int64Array>()
+                                        .expect("Int64 column")
+                                        .value(row)
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                rows.sort_unstable();
+                rows
+            };
+            assert_eq!(
+                rows(&carried[..]),
+                rows(&full[..]),
+                "{case}, step {step}: visible mem-tier rows"
+            );
+            // The checkpoint's per-shard groups come from the same carried state,
+            // for the current tier and for the tier captured before this step,
+            // which the cache now describes a newer state of.
+            let as_segments = |batches: &[RecordBatch]| {
+                vec![VisibleMemTierSegment {
+                    statistics: Arc::new(Statistics::new_unknown(&schema)),
+                    batches: batches.to_vec(),
+                }]
+            };
+            for (shards, what) in [
+                (&raw.mem_tier_shards, "checkpoint visible rows"),
+                (&before, "checkpoint visible rows of the earlier capture"),
+            ] {
+                let by_shard = provider
+                    .visible_mem_tier_batches_by_shard(shards)
+                    .expect("checkpoint visibility");
+                assert_eq!(
+                    by_shard.len(),
+                    shards.len(),
+                    "{case}, step {step}: shard groups"
+                );
+                for (shard, group) in shards.iter().zip(&by_shard) {
+                    let full_group = provider
+                        .visible_mem_tier_batches(shard, None)
+                        .expect("full shard visibility");
+                    assert_eq!(
+                        rows(&as_segments(group)[..]),
+                        rows(&as_segments(&full_group)[..]),
+                        "{case}, step {step}: {what}"
+                    );
+                }
+            }
+
+            let merged =
+                provider.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
+            let rebuilt = CayenneTableProvider::merged_deletion_snapshot_sharded(
+                raw.deletion_snapshot.clone(),
+                &raw.mem_tier_shards,
+            );
+            let pk_indices: Vec<usize> = (0..key_names.len()).collect();
+            let converter = provider
+                .build_pk_converter(&pk_indices)
+                .expect("key converter");
+            for key in &written {
+                let delete_sequence = |snapshot: &PkDeletionSnapshot| match snapshot {
+                    PkDeletionSnapshot::Int64Pk { tombstones } => {
+                        tombstones.get(key.0).map(|t| t.delete_sequence)
+                    }
+                    PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                        let encoded = converter
+                            .convert_columns(&columns(&[*key], None))
+                            .expect("encode key");
+                        tombstones
+                            .get(encoded.row(0).data())
+                            .map(|t| t.delete_sequence)
+                    }
+                    PkDeletionSnapshot::PositionBased => None,
+                };
+                assert_eq!(
+                    delete_sequence(&merged),
+                    delete_sequence(&rebuilt),
+                    "{case}, step {step}: merged delete sequence for key {key:?}"
+                );
+            }
+
+            // And end to end through the scan path the queries use.
+            let order = if composite { "a, b" } else { "a" };
+            let batches = ctx
+                .sql(&format!("SELECT * FROM t ORDER BY {order}"))
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("scan");
+            let expected: Vec<Vec<i64>> = model
+                .iter()
+                .map(|(key, value)| {
+                    let mut row = vec![key.0];
+                    if composite {
+                        row.push(key.1);
+                    }
+                    row.push(*value);
+                    row
+                })
+                .collect();
+            let actual: Vec<Vec<i64>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).map(move |row| {
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                column
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .expect("Int64 column")
+                                    .value(row)
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            assert_eq!(actual, expected, "{case}, step {step}: SQL rows");
+        }
+        let carried = provider
+            .scan_view_cache
+            .carried_segments
+            .load(Ordering::Relaxed);
+        let extended = provider
+            .scan_view_cache
+            .extended_merges
+            .load(Ordering::Relaxed);
+        assert!(carried > 0, "{case}: no build carried a segment forward");
+        assert!(extended > 0, "{case}: no build extended a previous merge");
+    }
+
     /// [`ScanViewReuse::UntilInvalidated`] — the full/append path. A scan through
     /// the demand cache must see its own writes on the VERY NEXT scan: after an append
     /// bumps `scan_input_version`, the cached view is invalid, so the scan recaptures
@@ -76661,6 +79955,355 @@ mod tests {
         assert_eq!(rows, expected, "one live row per key, key 7 upserted");
     }
 
+    /// A checkpoint that moves the inline rows into files while a write has the
+    /// table-wide index checked out must not cost that index: the flush changes
+    /// where rows live, not which keys are live. The restore relabels the `Inlined`
+    /// entries the index and the commits before the flush carry, caches the index,
+    /// and marks per-key OCC degraded, because the relabeled keys keep stamps from
+    /// before the flush. Discarding the index instead would make the next write
+    /// rebuild it from a full-table key scan under `write_lock` (on `stock` at
+    /// CH-benCH SF-100, a 10M-key rebuild that stalls the table's replication).
+    #[tokio::test]
+    async fn an_inline_flush_during_a_table_wide_checkout_relabels_an_exact_keyset() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_table_checkout_inline_flush",
+            ctx.runtime_env(),
+            VortexConfig::default(),
+        )
+        .await;
+        let schema = provider.table_schema();
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+        let digest_of = |id: i64| {
+            pk_digest_set_for_ids(&converter, &[id])
+                .iter_with_digest()
+                .next()
+                .expect("one key")
+                .0
+        };
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        // An inline row the index already holds when the write checks it out.
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[5]), 10);
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        let checked_out = checked_out.expect("the seed insert leaves a cached keyset");
+        assert!(
+            matches!(checked_out, CachedPkIndex::Exact(_)),
+            "precondition: the keyset is exact"
+        );
+        assert!(
+            !provider.pk_keyset_occ_degraded.load(Ordering::Acquire),
+            "precondition: per-key OCC is trusted before the flush"
+        );
+
+        // One inline commit lands before the flush, one after it.
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[7]), 11);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.record_inlined_pk_keys(&pk_digest_set_for_ids(&converter, &[8]), 12);
+
+        provider.store_cached_pk_index(checked_out, checkout);
+
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Exact(keyset)) => {
+                let location_of = |id: i64| keyset.location_by_digest(digest_of(id)).cloned();
+                assert!(
+                    matches!(location_of(5), Some(RowLocation::FileUnlocated)),
+                    "id=5 was inline when the index was checked out and the flush moved it \
+                     into a file: an `Inlined` entry would supersede only the inline copy and \
+                     leave the file copy live"
+                );
+                assert!(
+                    matches!(location_of(7), Some(RowLocation::FileUnlocated)),
+                    "id=7 was committed inline before the flush moved it into a file"
+                );
+                assert!(
+                    matches!(location_of(8), Some(RowLocation::Inlined)),
+                    "id=8 was committed inline after the flush and is still inline"
+                );
+            }
+            other => panic!(
+                "the table-wide index must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next write), present={}",
+                other.is_some()
+            ),
+        }
+        assert!(
+            provider.pk_keyset_occ_degraded.load(Ordering::Acquire),
+            "the relabeled keys keep OCC stamps from before the flush, so per-key OCC must \
+             fall back to the per-table check"
+        );
+    }
+
+    /// An off-lock transaction plans its writes from where the primary-key index says
+    /// each replaced row lives, and its commit trusts per-key OCC stamps. A one-shard
+    /// checkpoint that moves key 7's inline row into a file between the plan and the
+    /// commit leaves key 7's stamp unchanged, so per-key OCC would admit a plan that
+    /// supersedes only the absent inline copy; the commit must conflict instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transaction_that_planned_against_an_inline_row_conflicts_after_a_checkpoint_moves_it()
+     {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_sharded_cdc_upsert_table_with_cap("occ_inline_flush", ctx.runtime_env(), 1, 0)
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        let write_set = pk_digest_set_for_ids(&converter, &[7]);
+        let footprint: std::collections::HashSet<u128> = write_set
+            .iter_with_digest()
+            .map(|(digest, _)| digest)
+            .collect();
+        let stage_seq = provider.sequence_high_water().await;
+        assert!(
+            !provider.transaction_has_conflict(
+                stage_seq,
+                &footprint,
+                true,
+                &write_set,
+                stage_seq + 1,
+            ),
+            "precondition: per-key OCC is in force, so a commit to another key alone does \
+             not conflict"
+        );
+
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint moves key 7 into a file");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+        let current = provider.sequence_high_water().await;
+        assert!(
+            provider.transaction_has_conflict(stage_seq, &footprint, true, &write_set, current),
+            "a transaction that planned against key 7's inline row must conflict once a \
+             checkpoint has moved it into a file"
+        );
+    }
+
+    /// The table-wide index is a Bloom once the keyset outgrows its budget (the
+    /// form `order_line` runs in at CH-benCH SF-100, where a discard reports
+    /// `kind=bloom, reason=invalidated`). A Bloom carries no row locations, so an
+    /// inline flush during its checkout has nothing to relabel and must not cost
+    /// the index: the restore keeps it and replays the keys committed while it
+    /// was out.
+    #[tokio::test]
+    async fn an_inline_flush_during_a_table_wide_checkout_keeps_a_bloom_index() {
+        use crate::provider::pk_index::pk_digest;
+
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_budgeted_upsert_table(
+            "pk_table_checkout_inline_flush_bloom",
+            1,
+            ctx.runtime_env(),
+        )
+        .await;
+        provider.maybe_install_warm_pk_caches().await;
+        // ~25k 8-byte keys cross the 1 MiB budget (see
+        // `conversion_bloom_is_right_sized_for_conversion_time_keys`).
+        let mut keys = PkDigestSet::with_capacity(25_000);
+        for i in 0..25_000u64 {
+            let key = crate::row_converter::Row::from_encoded(&i.to_be_bytes()).owned();
+            keys.insert_with_digest(pk_digest(&key), key);
+        }
+        provider.record_file_pk_keys(&keys, 1);
+        let (checked_out, checkout) = provider.take_cached_pk_index();
+        assert!(
+            matches!(checked_out, Some(CachedPkIndex::Bloom(_))),
+            "precondition: the over-budget table-wide index is a Bloom"
+        );
+        let checked_out = checked_out.expect("the Bloom is checked out");
+
+        // A key committed inline while the index is out, then the checkpoint's
+        // inline flush, then the restore.
+        let committed_id = 1_000_000_u64;
+        let committed =
+            crate::row_converter::Row::from_encoded(&committed_id.to_be_bytes()).owned();
+        let mut committed_keys = PkDigestSet::with_capacity(1);
+        committed_keys.insert_with_digest(pk_digest(&committed), committed.clone());
+        provider.record_inlined_pk_keys(&committed_keys, 2);
+        provider.flip_inlined_keyset_entries_to_file_unlocated();
+        provider.store_cached_pk_index(checked_out, checkout);
+
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Bloom(bloom)) => assert!(
+                bloom.maybe_contains(committed.as_ref()),
+                "the restore must replay the key committed during the checkout"
+            ),
+            other => panic!(
+                "the table-wide Bloom must survive an inline flush during its checkout \
+                 (discarding it forces a full-table rebuild on the next write), present={}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// The table-wide twin of
+    /// `a_checkpoint_during_a_sharded_keyset_rebuild_keeps_the_flushed_inline_keys`,
+    /// driven through real applies on a one-shard memory-CDC table, whose applies
+    /// validate against the table-wide index. The keyset budget is zero, so the
+    /// index is the Bloom a table past its budget runs on — the form every large
+    /// CH-benCH table's index takes. A cold cache makes an apply's checkout
+    /// rebuild it, and a checkpoint lands right after the rebuild's fenced
+    /// capture and moves key 7 out of the inline corpus. The index must come back
+    /// cached — discarded, the next apply rebuilds it from a full-table key scan
+    /// under `write_lock`, and on a large CDC table a checkpoint lands inside
+    /// nearly every such rebuild, so the applies never stop rebuilding — and must
+    /// still know key 7, so its next upsert replaces the row the checkpoint moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_during_a_table_wide_keyset_rebuild_keeps_the_index() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_table_rebuild_inline_flush",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                cdc_mem_tier_min_flush_bytes: 0,
+                cdc_mem_tier_shards: 1,
+                pk_keyset_cache_mb: Some(0),
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("primary key indices resolve")
+            .expect("the table declares a primary key");
+        let converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("primary key converter");
+
+        // RAM-tier rows for the checkpoint to flush, and key 7 in the inline corpus.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1), (101, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        assert!(
+            !provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: key 7 must be in the inline corpus"
+        );
+
+        // A cold cache, so the next apply's checkout rebuilds the index, and a
+        // checkpoint that runs right after the rebuild's fenced capture.
+        provider.clear_cached_pk_keyset();
+        let checkpointed = Arc::new(AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let checkpointed = Arc::clone(&checkpointed);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    provider_in_hook
+                        .checkpoint_mem_tier()
+                        .await
+                        .expect("checkpoint during the keyset rebuild");
+                    checkpointed.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        assert!(
+            apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(200, 1)])
+                .await
+                .is_some(),
+            "precondition: the apply takes the in-memory path"
+        );
+        assert!(
+            checkpointed.load(Ordering::SeqCst),
+            "precondition: the checkpoint ran inside the apply's keyset rebuild"
+        );
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint moved key 7 out of the inline corpus"
+        );
+
+        let key_7: Vec<u8> = {
+            let keys = pk_digest_set_for_ids(&converter, &[7]);
+            let (_, key) = keys.iter_with_digest().next().expect("one key");
+            let bytes: &[u8] = key.as_ref();
+            bytes.to_vec()
+        };
+        match provider.pk_keyset_cache.lock().as_ref() {
+            Some(CachedPkIndex::Bloom(bloom)) => assert!(
+                bloom.maybe_contains(&key_7),
+                "the rebuilt index must hold key 7, whose row the checkpoint moved into a file"
+            ),
+            Some(CachedPkIndex::Exact(_)) => {
+                panic!("precondition: a zero keyset budget leaves a Bloom index")
+            }
+            None => {
+                panic!("the rebuilt table-wide Bloom must survive the checkpoint's inline flush")
+            }
+        }
+
+        // The next apply reuses the index instead of rebuilding it, and its upsert of
+        // key 7 replaces the row the checkpoint moved.
+        let rebuilt = Arc::new(AtomicBool::new(false));
+        {
+            let rebuilt = Arc::clone(&rebuilt);
+            *provider.test_post_keyset_capture_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    rebuilt.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+        assert!(
+            !rebuilt.load(Ordering::SeqCst),
+            "the next apply must reuse the table-wide index, not rebuild it from a table scan"
+        );
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_table_rebuild_inline_flush")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value"
+        );
+    }
+
     /// A checkpoint that moves the inline rows into files while an apply has the
     /// per-shard index checked out must not cost that index: the flush changes
     /// where rows live, not which keys are live. The restore relabels the `Inlined`
@@ -76922,6 +80565,409 @@ mod tests {
             rows_for_7,
             vec![(7, 2)],
             "one live row for key 7, with its upserted value"
+        );
+    }
+
+    /// Arrange for `hook` to make one best-effort mem-tier checkpoint attempt when it
+    /// fires, and return where the attempt reports what it did.
+    fn install_checkpoint_attempt(
+        provider: &CayenneTableProvider,
+        hook: &ParkingMutex<Option<TestPostCaptureHook>>,
+    ) -> Arc<ParkingMutex<Option<String>>> {
+        let outcome = Arc::new(ParkingMutex::new(None));
+        let provider_in_hook = provider.clone_for_write();
+        let outcome_in_hook = Arc::clone(&outcome);
+        *hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let attempt = match provider_in_hook
+                    .try_checkpoint_mem_tier()
+                    .await
+                    .expect("a best-effort checkpoint attempt")
+                {
+                    CheckpointAttempt::Completed(rows) => format!("ran and flushed {rows} rows"),
+                    CheckpointAttempt::Busy => "refused, its lock was held".to_string(),
+                };
+                *outcome_in_hook.lock() = Some(attempt);
+            })
+        }));
+        outcome
+    }
+
+    /// A one-shard checkpoint takes no `write_lock`. If it lands after an insert
+    /// publishes key 7 inline and before the insert records the key, its relabel of
+    /// the inline keys misses key 7, which then stays recorded `Inlined` while its
+    /// row sits in a file, and a later upsert of key 7 tombstones only the absent
+    /// inline copy and leaves two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_upsert_replaces_a_row_a_checkpoint_flushed_before_its_key_was_recorded() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_inline_record_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // A RAM-tier row for the checkpoint to flush, and a resident Exact keyset.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Exact(_))
+            ),
+            "precondition: a resident Exact keyset"
+        );
+
+        let attempt =
+            install_checkpoint_attempt(&provider, &provider.test_post_inline_publish_hook);
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        let attempt = attempt.lock().take().expect(
+            "precondition: the insert reached the window between publishing and recording its key",
+        );
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint after the insert");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: a checkpoint moved key 7 out of the inline corpus"
+        );
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[2]),
+        )
+        .await;
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_inline_record_race")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value (the checkpoint attempted between \
+             the publication and the recording {attempt})"
+        );
+    }
+
+    /// The checkpoint reads the published inline corpus, encodes it, and then clears
+    /// the whole corpus. An insert committed to the metastore in between, and not yet
+    /// published, is in neither what the checkpoint read nor anything it keeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inline_insert_committed_during_a_checkpoint_survives_its_clear() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "inline_commit_clear_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // A RAM-tier row for the checkpoint to flush, and a published inline row so the
+        // checkpoint folds and clears the inline corpus.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[5], &[1]),
+        )
+        .await;
+        assert_eq!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1,
+            "precondition: key 5 is published inline"
+        );
+
+        let attempt = install_checkpoint_attempt(&provider, &provider.test_pre_inline_publish_hook);
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        let attempt = attempt.lock().take().expect(
+            "precondition: the insert reached the window between committing and publishing its row",
+        );
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint after the insert");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: a checkpoint folded the inline corpus into a file"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "inline_commit_clear_race").await,
+            vec![(5, 1), (7, 1), (100, 1)],
+            "every acknowledged row, once (the checkpoint attempted between the commit and \
+             the publication {attempt})"
+        );
+    }
+
+    /// A statement write checks out the primary-key index when it prepares its
+    /// validation. A one-shard checkpoint that moves key 7's inline row into a file
+    /// after that checkout and before the validation reads key 7 leaves the write
+    /// deciding, from the index it holds, that key 7 is inline: it supersedes only the
+    /// absent inline copy, and the file copy stays live beside the new row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_upsert_validated_after_a_checkpoint_moved_its_key_replaces_the_flushed_row() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_prepare_checkpoint_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // A RAM-tier row for the checkpoint to flush, and key 7 inline in a resident
+        // Exact keyset.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        assert!(
+            matches!(
+                provider.pk_keyset_cache.lock().as_ref(),
+                Some(CachedPkIndex::Exact(_))
+            ),
+            "precondition: a resident Exact keyset"
+        );
+
+        let attempt = install_checkpoint_attempt(&provider, &provider.test_post_prepare_hook);
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[2]),
+        )
+        .await;
+        let attempt = attempt.lock().take().expect(
+            "precondition: the upsert reached the window between its index checkout and its validation",
+        );
+        // A fresh RAM-tier row, so this checkpoint folds the inline corpus even when
+        // the attempt above already flushed the tier (an empty tier returns early).
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(101, 1)]).await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint after the upsert");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: a checkpoint folded the inline corpus into a file"
+        );
+
+        let rows_for_7: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "pk_prepare_checkpoint_race")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 7)
+                .collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value (the checkpoint attempted between \
+             the index checkout and the validation {attempt})"
+        );
+    }
+
+    /// A statement upsert whose rows fit the inline row cap but whose encoding exceeds
+    /// `inline_max_bytes` validates its rows while buffering them, falls back to
+    /// writing a new snapshot, and publishes that snapshot with the deletions its
+    /// validation chose. A one-shard checkpoint that moves key 7's inline row into a
+    /// file between the fallback and the publication leaves the write superseding key
+    /// 7 only in the inline corpus, beside its new row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_upsert_published_after_a_checkpoint_moved_its_key_replaces_the_flushed_row() {
+        let ctx = SessionContext::new();
+        // `create_sharded_cdc_upsert_table_with_cap`'s one-shard table, with an inline
+        // byte cap a few hundred rows exceed.
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pk_fallback_checkpoint_race",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                inline_max_bytes: 4096,
+                cdc_mem_tier_min_flush_bytes: 0,
+                cdc_mem_tier_max_bytes: 0,
+                cdc_mem_tier_shards: 1,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+
+        // Within `inline_max_rows`, so the write is collapsed and tries to inline, but
+        // its encoding exceeds `inline_max_bytes`, so it falls back to a new snapshot.
+        let ids: Vec<i64> = std::iter::once(7).chain(10_000..10_500).collect();
+        let values = vec![2; ids.len()];
+        let attempt = install_checkpoint_attempt(&provider, &provider.test_pre_staged_publish_hook);
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &values),
+        )
+        .await;
+        let attempt = attempt.lock().take().expect(
+            "precondition: the upsert fell back to a new snapshot and reached its publication",
+        );
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint after the upsert");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: a checkpoint folded the inline corpus into a file"
+        );
+
+        let rows = collect_id_value_pairs(&ctx, &provider, "pk_fallback_checkpoint_race").await;
+        let rows_for_7: Vec<(i64, i64)> = rows.iter().copied().filter(|(id, _)| *id == 7).collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value (the checkpoint attempted between \
+             the fallback and the publication {attempt})"
+        );
+        assert_eq!(
+            rows.len(),
+            1 + 1 + 500,
+            "key 100, key 7 and the 500 new keys"
+        );
+    }
+
+    /// A change-stream upsert too large to inline stages a new snapshot and an
+    /// unpublished tombstone for key 7's inline row, releases `write_lock`, and
+    /// publishes both later. A one-shard checkpoint that folded the inline corpus in
+    /// between would write key 7's old row into its file and delete the tombstone
+    /// meant to hide it, so the publication would leave two live rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_staged_upsert_replaces_a_row_a_checkpoint_flushed_before_it_published() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "pk_staged_tombstone_checkpoint_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        // The RAM tier keeps its row; later change-stream appends write durably.
+        provider.clear_slot_advancer();
+
+        let ids: Vec<i64> = std::iter::once(7).chain(10_000..11_100).collect();
+        let values = vec![2; ids.len()];
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &values)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("stage the change-stream upsert");
+        assert!(
+            write.has_pending_finalize(),
+            "precondition: the upsert staged a snapshot to publish later"
+        );
+        assert!(
+            provider.pending_inline_tombstones.load(Ordering::Acquire) > 0,
+            "precondition: the upsert staged an unpublished tombstone for key 7's inline row"
+        );
+
+        // A checkpoint starts while the upsert is staged. One that does not wait for the
+        // publication completes within this bounded join attempt.
+        let checkpointing = provider.clone_for_write();
+        let mut checkpoint = tokio::spawn(async move { checkpointing.checkpoint_mem_tier().await });
+        let completed_before_publication =
+            match tokio::time::timeout(Duration::from_secs(2), &mut checkpoint).await {
+                Ok(joined) => {
+                    joined
+                        .expect("join the checkpoint")
+                        .expect("checkpoint while the upsert is staged");
+                    true
+                }
+                Err(_) => false,
+            };
+        write.finish().await.expect("publish the staged upsert");
+        if !completed_before_publication {
+            checkpoint
+                .await
+                .expect("join the checkpoint")
+                .expect("checkpoint after the publication");
+        }
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint folded the inline corpus"
+        );
+
+        let rows =
+            collect_id_value_pairs(&ctx, &provider, "pk_staged_tombstone_checkpoint_race").await;
+        let rows_for_7: Vec<(i64, i64)> = rows.iter().copied().filter(|(id, _)| *id == 7).collect();
+        assert_eq!(
+            rows_for_7,
+            vec![(7, 2)],
+            "one live row for key 7, with its upserted value (the checkpoint completed before \
+             the publication: {completed_before_publication})"
         );
     }
 

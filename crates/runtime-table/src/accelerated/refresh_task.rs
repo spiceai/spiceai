@@ -65,8 +65,8 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+use runtime_acceleration::{SnapshotPoll, SnapshotPollOutcome};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
@@ -660,18 +660,16 @@ impl std::fmt::Debug for RefreshTask {
 
 /// Which stored rows an append's incoming rows are compared with, by the keep-newest
 /// selection and the exact-row dedupe.
-///
-/// The comparison is always inclusive of the mark: widening the stored side can only
-/// add rows to compare with, never cause a duplicate, so the stored side needs no
-/// `>`/`>=` distinction of its own (the source filter keeps its strict `>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredRowsFrom {
     /// Nothing: a full load overwrites the stored rows, and an append into an empty
     /// acceleration has none.
     None,
-    /// The stored rows at or after a mark: the high-water mark the source filter used,
-    /// or the lowest time the incoming rows can hold.
-    From(u128),
+    /// The stored rows after the high-water mark the source filter used, matching its
+    /// strict `>`.
+    AfterMark(u128),
+    /// The stored rows at or after the lowest time the incoming rows can hold.
+    AtOrAfter(u128),
     /// Every stored row, when no mark is safe.
     All,
 }
@@ -679,12 +677,12 @@ enum StoredRowsFrom {
 impl StoredRowsFrom {
     /// The high-water mark an append read from the acceleration, when it has one.
     fn from_mark(mark: Option<u128>) -> Self {
-        mark.map_or(Self::None, Self::From)
+        mark.map_or(Self::None, Self::AfterMark)
     }
 
     fn from_seed(seed: SeedMark) -> Self {
         match seed {
-            SeedMark::Lowest(nanos) => Self::From(nanos),
+            SeedMark::Lowest(nanos) => Self::AtOrAfter(nanos),
             SeedMark::AllStoredRows(_) => Self::All,
         }
     }
@@ -693,7 +691,8 @@ impl StoredRowsFrom {
     fn filter(self, converter: &TimestampFilterConvert) -> Option<Expr> {
         match self {
             Self::None | Self::All => None,
-            Self::From(mark) => Some(converter.convert_at_or_after_mark(mark)),
+            Self::AfterMark(mark) => Some(converter.convert_high_water_mark(mark)),
+            Self::AtOrAfter(mark) => Some(converter.convert_at_or_after_mark(mark)),
         }
     }
 }
@@ -890,7 +889,8 @@ impl RefreshTask {
         // optimization does not apply: skipping would silently drop the override and retain the
         // previously-materialized rows (issue #11353). When an override is present, bypass the
         // skip check and reset the provider's cached version so the *next* plain refresh
-        // re-materializes the full source instead of skipping against the narrowed data.
+        // re-materializes the full source instead of skipping against the narrowed data. A reload
+        // reads the source whether or not it changed, so it skips the check.
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
@@ -899,7 +899,7 @@ impl RefreshTask {
                     table_provider.as_ref(),
                 )
                 .await;
-            } else {
+            } else if !refresh.reload {
                 match data_components::refresh_skip::should_skip_refresh_for_table_provider(
                     table_provider.as_ref(),
                 )
@@ -998,7 +998,9 @@ impl RefreshTask {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
                 // and reload the accelerator from it. The federated source is
                 // never queried for refreshes in this mode.
-                return self.refresh_from_snapshot(refresh).await;
+                return self
+                    .refresh_from_snapshot(refresh, &dataset_metrics_label_sets)
+                    .await;
             }
         };
 
@@ -1484,7 +1486,7 @@ impl RefreshTask {
 
         // A source that records which rows each commit added has its append refresh
         // follow its commits instead of a time window.
-        if let Some(store) = &self.append_cursor_store {
+        if let Some(store) = self.commit_cursor_store(refresh) {
             let federated_provider = self.federated.table_provider().await;
             if let Some(source) = incremental_append_source(federated_provider.as_ref()) {
                 if refresh.override_sql_raw.is_none() {
@@ -1638,6 +1640,18 @@ impl RefreshTask {
         refresh.versions_by_time.is_some() && self.version_ordering(refresh).is_some()
     }
 
+    /// The append cursor store, when the refresh follows the source's commits. A keyed
+    /// refresh that keeps the last arrival of a key reads by time instead: commits carry
+    /// rows of any age, and a late older row would overwrite the newer stored one (#15273).
+    fn commit_cursor_store(&self, refresh: &Refresh) -> Option<&AppendCursorStore> {
+        // Same as `keeps_newest() || version_ordering().is_none()`, reading the key once.
+        let follows_commits = refresh.time_column.is_some()
+            && (refresh.versions_by_time.is_some() || self.version_ordering(refresh).is_none());
+        self.append_cursor_store
+            .as_ref()
+            .filter(|_| follows_commits)
+    }
+
     /// Warns that this append refresh reads by time instead of following the source's
     /// commits, once for each change of reason, and counts it under its reason.
     async fn report_append_fallback(&self, fallback: &Fallback) {
@@ -1668,12 +1682,9 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<Option<PinnedRead>, RetryError<super::Error>> {
-        let Some(store) = &self.append_cursor_store else {
+        let Some(store) = self.commit_cursor_store(refresh) else {
             return Ok(None);
         };
-        if refresh.time_column.is_none() {
-            return Ok(None);
-        }
         let federated_provider = self.federated.table_provider().await;
         let Some(source) = incremental_append_source(federated_provider.as_ref()) else {
             return Ok(None);
@@ -1921,9 +1932,12 @@ impl RefreshTask {
                     )
                 });
             let start = match stored_from {
-                StoredRowsFrom::From(value) if string_time => value
+                StoredRowsFrom::AfterMark(value) if string_time => value
                     .checked_sub(MAX_UTC_OFFSET_NANOS)
-                    .map_or(StoredRowsFrom::All, StoredRowsFrom::From),
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::AfterMark),
+                StoredRowsFrom::AtOrAfter(value) if string_time => value
+                    .checked_sub(MAX_UTC_OFFSET_NANOS)
+                    .map_or(StoredRowsFrom::All, StoredRowsFrom::AtOrAfter),
                 other => other,
             };
             // Read when the write first pulls rows, which it does holding the
@@ -2011,6 +2025,7 @@ impl RefreshTask {
     async fn refresh_from_snapshot(
         &self,
         refresh: &Refresh,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
 
@@ -2095,34 +2110,11 @@ impl RefreshTask {
 
         let (info, metadata_e_tag) = match download_result {
             Ok(SnapshotPoll {
-                download: Some(info),
+                outcome: SnapshotPollOutcome::Downloaded(info),
                 metadata_e_tag,
             }) => (info, metadata_e_tag),
-            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
-                // No snapshot has ever been loaded and none is available at the configured location.
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    snapshot_location = %state.manager.snapshot_location(),
-                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
-                );
-                self.set_refresh_status(
-                    None,
-                    status::ComponentStatus::error_with_message(
-                        "no snapshot available".to_string(),
-                    ),
-                )
-                .await;
-                return Err(RetryError::transient(
-                    super::Error::FailedToRefreshDataset {
-                        source: datafusion::error::DataFusionError::Internal(
-                            "refresh_mode: snapshot - no snapshot found at the configured location"
-                                .to_string(),
-                        ),
-                    },
-                ));
-            }
             Ok(SnapshotPoll {
-                download: None,
+                outcome: SnapshotPollOutcome::UpToDate,
                 metadata_e_tag,
             }) => {
                 state.record_metadata_e_tag(metadata_e_tag);
@@ -2131,10 +2123,52 @@ impl RefreshTask {
                     current_snapshot_id = ?current_local_id,
                     "refresh_mode: snapshot - no newer snapshot available; skipping reload"
                 );
-                let dataset_metrics_label_sets =
-                    self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
                 return Ok(self
-                    .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                    .finish_up_to_date(refresh, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome: SnapshotPollOutcome::NotPublished,
+                ..
+            }) => {
+                let error = super::Error::SnapshotNotPublished {
+                    location: state.manager.snapshot_location().to_string(),
+                };
+                let Some(loaded_id) = current_local_id else {
+                    // Nothing is loaded yet: fail the refresh so the retry loop counts
+                    // and retries it.
+                    tracing::warn!(
+                        "Dataset '{}' has no snapshot to load, so it cannot be queried until one is published. Cause: {error}",
+                        self.dataset_name
+                    );
+                    self.set_refresh_status(
+                        None,
+                        status::ComponentStatus::error_with_message(
+                            "no snapshot available".to_string(),
+                        ),
+                    )
+                    .await;
+                    return Err(RetryError::transient(error));
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome:
+                    SnapshotPollOutcome::OlderThanLoaded {
+                        published_id,
+                        loaded_id,
+                    },
+                ..
+            }) => {
+                let error = super::Error::SnapshotOlderThanLoaded {
+                    location: state.manager.snapshot_location().to_string(),
+                    published_id,
+                    loaded_id,
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
                     .await);
             }
             Err(e) => {
@@ -2341,6 +2375,28 @@ impl RefreshTask {
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Counts and logs a poll that could not advance to the published snapshot. The
+    /// dataset keeps serving snapshot `loaded_id`, so it stays `Ready` and the refresh
+    /// reports it up to date.
+    async fn keep_serving_loaded_snapshot(
+        &self,
+        error: &super::Error,
+        loaded_id: u64,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
+    ) -> RefreshOutcome {
+        emit_refresh_errors(
+            dataset_metrics_label_sets.to_vec(),
+            refresh_error_reason(error),
+        );
+        tracing::warn!(
+            "Dataset '{}' cannot refresh from its snapshot location, so it keeps serving snapshot {loaded_id}. Cause: {error}",
+            self.dataset_name
+        );
+        self.set_refresh_status(None, status::ComponentStatus::Ready)
+            .await;
+        RefreshOutcome::UpToDate
     }
 
     async fn trace_load_completed(
@@ -2705,12 +2761,7 @@ impl RefreshTask {
         ctx
     }
 
-    /// `high_water_mark` is the mark the source filter was built from. Pass it whenever
-    /// the caller has it: recomputing it here reads `max(time_column)` a second time, and
-    /// a write that lands on the accelerator between the two reads gives this comparison a
-    /// *higher* mark than the source query used. The rows in between are then missing from
-    /// the comparison set and are appended again — the same duplication as widening one
-    /// side without the other (#12492). `None` falls back to deriving it.
+    /// Drops the incoming rows that match a stored row selected by `stored_from`.
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
@@ -2725,100 +2776,9 @@ impl RefreshTask {
             return Ok(update);
         };
 
-        let federated_provider = self.federated.table_provider().await;
-
-        // The high-water filter below must widen in step with the source-side filter in
-        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
-        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
-        // get appended a second time, turning the skip into silent duplication (#12492).
-        let mut existing_records = accelerator_df(
-            &Arc::clone(&self.accelerator),
-            &Self::create_refresh_df_context(
-                Arc::clone(&federated_provider),
-                &self.dataset_name,
-                &self.accelerator,
-                self.disable_federation,
-                self.io_runtime.clone(),
-            )
-            .await,
-        )
-        .map_err(find_datafusion_root)
-        .context(super::UnableToScanTableProviderSnafu)?;
-        if let Some(filter) = stored_from.filter(&filter_converter) {
-            existing_records = existing_records
-                .filter(filter)
-                .map_err(find_datafusion_root)
-                .context(super::UnableToScanTableProviderSnafu)?;
-        }
-        let mut existing_records = existing_records
-            .collect()
-            .await
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?;
-
-        // ACID fix for append dedup with nullable time_column:
-        // The > max_time query intentionally excludes older rows (including all
-        // NULL-time rows, since NULL > X is never true). To prevent duplicate
-        // appends of rows that have NULL in the time_column (a real consistency
-        // bug on retry / repeated refresh / source re-emit), we additionally
-        // collect *all* rows where the time column IS NULL. These "timeless"
-        // rows are then available to the exact-row StructArray comparator in
-        // filter_records, which treats two nulls in the same position as Equal
-        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
-        // rows are now correctly filtered.
-        //
-        // Devil's advocate / remaining edge case (being really sure):
-        // This loads the *entire historical set* of NULL-time rows on every
-        // append refresh when the column is nullable. For datasets with a very
-        // large number of distinct historical rows that happen to have NULL
-        // time (rare but possible with dirty sources or optional event times),
-        // this can consume significant memory during the dedup phase, potentially
-        // causing OOM in the refresh task. In such cases the >max optimization
-        // is defeated for the NULL subset.
-        //
-        // Mitigation in practice: most append workloads either have non-nullable
-        // time columns, or the number of NULL-time rows is small/bounded. For
-        // high-cardinality NULL time + append, users should prefer defining a
-        // primary key + on_conflict upsert semantics on the accelerator (which
-        // the engine will enforce at write time) or avoid append mode.
-        // We explicitly document the limitation here as part of rigorous
-        // correctness review for the recurring ACID task.
-        //
-        // This is the "comprehensive edge case" coverage for the recurring ACID
-        // task. We only pay the (hopefully small) cost of loading the NULL-time
-        // subset; the > max tail optimization is preserved for the non-null
-        // recent data. If the time_column is non-nullable, we skip this path.
-        // Every stored row is already in the set when no mark narrowed it.
-        if stored_from != StoredRowsFrom::All
-            && let Some(tc) = &refresh.time_column
-            && self
-                .accelerator
-                .schema()
-                .column_with_name(tc)
-                .is_some_and(|(_, f)| f.is_nullable())
-        {
-            let null_time_rows = accelerator_df(
-                &Arc::clone(&self.accelerator),
-                &Self::create_refresh_df_context(
-                    Arc::clone(&federated_provider),
-                    &self.dataset_name,
-                    &self.accelerator,
-                    self.disable_federation,
-                    self.io_runtime.clone(),
-                )
-                .await,
-            )
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .filter(ident(tc).is_null())
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?
-            .collect()
-            .await
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)?;
-            existing_records.extend(null_time_rows);
-        }
+        let existing_records = self
+            .stored_rows_to_compare(refresh, &filter_converter, stored_from)
+            .await?;
 
         // Use the update stream's schema for dedup comparison, not the full federated
         // provider schema. When `refresh_sql` selects a column subset, the incoming
@@ -2901,6 +2861,111 @@ impl RefreshTask {
         }));
 
         Ok(StreamingDataUpdate::new(filtered_data, update_type))
+    }
+
+    /// The stored rows an append compares its incoming rows with: those `stored_from`
+    /// selects, plus every stored row whose time column is NULL.
+    async fn stored_rows_to_compare(
+        &self,
+        refresh: &Refresh,
+        filter_converter: &TimestampFilterConvert,
+        stored_from: StoredRowsFrom,
+    ) -> Result<Vec<RecordBatch>, RetryError<super::Error>> {
+        let federated_provider = self.federated.table_provider().await;
+
+        // The high-water filter below must widen in step with the source-side filter in
+        // `get_full_or_incremental_append_update`: on a day-granular time column, if the
+        // re-fetched same-day rows are not in this comparison set they pass the dedupe and
+        // get appended a second time, turning the skip into silent duplication (#12492).
+        let mut existing_records = accelerator_df(
+            &Arc::clone(&self.accelerator),
+            &Self::create_refresh_df_context(
+                Arc::clone(&federated_provider),
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await,
+        )
+        .map_err(find_datafusion_root)
+        .context(super::UnableToScanTableProviderSnafu)?;
+        if let Some(filter) = stored_from.filter(filter_converter) {
+            existing_records = existing_records
+                .filter(filter)
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?;
+        }
+        let mut existing_records = existing_records
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
+
+        // ACID fix for append dedup with nullable time_column:
+        // The > max_time query intentionally excludes older rows (including all
+        // NULL-time rows, since NULL > X is never true). To prevent duplicate
+        // appends of rows that have NULL in the time_column (a real consistency
+        // bug on retry / repeated refresh / source re-emit), we additionally
+        // collect *all* rows where the time column IS NULL. These "timeless"
+        // rows are then available to the exact-row StructArray comparator in
+        // filter_records, which treats two nulls in the same position as Equal
+        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
+        // rows are now correctly filtered.
+        //
+        // Devil's advocate / remaining edge case (being really sure):
+        // This loads the *entire historical set* of NULL-time rows on every
+        // append refresh when the column is nullable. For datasets with a very
+        // large number of distinct historical rows that happen to have NULL
+        // time (rare but possible with dirty sources or optional event times),
+        // this can consume significant memory during the dedup phase, potentially
+        // causing OOM in the refresh task. In such cases the >max optimization
+        // is defeated for the NULL subset.
+        //
+        // Mitigation in practice: most append workloads either have non-nullable
+        // time columns, or the number of NULL-time rows is small/bounded. For
+        // high-cardinality NULL time + append, users should prefer defining a
+        // primary key + on_conflict upsert semantics on the accelerator (which
+        // the engine will enforce at write time) or avoid append mode.
+        // We explicitly document the limitation here as part of rigorous
+        // correctness review for the recurring ACID task.
+        //
+        // This is the "comprehensive edge case" coverage for the recurring ACID
+        // task. We only pay the (hopefully small) cost of loading the NULL-time
+        // subset; the > max tail optimization is preserved for the non-null
+        // recent data. If the time_column is non-nullable, we skip this path.
+        // Every stored row is already in the set when no mark narrowed it.
+        if stored_from != StoredRowsFrom::All
+            && let Some(tc) = &refresh.time_column
+            && self
+                .accelerator
+                .schema()
+                .column_with_name(tc)
+                .is_some_and(|(_, f)| f.is_nullable())
+        {
+            let null_time_rows = accelerator_df(
+                &Arc::clone(&self.accelerator),
+                &Self::create_refresh_df_context(
+                    Arc::clone(&federated_provider),
+                    &self.dataset_name,
+                    &self.accelerator,
+                    self.disable_federation,
+                    self.io_runtime.clone(),
+                )
+                .await,
+            )
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .filter(ident(tc).is_null())
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
+            existing_records.extend(null_time_rows);
+        }
+        Ok(existing_records)
     }
 
     #[expect(clippy::cast_sign_loss)]
@@ -3137,6 +3202,9 @@ impl RefreshTask {
                     RefreshMode::Full => label_set.push(KeyValue::new("mode", "full".to_string())),
                     RefreshMode::Append => {
                         label_set.push(KeyValue::new("mode", "append".to_string()));
+                    }
+                    RefreshMode::Snapshot => {
+                        label_set.push(KeyValue::new("mode", "snapshot".to_string()));
                     }
                     _ => (),
                 }
@@ -3944,16 +4012,25 @@ fn terminal_generation_change_refresh_error<T>(
 
 /// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
 ///
-/// Generation-change is checked first so a 412 wrapped in a Parquet fetch
-/// error is still filterable, not classified as decoder corruption.
+/// A snapshot poll's own errors name their reason. Otherwise generation-change is
+/// checked first so a 412 wrapped in a Parquet fetch error is still filterable, not
+/// classified as decoder corruption.
 #[must_use]
 pub fn refresh_error_reason(error: &super::Error) -> &'static str {
-    if error_chain_matches(error, looks_like_generation_change) {
-        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
-    } else if error_chain_matches(error, looks_like_parquet_decode) {
-        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
-    } else {
-        metrics::REFRESH_ERROR_REASON_OTHER
+    match error {
+        super::Error::SnapshotNotPublished { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND
+        }
+        super::Error::SnapshotOlderThanLoaded { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        }
+        _ if error_chain_matches(error, looks_like_generation_change) => {
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        }
+        _ if error_chain_matches(error, looks_like_parquet_decode) => {
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        }
+        _ => metrics::REFRESH_ERROR_REASON_OTHER,
     }
 }
 
@@ -4776,6 +4853,76 @@ mod tests {
         );
     }
 
+    /// A snapshot poll that cannot advance names its reason on
+    /// `dataset_acceleration_refresh_errors`.
+    #[test]
+    fn snapshot_refresh_errors_name_their_reason() {
+        let not_published = super::super::Error::SnapshotNotPublished {
+            location: "s3://bucket/snapshots/".to_string(),
+        };
+        assert_eq!(
+            refresh_error_reason(&not_published),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND
+        );
+        assert_eq!(
+            not_published.to_string(),
+            "No snapshot of the dataset is published at 's3://bucket/snapshots/'. Ensure the location is correct and that a dataset with `acceleration.snapshots` enabled has published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+
+        let older = super::super::Error::SnapshotOlderThanLoaded {
+            location: "s3://bucket/snapshots/".to_string(),
+            published_id: 0,
+            loaded_id: 3,
+        };
+        assert_eq!(
+            refresh_error_reason(&older),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        );
+        assert_eq!(
+            older.to_string(),
+            "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+    }
+
+    /// Snapshot refreshes carry `mode="snapshot"`, as source refreshes carry `mode="full"`.
+    #[tokio::test]
+    async fn snapshot_refresh_metrics_carry_the_snapshot_mode() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("snapshot_mode_labels"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        assert_eq!(
+            task.get_dataset_label_sets(&RefreshMode::Snapshot).await,
+            vec![vec![
+                KeyValue::new("dataset", "snapshot_mode_labels"),
+                KeyValue::new("mode", "snapshot"),
+            ]]
+        );
+        assert_eq!(
+            task.get_dataset_label_sets(&RefreshMode::Full).await,
+            vec![vec![
+                KeyValue::new("dataset", "snapshot_mode_labels"),
+                KeyValue::new("mode", "full"),
+            ]]
+        );
+    }
+
     /// The periodic caching refresh fetches under the same process-wide `SessionState` as the
     /// query path; a copy built per task would rebuild the default registry for every dataset.
     #[tokio::test]
@@ -5114,6 +5261,89 @@ mod tests {
             .expect("accelerator rows should be collected");
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         assert_eq!(row_count, 1, "insert should remain committed");
+    }
+
+    /// The ids an acceleration holds after `refresh`, when it held ids 7 to 12 (ts 107 to 112)
+    /// and the source holds ids 1 to 12, the first six older (ts 1 to 6).
+    async fn ids_after_refresh(refresh: Refresh) -> Vec<i64> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let rows = |ids: std::ops::RangeInclusive<i64>| {
+            let ts = ids
+                .clone()
+                .map(|id| if id <= 6 { id } else { id + 100 })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .expect("batch builds")
+        };
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(7..=12)]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(1..=12)]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("reload"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        task.run(refresh).await.expect("the refresh runs");
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("accelerator scan should succeed");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("accelerator rows should be collected")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_append_dataset_loads_rows_older_than_its_acceleration() {
+        let append = || {
+            Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::UnixSeconds)
+        };
+        assert_eq!(
+            ids_after_refresh(append().for_run()).await,
+            (7..=12).collect::<Vec<_>>(),
+            "an append reads only rows newer than the acceleration's"
+        );
+        let mut owing = append();
+        owing.owe_reload();
+        assert_eq!(
+            ids_after_refresh(owing.for_run()).await,
+            (1..=12).collect::<Vec<_>>()
+        );
     }
 
     /// Tests that `max_timestamp_df` returns the maximum value for integer time columns
@@ -6163,6 +6393,88 @@ mod tests {
         );
     }
 
+    /// An acceleration holding two rows, at `ts = 1_000` and `ts = 2_000`.
+    fn task_with_two_stored_rows() -> RefreshTask {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let stored = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("stored batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![stored]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("test_two_stored_rows"),
+            Arc::new(FederatedTable::new_unchecked(federated_table)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build()
+    }
+
+    async fn compared_row_count(
+        task: &RefreshTask,
+        refresh: &Refresh,
+        stored_from: StoredRowsFrom,
+    ) -> usize {
+        let converter = task
+            .get_accelerator_filter_converter(refresh)
+            .expect("the time column has a filter converter");
+        task.stored_rows_to_compare(refresh, &converter, stored_from)
+            .await
+            .expect("the comparison set is read")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// Regression test for #15329: the source reads strictly after the high-water mark,
+    /// so no stored row at the mark is compared.
+    #[tokio::test]
+    async fn append_compares_no_stored_row_at_the_high_water_mark() {
+        let task = task_with_two_stored_rows();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("ts".to_string());
+        let mark = high_water_mark(&task, &refresh).await;
+
+        assert_eq!(compared_row_count(&task, &refresh, mark).await, 0);
+    }
+
+    #[tokio::test]
+    async fn append_compares_the_stored_rows_inside_the_overlap_window() {
+        let task = task_with_two_stored_rows();
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_nanos(500));
+        let mark = high_water_mark(&task, &refresh).await;
+
+        assert_eq!(compared_row_count(&task, &refresh, mark).await, 1);
+    }
+
+    /// Incoming rows can hold a commit's lowest time, so stored rows at it are compared.
+    #[tokio::test]
+    async fn append_from_a_commit_compares_the_stored_rows_at_its_lowest_time() {
+        let task = task_with_two_stored_rows();
+        let refresh = Refresh::new(RefreshMode::Append).time_column("ts".to_string());
+
+        let seed = StoredRowsFrom::from_seed(SeedMark::Lowest(2_000));
+
+        assert_eq!(compared_row_count(&task, &refresh, seed).await, 1);
+    }
+
     /// Regression test for append refreshes from `PostgreSQL` into Cayenne.
     ///
     /// `PostgreSQL` `timestamptz` arrives as nanoseconds, while Cayenne stores every timestamp
@@ -6247,7 +6559,7 @@ mod tests {
             .except_existing_records_from(
                 &refresh,
                 StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                StoredRowsFrom::From(0),
+                StoredRowsFrom::AfterMark(0),
             )
             .await
             .expect("Cayenne timestamp normalization should allow append de-duplication");
@@ -6354,7 +6666,7 @@ mod tests {
             .except_existing_records_from(
                 &refresh,
                 StreamingDataUpdate::new(update_stream, UpdateType::Append),
-                StoredRowsFrom::From(0),
+                StoredRowsFrom::AfterMark(0),
             )
             .await
             .expect("Cayenne nanosecond deduplication should succeed");

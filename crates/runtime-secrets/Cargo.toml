@@ -9,6 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# The startup preflight walks the loaded `App`'s component params.
+app = { path = "../app" }
 async-trait.workspace = true
 base64.workspace = true
 dotenv.workspace = true
