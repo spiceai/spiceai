@@ -53,6 +53,43 @@ use crate::tools::utils::tool_call_error_response;
 use llms::progress::Progress;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+/// The most Spice tool calls Spice runs from one model response.
+///
+/// The provider decides how many tool calls a response makes, and every call Spice runs is a
+/// query or search plus its `runtime.task_history` rows, so without a bound one small request
+/// could make a misbehaving or compromised provider run any number of them. A model that calls
+/// tools in parallel makes a handful of calls per response, rarely more than a few dozen; 64
+/// leaves ample room for that while bounding a request at 64 calls per round of
+/// `tool_recursion_limit`. The calls past it are answered with
+/// [`tool_call_not_run_message`] rather than dropped, because the model's next round needs a
+/// result for every call it made.
+pub(crate) const MAX_SPICE_TOOL_CALLS_PER_RESPONSE: usize = 64;
+
+/// What the model is told for a call it made past [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] in a
+/// response that made `requested` Spice tool calls.
+pub(crate) fn tool_call_not_run_message(requested: usize) -> String {
+    format!(
+        "Spice did not run this tool call: the response made {requested} tool calls, and Spice runs at most {MAX_SPICE_TOOL_CALLS_PER_RESPONSE} from one response. Make fewer tool calls at once."
+    )
+}
+
+/// The warning for a response from model `model` that made `requested` Spice tool calls, more
+/// than [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`].
+fn tool_calls_over_limit_warning(model: &str, requested: usize) -> String {
+    let skipped = requested.saturating_sub(MAX_SPICE_TOOL_CALLS_PER_RESPONSE);
+    format!(
+        "Model '{model}' made {requested} tool calls in one response, more than the {MAX_SPICE_TOOL_CALLS_PER_RESPONSE} Spice runs from one response, so Spice ran the first {MAX_SPICE_TOOL_CALLS_PER_RESPONSE} and told the model the other {skipped} did not run. If the model needs more, prompt it to make fewer tool calls at once. See: https://spiceai.org/docs/features/large-language-models/tools"
+    )
+}
+
+/// Warns when a response from model `model` made `requested` Spice tool calls, more than
+/// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`].
+pub(crate) fn warn_if_over_tool_call_limit(model: &str, requested: usize) {
+    if requested > MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+        tracing::warn!("{}", tool_calls_over_limit_warning(model, requested));
+    }
+}
+
 pub struct ToolUsingChat {
     inner_chat: Arc<dyn Chat>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
@@ -216,6 +253,10 @@ impl ToolUsingChat {
     /// `assistant_text` is the text the model wrote beside the tool calls. It is replayed with the
     /// calls: a model that does not see it does not know it already said it, and says it again.
     ///
+    /// Only the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] Spice tool calls run; each call after
+    /// them gets a [`tool_call_not_run_message`] result. `model` names the model in the warning
+    /// that says so.
+    ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
     ///   requested.
@@ -224,6 +265,7 @@ impl ToolUsingChat {
     ///   reprocessed by the model.
     async fn process_tool_calls_and_run_spice_tools(
         &self,
+        model: &str,
         assistant_text: &str,
         requested_tools: Vec<ChatCompletionMessageToolCall>,
     ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
@@ -258,8 +300,15 @@ impl ToolUsingChat {
         }
         let assistant_message: ChatCompletionRequestMessage = assistant_message.build()?.into();
 
-        let mut tool_and_response_content = vec![];
-        for t in spiced_tools.clone() {
+        let requested = spiced_tools.len();
+        warn_if_over_tool_call_limit(model, requested);
+        let mut tool_and_response_content = Vec::with_capacity(requested);
+        for (index, t) in spiced_tools.iter().enumerate() {
+            if index >= MAX_SPICE_TOOL_CALLS_PER_RESPONSE {
+                let not_run = Value::String(tool_call_not_run_message(requested));
+                tool_and_response_content.push((t, not_run));
+                continue;
+            }
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
@@ -269,7 +318,7 @@ impl ToolUsingChat {
                     .to_jsonl(),
             );
 
-            let content = self.call_tool(&t).await;
+            let content = self.call_tool(t).await;
             tool_and_response_content.push((t, content));
         }
 
@@ -295,7 +344,7 @@ impl ToolUsingChat {
         messages.extend(tool_messages);
 
         let context = RequestContext::current(AsyncMarker::new().await);
-        crate::model::add_tools_used(&context, spiced_tools.len());
+        crate::model::add_tools_used(&context, requested.min(MAX_SPICE_TOOL_CALLS_PER_RESPONSE));
 
         Ok(Some(messages))
     }
@@ -354,7 +403,7 @@ impl ToolUsingChat {
                 .collect();
 
             match self
-                .process_tool_calls_and_run_spice_tools(&text, tool_calls)
+                .process_tool_calls_and_run_spice_tools(&req.model, &text, tool_calls)
                 .await?
             {
                 // New messages means we have run spice tools locally, ready to recall model.
@@ -979,9 +1028,14 @@ fn make_a_stream(
                             ChoiceDisposition::RunTools => {}
                         }
 
-                        // A tool call has finished (i.e. we have all chunks), process it.
+                        // A tool call has finished (i.e. we have all chunks), process it. The
+                        // calls run in the order the model made them.
                         let tool_calls_to_process = match tool_call_states.lock() {
-                            Ok(states_lock) => states_lock.values().cloned().collect(),
+                            Ok(states_lock) => states_lock
+                                .iter()
+                                .sorted_by_key(|(key, _)| **key)
+                                .map(|(_, call)| call.clone())
+                                .collect(),
                             Err(e) => {
                                 tracing::error!("Failed to lock tool_call_states: {}", e);
                                 return;
@@ -996,6 +1050,7 @@ fn make_a_stream(
 
                         let round = match model
                             .process_tool_calls_and_run_spice_tools(
+                                &req.model,
                                 &round_text,
                                 tool_calls_to_process,
                             )
@@ -1203,6 +1258,14 @@ mod tests {
 
     fn stream_choice(json: &str) -> ChatChoiceStream {
         serde_json::from_str(json).expect("valid stream choice")
+    }
+
+    #[test]
+    fn the_tool_call_limit_warning_names_the_model_and_what_did_not_run() {
+        assert_eq!(
+            tool_calls_over_limit_warning("chatm", 20_000),
+            "Model 'chatm' made 20000 tool calls in one response, more than the 64 Spice runs from one response, so Spice ran the first 64 and told the model the other 19936 did not run. If the model needs more, prompt it to make fewer tool calls at once. See: https://spiceai.org/docs/features/large-language-models/tools"
+        );
     }
 
     #[test]

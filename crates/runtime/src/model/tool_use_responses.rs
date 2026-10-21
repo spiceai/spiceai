@@ -43,7 +43,10 @@ use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
 use crate::model::responses_tool_history::{ToolOutcome, mcp_call, replayed_call};
-use crate::model::tool_use::encode_tool_name;
+use crate::model::tool_use::{
+    MAX_SPICE_TOOL_CALLS_PER_RESPONSE, encode_tool_name, tool_call_not_run_message,
+    warn_if_over_tool_call_limit,
+};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 #[derive(Clone, Debug)]
@@ -241,13 +244,39 @@ impl ToolUsingResponses {
         self.call_tool(call).await
     }
 
-    /// Runs the Spice tool calls in `output`, one round's output, and returns their outcomes by
-    /// `call_id`, none when `output` calls no Spice tool.
-    async fn run_spice_tool_calls(&self, output: &[OutputItem]) -> HashMap<String, ToolOutcome> {
+    /// Runs `call`, a call to one of Spice's tools, if `runs_left` allows one more run in its
+    /// round, which made `requested` Spice tool calls. A call past the round's
+    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] does not run, and fails with
+    /// [`tool_call_not_run_message`].
+    async fn run_spice_tool_call_within_limit(
+        &self,
+        call: &FunctionToolCall,
+        runs_left: &mut usize,
+        requested: usize,
+    ) -> ToolOutcome {
+        if *runs_left == 0 {
+            return ToolOutcome::Failed(tool_call_not_run_message(requested));
+        }
+        *runs_left -= 1;
+        self.run_spice_tool_call(call).await
+    }
+
+    /// Runs the Spice tool calls in `output`, one round's output from model `model`, and returns
+    /// their outcomes by `call_id`, none when `output` calls no Spice tool. Only the first
+    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls run.
+    async fn run_spice_tool_calls(
+        &self,
+        model: &str,
+        output: &[OutputItem],
+    ) -> HashMap<String, ToolOutcome> {
         let calls = self.spice_tool_calls(output);
+        warn_if_over_tool_call_limit(model, calls.len());
+        let mut runs_left = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
         let mut outcomes = HashMap::with_capacity(calls.len());
-        for call in calls {
-            let outcome = self.run_spice_tool_call(call).await;
+        for call in &calls {
+            let outcome = self
+                .run_spice_tool_call_within_limit(call, &mut runs_left, calls.len())
+                .await;
             outcomes.insert(call.call_id.clone(), outcome);
         }
         outcomes
@@ -350,7 +379,10 @@ impl ToolUsingResponses {
         );
 
         let context = RequestContext::current(AsyncMarker::new().await);
-        crate::model::add_tools_used(&context, outcomes.len());
+        crate::model::add_tools_used(
+            &context,
+            outcomes.len().min(MAX_SPICE_TOOL_CALLS_PER_RESPONSE),
+        );
 
         input
     }
@@ -389,7 +421,12 @@ impl ToolUsingResponses {
             let response = self.inner_responses.responses_request(req.clone()).await?;
 
             if tool_rounds_left != Some(0) {
-                let outcomes = self.run_spice_tool_calls(&response.output).await;
+                let outcomes = self
+                    .run_spice_tool_calls(
+                        req.model.as_deref().unwrap_or_default(),
+                        &response.output,
+                    )
+                    .await;
                 if !outcomes.is_empty() {
                     let next_input = self
                         .next_input(
@@ -891,6 +928,12 @@ fn make_responses_stream(
 
                     // Run each call as the client reaches its end, then send the round's events
                     // that followed it.
+                    let requested = model.spice_tool_calls(&response.output).len();
+                    warn_if_over_tool_call_limit(
+                        req.model.as_deref().unwrap_or_default(),
+                        requested,
+                    );
+                    let mut runs_left = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
                     let mut outcomes = HashMap::new();
                     for event in held {
                         let ended_call = match &event {
@@ -908,7 +951,13 @@ fn make_responses_stream(
                         };
                         let events = match ended_call {
                             Some((call, output_index)) => {
-                                let outcome = model.run_spice_tool_call(call).await;
+                                let outcome = model
+                                    .run_spice_tool_call_within_limit(
+                                        call,
+                                        &mut runs_left,
+                                        requested,
+                                    )
+                                    .await;
                                 let events =
                                     client_stream.tool_call_ended(call, output_index, &outcome);
                                 outcomes.insert(call.call_id.clone(), outcome);
@@ -924,7 +973,9 @@ fn make_responses_stream(
                     // every call's result.
                     for call in model.spice_tool_calls(&response.output) {
                         if !outcomes.contains_key(&call.call_id) {
-                            let outcome = model.run_spice_tool_call(call).await;
+                            let outcome = model
+                                .run_spice_tool_call_within_limit(call, &mut runs_left, requested)
+                                .await;
                             outcomes.insert(call.call_id.clone(), outcome);
                         }
                     }
