@@ -96,19 +96,56 @@ pub(crate) fn counter_with_label(
     label: &str,
     value: &str,
 ) -> f64 {
+    metric_value(registry, name, &[(label, value)])
+}
+
+/// The sum of `name` over the series that carry every label in `labels`; a histogram
+/// counts its samples. `0` before any is recorded.
+pub(crate) fn metric_value(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> f64 {
+    metric_series(registry, name, labels)
+        .iter()
+        .map(|(_, value)| value)
+        .sum()
+}
+
+/// The series of `name` that carry every label in `labels`, as `(labels, value)`; a
+/// histogram's value is its sample count.
+pub(crate) fn metric_series(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Vec<(Vec<(String, String)>, f64)> {
     registry
         .gather()
         .iter()
         .filter(|family| family.name() == name)
         .flat_map(prometheus::proto::MetricFamily::get_metric)
-        .filter(|metric| {
-            metric
+        .map(|metric| {
+            let metric_labels: Vec<(String, String)> = metric
                 .get_label()
                 .iter()
-                .any(|pair| pair.name() == label && pair.value() == value)
+                .map(|pair| (pair.name().to_string(), pair.value().to_string()))
+                .collect();
+            let value = match metric.get_histogram().as_ref() {
+                // Exact: a sample count is a small integer.
+                #[expect(clippy::cast_precision_loss)]
+                Some(histogram) => histogram.get_sample_count() as f64,
+                None => metric.get_counter().value(),
+            };
+            (metric_labels, value)
         })
-        .map(|metric| metric.get_counter().value())
-        .sum()
+        .filter(|(metric_labels, _)| {
+            labels.iter().all(|(name, value)| {
+                metric_labels
+                    .iter()
+                    .any(|(metric_name, metric_value)| metric_name == name && metric_value == value)
+            })
+        })
+        .collect()
 }
 
 pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock::new(|| {
