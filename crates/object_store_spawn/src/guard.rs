@@ -26,12 +26,17 @@ limitations under the License.
 //!
 //! Hosts given as IP literals are not resolved, so callers check the first URL themselves;
 //! redirect targets are checked by the policy.
+//!
+//! An HTTP proxy is pinned to one resolved address when the client is built. The proxy hop
+//! connects to that address, so the resolver does not see the proxy's hostname, while a direct
+//! connection to the same hostname — a `NO_PROXY` exclusion, or a destination whose scheme does
+//! not use that proxy — is still checked. An `https://` proxy keeps its hostname because its
+//! certificate is checked against that name, and the resolver checks the name like any other host.
 
 use std::{
-    collections::HashSet,
     error::Error as StdError,
     fmt,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
@@ -51,16 +56,14 @@ use url::Url;
 /// Redirects followed before the request fails; the same limit `object_store`'s client uses.
 const MAX_REDIRECTS: usize = 10;
 
-/// Environment variables `reqwest` reads a proxy from. A proxy host is resolved like any
-/// other host, so it is exempt from the address check: the operator configured it.
-const PROXY_ENV_VARS: &[&str] = &[
-    "HTTP_PROXY",
-    "http_proxy",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-];
+/// Which destinations a configured proxy applies to. Matches `reqwest`'s `Proxy::http`,
+/// `Proxy::https`, and `Proxy::all`.
+#[derive(Clone, Copy)]
+enum ProxyScope {
+    Http,
+    Https,
+    All,
+}
 
 type AddressCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 type UrlCheck = Arc<dyn Fn(&Url) -> bool + Send + Sync>;
@@ -149,24 +152,7 @@ pub(crate) fn build_client(
         builder = builder.default_headers(headers.clone());
     }
 
-    let mut exempt_hosts: HashSet<String> = PROXY_ENV_VARS
-        .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .filter_map(|proxy| proxy_host(&proxy))
-        .collect();
-    if let Some(proxy_url) = value(ClientConfigKey::ProxyUrl) {
-        exempt_hosts.extend(proxy_host(&proxy_url));
-        let mut proxy = Proxy::all(&proxy_url).map_err(generic)?;
-        if let Some(certificate) = value(ClientConfigKey::ProxyCaCertificate) {
-            let certificate =
-                reqwest::Certificate::from_pem(certificate.as_bytes()).map_err(generic)?;
-            builder = builder.add_root_certificate(certificate);
-        }
-        if let Some(excludes) = value(ClientConfigKey::ProxyExcludes) {
-            proxy = proxy.no_proxy(NoProxy::from_string(&excludes));
-        }
-        builder = builder.proxy(proxy);
-    }
+    builder = install_proxies(builder, options)?;
 
     if let Some(timeout) = duration(value(ClientConfigKey::Timeout))? {
         builder = builder.timeout(timeout);
@@ -222,7 +208,6 @@ pub(crate) fn build_client(
         }))
         .dns_resolver(Arc::new(GuardedResolver {
             guard: guard.clone(),
-            exempt_hosts: Arc::new(exempt_hosts),
         }))
         .https_only(!flag(value(ClientConfigKey::AllowHttp))?)
         .build()
@@ -233,21 +218,18 @@ pub(crate) fn build_client(
 /// so a name that resolves to both a public and a blocked address cannot be used either.
 struct GuardedResolver {
     guard: DestinationGuard,
-    exempt_hosts: Arc<HashSet<String>>,
 }
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_ascii_lowercase();
         let guard = self.guard.clone();
-        let exempt = self.exempt_hosts.contains(&host);
         Box::pin(async move {
             let addresses: Vec<SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if !exempt
-                && addresses
-                    .iter()
-                    .any(|address| (guard.blocks_address)(address.ip()))
+            if addresses
+                .iter()
+                .any(|address| (guard.blocks_address)(address.ip()))
             {
                 return Err(Box::new(guard.refused(host)) as Box<dyn StdError + Send + Sync>);
             }
@@ -256,12 +238,140 @@ impl Resolve for GuardedResolver {
     }
 }
 
-fn proxy_host(proxy: &str) -> Option<String> {
+/// Installs the proxies `reqwest` would use, with each HTTP proxy pinned to a resolved address.
+///
+/// An explicit `proxy_url` replaces environment proxies, because handing `reqwest` any proxy
+/// turns off its own environment lookup. With no explicit URL, the same variables and precedence
+/// as `hyper-util`'s environment matcher are read here: `ALL_PROXY` fills in for a missing
+/// `HTTP_PROXY` or `HTTPS_PROXY`, and `REQUEST_METHOD` suppresses them the way that matcher does
+/// for CGI.
+fn install_proxies(
+    mut builder: reqwest::ClientBuilder,
+    options: &ClientOptions,
+) -> object_store::Result<reqwest::ClientBuilder> {
+    let value = |key: ClientConfigKey| options.get_config_value(&key);
+    if let Some(proxy_url) = value(ClientConfigKey::ProxyUrl) {
+        if let Some(certificate) = value(ClientConfigKey::ProxyCaCertificate) {
+            let certificate =
+                reqwest::Certificate::from_pem(certificate.as_bytes()).map_err(generic)?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let url = parse_proxy_url(&proxy_url).ok_or_else(|| invalid("proxy_url", &proxy_url))?;
+        builder = builder.proxy(scoped_proxy(
+            ProxyScope::All,
+            &url,
+            value(ClientConfigKey::ProxyExcludes).as_deref(),
+        )?);
+        return Ok(builder);
+    }
+
+    if std::env::var_os("REQUEST_METHOD").is_some() {
+        return Ok(builder);
+    }
+
+    let all = first_env(&["ALL_PROXY", "all_proxy"]);
+    let http = first_env(&["HTTP_PROXY", "http_proxy"]);
+    let https = first_env(&["HTTPS_PROXY", "https_proxy"]);
+    let no_proxy = first_env(&["NO_PROXY", "no_proxy"]);
+    let excludes = nonempty(no_proxy.trim());
+
+    if let Some(raw) = nonempty(http.trim()).or(nonempty(all.trim()))
+        && let Some(proxy) = env_proxy(ProxyScope::Http, raw, excludes)?
+    {
+        builder = builder.proxy(proxy);
+    }
+    if let Some(raw) = nonempty(https.trim()).or(nonempty(all.trim()))
+        && let Some(proxy) = env_proxy(ProxyScope::Https, raw, excludes)?
+    {
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder)
+}
+
+fn env_proxy(
+    scope: ProxyScope,
+    raw: &str,
+    excludes: Option<&str>,
+) -> object_store::Result<Option<Proxy>> {
+    let Some(url) = parse_proxy_url(raw) else {
+        return Ok(None);
+    };
+    // This client is built without the `socks` feature. Leaving another scheme to `reqwest`'s
+    // own environment handling would require not calling `ClientBuilder::proxy` at all, which
+    // also drops the HTTP proxies installed above. Skip the scheme instead.
+    if !matches!(url.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    scoped_proxy(scope, &url, excludes).map(Some)
+}
+
+fn scoped_proxy(
+    scope: ProxyScope,
+    url: &Url,
+    excludes: Option<&str>,
+) -> object_store::Result<Proxy> {
+    let pinned = pin_http_proxy(url);
+    let mut proxy = match scope {
+        ProxyScope::Http => Proxy::http(pinned.as_str()),
+        ProxyScope::Https => Proxy::https(pinned.as_str()),
+        ProxyScope::All => Proxy::all(pinned.as_str()),
+    }
+    .map_err(generic)?;
+    if let Some(excludes) = excludes {
+        proxy = proxy.no_proxy(NoProxy::from_string(excludes));
+    }
+    Ok(proxy)
+}
+
+/// Rewrites an `http://` proxy to the first address it resolves to.
+///
+/// The guarded resolver then never exempts that hostname: a direct connection to it is checked,
+/// and the proxy hop uses the address. Resolution happens once, while the client is built.
+/// `connect` is synchronous, so the lookup blocks the caller for that one query. An `https://`
+/// proxy is left unchanged so certificate verification still sees its hostname.
+fn pin_http_proxy(url: &Url) -> Url {
+    if url.scheme() != "http" {
+        return url.clone();
+    }
+    if matches!(url.host(), Some(url::Host::Ipv4(_) | url::Host::Ipv6(_))) {
+        return url.clone();
+    }
+    let Some(host) = url.host_str() else {
+        return url.clone();
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let Ok(mut addresses) = (host, port).to_socket_addrs() else {
+        return url.clone();
+    };
+    let Some(address) = addresses.next() else {
+        return url.clone();
+    };
+    let mut pinned = url.clone();
+    if pinned.set_ip_host(address.ip()).is_err() || pinned.set_port(Some(address.port())).is_err() {
+        return url.clone();
+    }
+    pinned
+}
+
+fn parse_proxy_url(proxy: &str) -> Option<Url> {
     let proxy = proxy.trim();
-    let parsed = Url::parse(proxy)
+    if proxy.is_empty() {
+        return None;
+    }
+    Url::parse(proxy)
         .or_else(|_| Url::parse(&format!("http://{proxy}")))
-        .ok()?;
-    parsed.host_str().map(str::to_ascii_lowercase)
+        .ok()
+}
+
+fn first_env(names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_default()
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn generic(source: impl StdError + Send + Sync + 'static) -> object_store::Error {
