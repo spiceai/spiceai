@@ -100,9 +100,10 @@ struct GuardState {
     /// Fingerprint of the last checked (columns, files) pair and its result, so repeated
     /// scans over unchanged files read no file footers.
     last_check: Option<(u64, Option<Drift>)>,
-    /// The missing columns last reported by `WARN`; cleared when a scan finds none, so a
-    /// column that goes missing again is reported again.
-    last_warned: Option<Vec<String>>,
+    /// The missing columns already reported by `WARN`. A column leaves the set only when a
+    /// scan that reads it finds it again, so scans that do not read it neither repeat nor
+    /// re-arm its warning, and a column that goes missing again is reported again.
+    warned: BTreeSet<String>,
 }
 
 /// Checks a file dataset's scans for registered columns missing from every scanned file.
@@ -192,13 +193,23 @@ impl FileSchemaDriftGuard {
                     return Ok(());
                 }
             };
-            let drift = self.find_drift(state, &store, columns, &files).await?;
+            let drift = self
+                .find_drift(state, &store, columns.clone(), &files)
+                .await?;
             self.state.lock().last_check = Some((fingerprint, drift.clone()));
             drift
         };
 
+        // Re-arm the warning for every column this scan read and found.
+        {
+            let missing = drift.as_ref().map_or(&[][..], |d| d.missing.as_slice());
+            self.state
+                .lock()
+                .warned
+                .retain(|c| !columns.contains(c) || missing.contains(c));
+        }
+
         let Some(drift) = drift else {
-            self.state.lock().last_warned = None;
             return Ok(());
         };
 
@@ -210,9 +221,19 @@ impl FileSchemaDriftGuard {
         }
 
         let mut guard_state = self.state.lock();
-        if guard_state.last_warned.as_ref() != Some(&drift.missing) {
-            tracing::warn!("{}", read_warning_message(&self.dataset_name, &drift));
-            guard_state.last_warned = Some(drift.missing);
+        let unreported: Vec<String> = drift
+            .missing
+            .iter()
+            .filter(|c| !guard_state.warned.contains(*c))
+            .cloned()
+            .collect();
+        if !unreported.is_empty() {
+            let report = Drift {
+                missing: unreported,
+                example_file: drift.example_file,
+            };
+            tracing::warn!("{}", read_warning_message(&self.dataset_name, &report));
+            guard_state.warned.extend(report.missing);
         }
         Ok(())
     }
@@ -627,10 +648,14 @@ mod tests {
             .await
             .expect("a federated read still answers");
         assert_eq!(single_value(&batches), None);
-        assert_eq!(
-            table.guard.state.lock().last_warned.as_deref(),
-            Some(&["amount_cents".to_string()][..]),
-        );
+        assert!(table.guard.state.lock().warned.contains("amount_cents"));
+
+        // A scan that does not read the missing column neither repeats nor re-arms the
+        // warning.
+        query(&table, false, "SELECT sum(id) FROM base")
+            .await
+            .expect("read of a present column");
+        assert!(table.guard.state.lock().warned.contains("amount_cents"));
 
         // Restoring the column clears the warning so a later drop is reported again.
         write_parquet(
@@ -642,7 +667,7 @@ mod tests {
             .await
             .expect("read after restore");
         assert_eq!(single_value(&batches), Some(3));
-        assert!(table.guard.state.lock().last_warned.is_none());
+        assert!(table.guard.state.lock().warned.is_empty());
     }
 
     #[tokio::test]
