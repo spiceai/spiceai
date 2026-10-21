@@ -149,8 +149,8 @@ impl BoundedHttpClient {
 /// rmcp treats an error inside a POST stream as fatal to the whole transport,
 /// which would fail every call in flight and make the caller reconnect and
 /// fetch the oversized response again. So when the POST was a request, the
-/// stream instead ends the partial event and closes with a JSON-RPC error
-/// response for that request: only that call fails.
+/// stream invalidates any partial event and then sends a JSON-RPC error for
+/// that request: only that call fails.
 struct BoundedByteStream {
     inner: BoxStream<'static, reqwest::Result<Bytes>>,
     client: BoundedHttpClient,
@@ -172,9 +172,12 @@ impl BoundedByteStream {
         let json = serde_json::to_string(&error).map_err(|e| ResponseBodyError::TooLarge {
             message: e.to_string(),
         })?;
-        // The blank line ends the truncated event, which rmcp then discards
-        // as unparseable, before the error event.
-        Ok(Bytes::from(format!("\n\ndata: {json}\n\n")))
+        // Do not begin with a blank line. Bytes already forwarded may hold a
+        // complete `data:` field, and a blank line would dispatch it as a
+        // success for this request. `data: x` continues that field so the
+        // event is not JSON; the client skips it, and the next event is the
+        // size error.
+        Ok(Bytes::from(format!("data: x\n\ndata: {json}\n\n")))
     }
 }
 
@@ -629,6 +632,21 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         let id = message["id"].to_string();
+        if mode == "sse_sealed" {
+            // A complete success, still unterminated, one byte under the cap.
+            // The next chunk is the blank line that would dispatch it.
+            let first = unterminated_sealed_event(&id);
+            let sent = Arc::clone(&upstream.flood_bytes_sent);
+            sent.fetch_add(first.len() + 2, Ordering::SeqCst);
+            let body = futures::stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from(first)),
+                Ok(Bytes::from_static(b"\n\n")),
+            ]);
+            return Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(body))
+                .expect("valid sealed response");
+        }
         let (content_type, prefix) = if mode == "sse" {
             ("text/event-stream", "data: ")
         } else {
@@ -704,6 +722,29 @@ mod tests {
             .map_err(|e| e.to_string())
     }
 
+    /// Comment padding, then `data: {complete success}` with no trailing
+    /// newline, totaling one byte under [`MAX_TOOL_RESULT_SIZE`].
+    fn unterminated_sealed_event(id: &str) -> String {
+        let tail = format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"SEALED_OK\"}}],\"isError\":false}}}}"
+        );
+        let pad = (MAX_TOOL_RESULT_SIZE - 1)
+            .checked_sub(tail.len())
+            .expect("the sealed event fits under the cap");
+        let mut body = String::with_capacity(MAX_TOOL_RESULT_SIZE);
+        body.push(':');
+        body.extend(std::iter::repeat_n('x', pad - 2));
+        body.push('\n');
+        body.push_str(&tail);
+        assert_eq!(
+            body.len(),
+            MAX_TOOL_RESULT_SIZE - 1,
+            "pad leaves the event one byte under the cap"
+        );
+        assert!(body.ends_with(&tail) && !tail.ends_with('\n'));
+        body
+    }
+
     fn text_result(bytes: usize) -> Value {
         json!([{"type": "text", "text": "X".repeat(bytes)}])
     }
@@ -724,6 +765,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A finished success sits in the parser, one byte under the cap, and the
+    /// next chunk is the blank line that would dispatch it. The call must
+    /// return only the size error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unterminated_success_is_not_dispatched_when_the_next_chunk_crosses_the_cap() {
+        let (url, upstream) = start_upstream(true).await;
+        let catalog = connect(url).await;
+        let result = call(&catalog, "flood", &json!({"mode": "sse_sealed"})).await;
+        let error = result.expect_err("the sealed success must not be returned");
+        assert!(
+            error.contains(&response_too_large_message(SERVER_NAME)),
+            "the error must be the size limit, got: {error}"
+        );
+        assert!(
+            !error.contains("SEALED_OK"),
+            "the success payload must not be delivered, got: {error}"
+        );
+        assert_eq!(upstream.flood_requests.load(Ordering::SeqCst), 1);
     }
 
     /// regression test: a tool result of any size was read into memory in
