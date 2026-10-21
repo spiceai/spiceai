@@ -756,7 +756,7 @@ fn generate_mtp(
         spec.process(&batch).map_err(|e| e.to_string())?;
         history.push(id);
 
-        let mut accepted = 0;
+        let mut accepted: usize = 0;
         let next = loop {
             let index = i32::try_from(accepted).map_err(|e| e.to_string())?;
             let token = sampler.sample(spec.target_context(), index);
