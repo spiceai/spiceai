@@ -41,7 +41,8 @@ use super::{
 };
 use crate::configure_test_datafusion;
 use crate::utils::{
-    register_test_connectors, runtime_ready_check, test_request_context, wait_until_true,
+    free_ports, register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    wait_until_true,
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -72,24 +73,6 @@ fn spicepod(engine: &str, dir: &std::path::Path) -> String {
         .expect("writing to a String cannot fail");
     }
     format!("version: v1\nkind: Spicepod\nname: surfaces_{engine}\ndatasets:\n{datasets}")
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(SocketAddr::new(LOCALHOST, 0))
-        .and_then(|listener| listener.local_addr())
-        .expect("an ephemeral port must be available")
-        .port()
-}
-
-async fn in_process(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
-    let result = rt
-        .datafusion()
-        .query_builder(sql)
-        .build()
-        .run()
-        .await
-        .map_err(|e| e.to_string())?;
-    result.data.try_collect().await.map_err(|e| e.to_string())
 }
 
 /// Decodes `/v1/sql`'s `application/vnd.spiceai.sql.v1+json` answer with the Arrow schema
@@ -164,23 +147,19 @@ fn row_count(batches: &[RecordBatch]) -> usize {
 /// Loads `engine` from a Spicepod, deletes the source files, starts the HTTP and Flight
 /// servers, and compares every micro query on every client with both standalone oracles.
 async fn surfaces_match_standalone_oracles(engine: &str) {
-    let fact = make_fact(FACT_ROWS, 64);
-    let dim = make_dim(DIM_ROWS);
-
+    let tables = [("t", make_fact(FACT_ROWS, 64)), ("d", make_dim(DIM_ROWS))];
     let dir = tempfile::tempdir().expect("temp dir");
-    let t_path = dir.path().join("t.parquet");
-    let d_path = dir.path().join("d.parquet");
-    write_parquet(&t_path, &fact);
-    write_parquet(&d_path, &dim);
+    for (name, batch) in &tables {
+        write_parquet(&dir.path().join(format!("{name}.parquet")), batch);
+    }
     std::fs::write(
         dir.path().join("spicepod.yaml"),
         spicepod(engine, dir.path()),
     )
     .expect("the spicepod must be written");
 
-    let (_sqlite_dir, sqlite) =
-        sqlite_accel::load_standalone_sqlite(&[("t", fact.clone()), ("d", dim.clone())]);
-    let (_duckdb_dir, duckdb) = duckdb_accel::load_standalone_duckdb(&[("t", fact), ("d", dim)]);
+    let (_sqlite_dir, sqlite) = sqlite_accel::load_standalone_sqlite(&tables);
+    let (_duckdb_dir, duckdb) = duckdb_accel::load_standalone_duckdb(&tables);
 
     register_test_connectors().await;
     configure_test_datafusion();
@@ -194,11 +173,12 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
     runtime_ready_check(&rt).await;
 
     // From here on only the acceleration holds the rows.
-    std::fs::remove_file(&t_path).expect("remove t.parquet");
-    std::fs::remove_file(&d_path).expect("remove d.parquet");
+    for (name, _) in &tables {
+        std::fs::remove_file(dir.path().join(format!("{name}.parquet")))
+            .unwrap_or_else(|e| panic!("remove {name}.parquet: {e}"));
+    }
 
-    let http_port = free_port();
-    let flight_port = free_port();
+    let [http_port, flight_port] = free_ports();
     let config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
         .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
@@ -208,35 +188,26 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
     });
 
     let http = reqwest::Client::new();
+    let flight_endpoint = Channel::from_shared(format!("http://{LOCALHOST}:{flight_port}"))
+        .expect("a valid Flight URI");
+    // HTTP readiness does not mean the Flight server is listening, so wait for both.
     assert!(
         wait_until_true(Duration::from_secs(30), || async {
             http.get(format!("http://{LOCALHOST}:{http_port}/health"))
                 .send()
                 .await
                 .is_ok()
+                && flight_endpoint.connect().await.is_ok()
         })
         .await,
-        "the HTTP server on port {http_port} did not start within 30s"
+        "the HTTP server on port {http_port} and the Flight server on port {flight_port} did not both start within 30s"
     );
-    // HTTP readiness does not mean the Flight server is listening; connect until it is.
-    let endpoint = Channel::from_shared(format!("http://{LOCALHOST}:{flight_port}"))
-        .expect("a valid Flight URI");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let flight = loop {
-        match endpoint.connect().await {
-            Ok(channel) => break channel,
-            Err(e) => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the Flight server on port {flight_port} did not start within 30s: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    };
+    let flight = flight_endpoint
+        .connect()
+        .await
+        .expect("the Flight server accepted a connection");
 
     let mut fails = Vec::new();
-    let mut compared = 0usize;
     for q in micro_queries() {
         let oracles = [
             (
@@ -250,34 +221,38 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
                     .unwrap_or_else(|e| panic!("sqlite sql {}: {e}", q.name)),
             ),
         ];
+        // Every micro query returns rows, so an empty answer on either side is a load or a
+        // fallback that did not happen, not an agreement.
+        for (oracle, expected) in &oracles {
+            assert!(
+                row_count(expected) > 0,
+                "{oracle} returned no rows for {}",
+                q.name
+            );
+        }
         let surfaces = [
-            ("in-process", in_process(&rt, &q.sql).await),
+            (
+                "in-process",
+                run_query(&rt, &q.sql).await.map_err(|e| e.to_string()),
+            ),
             ("http", over_http(&http, http_port, &q.sql).await),
             ("flight-sql", over_flight_sql(&flight, &q.sql).await),
         ];
         for (surface, spice) in &surfaces {
             let spice = match spice {
-                Ok(batches) => batches,
+                Ok(batches) if row_count(batches) > 0 => batches,
+                Ok(_) => {
+                    fails.push(format!("{engine}/{surface}/{}: empty answer", q.name));
+                    continue;
+                }
                 Err(e) => {
                     fails.push(format!("{engine}/{surface}/{}: query failed: {e}", q.name));
                     continue;
                 }
             };
             for (oracle, expected) in &oracles {
-                // Every micro query returns rows, so an empty answer on either side is a
-                // load or a fallback that did not happen, not an agreement.
-                if row_count(spice) == 0 || row_count(expected) == 0 {
-                    fails.push(format!(
-                        "{engine}/{surface} vs {oracle}/{}: empty answer (spice {} rows, oracle {} rows)",
-                        q.name,
-                        row_count(spice),
-                        row_count(expected)
-                    ));
-                    continue;
-                }
                 let status = compare(&q, spice, expected);
                 eprintln!("{engine}/{surface} vs {oracle} / {} -> {status}", q.name);
-                compared += 1;
                 if !status.starts_with("PASS") {
                     fails.push(format!(
                         "{engine}/{surface} vs {oracle}/{}: {status}",
@@ -289,12 +264,7 @@ async fn surfaces_match_standalone_oracles(engine: &str) {
     }
     assert!(
         fails.is_empty(),
-        "Spice {engine} acceleration vs standalone oracles, {compared} cells compared, failures: {fails:#?}"
-    );
-    assert_eq!(
-        compared,
-        micro_queries().len() * 3 * 2,
-        "every query must be compared on three clients against two oracles"
+        "Spice {engine} acceleration vs standalone oracles failures: {fails:#?}"
     );
 }
 
