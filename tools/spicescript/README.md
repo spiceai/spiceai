@@ -76,8 +76,8 @@ DuckDB CLI matching Spice's embedded DuckDB into `~/.cache/spicescript/`
 | `--partition I/N` | Run only share I of N (1-based), for splitting a suite across CI jobs. Scripts go longest first, by recorded duration, to the share with the least work so far, so every job computes the same split and the shares take about as long. |
 | `--record-durations` | Write each script's run time to `recordings/durations.json` beside it. A script without a recorded duration is refused unless this is set, so a new script gets one when it's added. Record from a `--jobs 1` run. |
 | `--max-wait DURATION` | Cap every wait (`eventually`, readiness, refreshes) at this length. For known-failing scripts, which otherwise wait out every limit. |
-| `--matrix KEY=VALUE` | Run only the matrix combinations with this value (as `${matrix.KEY}` prints it); repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
-| `--variant NAME` | Run only this variant; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
+| `--matrix KEY=VALUE` | Choose which **runs** happen: only the matrix combinations with this value of a key under `matrix:` (as `${matrix.KEY}` prints it), such as `src=clickhouse`; repeat a key for several values. Scripts without the key or any of the values are skipped. Expected failures of the combinations left out are neither required to fail nor dropped by `--record-failures`. |
+| `--variant NAME` | Choose which **instances** start in each run: only this name under `variants:`, such as `cayenne`; repeat it for several. Scripts with none of them are skipped. Expected failures of the variants left out, and of comparisons between variants (the run compares a different set), are neither required to fail nor dropped by `--record-failures`. Neither option combines with `--record-durations`. |
 | `--work-dir DIR` | Where instances keep their spicepods, data and `spiced.log` (default `target/spicescript`). |
 | `--keep` | Leave source containers running after the run, for debugging. |
 | `--spice-cli PATH` | The `spice` CLI that `spice` steps run. |
@@ -140,6 +140,21 @@ Files and object stores answer no queries themselves, so a script mirrors their
 rows into a database to have an oracle (`generate: … mirror: <source>`).
 
 ### Instances, variants and the matrix
+
+A script has two axes, and they mean different things:
+
+| | `matrix:` | `variants:` |
+| --- | --- | --- |
+| What it varies | the setup: a source, a format, a mode | the spicepod: an engine, a refresh mode, a setting |
+| What one value gets | a separate **run**, with its own sources and containers | an **instance** (`spiced`) within each run, sharing that run's sources |
+| Compared? | no: each run is checked on its own | yes: every variant of a run must give the same answers |
+| Placeholder / step filter | `${matrix.<key>}`, `when:` | `${variant.name}`, `only:` / `except:` |
+| Ledger `run` / `who` | `name[key=value,…]` | the variant's name |
+| Select from the command line | `--matrix KEY=VALUE` | `--variant NAME` |
+
+Use the matrix when the sources themselves differ (PostgreSQL vs MySQL); use
+variants when the same sources are read in different ways (Cayenne vs Arrow),
+so their answers can be compared with each other.
 
 A run is every `--spiced` binary crossed with every variant, separately for
 each matrix combination. Each instance has its own ports, working directory,

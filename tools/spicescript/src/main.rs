@@ -118,15 +118,19 @@ struct Cli {
     #[arg(long = "max-wait", value_name = "DURATION", value_parser = humantime::parse_duration)]
     max_wait: Option<std::time::Duration>,
 
-    /// Run only the matrix combinations with this value, as `KEY=VALUE`;
-    /// repeat a key for several values. Scripts without the key or any of its
-    /// values are skipped.
+    /// Run only the matrix combinations with this value, as `KEY=VALUE` (a
+    /// key under the script's `matrix:`, such as `src=clickhouse`). Each
+    /// combination is a separate run with its own sources; this picks which
+    /// runs happen. Repeat a key for several values. Scripts without the key
+    /// or any of its values are skipped.
     #[arg(long = "matrix", value_name = "KEY=VALUE", value_parser = parse_matrix_value)]
     matrix: Vec<(String, String)>,
 
-    /// Run only this variant; repeat it for several. Scripts with none of
-    /// them are skipped.
-    #[arg(long = "variant", value_name = "NAME")]
+    /// Run only this variant (a name under the script's `variants:`, such as
+    /// `cayenne`). Variants are the instances within each run, compared with
+    /// each other; this picks which of them start. Repeat it for several.
+    /// Scripts with none of them are skipped.
+    #[arg(long = "variant", value_name = "NAME", value_parser = parse_variant_name)]
     variants: Vec<String>,
 }
 
@@ -398,8 +402,19 @@ fn expected_failures_note(expected: usize) -> String {
 fn parse_matrix_value(text: &str) -> Result<(String, String), String> {
     match text.split_once('=') {
         Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
-        _ => Err(format!("`{text}` is not KEY=VALUE")),
+        _ => Err(format!(
+            "`{text}` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant {text}"
+        )),
     }
+}
+
+fn parse_variant_name(text: &str) -> Result<String, String> {
+    if text.contains('=') {
+        return Err(format!(
+            "`{text}` is a matrix value, not a variant name; to run the combinations with it, use --matrix {text}"
+        ));
+    }
+    Ok(text.to_string())
 }
 
 fn parse_partition(text: &str) -> Result<(usize, usize), String> {
@@ -501,6 +516,23 @@ mod tests {
             parse_partition("0/3").is_err()
                 && parse_partition("4/3").is_err()
                 && parse_partition("x").is_err()
+        );
+    }
+
+    #[test]
+    fn a_selection_meant_for_the_other_flag_names_it() {
+        assert_eq!(
+            parse_matrix_value("src=clickhouse"),
+            Ok(("src".to_string(), "clickhouse".to_string()))
+        );
+        assert_eq!(
+            parse_matrix_value("cayenne"),
+            Err("`cayenne` is not KEY=VALUE, a key under the script's `matrix:`; to run one of its `variants:`, use --variant cayenne".to_string())
+        );
+        assert_eq!(parse_variant_name("cayenne"), Ok("cayenne".to_string()));
+        assert_eq!(
+            parse_variant_name("src=clickhouse"),
+            Err("`src=clickhouse` is a matrix value, not a variant name; to run the combinations with it, use --matrix src=clickhouse".to_string())
         );
     }
 }
