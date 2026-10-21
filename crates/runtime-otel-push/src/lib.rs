@@ -209,7 +209,7 @@ fn map_temporality(t: OtelTemporality) -> Temporality {
 /// # Example
 ///
 /// ```ignore
-/// use runtime::otel_push_exporter::{create_otel_periodic_reader, OtelExporterConfig, OtelTemporality};
+/// use runtime_otel_push::{create_otel_periodic_reader, OtelExporterConfig, OtelTemporality};
 /// use std::collections::HashMap;
 ///
 /// let config = OtelExporterConfig {
@@ -1104,10 +1104,10 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                format!(" WARN runtime::otel_push_exporter: {failed}"),
-                " INFO runtime::otel_push_exporter: Log export to the OpenTelemetry endpoint 'otel-collector:4317' recovered; 3 log records were not delivered while it was failing.".to_string(),
-                format!(" WARN runtime::otel_push_exporter: {failed}"),
-                " INFO runtime::otel_push_exporter: Log export to the OpenTelemetry endpoint 'otel-collector:4317' recovered; 1 log record was not delivered while it was failing.".to_string(),
+                format!(" WARN runtime_otel_push: {failed}"),
+                " INFO runtime_otel_push: Log export to the OpenTelemetry endpoint 'otel-collector:4317' recovered; 3 log records were not delivered while it was failing.".to_string(),
+                format!(" WARN runtime_otel_push: {failed}"),
+                " INFO runtime_otel_push: Log export to the OpenTelemetry endpoint 'otel-collector:4317' recovered; 1 log record was not delivered while it was failing.".to_string(),
             ]
         );
     }
@@ -1144,7 +1144,7 @@ mod tests {
         assert_eq!(
             lines,
             vec![format!(
-                " WARN runtime::otel_push_exporter: {}",
+                " WARN runtime_otel_push: {}",
                 log_export_failed_message(
                     "otel-collector:4317",
                     &OTelSdkError::InternalFailure(
