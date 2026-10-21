@@ -34,125 +34,43 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Append refresh, `mode: file`, against the labeled `PostgreSQL` source.
+///
+/// Compares schema and the row multiset for the projection, one aggregation, and one
+/// self-join. `created_at` is UTC epoch milliseconds. The statements do not order rows
+/// and do not divide integers. A probe row inserted after the last refresh must stay
+/// out of the acceleration.
 #[tokio::test]
 async fn test_acceleration_refresh_cayenne_append() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-
-    test_request_context()
-        .scope(async {
-            let running_container = common::start_postgres_docker_container().await?;
-            let port = usize::from(running_container.host_port(5432)?);
-
-            let db_conn = initialize_postgres(port).await?;
-
-            // Create unique temp directory for this test
-            let temp_dir = tempfile::tempdir()?;
-            let metadata_dir = temp_dir.path().join("cayenne_metadata");
-            std::fs::create_dir_all(&metadata_dir)?;
-
-            let mut params = HashMap::new();
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_str().expect("valid UTF-8 path").to_string(),
-            );
-
-            let mut acceleration_config =
-                get_acceleration_config_append("cayenne", Some(Params::from_string_map(params)));
-            acceleration_config.mode = Mode::File;
-            // Cayenne append mode requires either primary_key or time_column
-            // Here we remove primary_key but keep time_column (via start_test_runtime)
-            acceleration_config.primary_key = None;
-            let rt = start_test_runtime(port, acceleration_config).await?;
-
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                1
-            );
-
-            execute_ps_sql(
-                &db_conn,
-                "INSERT INTO test_table (created_at) VALUES (date_trunc('milliseconds', now()));",
-            )
-            .await?;
-
-            refresh_table(Arc::clone(&rt), "test_table").await?;
-
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                2
-            );
-
-            running_container.remove().await?;
-            Ok(())
-        })
-        .await
+    cayenne_refresh_matches_source(super::refresh_modes::RefreshCase::Append).await
 }
 
+/// Full refresh, `mode: file`, against the same source and the same three statements.
 #[tokio::test]
 async fn test_acceleration_refresh_cayenne_full() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    cayenne_refresh_matches_source(super::refresh_modes::RefreshCase::Full).await
+}
 
-    test_request_context()
-        .scope(async {
-            let running_container = common::start_postgres_docker_container().await?;
-            let port = usize::from(running_container.host_port(5432)?);
-
-            let db_conn = initialize_postgres(port).await?;
-
-            // Create unique temp directory for this test
-            let temp_dir = tempfile::tempdir()?;
-            let metadata_dir = temp_dir.path().join("cayenne_metadata");
-            std::fs::create_dir_all(&metadata_dir)?;
-
-            let mut params = HashMap::new();
-            params.insert(
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.to_str().expect("valid UTF-8 path").to_string(),
-            );
-
-            let mut acceleration_config =
-                get_acceleration_config_full("cayenne", Some(Params::from_string_map(params)));
-            acceleration_config.mode = Mode::File;
-            let rt = start_test_runtime(port, acceleration_config).await?;
-
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                1
-            );
-
-            execute_ps_sql(
-                &db_conn,
-                "INSERT INTO test_table (created_at) VALUES (date_trunc('milliseconds', now()));",
-            )
-            .await?;
-
-            refresh_table(Arc::clone(&rt), "test_table").await?;
-
-            let results = execute_rt_sql(Arc::clone(&rt), "SELECT * from test_table").await?;
-            assert_eq!(
-                results
-                    .iter()
-                    .map(arrow::array::RecordBatch::num_rows)
-                    .sum::<usize>(),
-                2
-            );
-
-            running_container.remove().await?;
-            Ok(())
-        })
-        .await
+async fn cayenne_refresh_matches_source(
+    mode: super::refresh_modes::RefreshCase,
+) -> Result<(), anyhow::Error> {
+    // The directory has to outlive the runtime: Cayenne's file mode reads it after refresh.
+    let (_temp_dir, params) = cayenne_params();
+    super::refresh_modes::refresh_matches_postgres_source("cayenne", mode, move |_port| {
+        let mut acceleration = match mode {
+            super::refresh_modes::RefreshCase::Append => {
+                get_acceleration_config_append("cayenne", Some(params))
+            }
+            super::refresh_modes::RefreshCase::Full => {
+                get_acceleration_config_full("cayenne", Some(params))
+            }
+        };
+        acceleration.mode = Mode::File;
+        acceleration
+    })
+    .await
 }
 
 /// Test that Cayenne append mode works with both `primary_key` and `time_column` specified.
