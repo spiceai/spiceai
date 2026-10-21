@@ -53,13 +53,15 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
+use futures::StreamExt;
 use object_store::ObjectMeta;
 use parking_lot::Mutex;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
 
-/// How many files' schemas are read per round while looking for a column. The newest file
-/// is read alone first because it normally carries every registered column.
-const SCHEMA_PROBE_CHUNK: usize = 64;
+/// How many files' schemas are read concurrently while looking for a column. Files are
+/// read newest first and the probe stops as soon as every column is found, normally after
+/// the newest file.
+const SCHEMA_PROBE_CONCURRENCY: usize = 16;
 
 /// `SessionConfig` extension marking a session whose scans feed an acceleration refresh.
 ///
@@ -145,8 +147,9 @@ impl FileSchemaDriftGuard {
     ///
     /// Returns a [`DataFusionError::Plan`] naming the missing columns when `state` is an
     /// acceleration refresh session ([`is_acceleration_refresh`]) and a projected registered
-    /// column is missing from every scanned file. A file schema that cannot be read skips the
-    /// check rather than failing the scan.
+    /// column is missing from every scanned file, or the error reading a file's schema in an
+    /// acceleration refresh session. Any other scan skips the check when a file schema cannot
+    /// be read.
     pub async fn check_scan(
         &self,
         state: &dyn Session,
@@ -189,11 +192,26 @@ impl FileSchemaDriftGuard {
                     return Ok(());
                 }
             };
-            let drift = self
+            match self
                 .find_drift(state, &store, columns.clone(), &files)
-                .await?;
-            self.state.lock().last_check = Some((fingerprint, drift.clone()));
-            drift
+                .await
+            {
+                Ok(drift) => {
+                    self.state.lock().last_check = Some((fingerprint, drift.clone()));
+                    drift
+                }
+                // Inconclusive, and not recorded, so the next scan probes again. A refresh
+                // must not load data it could not check, so it fails with the read error
+                // (the scan reads the same files); any other scan goes ahead.
+                Err(e) if is_acceleration_refresh(state) => return Err(e),
+                Err(e) => {
+                    tracing::debug!(
+                        "Dataset '{}': skipping the missing-column check, a source file schema could not be read: {e}",
+                        self.dataset_name
+                    );
+                    return Ok(());
+                }
+            }
         };
 
         // Re-arm the warning for every column this scan read and found.
@@ -259,6 +277,14 @@ impl FileSchemaDriftGuard {
 
     /// Reads the files' schemas, newest first, until every column in `columns` is found.
     /// Returns the columns no file carries.
+    /// Reads the files' schemas, newest first and one file at a time (so unrelated columns
+    /// whose types differ across files never have to merge), until every column in `columns`
+    /// is found. Returns the columns no file carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reading a file's schema. The probe is then inconclusive: the caller
+    /// must neither report drift nor record the files as checked.
     async fn find_drift(
         &self,
         state: &dyn Session,
@@ -267,23 +293,14 @@ impl FileSchemaDriftGuard {
         files: &[ObjectMeta],
     ) -> DFResult<Option<Drift>> {
         let mut remaining: BTreeSet<String> = columns.into_iter().collect();
-        let (newest, rest) = files.split_at(files.len().min(1));
-        for chunk in std::iter::once(newest).chain(rest.chunks(SCHEMA_PROBE_CHUNK)) {
-            if chunk.is_empty() {
-                continue;
-            }
-            // A file whose schema cannot be read here fails the scan itself if it is
-            // unreadable; the check only reports drift it can prove, so it is skipped.
-            let schema = match self.format.infer_schema(state, store, chunk).await {
-                Ok(schema) => schema,
-                Err(e) => {
-                    tracing::debug!(
-                        "Dataset '{}': skipping the missing-column check, a source file schema could not be read: {e}",
-                        self.dataset_name
-                    );
-                    return Ok(None);
-                }
-            };
+        let mut schemas = futures::stream::iter(files)
+            .map(|file| {
+                self.format
+                    .infer_schema(state, store, std::slice::from_ref(file))
+            })
+            .buffered(SCHEMA_PROBE_CONCURRENCY);
+        while let Some(schema) = schemas.next().await {
+            let schema = schema?;
             remaining.retain(|name| schema.field_with_name(name).is_err());
             if remaining.is_empty() {
                 return Ok(None);
@@ -643,6 +660,35 @@ mod tests {
             .await
             .expect("a column some scanned file carries is not drift");
         assert_eq!(single_value(&batches), Some(2));
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_detects_drift_when_unrelated_columns_conflict_across_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_parquet(&dir.path().join("a.parquet"), &["id", "extra"], &[1]);
+        // Same unregistered column, different type: a merged inference would fail.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(dir.path().join("b.parquet")).expect("create");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let table = guarded_table(dir.path(), &["id", "amount_cents"]);
+
+        let err = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect_err("drift must be found without merging unrelated column types");
+        assert!(err.to_string().contains("'amount_cents'"), "{err}");
     }
 
     #[tokio::test]
