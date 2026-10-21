@@ -46,6 +46,7 @@ use tracing::{Instrument, Level};
 
 use async_trait::async_trait;
 use llms::chat::Chat;
+use model_capabilities::{Capability, CapabilityStore, require};
 use runtime_rate_control::RateController;
 
 use std::collections::HashMap;
@@ -95,6 +96,7 @@ pub type RateControllerStore = HashMap<String, Arc<RateController>>;
 
 pub struct Ai {
     model_store: Arc<RwLock<ChatModelStore>>,
+    capabilities: Arc<RwLock<CapabilityStore>>,
     rate_controllers: Arc<RwLock<RateControllerStore>>,
     /// Explains a configured model that is missing from `model_store`. A model that failed to
     /// load, or has not finished loading, is never inserted there, so without its status a lookup
@@ -130,12 +132,14 @@ impl Ai {
     #[must_use]
     pub fn new(
         model_store: Arc<RwLock<ChatModelStore>>,
+        capabilities: Arc<RwLock<CapabilityStore>>,
         rate_controllers: Arc<RwLock<RateControllerStore>>,
         model_status: Arc<RuntimeStatus>,
     ) -> Self {
         let ptr = Arc::as_ptr(&model_store).addr() as u64;
         Self {
             model_store,
+            capabilities,
             rate_controllers,
             model_status,
             ptr,
@@ -203,6 +207,12 @@ impl ScalarUDFImpl for Ai {
 
 #[async_trait]
 impl AsyncScalarUDFImpl for Ai {
+    /// `DataFusion` otherwise hands an async function whole input batches (8192 rows by
+    /// default), which the batch cap below would reject.
+    fn ideal_batch_size(&self) -> Option<usize> {
+        Some(MAX_BATCH_SIZE)
+    }
+
     async fn invoke_async_with_args(
         &self,
         args: ScalarFunctionArgs,
@@ -244,8 +254,9 @@ impl AsyncScalarUDFImpl for Ai {
             self.get_default_model_name().await?
         };
 
+        let capabilities = self.capabilities.read().await;
         let model_store = self.model_store.read().await;
-        let Some(model) = model_store.get(&model_name) else {
+        let Ok(model) = require(&capabilities, &model_store, &model_name, Capability::Chat) else {
             if let Some(reason) = self.model_status.unavailable_model_reason(&model_name) {
                 return exec_err!("{AI_UDF_NAME}: {reason}");
             }
@@ -255,6 +266,8 @@ impl AsyncScalarUDFImpl for Ai {
                 model_store.keys().cloned().collect::<Vec<_>>().join(", ")
             );
         };
+        drop(model_store);
+        drop(capabilities);
 
         // Look up per-model rate controller for concurrency control
         let rate_controller = {
@@ -297,7 +310,7 @@ impl AsyncScalarUDFImpl for Ai {
 
         let result = self
             .process_messages(
-                Arc::clone(model),
+                model,
                 &model_name,
                 message_array,
                 rate_controller,
@@ -724,7 +737,12 @@ mod tests {
     #[test]
     fn test_ai_udf_signature() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let sig = udf.signature();
         // Check that we have a OneOf signature with multiple options
@@ -744,7 +762,12 @@ mod tests {
     #[tokio::test]
     async fn test_default_model_selection() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let default_model = udf
             .get_default_model_name()
@@ -768,7 +791,12 @@ mod tests {
         store.insert("model2".to_string(), Arc::new(model2) as Arc<dyn Chat>);
 
         let model_store = Arc::new(RwLock::new(store));
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let result = udf.get_default_model_name().await;
         assert!(result.is_err());
@@ -784,7 +812,12 @@ mod tests {
     async fn test_no_models_error() {
         let store = HashMap::new();
         let model_store = Arc::new(RwLock::new(store));
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let result = udf.get_default_model_name().await;
         assert!(result.is_err());
@@ -802,7 +835,12 @@ mod tests {
         for (name, model_status) in models {
             status.update_model(name, model_status.clone());
         }
-        Ai::new(Arc::default(), empty_rate_controllers(), status)
+        Ai::new(
+            Arc::default(),
+            Arc::default(),
+            empty_rate_controllers(),
+            status,
+        )
     }
 
     fn scalar_args(message: &str, model: Option<&str>) -> ScalarFunctionArgs {
@@ -850,7 +888,12 @@ mod tests {
     async fn named_model_without_a_status_is_still_not_found() {
         let status = RuntimeStatus::new();
         status.update_model("test-model", ComponentStatus::Ready);
-        let udf = Ai::new(create_test_model_store(), empty_rate_controllers(), status);
+        let udf = Ai::new(
+            create_test_model_store(),
+            Arc::default(),
+            empty_rate_controllers(),
+            status,
+        );
 
         let err = udf
             .invoke_async_with_args(scalar_args("hi", Some("unknown")))
@@ -901,7 +944,12 @@ mod tests {
     #[test]
     fn test_udf_name() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         assert_eq!(udf.name(), "ai");
     }
@@ -909,7 +957,12 @@ mod tests {
     #[test]
     fn test_documentation() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let docs = udf.documentation().expect("should have documentation");
         assert_eq!(
@@ -922,7 +975,12 @@ mod tests {
     #[test]
     fn test_return_type_variations() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         // Test with single Utf8 argument
         let return_type1 = udf
@@ -946,7 +1004,12 @@ mod tests {
     #[test]
     fn test_non_async_invoke_with_args_error() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let args = ScalarFunctionArgs {
             args: vec![],
@@ -1146,6 +1209,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1180,6 +1244,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1223,6 +1288,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1263,6 +1329,7 @@ mod tests {
         let model_store = create_multi_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1297,6 +1364,7 @@ mod tests {
         let model_store = create_multi_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1329,7 +1397,12 @@ mod tests {
     #[test]
     fn test_debug_implementation() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let debug_str = format!("{:?}", udf);
         assert!(debug_str.contains("Ai"));
@@ -1339,7 +1412,12 @@ mod tests {
     #[test]
     fn test_into_async_udf() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let async_udf = udf.into_async_udf();
         let scalar_udf = async_udf.into_scalar_udf();
@@ -1350,7 +1428,12 @@ mod tests {
     #[test]
     fn test_signature_volatility() {
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let sig = udf.signature();
         assert_eq!(sig.volatility, Volatility::Volatile);
@@ -1396,6 +1479,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1448,6 +1532,7 @@ mod tests {
         let model_store = create_multi_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1504,6 +1589,7 @@ mod tests {
         let model_store = create_multi_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1553,6 +1639,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1595,12 +1682,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// Time is paused, so the 10 s model calls and the 500 ms bound are exact rather than raced.
+    #[tokio::test(start_paused = true)]
     async fn test_cancellation_support() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, sleep, timeout};
 
-        // Mock Chat that simulates long-running operations
-        struct SlowMockChat;
+        // Mock Chat that simulates long-running operations, counting the calls that start
+        // and the ones that run to completion.
+        struct SlowMockChat {
+            started: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+        }
 
         #[async_trait]
         impl Chat for SlowMockChat {
@@ -1609,7 +1702,9 @@ mod tests {
             }
 
             async fn run(&self, _prompt: String) -> llms::chat::Result<Option<String>> {
+                self.started.fetch_add(1, Ordering::SeqCst);
                 sleep(Duration::from_secs(10)).await;
+                self.completed.fetch_add(1, Ordering::SeqCst);
                 Ok(Some("Should be cancelled".to_string()))
             }
 
@@ -1620,6 +1715,8 @@ mod tests {
             {
                 use async_stream::stream;
 
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let completed = Arc::clone(&self.completed);
                 let stream = stream! {
                     // Yield a chunk
                     yield Ok(CreateChatCompletionStreamResponse {
@@ -1648,6 +1745,7 @@ mod tests {
 
                     // Simulate a long delay between chunks
                     sleep(Duration::from_secs(10)).await;
+                    completed.fetch_add(1, Ordering::SeqCst);
 
                     yield Ok(CreateChatCompletionStreamResponse {
                         id: "slow-id".to_string(),
@@ -1670,7 +1768,9 @@ mod tests {
                 _req: CreateChatCompletionRequest,
             ) -> Result<CreateChatCompletionResponse, async_openai::error::OpenAIError>
             {
+                self.started.fetch_add(1, Ordering::SeqCst);
                 sleep(Duration::from_secs(10)).await;
+                self.completed.fetch_add(1, Ordering::SeqCst);
                 Err(async_openai::error::OpenAIError::ApiError(ApiError {
                     message: "Should be cancelled".to_string(),
                     r#type: None,
@@ -1680,14 +1780,20 @@ mod tests {
             }
         }
 
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
         let mut store = HashMap::new();
         store.insert(
             "slow-model".to_string(),
-            Arc::new(SlowMockChat) as Arc<dyn Chat>,
+            Arc::new(SlowMockChat {
+                started: Arc::clone(&started),
+                completed: Arc::clone(&completed),
+            }) as Arc<dyn Chat>,
         );
         let model_store = Arc::new(RwLock::new(store));
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1703,23 +1809,26 @@ mod tests {
             .get("slow-model")
             .expect("should get slow-model");
 
-        // Start the processing task with a timeout
+        // A bound far shorter than the model calls: dropping the timed-out future is the
+        // cancellation a query timeout or a user's cancel delivers.
         let result = timeout(
-            Duration::from_millis(500), // Short timeout to trigger cancellation
-            udf.process_messages(
-                Arc::clone(model),
-                "slow-model",
-                messages,
-                None,
-                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
-            ),
+            Duration::from_millis(500),
+            udf.process_messages(Arc::clone(model), "slow-model", messages, None, 3),
         )
         .await;
+        result.expect_err("10 s model calls cannot finish inside a 500 ms bound");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            3,
+            "every message's model call was in flight when the bound expired"
+        );
 
-        // Should timeout, demonstrating that long-running operations can be cancelled
-        assert!(
-            result.is_err(),
-            "Task should timeout (which is a form of cancellation)"
+        // Well past the calls' own 10 s: a call left running detached would finish now.
+        sleep(Duration::from_secs(20)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "cancelling the AI function must cancel its in-flight model calls, not detach them"
         );
     }
 
@@ -1777,6 +1886,7 @@ mod tests {
         let model_store = Arc::new(RwLock::new(store));
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1814,6 +1924,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1863,6 +1974,7 @@ mod tests {
         let model_store = create_test_model_store();
         let udf = Ai::new(
             model_store.clone(),
+            Arc::default(),
             empty_rate_controllers(),
             RuntimeStatus::new(),
         );
@@ -1913,7 +2025,12 @@ mod tests {
         // In a real environment with proper tracing setup, these would be captured by monitoring systems.
 
         let model_store = create_test_model_store();
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let message_scalar =
             ColumnarValue::Scalar(ScalarValue::Utf8(Some("Test metrics".to_string())));
@@ -2038,7 +2155,12 @@ mod tests {
         rc_store.insert("rate-limited-model".to_string(), rate_controller);
         let rate_controllers = Arc::new(RwLock::new(rc_store));
 
-        let udf = Ai::new(model_store, rate_controllers, RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            rate_controllers,
+            RuntimeStatus::new(),
+        );
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("msg1"),
@@ -2109,7 +2231,12 @@ mod tests {
         store.insert("no-rc-model".to_string(), Arc::clone(&model));
         let model_store = Arc::new(RwLock::new(store));
 
-        let udf = Ai::new(model_store, empty_rate_controllers(), RuntimeStatus::new());
+        let udf = Ai::new(
+            model_store,
+            Arc::default(),
+            empty_rate_controllers(),
+            RuntimeStatus::new(),
+        );
 
         let messages = Arc::new(arrow::array::StringArray::from(vec![
             Some("msg1"),

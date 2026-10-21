@@ -295,7 +295,7 @@ async fn commit_overwrite_clears_all_per_snapshot_state() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, None)
+        .commit_overwrite(&table_id, &new_snapshot, None, &[])
         .await
         .expect("commit_overwrite happy path");
 
@@ -368,7 +368,7 @@ async fn commit_overwrite_replaces_inlined_corpus_atomically() {
 
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement))
+        .commit_overwrite(&table_id, &new_snapshot, Some(&replacement), &[])
         .await
         .expect("commit_overwrite with inline payload");
 
@@ -411,7 +411,7 @@ async fn commit_overwrite_replaces_inlined_corpus_atomically() {
     };
     let third_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &third_snapshot, Some(&second))
+        .commit_overwrite(&table_id, &third_snapshot, Some(&second), &[])
         .await
         .expect("second inlined overwrite");
     let rows = catalog
@@ -448,7 +448,7 @@ async fn commit_overwrite_in_txn_rolls_back_atomically() {
             .expect("begin_transaction");
         let bogus_new_snapshot = uuid::Uuid::now_v7().to_string();
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_id, &bogus_new_snapshot, None)
+            .commit_overwrite_in_txn(&mut *txn, &table_id, &bogus_new_snapshot, None, &[])
             .await
             .expect("commit_overwrite_in_txn against borrowed txn");
 
@@ -479,7 +479,13 @@ async fn commit_overwrite_in_txn_rejects_invalid_uuid() {
         .expect("begin_transaction");
 
     let bad_table_id = catalog
-        .commit_overwrite_in_txn(&mut *txn, "'; DROP TABLE cayenne_table; --", "1234", None)
+        .commit_overwrite_in_txn(
+            &mut *txn,
+            "'; DROP TABLE cayenne_table; --",
+            "1234",
+            None,
+            &[],
+        )
         .await;
     assert!(
         bad_table_id.is_err(),
@@ -488,7 +494,7 @@ async fn commit_overwrite_in_txn_rejects_invalid_uuid() {
 
     let valid_table = uuid::Uuid::now_v7().to_string();
     let bad_snapshot = catalog
-        .commit_overwrite_in_txn(&mut *txn, &valid_table, "not-a-uuid", None)
+        .commit_overwrite_in_txn(&mut *txn, &valid_table, "not-a-uuid", None, &[])
         .await;
     assert!(
         bad_snapshot.is_err(),
@@ -518,7 +524,7 @@ async fn commit_overwrite_isolated_by_table_id() {
 
     let new_snap_a = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_a, &new_snap_a, None)
+        .commit_overwrite(&table_a, &new_snap_a, None, &[])
         .await
         .expect("commit_overwrite table_a");
 
@@ -553,7 +559,7 @@ async fn commit_overwrite_succeeds_on_empty_pre_state() {
     // No state planted — fresh table.
     let new_snapshot = uuid::Uuid::now_v7().to_string();
     catalog
-        .commit_overwrite(&table_id, &new_snapshot, None)
+        .commit_overwrite(&table_id, &new_snapshot, None, &[])
         .await
         .expect("commit_overwrite on empty pre-state");
 
@@ -608,7 +614,7 @@ async fn commit_overwrite_clears_inlined_state_unlike_commit_compaction() {
         .await
         .expect("commit_compaction");
     catalog
-        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None)
+        .commit_overwrite(&overwrite_id, &new_overwrite_snap, None, &[])
         .await
         .expect("commit_overwrite");
 
@@ -686,11 +692,11 @@ async fn two_commit_overwrites_in_one_txn_both_apply() {
             .await
             .expect("begin_transaction");
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a, None)
+            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a, None, &[])
             .await
             .expect("commit_overwrite_in_txn table_a");
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_b, &new_b, None)
+            .commit_overwrite_in_txn(&mut *txn, &table_b, &new_b, None, &[])
             .await
             .expect("commit_overwrite_in_txn table_b");
         txn.commit().await.expect("shared txn commit");
@@ -745,14 +751,14 @@ async fn commit_overwrite_in_txn_partial_failure_rolls_back_full_bundle() {
         // committed yet).
         let new_a = uuid::Uuid::now_v7().to_string();
         catalog
-            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a, None)
+            .commit_overwrite_in_txn(&mut *txn, &table_a, &new_a, None, &[])
             .await
             .expect("first call lands");
 
         // Second call against the same txn with an invalid UUID is
         // rejected at validation; the txn is still alive but tainted.
         let bad = catalog
-            .commit_overwrite_in_txn(&mut *txn, "not-a-uuid", "also-not-a-uuid", None)
+            .commit_overwrite_in_txn(&mut *txn, "not-a-uuid", "also-not-a-uuid", None, &[])
             .await;
         assert!(bad.is_err(), "invalid UUID call must be rejected");
 

@@ -266,6 +266,17 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         columns: &["table_id", "snapshot_id", "index_blob"],
     },
     ExpectedTable {
+        name: "cayenne_index_run",
+        table_id_encoding: TableIdEncoding::Text,
+        columns: &[
+            "table_id",
+            "index_key",
+            "run_name",
+            "row_count",
+            "size_bytes",
+        ],
+    },
+    ExpectedTable {
         name: "cayenne_inlined_data",
         table_id_encoding: TableIdEncoding::Text,
         columns: &[

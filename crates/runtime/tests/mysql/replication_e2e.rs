@@ -45,6 +45,7 @@ use app::AppBuilder;
 use mysql_async::prelude::Queryable;
 use runtime::Runtime;
 use spicepod::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 use tokio::time::sleep;
@@ -137,6 +138,17 @@ fn mysql_params(port: u16) -> HashMap<String, String> {
     ])
 }
 
+/// Every app here reads the accelerated table again after a binlog change, often
+/// with the same SQL it ran before the change. Refresh leaves cached SQL results
+/// in place, so a read through the cache can return the pre-change answer; these
+/// tests check replication, not caching, so they skip it.
+fn replication_app(name: impl Into<String>) -> AppBuilder {
+    AppBuilder::new(name).with_sql_cache(SQLResultsCacheConfig {
+        enabled: false,
+        ..Default::default()
+    })
+}
+
 fn make_dataset(
     ds: &ReplicatedDataset,
     params: &HashMap<String, String>,
@@ -152,9 +164,13 @@ fn make_dataset(
             .then(|| Params::from_string_map(engine.accel_params.clone())),
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some(ds.primary_key.to_string()),
-        on_conflict: vec![(ds.primary_key.to_string(), OnConflictBehavior::Upsert)]
-            .into_iter()
-            .collect(),
+        // Cayenne keeps one row per primary key on its own; the other engines
+        // replace a row only through an `on_conflict` upsert keyed on it.
+        on_conflict: if engine.engine == "cayenne" {
+            HashMap::new()
+        } else {
+            HashMap::from([(ds.primary_key.to_string(), OnConflictBehavior::Upsert)])
+        },
         ..Acceleration::default()
     });
     dataset
@@ -242,7 +258,7 @@ async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> 
             // ------------------------------------------------------------
             let params = mysql_params(port);
             let mut builder =
-                AppBuilder::new(format!("mysql_replication_integration_{}", engine.engine));
+                replication_app(format!("mysql_replication_integration_{}", engine.engine));
             for ds in DATASETS {
                 builder = builder.with_dataset(make_dataset(ds, &params, &engine));
             }
@@ -456,7 +472,7 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
                     accel_params: accel_params.clone(),
                 };
                 let ds = make_dataset(&DATASETS[1], &params, &engine);
-                AppBuilder::new("mysql_replication_restart").with_dataset(ds)
+                replication_app("mysql_replication_restart").with_dataset(ds)
             };
 
             configure_test_datafusion();
@@ -592,7 +608,7 @@ async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Er
                     accel_params: accel_params.clone(),
                 };
                 let ds = make_dataset(&DATASETS[1], &params, &engine);
-                AppBuilder::new("mysql_replication_gtid").with_dataset(ds)
+                replication_app("mysql_replication_gtid").with_dataset(ds)
             };
 
             configure_test_datafusion();
@@ -865,7 +881,7 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
                 mode: spicepod::acceleration::Mode::File,
                 accel_params,
             };
-            let app = AppBuilder::new("mysql_replication_reconnect")
+            let app = replication_app("mysql_replication_reconnect")
                 .with_dataset(make_dataset(&dataset, &mysql_params(port), &engine))
                 .build();
 
@@ -1257,7 +1273,7 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
                 primary_key: "t_id",
                 expected_initial_count: 3,
             };
-            let app = AppBuilder::new("mysql_replication_types")
+            let app = replication_app("mysql_replication_types")
                 .with_dataset(make_dataset(
                     &dataset,
                     &mysql_params(port),

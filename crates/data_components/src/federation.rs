@@ -14,116 +14,53 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Spice-owned `SQLExecutor` wrapper that applies a function deny-list to
-//! federation decisions for any `SqlTable`-backed connector (Snowflake, `ClickHouse`, ODBC, …).
-//!
-//! This wrapper installs a logical optimizer that consults a `FunctionSupport`
-//! deny-list and unwraps federated plans when an unsupported function appears,
-//! so `DataFusion` evaluates the affected expression locally instead of
-//! pushing Spice-only UDFs like `json_get_str` to the remote engine.
+//! Federation for `SqlTable`-backed connectors (`PostgreSQL`, Snowflake,
+//! `ClickHouse`, ODBC, …) that keeps Spice-only functions like `json_get_str` out
+//! of the SQL sent to the remote engine.
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use datafusion::{
-    arrow::datatypes::SchemaRef,
-    common::TableReference,
-    error::Result as DataFusionResult,
-    physical_plan::{PhysicalExpr, SendableRecordBatchStream},
-    sql::unparser::dialect::Dialect,
-};
+use datafusion::{arrow::datatypes::SchemaRef, common::TableReference};
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
-    sql::{LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource},
+    sql::{RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource},
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 
-use crate::function_support::{FunctionSupport, unfederate_plan_with_unsupported_functions};
+use crate::function_support::FunctionSupport;
 
-/// `SQLExecutor` that delegates to a wrapped [`SqlTable`] but installs a logical
-/// optimizer to consult a function deny-list.
-pub struct DenyFunctionsSqlExecutor<T: 'static, P: 'static> {
-    inner: Arc<SqlTable<T, P>>,
-    function_support: Option<FunctionSupport>,
-}
-
-impl<T: 'static, P: 'static> DenyFunctionsSqlExecutor<T, P> {
-    #[must_use]
-    pub fn new(inner: Arc<SqlTable<T, P>>, function_support: Option<FunctionSupport>) -> Self {
-        Self {
-            inner,
-            function_support,
-        }
-    }
-}
-
-impl<T, P> std::fmt::Debug for DenyFunctionsSqlExecutor<T, P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DenyFunctionsSqlExecutor")
-            .field("inner", &self.inner)
-            .field("function_support", &self.function_support)
-            .finish()
-    }
-}
-
-#[async_trait]
-impl<T: 'static, P: 'static> SQLExecutor for DenyFunctionsSqlExecutor<T, P> {
-    fn name(&self) -> &str {
-        SQLExecutor::name(self.inner.as_ref())
-    }
-
-    fn compute_context(&self) -> Option<String> {
-        SQLExecutor::compute_context(self.inner.as_ref())
-    }
-
-    fn dialect(&self) -> Arc<dyn Dialect> {
-        SQLExecutor::dialect(self.inner.as_ref())
-    }
-
-    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
-        let function_support = self.function_support.clone()?;
-        Some(Box::new(move |plan| {
-            unfederate_plan_with_unsupported_functions(plan, &function_support)
-        }))
-    }
-
-    fn execute(
-        &self,
-        query: &str,
-        schema: SchemaRef,
-        filters: &[Arc<dyn PhysicalExpr>],
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        SQLExecutor::execute(self.inner.as_ref(), query, schema, filters)
-    }
-
-    async fn table_names(&self) -> DataFusionResult<Vec<String>> {
-        SQLExecutor::table_names(self.inner.as_ref()).await
-    }
-
-    async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        SQLExecutor::get_table_schema(self.inner.as_ref(), table_name).await
-    }
-}
-
-/// Build a [`FederatedTableProviderAdaptor`] for a [`SqlTable`] that
-/// routes plan-pushdown decisions through [`DenyFunctionsSqlExecutor`].
+/// Build a [`FederatedTableProviderAdaptor`] for a [`SqlTable`] whose
+/// `function_support` policy keeps the functions it denies (e.g. `json_get_str`)
+/// out of the remote engine's SQL.
 ///
-/// This mirrors [`SqlTable::create_federated_table_provider`] but installs the
-/// wrapper executor so that any plan referencing a function on the supplied
-/// `function_support` deny-list (e.g. `json_get_str`) falls back to local
-/// `DataFusion` evaluation instead of being unparsed into the remote engine's
-/// SQL.
+/// As in [`SqlTable::create_federated_table_provider`], the one `SqlTable` is both
+/// the federation executor and the adaptor's fallback scan, so a single policy
+/// answers both questions federation asks of it:
+///
+/// - `can_execute_plan` decides which sub-plans federate. It refuses a plan that
+///   calls a denied function, and the federation analyzer then federates the
+///   largest sub-plans beneath it, so only the nodes that call the function run
+///   locally: `json_get_str(min(doc), 'a')` sends `SELECT min(doc)` and applies
+///   `json_get_str` to the one row that comes back.
+/// - `supports_filters_pushdown` decides which filters the fallback scan unparses
+///   into its `WHERE` clause. A filtered scan is pushed down there before
+///   `can_execute_plan` ever sees it, so a denied function in a filter is kept
+///   local by this answer alone.
+///
+/// The table is taken by value so the policy can be installed on it. A table that
+/// already carries a policy keeps it when `function_support` is `None`.
 #[must_use]
 pub fn create_spice_federated_table_provider<T: 'static, P: 'static>(
-    table: Arc<SqlTable<T, P>>,
+    table: SqlTable<T, P>,
     schema: SchemaRef,
     table_reference: TableReference,
     function_support: Option<FunctionSupport>,
 ) -> FederatedTableProviderAdaptor {
-    let executor: Arc<dyn SQLExecutor> = Arc::new(DenyFunctionsSqlExecutor::new(
-        Arc::clone(&table),
-        function_support,
-    ));
+    let table = Arc::new(match function_support {
+        Some(policy) => table.with_function_support(Some(policy)),
+        None => table,
+    });
+    let executor = Arc::clone(&table) as Arc<dyn SQLExecutor>;
     let fed_provider = Arc::new(SQLFederationProvider::new(executor));
     let table_source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_schema(
         fed_provider,
@@ -150,15 +87,14 @@ mod tests {
     use datafusion::datasource::DefaultTableSource;
     use datafusion::datasource::TableProvider;
     use datafusion::datasource::empty::EmptyTable;
-    use datafusion::error::DataFusionError;
+    use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::execution::context::SessionContext;
     use datafusion::functions::expr_fn::{date_part, date_trunc};
     use datafusion::functions_aggregate::expr_fn::count;
     use datafusion::logical_expr::TableType;
     use datafusion::logical_expr::{
-        ColumnarValue, Expr, Extension, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF,
-        TableSource, Volatility, builder::LogicalTableSource, cast, create_udf,
-        expr::ScalarFunction,
+        ColumnarValue, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource,
+        Volatility, builder::LogicalTableSource, cast, create_udf, expr::ScalarFunction,
     };
     use datafusion::logical_expr::{DmlStatement, WriteOp};
     use datafusion::logical_expr::{exists, not_exists};
@@ -168,12 +104,11 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
-        BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
-        MySqlDialect, PostgreSqlDialect, SqliteDialect,
+        BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, Dialect,
+        DuckDBDialect, MySqlDialect, PostgreSqlDialect, SqliteDialect,
     };
     use datafusion_federation::FederationAnalyzerRule;
     use datafusion_federation::sql::SQLExecutor;
-    use datafusion_federation::{FederatedPlanNode, sql::SQLFederationPlanner};
     use datafusion_table_providers::sql::db_connection_pool::{
         DbConnectionPool, JoinPushDown, dbconnection::DbConnection,
     };
@@ -209,19 +144,21 @@ mod tests {
     }
 
     fn test_sql_table() -> Arc<SqlTable<(), &'static dyn ToString>> {
+        Arc::new(owned_test_sql_table())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool: each test chooses the policy it exercises"
+    )]
+    fn owned_test_sql_table() -> SqlTable<(), &'static dyn ToString> {
         let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
             Arc::new(MockPool {});
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
         ]));
-        Arc::new(SqlTable::new_with_schema(
-            "test",
-            &pool,
-            schema,
-            TableReference::bare("t"),
-            None,
-        ))
+        SqlTable::new_with_schema("test", &pool, schema, TableReference::bare("t"), None)
     }
 
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
@@ -238,22 +175,6 @@ mod tests {
         Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields))))
     }
 
-    fn scan_with_projection(udf_name: &str) -> LogicalPlan {
-        let source = table_source(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("val", DataType::Utf8, true),
-        ]);
-        LogicalPlanBuilder::scan("t", source, None)
-            .expect("scan")
-            .project(vec![Expr::ScalarFunction(ScalarFunction::new_udf(
-                stub_udf(udf_name),
-                vec![col("val")],
-            ))])
-            .expect("project")
-            .build()
-            .expect("build")
-    }
-
     fn deny_support(names: &[&str]) -> FunctionSupport {
         FunctionSupport::new(
             Some(FunctionRestriction::Deny(
@@ -265,74 +186,17 @@ mod tests {
     }
 
     fn test_executor() -> impl SQLExecutor + 'static {
-        DenyFunctionsSqlExecutor::new(test_sql_table(), None)
-    }
-
-    fn federated_plan(plan: LogicalPlan) -> LogicalPlan {
-        let executor: Arc<dyn SQLExecutor> = Arc::new(test_executor());
-        let planner = Arc::new(SQLFederationPlanner::new(executor));
-        LogicalPlan::Extension(Extension {
-            node: Arc::new(FederatedPlanNode::new(plan, planner)),
-        })
-    }
-
-    fn assert_federated_plan_contains(actual: &LogicalPlan, expected: &LogicalPlan) {
-        let LogicalPlan::Extension(extension) = actual else {
-            panic!("expected federated extension plan");
-        };
-        let federated = extension
-            .node
-            .as_any()
-            .downcast_ref::<FederatedPlanNode>()
-            .expect("federated plan node");
-        assert_eq!(federated.plan(), expected);
-    }
-
-    #[test]
-    fn logical_optimizer_absent_when_no_deny_list() {
-        let executor = DenyFunctionsSqlExecutor::new(test_sql_table(), None);
-        assert!(
-            executor.logical_optimizer().is_none(),
-            "no deny-list should leave federation decisions unchanged"
-        );
-    }
-
-    #[test]
-    fn logical_optimizer_unfederates_denied_function() {
-        let executor =
-            DenyFunctionsSqlExecutor::new(test_sql_table(), Some(deny_support(&["json_get_str"])));
-        let plan = scan_with_projection("json_get_str");
-        let mut optimizer = executor
-            .logical_optimizer()
-            .expect("deny-list should install optimizer");
-        let rewritten = optimizer(federated_plan(plan.clone())).expect("optimize plan");
-        assert!(
-            rewritten == plan,
-            "deny-listed function in projection must block federation"
-        );
-    }
-
-    #[test]
-    fn logical_optimizer_keeps_non_denied_function_federated() {
-        let executor =
-            DenyFunctionsSqlExecutor::new(test_sql_table(), Some(deny_support(&["json_get_str"])));
-        let plan = scan_with_projection("upper");
-        let federated = federated_plan(plan.clone());
-        let mut optimizer = executor
-            .logical_optimizer()
-            .expect("deny-list should install optimizer");
-        let rewritten = optimizer(federated).expect("optimize plan");
-        assert_federated_plan_contains(&rewritten, &plan);
+        owned_test_sql_table()
     }
 
     #[test]
     fn create_spice_federated_table_provider_wires_deny_list() {
-        // Regression test for #10703: building the federated adaptor must route
-        // logical optimization through the deny-list wrapper.
-        let table = test_sql_table();
+        // Regression test for #10703: the adaptor federates through, and falls
+        // back to, the `SqlTable` that carries the deny-list.
+        let table = owned_test_sql_table();
         let schema = table.schema();
         let adaptor = create_spice_federated_table_provider(
-            Arc::clone(&table),
+            table,
             Arc::clone(&schema),
             TableReference::bare("t"),
             Some(deny_support(&["json_get_str"])),
@@ -344,6 +208,236 @@ mod tests {
 
         // Federation source schema must match the SqlTable schema verbatim.
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
+    }
+
+    /// The SQL `plan`'s only remote node would send: a `SqlExec` when the scan
+    /// serves the table itself, a `VirtualExecutionPlan` when the plan federated.
+    fn pushed_sql(plan: &Arc<dyn ExecutionPlan>) -> String {
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("SqlExec") || line.contains("VirtualExecutionPlan"))
+            .unwrap_or_else(|| panic!("expected a remote scan in:\n{rendered}"));
+        line.split_once("sql=").map_or_else(
+            || panic!("expected the scan to render its SQL: {line}"),
+            |(_, sql)| sql.trim().to_string(),
+        )
+    }
+
+    /// Regression test for the filter half of #13664: a Spice-only function in a
+    /// `WHERE` clause must be evaluated locally, not unparsed into the SQL the
+    /// remote scan sends.
+    ///
+    /// The executor's deny-list only decides whether a *plan* federates, and a
+    /// filtered scan never reaches that decision: the federation analyzer's
+    /// filter pushdown moves the predicate into the scan first, through the
+    /// adaptor's `supports_filters_pushdown`, which asks the wrapped `SqlTable`.
+    /// A `SqlTable` built without its own copy of the policy answers `Exact` for
+    /// anything the dialect can spell, so the remote engine was sent `WHERE
+    /// json_get_str(...) = 'x'` and failed with an unknown-function error — on
+    /// every `PostgreSQL`, Snowflake and `ClickHouse` table built through this
+    /// helper. A built-in the remote engine does have keeps pushing down.
+    #[tokio::test]
+    async fn a_denied_function_in_a_where_clause_is_not_pushed_into_the_scan() {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::functions::string::expr_fn::upper;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion_federation::FederatedQueryPlanner;
+
+        let table = owned_test_sql_table();
+        let schema = table.schema();
+        let provider = Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            TableReference::bare("t"),
+            Some(deny_support(&["json_get_str"])),
+        ));
+
+        let denied = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf("json_get_str"),
+            vec![col("val")],
+        ))
+        .eq(lit("x"));
+        let allowed = upper(col("val")).eq(lit("X"));
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&denied, &allowed])
+                .expect("pushdown verdicts"),
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact
+            ],
+            "the deny-listed call must stay local; the built-in must still push down"
+        );
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(stub_udf("json_get_str").as_ref().clone());
+        ctx.register_table("t", provider)
+            .expect("register the federated table");
+
+        let denied_plan = ctx
+            .sql("SELECT id FROM t WHERE json_get_str(val) = 'x'")
+            .await
+            .expect("plan the denied query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the denied query");
+        assert_eq!(
+            pushed_sql(&denied_plan),
+            "SELECT t.id, t.val FROM t",
+            "the remote scan must not be asked to evaluate json_get_str: it returns `val` and \
+             the filter runs locally"
+        );
+
+        let allowed_plan = ctx
+            .sql("SELECT id FROM t WHERE upper(val) = 'X'")
+            .await
+            .expect("plan the control query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the control query");
+        assert_eq!(
+            pushed_sql(&allowed_plan),
+            "SELECT t.id FROM t WHERE (upper(t.val) = 'X')",
+            "a built-in the remote engine has must keep pushing down"
+        );
+    }
+
+    /// A pool whose tables all share one remote compute context, so a join
+    /// between them can federate as one statement.
+    struct SharedContextPool {}
+
+    #[async_trait]
+    impl DbConnectionPool<(), &'static dyn ToString> for SharedContextPool {
+        async fn connect(
+            &self,
+        ) -> Result<Box<dyn DbConnection<(), &'static dyn ToString>>, Box<dyn Error + Send + Sync>>
+        {
+            Ok(Box::new(MockConn {}))
+        }
+
+        fn join_push_down(&self) -> JoinPushDown {
+            JoinPushDown::AllowedFor("shared".to_string())
+        }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool: the caller installs the policy through `create_spice_federated_table_provider`"
+    )]
+    fn shared_context_sql_table(
+        pool: &Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync>,
+        name: &'static str,
+    ) -> SqlTable<(), &'static dyn ToString> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        SqlTable::new_with_schema("test", pool, schema, TableReference::bare(name), None)
+    }
+
+    /// The SQL of every remote scan in `plan`, in plan order.
+    fn all_pushed_sql(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string()
+            .lines()
+            .filter(|line| line.contains("SqlExec") || line.contains("VirtualExecutionPlan"))
+            .filter_map(|line| {
+                line.split_once("sql=")
+                    .map(|(_, sql)| sql.trim().to_string())
+            })
+            .collect()
+    }
+
+    /// Regression test for #13770: a Spice-only function keeps only the plan
+    /// node that calls it local. The aggregate or join beneath it carries no
+    /// such function and must still federate, instead of the whole plan
+    /// falling back to one scan per table plus a local aggregate or join.
+    #[tokio::test]
+    async fn a_denied_function_keeps_only_its_own_node_local() {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion_federation::FederatedQueryPlanner;
+        use datafusion_federation::sql::federation_analyzer_rule;
+
+        let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
+            Arc::new(SharedContextPool {});
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(federation_analyzer_rule()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(stub_udf("json_get_str").as_ref().clone());
+        for name in ["t", "u"] {
+            let table = shared_context_sql_table(&pool, name);
+            let schema = table.schema();
+            let provider = Arc::new(create_spice_federated_table_provider(
+                table,
+                schema,
+                TableReference::bare(name),
+                Some(deny_support(&["json_get_str"])),
+            ));
+            ctx.register_table(name, provider)
+                .expect("register the federated table");
+        }
+
+        for (sql, expected_remote, expected_local) in [
+            (
+                "SELECT json_get_str(min(val)) FROM t",
+                vec!["SELECT min(t.val) FROM t"],
+                Some("json_get_str"),
+            ),
+            (
+                "SELECT json_get_str(max(t.val)) FROM t JOIN u ON t.id = u.id",
+                vec!["SELECT max(t.val) FROM t INNER JOIN u ON (t.id = u.id)"],
+                Some("json_get_str"),
+            ),
+            // The function directly over a scan has nothing below it to
+            // federate but the scan itself.
+            (
+                "SELECT json_get_str(val) FROM t",
+                vec!["SELECT t.val FROM t"],
+                Some("json_get_str"),
+            ),
+            // A built-in the remote engine has federates with the whole plan.
+            (
+                "SELECT upper(min(val)) FROM t",
+                vec!["SELECT upper(min(t.val)) FROM t"],
+                None,
+            ),
+        ] {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("plan {sql}: {e}"))
+                .create_physical_plan()
+                .await
+                .unwrap_or_else(|e| panic!("physical plan for {sql}: {e}"));
+            let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert_eq!(
+                all_pushed_sql(&plan),
+                expected_remote,
+                "remote SQL for {sql}; plan:\n{rendered}"
+            );
+            if let Some(function) = expected_local {
+                assert!(
+                    rendered
+                        .lines()
+                        .any(|line| line.contains("ProjectionExec") && line.contains(function)),
+                    "{function} must be evaluated by a local ProjectionExec for {sql}; plan:\n{rendered}"
+                );
+            }
+        }
     }
 
     /// Unparse a plan the way a federated connector would, and demand it
@@ -1110,6 +1204,255 @@ mod tests {
             ),
             "refused for another reason: {err}"
         );
+    }
+
+    /// A scan of `name(id)` holding `ids`. Unlike `id_source`'s, `DataFusion` can
+    /// execute it, so a guard can set what the plan returns beside what its
+    /// unparsed SQL returns from a real engine.
+    fn id_table(name: &str, ids: &[&str]) -> LogicalPlan {
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::datasource::{MemTable, provider_as_source};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("build the id batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the id table");
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(table)), Some(vec![0]))
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    /// `id_table(name, ids)` keeping only the row whose `id` is `kept`.
+    fn id_table_where(name: &str, ids: &[&str], kept: &str) -> LogicalPlan {
+        LogicalPlanBuilder::from(id_table(name, ids))
+            .filter(col(format!("{name}.id")).eq(lit(kept)))
+            .expect("filter")
+            .build()
+            .expect("build filter")
+    }
+
+    /// Sorted rows as text, with `None` for NULL, so two engines' answers compare
+    /// as multisets.
+    #[cfg(feature = "sqlite")]
+    type Rows = Vec<Vec<Option<String>>>;
+
+    /// What `DataFusion` returns for `plan`: the oracle the unparsed SQL is held
+    /// to. Executing a plan shares no code with unparsing it.
+    #[cfg(feature = "sqlite")]
+    async fn datafusion_rows(plan: &LogicalPlan) -> Rows {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::compute::cast;
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan.clone())
+            .await
+            .expect("plan the oracle")
+            .collect()
+            .await
+            .expect("execute the oracle");
+        let mut rows = Rows::new();
+        for batch in batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| cast(column, &DataType::Utf8).expect("render a column as text"))
+                .collect::<Vec<_>>();
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.as_string::<i32>();
+                            (!column.is_null(row)).then(|| column.value(row).to_string())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// What `SQLite` returns for `sql` over `tables`, each `name(id TEXT)`.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_rows(tables: &[(&str, &[&str])], sql: &str) -> Rows {
+        let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+        for (name, ids) in tables {
+            conn.execute(&format!("CREATE TABLE {name} (id TEXT NOT NULL)"), [])
+                .expect("create a table");
+            for id in *ids {
+                conn.execute(&format!("INSERT INTO {name} VALUES (?1)"), [id])
+                    .expect("insert a row");
+            }
+        }
+        let mut statement = conn
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+        let width = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_else(|error| panic!("SQLite could not run {sql}: {error}"))
+            .collect::<Result<Rows, _>>()
+            .unwrap_or_else(|error| panic!("SQLite failed reading the rows of {sql}: {error}"));
+        rows.sort();
+        rows
+    }
+
+    /// Unparses `plan` for `SQLite`, runs it over `tables`, and demands the rows
+    /// `DataFusion` returns for the plan itself.
+    #[cfg(feature = "sqlite")]
+    async fn assert_sqlite_returns_the_plans_rows(
+        shape: &str,
+        plan: &LogicalPlan,
+        tables: &[(&str, &[&str])],
+    ) {
+        let expected = datafusion_rows(plan).await;
+        assert!(
+            expected.len() > 1,
+            "{shape}: the plan returns {} row(s), too few for a wrong scope to change",
+            expected.len()
+        );
+        let sql = unparse_with("sqlite", &SqliteDialect {}, plan);
+        assert_eq!(
+            sqlite_rows(tables, &sql),
+            expected,
+            "{shape}: SQLite returned other rows than the plan for: {sql}"
+        );
+    }
+
+    /// Regression test for #14373, fixed by fork PR #233: a join that is the
+    /// *right* input of another join was linearised into the enclosing `FROM`
+    /// with its right side first — `a ⋈ (b ⋈ c)` came out as
+    /// `FROM a INNER JOIN c ON b.id = c.id … JOIN b ON a.id = b.id`, naming `b`
+    /// before it is in scope. `PostgreSQL`, `DuckDB` and `SQLite` reject it, and an
+    /// engine that binds lazily runs a different join tree. The nested join stays
+    /// a parenthesised joined table on the right, and a LEFT JOIN folds a filter
+    /// from inside it into its own `ON`, since the shared `WHERE` would discard
+    /// the left rows the LEFT JOIN preserves.
+    #[tokio::test]
+    async fn a_join_that_is_another_joins_right_input_stays_on_its_right() {
+        let a: &[&str] = &["1", "2", "3"];
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1", "2", "4"];
+        let nested = |b_input: LogicalPlan, outer: JoinType| {
+            LogicalPlanBuilder::from(id_table("a", a))
+                .join(
+                    id_join(b_input, id_table("c", c), JoinType::Inner, ("b.id", "c.id")),
+                    outer,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )
+                .expect("outer join")
+                .project(vec![col("a.id"), col("b.id"), col("c.id")])
+                .expect("projection")
+                .build()
+                .expect("build")
+        };
+        let shapes = [
+            (
+                "a INNER JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Inner),
+            ),
+            (
+                "a FULL JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Full),
+            ),
+            (
+                "a LEFT JOIN (b[id = '1'] JOIN c)",
+                nested(id_table_where("b", b, "1"), JoinType::Left),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("a", a), ("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            // `b` has to be in scope where the outer join's `ON` names it, so the
+            // nested join is introduced, parenthesised, before that `ON`.
+            assert_precedes(&sql, "JOIN (b", "ON a.id = b.id");
+            assert!(
+                !sql.contains("WHERE"),
+                "{shape}: a filter from the nested input reached the enclosing WHERE: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14375, fixed by fork PR #234: a `Limit` that is a join
+    /// input got a scope of its own only when the enclosing `SELECT` already had a
+    /// `WHERE` or a projection. Without either, its `LIMIT` landed on the enclosing
+    /// query and bounded the join's output instead of one input — with
+    /// `b = {1, 2}` and `c = {1}`, `b FULL JOIN (c LIMIT 1)` returns two rows and
+    /// the SQL returned one. The limited input is derived under its scan's own
+    /// name, which the join's `ON` and the select list already use.
+    #[tokio::test]
+    async fn a_limit_on_a_join_input_bounds_that_input_rather_than_the_join() {
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1"];
+        let limited = |name: &str, ids: &[&str]| {
+            LogicalPlanBuilder::from(id_table(name, ids))
+                .limit(0, Some(1))
+                .expect("limit")
+                .build()
+                .expect("build limit")
+        };
+        let shapes = [
+            (
+                "b FULL JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Full,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "b LEFT JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Left,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "(c LIMIT 1) RIGHT JOIN b",
+                id_join(
+                    limited("c", c),
+                    id_table("b", b),
+                    JoinType::Right,
+                    ("c.id", "b.id"),
+                ),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            assert!(
+                paren_depth_at(&sql, first_offset_of(&sql, "LIMIT 1")) >= 1,
+                "{shape}: the input's LIMIT bounds the whole join instead of a derived table \
+                 of its own: {sql}"
+            );
+        }
     }
 
     fn federation_dialects() -> Vec<(&'static str, Arc<dyn Dialect>)> {
@@ -3003,7 +3346,7 @@ mod tests {
         ]));
         Arc::new(DefaultTableSource::new(Arc::new(
             create_spice_federated_table_provider(
-                test_sql_table(),
+                owned_test_sql_table(),
                 schema,
                 TableReference::bare("t"),
                 None,
@@ -3274,8 +3617,7 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
         ]));
-        let executor: Arc<dyn SQLExecutor> =
-            Arc::new(DenyFunctionsSqlExecutor::new(test_sql_table(), None));
+        let executor = test_sql_table() as Arc<dyn SQLExecutor>;
         let source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_schema(
             Arc::new(SQLFederationProvider::new(executor)),
             RemoteTableRef::from(TableReference::bare("t")),
@@ -3479,6 +3821,95 @@ mod tests {
         }
     }
 
+    /// MySQL's bare `DATETIME` keeps no fractional seconds and rounds a literal with
+    /// more than six, so a fractional-second filter must reach it as `DATETIME(6)`
+    /// with the literal cut to six digits, or it compares a different instant.
+    #[test]
+    fn a_fractional_second_filter_unparsed_for_mysql_keeps_its_precision() {
+        let at = |nanos: i64| lit(ScalarValue::TimestampNanosecond(Some(nanos), None));
+        // 1994-06-15 12:30:00.5 and 12:30:00.123456789 as nanoseconds since the Unix epoch.
+        let (half_second, nine_digits) = (771_683_400_500_000_000, 771_683_400_123_456_789);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            )]),
+            None,
+        )
+        .expect("scan events")
+        .filter(
+            col("ts")
+                .eq(at(half_second))
+                .or(col("ts").eq(at(nine_digits))),
+        )
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("mysql", &MySqlDialect {}, &plan);
+        for literal in [
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))",
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))",
+        ] {
+            assert!(
+                sql.contains(literal),
+                "MySQL must compare at microsecond precision, or the filter selects the wrong \
+                 rows: expected {literal} in {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14941: `INTERSECT` and `EXCEPT` are planned as semi
+    /// and anti joins whose keys match NULLs, because a set operation treats two
+    /// NULLs as the same value. `=` is never true on NULL, so the federated
+    /// statement must compare those keys with `IS NOT DISTINCT FROM` (`<=>` on
+    /// MySQL), or the remote engine drops every row with a NULL in a compared
+    /// column from an `INTERSECT` and keeps it in an `EXCEPT`.
+    #[test]
+    fn intersect_and_except_unparse_keys_that_match_nulls() {
+        let scan = |name: &str| {
+            LogicalPlanBuilder::scan(
+                name,
+                table_source(vec![Field::new("k", DataType::Utf8, true)]),
+                None,
+            )
+            .and_then(|scan| scan.project(vec![col("k")]))
+            .and_then(LogicalPlanBuilder::build)
+            .unwrap_or_else(|error| panic!("scan {name}: {error}"))
+        };
+        // (dialect, identifier quote, how it spells a key comparison that matches NULLs)
+        let dialects: [(&str, &dyn Dialect, char, &str); 3] = [
+            ("duckdb", &DuckDBDialect::new(), '"', "IS NOT DISTINCT FROM"),
+            (
+                "postgres",
+                &PostgreSqlDialect {},
+                '"',
+                "IS NOT DISTINCT FROM",
+            ),
+            ("mysql", &MySqlDialect {}, '`', "<=>"),
+        ];
+        for (operation, exists) in [("INTERSECT", "EXISTS"), ("EXCEPT", "NOT EXISTS")] {
+            let plan = if operation == "INTERSECT" {
+                LogicalPlanBuilder::intersect(scan("a"), scan("b"), false)
+            } else {
+                LogicalPlanBuilder::except(scan("a"), scan("b"), false)
+            }
+            .unwrap_or_else(|error| panic!("{operation}: {error}"));
+            for (dialect_name, dialect, q, matches) in dialects {
+                assert_eq!(
+                    unparse_with(dialect_name, dialect, &plan),
+                    format!(
+                        "SELECT DISTINCT {q}a{q}.{q}k{q} FROM {q}a{q} WHERE {exists} \
+                         (SELECT 1 FROM {q}b{q} WHERE ({q}a{q}.{q}k{q} {matches} {q}b{q}.{q}k{q}))"
+                    ),
+                    "{dialect_name}: {operation} must compare its keys so that NULLs match"
+                );
+            }
+        }
+    }
+
     /// Regression test for the unparser's `rescope_projection_over_projection`,
     /// carried by the `spiceai/datafusion` fork (upstream's
     /// apache/datafusion#22961): common subexpression elimination leaves a
@@ -3629,6 +4060,434 @@ mod tests {
             stats.num_rows, input_rows,
             "casting changes column types, not row counts, so the cast node has to report \
              its input's row count"
+        );
+    }
+
+    /// The federated scan of a `SqlTable` built through
+    /// `create_spice_federated_table_provider`, refusing `json_get_str`, and the
+    /// physical plan of each statement against it: which sorts and limits reach
+    /// the remote SQL.
+    mod scan_pushdown {
+        use super::*;
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column as PhysicalColumn};
+        use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
+        use datafusion_federation::FederatedQueryPlanner;
+        use datafusion_federation::schema_cast::SchemaCastScanExec;
+        use datafusion_federation::sql::{VirtualExecutionPlan, federation_analyzer_rule};
+
+        fn context() -> SessionContext {
+            let state = SessionStateBuilder::new()
+                .with_default_features()
+                .with_analyzer_rule(Arc::new(federation_analyzer_rule()))
+                .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            ctx.register_udf(stub_udf("json_get_str").as_ref().clone());
+            ctx
+        }
+
+        /// Registers `name` as a `SqlTable` refusing `json_get_str`, with its
+        /// scan's sort pushdown switch set to `sort_pushdown`.
+        fn register_sql_table(ctx: &SessionContext, name: &str, sort_pushdown: bool) {
+            let table = owned_test_sql_table().with_allow_physical_sort_pushdown(sort_pushdown);
+            let schema = table.schema();
+            let provider = create_spice_federated_table_provider(
+                table,
+                schema,
+                TableReference::bare(name),
+                Some(deny_support(&["json_get_str"])),
+            );
+            ctx.register_table(name, Arc::new(provider))
+                .expect("register the federated table");
+        }
+
+        async fn physical_plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+            ctx.sql(sql)
+                .await
+                .unwrap_or_else(|e| panic!("plan {sql}: {e}"))
+                .create_physical_plan()
+                .await
+                .unwrap_or_else(|e| panic!("physical plan for {sql}: {e}"))
+        }
+
+        fn rendered(plan: &Arc<dyn ExecutionPlan>) -> String {
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+        }
+
+        /// Regression test for the `datafusion-federation` and
+        /// `datafusion-table-providers` fork patches that let a federated scan
+        /// take a sort (`VirtualExecutionPlan::try_pushdown_sort`, forwarded by
+        /// `SchemaCastScanExec`; `SqlTable::supports_sort_pushdown`).
+        ///
+        /// Once the source refuses the projection that calls a Spice-only
+        /// function, the analyzer federates the scan beneath it and the `ORDER BY`
+        /// sits above that scan. With the patches the sort reaches the source and
+        /// `DataFusion` keeps no sort of its own; without any one of them it sorts
+        /// every row locally. A table whose own scan has sort pushdown switched
+        /// off (`ScyllaDB` accepts `ORDER BY` only in narrow cases) must keep the
+        /// sort local here too, and so must a sort on the function's own result.
+        #[tokio::test]
+        async fn a_sort_above_a_refused_projection_reaches_the_source() {
+            let ctx = context();
+            register_sql_table(&ctx, "t", true);
+            register_sql_table(&ctx, "s", false);
+
+            let mut mismatches = vec![];
+            for (sql, expected_remote, sorts_locally) in [
+                (
+                    "SELECT json_get_str(val) AS j, id FROM t ORDER BY id",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id ASC NULLS LAST",
+                    false,
+                ),
+                (
+                    "SELECT json_get_str(val) AS j, id FROM s ORDER BY id",
+                    "SELECT s.id, s.val FROM s",
+                    true,
+                ),
+                (
+                    "SELECT json_get_str(val) AS j FROM t ORDER BY j",
+                    "SELECT t.val FROM t",
+                    true,
+                ),
+            ] {
+                let plan = physical_plan(&ctx, sql).await;
+                let rendered = rendered(&plan);
+                let remote = all_pushed_sql(&plan);
+                if remote != [expected_remote] {
+                    mismatches.push(format!("{sql}\n  remote SQL: {remote:?}\n{rendered}"));
+                }
+                if rendered.contains("SortExec") != sorts_locally {
+                    mismatches.push(format!(
+                        "{sql}\n  expected a local SortExec: {sorts_locally}\n{rendered}"
+                    ));
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        }
+
+        /// An executor that refuses `json_get_str` and says nothing about sorts.
+        struct SilentExecutor;
+
+        #[async_trait]
+        impl SQLExecutor for SilentExecutor {
+            fn name(&self) -> &'static str {
+                "silent"
+            }
+
+            fn compute_context(&self) -> Option<String> {
+                Some("silent".to_string())
+            }
+
+            fn dialect(&self) -> Arc<dyn datafusion::sql::unparser::dialect::Dialect> {
+                Arc::new(DefaultDialect {})
+            }
+
+            fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+                !crate::function_support::contains_unsupported_functions(
+                    plan,
+                    &deny_support(&["json_get_str"]),
+                )
+                .unwrap_or(true)
+            }
+
+            fn execute(
+                &self,
+                _query: &str,
+                _schema: SchemaRef,
+                _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
+            ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream>
+            {
+                Err(DataFusionError::NotImplemented("planning only".to_string()))
+            }
+
+            async fn table_names(&self) -> DataFusionResult<Vec<String>> {
+                Err(DataFusionError::NotImplemented("planning only".to_string()))
+            }
+
+            async fn get_table_schema(&self, _table_name: &str) -> DataFusionResult<SchemaRef> {
+                Err(DataFusionError::NotImplemented("planning only".to_string()))
+            }
+        }
+
+        /// Regression test for the `datafusion-federation` fork's default of
+        /// `SQLExecutor::supports_sort_pushdown`. Accepting a sort declares the
+        /// remote's order exact and removes `DataFusion`'s own sort, so an
+        /// executor that has not said its engine orders rows as `DataFusion` would
+        /// (Flight, Flight SQL, Spark Connect and Turso here) must keep the sort
+        /// local. The statement is the one the `SqlTable` above sends sorted.
+        #[tokio::test]
+        async fn an_executor_that_does_not_opt_in_keeps_the_sort_local() {
+            let ctx = context();
+            let schema = owned_test_sql_table().schema();
+            let source: Arc<dyn FederatedTableSource> = Arc::new(SQLTableSource::new_with_schema(
+                Arc::new(SQLFederationProvider::new(Arc::new(SilentExecutor))),
+                RemoteTableRef::from(TableReference::bare("r")),
+                schema,
+            ));
+            ctx.register_table("r", Arc::new(FederatedTableProviderAdaptor::new(source)))
+                .expect("register the federated table");
+
+            let sql = "SELECT json_get_str(val) AS j, id FROM r ORDER BY id";
+            let plan = physical_plan(&ctx, sql).await;
+            let rendered = rendered(&plan);
+            assert_eq!(
+                all_pushed_sql(&plan),
+                ["SELECT r.id, r.val FROM r"],
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("SortExec"),
+                "the sort must stay local: {rendered}"
+            );
+        }
+
+        fn sort_on(name: &str, index: usize) -> Vec<PhysicalSortExpr> {
+            vec![PhysicalSortExpr::new(
+                Arc::new(PhysicalColumn::new(name, index)),
+                SortOptions::default(),
+            )]
+        }
+
+        /// Whether `cast` takes a sort on `order` as `Exact`; it must never
+        /// answer `Inexact`.
+        fn takes(cast: &SchemaCastScanExec, order: &[PhysicalSortExpr]) -> bool {
+            match cast.try_pushdown_sort(order).expect("try_pushdown_sort") {
+                SortOrderPushdownResult::Exact { inner } => {
+                    assert_eq!(
+                        inner.properties().output_ordering().map(|o| o.to_vec()),
+                        Some(order.to_vec()),
+                        "an Exact answer must declare the ordering"
+                    );
+                    true
+                }
+                SortOrderPushdownResult::Inexact { .. } => {
+                    panic!("expected Exact or Unsupported")
+                }
+                SortOrderPushdownResult::Unsupported => false,
+            }
+        }
+
+        /// Regression test for the `datafusion-federation` fork's
+        /// `SchemaCastScanExec::try_pushdown_sort`: it passes a sort to the scan
+        /// beneath only on columns the cast leaves at their type. A cast can
+        /// change how a column's values order, and a sort accepted on the
+        /// remote's type would be declared as the order of the cast values,
+        /// returning rows out of the requested order.
+        #[test]
+        fn a_schema_cast_passes_a_sort_only_on_columns_it_keeps_at_their_type() {
+            let table = Arc::new(owned_test_sql_table());
+            let plan = LogicalPlanBuilder::scan(
+                "t",
+                datafusion::datasource::provider_as_source(
+                    Arc::clone(&table) as Arc<dyn TableProvider>
+                ),
+                None,
+            )
+            .expect("scan")
+            .build()
+            .expect("plan");
+            let scan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(VirtualExecutionPlan::new(
+                    plan.clone(),
+                    Arc::clone(&table) as Arc<dyn SQLExecutor>,
+                    datafusion::common::Statistics::new_unknown(&table.schema()),
+                    None,
+                ))
+            };
+
+            let same = SchemaCastScanExec::new(scan(), table.schema());
+            assert!(
+                takes(&same, &sort_on("id", 0)),
+                "a kept column passes the sort through"
+            );
+
+            let id_widened = SchemaCastScanExec::new(
+                scan(),
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("val", DataType::Utf8, true),
+                ])),
+            );
+            assert!(
+                !takes(&id_widened, &sort_on("id", 0)),
+                "a recast column must not take the sort"
+            );
+            assert!(
+                takes(&id_widened, &sort_on("val", 1)),
+                "a column the cast keeps still does"
+            );
+        }
+
+        /// Registers `t` and `u`, `SqlTable`s on one remote that refuse
+        /// `json_get_str`, so a join between them federates as one statement.
+        fn register_shared_tables(ctx: &SessionContext) {
+            let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
+                Arc::new(SharedContextPool {});
+            for name in ["t", "u"] {
+                let table = shared_context_sql_table(&pool, name);
+                let schema = table.schema();
+                let provider = create_spice_federated_table_provider(
+                    table,
+                    schema,
+                    TableReference::bare(name),
+                    Some(deny_support(&["json_get_str"])),
+                );
+                ctx.register_table(name, Arc::new(provider))
+                    .expect("register the federated table");
+            }
+        }
+
+        /// Regression test for the fork patches that carry a limit into a
+        /// federated scan: `datafusion-federation`'s `VirtualExecutionPlan::with_fetch`,
+        /// passed through by `SchemaCastScanExec`, and `datafusion`'s
+        /// `RepartitionExec::with_fetch`.
+        ///
+        /// Once the source refuses the projection that calls a Spice-only
+        /// function, the analyzer federates the scan or join beneath it, and a
+        /// `LIMIT` or `ORDER BY … LIMIT` sits above the refused projection.
+        /// `DataFusion` hands the limit down through the projection and, for a
+        /// sort, through the round-robin repartition it puts above a
+        /// single-partition scan; the federated scan takes it into its SQL.
+        /// Without the patches the remote is asked for every row, sorted.
+        #[tokio::test]
+        async fn a_limit_above_a_refused_projection_reaches_the_source() {
+            let ctx = context();
+            register_shared_tables(&ctx);
+            let mut mismatches = vec![];
+            // (statement, SQL the source receives, a node the local plan must
+            // keep, a node it must not)
+            for (sql, expected_remote, keeps, drops) in [
+                (
+                    "SELECT json_get_str(val) FROM t LIMIT 3",
+                    "SELECT t.val FROM t LIMIT 3",
+                    None,
+                    Some("LimitExec"),
+                ),
+                (
+                    "SELECT json_get_str(val) FROM t ORDER BY id LIMIT 3",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id ASC NULLS LAST LIMIT 3",
+                    None,
+                    Some("SortExec"),
+                ),
+                // The source returns the rows the offset skips as well, and the
+                // offset is applied here.
+                (
+                    "SELECT json_get_str(val) FROM t ORDER BY id DESC LIMIT 3 OFFSET 2",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id DESC NULLS FIRST LIMIT 5",
+                    Some("GlobalLimitExec: skip=2, fetch=3"),
+                    Some("SortExec"),
+                ),
+                // The function above a join: the join federates, and so does the
+                // limit, over the join's own select list.
+                (
+                    "SELECT json_get_str(t.val) FROM t JOIN u ON t.id = u.id LIMIT 3",
+                    "SELECT t.id, t.val, u.id FROM t INNER JOIN u ON (t.id = u.id) LIMIT 3",
+                    None,
+                    Some("LimitExec"),
+                ),
+                (
+                    "SELECT json_get_str(t.val), t.id, u.id FROM t JOIN u ON t.id = u.id LIMIT 3",
+                    "SELECT t.id, t.val, u.id FROM t INNER JOIN u ON (t.id = u.id) LIMIT 3",
+                    None,
+                    Some("LimitExec"),
+                ),
+            ] {
+                let plan = physical_plan(&ctx, sql).await;
+                let rendered = rendered(&plan);
+                let remote = all_pushed_sql(&plan);
+                if remote != [expected_remote] {
+                    mismatches.push(format!("{sql}\n  remote SQL: {remote:?}\n{rendered}"));
+                }
+                if keeps.is_some_and(|node| !rendered.contains(node)) {
+                    mismatches.push(format!("{sql}\n  must keep {keeps:?}\n{rendered}"));
+                }
+                if drops.is_some_and(|node| rendered.contains(node)) {
+                    mismatches.push(format!("{sql}\n  must not keep {drops:?}\n{rendered}"));
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        }
+
+        /// The limit stays above what it cannot cross, and out of the SQL when
+        /// the remote could not take it as a `LIMIT`.
+        #[tokio::test]
+        async fn a_limit_stays_where_the_source_cannot_take_it() {
+            let ctx = context();
+            register_shared_tables(&ctx);
+            let mut mismatches = vec![];
+            for (sql, expected_remote) in [
+                // A limit taken before the filter would keep rows the filter drops.
+                (
+                    "SELECT id FROM t WHERE json_get_str(val) = 'x' LIMIT 3",
+                    "SELECT t.id, t.val FROM t",
+                ),
+                // The source cannot order by a value only Spice computes.
+                (
+                    "SELECT json_get_str(val) AS j FROM t ORDER BY j LIMIT 3",
+                    "SELECT t.val FROM t",
+                ),
+                // Offset plus count is past the signed 64-bit `LIMIT` a source
+                // takes (`PostgreSQL`: "bigint out of range"); each alone is not.
+                (
+                    "SELECT json_get_str(val) FROM t ORDER BY id \
+                     LIMIT 9223372036854775807 OFFSET 9223372036854775807",
+                    "SELECT t.id, t.val FROM t ORDER BY t.id ASC NULLS LAST",
+                ),
+            ] {
+                let plan = physical_plan(&ctx, sql).await;
+                let rendered = rendered(&plan);
+                let remote = all_pushed_sql(&plan);
+                if remote != [expected_remote] {
+                    mismatches.push(format!("{sql}\n  remote SQL: {remote:?}\n{rendered}"));
+                }
+            }
+            assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        }
+    }
+
+    /// MySQL's bare `DATETIME` keeps no fractional seconds, so a timestamp
+    /// pushed down as `CAST('… .5' AS DATETIME)` compares against the whole
+    /// second and a filter on a fractional-second value selects the wrong rows
+    /// (#14929). The cast names the precision of the literal's unit, at most the
+    /// six digits MySQL holds, and longer literals are cut to six, not rounded.
+    #[test]
+    fn a_mysql_timestamp_literal_keeps_its_fractional_seconds() {
+        let unparser = Unparser::new(&MySqlDialect {});
+        let render = |value: ScalarValue| {
+            unparser
+                .expr_to_sql(&lit(value))
+                .expect("unparse timestamp literal")
+                .to_string()
+        };
+        // 1994-06-15 12:30:00 UTC plus a fraction, in each unit.
+        assert_eq!(
+            render(ScalarValue::TimestampNanosecond(
+                Some(771_683_400_500_000_000),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampNanosecond(
+                Some(771_683_400_123_456_789),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampMillisecond(
+                Some(771_683_400_500),
+                None
+            )),
+            "CAST('1994-06-15 12:30:00.500' AS DATETIME(3))"
+        );
+        assert_eq!(
+            render(ScalarValue::TimestampSecond(Some(771_683_400), None)),
+            "CAST('1994-06-15 12:30:00' AS DATETIME(0))"
         );
     }
 }

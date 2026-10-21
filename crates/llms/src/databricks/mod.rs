@@ -31,7 +31,7 @@ use async_openai::{
         ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream, ChatCompletionTools,
         CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse, PromptTokensDetails,
-        ServiceTier,
+        ServiceTierResponse,
     },
     types::embeddings::{CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput},
 };
@@ -183,7 +183,7 @@ pub fn from_access_token(
 
     Databricks {
         model: model.to_string(),
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         health_check: HealthCheck::Required,
         cache: None,
     }
@@ -209,7 +209,7 @@ pub fn from_token_provider(
 
     Databricks {
         model: model.to_string(),
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         health_check,
         cache: None,
     }
@@ -222,7 +222,7 @@ pub struct DatabricksCreateChatCompletionStreamResponse {
     pub choices: Vec<ChatChoiceStream>,
     pub created: u32,
     pub model: String,
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<ServiceTierResponse>,
     pub system_fingerprint: Option<String>,
     pub object: String,
 

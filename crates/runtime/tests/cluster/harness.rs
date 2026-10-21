@@ -139,7 +139,7 @@ pub struct ClusterHarness {
     /// Executor registry for checking flight SQL client readiness.
     executor_registry: Option<Arc<ExecutorRegistry>>,
     /// PKI infrastructure for creating new executor certs (late-join support).
-    pki: test_framework::pki::PkiConfig,
+    pki: Option<test_framework::pki::PkiConfig>,
     /// Scheduler's cluster advertise address.
     scheduler_cluster_addr: String,
     /// Keep the temp directory alive for the harness lifetime.
@@ -236,6 +236,21 @@ impl ClusterHarness {
         }
     }
 
+    /// The executors the scheduler's Ballista state holds, as `(id, host:port)`
+    /// sorted by id.
+    pub async fn registered_executors(&self) -> Result<Vec<(String, String)>, anyhow::Error> {
+        let mut executors: Vec<(String, String)> = self
+            .executor_manager
+            .get_executors_state()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .into_iter()
+            .map(|(metadata, _, _)| (metadata.id, format!("{}:{}", metadata.host, metadata.port)))
+            .collect();
+        executors.sort();
+        Ok(executors)
+    }
+
     /// Run a SQL query through the scheduler and collect all result batches.
     pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
         QueryBuilder::new(sql, self.scheduler.datafusion())
@@ -247,6 +262,27 @@ impl ClusterHarness {
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| anyhow::Error::msg(format!("query stream failed: {e}")))
+    }
+
+    /// Run `sql` as a Ballista job and collect all result batches. Unlike
+    /// [`query`](Self::query), which runs on the scheduler alone, the plan is
+    /// serialized and its tasks run on the executors.
+    pub async fn query_distributed(
+        &self,
+        sql: &str,
+        job_id: &str,
+    ) -> Result<Vec<RecordBatch>, anyhow::Error> {
+        QueryBuilder::new(sql, self.scheduler.datafusion())
+            .build()
+            .submit_distributed(job_id)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("submitting {job_id} failed: {e}")))?
+            .into_stream()
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("{job_id} failed: {e}")))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("{job_id} stream failed: {e}")))
     }
 
     /// Run `EXPLAIN <sql>` through the scheduler and collect all result batches.
@@ -268,7 +304,7 @@ impl ClusterHarness {
         let (executor_rt, executor_handle) = start_executor(
             &label,
             executor_app,
-            &self.pki,
+            self.pki.as_ref(),
             &self.scheduler_cluster_addr,
         )
         .await?;
@@ -299,6 +335,7 @@ impl ClusterHarness {
 pub struct ClusterHarnessBuilder {
     scheduler_app: Option<App>,
     executor_apps: Vec<Option<App>>,
+    allow_insecure_connections: bool,
 }
 
 impl ClusterHarnessBuilder {
@@ -306,12 +343,19 @@ impl ClusterHarnessBuilder {
         Self {
             scheduler_app: None,
             executor_apps: Vec::new(),
+            allow_insecure_connections: false,
         }
     }
 
     /// Set the scheduler's `App` (datasets, runtime config, etc.).
     pub fn scheduler(mut self, app: App) -> Self {
         self.scheduler_app = Some(app);
+        self
+    }
+
+    /// Start nodes with `--allow-insecure-connections` and no cluster certificates.
+    pub fn without_mtls(mut self) -> Self {
+        self.allow_insecure_connections = true;
         self
     }
 
@@ -344,17 +388,17 @@ impl ClusterHarnessBuilder {
 
         let tempdir = Arc::new(tempfile::tempdir().expect("should create temp dir"));
 
-        let pki = init_pki(tempdir.path()).map_err(anyhow::Error::msg)?;
+        let pki = if self.allow_insecure_connections {
+            None
+        } else {
+            Some(init_pki(tempdir.path()).map_err(anyhow::Error::msg)?)
+        };
 
         let n_executors = self.executor_apps.len();
 
         // --- Scheduler ---
 
         let scheduler_ports = NodePorts::allocate();
-
-        let scheduler_cert = pki
-            .create_client_cert("scheduler")
-            .map_err(anyhow::Error::msg)?;
 
         let scheduler_app = self
             .scheduler_app
@@ -367,12 +411,7 @@ impl ClusterHarnessBuilder {
                 role: Some(ClusterRole::Scheduler),
                 node_bind_address: scheduler_ports.cluster_addr(),
                 node_advertise_address: Some("127.0.0.1".to_string()),
-                node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
-                node_mtls_certificate_file: Some(
-                    scheduler_cert.cert_path.to_string_lossy().to_string(),
-                ),
-                node_mtls_key_file: Some(scheduler_cert.key_path.to_string_lossy().to_string()),
-                ..Default::default()
+                ..node_tls_config(pki.as_ref(), "scheduler")?
             },
             ..Default::default()
         };
@@ -382,7 +421,8 @@ impl ClusterHarnessBuilder {
                 .with_runtime_config(scheduler_config.clone())
                 .with_resolved_cluster_config(
                     ResolvedClusterConfig::try_new(scheduler_config.cluster.clone())
-                        .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                        .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                        .with_instance_id("scheduler"),
                 )
                 .with_app(scheduler_app)
                 .build()
@@ -431,7 +471,7 @@ impl ClusterHarnessBuilder {
                 maybe_app.unwrap_or_else(|| AppBuilder::new(format!("test_{label}")).build());
 
             let (executor_rt, executor_handle) =
-                start_executor(&label, executor_app, &pki, &scheduler_cluster_addr).await?;
+                start_executor(&label, executor_app, pki.as_ref(), &scheduler_cluster_addr).await?;
 
             executor_rts.push(executor_rt);
             handles.push(executor_handle);
@@ -469,6 +509,25 @@ impl ClusterHarnessBuilder {
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn node_tls_config(
+    pki: Option<&test_framework::pki::PkiConfig>,
+    label: &str,
+) -> Result<ClusterConfig, anyhow::Error> {
+    let Some(pki) = pki else {
+        return Ok(ClusterConfig {
+            allow_insecure_connections: true,
+            ..Default::default()
+        });
+    };
+    let cert = pki.create_client_cert(label).map_err(anyhow::Error::msg)?;
+    Ok(ClusterConfig {
+        node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
+        node_mtls_certificate_file: Some(cert.cert_path.to_string_lossy().to_string()),
+        node_mtls_key_file: Some(cert.key_path.to_string_lossy().to_string()),
+        ..Default::default()
+    })
+}
+
 /// Build, start, and wait for one executor node.
 ///
 /// Shared by [`ClusterHarnessBuilder::start`] (initial executors) and
@@ -476,11 +535,10 @@ impl ClusterHarnessBuilder {
 async fn start_executor(
     label: &str,
     app: App,
-    pki: &test_framework::pki::PkiConfig,
+    pki: Option<&test_framework::pki::PkiConfig>,
     scheduler_cluster_addr: &str,
 ) -> Result<(Arc<Runtime>, JoinHandle<RuntimeResult<()>>), anyhow::Error> {
     let executor_ports = NodePorts::allocate();
-    let executor_cert = pki.create_client_cert(label).map_err(anyhow::Error::msg)?;
 
     tracing::warn!("{label}: Ports: {executor_ports:?}. Scheduler: {scheduler_cluster_addr}");
     let executor_config = Config {
@@ -491,10 +549,7 @@ async fn start_executor(
             node_bind_address: executor_ports.cluster_addr(),
             scheduler_address: Some(scheduler_cluster_addr.to_string()),
             node_advertise_address: Some("127.0.0.1".to_string()),
-            node_mtls_ca_certificate_file: Some(pki.ca_cert_path.to_string_lossy().to_string()),
-            node_mtls_certificate_file: Some(executor_cert.cert_path.to_string_lossy().to_string()),
-            node_mtls_key_file: Some(executor_cert.key_path.to_string_lossy().to_string()),
-            ..Default::default()
+            ..node_tls_config(pki, label)?
         },
         ..Default::default()
     };
@@ -504,7 +559,8 @@ async fn start_executor(
             .with_runtime_config(executor_config.clone())
             .with_resolved_cluster_config(
                 ResolvedClusterConfig::try_new(executor_config.cluster.clone())
-                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?,
+                    .map_err(|e| anyhow::Error::msg(format!("cluster config: {e}")))?
+                    .with_instance_id(label),
             )
             .with_app(app)
             .build()

@@ -41,8 +41,10 @@ use data_components::http::auth::{
 };
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
+use percent_encoding::percent_decode_str;
 use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
-use secrecy::ExposeSecret;
+use runtime_object_store::http_auth;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::semantic::Column;
@@ -54,7 +56,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
-use url::Url;
+use url::{Url, form_urlencoded};
 
 use super::{ConnectorComponent, ConnectorParams};
 use super::{
@@ -70,6 +72,12 @@ use reqwest::{
 use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
+
+/// The `client_timeout` an HTTPS dataset gets when it sets none. Also the
+/// default bound for the rate-control acquire wait, so it must stay equal to
+/// the GraphQL client's timeout for datasets that share an origin.
+pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
@@ -442,12 +450,13 @@ impl Https {
             })
             .unwrap_or_default();
 
-        let rate_control = http_rate_control::resolve_config(
+        let mut rate_control = http_rate_control::resolve_config(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
             dataset,
             "https",
         )?;
+        rate_control.apply_default_acquire_timeout(self.configured_client_timeout());
 
         // Both of these bound memory, so an unparseable value is refused rather
         // than quietly replaced by a default: silently falling back would leave
@@ -463,7 +472,7 @@ impl Https {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/http"
+                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/https"
                     ),
                 }
             })?,
@@ -481,7 +490,7 @@ impl Https {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/http"
+                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/https"
                     ),
                     source: Box::new(source),
                 }
@@ -923,22 +932,31 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
-        let timeout_secs = self
-            .params
-            .get("client_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
+    fn configured_client_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("client_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS),
+        )
+    }
 
-        let connect_timeout_secs = self
-            .params
-            .get("connect_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(10);
+    fn configured_connect_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("connect_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+    }
+
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
+        let client_timeout = self.configured_client_timeout();
+        let connect_timeout = self.configured_connect_timeout();
 
         let pool_max_idle_per_host = self
             .params
@@ -958,8 +976,8 @@ impl Https {
 
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(connect_timeout)
+            .timeout(client_timeout)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {
@@ -1408,7 +1426,7 @@ impl Https {
 
         let rate_limiter = self
             .rate_control_registry
-            .shared_rate_limiter(&base_url)
+            .shared_rate_limiter_for_config(&base_url, &rate_control)
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
@@ -2202,9 +2220,27 @@ impl ListingTableConnector for HttpListingConnector {
             let _ = u.set_port(Some(n));
         }
 
-        if let Some(p) = self.params.get("password").expose().ok()
-            && u.set_password(Some(p)).is_err()
-        {
+        // The user name and password reach the object store as an `Authorization`
+        // header through `http_auth`, so the URL carries neither.
+        let username = self.params.get("username").expose().ok().map_or_else(
+            || {
+                percent_decode_str(u.username())
+                    .decode_utf8_lossy()
+                    .into_owned()
+            },
+            ToString::to_string,
+        );
+        let password = match self.params.get("password").ok() {
+            Some(password) => Some(password.clone()),
+            None => u.password().map(|password| {
+                SecretString::from(
+                    percent_decode_str(password)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                )
+            }),
+        };
+        if u.set_username("").is_err() || u.set_password(None).is_err() {
             return Err(
                 DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
                     dataconnector: "https".to_string(),
@@ -2213,18 +2249,17 @@ impl ListingTableConnector for HttpListingConnector {
             );
         }
 
-        if let Some(p) = self.params.get("username").expose().ok()
-            && u.set_username(p).is_err()
-        {
-            return Err(
-                DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                },
+        let mut fragment = build_fragments(&self.params, vec!["client_timeout"]);
+        if !username.is_empty() || password.is_some() {
+            let token = http_auth::register(
+                &u,
+                &username,
+                password.unwrap_or_else(|| SecretString::from(String::new())),
             );
+            form_urlencoded::Serializer::for_suffix(&mut fragment, 0)
+                .append_pair(http_auth::FRAGMENT_KEY, &token);
         }
-
-        u.set_fragment(Some(&build_fragments(&self.params, vec!["client_timeout"])));
+        u.set_fragment(Some(&fragment));
 
         Ok(u)
     }
@@ -2280,6 +2315,7 @@ mod tests {
         ];
 
         for (k, v) in extra {
+            params.retain(|(key, _)| key.as_str() != *k);
             params.push(((*k).to_string(), (*v).to_string().into()));
         }
 
@@ -2408,12 +2444,16 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         }
     }
 
-    fn assert_conflicting_rate_control_error(error: DataConnectorError) {
+    /// Assert a shared-origin rate-control conflict that quotes exactly
+    /// `differences`, the parameters it resolves differently with both values.
+    fn assert_conflicting_rate_control_error(error: DataConnectorError, differences: &str) {
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("different rate-control settings"),
-                    "expected shared-origin rate-control conflict, got: {message}"
+                    message.contains(&format!(
+                        "must resolve to the same rate-control settings, but this one differs from those already targeting it: {differences}. Set "
+                    )),
+                    "expected shared-origin rate-control conflict on {differences}, got: {message}"
                 );
             }
             other => panic!("expected shared-origin rate-control conflict, got: {other}"),
@@ -2755,7 +2795,10 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         else {
             panic!("mixed configured/unconfigured origin should be rejected");
         };
-        assert_conflicting_rate_control_error(error);
+        assert_conflicting_rate_control_error(
+            error,
+            "`max_concurrent_requests` is unset here and 2 there",
+        );
 
         let unconfigured = test_connector_with(&[]).await;
         let configured = test_connector_with(&[("max_concurrent_requests", "2")]).await;
@@ -2782,7 +2825,148 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         else {
             panic!("mixed unconfigured/configured origin should be rejected");
         };
-        assert_conflicting_rate_control_error(error);
+        assert_conflicting_rate_control_error(
+            error,
+            "`max_concurrent_requests` is 2 here and unset there",
+        );
+    }
+
+    /// Create HTTP providers for `datasets` (each a name and its params) that
+    /// all target `origin`, in order, returning the first failure.
+    async fn create_providers_on_one_origin(
+        origin: &str,
+        datasets: &[&[(&str, &str)]],
+    ) -> DataConnectorResult<()> {
+        for (index, params) in datasets.iter().enumerate() {
+            let connector = test_connector_with(params).await;
+            let dataset =
+                test_dataset(&format!("{origin}/data{index}"), RefreshMode::Append, None).await;
+            connector.create_http_table_provider(&dataset).await?;
+        }
+        Ok(())
+    }
+
+    /// Regression test for #14914: an explicit `rate_control_window` equal to
+    /// the default resolves to the same window as an unset one, so datasets that
+    /// set it either way share their origin, in either load order.
+    #[tokio::test]
+    async fn test_http_rate_control_window_equal_to_default_shares_origin() {
+        let explicit: &[(&str, &str)] = &[
+            ("requests_per_second_limit", "10"),
+            ("rate_control_window", "10s"),
+        ];
+        let unset: &[(&str, &str)] = &[("requests_per_second_limit", "10")];
+
+        create_providers_on_one_origin(
+            "https://window-explicit-first.example.com",
+            &[explicit, unset],
+        )
+        .await
+        .expect("an explicit default window must share an origin with an unset one");
+        create_providers_on_one_origin(
+            "https://window-unset-first.example.com",
+            &[unset, explicit],
+        )
+        .await
+        .expect("an unset window must share an origin with an explicit default one");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://window-differs.example.com",
+            &[
+                unset,
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_window", "20s"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("a window that resolves differently must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_window` is 20s here and 10s there",
+        );
+    }
+
+    /// The acquire timeout defaults to each dataset's `client_timeout`, but only
+    /// bounds the wait of a rate controller. Datasets without rate control build
+    /// none, so different client timeouts cannot conflict; rate-limited datasets
+    /// that share a controller must agree on its bound.
+    #[tokio::test]
+    async fn test_http_rate_control_acquire_default_conflicts_only_with_a_controller() {
+        create_providers_on_one_origin(
+            "https://client-timeouts-unlimited.example.com",
+            &[&[("client_timeout", "30")], &[("client_timeout", "60")]],
+        )
+        .await
+        .expect("datasets without rate control must share an origin whatever their timeouts");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://client-timeouts-limited.example.com",
+            &[
+                &[
+                    ("client_timeout", "30"),
+                    ("requests_per_second_limit", "10"),
+                ],
+                &[
+                    ("client_timeout", "60"),
+                    ("requests_per_second_limit", "10"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("rate-limited datasets with different acquire bounds must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_acquire_timeout` is 60s here and 30s there",
+        );
+    }
+
+    /// One failure threshold written as a percentage and as a fraction parses
+    /// to two adjacent floats, and must still share an origin.
+    #[tokio::test]
+    async fn test_http_rate_control_failure_threshold_spellings_share_origin() {
+        create_providers_on_one_origin(
+            "https://threshold-spellings.example.com",
+            &[
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "33.3%"),
+                ],
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "0.333"),
+                ],
+            ],
+        )
+        .await
+        .expect("two spellings of one failure threshold must share an origin");
+
+        let Err(error) = create_providers_on_one_origin(
+            "https://threshold-differs.example.com",
+            &[
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "33.3%"),
+                ],
+                &[
+                    ("requests_per_second_limit", "10"),
+                    ("rate_control_failure_threshold", "0.334"),
+                ],
+            ],
+        )
+        .await
+        else {
+            panic!("a different failure threshold must be rejected");
+        };
+        assert_conflicting_rate_control_error(
+            error,
+            "`rate_control_failure_threshold` is 33.4% here and 33.3% there",
+        );
     }
 
     #[tokio::test]
@@ -3307,6 +3491,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity comes from exactly the inline PEMs given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromPem {
+                cert_pem: resolved_cert,
+                key_pem: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_pem.as_bytes());
+                assert_eq!(resolved_key, key_pem.as_bytes());
+            }
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected an inline identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the inline identity should parse")
+                .is_some(),
+            "a configured inline identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3335,6 +3544,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity is read from exactly the two files given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromFiles {
+                cert_path: resolved_cert,
+                key_path: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_path);
+                assert_eq!(resolved_key, key_path);
+            }
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected a file-based identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the identity files should be read and parse")
+                .is_some(),
+            "a configured file identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3465,20 +3699,47 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     /// Rate-control metrics keep working through the combined provider — a
     /// delegating impl that silently answered `None` would leave them
     /// registered but never observed.
+    /// An `AsyncInstrument` that records what a metric callback observes.
+    #[derive(Default)]
+    struct RecordingInstrument(parking_lot::Mutex<Vec<u64>>);
+
+    impl opentelemetry::metrics::AsyncInstrument<u64> for RecordingInstrument {
+        fn observe(&self, measurement: u64, _attributes: &[KeyValue]) {
+            self.0.lock().push(measurement);
+        }
+    }
+
     #[tokio::test]
     async fn rate_control_metrics_still_observe_through_the_combined_provider() {
         let connector = test_connector_with(&[("max_concurrent_requests", "4")]).await;
+        // Apply the resolved config the way creating the table provider does,
+        // so the metric has the configured value to report.
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+        let config = http_rate_control::resolve_config(
+            &connector.params,
+            connector.runtime_rate_control_params.as_ref(),
+            &dataset,
+            "https",
+        )
+        .expect("the rate-control config should resolve");
+        connector.metrics.set_config(&config);
         let metrics_provider =
             DataConnector::metrics_provider(&connector).expect("the connector exposes metrics");
 
         let metric = metrics_provider
             .get_metric("rate_control_max_concurrent_requests")
             .expect("rate-control metrics remain available");
-        assert!(
-            metrics_provider
-                .callback_to_observe_metric(metric, vec![])
-                .is_some(),
-            "a rate-control metric must still be observed, not just listed"
+        let Some(ObserveMetricCallback::U64(callback)) =
+            metrics_provider.callback_to_observe_metric(metric, vec![])
+        else {
+            panic!("a rate-control metric must still be observed, as a u64, not just listed");
+        };
+        let observed = RecordingInstrument::default();
+        callback(&observed);
+        assert_eq!(
+            *observed.0.lock(),
+            vec![4],
+            "the callback must observe the configured max_concurrent_requests"
         );
     }
 

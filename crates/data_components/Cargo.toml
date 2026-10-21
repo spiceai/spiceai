@@ -6,6 +6,7 @@ license-file.workspace = true
 name = "data_components"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -91,7 +92,9 @@ reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
-runtime-request-context = { path = "../runtime-request-context" }
+runtime-request-context = { path = "../runtime-request-context", features = [
+  "datafusion",
+] }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -240,3 +243,8 @@ required-features = ["mysql"]
 
 [lints]
 workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

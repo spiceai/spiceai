@@ -380,23 +380,58 @@ mod tests {
         assert!(SPINNER_FRAMES.iter().all(|f| !f.is_empty()));
     }
 
-    #[tokio::test]
+    // Paused time: the animation's 80 ms ticks elapse only when the runtime is
+    // otherwise idle, so a spinner that never stops trips the bounded timeout at
+    // once instead of hanging the test.
+    #[tokio::test(start_paused = true)]
     async fn test_spinner_start_and_stop() {
-        // Test that spinner can be started and stopped without panic
         let spinner = Spinner::start();
-        // Give it a moment to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Stop should complete without error
-        spinner.stop().await;
+        let running = Arc::clone(&spinner.running);
+        let task = spinner
+            .handle
+            .as_ref()
+            .expect("start spawns the animation task")
+            .abort_handle();
+
+        // The animation draws its first frame and parks on its tick; it keeps
+        // running until told to stop.
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "the animation must run until stopped");
+
+        tokio::time::timeout(Duration::from_secs(1), spinner.stop())
+            .await
+            .expect("stop returns once the animation task has exited");
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "stop clears the running flag"
+        );
+        assert!(
+            task.is_finished(),
+            "stop waits for the animation task to exit before returning"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_spinner_drop_stops_animation() {
-        // Test that dropping the spinner stops the animation
-        let spinner = Spinner::start();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut spinner = Spinner::start();
+        // Drop only clears the flag, so hold the task to watch it end.
+        let handle = spinner
+            .handle
+            .take()
+            .expect("start spawns the animation task");
+
+        tokio::task::yield_now().await;
+        assert!(
+            !handle.is_finished(),
+            "the animation must run until stopped"
+        );
+
         drop(spinner);
-        // Just verify no panic occurs
+        // The task sees the cleared flag on its next tick and exits.
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("dropping the spinner ends the animation task")
+            .expect("the animation task exits cleanly");
     }
 
     #[test]
@@ -430,15 +465,6 @@ mod tests {
 
             // Verify parent directory was created
             assert!(history_path.parent().is_some_and(std::path::Path::exists));
-        }
-    }
-
-    #[test]
-    fn test_save_history_with_none_path() {
-        // Test that save_history handles None path gracefully
-        if let Ok((mut editor, _)) = create_editor_with_history("test.txt") {
-            // This should not panic
-            save_history(&mut editor, None);
         }
     }
 

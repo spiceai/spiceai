@@ -11,8 +11,9 @@ name: runtime-test
 # RUNTIME CONFIGURATION
 # =============================================================================
 runtime:
-  # Shared object store for runtime state (results-cache warmup, source
-  # rate-control, and distributed query when those sections omit state_location).
+  # Shared object store for runtime state (results-cache warmup, cluster source
+  # rate control, and distributed query unless runtime.scheduler.state_location
+  # is set).
   state:
     location: s3://my-bucket/spice-state
     params:

@@ -141,7 +141,13 @@ fn only_the_built_in_starts_with_is_pushed() {
     use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
 
     let built_in = datafusion::functions::string::expr_fn::starts_with(col("status"), lit("ac"));
-    assert!(translate(&built_in).is_some());
+    let (condition, parameters) =
+        translate(&built_in).expect("the built-in starts_with is translatable");
+    assert_eq!(
+        condition,
+        r#"((IS_STRING(c["status"]) AND STARTSWITH(c["status"], @p0, false)) OR (IS_DEFINED(c["status"]) AND NOT IS_NULL(c["status"]) AND NOT IS_STRING(c["status"])))"#
+    );
+    assert_eq!(parameters, vec![("@p0".to_string(), Value::from("ac"))]);
     let user = create_udf(
         "starts_with",
         vec![DataType::Utf8, DataType::Utf8],

@@ -15,6 +15,11 @@ on:
       - 'scripts/signoff'
       - 'scripts/test_signoff_status.sh'
       - 'scripts/test_signoff_attestation_refresh.sh'
+      - 'scripts/test_signoff_coverage.py'
+      - 'scripts/signoff-batch'
+      - 'scripts/test_signoff_batch.py'
+      - 'Makefile'
+      - '.config/nextest.toml'
       - '.github/workflows/signoff_script_test.yml'
   push:
     branches:
@@ -23,6 +28,11 @@ on:
       - 'scripts/signoff'
       - 'scripts/test_signoff_status.sh'
       - 'scripts/test_signoff_attestation_refresh.sh'
+      - 'scripts/test_signoff_coverage.py'
+      - 'scripts/signoff-batch'
+      - 'scripts/test_signoff_batch.py'
+      - 'Makefile'
+      - '.config/nextest.toml'
       - '.github/workflows/signoff_script_test.yml'
   workflow_dispatch:
 
@@ -31,6 +41,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test-coverage:
+    name: Sign-off coverage integration tests
+    runs-on: spiceai-macos
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-nextest
+      - name: Exercise the sign-off gate
+        run: python3 scripts/test_signoff_coverage.py
+
   test-commit-status:
     name: Unit tests for signoff commit statuses
     # GitHub-hosted on purpose: a sub-second test must not queue behind the
@@ -72,3 +97,20 @@ jobs:
 
       - name: Run tests
         run: bash scripts/test_signoff_attestation_refresh.sh
+
+  test-signoff-batch:
+    name: Tests for signoff-batch
+    # Real Git against a local bare "origin", with stub gh and scripts/signoff:
+    # pushes stay in the job's temp directory and no status is posted.
+    runs-on: spiceai-dev-runners
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: python3 scripts/test_signoff_batch.py

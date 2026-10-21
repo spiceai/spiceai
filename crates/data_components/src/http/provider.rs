@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod completeness;
+pub use completeness::HttpFetchCompletion;
+
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;
 use arrow::{
@@ -26,7 +29,7 @@ use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, TableReference, project_schema},
+    common::{Constraints, TableReference, project_schema, runtime::IoWaitExt},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -46,7 +49,8 @@ use reqwest::{
     Client,
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
-use runtime_rate_control::{Permit, RateController};
+use runtime_rate_control::{Permit, RateController, RequestOutcome};
+use runtime_request_context::{TRACEPARENT_HEADER, resolve_request_context};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -735,6 +739,25 @@ impl RequestFilterOptions {
 
     fn is_enabled(&self, kind: RequestFilterKind) -> bool {
         self.enabled_filters.contains(&kind)
+    }
+}
+
+/// The W3C `traceparent` of the query that a fetch serves. It is sent to the
+/// origin, so that a trace links the query to the origin call. It is not part of
+/// the response cache key: a response does not depend on the trace that asked for it.
+#[derive(Clone, Debug)]
+struct ForwardedTraceParent(HeaderValue);
+
+impl ForwardedTraceParent {
+    /// The trace context of the request that `context` executes, if it has one.
+    /// On a cluster executor, the context arrives as a serialized config extension.
+    fn from_task_context(context: &TaskContext) -> Option<Self> {
+        let request_context = resolve_request_context(context, false)?;
+        let trace_parent = request_context.trace_parent().as_ref()?;
+        // Hex digits and dashes only, so the conversion does not fail.
+        HeaderValue::try_from(trace_parent.to_string())
+            .ok()
+            .map(Self)
     }
 }
 
@@ -1742,11 +1765,21 @@ impl HttpTableProvider {
         }
     }
 
+    /// Feed a request's outcome to the origin's rate limiter so an adaptive
+    /// controller can raise or lower the effective rate. A no-op for limiters
+    /// without adaptive control.
+    fn record_request_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
+        }
+    }
+
     async fn perform_request_with_retry(
         &self,
         url: Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
+        trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
@@ -1754,6 +1787,7 @@ impl HttpTableProvider {
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
         let request_headers_owned = request_headers.cloned();
+        let trace_parent_owned = trace_parent.cloned();
         let path_owned = path_label.to_string();
 
         // The ladder spends exactly the configured budget: no request follows the last
@@ -1765,11 +1799,18 @@ impl HttpTableProvider {
             let url = url_clone.clone();
             let body = body_owned.clone();
             let request_headers = request_headers_owned.clone();
+            let trace_parent = trace_parent_owned.clone();
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(&url, body.as_deref(), request_headers.as_ref(), &path)
-                    .await
+                this.perform_single_request(
+                    &url,
+                    body.as_deref(),
+                    request_headers.as_ref(),
+                    trace_parent.as_ref(),
+                    &path,
+                )
+                .await
             }
         })
         .await
@@ -1800,6 +1841,7 @@ impl HttpTableProvider {
         url: &Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
+        trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         // Held until the body below has been read, so a response still streaming counts
@@ -1840,20 +1882,47 @@ impl HttpTableProvider {
             }
         }
 
+        // A `traceparent` that the dataset or the query sets is sent as written.
+        if let Some(trace_parent) = trace_parent
+            && !self.custom_headers.contains_key(TRACEPARENT_HEADER)
+            && !request_headers.is_some_and(|headers| headers.contains_key(TRACEPARENT_HEADER))
+        {
+            request_builder = request_builder.header(TRACEPARENT_HEADER, trace_parent.0.clone());
+        }
+
         if let Some(auth) = self.auth.as_ref() {
             request_builder = auth.apply(request_builder);
         }
 
-        let response = request_builder.send().await.map_err(|e| {
+        // Waiting on the origin: a distributed task can lend its slot meanwhile.
+        let response = request_builder.send().io_wait().await.map_err(|e| {
             let err = Error::http_request(&self.base_url, e);
             tracing::debug!("{err}");
+            // A timeout or connection error is a failure signal for adaptive
+            // rate control: the origin is unreachable or too slow, so admit
+            // fewer requests until it recovers.
+            self.record_request_outcome(RequestOutcome::Failure);
             RetryError::transient(err)
         })?;
 
-        let status_code = response.status().as_u16();
+        let status = response.status();
+        let status_code = status.as_u16();
         let response_headers = response.headers().clone();
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
+        // Classify the response for adaptive rate control:
+        // - retryable (408/429/5xx): a failure signal — the origin is struggling,
+        //   so admit fewer requests until it recovers.
+        // - 2xx: a success — the origin served the request under load.
+        // - anything else (a non-retryable 4xx such as 401/403/404): discarded, not
+        //   recorded. The origin answered promptly, but the failure is a
+        //   client/auth/config condition that throttling cannot remediate, so it
+        //   must move the coefficient in neither direction.
+        if crate::resilient_http::status_is_retryable(status) {
+            self.record_request_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_request_outcome(RequestOutcome::Success);
+        }
 
         // 5xx/429: retry with backoff (transient server issue or rate limiting). The body
         // is not read, on this attempt or on the last one the budget allows: a retryable
@@ -2032,6 +2101,7 @@ impl HttpTableProvider {
         // is_timeout/is_connect/is_body/is_decode together as transient.
         let content = response
             .text()
+            .io_wait()
             .await
             .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
@@ -2066,6 +2136,7 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
+        trace_parent: Option<&ForwardedTraceParent>,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
@@ -2081,6 +2152,7 @@ impl HttpTableProvider {
                 url,
                 body_owned.as_deref(),
                 parsed_request_headers.as_ref(),
+                trace_parent,
                 &path_owned,
             )
             .await?;
@@ -2097,11 +2169,12 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
+        trace_parent: Option<&ForwardedTraceParent>,
     ) -> Result<HttpFetchResult> {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_response(path, query, body, request_headers)
+                .fetch_response(path, query, body, request_headers, trace_parent)
                 .await;
         }
 
@@ -2123,7 +2196,7 @@ impl HttpTableProvider {
         }
 
         let fetch_result = self
-            .fetch_response(path, query, body, request_headers)
+            .fetch_response(path, query, body, request_headers, trace_parent)
             .await?;
 
         // Retention is resolved here because this is the only place both the
@@ -2321,9 +2394,22 @@ pub struct HttpExec {
     /// prunes `response_status` out of the batch before `cache::batches_cacheable`
     /// ever sees it.
     metrics: ExecutionPlanMetricsSet,
+    completion: Option<HttpFetchCompletion>,
 }
 
 impl HttpExec {
+    /// Clone a cache-owned source execution with a fresh completion token.
+    /// Execute each partition once; reuse invalidates this execution's token.
+    /// Request and response metadata are unchanged.
+    #[must_use]
+    pub fn for_cache_fetch(&self) -> (Self, HttpFetchCompletion) {
+        let completion = HttpFetchCompletion::new(self.partitions.len());
+        let mut plan = self.clone();
+        plan.completion = Some(completion.clone());
+        plan.metrics = ExecutionPlanMetricsSet::new();
+        (plan, completion)
+    }
+
     /// Returns the provider used by this exec.
     #[must_use]
     pub fn provider(&self) -> &Arc<HttpTableProvider> {
@@ -2375,6 +2461,7 @@ impl HttpExec {
             properties,
             deferred_partitions: false,
             metrics: ExecutionPlanMetricsSet::new(),
+            completion: None,
         }
     }
 
@@ -2468,6 +2555,7 @@ impl HttpExec {
         &self,
         provider: &HttpTableProvider,
         partition: usize,
+        trace_parent: Option<&ForwardedTraceParent>,
     ) -> DataFusionResult<RecordBatch> {
         let (path, query, body, request_headers) = &self.partitions[partition];
 
@@ -2488,7 +2576,13 @@ impl HttpExec {
 
         // Fetch content with path, query, and body
         let result = provider
-            .get_response(path_val, query_val, body_val, request_headers_val)
+            .get_response(
+                path_val,
+                query_val,
+                body_val,
+                request_headers_val,
+                trace_parent,
+            )
             .await
             .map_err(DataFusionError::from)?;
 
@@ -2671,9 +2765,14 @@ impl HttpExec {
             "request_headers" => {
                 Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
             }
-            "content" => Ok(Arc::new(StringArray::from_iter_values(
-                content_rows.iter().map(String::as_str),
-            )) as ArrayRef),
+            "content" => {
+                let bytes = Self::content_byte_capacity(content_rows.iter().map(String::len))?;
+                let mut builder = StringBuilder::with_capacity(content_rows.len(), bytes);
+                for row in content_rows {
+                    builder.append_value(row);
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
             "response_status" => Ok(Arc::new(UInt16Array::from(vec![
                 fetch_result.response_status;
                 num_rows
@@ -2710,6 +2809,18 @@ impl HttpExec {
                 "Unsupported field name: {other}"
             ))),
         }
+    }
+
+    fn content_byte_capacity(mut lengths: impl Iterator<Item = usize>) -> DataFusionResult<usize> {
+        let bytes = lengths.try_fold(0usize, |bytes, length| {
+            bytes.checked_add(length).ok_or_else(|| {
+                DataFusionError::Execution("HTTP content byte length overflow".into())
+            })
+        })?;
+        i32::try_from(bytes).map_err(|_| {
+            DataFusionError::Execution("HTTP content exceeds Utf8's 32-bit offset capacity".into())
+        })?;
+        Ok(bytes)
     }
 
     /// Compute the per-batch `_fetched_at` timestamp in nanoseconds since
@@ -3004,7 +3115,7 @@ impl ExecutionPlan for HttpExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         tracing::trace!(
             "HttpExec::execute called for partition {}, total partitions: {}",
@@ -3015,6 +3126,14 @@ impl ExecutionPlan for HttpExec {
         let exec = Arc::new(self.clone());
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
+        let trace_parent = ForwardedTraceParent::from_task_context(&context);
+        let completion = self
+            .completion
+            .as_ref()
+            .map(|token| token.start(partition, self.limit.is_some()));
+        let progress = completion
+            .as_ref()
+            .map(completeness::CompletionGuard::progress);
 
         if provider.is_paginated() {
             let (path, query, body, request_headers) = self.partitions[partition].clone();
@@ -3038,6 +3157,8 @@ impl ExecutionPlan for HttpExec {
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
                 let exec = Arc::clone(&exec);
                 let provider = Arc::clone(&provider);
+                let progress = progress.clone();
+                let trace_parent = trace_parent.clone();
 
                 async move {
                     loop {
@@ -3052,6 +3173,9 @@ impl ExecutionPlan for HttpExec {
                         if let Some(max_pages) = config.max_pages
                             && state.page >= max_pages
                         {
+                            if let Some(progress) = &progress {
+                                progress.truncated();
+                            }
                             tracing::warn!(
                                 "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
                                 max_pages
@@ -3099,10 +3223,14 @@ impl ExecutionPlan for HttpExec {
                                     merged_query.as_deref(),
                                     body_val,
                                     state.request_headers.as_deref(),
+                                    trace_parent.as_ref(),
                                 )
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
+                            if let Some(progress) = &progress {
+                                progress.followed_page();
+                            }
                             let parsed_request_headers = state
                                 .request_headers
                                 .as_deref()
@@ -3141,6 +3269,7 @@ impl ExecutionPlan for HttpExec {
                                             url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
+                                            trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -3169,6 +3298,7 @@ impl ExecutionPlan for HttpExec {
                                             url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
+                                            trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -3198,6 +3328,7 @@ impl ExecutionPlan for HttpExec {
                                             url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
+                                            trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -3311,6 +3442,9 @@ impl ExecutionPlan for HttpExec {
                         )?;
 
                         if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                            if let Some(progress) = &progress {
+                                progress.failed();
+                            }
                             MetricBuilder::new(&exec.metrics)
                                 .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
                                 .add(1);
@@ -3331,12 +3465,24 @@ impl ExecutionPlan for HttpExec {
             });
 
             let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-            Ok(Box::pin(stream_adapter))
+            Ok(completeness::track(Box::pin(stream_adapter), completion))
         } else {
             // Non-paginated: single fetch
             let stream = futures::stream::once(async move {
                 tracing::trace!("Fetching partition {}", partition);
-                let batch = exec.fetch_and_create_batch(&provider, partition).await?;
+                let batch = exec
+                    .fetch_and_create_batch(&provider, partition, trace_parent.as_ref())
+                    .await?;
+                if batch
+                    .schema()
+                    .metadata()
+                    .get(crate::HTTP_RESPONSE_STATUS_METADATA_KEY)
+                    .and_then(|status| status.parse::<u16>().ok())
+                    .is_some_and(HttpTableProvider::is_retryable_status)
+                    && let Some(progress) = &progress
+                {
+                    progress.failed();
+                }
                 tracing::trace!(
                     "Yielding batch for partition {}: {} rows",
                     partition,
@@ -3346,7 +3492,7 @@ impl ExecutionPlan for HttpExec {
             });
 
             let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-            Ok(Box::pin(stream_adapter))
+            Ok(completeness::track(Box::pin(stream_adapter), completion))
         }
     }
 }
@@ -3378,6 +3524,47 @@ struct PaginationState {
     last_page_path: Option<String>,
     last_page_query: Option<String>,
     recent_page_urls: VecDeque<String>,
+}
+
+const REQUEST_PATH_DOT_SEGMENT_MESSAGE: &str = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+
+const REQUEST_PATH_REWRITTEN_MESSAGE: &str = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
+/// Rejects a `request_path` the HTTP request would not send as written.
+///
+/// `allowed_request_paths` is matched against the path as written, but the request goes to
+/// the path `Url::set_path` produces, and WHATWG URL parsing resolves percent-encoded dot
+/// segments (`%2e%2e`, `.%2e`), removes tabs and newlines, and turns `\` into `/`. Each of
+/// these lets a path that matches an allowed pattern reach one that does not, or climb out
+/// of the path in the dataset's `from` URL. Comparing the decoded path before and after
+/// parsing catches every such rewrite rather than a list of known encodings. The segment
+/// check also rejects a dot segment behind an encoded slash (`%2e%2e%2fadmin`), which the
+/// URL parser leaves alone but an origin that decodes `%2f` before routing would resolve.
+///
+/// The messages do not repeat the value: a path can carry identifiers or tokens, and these
+/// errors reach logs and query history.
+fn ensure_request_path_is_sent_as_written(raw: &str, base_url: &Url) -> Result<()> {
+    let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+    if decoded
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(Error::FilterRejected {
+            message: REQUEST_PATH_DOT_SEGMENT_MESSAGE.to_string(),
+        });
+    }
+
+    // Only the request path is compared, so replacing the base path here is deliberate: the
+    // base path is joined in front of an accepted value, which cannot remove a segment of it.
+    let mut url = base_url.clone();
+    url.set_path(raw);
+    if percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy() != decoded {
+        return Err(Error::FilterRejected {
+            message: REQUEST_PATH_REWRITTEN_MESSAGE.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn pagination_request_label(url: &Url) -> String {
@@ -3985,6 +4172,59 @@ impl HttpTableProvider {
         Ok(())
     }
 
+    /// The values `filters` make this connector send for the request column
+    /// `column` (`request_path`, `request_query` or `request_body`), in filter
+    /// order. None means the request goes without one: the dataset's own path
+    /// and query, and a GET rather than a POST.
+    ///
+    /// Follows the shapes `extract_filter_values` records a value from —
+    /// `<column> = '<literal>'` and `<column> IN (<literals>)`, under any
+    /// nesting of `AND`/`OR` — so a cache keyed on stored request values can
+    /// tell which request a lookup will make. Other predicates (`<>`, `LIKE`,
+    /// a literal on the left) record nothing.
+    #[must_use]
+    pub fn request_filter_values<'a>(filters: &'a [Expr], column: &str) -> Vec<&'a str> {
+        fn walk<'a>(expr: &'a Expr, name: &str, values: &mut Vec<&'a str>) {
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+                    Operator::Eq => {
+                        if let (
+                            Expr::Column(column),
+                            Expr::Literal(ScalarValue::Utf8(Some(value)), _),
+                        ) = (left.as_ref(), right.as_ref())
+                            && column.name == name
+                        {
+                            values.push(value);
+                        }
+                    }
+                    Operator::And | Operator::Or => {
+                        walk(left, name, values);
+                        walk(right, name, values);
+                    }
+                    _ => {}
+                },
+                Expr::InList(in_list) => {
+                    if let Expr::Column(column) = in_list.expr.as_ref()
+                        && column.name == name
+                    {
+                        values.extend(in_list.list.iter().filter_map(|item| match item {
+                            Expr::Literal(ScalarValue::Utf8(Some(value)), _) => {
+                                Some(value.as_str())
+                            }
+                            _ => None,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut values = Vec::new();
+        for filter in filters {
+            walk(filter, column, &mut values);
+        }
+        values
+    }
+
     /// Check if a filter expression can be pushed down to HTTP requests
     /// Note: This returns true if the filter is on `request_path`, `request_query`, `request_body`, or `request_headers` columns.
     /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
@@ -4060,6 +4300,7 @@ impl HttpTableProvider {
                 ),
             });
         }
+        ensure_request_path_is_sent_as_written(raw, &self.base_url)?;
 
         let Some((globset, patterns)) = &self.allowed_paths else {
             tracing::warn!("Path filter attempted but allowed_paths is None");
@@ -4389,14 +4630,41 @@ mod response_cache_tests {
         );
     }
 
+    /// The positive control for `an_entry_past_its_window_is_not_served`: inside
+    /// its window an entry is served, and it is the entry stored under that key.
     #[tokio::test]
     async fn a_fresh_entry_is_served() {
         let cache = build_response_cache(1024 * 1024);
         cache
             .insert(key(1), entry(4096, Duration::from_mins(5)))
             .await;
+        cache
+            .insert(key(2), entry(1024, Duration::from_mins(5)))
+            .await;
         settle(&cache).await;
-        assert!(cache.get(&key(1)).await.is_some());
+
+        let served = cache
+            .get(&key(1))
+            .await
+            .expect("an entry inside its retention window must be served");
+        assert_eq!(
+            *served.content,
+            "x".repeat(4096),
+            "the body stored under the key"
+        );
+        assert_eq!(served.response_status, 200);
+        assert_eq!(served.max_age, Duration::from_mins(5));
+        assert_eq!(served.detected_format.as_deref(), Some("json"));
+
+        let other = cache
+            .get(&key(2))
+            .await
+            .expect("a second fresh entry must be served too");
+        assert_eq!(
+            *other.content,
+            "x".repeat(1024),
+            "each key serves its own entry"
+        );
     }
 
     /// The invariant the admission path exists to hold: a response the origin
@@ -4422,7 +4690,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":1}"#);
@@ -4463,7 +4731,7 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for id in 0..200 {
             provider
-                .get_response(&format!("/report/{id}"), None, None, None)
+                .get_response(&format!("/report/{id}"), None, None, None, None)
                 .await
                 .expect("each response is served");
         }
@@ -4499,7 +4767,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":6}"#);
@@ -4531,7 +4799,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4566,7 +4834,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is served rather than panicking the query");
         assert_eq!(served.content, r#"{"rows":8}"#);
@@ -4692,14 +4960,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(4096, None);
         provider
-            .get_response("/small", None, None, None)
+            .get_response("/small", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
         assert_eq!(provider.cache.entry_count(), 1, "the small entry is held");
 
         provider
-            .get_response("/huge", None, None, None)
+            .get_response("/huge", None, None, None, None)
             .await
             .expect("the oversized response is still served to its caller");
         settle(&provider.cache).await;
@@ -4729,7 +4997,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4758,7 +5026,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -4890,7 +5158,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4920,7 +5188,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -4964,7 +5232,7 @@ mod response_cache_tests {
         // `Vary` naming anything at all.
         let unauthenticated = provider_for(&origin);
         unauthenticated
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&unauthenticated.cache).await;
@@ -4972,7 +5240,7 @@ mod response_cache_tests {
 
         let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
         authenticated
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&authenticated.cache).await;
@@ -5004,7 +5272,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5036,7 +5304,7 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for _ in 0..3 {
             let served = provider
-                .get_response("/report", None, None, None)
+                .get_response("/report", None, None, None, None)
                 .await
                 .expect("the response is served");
             assert_eq!(served.content, r#"{"rows":2}"#);
@@ -5065,7 +5333,7 @@ mod response_cache_tests {
 
         let without_fallback = provider_for(&origin);
         without_fallback
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&without_fallback.cache).await;
@@ -5078,7 +5346,7 @@ mod response_cache_tests {
         let with_fallback =
             provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::from_mins(5)));
         with_fallback
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&with_fallback.cache).await;
@@ -5102,7 +5370,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::ZERO));
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5125,7 +5393,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(0, None);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5155,7 +5423,7 @@ mod response_cache_tests {
         let provider = provider_for(&origin)
             .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
         let fetched = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("`store` must answer a 404 with its body, or this asserts nothing");
         assert_eq!(
@@ -5205,9 +5473,22 @@ mod response_cache_tests {
     /// `a_cacheable_response_is_admitted_and_then_served_without_the_origin`.
     #[test]
     fn an_ordinary_entry_is_chargeable() {
-        assert!(
-            entry_weight(&key(1), &entry(4096, Duration::from_mins(5))).is_some(),
-            "an ordinary response must be chargeable, or nothing would ever be cached"
+        let weigh = |body_bytes: usize| {
+            entry_weight(&key(1), &entry(body_bytes, Duration::from_mins(5)))
+                .expect("an ordinary response must be chargeable, or nothing would ever be cached")
+        };
+        // `"x".repeat(n)` allocates exactly `n` bytes of capacity, so two entries
+        // that differ only in body size must be charged exactly that difference.
+        // Undercharging the body is how a byte budget silently stops binding.
+        assert_eq!(
+            weigh(8192) - weigh(4096),
+            4096,
+            "every byte of the body must be billed"
+        );
+        assert_eq!(
+            weigh(4096) - weigh(0),
+            4096,
+            "a body is charged its bytes on top of the entry's fixed overhead"
         );
     }
 
@@ -5368,12 +5649,39 @@ mod response_cache_tests {
     /// small response on a request-keyed workload.
     #[tokio::test]
     async fn the_key_is_weighed_alongside_the_response() {
-        let cache = build_response_cache(1024 * 1024);
-        cache.insert(key(1), entry(0, Duration::from_mins(5))).await;
-        settle(&cache).await;
-        assert!(
-            cache.weighted_size() > 0,
-            "an empty response still costs its key"
+        // Two keys that differ only in a query 1000 bytes longer. `repeat`
+        // allocates exactly the requested capacity, so the key accounts differ by
+        // exactly those bytes and everything else about the entries is equal.
+        let key_with_query = |query: String| CacheKey {
+            path: "/v1/messages".to_string(),
+            query: Some(query),
+            body: None,
+            request_headers: None,
+        };
+
+        let short = build_response_cache(1024 * 1024);
+        short
+            .insert(
+                key_with_query("q".repeat(10)),
+                entry(0, Duration::from_mins(5)),
+            )
+            .await;
+        settle(&short).await;
+
+        let long = build_response_cache(1024 * 1024);
+        long.insert(
+            key_with_query("q".repeat(1010)),
+            entry(0, Duration::from_mins(5)),
+        )
+        .await;
+        settle(&long).await;
+
+        assert_eq!(short.entry_count(), 1, "the short-keyed entry is admitted");
+        assert_eq!(long.entry_count(), 1, "the long-keyed entry is admitted");
+        assert_eq!(
+            long.weighted_size(),
+            short.weighted_size() + 1000,
+            "every byte the key holds must be charged against the budget"
         );
     }
 }
@@ -5398,6 +5706,8 @@ mod tests {
         net::TcpListener,
     };
     use url::Url;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Debug)]
     struct TestAuthenticator;
@@ -5560,7 +5870,7 @@ mod tests {
             let (provider, permits) =
                 retry_test_provider(url.clone(), budget, Duration::from_secs(2));
             let Err(error) = provider
-                .perform_request_with_retry(url.clone(), None, None, "/lookup")
+                .perform_request_with_retry(url.clone(), None, None, None, "/lookup")
                 .await
             else {
                 panic!("connection refusal should fail");
@@ -5573,7 +5883,7 @@ mod tests {
             retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
         let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, "/lookup")
+            .perform_request_with_retry(url, None, None, None, "/lookup")
             .await
         else {
             panic!("timed out origin should fail");
@@ -5601,7 +5911,7 @@ mod tests {
         let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
 
         let Err(send_error) = provider
-            .perform_request_with_retry(url, None, None, "/path-secret")
+            .perform_request_with_retry(url, None, None, None, "/path-secret")
             .await
         else {
             panic!("connection refusal should fail");
@@ -5669,7 +5979,7 @@ mod tests {
                         retry_test_provider(url.clone(), budget, Duration::from_secs(3));
                     let provider = provider.with_error_response_action(action);
                     let Err(error) = provider
-                        .perform_request_with_retry(url, None, None, "/lookup")
+                        .perform_request_with_retry(url, None, None, None, "/lookup")
                         .await
                     else {
                         panic!("{status} under `{action}` must fail the request");
@@ -5749,7 +6059,7 @@ mod tests {
         let second_url = url.clone();
         let request = tokio::spawn(async move {
             provider
-                .perform_request_with_retry(url, None, None, "/lookup")
+                .perform_request_with_retry(url, None, None, None, "/lookup")
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), headers_received)
@@ -5758,7 +6068,7 @@ mod tests {
             .expect("headers signal sent");
         let second_request = tokio::spawn(async move {
             second_provider
-                .perform_request_with_retry(second_url, None, None, "/lookup")
+                .perform_request_with_retry(second_url, None, None, None, "/lookup")
                 .await
         });
         assert!(
@@ -5831,7 +6141,7 @@ mod tests {
             .with_error_response_action(ErrorResponseAction::Store);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            provider.perform_request_with_retry(url, None, None, "/lookup"),
+            provider.perform_request_with_retry(url, None, None, None, "/lookup"),
         )
         .await
         .expect("the refusal must not wait for the withheld body");
@@ -5877,7 +6187,7 @@ mod tests {
             // `store`, so the 404 body is data and the case can assert what was read.
             let provider = provider.with_error_response_action(ErrorResponseAction::Store);
             let result = provider
-                .perform_request_with_retry(url, None, None, "/lookup")
+                .perform_request_with_retry(url, None, None, None, "/lookup")
                 .await
                 .expect("HTTP response should remain available");
             assert_eq!(result.response_status, expected_status);
@@ -5896,7 +6206,7 @@ mod tests {
         .await;
         let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, "/lookup")
+            .perform_request_with_retry(url, None, None, None, "/lookup")
             .await
         else {
             panic!("a 404 under the default `on_error_response` must fail the request");
@@ -6311,6 +6621,114 @@ mod tests {
         }
     }
 
+    /// `request_filter_values` names exactly the bodies and queries the scan
+    /// sends: the distinct values `extract_partitions` produces, or none when
+    /// the request goes without one.
+    #[test]
+    fn request_filter_values_matches_extracted_partitions() {
+        use datafusion::prelude::{col, lit};
+        let provider = base_provider()
+            .with_allowed_paths(["/items"])
+            .expect("allowed path")
+            .enable_body_filters(1024)
+            .enable_query_filters(1024);
+        let body = || col("request_body");
+        let cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            ("eq", vec![body().eq(lit("x"))], vec!["x"]),
+            ("eq empty", vec![body().eq(lit(""))], vec![""]),
+            (
+                "in list",
+                vec![body().in_list(vec![lit("a"), lit("")], false)],
+                vec!["a", ""],
+            ),
+            (
+                "or",
+                vec![body().eq(lit("a")).or(body().eq(lit("b")))],
+                vec!["a", "b"],
+            ),
+            (
+                "and with path",
+                vec![
+                    col("request_path")
+                        .eq(lit("/items"))
+                        .and(body().eq(lit("x"))),
+                ],
+                vec!["x"],
+            ),
+            ("not eq", vec![body().not_eq(lit("x"))], vec![]),
+            ("like", vec![body().like(lit("%x%"))], vec![]),
+            ("literal on the left", vec![lit("x").eq(body())], vec![]),
+            (
+                "path only",
+                vec![col("request_path").eq(lit("/items"))],
+                vec![],
+            ),
+            ("no filters", vec![], vec![]),
+        ];
+        for (name, filters, expected) in cases {
+            assert_eq!(
+                HttpTableProvider::request_filter_values(&filters, "request_body"),
+                expected,
+                "{name}"
+            );
+            let mut sent: Vec<Option<String>> = provider
+                .extract_partitions(&filters)
+                .expect("extract partitions")
+                .into_iter()
+                .map(|partition| partition.2)
+                .collect();
+            sent.dedup();
+            let expected_sent: Vec<Option<String>> = if expected.is_empty() {
+                vec![None]
+            } else {
+                expected
+                    .iter()
+                    .map(|value| Some((*value).to_string()))
+                    .collect()
+            };
+            assert_eq!(sent, expected_sent, "{name}: bodies the scan sends");
+        }
+
+        let query = || col("request_query");
+        let query_cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            ("eq", vec![query().eq(lit("q=a"))], vec!["q=a"]),
+            (
+                "in list",
+                vec![query().in_list(vec![lit("q=a"), lit("q=b")], false)],
+                vec!["q=a", "q=b"],
+            ),
+            ("not eq", vec![query().not_eq(lit("q=a"))], vec![]),
+            (
+                "path only",
+                vec![col("request_path").eq(lit("/items"))],
+                vec![],
+            ),
+        ];
+        for (name, filters, expected) in query_cases {
+            assert_eq!(
+                HttpTableProvider::request_filter_values(&filters, "request_query"),
+                expected,
+                "query {name}"
+            );
+            let mut sent: Vec<Option<String>> = provider
+                .extract_partitions(&filters)
+                .expect("extract partitions")
+                .into_iter()
+                .map(|partition| partition.1)
+                .collect();
+            sent.dedup();
+            let expected_sent: Vec<Option<String>> = if expected.is_empty() {
+                vec![None]
+            } else {
+                expected
+                    .iter()
+                    .map(|value| Some((*value).to_string()))
+                    .collect()
+            };
+            assert_eq!(sent, expected_sent, "query {name}: queries the scan sends");
+        }
+    }
+
     #[test]
     fn test_request_body_filter_needs_enable() {
         let provider = base_provider();
@@ -6638,6 +7056,57 @@ mod tests {
         assert_eq!(url.as_str(), "https://api.example.com/v1/users");
     }
 
+    /// Every rejected value here matches `/shows/**` as written, yet `Url::set_path` would
+    /// send it somewhere else — outside `/shows/`, or outside the `/api/v1` base path.
+    #[test]
+    fn test_request_path_rewritten_by_url_parsing_is_rejected() {
+        let base_url = Url::parse("https://api.example.com/api/v1").expect("valid URL");
+        // The messages are asserted in full so a reword cannot reintroduce the path, which
+        // may carry identifiers or tokens, or a raw newline from it.
+        let dot_segment = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+        let rewritten = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
+        let cases = [
+            ("/shows/%2e%2e/people/1", dot_segment),
+            ("/shows/%2E%2E/people/1", dot_segment),
+            ("/shows/%2E%2e/people/1", dot_segment),
+            ("/shows/.%2e/people/1", dot_segment),
+            ("/shows/%2e./people/1", dot_segment),
+            ("/shows/%2e/people/1", dot_segment),
+            ("/shows/./people/1", dot_segment),
+            ("/shows/%2e%2e/%2e%2e/%2e%2e/admin", dot_segment),
+            ("/shows/%2e%2e%2fadmin", dot_segment),
+            ("/shows/%2e%2e%5cadmin", dot_segment),
+            ("/shows/.\t./people/1", rewritten),
+            ("/shows/.\n./people/1", rewritten),
+            ("/shows/a\\b", rewritten),
+        ];
+        for (raw, expected) in cases {
+            match ensure_request_path_is_sent_as_written(raw, &base_url) {
+                Err(Error::FilterRejected { message }) => {
+                    assert_eq!(message, expected, "request_path {raw:?}");
+                }
+                other => panic!("request_path {raw:?} must be rejected, got {other:?}"),
+            }
+        }
+
+        // Percent-encoding the URL parser applies or leaves alone does not change the path
+        // the origin sees, and an encoded slash inside a segment is an ordinary value.
+        for raw in [
+            "/shows/1",
+            "/shows/a b",
+            "/shows/caf\u{e9}",
+            "/shows/%2e%2e-not-a-dot-segment",
+            "/shows/group%2Fproject",
+            "/shows/%252e%252e",
+            "/shows/a..b",
+        ] {
+            if let Err(err) = ensure_request_path_is_sent_as_written(raw, &base_url) {
+                panic!("request_path {raw:?} must be accepted, got {err:?}");
+            }
+        }
+    }
+
     #[test]
     fn test_url_construction_without_base_path() {
         let base_url = Url::parse("https://api.example.com/").expect("valid URL");
@@ -6853,7 +7322,7 @@ mod tests {
         );
 
         let batch = exec
-            .fetch_and_create_batch(provider.as_ref(), 0)
+            .fetch_and_create_batch(provider.as_ref(), 0, None)
             .await
             .expect("batch should be created from cached response");
 
@@ -7013,52 +7482,346 @@ mod tests {
         assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
     }
 
-    #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
-    async fn test_query_params_any_order_works() {
-        use datafusion::prelude::SessionContext;
+    // The SQL-level tests below stand a local `wiremock` origin in for the public
+    // JSON APIs whose shapes they model, serving fixed fixtures, so every row they
+    // assert is known exactly and they run deterministically without a network.
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/search/people".to_string()])
+    // Response fixtures as compact JSON with every object's keys in sorted order.
+    // The connector stores each JSON row compactly serialized, and sorted keys
+    // serialize identically whether or not `serde_json`'s `preserve_order`
+    // feature is unified into the build.
+    const POST_1: &str = r#"{"body":"quia et suscipit","id":1,"title":"sunt aut facere repellat provident","userId":1}"#;
+    const POST_2: &str =
+        r#"{"body":"est rerum tempore vitae","id":2,"title":"qui est esse","userId":1}"#;
+    const POST_3: &str = r#"{"body":"et iusto sed quo iure","id":3,"title":"ea molestias quasi exercitationem","userId":1}"#;
+    const SHOW_1: &str = r#"{"genres":["Drama","Science-Fiction","Thriller"],"id":1,"name":"Under the Dome","type":"Scripted"}"#;
+    const SHOW_2: &str = r#"{"genres":["Action","Crime","Science-Fiction"],"id":2,"name":"Person of Interest","type":"Scripted"}"#;
+    const SHOW_82: &str = r#"{"genres":["Adventure","Drama","Fantasy"],"id":82,"name":"Game of Thrones","type":"Scripted"}"#;
+
+    /// `compact` re-indented across lines, the way public JSON APIs commonly
+    /// serve it. Serving this and expecting `compact` back in `content` also
+    /// pins that each row is stored compactly serialized.
+    fn pretty_json(compact: &str) -> String {
+        let value: serde_json::Value =
+            serde_json::from_str(compact).expect("the fixture is valid JSON");
+        serde_json::to_string_pretty(&value).expect("the fixture re-serializes")
+    }
+
+    /// A reply carrying `body` with an `application/json` content type.
+    fn json_response(status: u16, body: String) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_raw(body, "application/json")
+    }
+
+    /// An unaccelerated provider whose base URL is the mock origin's root.
+    fn origin_provider(origin: &MockServer) -> HttpTableProvider {
+        HttpTableProvider::new(
+            Url::parse(&origin.uri()).expect("the mock server's URI is a valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        )
+    }
+
+    /// A session with `provider` registered as `table`.
+    fn http_session(
+        table: &str,
+        provider: HttpTableProvider,
+    ) -> datafusion::prelude::SessionContext {
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table(table, Arc::new(provider))
+            .expect("the HTTP table registers");
+        ctx
+    }
+
+    /// Runs `sql` and returns every row, each column rendered as text, in the
+    /// order the query returned them.
+    async fn sql_rows(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Vec<Vec<String>> {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("the query plans")
+            .collect()
+            .await
+            .expect("the query executes");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            arrow::util::display::array_value_to_string(column, row)
+                                .expect("the column renders as text")
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        rows
+    }
+
+    fn row(values: &[&str]) -> Vec<String> {
+        values.iter().copied().map(String::from).collect()
+    }
+
+    const CALLER_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    /// A session whose queries run as a request that arrived with `traceparent`,
+    /// the way the runtime installs the caller's `RequestContext` on a query.
+    fn traced_session(
+        table: &str,
+        provider: HttpTableProvider,
+        traceparent: &str,
+    ) -> datafusion::prelude::SessionContext {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            http::HeaderValue::from_str(traceparent).expect("the traceparent is a valid header"),
+        );
+        let request_context = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Http,
+        )
+        .from_headers(&headers)
+        .build();
+        let config =
+            datafusion::prelude::SessionConfig::new().with_extension(Arc::new(request_context));
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        ctx.register_table(table, Arc::new(provider))
+            .expect("the HTTP table registers");
+        ctx
+    }
+
+    /// Every `traceparent` value of each request the origin received, in order.
+    async fn received_traceparents(origin: &MockServer) -> Vec<Vec<String>> {
+        origin
+            .received_requests()
+            .await
+            .expect("the mock origin records requests")
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get_all("traceparent")
+                    .iter()
+                    .map(|value| value.to_str().expect("ASCII header").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The origin call joins the caller's trace: it carries the `traceparent`
+    /// of the query that caused it.
+    #[tokio::test]
+    async fn test_origin_request_carries_the_callers_traceparent() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let ctx = traced_session("posts", origin_provider(&origin), CALLER_TRACEPARENT);
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts").await,
+            vec![row(&[POST_1])]
+        );
+
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![CALLER_TRACEPARENT.to_string()]]
+        );
+    }
+
+    /// On a cluster executor, the request context arrives as the serialized
+    /// `SpiceRequestContextConfig`, not as a typed extension. The origin call
+    /// still carries the caller's `traceparent`, with its sampling decision.
+    #[tokio::test]
+    async fn test_executor_origin_request_carries_the_callers_unsampled_traceparent() {
+        const UNSAMPLED: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("traceparent", http::HeaderValue::from_static(UNSAMPLED));
+        let scheduler_context = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Http,
+        )
+        .from_headers(&headers)
+        .build();
+        let config = datafusion::prelude::SessionConfig::new().with_option_extension(
+            runtime_request_context::SpiceRequestContextConfig::from_request_context(
+                &scheduler_context,
+            ),
+        );
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        ctx.register_table("posts", Arc::new(origin_provider(&origin)))
+            .expect("the HTTP table registers");
+
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts").await,
+            vec![row(&[POST_1])]
+        );
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![UNSAMPLED.to_string()]]
+        );
+    }
+
+    /// Each page after the first is fetched outside the response cache path,
+    /// and still carries the caller's `traceparent`.
+    #[tokio::test]
+    async fn test_every_page_carries_the_callers_traceparent() {
+        let origin = MockServer::start().await;
+        for (offset, body) in [
+            ("0", format!("[{POST_1},{POST_2}]")),
+            ("2", format!("[{POST_3}]")),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/posts"))
+                .and(query_param("offset", offset))
+                .respond_with(json_response(200, body))
+                .expect(1)
+                .mount(&origin)
+                .await;
+        }
+
+        let base_url = Url::parse(&format!("{}/posts", origin.uri()))
+            .expect("the mock server's URI is a valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(2),
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config");
+        let ctx = traced_session("posts", provider, CALLER_TRACEPARENT);
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts ORDER BY content")
+                .await
+                .len(),
+            3
+        );
+
+        origin.verify().await;
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![
+                vec![CALLER_TRACEPARENT.to_string()],
+                vec![CALLER_TRACEPARENT.to_string()],
+            ]
+        );
+    }
+
+    /// A query with no trace context sends no `traceparent`.
+    #[tokio::test]
+    async fn test_untraced_query_sends_no_traceparent() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let ctx = http_session("posts", origin_provider(&origin));
+        sql_rows(&ctx, "SELECT content FROM posts").await;
+
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![Vec::<String>::new()]
+        );
+    }
+
+    /// A `traceparent` the dataset sets in its own headers is sent as written:
+    /// the caller's trace context does not replace it or add a second value.
+    #[tokio::test]
+    async fn test_configured_traceparent_header_is_not_replaced() {
+        const CONFIGURED: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(CONFIGURED));
+        let ctx = traced_session(
+            "posts",
+            origin_provider(&origin).with_headers(headers),
+            CALLER_TRACEPARENT,
+        );
+        sql_rows(&ctx, "SELECT content FROM posts").await;
+
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![CONFIGURED.to_string()]]
+        );
+    }
+
+    /// A `request_query` filter is sent to the origin exactly as written, in
+    /// whichever order its parameters appear. Re-ordering it (say, sorting) would
+    /// still fetch the right body but stamp every row's `request_query` with a
+    /// value the query's own filter no longer matches, so every row would be
+    /// filtered out above the scan.
+    #[tokio::test]
+    async fn test_query_params_any_order_works() {
+        const LAUREN_1: &str = r#"{"person":{"id":1,"name":"Lauren Ambrose"},"score":9}"#;
+        const LAUREN_2: &str = r#"{"person":{"id":2,"name":"Lauren Graham"},"score":8}"#;
+        const MICHAEL: &str = r#"{"person":{"id":3,"name":"Michael Emerson"},"score":7}"#;
+
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/people"))
+            .and(query_param("q", "lauren"))
+            .and(query_param("page", "1"))
+            .respond_with(json_response(
+                200,
+                pretty_json(&format!("[{LAUREN_1},{LAUREN_2}]")),
+            ))
+            .expect(1)
+            .mount(&origin)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/people"))
+            .and(query_param("q", "michael"))
+            .and(query_param("page", "1"))
+            .respond_with(json_response(200, pretty_json(&format!("[{MICHAEL}]"))))
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/search/people"])
             .expect("allowed paths")
             .enable_query_filters(128);
+        let ctx = http_session("tvmaze", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("tvmaze", Arc::new(provider))
-            .expect("register table");
-
-        // Query with unordered params (q first, page second)
-        let df1 = ctx
-            .sql("SELECT content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=lauren&page=1'")
-            .await
-            .expect("unordered query should succeed");
-
-        let results1 = df1.collect().await.expect("collect should succeed");
-        assert!(
-            !results1.is_empty(),
-            "Should have results for unordered params"
-        );
-        assert!(
-            results1[0].num_rows() > 0,
-            "Should have rows for unordered params"
+        // Parameters in the order the user wrote them (q first, page second).
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=lauren&page=1' ORDER BY content"
+            )
+            .await,
+            vec![
+                row(&["q=lauren&page=1", LAUREN_1]),
+                row(&["q=lauren&page=1", LAUREN_2]),
+            ]
         );
 
-        // Query with alphabetically ordered params (page first, q second)
-        let df2 = ctx
-            .sql("SELECT content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'page=1&q=michael'")
-            .await
-            .expect("alphabetical query should succeed");
+        // And alphabetically (page first, q second).
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'page=1&q=michael' ORDER BY content"
+            )
+            .await,
+            vec![row(&["page=1&q=michael", MICHAEL])]
+        );
 
-        let results2 = df2.collect().await.expect("collect should succeed");
-        assert!(
-            !results2.is_empty(),
-            "Should have results for alphabetical params"
-        );
-        assert!(
-            results2[0].num_rows() > 0,
-            "Should have rows for alphabetical params"
-        );
+        origin.verify().await;
     }
 
     #[test]
@@ -7084,13 +7847,6 @@ mod tests {
             );
         }
     }
-
-    // Integration tests that make real HTTP requests.
-    // These are marked with #[ignore] because they depend on live external services and are
-    // therefore not deterministic in CI; run them explicitly with `cargo test -- --ignored`.
-    // The runtime's resilience against transient upstream failures (timeouts, connection
-    // resets mid-body, 5xx, 429) is exercised in production via the configured retry/backoff
-    // and timeouts; the retry *policy* is unit-tested above without depending on the network.
 
     // Tests for globset pattern matching
     #[test]
@@ -7388,356 +8144,203 @@ mod tests {
             .expect_err("should not match");
     }
 
+    /// One path filter is one request, and its JSON object body is one row.
     #[tokio::test]
-    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_single_post() {
-        use datafusion::prelude::SessionContext;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/posts/1"))
+            .respond_with(json_response(200, pretty_json(POST_1)))
+            .expect(1)
+            .mount(&origin)
+            .await;
 
-        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/posts/1".to_string()])
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/posts/1"])
             .expect("allowed paths");
+        let ctx = http_session("posts", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("posts", Arc::new(provider))
-            .expect("register table");
-
-        // Test basic query
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path = '/posts/1'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        assert!(batch.num_rows() > 0, "Should have rows");
-        assert_eq!(batch.num_columns(), 3);
-
-        // Validate response_status is 200 for successful request
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
         assert_eq!(
-            status_col.value(0),
-            200,
-            "Successful request should have response_status 200"
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content, response_status FROM posts WHERE request_path = '/posts/1'"
+            )
+            .await,
+            vec![row(&["/posts/1", POST_1, "200"])]
         );
 
-        // Validate content contains expected post fields
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        assert!(content.contains("userId"), "Should contain userId field");
-        assert!(
-            content.contains("\"id\"") && content.contains('1'),
-            "Should contain id field with value 1"
-        );
-        assert!(content.contains("title"), "Should contain title field");
-        assert!(content.contains("body"), "Should contain body field");
-
-        // Validate actual field values from the API
-        assert!(
-            content.contains("sunt aut facere repellat provident"),
-            "Should contain expected title text"
-        );
-        assert!(
-            content.contains("quia et suscipit"),
-            "Should contain expected body text"
-        );
+        origin.verify().await;
     }
 
+    /// An `IN` list over `request_path` fans out to one request per path, and
+    /// every row carries the path it was fetched from.
     #[tokio::test]
-    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_multiple_posts() {
-        use datafusion::prelude::SessionContext;
-
-        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec![
-                "/posts/1".to_string(),
-                "/posts/2".to_string(),
-                "/posts/3".to_string(),
-            ])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("posts", Arc::new(provider))
-            .expect("register table");
-
-        // Test IN list filter for multiple paths
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
-
-        // Verify response_status is 200 for all successful requests and content contains expected post IDs
-        let mut found_posts = [false, false, false]; // Track posts 1, 2, 3
-        for batch in &results {
-            let content_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            let status_col = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt16Array>()
-                .expect("response_status should be UInt16Array");
-
-            for i in 0..batch.num_rows() {
-                // Validate response_status is 200
-                assert_eq!(
-                    status_col.value(i),
-                    200,
-                    "All successful requests should have response_status 200"
-                );
-
-                let content = content_col.value(i);
-                assert!(content.contains("userId"), "Should contain userId field");
-                assert!(content.contains("id"), "Should contain id field");
-                assert!(content.contains("title"), "Should contain title field");
-
-                // Check which post this is by title
-                if content.contains("sunt aut facere repellat provident") {
-                    found_posts[0] = true;
-                } else if content.contains("qui est esse") {
-                    found_posts[1] = true;
-                } else if content.contains("ea molestias quasi exercitationem") {
-                    found_posts[2] = true;
-                }
-            }
+        let origin = MockServer::start().await;
+        for (route, post) in [
+            ("/posts/1", POST_1),
+            ("/posts/2", POST_2),
+            ("/posts/3", POST_3),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(json_response(200, pretty_json(post)))
+                .expect(1)
+                .mount(&origin)
+                .await;
         }
 
-        assert!(found_posts[0], "Should have found post 1");
-        assert!(found_posts[1], "Should have found post 2");
-        assert!(found_posts[2], "Should have found post 3");
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/posts/1", "/posts/2", "/posts/3"])
+            .expect("allowed paths");
+        let ctx = http_session("posts", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content, response_status FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3') ORDER BY request_path"
+            )
+            .await,
+            vec![
+                row(&["/posts/1", POST_1, "200"]),
+                row(&["/posts/2", POST_2, "200"]),
+                row(&["/posts/3", POST_3, "200"]),
+            ]
+        );
+
+        origin.verify().await;
     }
+
+    /// A JSON array body is split into one row per element.
     #[tokio::test]
-    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_all_posts() {
-        use datafusion::prelude::SessionContext;
+        let posts: Vec<String> = (1..=5)
+            .map(|id| format!(r#"{{"id":{id},"title":"post {id}","userId":1}}"#))
+            .collect();
 
-        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/posts".to_string()])
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/posts"))
+            .respond_with(json_response(
+                200,
+                pretty_json(&format!("[{}]", posts.join(","))),
+            ))
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/posts"])
             .expect("allowed paths");
+        let ctx = http_session("posts", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("posts", Arc::new(provider))
-            .expect("register table");
-
-        // Test fetching all posts (returns JSON array)
-        let df = ctx
-            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        // JSONPlaceholder /posts returns exactly 100 posts as a JSON array
-        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(
-            total_rows, 100,
-            "Should have exactly 100 posts from /posts endpoint"
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content FROM posts WHERE request_path = '/posts' ORDER BY content"
+            )
+            .await,
+            vec![
+                row(&["/posts", posts[0].as_str()]),
+                row(&["/posts", posts[1].as_str()]),
+                row(&["/posts", posts[2].as_str()]),
+                row(&["/posts", posts[3].as_str()]),
+                row(&["/posts", posts[4].as_str()]),
+            ]
         );
 
-        // Verify first post has expected structure
-        let batch = &results[0];
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let first_post = content_col.value(0);
-        assert!(first_post.contains("userId"), "Should contain userId field");
-        assert!(first_post.contains("id"), "Should contain id field");
-        assert!(first_post.contains("title"), "Should contain title field");
-        assert!(first_post.contains("body"), "Should contain body field");
-
-        // Validate first post has expected values
-        assert!(
-            first_post.contains("sunt aut facere repellat provident"),
-            "First post should have expected title"
-        );
-
-        // Verify we can find a post with id 100 (last post)
-        let mut found_last_post = false;
-        for batch in &results {
-            let content_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            for i in 0..batch.num_rows() {
-                let content = content_col.value(i);
-                // Last post has id 100
-                if content.contains("\"id\"")
-                    && content.contains("100")
-                    && !content.contains("1000")
-                {
-                    found_last_post = true;
-                    break;
-                }
-            }
-        }
-        assert!(found_last_post, "Should have found post with id 100");
+        origin.verify().await;
     }
+
+    /// A request path is joined onto the base URL's own path, while the row's
+    /// `request_path` stays the path the query filtered on.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_single_show() {
-        use datafusion::prelude::SessionContext;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/shows/1"))
+            .respond_with(json_response(200, pretty_json(SHOW_1)))
+            .expect(1)
+            .mount(&origin)
+            .await;
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/shows/1".to_string()])
+        let base_url = Url::parse(&format!("{}/api/v1", origin.uri()))
+            .expect("the mock server's URI is a valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(["/shows/1"])
             .expect("allowed paths");
+        let ctx = http_session("shows", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // Test basic query with filter
-        let df = ctx
-            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        assert!(batch.num_rows() > 0, "Should have rows");
-
-        // Verify content is JSON
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        assert!(content.starts_with('{'), "Should be JSON object");
-        assert!(
-            content.contains("\"id\"") && content.contains('1'),
-            "Should contain id field with value 1"
-        );
-        assert!(
-            content.contains("\"name\"") && content.contains("Under the Dome"),
-            "Should be 'Under the Dome'"
-        );
-        assert!(content.contains("url"), "Should contain url field");
-        assert!(content.contains("genres"), "Should contain genres field");
-        assert!(content.contains("summary"), "Should contain summary field");
-
-        // Validate specific field values
-        assert!(content.contains("Scripted"), "Should have type 'Scripted'");
-        assert!(content.contains("Drama"), "Should have Drama genre");
-        assert!(
-            content.contains("Science-Fiction"),
-            "Should have Science-Fiction genre"
-        );
-        assert!(
-            content.contains("sealed off from the rest of the world"),
-            "Should contain expected summary text"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
-    async fn test_integration_tvmaze_404_not_found() {
-        use datafusion::prelude::SessionContext;
-
-        // Use an invalid route that returns 404 with JSON error body
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            // What this asserts is that the connector can record an error response as a
-            // row, which is `store` rather than the default.
-            .with_error_response_action(ErrorResponseAction::Store)
-            .with_allowed_paths(vec!["/search/invalid_404".to_string()])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("tvmaze", Arc::new(provider))
-            .expect("register table");
-
-        // Query for an invalid route - should return a row with 404 status and error JSON
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM tvmaze WHERE request_path = '/search/invalid_404'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results even for 404");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
-
-        // Validate response_status is 404
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
         assert_eq!(
-            status_col.value(0),
-            404,
-            "Invalid route should have response_status 404"
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content FROM shows WHERE request_path = '/shows/1'"
+            )
+            .await,
+            vec![row(&["/shows/1", SHOW_1])]
         );
 
-        // Validate content contains the 404 JSON error response body
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        // TVMaze returns JSON error: {"name":"Not Found","message":"Page not found.","code":0,"status":404,...}
-        assert!(
-            content.contains("Not Found"),
-            "404 response should contain 'Not Found' in body"
-        );
+        origin.verify().await;
     }
 
+    /// A 4xx is the origin's answer rather than a transient failure: it is not
+    /// retried, and it comes back as one row carrying the status and the error
+    /// body, not as a query error.
     #[tokio::test]
-    #[ignore = "hits a live external API (httpbin.org); not deterministic in CI — run with --ignored"]
-    async fn test_integration_httpbin_500_server_error_is_refused_under_every_action() {
-        use datafusion::prelude::SessionContext;
+    async fn test_integration_tvmaze_404_not_found() {
+        const NOT_FOUND: &str =
+            r#"{"code":0,"message":"Page not found.","name":"Not Found","status":404}"#;
 
-        // The live counterpart of the unit coverage: a server error is refused by its
-        // status class, so even `store` — the action a dataset picks to keep a 404
-        // working — does not record one. See [`ErrorResponseAction`].
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/invalid_404"))
+            .respond_with(json_response(404, pretty_json(NOT_FOUND)))
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        // What this asserts is that the connector can record a client-error
+        // response as a row, which is `store` rather than the default.
+        let provider = origin_provider(&origin)
+            .with_error_response_action(ErrorResponseAction::Store)
+            .with_allowed_paths(["/search/invalid_404"])
+            .expect("allowed paths");
+        let ctx = http_session("tvmaze", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content, response_status FROM tvmaze WHERE request_path = '/search/invalid_404'"
+            )
+            .await,
+            vec![row(&["/search/invalid_404", NOT_FOUND, "404"])]
+        );
+
+        origin.verify().await;
+    }
+
+    /// A 5xx is refused under every action — including `store`, which exists to
+    /// keep a 404 working — so an outage cannot replace the dataset's rows.
+    /// See [`ErrorResponseAction`].
+    #[tokio::test]
+    async fn test_integration_httpbin_500_server_error_is_refused_under_every_action() {
+        // The SQL counterpart of the unit coverage: a server error is refused by
+        // its status class, so even `store` does not record one.
         for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
-            // httpbin.org provides endpoints that return specific HTTP status codes
-            let url = Url::parse("https://httpbin.org").expect("valid URL");
-            let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-                // The ladder is not what this asserts, and every retry is a real sleep.
+            let origin = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/status/500"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&origin)
+                .await;
+
+            let provider = origin_provider(&origin)
                 .with_max_retries(0)
                 .with_error_response_action(action)
-                .with_allowed_paths(vec!["/status/500".to_string()])
+                .with_allowed_paths(["/status/500"])
                 .expect("allowed paths");
-
-            let ctx = SessionContext::new();
-            ctx.register_table("httpbin", Arc::new(provider))
-                .expect("register table");
+            let ctx = http_session("httpbin", provider);
 
             let error = ctx
                 .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
@@ -7748,225 +8351,160 @@ mod tests {
                 .expect_err("a server error must not be answered with rows");
 
             assert!(
+                is_transient_origin_failure(&error),
+                "{action}: a 500 is an origin that is down, not a row: {error}"
+            );
+            assert!(
                 error.to_string().contains("500"),
                 "{action}: the failure must name the status the origin gave: {error}"
             );
+
+            origin.verify().await;
         }
     }
 
+    /// An `OR` of equalities on `request_path` fans out to one request per path,
+    /// like an `IN` list.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_multiple_shows() {
-        use datafusion::prelude::SessionContext;
-
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec![
-                "/shows/1".to_string(),
-                "/shows/2".to_string(),
-                "/shows/82".to_string(),
-            ])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // Test OR filter for multiple paths
-        let df = ctx
-            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1' OR request_path = '/shows/2' OR request_path = '/shows/82'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 shows");
-
-        // Collect all show names to verify we got the right shows
-        let mut show_names = Vec::new();
-        let mut found_under_dome = false;
-        let mut found_person_interest = false;
-        let mut found_game_thrones = false;
-
-        for batch in &results {
-            let content_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            for i in 0..batch.num_rows() {
-                let content = content_col.value(i);
-                if content.contains("Under the Dome") {
-                    show_names.push("Under the Dome");
-                    // Validate Under the Dome specific values
-                    assert!(content.contains("\"id\"") && content.contains('1'));
-                    assert!(content.contains("Drama"));
-                    assert!(content.contains("Science-Fiction"));
-                    found_under_dome = true;
-                } else if content.contains("Person of Interest") {
-                    show_names.push("Person of Interest");
-                    // Validate Person of Interest specific values
-                    assert!(content.contains("\"id\"") && content.contains('2'));
-                    assert!(content.contains("Action"));
-                    assert!(content.contains("Crime"));
-                    found_person_interest = true;
-                } else if content.contains("Game of Thrones") {
-                    show_names.push("Game of Thrones");
-                    // Validate Game of Thrones specific values
-                    assert!(content.contains("\"id\"") && content.contains("82"));
-                    assert!(content.contains("Fantasy"));
-                    assert!(content.contains("Adventure"));
-                    found_game_thrones = true;
-                }
-            }
+        let origin = MockServer::start().await;
+        for (route, show) in [
+            ("/shows/1", SHOW_1),
+            ("/shows/2", SHOW_2),
+            ("/shows/82", SHOW_82),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(json_response(200, pretty_json(show)))
+                .expect(1)
+                .mount(&origin)
+                .await;
         }
 
-        assert_eq!(show_names.len(), 3, "Should have found all 3 shows");
-        assert!(found_under_dome, "Should have found Under the Dome");
-        assert!(
-            found_person_interest,
-            "Should have found Person of Interest"
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/shows/1", "/shows/2", "/shows/82"])
+            .expect("allowed paths");
+        let ctx = http_session("shows", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content FROM shows WHERE request_path = '/shows/1' OR request_path = '/shows/2' OR request_path = '/shows/82' ORDER BY request_path"
+            )
+            .await,
+            vec![
+                row(&["/shows/1", SHOW_1]),
+                row(&["/shows/2", SHOW_2]),
+                row(&["/shows/82", SHOW_82]),
+            ]
         );
-        assert!(found_game_thrones, "Should have found Game of Thrones");
+
+        origin.verify().await;
     }
+
+    /// Selecting only `content` while filtering on `request_path` returns just
+    /// that one column, with the filter still applied.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_projection() {
-        use datafusion::prelude::SessionContext;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/shows/1"))
+            .respond_with(json_response(200, pretty_json(SHOW_1)))
+            .expect(1)
+            .mount(&origin)
+            .await;
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/shows/1".to_string()])
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/shows/1"])
             .expect("allowed paths");
+        let ctx = http_session("shows", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // Test with projection - only select content column
-        let df = ctx
-            .sql("SELECT content FROM shows WHERE request_path = '/shows/1'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_columns(), 1, "Should only have content column");
-        assert!(batch.num_rows() > 0, "Should have rows");
-
-        // Verify the content is valid JSON with expected fields
-        let content_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        assert!(
-            content.contains("Under the Dome"),
-            "Should be Under the Dome"
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT content FROM shows WHERE request_path = '/shows/1'"
+            )
+            .await,
+            vec![row(&[SHOW_1])]
         );
-        assert!(content.contains("genres"), "Should contain genres field");
 
-        // Validate specific values in the projection
-        assert!(content.contains("Drama"), "Should contain Drama genre");
-        assert!(
-            content.contains("Science-Fiction"),
-            "Should contain Science-Fiction genre"
-        );
+        origin.verify().await;
     }
 
+    /// Aggregates count one row per fetched response.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_aggregation() {
-        use datafusion::prelude::SessionContext;
-
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/shows/1".to_string(), "/shows/2".to_string()])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // First validate that we get the actual content before testing aggregation
-        let df_content = ctx
-            .sql("SELECT content FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
-            .await
-            .expect("query should succeed");
-
-        let content_results = df_content.collect().await.expect("collect should succeed");
-        assert!(!content_results.is_empty(), "Should have content results");
-
-        let mut found_under_dome = false;
-        let mut found_person_interest = false;
-
-        for batch in &content_results {
-            let content_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            for i in 0..batch.num_rows() {
-                let content = content_col.value(i);
-                if content.contains("Under the Dome") {
-                    assert!(content.contains("Drama"));
-                    found_under_dome = true;
-                }
-                if content.contains("Person of Interest") {
-                    assert!(content.contains("Action"));
-                    found_person_interest = true;
-                }
-            }
+        let origin = MockServer::start().await;
+        for (route, show) in [("/shows/1", SHOW_1), ("/shows/2", SHOW_2)] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(json_response(200, pretty_json(show)))
+                // Once per query: the origin sends no `Cache-Control`, so no
+                // response is retained between the two queries below.
+                .expect(2)
+                .mount(&origin)
+                .await;
         }
 
-        assert!(
-            found_under_dome,
-            "Should have found Under the Dome with Drama genre"
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/shows/1", "/shows/2"])
+            .expect("allowed paths");
+        let ctx = http_session("shows", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT content FROM shows WHERE request_path IN ('/shows/1', '/shows/2') ORDER BY content"
+            )
+            .await,
+            vec![row(&[SHOW_2]), row(&[SHOW_1])]
         );
-        assert!(
-            found_person_interest,
-            "Should have found Person of Interest with Action genre"
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT COUNT(*) AS total FROM shows WHERE request_path IN ('/shows/1', '/shows/2')"
+            )
+            .await,
+            vec![row(&["2"])]
         );
 
-        // Test count aggregation
-        let df = ctx
-            .sql("SELECT COUNT(*) as total FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        let count_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("count should be int64 array");
-
-        let count = count_col.value(0);
-        assert_eq!(count, 2, "Should have counted exactly 2 rows for 2 shows");
+        origin.verify().await;
     }
 
-    /// Integration test: Open Library search API with query-parameter pagination.
-    /// Uses `pagination_query_params` with `offset={offset}&limit={limit}` to
-    /// paginate through search results, and `pagination_data_pointer` to extract
-    /// the `docs` array from each page.
+    /// Query-parameter pagination in the shape of a search API: an
+    /// `offset={offset}&limit={limit}` template merged into the base URL's own
+    /// query, a page size of 3, rows taken from `/docs`, and at most two pages.
+    /// The origin has a third page, which `max_pages` must keep the connector
+    /// from fetching.
     #[tokio::test]
-    #[ignore = "hits a live external API (openlibrary.org); not deterministic in CI — run with --ignored"]
     async fn test_integration_openlibrary_query_param_pagination() {
-        use datafusion::prelude::SessionContext;
+        let docs: Vec<String> = (1..=7)
+            .map(|n| format!(r#"{{"key":"/works/OL{n}W","title":"Book {n}"}}"#))
+            .collect();
 
-        let url = Url::parse("https://openlibrary.org/search.json?q=tolkien").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+        let origin = MockServer::start().await;
+        for (offset, page, expected_requests) in [
+            ("0", &docs[0..3], 1_u64),
+            ("3", &docs[3..6], 1),
+            ("6", &docs[6..7], 0),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/search.json"))
+                .and(query_param("q", "tolkien"))
+                .and(query_param("offset", offset))
+                .and(query_param("limit", "3"))
+                .respond_with(json_response(
+                    200,
+                    pretty_json(&format!(r#"{{"docs":[{}],"numFound":7}}"#, page.join(","))),
+                ))
+                .expect(expected_requests)
+                .mount(&origin)
+                .await;
+        }
+
+        let base_url = Url::parse(&format!("{}/search.json?q=tolkien", origin.uri()))
+            .expect("the mock server's URI is a valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
             .with_pagination(PaginationConfig {
                 query_params: Some("offset={offset}&limit={limit}".to_string()),
                 page_size: Some(3),
@@ -7976,41 +8514,28 @@ mod tests {
                 ..Default::default()
             })
             .expect("pagination config");
+        let ctx = http_session("books", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("books", Arc::new(provider))
-            .expect("register table");
-
-        let df = ctx
-            .sql("SELECT content FROM books")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
-
-        // With page_size=3 and max_pages=2, we expect up to 6 rows.
-        // If the last page has fewer than 3 rows, we get fewer.
-        assert!(
-            total_rows >= 4,
-            "Should have fetched multiple pages of results, got {total_rows}"
-        );
-        assert!(
-            total_rows <= 6,
-            "Should not exceed 2 pages * 3 items = 6 rows, got {total_rows}"
+        // Exactly two full pages, each row stamped with the query that fetched it.
+        let first_page = "q=tolkien&offset=0&limit=3";
+        let second_page = "q=tolkien&offset=3&limit=3";
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_query, content FROM books ORDER BY content"
+            )
+            .await,
+            vec![
+                row(&[first_page, docs[0].as_str()]),
+                row(&[first_page, docs[1].as_str()]),
+                row(&[first_page, docs[2].as_str()]),
+                row(&[second_page, docs[3].as_str()]),
+                row(&[second_page, docs[4].as_str()]),
+                row(&[second_page, docs[5].as_str()]),
+            ]
         );
 
-        // Verify content looks like book records
-        let content_col = results[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-        let first_row = content_col.value(0);
-        assert!(
-            first_row.contains("title"),
-            "Book records should contain a title field: {first_row}"
-        );
+        origin.verify().await;
     }
 
     // --- Pagination tests ---
@@ -8194,8 +8719,17 @@ mod tests {
             ..Default::default()
         };
         let content = r#"{"results": [1, 2, 3]}"#;
-        let result = extract_page_data(content, &config, None);
-        assert!(result.is_err(), "missing pointer should return error");
+        // A mistyped pointer must fail and name the pointer, rather than quietly
+        // yield zero rows from a page that has data.
+        match extract_page_data(content, &config, None) {
+            Err(DataFusionError::Execution(message)) => assert_eq!(
+                message,
+                "Failed to extract paginated HTTP response data: configured data pointer '/nonexistent' was not found in the response"
+            ),
+            other => panic!(
+                "a missing data pointer must be an execution error that names it, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -9445,11 +9979,15 @@ mod tests {
         // When next_pointer is set but parsed_json is None, it should error
         let headers = vec![];
 
-        let result = super::extract_next_page_info(None, &headers, &config, &base_url, 0);
-        assert!(
-            result.is_err(),
-            "missing parsed JSON should return error when next_pointer is configured"
-        );
+        match super::extract_next_page_info(None, &headers, &config, &base_url, 0) {
+            Err(Error::Pagination { message }) => assert_eq!(
+                message,
+                "JSON not parsed but next_pointer '/next' is configured"
+            ),
+            other => panic!(
+                "missing parsed JSON with a next_pointer configured must be a pagination error, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -9484,11 +10022,16 @@ mod tests {
         let content = r#"{"data": [1, 2], "page": 3}"#;
         let headers = vec![];
 
-        let result = extract_next_page_info(content, &headers, &config, &base_url);
-        assert!(
-            result.is_err(),
-            "numeric pointer without token_param should error"
-        );
+        match extract_next_page_info(content, &headers, &config, &base_url) {
+            Err(Error::Pagination { message }) => assert_eq!(
+                message,
+                "Failed to extract pagination value from JSON pointer '/page': numeric values require 'pagination_token_param' to be configured",
+                "the error must name the setting that fixes it"
+            ),
+            other => panic!(
+                "a numeric pointer value without token_param must be a pagination error, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -9498,15 +10041,24 @@ mod tests {
             next_pointer: Some("/next".to_string()),
             ..Default::default()
         };
-        // Boolean value is not a valid pagination pointer
-        let content = r#"{"next": true}"#;
+        // A boolean, array or object is not a valid pagination value. Unlike null
+        // or an empty string (`test_extract_next_page_info_null_means_no_more_pages`),
+        // it must not end pagination quietly.
         let headers = vec![];
 
-        let result = extract_next_page_info(content, &headers, &config, &base_url);
-        assert!(
-            result.is_err(),
-            "non-string/non-number pointer value should return error"
-        );
+        for value in ["true", "[1, 2]", r#"{"page": 2}"#] {
+            let content = format!(r#"{{"next": {value}}}"#);
+            match extract_next_page_info(&content, &headers, &config, &base_url) {
+                Err(Error::Pagination { message }) => assert_eq!(
+                    message,
+                    "Failed to extract pagination value from JSON pointer '/next': expected a string, number, or null",
+                    "next = {value}"
+                ),
+                other => {
+                    panic!("next = {value} must be rejected as a pagination error, got: {other:?}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -9516,11 +10068,15 @@ mod tests {
             ..Default::default()
         };
         // When data_pointer is set but parsed_json is None, it should error
-        let result = super::extract_page_data("", None, &config, None);
-        assert!(
-            result.is_err(),
-            "missing parsed JSON should return error when data_pointer is configured"
-        );
+        match super::extract_page_data("", None, &config, None) {
+            Err(DataFusionError::Execution(message)) => assert_eq!(
+                message,
+                "JSON not parsed but data_pointer '/results' is configured"
+            ),
+            other => panic!(
+                "missing parsed JSON with a data_pointer configured must be an execution error, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -10100,8 +10656,18 @@ mod tests {
             ..empty_fetch_result()
         };
 
-        exec.create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+        let err = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
             .expect_err("a zero-row 429 must be an error, not a successful empty batch");
+        // A rate limit, not a server failure: the message names the 429 the
+        // origin actually answered.
+        let DataFusionError::External(source) = &err else {
+            panic!("a zero-row 429 must surface as an external (origin) error, got: {err:?}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "HTTP request was rate limited: the origin answered 429 Too Many Requests with an empty body"
+        );
     }
 
     /// A genuinely empty 2xx result (the origin really has no rows to
@@ -10706,6 +11272,173 @@ mod tests {
             partitions,
             None,
         )
+    }
+
+    #[test]
+    fn content_builder_preserves_utf8_empty_nul_and_duplicate_values() {
+        let plain = make_exec(vec![(None, None, None, None)], None);
+        let (cached, _) = plain.for_cache_fetch();
+        let rows: Vec<String> = ["", "雪🌶", "before\0after", "same", "same"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let bytes = rows.iter().map(String::len).sum::<usize>();
+        assert_eq!(
+            HttpExec::content_byte_capacity(rows.iter().map(String::len)).expect("valid bytes"),
+            bytes
+        );
+        for exec in [plain, cached] {
+            let batch = exec
+                .create_batch_from_rows(None, None, None, None, &rows, &empty_fetch_result())
+                .expect("content batch");
+            assert_eq!(
+                string_col(&batch, "content"),
+                rows.iter().cloned().map(Some).collect::<Vec<_>>()
+            );
+            let content = batch.column_by_name("content").expect("content column");
+            assert_eq!(content.data_type(), &DataType::Utf8);
+            assert_eq!(content.null_count(), 0);
+            let content = content
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 content");
+            assert_eq!(content.value_data().len(), bytes);
+        }
+    }
+
+    #[test]
+    fn content_byte_capacity_checks_sum_and_utf8_offsets_without_allocating() {
+        let max = usize::try_from(i32::MAX).expect("Utf8 offset fits usize");
+        assert_eq!(
+            HttpExec::content_byte_capacity(std::iter::empty()).expect("empty"),
+            0
+        );
+        assert_eq!(
+            HttpExec::content_byte_capacity([max].into_iter()).expect("maximum offset"),
+            max
+        );
+        HttpExec::content_byte_capacity([max, 1].into_iter())
+            .expect_err("capacity past the largest Utf8 offset");
+        HttpExec::content_byte_capacity([usize::MAX, 1].into_iter())
+            .expect_err("capacity overflows usize");
+    }
+
+    #[test]
+    fn cache_fetch_metadata_matches_plain_http() {
+        let plain = make_exec(vec![(None, None, None, None)], None);
+        let (cached, completion) = plain.for_cache_fetch();
+        let rows = vec!["same".to_string(), "same".to_string()];
+        for query in [None, Some("")] {
+            for body in [None, Some("")] {
+                let batch = cached
+                    .create_batch_from_rows(None, query, body, None, &rows, &empty_fetch_result())
+                    .expect("cache metadata batch");
+                assert_eq!(
+                    string_col(&batch, "request_query"),
+                    vec![Some(query.unwrap_or("").to_string()); 2]
+                );
+                assert_eq!(
+                    string_col(&batch, "request_body"),
+                    vec![Some(body.unwrap_or("").to_string()); 2]
+                );
+                assert_eq!(
+                    string_col(&batch, "content"),
+                    vec![Some("same".to_string()); 2]
+                );
+                let ordinary = plain
+                    .create_batch_from_rows(None, query, body, None, &rows, &empty_fetch_result())
+                    .expect("ordinary metadata batch");
+                assert_eq!(
+                    string_col(&ordinary, "request_query"),
+                    vec![Some(String::new()); 2]
+                );
+                assert_eq!(
+                    string_col(&ordinary, "request_body"),
+                    vec![Some(String::new()); 2]
+                );
+                assert_eq!(batch.schema(), ordinary.schema());
+            }
+        }
+        assert!(
+            !completion.is_complete(),
+            "metadata construction is not exhaustion proof"
+        );
+    }
+
+    #[test]
+    fn cache_fetch_preserves_base_query_and_empty_override_behavior() {
+        let mut provider = base_provider();
+        provider.base_url.set_query(Some("base=one"));
+        let exec = HttpExec::new(
+            provider.schema(),
+            Arc::new(provider),
+            vec![(None, None, None, None)],
+            None,
+        );
+        let (cached, _) = exec.for_cache_fetch();
+        assert_eq!(
+            cached
+                .provider
+                .build_request_url("", None)
+                .expect("default URL")
+                .query(),
+            Some("base=one")
+        );
+        assert_eq!(
+            cached
+                .provider
+                .build_request_url("", Some(""))
+                .expect("override URL")
+                .query(),
+            Some("")
+        );
+        assert_eq!(cached.partitions, exec.partitions);
+    }
+
+    #[test]
+    fn cache_fetch_nested_metadata_matches_plain_http() {
+        let metadata = ["request_query".to_string(), "request_body".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "request_query".into(),
+                "request_body".into(),
+                "payload".into(),
+            ],
+            "payload".into(),
+            metadata.clone(),
+            metadata,
+        );
+        let provider = Arc::new(
+            base_provider()
+                .with_json_nesting(nesting.clone(), nesting_schema_with_metadata(&nesting)),
+        );
+        let (cached, _) = HttpExec::new(
+            provider.schema(),
+            provider,
+            vec![(None, None, None, None)],
+            None,
+        )
+        .for_cache_fetch();
+        let batch = cached
+            .create_batch_from_rows(
+                None,
+                None,
+                None,
+                None,
+                &["{\"value\":1}".into()],
+                &empty_fetch_result(),
+            )
+            .expect("nested cache metadata");
+        assert_eq!(
+            string_col(&batch, "request_query"),
+            vec![Some(String::new())]
+        );
+        assert_eq!(
+            string_col(&batch, "request_body"),
+            vec![Some(String::new())]
+        );
     }
 
     #[test]

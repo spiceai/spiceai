@@ -33,15 +33,15 @@ limitations under the License.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/12883>.
 //!
-//! This lives in its own test binary because the meter install is global: the
-//! instrument is a `LazyLock` over `global::meter(..)`, so it binds to whichever
+//! It needs a process of its own, which nextest gives every test (see
+//! `utils::require_process_per_test`): the meter install is global, the
+//! instrument is a `LazyLock` over `global::meter(..)` that binds to whichever
 //! provider is installed when it is first touched, and a count assertion is only
 //! stable when no other test is recording on the same series.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use opentelemetry::global;
-use opentelemetry_sdk::{Resource, metrics::SdkMeterProvider};
+use crate::utils::PROMETHEUS;
 use runtime::datafusion::query::QueryActiveGuard;
 use runtime_request_context::{Protocol, RequestContext};
 
@@ -50,34 +50,6 @@ use runtime_request_context::{Protocol, RequestContext};
 /// exists to keep — and only the first of them finds the request idle, so the
 /// count must stay at exactly one however many overlap.
 const FAN_OUT: usize = 8;
-
-/// The one `MeterProvider` for this binary, installed before any instrument
-/// exists.
-static PROMETHEUS: LazyLock<prometheus::Registry> =
-    LazyLock::new(install_prometheus_meter_provider);
-
-/// Installs a `MeterProvider` backed by a scrapable Prometheus registry, as
-/// `spiced` does for the `--metrics` endpoint.
-fn install_prometheus_meter_provider() -> prometheus::Registry {
-    let registry = prometheus::Registry::new();
-
-    let exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry.clone())
-        .without_scope_info()
-        .without_units()
-        .without_counter_suffixes()
-        .without_target_info()
-        .build()
-        .expect("to build the prometheus exporter");
-
-    let provider = SdkMeterProvider::builder()
-        .with_resource(Resource::builder().build())
-        .with_reader(exporter)
-        .build();
-    global::set_meter_provider(provider);
-
-    registry
-}
 
 /// Asserts `query_active_count` sits exactly `expected` above `baseline`.
 ///
@@ -109,6 +81,9 @@ fn query_active_count(registry: &prometheus::Registry) -> f64 {
 
 #[test]
 fn query_active_count_returns_to_baseline_whatever_order_queries_finish_in() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global OpenTelemetry meter provider and reads exact counts from it",
+    );
     let registry = &*PROMETHEUS;
     let context = Arc::new(RequestContext::builder(Protocol::Http).build());
 

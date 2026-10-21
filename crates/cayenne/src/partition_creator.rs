@@ -42,6 +42,20 @@ use crate::{
     TimeRetentionFilterBuilder, metadata,
 };
 
+/// The partition column labels a Cayenne table records for each of its
+/// partitions: the column name for a plain column expression, otherwise the
+/// expression's `partition_by` name.
+#[must_use]
+pub fn partition_column_labels(partition_by: &[PartitionedBy]) -> Vec<String> {
+    partition_by
+        .iter()
+        .map(|p| match &p.expression {
+            Expr::Column(col) => col.name.clone(),
+            _ => p.name.clone(),
+        })
+        .collect()
+}
+
 /// Implements [`PartitionCreator`] for Cayenne-backed partitioned tables.
 ///
 /// Creates and opens per-partition [`CayenneTableProvider`]s rooted at
@@ -201,7 +215,9 @@ impl CayennePartitionCreator {
         .with_context(Arc::clone(&self.context))
         .with_retention_filters(self.retention_filters.clone())
         .with_scan_view_reuse(self.scan_view_reuse)
-        .with_secondary_indexes(self.secondary_indexes.clone());
+        .with_secondary_indexes(self.secondary_indexes.clone())
+        .with_dataset_name(&self.table_name)
+        .with_partitioned_table_conflict_detection(self.vortex_config.pk_conflict_detection);
         if let Some(ref rb) = self.time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(rb.clone());
         }
@@ -219,16 +235,6 @@ impl CayennePartitionCreator {
         // the idle evictor) so a partition provider offloads its builds and releases
         // idle cached views' pinned snapshot dirs, like the top-level provider.
         provider.init_scan_view_cache();
-    }
-
-    fn partition_column_labels(&self) -> Vec<String> {
-        self.partition_by
-            .iter()
-            .map(|p| match &p.expression {
-                Expr::Column(col) => col.name.clone(),
-                _ => p.name.clone(),
-            })
-            .collect()
     }
 
     fn partition_table_name(&self, partition_key: &str) -> String {
@@ -322,7 +328,7 @@ impl PartitionCreator for CayennePartitionCreator {
             }
         }
 
-        let partition_column_names = self.partition_column_labels();
+        let partition_column_names = partition_column_labels(&self.partition_by);
         let partition_key = encode_composite_key(&partition_values)
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
@@ -377,7 +383,7 @@ impl PartitionCreator for CayennePartitionCreator {
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))
             .boxed()
             .context(creator::InferringPartitionsSnafu)?;
-        let expected_partition_columns = self.partition_column_labels();
+        let expected_partition_columns = partition_column_labels(&self.partition_by);
 
         for partition_meta in partitions {
             if partition_meta.partition_columns != expected_partition_columns {

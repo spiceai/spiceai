@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod gcs;
+
 use itertools::Itertools;
 use runtime_secrets::Secrets;
 use secrecy::{ExposeSecret, SecretString};
@@ -89,10 +91,20 @@ impl Parameters {
             key_to_use = &key[full_prefix.len()..];
         }
 
+        // A retired key is dropped here, in its prefixed and unprefixed spelling, and
+        // reported by the component that owns it, so the generic "not supported"
+        // warning does not repeat it.
+        if all_params
+            .iter()
+            .any(|p| p.is_retired() && (p.display_name(prefix) == key || p.name == key))
+        {
+            return None;
+        }
+
         // Find the non-deprecated spec matching the unprefixed key name
         let spec = all_params
             .iter()
-            .find(|p| p.name == key_to_use && p.deprecation_message.is_none());
+            .find(|p| p.name == key_to_use && p.deprecation_message.is_none() && !p.is_retired());
 
         // Find deprecated spec matching the unprefixed key name (for backwards compat)
         // e.g., component("tools").deprecated(...) allows "openai_tools" to work
@@ -572,7 +584,7 @@ fn closest_param_suggestion(
 ) -> Option<String> {
     let candidates: Vec<String> = all_params
         .iter()
-        .filter(|p| p.deprecation_message.is_none())
+        .filter(|p| p.deprecation_message.is_none() && !p.is_retired())
         .map(|p| p.display_name(prefix))
         .collect();
     util::levenshtein::closest_match(typo, &candidates)
@@ -643,6 +655,33 @@ mod test {
         assert_eq!(
             closest_param_suggestion(&specs, "pg", "pg_hostnam"),
             Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_retired_param_is_dropped_and_not_suggested() {
+        let specs = [
+            ParameterSpec::component("tuning").moved_to("runtime.adaptive_tuning"),
+            ParameterSpec::component("host"),
+        ];
+        let format = |key| {
+            Parameters::validate_and_format_key(&specs, "pg", key, "dataset", Diagnostics::Suppress)
+        };
+        assert_eq!(
+            format("pg_tuning"),
+            None,
+            "a retired key must not be applied"
+        );
+        assert_eq!(
+            format("tuning"),
+            None,
+            "the unprefixed spelling of a retired key must not be applied either"
+        );
+        assert_eq!(format("pg_host"), Some("host".to_string()));
+        assert_ne!(
+            closest_param_suggestion(&specs, "pg", "pg_tunin"),
+            Some("pg_tuning".to_string()),
+            "a retired key must not be offered as a suggestion"
         );
     }
 

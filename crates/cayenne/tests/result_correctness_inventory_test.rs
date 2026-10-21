@@ -29,8 +29,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::cloned_ref_to_slice_refs)]
 
-#[path = "correctness/support/mod.rs"]
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 

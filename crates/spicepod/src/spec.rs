@@ -298,8 +298,12 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub management: Option<Management>,
 
-    /// Optional acceleration snapshot configuration
+    /// Deprecated: snapshots are stored in the `snapshots/` folder of
+    /// `runtime.state.location`. A dataset sets `acceleration.snapshots_location`,
+    /// `acceleration.snapshots_params` and
+    /// `acceleration.snapshots_bootstrap_on_failure_behavior` to override it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("deprecated" = true)))]
     pub snapshots: Option<Snapshots>,
 
     /// Optional extensions configuration

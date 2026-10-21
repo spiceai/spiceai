@@ -54,6 +54,100 @@ const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 /// since the Postgres epoch; Arrow `Date32` is days since the Unix epoch.
 const PG_EPOCH_DAYS: i32 = 10_957;
 
+const PG_BOOL_OID: u32 = 16;
+const PG_CHAR_OID: u32 = 18;
+const PG_INT8_OID: u32 = 20;
+const PG_INT2_OID: u32 = 21;
+const PG_INT4_OID: u32 = 23;
+const PG_OID_OID: u32 = 26;
+const PG_FLOAT4_OID: u32 = 700;
+const PG_FLOAT8_OID: u32 = 701;
+const PG_DATE_OID: u32 = 1082;
+const PG_TIME_OID: u32 = 1083;
+const PG_TIMESTAMP_OID: u32 = 1114;
+const PG_TIMESTAMPTZ_OID: u32 = 1184;
+const PG_NUMERIC_OID: u32 = 1700;
+
+/// An integer or float decoded by its wire type, before conversion to the
+/// builder's type ([`FieldBuilder::append_binary_of_another_type`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WireNumber {
+    Int(i64),
+    Float(f64),
+}
+
+impl std::fmt::Display for WireNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(v) => write!(f, "{v}"),
+            Self::Float(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+impl WireNumber {
+    /// The value as `T`, or `None` when `T` cannot hold it exactly: a float with
+    /// a fractional part, a non-finite float, or a value out of `T`'s range.
+    /// `-0.0` becomes `0`, as every SQL cast to an integer does.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the float is integral and below 2^127 in magnitude, so `as i128` is exact"
+    )]
+    fn to_int<T: TryFrom<i128>>(self) -> Option<T> {
+        let wide = match self {
+            Self::Int(v) => i128::from(v),
+            Self::Float(v) if v.is_finite() && v.fract() == 0.0 && v.abs() < 2f64.powi(127) => {
+                v as i128
+            }
+            Self::Float(_) => return None,
+        };
+        T::try_from(wide).ok()
+    }
+
+    /// The value as `f32`, or `None` when `f32` cannot hold it exactly. Every
+    /// `f32` is an `f64`, so a value `f64` cannot hold is not an `f32` either.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::float_cmp,
+        reason = "the conversion is checked by converting back and comparing exactly"
+    )]
+    fn to_f32(self) -> Option<f32> {
+        self.to_f64().and_then(|v| {
+            let f = v as f32;
+            (f64::from(f) == v || v.is_nan()).then_some(f)
+        })
+    }
+
+    /// The value as `f64`, or `None` when `f64` cannot hold it exactly.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the conversion is checked by converting back and comparing"
+    )]
+    fn to_f64(self) -> Option<f64> {
+        match self {
+            Self::Int(v) => {
+                let f = v as f64;
+                (f as i128 == i128::from(v)).then_some(f)
+            }
+            Self::Float(v) => Some(v),
+        }
+    }
+
+    /// The unscaled `Decimal128(precision, scale)` value, or `None` when the
+    /// decimal cannot hold it exactly. Only an integer converts: a float's
+    /// binary fraction has no exact decimal form in general.
+    fn to_decimal128(self, precision: u8, scale: i8) -> Option<i128> {
+        let Self::Int(v) = self else {
+            return None;
+        };
+        let scale = u32::try_from(scale).ok()?;
+        let unscaled = i128::from(v).checked_mul(10i128.checked_pow(scale)?)?;
+        let bound = 10i128.checked_pow(u32::from(precision))?;
+        (unscaled.abs() < bound).then_some(unscaled)
+    }
+}
+
 /// One logical change derived from a pgoutput message.
 #[derive(Debug, Clone)]
 pub struct DecodedChange {
@@ -229,8 +323,35 @@ pub fn build_change_batch(
                     let value = change.row.columns.get(*source_idx).and_then(Option::as_ref);
                     // The source column's Postgres type OID drives binary-format
                     // decoding; the text path ignores it.
-                    let type_oid = relation.columns[*source_idx].type_oid;
-                    data_builders[col_idx].append(value, change.op, type_oid)?;
+                    let column = &relation.columns[*source_idx];
+                    // A delete applies by primary key. Under `REPLICA IDENTITY FULL`
+                    // its old row carries every column, and one whose source type
+                    // changed may hold a value the column's type cannot; it is
+                    // carried as NULL, as `REPLICA IDENTITY DEFAULT` sends it,
+                    // rather than refusing a delete that does not depend on it.
+                    // Only a fixed-width column takes this path, and it is skipped
+                    // before any decode, so no partial value reaches the builder.
+                    if change.op == ChangeOp::Delete
+                        && !column.is_key
+                        && matches!(value, Some(Value::Binary(_)))
+                        && !data_builders[col_idx].decodes_wire_type(column.type_oid)
+                    {
+                        data_builders[col_idx].append_null();
+                        continue;
+                    }
+                    data_builders[col_idx]
+                        .append(value, change.op, column.type_oid)
+                        .map_err(|e| match e {
+                            super::Error::PgOutputDecode { message } => {
+                                super::Error::PgOutputDecode {
+                                    message: format!(
+                                        "column '{}': {message}",
+                                        dataset_schema.field(col_idx).name()
+                                    ),
+                                }
+                            }
+                            other => other,
+                        })?;
                 }
                 None => data_builders[col_idx].append_null(),
             }
@@ -1100,6 +1221,143 @@ impl FieldBuilder {
         Ok(())
     }
 
+    /// Whether the builder decodes a binary value of `type_oid` itself: always
+    /// for a builder that is not fixed-width (its decode dispatches on the OID or
+    /// takes the bytes as they are), otherwise only for its own source type.
+    #[inline]
+    fn decodes_wire_type(&self, type_oid: u32) -> bool {
+        match self {
+            Self::Bool(_) => type_oid == PG_BOOL_OID,
+            Self::Int8(_) => type_oid == PG_CHAR_OID,
+            Self::Int16(_) => type_oid == PG_INT2_OID,
+            Self::Int32(_) => type_oid == PG_INT4_OID,
+            Self::Int64(_) => type_oid == PG_INT8_OID,
+            Self::UInt32(_) => type_oid == PG_OID_OID,
+            Self::Float32(_) => type_oid == PG_FLOAT4_OID,
+            Self::Float64(_) => type_oid == PG_FLOAT8_OID,
+            Self::Date32(_) => type_oid == PG_DATE_OID,
+            Self::Time64Nanos(_) => type_oid == PG_TIME_OID,
+            // The provider maps `timestamptz` to a timezone-bearing column and
+            // `timestamp` to a naive one; their payloads share a width but not
+            // a meaning, so each column decodes only its own kind.
+            Self::TimestampMicros(_, tz) | Self::TimestampNanos(_, tz) => {
+                type_oid
+                    == if tz.is_some() {
+                        PG_TIMESTAMPTZ_OID
+                    } else {
+                        PG_TIMESTAMP_OID
+                    }
+            }
+            Self::Decimal128(..) => type_oid == PG_NUMERIC_OID,
+            _ => true,
+        }
+    }
+
+    /// Handle a binary value whose source type is not the builder's own.
+    ///
+    /// The builder is typed from the dataset's working schema, which can differ
+    /// from the type a column has in the WAL: under `on_schema_change: block`
+    /// after the source column's type changed, or for WAL written before a
+    /// widening the dataset has already adopted. The `send` decoders check only
+    /// a value's length, so decoding its bytes as the builder's type would
+    /// misread any value of the same width. Instead, an integer or float is
+    /// decoded as its wire type and appended when the builder's type holds it
+    /// exactly, and any other value of a known source type is an error.
+    ///
+    /// Called only when [`Self::decodes_wire_type`] is `false`. Returns `false`,
+    /// appending nothing, when the wire type is not one this handles; the caller
+    /// then decodes the value as the builder's type.
+    #[cold]
+    #[inline(never)]
+    fn append_binary_of_another_type(&mut self, raw: &[u8], type_oid: u32) -> Result<bool> {
+        use postgres_protocol::types as pg;
+
+        let target = match self {
+            Self::Bool(_) => DataType::Boolean,
+            Self::Int8(_) => DataType::Int8,
+            Self::Int16(_) => DataType::Int16,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int64(_) => DataType::Int64,
+            Self::UInt32(_) => DataType::UInt32,
+            Self::Float32(_) => DataType::Float32,
+            Self::Float64(_) => DataType::Float64,
+            Self::Date32(_) => DataType::Date32,
+            Self::Time64Nanos(_) => DataType::Time64(TimeUnit::Nanosecond),
+            Self::TimestampMicros(_, tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+            Self::TimestampNanos(_, tz) => DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+            Self::Decimal128(_, precision, scale) => DataType::Decimal128(*precision, *scale),
+            _ => return Ok(false),
+        };
+        let (wire_name, decoded) = match type_oid {
+            PG_INT2_OID => (
+                "int2",
+                pg::int2_from_sql(raw).map(i64::from).map(WireNumber::Int),
+            ),
+            PG_INT4_OID => (
+                "int4",
+                pg::int4_from_sql(raw).map(i64::from).map(WireNumber::Int),
+            ),
+            PG_INT8_OID => ("int8", pg::int8_from_sql(raw).map(WireNumber::Int)),
+            PG_CHAR_OID => (
+                "\"char\"",
+                pg::char_from_sql(raw).map(i64::from).map(WireNumber::Int),
+            ),
+            PG_OID_OID => (
+                "oid",
+                pg::oid_from_sql(raw).map(i64::from).map(WireNumber::Int),
+            ),
+            PG_FLOAT4_OID => (
+                "float4",
+                pg::float4_from_sql(raw)
+                    .map(f64::from)
+                    .map(WireNumber::Float),
+            ),
+            PG_FLOAT8_OID => ("float8", pg::float8_from_sql(raw).map(WireNumber::Float)),
+            _ if type_oid == PG_NUMERIC_OID
+                || super::schema_evolution::map_pg_oid_to_arrow(type_oid, -1).is_some() =>
+            {
+                return PgOutputDecodeSnafu {
+                    message: format!(
+                        "postgres_replication: the source column's type (type oid {type_oid}) is not \
+                         the dataset column's type `{target}`, so its value cannot be decoded. The \
+                         source column's type changed since the dataset was registered; set \
+                         `on_schema_change: sync_all_columns` to adopt a widening, or restart Spice \
+                         so the dataset re-registers with the new type. See: \
+                         https://spiceai.org/docs/components/data-connectors/postgres"
+                    ),
+                }
+                .fail();
+            }
+            _ => return Ok(false),
+        };
+        let value = decoded.map_err(|e| super::Error::PgOutputDecode {
+            message: format!(
+                "postgres_replication: binary {wire_name} decode failed (type oid {type_oid}): {e}"
+            ),
+        })?;
+        let appended = match self {
+            Self::Int8(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::Int16(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::Int32(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::Int64(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::UInt32(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::Float32(b) => value.to_f32().map(|v| b.append_value(v)),
+            Self::Float64(b) => value.to_f64().map(|v| b.append_value(v)),
+            Self::Decimal128(b, precision, scale) => value
+                .to_decimal128(*precision, *scale)
+                .map(|v| b.append_value(v)),
+            _ => None,
+        };
+        appended.map(|()| true).ok_or_else(|| super::Error::PgOutputDecode {
+            message: format!(
+                "postgres_replication: the {wire_name} value {value} (type oid {type_oid}) cannot be \
+                 stored in the dataset's `{target}` column without loss. The source column's type \
+                 changed since the dataset was registered; set `on_schema_change: sync_all_columns` \
+                 to adopt the wider type. See: https://spiceai.org/docs/components/data-connectors/postgres"
+            ),
+        })
+    }
+
     /// Decode a binary (`send`-format) pgoutput value directly into the typed
     /// builder. Reached when Postgres tags the column `b` under the binary
     /// output protocol. `type_oid` names the source type for diagnostics.
@@ -1123,6 +1381,10 @@ impl FieldBuilder {
                  {detail}"
             ),
         };
+
+        if !self.decodes_wire_type(type_oid) && self.append_binary_of_another_type(raw, type_oid)? {
+            return Ok(());
+        }
 
         match self {
             Self::Bool(b) => b.append_value(pg::bool_from_sql(raw).map_err(decode_err("bool"))?),
@@ -2416,6 +2678,90 @@ mod tests {
         assert!(!name_is_null(&batch, 0));
     }
 
+    /// Regression test for #14718: under `REPLICA IDENTITY FULL`, a delete's
+    /// non-key value whose source type changed (here `float8` into the
+    /// registered `Int32`) is carried as NULL, not refused, and decodes nothing
+    /// into the builder, so the insert after it in the batch keeps its own value.
+    #[test]
+    fn delete_old_value_of_another_type_is_null_and_leaves_later_rows_intact() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int32, true),
+        ]));
+        let relation = Relation {
+            relation_id: 3,
+            namespace: "public".into(),
+            name: "t".into(),
+            replica_identity: b'f',
+            columns: vec![
+                PgColumn {
+                    is_key: true,
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                },
+                PgColumn {
+                    is_key: false,
+                    name: "k".into(),
+                    type_oid: 701,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let binary = |raw: Vec<u8>| Some(PgValue::Binary(Bytes::from(raw)));
+        let changes = [
+            DecodedChange {
+                op: ChangeOp::Delete,
+                row: TupleData {
+                    columns: vec![
+                        binary(1i64.to_be_bytes().to_vec()),
+                        binary(10.5f64.to_be_bytes().to_vec()),
+                    ],
+                },
+            },
+            DecodedChange {
+                op: ChangeOp::Create,
+                row: TupleData {
+                    columns: vec![
+                        binary(4i64.to_be_bytes().to_vec()),
+                        binary(2.0f64.to_be_bytes().to_vec()),
+                    ],
+                },
+            },
+        ];
+        let batch = build_change_batch(&schema, &relation, &changes).expect("build");
+        assert_op_column(&batch, &["d", "c"]);
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct();
+        let k = data
+            .column_by_name("k")
+            .expect("k")
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(k.is_null(0), "the delete's unfitting old value is NULL");
+        assert_eq!(k.value(1), 2, "the insert after it keeps its value");
+
+        // An insert with a value the column cannot hold is still refused.
+        let lossy = [DecodedChange {
+            op: ChangeOp::Create,
+            row: TupleData {
+                columns: vec![
+                    binary(5i64.to_be_bytes().to_vec()),
+                    binary(10.5f64.to_be_bytes().to_vec()),
+                ],
+            },
+        }];
+        let message = build_change_batch(&schema, &relation, &lossy)
+            .expect_err("lossy insert")
+            .to_string();
+        assert!(
+            message.contains("column 'k': postgres_replication: the float8 value 10.5"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn truncate_produces_empty_row_entry() {
         let schema = non_nullable_users_schema();
@@ -2709,13 +3055,22 @@ mod tests {
 
     #[test]
     fn pg_array_literal_rejects_malformed() {
-        for bad in [
-            "not-an-array",
-            "{unterminated",
-            r#"{"open}"#,
-            "{{1,2},{3,4}}",
+        // Each malformed shape is paired with the rejection branch it must hit,
+        // so a change that rejects it for a different reason is caught.
+        for (bad, reason) in [
+            ("not-an-array", "expected {...}"),
+            ("{unterminated", "expected {...}"),
+            (r#"{"open}"#, "unterminated quoted element"),
+            ("{{1,2},{3,4}}", "multidimensional arrays are not supported"),
+            ("[0:1{a,b}", "unterminated bounds prefix"),
+            (r#"{"a\}"#, "dangling escape"),
         ] {
-            parse_pg_array_literal(bad).expect_err(bad);
+            let err = parse_pg_array_literal(bad).expect_err(bad);
+            assert_eq!(
+                err.to_string(),
+                format!("pgoutput decode error: postgres array literal parse '{bad}': {reason}"),
+                "wrong rejection for {bad}"
+            );
         }
     }
 
@@ -3002,6 +3357,238 @@ mod tests {
         )
         .expect("append binary value");
         fb.finish()
+    }
+
+    /// Append one binary value of wire type `type_oid` into a builder of `dt`,
+    /// returning the built array or the decode error's text.
+    fn bin_convert(dt: &DataType, type_oid: u32, raw: &[u8]) -> Result<ArrayRef, String> {
+        let mut fb = FieldBuilder::with_capacity(dt, 1).expect("builder");
+        fb.append(
+            Some(&PgValue::Binary(Bytes::copy_from_slice(raw))),
+            ChangeOp::Create,
+            type_oid,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(fb.finish())
+    }
+
+    /// Regression test for #14718: a numeric value whose wire type differs from
+    /// the column's type (the source column's type changed) is decoded as its
+    /// wire type, then stored only when the column's type holds it exactly.
+    #[test]
+    fn binary_number_of_another_type_converts_only_when_exact() {
+        let f8 = |v: f64| v.to_be_bytes().to_vec();
+        let f4 = |v: f32| v.to_be_bytes().to_vec();
+        let i8b = |v: i64| v.to_be_bytes().to_vec();
+        let i4 = |v: i32| v.to_be_bytes().to_vec();
+
+        let int32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int32Type>().value(0))
+        };
+        assert_eq!(int32(bin_convert(&DataType::Int32, 701, &f8(2.0))), Ok(2));
+        assert_eq!(int32(bin_convert(&DataType::Int32, 701, &f8(-0.0))), Ok(0));
+        assert_eq!(int32(bin_convert(&DataType::Int32, 20, &i8b(-7))), Ok(-7));
+        assert_eq!(int32(bin_convert(&DataType::Int32, 700, &f4(3.0))), Ok(3));
+
+        let int64 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int64Type>().value(0))
+        };
+        assert_eq!(
+            int64(bin_convert(&DataType::Int64, 23, &i4(i32::MIN))),
+            Ok(i64::from(i32::MIN))
+        );
+        // 2^62 is exact in f64 and fits i64; 2^63 is exact in f64 and does not.
+        assert_eq!(
+            int64(bin_convert(&DataType::Int64, 701, &f8(2f64.powi(62)))),
+            Ok(1 << 62)
+        );
+
+        let float64 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Float64Type>().value(0))
+        };
+        assert_eq!(
+            float64(bin_convert(&DataType::Float64, 23, &i4(-5))),
+            Ok(-5.0)
+        );
+        assert_eq!(
+            float64(bin_convert(&DataType::Float64, 700, &f4(0.1))),
+            Ok(f64::from(0.1f32))
+        );
+        assert_eq!(
+            float64(bin_convert(&DataType::Float64, 20, &i8b(1 << 53))),
+            Ok(9_007_199_254_740_992.0)
+        );
+        let neg_zero = float64(bin_convert(&DataType::Float64, 23, &i4(0))).expect("zero");
+        assert!(neg_zero == 0.0 && neg_zero.is_sign_positive());
+
+        let float32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Float32Type>().value(0))
+        };
+        assert_eq!(
+            float32(bin_convert(&DataType::Float32, 701, &f8(1.5))),
+            Ok(1.5)
+        );
+        assert_eq!(
+            float32(bin_convert(&DataType::Float32, 701, &f8(f64::INFINITY))),
+            Ok(f32::INFINITY)
+        );
+        assert!(
+            float32(bin_convert(&DataType::Float32, 701, &f8(f64::NAN)))
+                .expect("NaN")
+                .is_nan()
+        );
+        assert_eq!(
+            float32(bin_convert(&DataType::Float32, 23, &i4(16_777_216))),
+            Ok(16_777_216.0)
+        );
+
+        // `"char"` and `oid` values convert into integer columns, exactly.
+        let int32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int32Type>().value(0))
+        };
+        assert_eq!(
+            int32(bin_convert(&DataType::Int32, 26, &42u32.to_be_bytes())),
+            Ok(42)
+        );
+        assert_eq!(
+            int64(bin_convert(&DataType::Int64, 26, &u32::MAX.to_be_bytes())),
+            Ok(i64::from(u32::MAX))
+        );
+        assert_eq!(int32(bin_convert(&DataType::Int32, 18, &[7u8])), Ok(7));
+        assert!(
+            bin_convert(&DataType::Int32, 26, &u32::MAX.to_be_bytes())
+                .expect_err("above i32::MAX")
+                .contains("the oid value 4294967295 (type oid 26) cannot be stored")
+        );
+        // `"char"` and `oid` columns take exact integers of another width too.
+        let int8 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int8Type>().value(0))
+        };
+        assert_eq!(
+            int8(bin_convert(&DataType::Int8, 21, &2i16.to_be_bytes())),
+            Ok(2)
+        );
+        let uint32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::UInt32Type>().value(0))
+        };
+        assert_eq!(uint32(bin_convert(&DataType::UInt32, 23, &i4(7))), Ok(7));
+
+        let decimal = |r: Result<ArrayRef, String>| {
+            r.map(|a| {
+                a.as_primitive::<arrow::datatypes::Decimal128Type>()
+                    .value(0)
+            })
+        };
+        assert_eq!(
+            decimal(bin_convert(&DataType::Decimal128(10, 2), 23, &i4(-42))),
+            Ok(-4200)
+        );
+
+        // Each of these loses information in the column's type, so it is an error
+        // naming the value and the type, not a rounded or truncated value.
+        for (dt, oid, raw, value) in [
+            (DataType::Int32, 701, f8(1.5), "1.5"),
+            (DataType::Int32, 701, f8(f64::NAN), "NaN"),
+            (DataType::Int32, 701, f8(f64::INFINITY), "inf"),
+            (
+                DataType::Int32,
+                20,
+                i8b(i64::from(i32::MAX) + 1),
+                "2147483648",
+            ),
+            (
+                DataType::Int64,
+                701,
+                f8(2f64.powi(63)),
+                "9223372036854776000",
+            ),
+            (DataType::Int16, 23, i4(40_000), "40000"),
+            (DataType::Int8, 21, 300i16.to_be_bytes().to_vec(), "300"),
+            (DataType::UInt32, 23, i4(-1), "-1"),
+            (DataType::Float64, 20, i8b(i64::MAX), "9223372036854775807"),
+            (DataType::Float32, 23, i4(16_777_217), "16777217"),
+            (DataType::Float32, 701, f8(0.1), "0.1"),
+            (DataType::Decimal128(4, 2), 23, i4(100), "100"),
+            (DataType::Decimal128(10, 2), 701, f8(1.0), "1"),
+        ] {
+            let message = bin_convert(&dt, oid, &raw).expect_err("lossy conversion");
+            let wire = match oid {
+                20 => "int8",
+                21 => "int2",
+                23 => "int4",
+                _ => "float8",
+            };
+            assert!(
+                message.contains(&format!(
+                    "the {wire} value {value} (type oid {oid}) cannot be stored in the dataset's `{dt}` column without loss"
+                )),
+                "{dt} from oid {oid}: {message}"
+            );
+        }
+    }
+
+    /// A value of a known source type that is neither the column's own type
+    /// nor a number converted above is an error, not bytes reinterpreted as the
+    /// column's type: a binary `numeric` zero is exactly eight bytes, and an
+    /// `int8` decode of it would store the scale.
+    #[test]
+    fn binary_value_of_another_known_type_is_an_error_not_a_misread() {
+        let numeric_zero = enc_numeric(&[], 0, false, 2);
+        assert_eq!(numeric_zero.len(), 8);
+        let text = b"1234".to_vec();
+        // `jsonb_send` prefixes the JSON text with a version byte, so the JSON
+        // number 123 is exactly four bytes — an `int4` decode of it would store
+        // 0x01313233 = 20001331.
+        let jsonb_number = vec![0x01, b'1', b'2', b'3'];
+        assert_eq!(jsonb_number.len(), 4);
+        for (dt, oid, raw) in [
+            (DataType::Int64, 1700, numeric_zero.clone()),
+            (DataType::Float64, 1700, numeric_zero),
+            (DataType::Int32, 25, text.clone()),
+            (DataType::Float32, 1043, text),
+            (DataType::Int64, 1114, 0i64.to_be_bytes().to_vec()),
+            (DataType::Int32, 3802, jsonb_number),
+        ] {
+            let message = bin_convert(&dt, oid, &raw).expect_err("no misread");
+            assert!(
+                message.contains(&format!(
+                    "the source column's type (type oid {oid}) is not the dataset column's type `{dt}`"
+                )),
+                "{dt} from oid {oid}: {message}"
+            );
+        }
+    }
+
+    /// `timestamp` and `timestamptz` share a wire payload but not its meaning:
+    /// a naive local time against a UTC instant. A column registered as one
+    /// does not take the other's values as its own.
+    #[test]
+    fn timestamp_and_timestamptz_values_are_not_interchangeable() {
+        let raw = 0i64.to_be_bytes().to_vec();
+        let utc: Option<Arc<str>> = Some(Arc::from("UTC"));
+        for (dt, oid) in [
+            (DataType::Timestamp(TimeUnit::Microsecond, None), 1184),
+            (DataType::Timestamp(TimeUnit::Nanosecond, None), 1184),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, utc.clone()),
+                1114,
+            ),
+            (DataType::Timestamp(TimeUnit::Nanosecond, utc.clone()), 1114),
+        ] {
+            let message = bin_convert(&dt, oid, &raw).expect_err("other timestamp kind");
+            assert!(
+                message.contains(&format!(
+                    "the source column's type (type oid {oid}) is not the dataset column's type `{dt}`"
+                )),
+                "{dt} from oid {oid}: {message}"
+            );
+        }
+        for (dt, oid) in [
+            (DataType::Timestamp(TimeUnit::Microsecond, None), 1114),
+            (DataType::Timestamp(TimeUnit::Nanosecond, utc), 1184),
+        ] {
+            bin_convert(&dt, oid, &raw).expect("own timestamp kind");
+        }
     }
 
     /// Encode a Postgres binary `numeric` from its base-10000 digit groups.

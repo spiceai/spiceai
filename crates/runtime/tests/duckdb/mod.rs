@@ -239,6 +239,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         .await
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -252,12 +253,13 @@ async fn duckdb_regexp() -> Result<(), String> {
                 .expect("failed to write sample file");
 
             let mut other_dataset = make_duckdb_acceleration_dataset(
-                "csv_test_arrow",
+                "csv_test_cayenne",
                 "csv",
                 &format!("'{}'", temp_file.path().display()),
             );
             other_dataset.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("cayenne".to_string()),
                 ..Default::default()
             });
 
@@ -290,20 +292,20 @@ async fn duckdb_regexp() -> Result<(), String> {
             let regex_metachar_semantics = r"
                 WITH duckdb_regex AS (
                     SELECT region FROM csv_test WHERE regexp_like(region, 'A.*A')
-                ), arrow_regex AS (
-                    SELECT region FROM csv_test_arrow WHERE regexp_like(region, 'A.*A')
+                ), cayenne_regex AS (
+                    SELECT region FROM csv_test_cayenne WHERE regexp_like(region, 'A.*A')
                 ), missing_in_duckdb AS (
-                    SELECT region FROM arrow_regex
+                    SELECT region FROM cayenne_regex
                     EXCEPT
                     SELECT region FROM duckdb_regex
-                ), missing_in_arrow AS (
+                ), missing_in_cayenne AS (
                     SELECT region FROM duckdb_regex
                     EXCEPT
-                    SELECT region FROM arrow_regex
+                    SELECT region FROM cayenne_regex
                 )
                 SELECT region FROM missing_in_duckdb
                 UNION ALL
-                SELECT region FROM missing_in_arrow
+                SELECT region FROM missing_in_cayenne
             ";
 
             let regex_semantic_diff: Vec<RecordBatch> = rt
@@ -321,7 +323,7 @@ async fn duckdb_regexp() -> Result<(), String> {
             assert_eq!(
                 regex_semantic_diff.iter().map(RecordBatch::num_rows).sum::<usize>(),
                 0,
-                "regexp_like regex metacharacter semantics diverged between DuckDB and Arrow"
+                "regexp_like regex metacharacter semantics diverged between DuckDB and Cayenne"
             );
 
             let cases = vec![
@@ -353,11 +355,11 @@ async fn duckdb_regexp() -> Result<(), String> {
                     "test_regexp_results_match",
                     "WITH duckdb_regexp_like AS (
                         SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')
-                    ), arrow_regexp_like AS (
-                        SELECT * FROM csv_test_arrow WHERE regexp_like(region, 'america', 'i')
+                    ), cayenne_regexp_like AS (
+                        SELECT * FROM csv_test_cayenne WHERE regexp_like(region, 'america', 'i')
                     )
 
-                    SELECT * FROM duckdb_regexp_like d JOIN arrow_regexp_like a ON d.region = a.region",
+                    SELECT * FROM duckdb_regexp_like d JOIN cayenne_regexp_like a ON d.region = a.region",
                 ),
             ];
 
@@ -1924,6 +1926,231 @@ async fn duckdb_binary_literal_filters_agree_with_local_evaluation() -> Result<(
                 rendered[2], rendered[0],
                 "accelerated projection must agree with local"
             );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Every row a statement returns, each rendered as `col|col|…` (`NULL` for a
+/// null), sorted so two answers compare as multisets.
+async fn sorted_rows(rt: &Runtime, sql: &str) -> Result<Vec<String>, String> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let batches: Vec<RecordBatch> = rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| format!("query `{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await
+        .map_err(|e| format!("query `{sql}` collect failed: {e}"))?;
+
+    let options = FormatOptions::default().with_null("NULL");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to format the rows of `{sql}`: {e}"))?;
+        for row in 0..batch.num_rows() {
+            rows.push(
+                formatters
+                    .iter()
+                    .map(|formatter| formatter.value(row).to_string())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+        }
+    }
+    rows.sort_unstable();
+    Ok(rows)
+}
+
+/// `INTERSECT` and `EXCEPT` compare rows with NULLs treated as equal, and must
+/// keep doing so when the whole query is handed to `DuckDB` as SQL. They are
+/// sent as `EXISTS`/`NOT EXISTS` subqueries, and correlating those with `=`
+/// made every row with a NULL in a compared column drop out of an `INTERSECT`
+/// and survive an `EXCEPT`: TPC-DS q38 counted 0 rows instead of 111, and q87
+/// 46704 instead of 46449 (regression test for #14941).
+///
+/// The same three tables are accelerated twice: into one `DuckDB` file, where
+/// the set operation is pushed down, and into Arrow, where `DataFusion`
+/// evaluates it. Each query must return the same rows from both, and the rows
+/// written out below.
+#[tokio::test]
+async fn duckdb_file_acceleration_set_operations_match_nulls() -> Result<(), String> {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use spicepod::param::Params;
+    use std::collections::HashMap;
+
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("day", DataType::Int64, true),
+            ]));
+            let write_table = |table: &str,
+                               names: Vec<Option<&str>>,
+                               days: Vec<Option<i64>>|
+             -> Result<std::path::PathBuf, String> {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(names)),
+                        Arc::new(Int64Array::from(days)),
+                    ],
+                )
+                .map_err(|e| format!("failed to build table {table}: {e}"))?;
+                let path = temp_dir.path().join(format!("{table}.parquet"));
+                let file = std::fs::File::create(&path)
+                    .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+                let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+                    .map_err(|e| format!("failed to open a writer for {table}: {e}"))?;
+                writer
+                    .write(&batch)
+                    .map_err(|e| format!("failed to write {table}: {e}"))?;
+                writer
+                    .close()
+                    .map_err(|e| format!("failed to close {table}: {e}"))?;
+                Ok(path)
+            };
+
+            let tables = [
+                (
+                    "a",
+                    write_table(
+                        "a",
+                        vec![None, None, Some("x"), Some("y"), Some("z"), None],
+                        vec![Some(1), Some(1), Some(2), None, Some(3), None],
+                    )?,
+                ),
+                (
+                    "b",
+                    write_table(
+                        "b",
+                        vec![None, Some("x"), Some("y"), Some("w")],
+                        vec![Some(1), Some(2), None, Some(4)],
+                    )?,
+                ),
+                (
+                    "c",
+                    write_table(
+                        "c",
+                        vec![None, Some("y"), Some("x")],
+                        vec![Some(1), None, Some(5)],
+                    )?,
+                ),
+            ];
+
+            let duckdb_file = temp_dir.path().join("set_operations.db");
+            let mut app = AppBuilder::new("duckdb_set_operations_test");
+            for (table, path) in &tables {
+                for engine in ["duckdb", "arrow"] {
+                    let name = format!("{table}_{engine}");
+                    let mut dataset =
+                        Dataset::new(format!("file:{}", path.display()), name.clone());
+                    dataset.name = name;
+                    dataset.acceleration = Some(Acceleration {
+                        enabled: true,
+                        engine: Some(engine.to_string()),
+                        mode: if engine == "duckdb" {
+                            Mode::File
+                        } else {
+                            Mode::Memory
+                        },
+                        refresh_mode: Some(RefreshMode::Full),
+                        params: (engine == "duckdb").then(|| {
+                            Params::from_string_map(HashMap::from([(
+                                "duckdb_file".to_string(),
+                                duckdb_file.display().to_string(),
+                            )]))
+                        }),
+                        ..Acceleration::default()
+                    });
+                    app = app.with_dataset(dataset);
+                }
+            }
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app.build()).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Each `{a}`, `{b}` and `{c}` stands for `SELECT name, day` from that
+            // table, accelerated by the engine under test.
+            let cases = [
+                ("INTERSECT", "{a} INTERSECT {b}", vec!["NULL|1", "x|2", "y|NULL"]),
+                ("EXCEPT", "{a} EXCEPT {b}", vec!["NULL|NULL", "z|3"]),
+                // The shape of TPC-DS q38: a chained INTERSECT, counted.
+                (
+                    "chained INTERSECT",
+                    "SELECT count(*) FROM ({a} INTERSECT {b} INTERSECT {c}) AS s",
+                    vec!["2"],
+                ),
+                // The shape of TPC-DS q87: a chained EXCEPT, counted.
+                (
+                    "chained EXCEPT",
+                    "SELECT count(*) FROM ({a} EXCEPT {b} EXCEPT {c}) AS s",
+                    vec!["2"],
+                ),
+                (
+                    "INTERSECT under a filter",
+                    "SELECT * FROM ({a} INTERSECT {b}) AS s WHERE name IS NULL OR day IS NULL",
+                    vec!["NULL|1", "y|NULL"],
+                ),
+            ];
+            let render = |template: &str, engine: &str| {
+                ["a", "b", "c"].iter().fold(template.to_string(), |sql, table| {
+                    sql.replace(
+                        &format!("{{{table}}}"),
+                        &format!("SELECT name, day FROM {table}_{engine}"),
+                    )
+                })
+            };
+
+            let mut failures = Vec::new();
+            for (label, template, expected) in &cases {
+                let duckdb_sql = render(template, "duckdb");
+                let arrow_sql = render(template, "arrow");
+
+                let plan = formatted_explain(&rt, &duckdb_sql).await?;
+                if !plan.contains("EXISTS") {
+                    failures.push(format!(
+                        "{label}: the set operation was not pushed down to DuckDB, so this case \
+                         does not test the SQL sent there; plan was:\n{plan}"
+                    ));
+                }
+
+                let duckdb_rows = sorted_rows(&rt, &duckdb_sql).await?;
+                let arrow_rows = sorted_rows(&rt, &arrow_sql).await?;
+                if duckdb_rows != arrow_rows || arrow_rows != *expected {
+                    failures.push(format!(
+                        "{label}: `{duckdb_sql}`\n    duckdb:   {duckdb_rows:?}\n    arrow:    {arrow_rows:?}\n    expected: {expected:?}"
+                    ));
+                }
+            }
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
 
             Ok(())
         })

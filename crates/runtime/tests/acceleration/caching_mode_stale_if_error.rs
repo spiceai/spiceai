@@ -84,14 +84,15 @@ const PAST_WINDOW: Duration = Duration::from_secs(10);
 /// over an entry rather than a single row.
 const ROWS: usize = 3;
 
-/// A mock origin serving `/items` as a JSON array of [`ROWS`] objects, counting
-/// the requests that reach it, until it is taken down or switched to answer
-/// with a fixed HTTP status (see [`Origin::set_status`]) — the shape a
-/// connector-exhausted-retries failure actually takes, as distinct from a
-/// send error from [`Origin::take_down`].
+/// A mock origin serving `/items` as a JSON array of [`ROWS`] objects (see
+/// [`Origin::set_rows`]), counting the requests that reach it, until it is
+/// taken down or switched to answer with a fixed HTTP status (see
+/// [`Origin::set_status`]) — the shape a connector-exhausted-retries failure
+/// actually takes, as distinct from a send error from [`Origin::take_down`].
 struct Origin {
     addr: SocketAddr,
     fetches: Arc<AtomicUsize>,
+    rows: Arc<AtomicUsize>,
     status: Arc<AtomicU16>,
     empty_fault_body: Arc<std::sync::atomic::AtomicBool>,
     delay_ms: Arc<AtomicUsize>,
@@ -102,6 +103,8 @@ impl Origin {
     async fn start() -> Self {
         let fetches = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&fetches);
+        let rows = Arc::new(AtomicUsize::new(ROWS));
+        let rows_for_handler = Arc::clone(&rows);
         let status = Arc::new(AtomicU16::new(200));
         let status_for_handler = Arc::clone(&status);
         let empty_fault_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -114,6 +117,7 @@ impl Origin {
             "/items",
             get(move |uri: axum::http::Uri| {
                 let counter = Arc::clone(&counter);
+                let rows = Arc::clone(&rows_for_handler);
                 let status = Arc::clone(&status_for_handler);
                 let empty_fault_body = Arc::clone(&empty_fault_body_for_handler);
                 let delay_ms = Arc::clone(&delay_for_handler);
@@ -135,7 +139,7 @@ impl Origin {
                         return (code, [("content-type", "text/plain")], body);
                     }
                     let query = uri.query().unwrap_or_default().to_string();
-                    let body = (1..=ROWS)
+                    let body = (1..=rows.load(Ordering::SeqCst))
                         .map(|rank| format!(r#"{{"rank":{rank},"query":"{query}"}}"#))
                         .collect::<Vec<_>>()
                         .join(",");
@@ -164,6 +168,7 @@ impl Origin {
         Self {
             addr,
             fetches,
+            rows,
             status,
             empty_fault_body,
             delay_ms,
@@ -173,6 +178,11 @@ impl Origin {
 
     fn fetches(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// Answers later requests with ranks `1..=rows`.
+    fn set_rows(&self, rows: usize) {
+        self.rows.store(rows, Ordering::SeqCst);
     }
 
     /// Switches the origin to answer every request with `status` instead of
@@ -402,6 +412,38 @@ async fn fetch_decomposed_rank(rt: &Runtime, rank: usize) -> Result<Vec<String>,
                 .collect::<Vec<_>>()
         })
         .collect())
+}
+
+/// The sorted `rank` of every row the accelerator holds for a
+/// [`decompose_into_named_columns`] dataset. Unfiltered, like [`cached_rows`].
+async fn cached_ranks(rt: &Runtime) -> Vec<String> {
+    let batches = rt
+        .datafusion()
+        .ctx
+        .table("http_data")
+        .await
+        .expect("table")
+        .select(vec![col("rank")])
+        .expect("rank column")
+        .collect()
+        .await
+        .expect("collect");
+    let mut ranks: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("rank is Utf8")
+                .iter()
+                .flatten()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ranks.sort_unstable();
+    ranks
 }
 
 /// Rows the accelerator currently holds. Unfiltered on purpose: a query carrying
@@ -854,6 +896,56 @@ async fn a_5xx_response_is_recognized_on_a_json_decomposed_dataset() -> Result<(
     Ok(())
 }
 
+/// Regression test for #14865: a read that filters a decomposed response column
+/// caches the whole response of its request, and reads of that request that
+/// differ only in response predicates share the one cached response. A later
+/// read for a rank the cached response lacks misses, and its fill replaces the
+/// request's rows instead of appending a second copy beside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_column_predicates_share_one_cached_response_per_request()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    origin.set_rows(ROWS - 1);
+    // A TTL longer than the test, so every cached read below is fresh.
+    let dataset = decompose_into_named_columns(caching_dataset(
+        &origin,
+        "enabled",
+        None,
+        Mode::Memory,
+        vec![("caching_ttl".to_string(), "10m".to_string())],
+    ));
+    let rt = build_runtime(dataset, "caching_decomposed_response_predicates").await;
+
+    assert_eq!(fetch_decomposed_rank(&rt, 1).await?, vec!["1"]);
+    wait_for_cached_rows(&rt, ROWS - 1, Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("a response-filtered read must cache its response: {e}"))?;
+    let fetches_after_fill = origin.fetches();
+    assert_eq!(fetch_decomposed_rank(&rt, 1).await?, vec!["1"]);
+    assert_eq!(fetch_decomposed_rank(&rt, 2).await?, vec!["2"]);
+    assert_eq!(
+        origin.fetches(),
+        fetches_after_fill,
+        "reads of the cached request are served without a fetch"
+    );
+
+    origin.set_rows(ROWS);
+    assert_eq!(fetch_decomposed_rank(&rt, 3).await?, vec!["3"]);
+    assert_eq!(
+        origin.fetches(),
+        fetches_after_fill + 1,
+        "a rank the cached response lacks is fetched"
+    );
+    wait_for_cached_rows(&rt, ROWS, Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("the refill must replace the request's rows: {e}"))?;
+    assert_eq!(cached_ranks(&rt).await, vec!["1", "2", "3"]);
+    Ok(())
+}
+
 /// Regression coverage for the independent, runtime-wide SQL results cache
 /// (`runtime.caching.sql_results`): it also calls `cache::batches_cacheable`
 /// on any dataset's query result, regardless of the dataset's own refresh
@@ -999,4 +1091,293 @@ async fn a_5xx_response_is_not_cached_by_the_sql_results_cache_under_a_narrow_pr
         );
     }
     Ok(())
+}
+
+/// Regression tests for #15356: an origin that answers `[]` to a cached request
+/// has retracted the rows it returned before, so that answer replaces the
+/// entry, on the file-mode Cayenne acceleration the issue was reported on.
+// Cayenne is not built on Windows, so neither is a test that loads it.
+#[cfg(all(feature = "sqlite", not(target_os = "windows")))]
+mod empty_response {
+    use super::*;
+
+    fn cayenne_file_params(dir: &std::path::Path) -> Vec<(String, String)> {
+        vec![(
+            "cayenne_file_path".to_string(),
+            dir.join("cayenne").to_string_lossy().to_string(),
+        )]
+    }
+
+    /// The sorted `request_query` of every row the accelerator holds.
+    /// Unfiltered, like [`cached_rows`].
+    async fn cached_queries(rt: &Runtime) -> Vec<String> {
+        let batches = rt
+            .datafusion()
+            .ctx
+            .table("http_data")
+            .await
+            .expect("table")
+            .select(vec![col("request_query")])
+            .expect("request_query column")
+            .collect()
+            .await
+            .expect("collect");
+        let mut queries: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("request_query is Utf8")
+                    .iter()
+                    .flatten()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        queries.sort_unstable();
+        queries
+    }
+
+    /// Caches the origin's `rows`-row response to each of the `queries`
+    /// lookups, each a GET, then has the origin answer `[]` to every request
+    /// and returns once the entries have expired.
+    async fn cache_then_retract(
+        rt: &Runtime,
+        origin: &Origin,
+        queries: &[&str],
+        rows: usize,
+    ) -> Result<(), anyhow::Error> {
+        origin.set_rows(rows);
+        for query in queries {
+            assert_eq!(
+                fetch_statuses(rt, query).await?,
+                vec![200; rows],
+                "the first read of {query} is the origin's good response"
+            );
+        }
+        let cached_at = wait_for_cached_rows(rt, rows * queries.len(), Duration::from_secs(30))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the responses were never cached, so nothing was retracted: {e}")
+            })?;
+        origin.set_rows(0);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            cached_at + TTL + Duration::from_secs(1),
+        ))
+        .await;
+        Ok(())
+    }
+
+    /// The expired entry is replaced by the empty answer, and only that entry:
+    /// another query cached for the same path keeps its rows. A later origin
+    /// failure then reaches the client, because `caching_stale_if_error` has
+    /// no retracted rows left to serve in its place.
+    async fn an_empty_response_replaces_the_cached_entry(
+        name: &str,
+        rows: usize,
+        primary_key: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let temp = tempfile::tempdir()?;
+        let origin = Origin::start().await;
+        let mut dataset = caching_dataset(
+            &origin,
+            "enabled",
+            Some("cayenne"),
+            Mode::File,
+            cayenne_file_params(temp.path()),
+        );
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.primary_key = primary_key.map(str::to_string);
+        }
+        let rt = build_runtime(dataset, name).await;
+
+        cache_then_retract(&rt, &origin, &["key=a", "key=b"], rows).await?;
+        let fetches_before = origin.fetches();
+        assert_eq!(
+            fetch_statuses(&rt, "key=a").await?,
+            Vec::<u16>::new(),
+            "past the TTL the lookup returns the origin's empty answer"
+        );
+        assert_eq!(
+            origin.fetches(),
+            fetches_before + 1,
+            "the expired entry is fetched again"
+        );
+        wait_for_cached_rows(&rt, rows, Duration::from_secs(30))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the origin's empty answer must replace the entry: {e}")
+            })?;
+        assert_eq!(
+            cached_queries(&rt).await,
+            vec!["key=b"; rows],
+            "the replacement removes the `key=a` entry and keeps the `key=b` entry"
+        );
+
+        origin.set_status(503);
+        assert_origin_failure(
+            fetch_statuses(&rt, "key=a").await,
+            503,
+            "the origin retracted the cached rows, so its 503 must reach the client instead of them",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_response_replaces_the_cached_entry_without_a_primary_key()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+        register_test_connectors().await;
+        an_empty_response_replaces_the_cached_entry("caching_empty_response", ROWS, None).await
+    }
+
+    /// The same retraction under a `primary_key` that leaves `request_body`
+    /// out. The key admits one row per request, so each response is a single
+    /// object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_response_replaces_the_cached_entry_with_a_primary_key()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+        register_test_connectors().await;
+        an_empty_response_replaces_the_cached_entry(
+            "caching_empty_response_pk",
+            1,
+            Some("(request_query,request_path)"),
+        )
+        .await
+    }
+
+    /// Every `rank` one lookup of [`decompose_into_named_columns`]'s request
+    /// returns, filtered on the request alone.
+    async fn fetch_decomposed_ranks(rt: &Runtime) -> Result<Vec<String>, DataFusionError> {
+        let batches = rt
+            .datafusion()
+            .ctx
+            .table("http_data")
+            .await?
+            .filter(col("request_path").eq(lit("/items")))?
+            .select(vec![col("rank")])?
+            .collect()
+            .await?;
+        let mut ranks: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("rank is Utf8")
+                    .iter()
+                    .flatten()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        ranks.sort_unstable();
+        Ok(ranks)
+    }
+
+    /// The same retraction on a dataset that decomposes the JSON body into
+    /// named `columns:`, so `request_path` is the only request column it stores
+    /// and the entry is replaced by that column alone, as a non-empty response
+    /// replaces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_response_replaces_the_cached_entry_of_a_decomposed_dataset()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+        register_test_connectors().await;
+        let temp = tempfile::tempdir()?;
+
+        let origin = Origin::start().await;
+        let dataset = decompose_into_named_columns(caching_dataset(
+            &origin,
+            "enabled",
+            Some("cayenne"),
+            Mode::File,
+            cayenne_file_params(temp.path()),
+        ));
+        let rt = build_runtime(dataset, "caching_empty_response_decomposed").await;
+
+        assert_eq!(fetch_decomposed_ranks(&rt).await?, vec!["1", "2", "3"]);
+        let cached_at = wait_for_cached_rows(&rt, ROWS, Duration::from_secs(30))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the response was never cached, so nothing was retracted: {e}")
+            })?;
+        origin.set_rows(0);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            cached_at + TTL + Duration::from_secs(1),
+        ))
+        .await;
+
+        assert_eq!(
+            fetch_decomposed_ranks(&rt).await?,
+            Vec::<String>::new(),
+            "past the TTL the lookup returns the origin's empty answer"
+        );
+        wait_for_cached_rows(&rt, 0, Duration::from_secs(30))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the origin's empty answer must replace the entry: {e}")
+            })?;
+
+        origin.set_status(503);
+        match fetch_decomposed_ranks(&rt).await {
+            Ok(ranks) => {
+                panic!("the origin's 503 must reach the client, got retracted ranks {ranks:?}")
+            }
+            Err(err) => assert!(
+                err.to_string().contains("503"),
+                "the error must name the origin's 503: {err}"
+            ),
+        }
+        Ok(())
+    }
+
+    /// A read inside the stale-while-revalidate window serves the stale entry
+    /// and revalidates it in the background. When the origin answers that
+    /// revalidation with `[]`, the answer replaces the entry, so the next read
+    /// returns the origin's empty answer instead of serving the retracted rows,
+    /// and asking the origin again, for the rest of the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_empty_revalidation_replaces_the_stale_entry() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+        register_test_connectors().await;
+        let temp = tempfile::tempdir()?;
+
+        let origin = Origin::start().await;
+        let mut params = cayenne_file_params(temp.path());
+        params.push((
+            "caching_stale_while_revalidate_ttl".to_string(),
+            "60s".to_string(),
+        ));
+        let dataset = caching_dataset(&origin, "enabled", Some("cayenne"), Mode::File, params);
+        let rt = build_runtime(dataset, "caching_empty_revalidation").await;
+
+        cache_then_retract(&rt, &origin, &["key=a"], ROWS).await?;
+        let fetches_before = origin.fetches();
+        assert_eq!(
+            fetch_statuses(&rt, "key=a").await?,
+            vec![200; ROWS],
+            "inside the window the stale entry is served while it is revalidated"
+        );
+        wait_for_cached_rows(&rt, 0, Duration::from_secs(30))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the revalidation's empty answer must replace the entry: {e}")
+            })?;
+        assert_eq!(
+            origin.fetches(),
+            fetches_before + 1,
+            "the stale read revalidates the entry once"
+        );
+        assert_eq!(
+            fetch_statuses(&rt, "key=a").await?,
+            Vec::<u16>::new(),
+            "after the empty revalidation the lookup returns the origin's empty answer"
+        );
+        Ok(())
+    }
 }

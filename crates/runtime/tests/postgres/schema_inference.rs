@@ -37,6 +37,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use secrecy::ExposeSecret;
+use spicepod::component::caching::SQLResultsCacheConfig;
 use spicepod::{
     acceleration::{Acceleration, RefreshMode},
     component::dataset::Dataset,
@@ -144,8 +145,13 @@ async fn seed_inventory(port: usize) -> Result<(), anyhow::Error> {
 
 async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow::Error> {
     register_test_connectors().await;
+    // Refresh leaves cached SQL results in place; reads after one must skip the cache.
     let app = AppBuilder::new("postgres_schema_inference_test")
         .with_dataset(dataset)
+        .with_sql_cache(SQLResultsCacheConfig {
+            enabled: false,
+            ..Default::default()
+        })
         .build();
 
     configure_test_datafusion();

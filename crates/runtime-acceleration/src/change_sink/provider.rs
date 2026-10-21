@@ -31,13 +31,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::WideningPlan;
 use async_trait::async_trait;
 use data_components::arrow::{IndexedMemTable, write::MemTable};
 use data_components::cdc::ChangeBatch as CdcBatch;
 use data_components::index_maintenance::perform_index_maintenance;
+use datafusion::common::ScalarValue;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionState;
@@ -50,11 +51,10 @@ use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, SpiceTable, find_concrete};
 
-use super::batch::AppendValidation;
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangeIndexes, ChangePayload, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, SetKey,
-    StorageDurability, WriteOptions,
+    ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, ScopedInput,
+    StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use cdc::{CdcMetrics, ChangeOperationType, group_into_sub_batches, select_rows};
@@ -62,7 +62,22 @@ use deletion::{
     build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
     missing_primary_keys,
 };
+use preflight::ReplacedScope;
 use refusal::before_mutation;
+
+/// A backend's delete by primary key, which reaches the rows that hold each key
+/// without scanning the table.
+#[async_trait]
+pub trait PrimaryKeyDelete: Send + Sync {
+    /// Delete every row whose primary key is a row of `keys`: the table's
+    /// primary-key columns in key order, typed as the table stores them.
+    /// Returns `false`, having changed nothing, when this table cannot delete
+    /// by key, so the caller deletes by predicate instead.
+    ///
+    /// # Errors
+    /// Returns an error if the delete fails, possibly after changing storage.
+    async fn delete_primary_keys(&self, keys: &RecordBatch) -> Result<bool>;
+}
 
 struct InsertPlanCache {
     target_schema: SchemaRef,
@@ -144,8 +159,11 @@ impl ProviderChangeSinkBackend {
     }
 
     /// Execute one finite append or ordered replacement through the composed
-    /// provider. All batches are cast and the append is planned before deletion.
+    /// provider: every replaced scope is deleted once, then all chunks are
+    /// appended. All batches are cast and the append is planned before deletion.
     /// The caller must establish that this provider supports ordered replacement.
+    /// `key_delete`, when the backend has one, deletes the replaced scopes that
+    /// a primary key identifies exactly; see [`Self::delete_replaced`].
     ///
     /// # Errors
     /// Returns validation, planning, execution, or index-maintenance failures.
@@ -154,61 +172,40 @@ impl ProviderChangeSinkBackend {
         &self,
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
-        scope: Option<SetKey>,
-        append_validations: Vec<AppendValidation>,
+        scoped_inputs: Vec<ScopedInput>,
         options: WriteOptions,
         ctx: &SessionContext,
+        key_delete: Option<&dyn PrimaryKeyDelete>,
     ) -> Result<bool> {
-        if scope.is_some() && !append_validations.is_empty() {
-            return Err(before_mutation(DataFusionError::Plan(
-                "Set replacement cannot carry scoped append validation ranges".into(),
-            )));
-        }
         let _guard = self.context.write_lock.lock().await;
         let state = ctx.state();
         let target_schema = self.context.table.schema();
-        let scope = scope
-            .map(|scope| SetKey::from_filters(Arc::clone(&target_schema), &scope.filters()))
-            .transpose()
-            .map_err(before_mutation)?;
         let batches = batches
             .into_iter()
             .map(|batch| try_cast_to(batch, Arc::clone(&target_schema)).map_err(Into::into))
             .collect::<Result<Vec<_>>>()
             .map_err(before_mutation)?;
-        if let Some(scope) = &scope {
-            for batch in &batches {
-                scope.validate_batch(batch).map_err(before_mutation)?;
-            }
-            preflight::validate_scope_constraints(
-                &self.context,
-                scope,
-                &batches,
-                options.delete_batch_size,
-                ctx,
-            )
-            .await?;
-        }
         let rows = batches
             .iter()
             .map(RecordBatch::num_rows)
             .fold(0_usize, usize::saturating_add);
         let has_rows = rows > 0;
         let chunks = batches.len();
-        let scoped_inputs = append_validations.len();
-        if scoped_inputs > 0 {
+        let inputs = scoped_inputs.len();
+        if inputs > 0 {
             tracing::debug!(
                 dataset = %self.context.dataset_name,
-                scoped_inputs,
+                inputs,
+                replaced = scoped_inputs.iter().filter(|input| input.replaces()).count(),
                 chunks,
                 rows,
-                "ChangeSink scoped append preflight"
+                "ChangeSink scoped write preflight"
             );
         }
-        preflight::validate_append_scopes(
+        let replaced = preflight::validate_scoped_inputs(
             &self.context,
             &batches,
-            &append_validations,
+            &scoped_inputs,
             options.delete_batch_size,
             ctx,
         )
@@ -233,31 +230,77 @@ impl ProviderChangeSinkBackend {
         } else {
             None
         };
-        let replaced = scope.is_some();
-        if let Some(scope) = scope {
-            let delete = self
-                .context
-                .table
-                .delete_from(&state, scope.filters())
+        if !replaced.is_empty() {
+            self.delete_replaced(&state, &replaced, key_delete, ctx)
                 .await?;
-            collect(delete, ctx.task_ctx()).await?;
         }
         if let Some(insert) = insert_plan {
             collect(insert, ctx.task_ctx()).await?;
-            if scoped_inputs > 0 {
+            if inputs > 0 {
                 tracing::debug!(
                     dataset = %self.context.dataset_name,
-                    scoped_inputs,
+                    inputs,
                     chunks,
                     rows,
-                    "ChangeSink scoped append published"
+                    "ChangeSink scoped write published"
                 );
             }
         }
-        if replaced || has_rows {
+        let changed = !replaced.is_empty() || has_rows;
+        if changed {
             perform_change_write_maintenance(&self.context.table).await?;
         }
-        Ok(replaced || has_rows)
+        Ok(changed)
+    }
+
+    /// Delete every replaced scope before the append: by primary key through
+    /// `key_delete` where preflight proved that exact, by scope predicate
+    /// otherwise. A scope predicate is a disjunction over every replaced scope,
+    /// which a provider may evaluate against every stored row; a key delete
+    /// reaches only the rows holding each key.
+    async fn delete_replaced(
+        &self,
+        state: &SessionState,
+        replaced: &[ReplacedScope],
+        key_delete: Option<&dyn PrimaryKeyDelete>,
+        ctx: &SessionContext,
+    ) -> Result<()> {
+        let deleted_by_key = match key_delete {
+            Some(key_delete) => self.delete_by_primary_key(replaced, key_delete).await?,
+            None => false,
+        };
+        let by_predicate = replaced
+            .iter()
+            .filter(|scope| !deleted_by_key || scope.primary_key.is_none())
+            .map(|scope| &scope.scope);
+        if let Some(filters) = replaced_scope_filters(by_predicate) {
+            let delete = self.context.table.delete_from(state, filters).await?;
+            collect(delete, ctx.task_ctx()).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete every replaced scope that carries a primary key through
+    /// `key_delete`. Returns `false`, having changed nothing, when no scope
+    /// carries one or the backend cannot delete by key.
+    async fn delete_by_primary_key(
+        &self,
+        replaced: &[ReplacedScope],
+        key_delete: &dyn PrimaryKeyDelete,
+    ) -> Result<bool> {
+        let keys = replaced
+            .iter()
+            .filter_map(|scope| scope.primary_key.as_deref())
+            .collect::<Vec<_>>();
+        let Some(columns) = preflight::primary_key_columns(&self.context) else {
+            return Ok(false);
+        };
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        let keys = primary_key_batch(&self.context.table.schema(), &columns, &keys)
+            .map_err(before_mutation)?;
+        key_delete.delete_primary_keys(&keys).await
     }
 
     fn warn_if_synchronous_cayenne(&self) {
@@ -417,19 +460,20 @@ impl ChangeSinkBackend for ProviderChangeSinkBackend {
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        let (payload, scope) = batch.into_parts();
-        if scope.is_some() && self.replacement == ReplacementSupport::Unsupported {
+        if batch.replaced_scopes().next().is_some()
+            && self.replacement == ReplacementSupport::Unsupported
+        {
             return Err(before_mutation(DataFusionError::NotImplemented(
                 "Set replacement is not enabled for this accelerator".into(),
             )));
         }
-        let changed = match payload {
+        let changed = match batch.into_payload() {
             ChangePayload::Rows {
                 schema,
                 batches,
-                append_validations,
+                scoped_inputs,
             } => {
-                self.apply_rows(schema, batches, scope, append_validations, options, ctx)
+                self.apply_rows(schema, batches, scoped_inputs, options, ctx, None)
                     .await?
             }
             ChangePayload::Cdc(rows) => {
@@ -524,6 +568,26 @@ pub fn reject_unknown_operations(groups: &[(ChangeOperationType, Vec<usize>)]) -
     Ok(())
 }
 
+/// The primary keys `keys`, each in key order, as a batch of the table's key
+/// columns typed as the table stores them.
+fn primary_key_batch(
+    schema: &Schema,
+    columns: &[usize],
+    keys: &[&[ScalarValue]],
+) -> Result<RecordBatch> {
+    let key_schema = Arc::new(schema.project(columns)?);
+    let arrays = key_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            let values = ScalarValue::iter_to_array(keys.iter().map(|key| key[position].clone()))?;
+            Ok(arrow::compute::cast(&values, field.data_type())?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(key_schema, arrays)?)
+}
+
 /// Native deletes bypass accelerator index wrappers; provider deletes do not.
 /// Both must also maintain source-side external indexes.
 ///
@@ -536,7 +600,37 @@ pub async fn delete_index_keys(
     rows: &[usize],
     include_accelerator: bool,
 ) -> Result<()> {
-    let mut indexes: ChangeIndexes = (context.external_indexes)();
+    let indexes = change_indexes(context, true, include_accelerator);
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let Some(keys) = build_pk_only_batch_from_change_batch(batch, rows)? else {
+        return Ok(());
+    };
+    delete_keys_from_indexes(context, indexes, &keys).await;
+    Ok(())
+}
+
+/// Delete primary keys from the accelerator's own indexes after a native
+/// delete, which bypasses the index wrappers a provider delete goes through.
+/// `keys` holds the table's primary-key columns.
+pub async fn delete_accelerator_index_keys(context: &ChangeSinkContext, keys: &RecordBatch) {
+    let indexes = change_indexes(context, false, true);
+    if !indexes.is_empty() {
+        delete_keys_from_indexes(context, indexes, keys).await;
+    }
+}
+
+fn change_indexes(
+    context: &ChangeSinkContext,
+    include_external: bool,
+    include_accelerator: bool,
+) -> ChangeIndexes {
+    let mut indexes: ChangeIndexes = if include_external {
+        (context.external_indexes)()
+    } else {
+        ChangeIndexes::new()
+    };
     if include_accelerator {
         indexes.extend(
             spice_table::nodes(context.table.as_ref(), LayerWalk::Read)
@@ -544,12 +638,15 @@ pub async fn delete_index_keys(
                 .map(Arc::clone),
         );
     }
-    if indexes.is_empty() {
-        return Ok(());
-    }
-    let Some(keys) = build_pk_only_batch_from_change_batch(batch, rows)? else {
-        return Ok(());
-    };
+    indexes
+}
+
+/// Best effort: a failing index is logged and the rest are still maintained.
+async fn delete_keys_from_indexes(
+    context: &ChangeSinkContext,
+    indexes: ChangeIndexes,
+    keys: &RecordBatch,
+) {
     let mut seen = HashSet::new();
     for index in indexes {
         if seen.insert(Arc::as_ptr(&index).cast::<()>().addr())
@@ -562,7 +659,6 @@ pub async fn delete_index_keys(
             );
         }
     }
-    Ok(())
 }
 
 /// Delete matching rows from writable Arrow tables, including partition children.

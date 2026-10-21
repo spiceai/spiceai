@@ -86,6 +86,29 @@ pub fn register_component_metric(
             REGISTERED_COUNT.add(1, &[]);
             Ok(())
         }
+        MetricType::ObservableGaugeF64 => {
+            let mut gauge = COMPONENTS_METER.f64_observable_gauge(metric_name);
+            if let Some(description) = metric.description {
+                gauge = gauge.with_description(description);
+            }
+            if let Some(unit) = metric.unit {
+                gauge = gauge.with_unit(unit);
+            }
+            let metric_callback = metric_provider
+                .callback_to_observe_metric(&metric, attributes)
+                .context(MetricCallbackNotImplementedSnafu { metric })?;
+            let callback_type = metric_callback_type(&metric_callback);
+            let ObserveMetricCallback::F64(callback) = metric_callback else {
+                return Err(Error::MetricCallbackWrongType {
+                    metric,
+                    expected_type: "f64",
+                    actual_type: callback_type,
+                });
+            };
+            let _ = gauge.with_callback(callback).build();
+            REGISTERED_COUNT.add(1, &[]);
+            Ok(())
+        }
         MetricType::ObservableGaugeU64 => {
             let mut gauge = COMPONENTS_METER.u64_observable_gauge(metric_name);
             if let Some(description) = metric.description {

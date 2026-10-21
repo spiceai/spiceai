@@ -71,6 +71,14 @@ jobs:
       # Always treat a manual workflow_dispatch run as having relevant changes so the
       # tests run even when no relevant files changed.
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+      # Whether `source-versions` runs: on every manual run (integration_nightly.yml
+      # dispatches one each night), and on a push to trunk or a release branch
+      # that touches what can behave differently on another release line of a
+      # federated source database. Not in the merge queue, where it would hold a
+      # runner per release line for a check that gates nothing; the push run
+      # after the merge reports the same commit.
+      source_changes: ${{ (github.event_name == 'push' && steps.check_sources.outputs.relevant_changes == 'true') || github.event_name == 'workflow_dispatch' }}
+      source_versions_matrix: ${{ steps.source_versions.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,6 +88,61 @@ jobs:
       - name: Check for code changes
         id: check
         uses: ./.github/actions/check-code-changes
+
+      - name: Check for federated source changes
+        id: check_sources
+        if: github.event_name == 'push'
+        uses: ./.github/actions/check-code-changes
+        with:
+          # The connectors, the test helpers that start the source containers, and
+          # the version list itself. Dependency bumps (database drivers, and the
+          # DataFusion forks whose SQL unparser writes what is pushed down) are
+          # left to the nightly run: one in six trunk commits touches Cargo.lock.
+          filters: |
+            code_changes:
+              - 'test/source_versions.json'
+              - 'crates/test-framework/src/source_versions.rs'
+              - '.github/workflows/integration.yml'
+              - 'crates/data-connectors/connector-postgres/**'
+              - 'crates/data-connectors/connector-postgres-common/**'
+              - 'crates/data-connectors/connector-mysql/**'
+              - 'crates/data-connectors/connector-mongodb/**'
+              - 'crates/data_components/src/postgres/**'
+              - 'crates/data_components/src/postgres_replication/**'
+              - 'crates/data_components/src/mysql/**'
+              - 'crates/data_components/src/mysql_replication/**'
+              - 'crates/runtime/src/catalogconnector/postgres.rs'
+              - 'crates/runtime/src/catalogconnector/postgres_accelerated.rs'
+              - 'crates/runtime/src/catalogconnector/mysql.rs'
+              - 'crates/accelerators/accelerator-postgres/**'
+              - 'crates/vendor/pgwire-replication/**'
+              - 'crates/runtime/tests/docker/**'
+              # Every test module the source-versions filters below select.
+              - 'crates/runtime/tests/postgres/**'
+              - 'crates/runtime/tests/schema_evolution/**'
+              - 'crates/runtime/tests/retention/**'
+              - 'crates/runtime/tests/tpcds_postgres/**'
+              - 'crates/runtime/tests/hashicorp_vault/**'
+              - 'crates/runtime/tests/acceleration/refresh/**'
+              - 'crates/runtime/tests/acceleration/checkpoint_postgres.rs'
+              - 'crates/runtime/tests/acceleration/on_conflict.rs'
+              - 'crates/runtime/tests/acceleration/query_push_down.rs'
+              - 'crates/runtime/tests/mysql/**'
+              - 'crates/runtime/tests/rehydration/**'
+              - 'crates/runtime/tests/refresh_retry/mysql.rs'
+              - 'crates/runtime/tests/mongo/**'
+
+      # Every listed release line except each source's newest, which the
+      # partitions below already run as the default.
+      - name: List federated source versions
+        id: source_versions
+        run: |
+          set -euo pipefail
+          matrix="$(jq -c '[to_entries[] | select(.key != "description") | .key as $source | .value.versions[:-1][] | {source: $source, version: .version, end_of_life: .end_of_life}]' test/source_versions.json)"
+          today="$(date -u +%F)"
+          jq -r --arg today "$today" 'to_entries[] | select(.key != "description") | .key as $source | .value.versions[] | select(.end_of_life <= $today) | "::warning title=Unsupported source version::\($source) \(.version) reached end of life on \(.end_of_life); remove it from test/source_versions.json"' test/source_versions.json
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Source versions beyond each default: ${matrix}"
 
   build:
     name: Build Test Binary
@@ -101,10 +164,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
+      # Cache Cargo dependencies. Saved by the "Save Cargo registry" step at the
+      # end of this job, and never from the merge queue (see there).
+      - name: Restore Cargo registry
+        id: cargo-registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -195,7 +260,9 @@ jobs:
           # gate sits inside an `any(...)` that `postgres`/`duckdb`/`sqlite` already satisfy.
           # `turso` alongside `postgres`/`mysql`/`delta_lake`/`duckdb`/`sqlite` is the
           # combination `make test-integration` runs.
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb,turso"
+          # `debezium` compiles the `cdc_ingest` and `cdc_cayenne` Debezium tests, which
+          # are gated on it and run nowhere else.
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,debezium,iceberg-write,snapshots,mongodb,turso"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -215,7 +282,7 @@ jobs:
           archive all_targets cargo nextest archive ${PKGS} \
             --test integration --test retention_oom --test integration_aws_sdk \
             --test integration_snapshot_refresh --test credential_provider \
-            --test partition_table_provider --test hadoop_catalog_test \
+            --test partition_table_provider \
             --features ${FEAT} --archive-file integration_tests.tar.zst
 
           echo "--- archive size ---"
@@ -244,12 +311,26 @@ jobs:
 
       - name: Upload test archive (artifact fallback)
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests-archive
           path: ./integration_tests.tar.zst
           retention-days: 3
           compression-level: 1
+
+      # Not from the merge queue: a cache saved there is scoped to the queue
+      # entry's temporary `gh-readonly-queue/...` ref, which later entries and
+      # trunk cannot restore from, so each save there stored ~3 GiB that was
+      # almost never read. Merge-queue runs restore the cache trunk saves.
+      - name: Save Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'merge_group' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
 
   test-partitions:
     name: Run Integration Tests (part ${{ matrix.label }})
@@ -309,7 +390,7 @@ jobs:
 
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true' && env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -328,9 +409,10 @@ jobs:
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          docker pull docker.io/library/postgres:latest
-          docker pull docker.io/library/mysql:latest
-          docker pull docker.io/library/mongo:latest
+          # Each source's default release line (the newest in test/source_versions.json).
+          for image in $(jq -r 'to_entries[] | select(.key != "description") | "\(.value.image):\(.value.versions[-1].version)"' test/source_versions.json); do
+            docker pull "${image}"
+          done
           docker pull docker.io/gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
@@ -457,11 +539,119 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
           retention-days: 1
+
+  # The tests that start a federated source database, run again on every other
+  # supported release line of that database. The partitions above run each
+  # source's newest line (test/source_versions.json); this job reuses their test
+  # archive with `SPICE_TEST_<SOURCE>_VERSION` set, so nothing is rebuilt. When it
+  # runs is `source_changes` in `check_changes`.
+  source-versions:
+    name: Integration Tests (${{ matrix.source }} ${{ matrix.version }})
+    needs: [build, check_changes]
+    if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
+    runs-on: spiceai-dev-runners
+    # The largest leg, PostgreSQL, ran its 85 tests in 4.3 minutes locally (six
+    # threads, PostgreSQL 14, 2026-10-08), against 13.1 minutes at most for a
+    # whole partition in CI; the bound leaves a cold runner room for the archive
+    # download and the image pull.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check_changes.outputs.source_versions_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      # The archive links the Oracle client library, as in the partitions.
+      - name: Install Oracle ODPI-C
+        uses: ./.github/actions/setup-oracle-odpi
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
+          mkdir -p ./integration_tests
+          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+
+      - name: Download test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: integration-tests-archive
+          path: ./integration_tests
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull ${{ matrix.source }} ${{ matrix.version }}
+        env:
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          image="$(jq -r --arg source "${SOURCE}" '.[$source].image' test/source_versions.json)"
+          docker pull "${image}:${VERSION}"
+
+      - name: Run ${{ matrix.source }} ${{ matrix.version }} tests
+        timeout-minutes: 45
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          # The test modules that start each source's container. A new module that
+          # starts one belongs here too, or this job never runs it on older lines.
+          # `retention::test_retention_sql` reads a Spice Cloud dataset, not a
+          # source container, so it runs once, in the partitions, with their key.
+          case "${SOURCE}" in
+            postgres)
+              export SPICE_TEST_POSTGRES_VERSION="${VERSION}"
+              filter='(test(/^(postgres|schema_evolution|retention|tpcds_postgres|hashicorp_vault)::/) | test(/^acceleration::(refresh|checkpoint_postgres|on_conflict|query_push_down)::/)) - test(=retention::test_retention_sql)'
+              ;;
+            mysql)
+              export SPICE_TEST_MYSQL_VERSION="${VERSION}"
+              filter='test(/^(mysql|rehydration)::/) | test(/^refresh_retry::mysql::/)'
+              ;;
+            mongodb)
+              export SPICE_TEST_MONGODB_VERSION="${VERSION}"
+              filter='test(/^mongo::/)'
+              ;;
+            *)
+              echo "::error::No test filter for source '${SOURCE}'; add one to this step"
+              exit 1
+              ;;
+          esac
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E "binary_id(=runtime::integration) & (${filter})"
 
   # Preserve the required check names and make the isolated GitHub lane part
   # of each result. A failed dependency must produce a failure, not a skipped
@@ -659,7 +849,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -747,7 +937,7 @@ jobs:
 
       - name: Download GitHub test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -757,7 +947,7 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v2
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
@@ -783,9 +973,10 @@ jobs:
             --archive-file ./integration_tests/integration_tests.tar.zst \
             --test-threads 1 -E 'binary_id(=runtime::integration) & test(/^github::/)'
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub permission diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: github-api-permissions
           path: github-api-results/
@@ -808,7 +999,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-snapshots-part-github
           path: integration-snapshots-part-github.tar.gz
@@ -852,7 +1043,7 @@ jobs:
 
       - name: Download AWS SDK test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -915,7 +1106,7 @@ jobs:
 
       - name: Download AWS SDK credential bridge test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -981,7 +1172,7 @@ jobs:
 
       - name: Download snapshot refresh test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -1043,7 +1234,7 @@ jobs:
 
       - name: Download data components test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests
@@ -1057,7 +1248,7 @@ jobs:
           MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::hadoop_catalog_test)'
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
     name: Partition Table Integration Tests
@@ -1095,7 +1286,7 @@ jobs:
 
       - name: Download partition table test archive
         if: env.HAS_TEST_MINIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests-archive
           path: ./integration_tests

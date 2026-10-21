@@ -23,7 +23,7 @@ use tonic::async_trait;
 
 use crate::{
     queries::{QuerySet, TableWithTimeColumn},
-    spicetest::append::worker::AppendConfig,
+    spicetest::append::{tpch_conflict_marker, worker::AppendConfig},
 };
 
 use super::AppendableSource;
@@ -58,27 +58,6 @@ fn tpch_primary_key(table_name: &str) -> Option<&'static str> {
         .iter()
         .find(|(t, _)| *t == table_name)
         .map(|(_, pk)| *pk)
-}
-
-/// A non-key numeric column per TPC-H table, each one read by at least one TPC-H
-/// query. Negating it in a conflicting row makes that row's survival visible to
-/// the query results, so an `on_conflict` that keeps the superseded row fails
-/// the benchmark's own answers rather than passing unnoticed.
-const TPCH_CONFLICT_MARKER_COLUMNS: &[(&str, &str)] = &[
-    ("customer", "c_acctbal"),
-    ("lineitem", "l_extendedprice"),
-    ("orders", "o_totalprice"),
-    ("part", "p_size"),
-    ("partsupp", "ps_supplycost"),
-    ("supplier", "s_acctbal"),
-];
-
-/// Returns the column to negate in a conflicting copy of a TPC-H table's rows.
-fn tpch_conflict_marker_column(table_name: &str) -> Option<&'static str> {
-    TPCH_CONFLICT_MARKER_COLUMNS
-        .iter()
-        .find(|(t, _)| *t == table_name)
-        .map(|(_, column)| *column)
 }
 
 /// Generates SQL for TPC-H initial setup (step 0).
@@ -199,10 +178,15 @@ fn generate_tpch_sql(
             writeln!(&mut sql, "ALTER TABLE {name}_conflict ADD COLUMN {column} TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;").ok();
 
             // The next step appends these same keys with their real values, so
-            // this copy is the one an upsert must discard. Negate a queried
-            // column to make keeping it change the query results.
-            if let Some(marker) = tpch_conflict_marker_column(name) {
-                writeln!(&mut sql, "UPDATE {name}_conflict SET {marker} = -{marker};").ok();
+            // this copy is the one an upsert must discard. Mark a queried column
+            // to make keeping it change the query results.
+            if let Some(marker) = tpch_conflict_marker(name) {
+                writeln!(
+                    &mut sql,
+                    "UPDATE {name}_conflict SET {};",
+                    marker.assignment()
+                )
+                .ok();
             }
 
             write!(
@@ -433,18 +417,18 @@ mod tests {
     }
 
     #[test]
-    fn a_conflicting_copy_negates_a_queried_column_before_it_is_appended() {
+    fn a_conflicting_copy_marks_a_queried_column_before_it_is_appended() {
         let sql = tpch_sql(true, "lineitem", "l_created_at");
         let update = sql
-            .find("UPDATE lineitem_conflict SET l_extendedprice = -l_extendedprice;")
-            .expect("the conflicting copy should have its marker column negated");
+            .find("UPDATE lineitem_conflict SET l_extendedprice = -ABS(l_extendedprice) - 1000000;")
+            .expect("the conflicting copy should have its marker column set");
         let insert = sql
             .find("INSERT INTO lineitem SELECT * FROM lineitem_conflict")
             .expect("the conflicting copy should be appended");
 
         assert!(
             update < insert,
-            "the marker column must be negated before the copy is appended"
+            "the marker column must be set before the copy is appended"
         );
     }
 

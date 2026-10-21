@@ -19,7 +19,10 @@ mod json_nested_fields;
 #[cfg(feature = "duckdb")]
 mod view_hot_reload;
 
+mod basic_auth;
 mod deferred;
+mod path_escape;
+mod server_timing;
 mod trace_id;
 
 use std::collections::HashMap;

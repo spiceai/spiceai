@@ -172,14 +172,16 @@ mod tests {
             json!({"id": "2", "only_in_second": 42}),
         ];
         let schema = infer_schema(&samples).expect("infer_schema should succeed");
-        schema
-            .field_with_name("id")
-            .expect("schema should have 'id' field");
-        schema
-            .field_with_name("only_in_first")
-            .expect("schema should have 'only_in_first' field");
-        schema
-            .field_with_name("only_in_second")
-            .expect("schema should have 'only_in_second' field");
+        // These become the dataset's columns: every field either document has, in the
+        // order first seen, each typed from its values and nullable because a document
+        // may lack it — and nothing else.
+        assert_eq!(
+            *schema,
+            Schema::new(vec![
+                arrow::datatypes::Field::new("id", DataType::Utf8, true),
+                arrow::datatypes::Field::new("only_in_first", DataType::Utf8, true),
+                arrow::datatypes::Field::new("only_in_second", DataType::Int64, true),
+            ])
+        );
     }
 }

@@ -348,8 +348,7 @@ impl DuckDBAccelerator {
             .chain(app.views.iter().map(|view| view.acceleration.as_ref()));
 
         for acceleration in accelerations.flatten() {
-            let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
-            if engine_str.to_lowercase() != "duckdb" {
+            if !acceleration.engine_name().eq_ignore_ascii_case("duckdb") {
                 continue;
             }
             // If the path is Some, we're counting the number of file instances
@@ -412,12 +411,7 @@ impl DuckDBAccelerator {
             let Some(acceleration) = &peer.acceleration else {
                 continue;
             };
-            if !acceleration
-                .engine
-                .as_deref()
-                .unwrap_or("arrow")
-                .eq_ignore_ascii_case("duckdb")
-            {
+            if !acceleration.engine_name().eq_ignore_ascii_case("duckdb") {
                 continue;
             }
             if !matches!(
@@ -814,10 +808,39 @@ impl DataAccelerator for DuckDBAccelerator {
         )))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !source.is_file_accelerated() {
+            return Ok(());
+        }
+        let path = self.file_path(source)?;
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("duckdb_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
         }
@@ -829,21 +852,6 @@ impl DataAccelerator for DuckDBAccelerator {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
 
             // Recover from any interrupted database file swap (crashed or
@@ -4358,6 +4366,56 @@ mod tests {
             nearest.abs() < f32::EPSILON,
             "the nearest neighbour of a stored vector is itself, at distance 0, not {nearest}"
         );
+    }
+
+    /// String filter values reach `DuckDB` as literals it parses back to the same
+    /// value. A backslash before a quote used to render as `'a\'b'`, which
+    /// `DuckDB` rejects as unterminated, and `a''b` rendered as `'a''b'`, which
+    /// `DuckDB` reads as `a'b` (#12580). This runs each rendered filter against a
+    /// real table, so it fails on a parser error or on a wrong match.
+    #[test]
+    fn duckdb_string_filters_with_backslashes_and_quotes_match_exactly() {
+        use datafusion::prelude::{col, lit};
+        use datafusion::sql::unparser::Unparser;
+        use runtime_datafusion::dialect::new_duckdb_dialect;
+
+        let values = [
+            r"a\b",
+            "a'b",
+            r"a\'b",
+            r"a\''b",
+            "a''b",
+            r"\'",
+            "'",
+            r"C:\path\it's",
+            r"trailing\",
+        ];
+        let duck = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        duck.execute_batch("CREATE TABLE orders (customer_id VARCHAR)")
+            .expect("create table");
+        for value in values {
+            duck.execute("INSERT INTO orders VALUES (?)", [value])
+                .expect("insert value");
+        }
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        for value in values {
+            let filter = unparser
+                .expr_to_sql(&col("customer_id").eq(lit(value)))
+                .expect("filter unparses")
+                .to_string();
+            let sql = format!("SELECT customer_id FROM orders WHERE {filter}");
+            let mut statement = duck
+                .prepare(&sql)
+                .unwrap_or_else(|e| panic!("DuckDB should parse {sql}: {e}"));
+            let matched: Vec<String> = statement
+                .query_map([], |row| row.get(0))
+                .expect("query runs")
+                .collect::<Result<_, _>>()
+                .expect("rows read");
+            assert_eq!(matched, vec![value.to_string()], "{sql}");
+        }
     }
 
     /// `trim(...)` resolves to `DataFusion`'s `btrim`, which is the name the

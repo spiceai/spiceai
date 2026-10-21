@@ -21,9 +21,9 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
-    TableStorageStats,
+    ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
+    InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+    TableStatistics, TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -83,6 +83,21 @@ pub enum CatalogError {
         replaced: String,
         /// The snapshot the table points at instead
         current: String,
+    },
+
+    /// A compaction's commit found that protected snapshots it folded into its
+    /// output are no longer registered: another writer merged or removed them
+    /// while it ran, so committing would register the folded rows twice.
+    #[snafu(display(
+        "Table {table_id} no longer registers {missing} of the {folded} protected snapshots it compacted, so the compacted snapshot was not committed"
+    ))]
+    ProtectedSnapshotsReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// How many protected snapshots the compaction folded
+        folded: usize,
+        /// How many of them the catalog no longer registers
+        missing: usize,
     },
 
     /// IO error
@@ -213,6 +228,15 @@ pub enum CatalogError {
     ))]
     ChangedConfiguration { table_name: String },
 
+    /// The table's stored rows were written under settings the requested ones change
+    /// the meaning of (see [`crate::metadata::SettingsChangeAction`]), and the caller
+    /// asked for such a table to be rebuilt rather than kept. Worded as the cause clause
+    /// the caller's message embeds.
+    #[snafu(display(
+        "the existing acceleration of dataset '{table_name}' was built with settings it cannot adopt in place ({changes})"
+    ))]
+    SettingsChangeRequiresRebuild { table_name: String, changes: String },
+
     #[snafu(display(
         "Failed to load table {table_name}: the datalake location changed from '{stored}' to '{configured}' while published datalake files exist. Revert 'cayenne_datalake_location' to '{stored}', or delete the acceleration and re-register the dataset to publish to the new location."
     ))]
@@ -221,6 +245,20 @@ pub enum CatalogError {
         stored: String,
         configured: String,
     },
+
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
+    ))]
+    PkConflictDetectionEnabledOnExistingTable { table_name: String },
+
+    /// [`Self::PkConflictDetectionEnabledOnExistingTable`] for a table the caller would
+    /// rebuild, but holds until its source can be read
+    /// (`SettingsChangeAction::HoldUntilSourceReadable`): the stored rows cannot be
+    /// served under the check meanwhile.
+    #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. Applying 'auto' rebuilds the table from its source, which cannot be read on the table's schema yet. To keep using the existing data, set 'cayenne_pk_conflict_detection' back to 'none'. To apply 'auto', restart once the source is reachable and any change to its schema is resolved (revert it, or set 'on_schema_change' to adopt it). See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionChangeHeld { table_name: String },
 
     #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
@@ -289,6 +327,8 @@ pub trait MetadataCatalog: Send + Sync {
     /// in the same transaction: the table aggregate, the snapshot-file cache,
     /// and `cayenne_cold_tier_file.statistics_blob`.
     ///
+    /// Also used when schema evolution has an outstanding row-count delta,
+    /// whose process-local reservation cannot protect the count after reopening.
     /// Used when a widening changes a decimal column's scale. Vortex stores
     /// unscaled integers and decodes them with the current schema's scale, so
     /// publishing the new schema while leaving those blobs in place would
@@ -644,7 +684,12 @@ pub trait MetadataCatalog: Send + Sync {
     /// because their `sequence_number` column records the delete-fence at
     /// creation, not the snapshot's own creation sequence.
     ///
-    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`].
+    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`]. Every
+    /// id in `protected_snapshot_ids_to_clear` must also still be registered: the
+    /// commit changes nothing and returns
+    /// [`CatalogError::ProtectedSnapshotsReplaced`] when one is not, because a
+    /// writer that merged or removed it since the rewrite folded it would
+    /// otherwise leave the rewritten rows registered twice.
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,
@@ -701,11 +746,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
+    ///
+    /// `delete_files` are position deletion vectors on the new snapshot, hiding
+    /// the copies of keys its incoming data repeated across record batches.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -842,6 +891,20 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear the persisted PK existence index for a table.
     async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Record a persisted secondary index run, after its file is written.
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()>;
+
+    /// Every persisted secondary index run of a table.
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>>;
+
+    /// Forget a persisted secondary index run, before its file is deleted.
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()>;
 
     // ── Inlined data (data inlining for small writes) ──────────────────
 

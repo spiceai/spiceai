@@ -298,6 +298,21 @@ pub struct HostReadings {
     /// could read a pod spec put it there. `None` when no request is declared,
     /// which is every bare-metal and benchmark deployment.
     pub declared_request_millicores: Option<u64>,
+    /// The simultaneous multithreading (SMT) layout of the CPUs this process may
+    /// run on: how many they are, and the physical cores they sit on. `None` when
+    /// it cannot be read, which is every platform but Linux.
+    pub smt: Option<SmtLayout>,
+}
+
+/// The logical CPUs a process may run on and the physical cores they sit on.
+/// With SMT each physical core runs two (or more) logical CPUs, which share its
+/// execution units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmtLayout {
+    /// Logical CPUs: the online CPUs in the process's affinity mask.
+    pub logical_cpus: usize,
+    /// Distinct physical cores among them.
+    pub physical_cores: usize,
 }
 
 impl HostReadings {
@@ -316,8 +331,104 @@ impl HostReadings {
             kubernetes: std::env::var_os("KUBERNETES_SERVICE_HOST")
                 .is_some_and(|value| !value.is_empty()),
             declared_request_millicores: detect_declared_request_millicores(),
+            smt: detect_smt_layout(),
         }
     }
+}
+
+/// The SMT layout of the CPUs this process may run on, from Linux: the online
+/// CPUs (sysfs) in its affinity mask (`Cpus_allowed_list` in `/proc/self/status`,
+/// which a cpuset or `taskset` narrows), and the distinct sets of SMT siblings
+/// they sit on, one per physical core. So a process confined to one thread of
+/// each of 8 cores counts 8 physical cores, not the host's ratio of them. `None`
+/// off Linux or when sysfs cannot be read.
+fn detect_smt_layout() -> Option<SmtLayout> {
+    const CPU_DIR: &str = "/sys/devices/system/cpu";
+    let online = parse_cpu_list(&std::fs::read_to_string(format!("{CPU_DIR}/online")).ok()?)?;
+    let allowed = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| allowed_cpus(&status));
+    smt_layout_of(&usable_cpus(online, allowed), |cpu| {
+        parse_cpu_list(
+            &std::fs::read_to_string(format!("{CPU_DIR}/cpu{cpu}/topology/thread_siblings_list"))
+                .ok()?,
+        )
+    })
+}
+
+/// The online CPUs this process may run on: `online` narrowed to `allowed`, the
+/// process's affinity mask, when that is known and leaves any.
+fn usable_cpus(online: Vec<usize>, allowed: Option<Vec<usize>>) -> Vec<usize> {
+    let Some(allowed) = allowed else {
+        return online;
+    };
+    let allowed: std::collections::HashSet<usize> = allowed.into_iter().collect();
+    let usable: Vec<usize> = online
+        .iter()
+        .copied()
+        .filter(|cpu| allowed.contains(cpu))
+        .collect();
+    if usable.is_empty() { online } else { usable }
+}
+
+/// The [`SmtLayout`] of `cpus`, each CPU's SMT siblings read by `siblings_of`.
+fn smt_layout_of(
+    cpus: &[usize],
+    siblings_of: impl Fn(usize) -> Option<Vec<usize>>,
+) -> Option<SmtLayout> {
+    let mut cores = std::collections::HashSet::new();
+    for &cpu in cpus {
+        cores.insert(siblings_of(cpu)?);
+    }
+    smt_layout(cpus.len(), cores.len())
+}
+
+/// The CPUs on the `Cpus_allowed_list` line of a `/proc/<pid>/status` file: the
+/// process's affinity mask.
+fn allowed_cpus(status: &str) -> Option<Vec<usize>> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .and_then(parse_cpu_list)
+}
+
+/// An [`SmtLayout`] of `logical_cpus` forming `physical_cores`, when both are
+/// known and consistent.
+const fn smt_layout(logical_cpus: usize, physical_cores: usize) -> Option<SmtLayout> {
+    if physical_cores == 0 || physical_cores > logical_cpus {
+        return None;
+    }
+    Some(SmtLayout {
+        logical_cpus,
+        physical_cores,
+    })
+}
+
+/// The CPUs of a Linux CPU list, such as `0-3,8,10-11`, the format of sysfs
+/// `online` and `thread_siblings_list` files. `None` when it does not parse.
+#[must_use]
+pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let list = list.trim();
+    if list.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        match part.split_once('-') {
+            Some((start, end)) => {
+                let (start, end) = (
+                    start.trim().parse::<usize>().ok()?,
+                    end.trim().parse::<usize>().ok()?,
+                );
+                if start > end {
+                    return None;
+                }
+                cpus.extend(start..=end);
+            }
+            None => cpus.push(part.trim().parse().ok()?),
+        }
+    }
+    Some(cpus)
 }
 
 /// The environment variable carrying the pod's own `requests.cpu`.
@@ -515,7 +626,14 @@ pub struct CpuBudget {
     /// The pod's declared `requests.cpu`. Reported, and the only request the
     /// warning below is allowed to compare against.
     declared_request_millicores: Option<u64>,
+    /// The host's SMT layout, which scales [`Self::physical_cores`].
+    smt: Option<SmtLayout>,
 }
+
+/// The physical cores Cayenne's `deletion_mode: auto` needs before it keeps a
+/// small primary-key table compacted whole alongside its writes (see
+/// [`CpuBudget::cayenne_keeps_small_tables_compacted`]).
+pub const CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES: usize = 8;
 
 impl CpuBudget {
     /// Resolve the effective entitlement.
@@ -645,6 +763,7 @@ impl CpuBudget {
             cpu_share: host.cpu_share,
             kubernetes: host.kubernetes,
             declared_request_millicores: host.declared_request_millicores,
+            smt: host.smt,
         })
     }
 
@@ -718,6 +837,10 @@ impl CpuBudget {
             (
                 "dedicated_runtime_worker_threads",
                 self.dedicated_runtime_worker_threads(),
+            ),
+            (
+                "interactive_query_worker_threads",
+                self.interactive_query_worker_threads(),
             ),
             ("target_partitions", self.target_partitions()),
             ("scan_split_concurrency", self.scan_split_concurrency()),
@@ -1089,6 +1212,50 @@ impl CpuBudget {
         self.detected_cores
     }
 
+    /// The entitlement in whole cores when an explicit quantity set it —
+    /// `--cpu-cores`, `SPICE_CPU_CORES` or `runtime.cpu.cores` — and `None` when it
+    /// was detected. `all` and `auto` name no quantity of their own, so both are
+    /// `None`.
+    #[must_use]
+    pub const fn configured_cores(&self) -> Option<usize> {
+        if matches!(self.source, CpuSource::Configured) {
+            Some(self.cores)
+        } else {
+            None
+        }
+    }
+
+    /// The physical cores behind [`Self::cores`]: the budget scaled by the
+    /// physical cores per logical CPU among the CPUs this process may run on,
+    /// rounded down and at least one. Equal to `cores` without SMT, or where the
+    /// layout is unknown. A budget of 8 logical CPUs on a host with two SMT
+    /// threads per core is 4; a process confined to one thread of each of 8 cores
+    /// has 8.
+    #[must_use]
+    pub const fn physical_cores(&self) -> usize {
+        match self.smt {
+            Some(SmtLayout {
+                logical_cpus,
+                physical_cores,
+            }) if physical_cores < logical_cpus => {
+                let scaled = self.cores * physical_cores / logical_cpus;
+                if scaled == 0 { 1 } else { scaled }
+            }
+            _ => self.cores,
+        }
+    }
+
+    /// The physical-core budget when the host reports its CPU topology.
+    /// Unlike [`Self::physical_cores`], an unreadable topology returns `None`
+    /// instead of assuming that every logical CPU is a physical core.
+    #[must_use]
+    pub const fn known_physical_cores(&self) -> Option<usize> {
+        match self.smt {
+            Some(_) => Some(self.physical_cores()),
+            None => None,
+        }
+    }
+
     // ---- tokio runtimes ----
 
     /// Worker threads for the primary runtime (HTTP, control plane, queries).
@@ -1103,6 +1270,18 @@ impl CpuBudget {
     pub const fn dedicated_runtime_worker_threads(&self) -> usize {
         let reserved = self.cores.saturating_sub(1);
         if reserved == 0 { 1 } else { reserved }
+    }
+
+    /// Worker threads for the interactive query runtime, which runs queries
+    /// that read a bounded set of rows by primary key apart from the analytical
+    /// queries on the `cpu` runtime: a fifth of the cores, at least two. A key
+    /// lookup costs milliseconds of CPU, so a few threads keep up with a high
+    /// lookup rate, and they are runnable beside the `cpu` runtime's rather
+    /// than queued behind its tasks.
+    #[must_use]
+    pub const fn interactive_query_worker_threads(&self) -> usize {
+        let threads = self.cores / 5;
+        if threads < 2 { 2 } else { threads }
     }
 
     // ---- query engine ----
@@ -1205,6 +1384,42 @@ impl CpuBudget {
         self.cores
     }
 
+    /// Whether Cayenne's `deletion_mode: auto` has the cores to keep a small
+    /// primary-key table on position deletes, compacted whole alongside its writes:
+    /// [`CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES`] physical cores. Cayenne
+    /// also requires Linux (`cayenne::auto_keeps_small_tables_compacted`).
+    /// Unknown CPU topology cannot establish that minimum.
+    ///
+    /// In a Linux virtual machine held to four CPUs, a 200K-row table under 2,000
+    /// upserts every 250 ms wrote at a P99 4% above key deletes' on position
+    /// deletes, with mixed reads. On eight performance cores of a bare-metal Arm
+    /// host, without SMT, its writes were even and its P99 reads 8–27% faster. The
+    /// count is of physical cores because no host with SMT was measured: two SMT
+    /// threads share one core's execution units however their priorities are set,
+    /// so 8 logical CPUs on 4 such cores are counted as the 4 that lost.
+    #[must_use]
+    pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
+        matches!(
+            self.known_physical_cores(),
+            Some(cores) if cores >= CAYENNE_SMALL_TABLE_COMPACTION_PHYSICAL_CORES
+        )
+    }
+
+    /// How many Cayenne `deletion_mode: auto` tables may rewrite themselves whole
+    /// at once to reclaim deletes: one per four physical cores, and at least one.
+    /// An unknown CPU topology admits only one reclaim at a time.
+    /// Tables written alike reach their reclaim triggers together: on eight cores,
+    /// with 20 tables of 200K rows, all 20 rewriting at once stalled aggregate scans
+    /// on them to 154–194 ms, against 67–74 ms on key deletes.
+    #[must_use]
+    pub const fn cayenne_whole_table_reclaim_permits(&self) -> usize {
+        let Some(physical_cores) = self.known_physical_cores() else {
+            return 1;
+        };
+        let permits = physical_cores / 4;
+        if permits == 0 { 1 } else { permits }
+    }
+
     /// Connections in the Cayenne `SQLite` metastore pool. Capped at 32 because
     /// each connection carries its own mmap and page cache; floored at 2 so a
     /// single-core host still has a slot for read-while-write.
@@ -1281,6 +1496,7 @@ pub fn cpu_budget() -> &'static CpuBudget {
             cpu_share: None,
             kubernetes: false,
             declared_request_millicores: None,
+            smt: None,
         })
     })
 }
@@ -1397,6 +1613,215 @@ mod tests {
         CpuBudget::resolve(&CpuConfig::default(), &host(cores)).expect("detection cannot fail")
     }
 
+    /// Cayenne's `deletion_mode: auto` keeps small tables compacted on eight
+    /// known physical cores and more, and on key deletes below.
+    #[test]
+    fn cayenne_keeps_small_tables_compacted_from_eight_cores() {
+        for (cores, keeps) in [(1, false), (4, false), (7, false), (8, true), (64, true)] {
+            assert_eq!(
+                smt_budget(cores, cores, cores).cayenne_keeps_small_tables_compacted(),
+                keeps,
+                "{cores} cores"
+            );
+        }
+    }
+
+    #[test]
+    fn cayenne_keeps_key_deletes_when_cpu_topology_is_unknown() {
+        for cores in [1, 7, 8, 16, 64] {
+            let budget = budget(cores);
+            assert_eq!(budget.known_physical_cores(), None);
+            assert!(
+                !budget.cayenne_keeps_small_tables_compacted(),
+                "{cores} logical CPUs do not establish a physical-core count"
+            );
+        }
+    }
+
+    fn smt_budget(cores: usize, logical_cpus: usize, physical_cores: usize) -> CpuBudget {
+        let host = HostReadings {
+            affinity_cores: cores,
+            smt: smt_layout(logical_cpus, physical_cores),
+            ..HostReadings::default()
+        };
+        CpuBudget::resolve(&CpuConfig::default(), &host).expect("detection cannot fail")
+    }
+
+    /// On a host with SMT the rule counts physical cores: 8 logical CPUs on a
+    /// host with two threads per core are 4 physical cores, and stay on key
+    /// deletes; 16 are 8.
+    #[test]
+    fn cayenne_keeps_small_tables_compacted_counts_physical_cores_under_smt() {
+        for (cores, logical, physical, expected_physical, keeps) in [
+            (8, 16, 8, 4, false),
+            (16, 16, 8, 8, true),
+            (12, 32, 16, 6, false),
+            (8, 8, 8, 8, true),
+            (1, 2, 1, 1, false),
+        ] {
+            let budget = smt_budget(cores, logical, physical);
+            assert_eq!(
+                (
+                    budget.physical_cores(),
+                    budget.cayenne_keeps_small_tables_compacted()
+                ),
+                (expected_physical, keeps),
+                "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+    }
+
+    /// One whole-table reclaim per four physical cores, and at least one.
+    #[test]
+    fn cayenne_whole_table_reclaim_permits_follow_physical_cores() {
+        for (cores, logical, physical, permits) in [
+            (1, 1, 1, 1),
+            (4, 4, 4, 1),
+            (8, 8, 8, 2),
+            (8, 16, 8, 1),
+            (16, 16, 16, 4),
+            (64, 64, 64, 16),
+        ] {
+            assert_eq!(
+                smt_budget(cores, logical, physical).cayenne_whole_table_reclaim_permits(),
+                permits,
+                "{cores} of {logical} logical CPUs on {physical} physical cores"
+            );
+        }
+        for cores in [1, 4, 8, 16, 64] {
+            assert_eq!(
+                budget(cores).cayenne_whole_table_reclaim_permits(),
+                1,
+                "{cores} logical CPUs with unknown topology admit one reclaim"
+            );
+        }
+    }
+
+    /// The sysfs CPU-list format: single CPUs and inclusive ranges, comma
+    /// separated, with the trailing newline sysfs writes.
+    #[test]
+    fn parse_cpu_list_reads_sysfs_lists() {
+        assert_eq!(
+            parse_cpu_list("0-3,8,10-11\n"),
+            Some(vec![0, 1, 2, 3, 8, 10, 11])
+        );
+        assert_eq!(parse_cpu_list("5"), Some(vec![5]));
+        assert_eq!(parse_cpu_list("0,64"), Some(vec![0, 64]));
+        assert_eq!(parse_cpu_list(""), Some(vec![]));
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("a-b"), None);
+    }
+
+    /// A layout whose physical count is zero or exceeds its logical CPUs is not
+    /// a layout, and the budget reads as having no SMT.
+    #[test]
+    fn an_inconsistent_smt_layout_is_ignored() {
+        assert_eq!(smt_layout(8, 0), None);
+        assert_eq!(smt_layout(4, 8), None);
+        assert_eq!(smt_budget(8, 4, 8).physical_cores(), 8);
+    }
+
+    /// The SMT siblings of a host with 8 cores of two threads each, numbered as
+    /// Intel hosts number them: CPUs `i` and `i + 8` share a core.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shape `smt_layout_of` reads siblings in, which can fail"
+    )]
+    fn paired_siblings(cpu: usize) -> Option<Vec<usize>> {
+        let core = cpu % 8;
+        Some(vec![core, core + 8])
+    }
+
+    /// The layout counts the CPUs the process may run on. Confined to one thread
+    /// of each of 8 cores it has 8 physical cores, and keeps small tables
+    /// compacted, where the host's ratio would count 4; confined to both threads
+    /// of 4 cores it has 4.
+    #[test]
+    fn the_smt_layout_counts_the_cpus_this_process_may_run_on() {
+        let online: Vec<usize> = (0..16).collect();
+        let layout = |allowed: Option<Vec<usize>>| {
+            smt_layout_of(&usable_cpus(online.clone(), allowed), paired_siblings)
+        };
+        let one_thread_each: Vec<usize> = (0..8).collect();
+        let both_threads_of_four = vec![0, 1, 2, 3, 8, 9, 10, 11];
+        assert_eq!(layout(None), smt_layout(16, 8), "the whole host");
+        assert_eq!(
+            layout(Some(one_thread_each.clone())),
+            smt_layout(8, 8),
+            "one thread of each of 8 cores"
+        );
+        assert_eq!(
+            layout(Some(both_threads_of_four.clone())),
+            smt_layout(8, 4),
+            "both threads of 4 cores"
+        );
+        assert_eq!(
+            layout(Some(vec![40])),
+            smt_layout(16, 8),
+            "an affinity mask naming no online CPU is ignored"
+        );
+        for (allowed, physical, keeps) in
+            [(one_thread_each, 8, true), (both_threads_of_four, 4, false)]
+        {
+            let cores = allowed.len();
+            let host = HostReadings {
+                affinity_cores: cores,
+                smt: layout(Some(allowed)),
+                ..HostReadings::default()
+            };
+            let budget =
+                CpuBudget::resolve(&CpuConfig::default(), &host).expect("detection cannot fail");
+            assert_eq!(
+                (
+                    budget.physical_cores(),
+                    budget.cayenne_keeps_small_tables_compacted()
+                ),
+                (physical, keeps),
+                "{cores} CPUs"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_cpus_reads_the_affinity_line_of_proc_status() {
+        let status =
+            "Name:\tspiced\nCpus_allowed:\tff\nCpus_allowed_list:\t0-3,8\nMems_allowed_list:\t0\n";
+        assert_eq!(allowed_cpus(status), Some(vec![0, 1, 2, 3, 8]));
+        assert_eq!(allowed_cpus("Name:\tspiced\n"), None);
+    }
+
+    /// On Linux the detected layout counts the CPUs this process may run on: the
+    /// count `sched_getaffinity` gives, read through `available_parallelism`. A
+    /// cgroup quota lowers that count below the affinity mask, so under one the
+    /// layout counts at least as many.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's own reading of the affinity mask, independent of /proc"
+    )]
+    fn the_detected_smt_layout_counts_the_affinity_mask() {
+        let host = HostReadings::detect();
+        let parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("the affinity count");
+        let logical_cpus = host
+            .smt
+            .map(|layout| layout.logical_cpus)
+            .expect("Linux sysfs gives an SMT layout");
+        if host.quota_millicores.is_none() {
+            assert_eq!(
+                logical_cpus, parallelism,
+                "the layout counts the affinity mask"
+            );
+        } else {
+            assert!(
+                logical_cpus >= parallelism,
+                "under a quota the layout still counts the whole affinity mask: {logical_cpus} < {parallelism}"
+            );
+        }
+    }
+
     fn quota(affinity_cores: usize, quota_millicores: u64) -> HostReadings {
         HostReadings {
             affinity_cores,
@@ -1440,6 +1865,7 @@ mod tests {
             cpu_share: None,
             kubernetes: false,
             declared_request_millicores: Some(declared_request_millicores),
+            smt: None,
         }
     }
 
@@ -2036,7 +2462,7 @@ mod tests {
 
     /// The claim in `configured_above_ceiling_warning` is that lowering changes
     /// no pool size — not that every pool equals the core budget, which is false
-    /// and was what the message said. Three of the fifteen derived quantities
+    /// and was what the message said. Four of the sixteen derived quantities
     /// diverge from `cores` at `cores = 3`, and a reword checked only against
     /// `derived_sizing()` being *unchanged* cannot see that, because unchanged
     /// and equal are different properties. This pins the divergence itself, so
@@ -2060,6 +2486,7 @@ mod tests {
             divergent,
             vec![
                 ("dedicated_runtime_worker_threads", 2),
+                ("interactive_query_worker_threads", 2),
                 ("max_concurrent_queries", 12),
                 ("cayenne_encode_permits", 1),
             ],
@@ -2330,6 +2757,32 @@ mod tests {
     }
 
     #[test]
+    fn configured_cores_reports_only_an_explicit_quantity() {
+        let configured = |cli: Option<&str>,
+                          env: Option<&str>,
+                          spicepod: Option<&str>,
+                          readings: &HostReadings| {
+            CpuBudget::resolve(&CpuConfig::from_sources(cli, env, spicepod), readings)
+                .expect("valid")
+                .configured_cores()
+        };
+
+        // Every surface that names a quantity reports it, rounded up as `cores()` is.
+        assert_eq!(configured(Some("2"), None, None, &host(16)), Some(2));
+        assert_eq!(configured(None, Some("5"), None, &host(16)), Some(5));
+        assert_eq!(configured(None, None, Some("3.5"), &host(16)), Some(4));
+        // Above the host's CPUs it is still the value the runtime sizes itself for.
+        assert_eq!(configured(None, None, Some("64"), &host(16)), Some(64));
+
+        // `auto` and `all` name no quantity, and a detected budget is not configured.
+        assert_eq!(configured(None, None, Some("auto"), &host(16)), None);
+        assert_eq!(configured(None, None, Some("all"), &quota(16, 4000)), None);
+        assert_eq!(configured(None, None, None, &quota(16, 4000)), None);
+        assert_eq!(configured(None, None, None, &request_only(16, 2000)), None);
+        assert_eq!(configured(None, None, None, &host(16)), None);
+    }
+
+    #[test]
     fn fractional_entitlements_round_up_to_whole_threads() {
         let budget =
             CpuBudget::resolve(&CpuConfig::from_sources(Some("3.5"), None, None), &host(18))
@@ -2542,6 +2995,7 @@ mod tests {
             cpu_share: Some(CpuShare::Weight(174)),
             declared_request_millicores: None,
             kubernetes: true,
+            smt: None,
         };
         let warning = CpuBudget::resolve(&CpuConfig::default(), &unwired)
             .expect("valid")
@@ -2673,6 +3127,7 @@ mod tests {
         for name in [
             "main_runtime_worker_threads",
             "dedicated_runtime_worker_threads",
+            "interactive_query_worker_threads",
             "target_partitions",
             "max_concurrent_queries",
             "cayenne_encode_permits",

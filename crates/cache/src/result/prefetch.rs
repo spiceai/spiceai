@@ -198,6 +198,12 @@ mod tests {
             .expect("batch")
     }
 
+    /// A prefetch is a hint whose whole contract on the serve path is to return
+    /// without faulting, so these inputs, each with nothing to prefetch, must
+    /// simply return: no batches, a batch with no columns, and zero-row batches
+    /// that do have a column. The last reaches `prefetch_typed_values` with an
+    /// empty `Int32` value buffer, the one input here that would index past the
+    /// end (`&values[0]`) if its emptiness guard were missing.
     #[test]
     fn prefetch_of_empty_and_columnless_batches_does_not_panic() {
         prefetch_raw_serve_arced(&[]);
@@ -205,6 +211,15 @@ mod tests {
         let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
         prefetch_batch_headers(&empty);
         prefetch_raw_serve_arced(&[Arc::new(empty)]);
+
+        let zero_rows = batch(0);
+        assert_eq!(
+            (zero_rows.num_rows(), zero_rows.num_columns()),
+            (0, 1),
+            "the batch must have a column but no rows to reach the empty value buffer"
+        );
+        prefetch_batch_headers(&zero_rows);
+        prefetch_raw_serve_arced(&[Arc::new(zero_rows), Arc::new(batch(0))]);
     }
 
     #[test]

@@ -20,6 +20,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "ClickHouse data connector for Spice.ai runtime"
 
 [dependencies]
@@ -50,6 +51,7 @@ uuid.workspace = true
 default = []
 
 [dev-dependencies]
+insta.workspace = true
 runtime = { path = "../../runtime" }
 
 [lints]

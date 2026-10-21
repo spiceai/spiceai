@@ -25,15 +25,20 @@ use serde::{Serialize, Serializer};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 enum IcebergErrorType {
     NoSuchNamespaceException,
+    NoSuchTableException,
     BadRequestException,
+    ServiceUnavailableException,
     InternalServerError,
 }
 
 impl IcebergErrorType {
     fn code(&self) -> u16 {
         match self {
-            IcebergErrorType::NoSuchNamespaceException => 404,
+            IcebergErrorType::NoSuchNamespaceException | IcebergErrorType::NoSuchTableException => {
+                404
+            }
             IcebergErrorType::BadRequestException => 400,
+            IcebergErrorType::ServiceUnavailableException => 503,
             IcebergErrorType::InternalServerError => 500,
         }
     }
@@ -48,8 +53,14 @@ impl Serialize for IcebergErrorType {
             IcebergErrorType::NoSuchNamespaceException => {
                 serializer.serialize_str("NoSuchNamespaceException")
             }
+            IcebergErrorType::NoSuchTableException => {
+                serializer.serialize_str("NoSuchTableException")
+            }
             IcebergErrorType::BadRequestException => {
                 serializer.serialize_str("BadRequestException")
+            }
+            IcebergErrorType::ServiceUnavailableException => {
+                serializer.serialize_str("ServiceUnavailableException")
             }
             IcebergErrorType::InternalServerError => {
                 serializer.serialize_str("InternalServerError")
@@ -60,13 +71,15 @@ impl Serialize for IcebergErrorType {
 
 #[derive(Debug, Copy, Clone)]
 pub enum InternalServerErrorCode {
-    InvalidSchema,
+    InvalidTableMetadata,
 }
 
 impl std::fmt::Display for InternalServerErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InternalServerErrorCode::InvalidSchema => write!(f, "DF_INVALID_SCHEMA"),
+            InternalServerErrorCode::InvalidTableMetadata => {
+                write!(f, "ICEBERG_INVALID_TABLE_METADATA")
+            }
         }
     }
 }
@@ -96,6 +109,26 @@ impl IcebergResponseError {
         }
     }
 
+    pub fn no_such_table(message: String) -> Self {
+        Self {
+            error: IcebergError {
+                message,
+                r#type: IcebergErrorType::NoSuchTableException,
+                code: IcebergErrorType::NoSuchTableException.code(),
+            },
+        }
+    }
+
+    pub fn service_unavailable(message: String) -> Self {
+        Self {
+            error: IcebergError {
+                message,
+                r#type: IcebergErrorType::ServiceUnavailableException,
+                code: IcebergErrorType::ServiceUnavailableException.code(),
+            },
+        }
+    }
+
     pub fn bad_request(message: String) -> Self {
         Self {
             error: IcebergError {
@@ -119,10 +152,8 @@ impl IcebergResponseError {
 
 impl IntoResponse for IcebergResponseError {
     fn into_response(self) -> Response {
-        match self.error.code {
-            404 => (status::StatusCode::NOT_FOUND, Json(self)).into_response(),
-            400 => (status::StatusCode::BAD_REQUEST, Json(self)).into_response(),
-            _ => (status::StatusCode::INTERNAL_SERVER_ERROR, Json(self)).into_response(),
-        }
+        let status = status::StatusCode::from_u16(self.error.code)
+            .unwrap_or(status::StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(self)).into_response()
     }
 }

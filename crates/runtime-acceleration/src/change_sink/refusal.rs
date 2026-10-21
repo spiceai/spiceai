@@ -37,12 +37,40 @@ pub fn before_mutation(source: DataFusionError) -> DataFusionError {
 pub fn is_before_mutation(error: &DataFusionError) -> bool {
     let mut current: &(dyn std::error::Error + 'static) = error;
     loop {
-        if current.is::<BeforeMutation>() {
+        if current.is::<BeforeMutation>() || current.is::<MemberRefusal>() {
             return true;
         }
         let Some(source) = current.source() else {
             return false;
         };
         current = source;
+    }
+}
+
+/// A coalesced write refused before mutation because its member at `position`,
+/// in arrival order, is the first that would be refused had each member been
+/// applied on its own. The members before it would all have been applied.
+#[derive(Debug, Snafu)]
+#[snafu(display("{source}"))]
+pub struct MemberRefusal {
+    position: usize,
+    source: DataFusionError,
+}
+
+/// Refuse a coalesced write before mutation, naming its first refused member.
+#[must_use]
+pub fn member_refusal(position: usize, source: DataFusionError) -> DataFusionError {
+    DataFusionError::External(Box::new(MemberRefusal { position, source }))
+}
+
+/// The arrival position of the first refused member, when a refusal names one.
+#[must_use]
+pub fn refused_member(error: &DataFusionError) -> Option<usize> {
+    let mut current: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(refusal) = current.downcast_ref::<MemberRefusal>() {
+            return Some(refusal.position);
+        }
+        current = current.source()?;
     }
 }

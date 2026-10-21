@@ -28,9 +28,9 @@ limitations under the License.
 //! `.spice/data`, so each test names its datasets uniquely and removes their copies.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -53,7 +53,10 @@ use tempfile::TempDir;
 use crate::{
     docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
     init_tracing,
-    utils::{run_query, runtime_ready_check, test_request_context},
+    utils::{
+        PROMETHEUS, metric_series, metric_value, run_query, runtime_ready_check,
+        test_request_context,
+    },
 };
 
 const ACCESS_KEY: &str = "spiceadmin";
@@ -1170,19 +1173,7 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 
     let data_dir = dir.path().join("reader").join(modules);
     let metadata_dir = dir.path().join("reader").join("metadata");
-    let mut dataset = reader_dataset(rustfs, modules, &prefix);
-    if let Some(acceleration) = dataset.acceleration.as_mut() {
-        acceleration.params = Some(Params::from_string_map(HashMap::from([
-            (
-                "cayenne_file_path".to_string(),
-                data_dir.display().to_string(),
-            ),
-            (
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            ),
-        ])));
-    }
+    let dataset = reader_dataset_at(rustfs, modules, &prefix, &data_dir, &metadata_dir);
     let reader = Arc::new(
         Runtime::builder()
             .with_app(
@@ -1212,6 +1203,219 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
         Vec::<PathBuf>::new(),
         "nothing is restored under `.spice/data`"
     );
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+    Ok(())
+}
+
+const RECLAIM: &str = "spice_test_rustfs_snapshot_source_reclaim";
+
+/// A reader keeps only the snapshot directory it serves: each reload reclaims the
+/// one it supersedes, and a restart reclaims directories an earlier process left
+/// (spiceai/spiceai#14981).
+#[tokio::test]
+async fn a_reader_reclaims_the_snapshot_directories_a_reload_supersedes() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(RECLAIM).await?;
+            let result = reclaim_scenario(rustfs, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+/// A reader dataset with its copy under `data_dir` and its metastore under
+/// `metadata_dir`.
+fn reader_dataset_at(
+    rustfs: Rustfs,
+    name: &str,
+    prefix: &str,
+    data_dir: &Path,
+    metadata_dir: &Path,
+) -> Dataset {
+    let mut dataset = reader_dataset(rustfs, name, prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            ),
+        ])));
+    }
+    dataset
+}
+
+/// The `<table_id>/<snapshot_id>/` directories (both uuids) under a data directory.
+fn snapshot_dirs_under(data_dir: &Path) -> BTreeSet<PathBuf> {
+    fn is_uuid(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok())
+    }
+    fn walk(dir: &Path, parent_is_uuid: bool, found: &mut BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if !path.is_dir() {
+                continue;
+            }
+            if parent_is_uuid && is_uuid(&path) {
+                found.insert(path);
+            } else {
+                walk(&path, is_uuid(&path), found);
+            }
+        }
+    }
+    let mut found = BTreeSet::new();
+    walk(data_dir, false, &mut found);
+    found
+}
+
+/// Wait for `data_dir` to hold exactly `expected` snapshot directories; reclamation
+/// runs after a grace.
+async fn wait_for_snapshot_dirs(data_dir: &Path, expected: usize) -> Result<BTreeSet<PathBuf>> {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut seen = BTreeSet::new();
+    while Instant::now() < deadline {
+        seen = snapshot_dirs_under(data_dir);
+        if seen.len() == expected {
+            return Ok(seen);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow!(
+        "the copy under {} should hold {expected} snapshot directories, holds {}: {seen:?}",
+        data_dir.display(),
+        seen.len()
+    ))
+}
+
+fn csv_with_rows(rows: usize) -> String {
+    use std::fmt::Write as _;
+    let mut csv = String::from("id,name\n");
+    for id in 1..=rows {
+        writeln!(csv, "{id},row{id}").expect("writing to a String cannot fail");
+    }
+    csv
+}
+
+async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let modules_csv = dir.path().join("modules.csv");
+    std::fs::write(&modules_csv, csv_with_rows(3))?;
+    // Files, not inlined rows: an inlined snapshot has no directory to reclaim.
+    let mut writer_modules = writer_dataset(modules, &modules_csv, "cayenne", dir.path());
+    if let Some(acceleration) = writer_modules.acceleration.as_mut() {
+        let mut params = acceleration
+            .params
+            .as_ref()
+            .map(Params::as_string_map)
+            .unwrap_or_default();
+        params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
+        acceleration.params = Some(Params::from_string_map(params));
+    }
+    let writer = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_reclaim_writer")
+                    .with_snapshots(writer_snapshots(rustfs, &prefix))
+                    .with_dataset(writer_modules)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&writer).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 0).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+
+    let data_dir = dir.path().join("reader").join(modules);
+    let metadata_dir = dir.path().join("reader").join("metadata");
+    let reader_app = || {
+        AppBuilder::new("snapshot_source_reclaim_reader")
+            .with_dataset(reader_dataset_at(
+                rustfs,
+                modules,
+                &prefix,
+                &data_dir,
+                &metadata_dir,
+            ))
+            .build()
+    };
+    let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
+    load(&reader).await?;
+    wait_for_rows(&reader, modules, 3).await?;
+    let mut served = wait_for_snapshot_dirs(&data_dir, 1).await?;
+
+    // Each reload supersedes the previous directory; only the served one remains.
+    for round in 1..=5 {
+        let rows_now = 3 + round;
+        std::fs::write(&modules_csv, csv_with_rows(rows_now))?;
+        wait_for_rows(&writer, modules, rows_now).await?;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            replicate_snapshots(rustfs, &prefix).await?;
+            if rows(&reader, modules).await?.len() == rows_now {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "reload {round}: the reader should follow the writer to {rows_now} rows"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let now_served = wait_for_snapshot_dirs(&data_dir, 1)
+            .await
+            .with_context(|| {
+                format!("reload {round} should reclaim the superseded snapshot directory")
+            })?;
+        ensure!(
+            now_served != served,
+            "reload {round} should serve a new snapshot directory, serves {now_served:?}"
+        );
+        served = now_served;
+    }
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
+
+    // A restart reclaims directories an earlier process leaked.
+    reader.shutdown().await;
+    let table_dir = served
+        .iter()
+        .next()
+        .and_then(|dir| dir.parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("the served snapshot directory has a table root"))?;
+    for _ in 0..3 {
+        let leaked = table_dir.join(uuid::Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&leaked)?;
+        std::fs::write(leaked.join("stale.vortex"), b"stale")?;
+    }
+    ensure!(
+        snapshot_dirs_under(&data_dir).len() == 4,
+        "precondition: three leaked directories beside the served one"
+    );
+    let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
+    load(&reader).await?;
+    wait_for_rows(&reader, modules, 8).await?;
+    let after_restart = wait_for_snapshot_dirs(&data_dir, 1)
+        .await
+        .context("a restart should reclaim the directories an earlier process left")?;
+    assert_eq!(
+        after_restart, served,
+        "the served snapshot directory is kept"
+    );
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
 
     reader.shutdown().await;
     writer.shutdown().await;
@@ -1295,6 +1499,195 @@ async fn other_engine_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()
     );
 
     load.abort();
+    reader.shutdown().await;
+    Ok(())
+}
+
+const METRICS: &str = "spice_test_rustfs_snapshot_source_metrics";
+const REFRESH_ERRORS: &str = "dataset_acceleration_refresh_errors";
+const FETCHES_SKIPPED: &str = "dataset_acceleration_refresh_data_fetches_skipped";
+const REFRESH_DURATION: &str = "dataset_acceleration_refresh_duration_ms";
+
+/// Waits for `metric` over `labels` to reach `at_least`.
+async fn wait_for_metric(
+    metric: &str,
+    labels: &[(&str, &str)],
+    at_least: f64,
+    deadline: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut value = metric_value(&PROMETHEUS, metric, labels);
+    while value < at_least {
+        if started.elapsed() >= deadline {
+            return Err(anyhow!(
+                "{metric}{labels:?} should reach {at_least} within {deadline:?}, is {value}; all series: {:?}",
+                metric_series(&PROMETHEUS, metric, &[])
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        value = metric_value(&PROMETHEUS, metric, labels);
+    }
+    Ok(())
+}
+
+/// The count of `metric` over `labels`.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn count(metric: &str, labels: &[(&str, &str)]) -> u64 {
+    metric_value(&PROMETHEUS, metric, labels) as u64
+}
+
+/// Waits for one more skipped fetch: a poll that found the loaded snapshot published.
+async fn wait_for_a_skipped_fetch(labels: &[(&str, &str)], deadline: Duration) -> Result<()> {
+    let before = metric_value(&PROMETHEUS, FETCHES_SKIPPED, labels);
+    wait_for_metric(FETCHES_SKIPPED, labels, before + 1.0, deadline).await
+}
+
+/// `modules` still serves the 5 rows of the loaded snapshot and is `Ready`.
+async fn assert_serving_loaded_snapshot(
+    reader: &Arc<Runtime>,
+    table: &datafusion::common::TableReference,
+    modules: &str,
+) -> Result<()> {
+    assert_eq!(
+        rows(reader, modules).await?.len(),
+        5,
+        "keeps serving the loaded snapshot"
+    );
+    assert_eq!(
+        reader.status().get_dataset_status(table),
+        Some(ComponentStatus::Ready)
+    );
+    Ok(())
+}
+
+/// A reader that cannot advance to the published snapshot counts each failed poll on
+/// `dataset_acceleration_refresh_errors` with a reason, under `mode="snapshot"`, and
+/// keeps serving the loaded snapshot; a poll that finds nothing newer is still a skipped
+/// fetch (#15294, #15295).
+#[tokio::test]
+async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    LazyLock::force(&PROMETHEUS);
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(METRICS).await?;
+            let result = metrics_scenario(rustfs, &container, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+#[expect(clippy::float_cmp)] // counters are whole numbers
+async fn metrics_scenario(
+    rustfs: Rustfs,
+    container: &RunningContainer,
+    modules: &str,
+) -> Result<()> {
+    let snapshot_mode = [("dataset", modules), ("mode", "snapshot")];
+    let with_reason = |reason| [snapshot_mode[0], snapshot_mode[1], ("reason", reason)];
+    let not_found = with_reason("snapshot_not_found");
+    let older = with_reason("snapshot_older_than_loaded");
+    let other = with_reason("other");
+    let errors = |labels: &[(&str, &str)]| count(REFRESH_ERRORS, labels);
+
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let table = datafusion::common::TableReference::bare(modules);
+    let writer = publish_and_replicate(rustfs, &prefix, modules, dir.path()).await?;
+
+    // So an unreachable store fails a poll within the test.
+    let mut dataset = reader_dataset(rustfs, modules, &prefix);
+    let mut params = s3_params(rustfs);
+    params.insert("file_format".to_string(), "snapshot".to_string());
+    params.insert("client_timeout".to_string(), "2s".to_string());
+    dataset.params = Some(Params::from_string_map(params));
+    let reader = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_metrics_reader")
+                    .with_dataset(dataset)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&reader).await?;
+    assert_eq!(rows(&reader, modules).await?.len(), 3);
+
+    // Load a second snapshot, so a rollback to snapshot 0 is older than the loaded one.
+    std::fs::write(dir.path().join("modules.csv"), GROWN_CSV)?;
+    wait_for_rows(&writer, modules, 5).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 1).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+    wait_for_rows(&reader, modules, 5).await?;
+    writer.shutdown().await;
+    // Polls that find nothing newer are skipped fetches.
+    wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
+    assert_eq!(errors(&[("dataset", modules)]), 0);
+
+    // The location is deleted.
+    let reader_bucket = bucket_store(rustfs, READER_BUCKET)?;
+    let metadata_key = ObjectPath::from(format!("{prefix}/metadata.json"));
+    let metadata = reader_bucket.get(&metadata_key).await?.bytes().await?;
+    reader_bucket.delete(&metadata_key).await?;
+    wait_for_metric(REFRESH_ERRORS, &not_found, 1.0, Duration::from_secs(30)).await?;
+    let skipped_at_first_error = count(FETCHES_SKIPPED, &snapshot_mode);
+    wait_for_metric(REFRESH_ERRORS, &not_found, 3.0, Duration::from_secs(30)).await?;
+    assert_eq!(
+        count(FETCHES_SKIPPED, &snapshot_mode),
+        skipped_at_first_error,
+        "a poll that finds no snapshot is a failed refresh, not a skipped fetch"
+    );
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+
+    // The location is recreated and the writer's ids restart.
+    let mut rolled_back: serde_json::Value = serde_json::from_slice(&metadata)?;
+    rolled_back[modules]["current-snapshot-id"] = serde_json::json!(0);
+    reader_bucket
+        .put(&metadata_key, serde_json::to_vec(&rolled_back)?.into())
+        .await?;
+    wait_for_metric(REFRESH_ERRORS, &older, 2.0, Duration::from_secs(30)).await?;
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+
+    // The current snapshot is published again.
+    reader_bucket.put(&metadata_key, metadata.into()).await?;
+    wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_secs(30)).await?;
+    let not_found_count = errors(&not_found);
+    let older_count = errors(&older);
+
+    // The store is unreachable. The client retries each read ten times and the metadata
+    // read retries that three times, so the failure surfaces after about 100 s.
+    assert_eq!(errors(&other), 0);
+    container.pause().await?;
+    let unreachable = wait_for_metric(REFRESH_ERRORS, &other, 1.0, Duration::from_mins(3)).await;
+    container.unpause().await?;
+    unreachable?;
+    // Reachable again.
+    wait_for_a_skipped_fetch(&snapshot_mode, Duration::from_mins(2)).await?;
+    assert_serving_loaded_snapshot(&reader, &table, modules).await?;
+    assert_eq!(errors(&not_found), not_found_count);
+    assert_eq!(errors(&older), older_count);
+
+    // No refresh series of the dataset is without a mode (the writer's carry `full`).
+    assert!(
+        metric_value(&PROMETHEUS, REFRESH_DURATION, &snapshot_mode) >= 1.0,
+        "{REFRESH_DURATION} series: {:?}",
+        metric_series(&PROMETHEUS, REFRESH_DURATION, &[("dataset", modules)])
+    );
+    for metric in [REFRESH_ERRORS, FETCHES_SKIPPED, REFRESH_DURATION] {
+        let without_mode: Vec<_> = metric_series(&PROMETHEUS, metric, &[("dataset", modules)])
+            .into_iter()
+            .filter(|(labels, _)| !labels.iter().any(|(name, _)| name == "mode"))
+            .collect();
+        assert!(
+            without_mode.is_empty(),
+            "{metric} series without a mode: {without_mode:?}"
+        );
+    }
+
     reader.shutdown().await;
     Ok(())
 }

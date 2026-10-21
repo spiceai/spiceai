@@ -72,7 +72,7 @@ fn is_advisory(name: &str) -> bool {
 /// `emit` mirrors this same classification.
 fn is_gating_failure(result: &AnalyticalQueryResult) -> bool {
     match &result.outcome {
-        Outcome::Pass => false,
+        Outcome::Pass | Outcome::Vacuous => false,
         Outcome::Divergence(_) if is_advisory(&result.name) => false,
         _ => true,
     }
@@ -82,6 +82,12 @@ fn is_gating_failure(result: &AnalyticalQueryResult) -> bool {
 #[derive(Debug)]
 pub enum Outcome {
     Pass,
+    /// The source and Spice both returned no rows. The two answers agree, but
+    /// about nothing: the query compared no values, so it is reported apart from
+    /// the queries that matched and is never counted as one. Non-gating on its
+    /// own; a gate in which every query is vacuous fails (see
+    /// [`AnalyticalReport::compared_nothing`]).
+    Vacuous,
     /// Value/row mismatch vs the source: numeric drift over tolerance, or a
     /// row-set / `NoAnswer` divergence from the validator. Advisory-eligible
     /// (see [`ADVISORY_QUERIES`]) because an FP-summation-order artifact on an
@@ -98,6 +104,7 @@ impl Outcome {
     fn label(&self) -> &'static str {
         match self {
             Outcome::Pass => "PASS",
+            Outcome::Vacuous => "VACUOUS",
             Outcome::Divergence(_) => "DIVERGE",
             Outcome::Fail(_) => "FAIL",
             Outcome::SourceError(_) => "PG_ERROR",
@@ -108,6 +115,7 @@ impl Outcome {
     fn detail(&self) -> Option<&str> {
         match self {
             Outcome::Pass => None,
+            Outcome::Vacuous => Some("no rows from the source or Spice, so nothing was compared"),
             Outcome::Divergence(m)
             | Outcome::Fail(m)
             | Outcome::SourceError(m)
@@ -131,14 +139,92 @@ pub struct AnalyticalReport {
     pub results: Vec<AnalyticalQueryResult>,
 }
 
+/// How many queries landed in each category of the gate. Vacuous queries are
+/// counted apart from matches: an empty answer on both sides compares nothing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    passed: u64,
+    vacuous: u64,
+    advisory: u64,
+    failed: u64,
+}
+
 impl AnalyticalReport {
+    fn tally(&self) -> Tally {
+        let mut tally = Tally::default();
+        for r in &self.results {
+            match &r.outcome {
+                Outcome::Pass => tally.passed += 1,
+                Outcome::Vacuous => tally.vacuous += 1,
+                // Only a value/row *divergence* on an advisory query is
+                // non-gating; harness/execution errors still gate so a real
+                // regression on q15 is not silently hidden.
+                Outcome::Divergence(_) if is_advisory(&r.name) => tally.advisory += 1,
+                _ => tally.failed += 1,
+            }
+        }
+        tally
+    }
+
+    /// Whether the gate compared no values at all: every query returned no rows
+    /// on both the source and Spice. Agreement about nothing is not a pass.
+    fn compared_nothing(&self) -> bool {
+        let Tally {
+            passed,
+            vacuous,
+            advisory,
+            failed,
+        } = self.tally();
+        vacuous > 0 && passed == 0 && advisory == 0 && failed == 0
+    }
+
+    /// The gate's verdict line, as [`Self::emit`] prints it.
+    fn verdict_line(&self) -> String {
+        let Tally {
+            passed,
+            vacuous,
+            advisory,
+            failed,
+        } = self.tally();
+        let total = passed + vacuous + advisory + failed;
+        if failed > 0 {
+            return format!("verdict: FAILED — {failed}/{total} queries diverged");
+        }
+        if self.compared_nothing() {
+            return format!(
+                "verdict: FAILED — no query compared any rows: all {total} returned no rows from the source or Spice"
+            );
+        }
+        let mut notes = Vec::new();
+        if vacuous > 0 {
+            let names: Vec<&str> = self
+                .results
+                .iter()
+                .filter(|r| matches!(r.outcome, Outcome::Vacuous))
+                .map(|r| r.name.as_str())
+                .collect();
+            notes.push(format!(
+                "{vacuous} vacuous, no rows on either side: {}",
+                names.join(", ")
+            ));
+        }
+        if advisory > 0 {
+            notes.push(format!("{advisory} advisory, non-gating"));
+        }
+        if notes.is_empty() {
+            format!("verdict: PASSED — {passed}/{total} queries match")
+        } else {
+            format!(
+                "verdict: PASSED — {passed}/{total} queries match ({})",
+                notes.join("; ")
+            )
+        }
+    }
+
     pub fn emit(&self) {
         println!("\nAnalytical Query Correctness");
         println!("  {:<14} {:>12} {:>10}", "query", "outcome", "max Δ%");
 
-        let mut passed: u64 = 0;
-        let mut failed: u64 = 0;
-        let mut advisory: u64 = 0;
         for r in &self.results {
             let delta = r
                 .max_rel_delta
@@ -147,43 +233,25 @@ impl AnalyticalReport {
             if let Some(detail) = r.outcome.detail() {
                 println!("    └─ {detail}");
             }
-            match &r.outcome {
-                Outcome::Pass => passed += 1,
-                // Only a value/row *divergence* on an advisory query is
-                // non-gating; harness/execution errors still gate so a real
-                // regression on q15 is not silently hidden.
-                Outcome::Divergence(_) if is_advisory(&r.name) => {
-                    advisory += 1;
-                    println!(
-                        "       (advisory — floating-point summation-order artifact, not gated; see https://github.com/spiceai/spiceai/issues/11212)"
-                    );
-                }
-                _ => failed += 1,
-            }
-        }
-
-        let total = passed + failed + advisory;
-        if failed == 0 {
-            if advisory == 0 {
-                println!("  verdict: PASSED — {passed}/{total} queries match");
-            } else {
+            if matches!(r.outcome, Outcome::Divergence(_)) && is_advisory(&r.name) {
                 println!(
-                    "  verdict: PASSED — {passed}/{total} queries match ({advisory} advisory, non-gating)"
+                    "       (advisory — floating-point summation-order artifact, not gated; see https://github.com/spiceai/spiceai/issues/11212)"
                 );
             }
-        } else {
-            println!("  verdict: FAILED — {failed}/{total} queries diverged");
         }
+
+        println!("  {}", self.verdict_line());
     }
 
-    /// Returns a single joined failure summary, or `None` if every query passed.
+    /// Returns a single joined failure summary, or `None` if the gate passed: no
+    /// query failed and at least one query compared rows.
     pub fn failure_message(&self) -> Option<String> {
         let problems: Vec<String> = self
             .results
             .iter()
             .filter(|r| is_gating_failure(r))
             .map(|r| match &r.outcome {
-                Outcome::Pass => unreachable!(),
+                Outcome::Pass | Outcome::Vacuous => unreachable!(),
                 Outcome::Divergence(m) => format!("{} divergence: {m}", r.name),
                 Outcome::Fail(m) => format!("{} error: {m}", r.name),
                 Outcome::SourceError(m) => format!("{} source error: {m}", r.name),
@@ -192,6 +260,12 @@ impl AnalyticalReport {
             .collect();
 
         if problems.is_empty() {
+            if self.compared_nothing() {
+                return Some(format!(
+                    "HTAP analytical-query gate compared nothing: all {} queries returned no rows from the source or Spice",
+                    self.results.len()
+                ));
+            }
             None
         } else {
             Some(format!(
@@ -384,120 +458,129 @@ async fn evaluate_query(
         }
     };
 
-    let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
-        && total_rows(&actual_sorted) == 0
-    {
-        (Outcome::Pass, None)
-    } else {
-        match validate_with_expected_batches(query.name.as_ref(), &actual_sorted, &expected_sorted)
-        {
-            Ok(QueryValidationResult::Pass) => {
-                // Structure, schema and row set agree within the string
-                // comparator's tolerance. Now apply the tight, type-aware
-                // numeric check (exact for integer/decimal, 0.1% for
-                // float — including avg() that alignment cast to decimal)
-                // and surface the magnitude either way.
-                match (expected_sorted.first(), actual_sorted.first()) {
-                    (Some(e0), Some(a0)) => {
-                        let delta = compare::numeric_delta(e0, a0, &approximate_cols);
-                        if delta.exceeded {
-                            if let Some(row) = delta.worst_row {
-                                let column = delta
-                                    .worst_col
-                                    .and_then(|c| e0.schema().fields().get(c).cloned())
-                                    .map(|f| f.name().clone());
-                                print_mismatch_context(
-                                    query.name.as_ref(),
-                                    e0,
-                                    a0,
-                                    row,
-                                    column.as_deref(),
-                                );
-                            }
-                            (
-                                Outcome::Divergence(format!(
-                                    "numeric drift exceeds tolerance — {}",
-                                    delta.worst.as_deref().unwrap_or("(unknown cell)")
-                                )),
-                                Some(delta.max_rel_delta),
-                            )
-                        } else {
-                            (Outcome::Pass, Some(delta.max_rel_delta))
-                        }
-                    }
-                    _ => (Outcome::Pass, None),
-                }
-            }
-            Ok(QueryValidationResult::Fail(reason)) => {
-                // Print the surrounding rows from both sides so a divergence
-                // can be inspected in context rather than as a lone cell. A
-                // `DataMismatch` carries the exact 1-based row and column of
-                // the first disagreement; a count-type divergence (differing
-                // row counts, or one engine returning no rows at all) has no
-                // single cell, so center the window on the boundary where the
-                // shorter (lex-sorted) side ends. `context_pair` synthesizes
-                // an empty batch from the present side's schema when one side
-                // has no batches, so a "source has rows, Spice has none" (or
-                // vice-versa) divergence still shows the rows that *are*
-                // there. `SchemaMismatch` has no comparable rows to show.
-                if let Some((e0, a0)) = context_pair(&expected_sorted, &actual_sorted) {
-                    match &reason {
-                        QueryValidationFailReason::DataMismatch {
-                            row_number, column, ..
-                        } => print_mismatch_context(
-                            query.name.as_ref(),
-                            &e0,
-                            &a0,
-                            row_number.saturating_sub(1),
-                            Some(column),
-                        ),
-                        QueryValidationFailReason::RowCountMismatch { .. }
-                        | QueryValidationFailReason::NoAnswer
-                        | QueryValidationFailReason::NoExpectedAnswer
-                        | QueryValidationFailReason::NoExpectedAnswerAtScaleFactor => {
-                            print_mismatch_context(
-                                query.name.as_ref(),
-                                &e0,
-                                &a0,
-                                e0.num_rows().min(a0.num_rows()),
-                                None,
-                            );
-                        }
-                        // A sort-order violation names the row that sorts before
-                        // its predecessor and the key column it broke, so the same
-                        // windowed context reads the way a `DataMismatch` does.
-                        QueryValidationFailReason::SortOrderViolation { violation, .. } => {
-                            print_mismatch_context(
-                                query.name.as_ref(),
-                                &e0,
-                                &a0,
-                                violation.row_number.saturating_sub(1),
-                                Some(&violation.column),
-                            );
-                        }
-                        QueryValidationFailReason::SchemaMismatch
-                        | QueryValidationFailReason::ColumnLengthMismatch { .. }
-                        | QueryValidationFailReason::RowNotAllowedByLimit { .. }
-                        | QueryValidationFailReason::RowOutOfSortOrder { .. } => {}
-                    }
-                }
-                (
-                    Outcome::Divergence(format!(
-                        "{reason:?} (source rows={}, spice rows={})",
-                        total_rows(&expected_sorted),
-                        total_rows(&actual_sorted),
-                    )),
-                    None,
-                )
-            }
-            Err(e) => (Outcome::Fail(e.to_string()), None),
-        }
-    };
+    let (outcome, max_rel_delta) = compare_sorted(
+        query.name.as_ref(),
+        &expected_sorted,
+        &actual_sorted,
+        &approximate_cols,
+    );
 
     AnalyticalQueryResult {
         name,
         outcome,
         max_rel_delta,
+    }
+}
+
+/// Compare a query's aligned and sorted source (`expected_sorted`) and Spice
+/// (`actual_sorted`) result sets. Two empty answers are [`Outcome::Vacuous`],
+/// never a match: they agree about nothing. Otherwise the row set must pass
+/// `validate_with_expected_batches` and then the type-aware numeric check; a
+/// divergence prints the surrounding rows from both sides.
+fn compare_sorted(
+    name: &str,
+    expected_sorted: &[RecordBatch],
+    actual_sorted: &[RecordBatch],
+    approximate_cols: &[bool],
+) -> (Outcome, Option<f64>) {
+    if total_rows(expected_sorted) == 0 && total_rows(actual_sorted) == 0 {
+        return (Outcome::Vacuous, None);
+    }
+    match validate_with_expected_batches(name, actual_sorted, expected_sorted) {
+        Ok(QueryValidationResult::Pass) => {
+            // Structure, schema and row set agree within the string
+            // comparator's tolerance. Now apply the tight, type-aware
+            // numeric check (exact for integer/decimal, 0.1% for
+            // float — including avg() that alignment cast to decimal)
+            // and surface the magnitude either way.
+            match (expected_sorted.first(), actual_sorted.first()) {
+                (Some(e0), Some(a0)) => {
+                    let delta = compare::numeric_delta(e0, a0, approximate_cols);
+                    if delta.exceeded {
+                        if let Some(row) = delta.worst_row {
+                            let column = delta
+                                .worst_col
+                                .and_then(|c| e0.schema().fields().get(c).cloned())
+                                .map(|f| f.name().clone());
+                            print_mismatch_context(name, e0, a0, row, column.as_deref());
+                        }
+                        (
+                            Outcome::Divergence(format!(
+                                "numeric drift exceeds tolerance — {}",
+                                delta.worst.as_deref().unwrap_or("(unknown cell)")
+                            )),
+                            Some(delta.max_rel_delta),
+                        )
+                    } else {
+                        (Outcome::Pass, Some(delta.max_rel_delta))
+                    }
+                }
+                _ => (Outcome::Pass, None),
+            }
+        }
+        Ok(QueryValidationResult::Fail(reason)) => {
+            // Print the surrounding rows from both sides so a divergence
+            // can be inspected in context rather than as a lone cell. A
+            // `DataMismatch` carries the exact 1-based row and column of
+            // the first disagreement; a count-type divergence (differing
+            // row counts, or one engine returning no rows at all) has no
+            // single cell, so center the window on the boundary where the
+            // shorter (lex-sorted) side ends. `context_pair` synthesizes
+            // an empty batch from the present side's schema when one side
+            // has no batches, so a "source has rows, Spice has none" (or
+            // vice-versa) divergence still shows the rows that *are*
+            // there. `SchemaMismatch` has no comparable rows to show.
+            if let Some((e0, a0)) = context_pair(expected_sorted, actual_sorted) {
+                match &reason {
+                    QueryValidationFailReason::DataMismatch {
+                        row_number, column, ..
+                    } => print_mismatch_context(
+                        name,
+                        &e0,
+                        &a0,
+                        row_number.saturating_sub(1),
+                        Some(column),
+                    ),
+                    QueryValidationFailReason::RowCountMismatch { .. }
+                    | QueryValidationFailReason::NoAnswer
+                    | QueryValidationFailReason::NoExpectedAnswer
+                    | QueryValidationFailReason::NoExpectedAnswerAtScaleFactor => {
+                        print_mismatch_context(
+                            name,
+                            &e0,
+                            &a0,
+                            e0.num_rows().min(a0.num_rows()),
+                            None,
+                        );
+                    }
+                    // A sort-order violation names the row that sorts before
+                    // its predecessor and the key column it broke, so the same
+                    // windowed context reads the way a `DataMismatch` does.
+                    QueryValidationFailReason::SortOrderViolation { violation, .. } => {
+                        print_mismatch_context(
+                            name,
+                            &e0,
+                            &a0,
+                            violation.row_number.saturating_sub(1),
+                            Some(&violation.column),
+                        );
+                    }
+                    QueryValidationFailReason::SchemaMismatch
+                    | QueryValidationFailReason::ColumnLengthMismatch { .. }
+                    | QueryValidationFailReason::RowNotAllowedByLimit { .. }
+                    | QueryValidationFailReason::RowOutOfSortOrder { .. } => {}
+                }
+            }
+            (
+                Outcome::Divergence(format!(
+                    "{reason:?} (source rows={}, spice rows={})",
+                    total_rows(expected_sorted),
+                    total_rows(actual_sorted),
+                )),
+                None,
+            )
+        }
+        Err(e) => (Outcome::Fail(e.to_string()), None),
     }
 }
 
@@ -598,7 +681,7 @@ fn sort_all_columns(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>>
 /// a zero-row batch cloned from the present side's schema, so a "one side has
 /// rows, the other has none" divergence still shows the rows that *are* there
 /// (the empty side renders as `<no rows in window>`). `None` only when both
-/// sides are empty, which the caller already treats as a pass.
+/// sides are empty, which the caller reports as [`Outcome::Vacuous`].
 fn context_pair(
     expected: &[RecordBatch],
     actual: &[RecordBatch],
@@ -696,6 +779,7 @@ fn print_windowed_table(batch: &RecordBatch, lo: usize, hi: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::printed_by;
     use arrow::array::StringArray;
 
     fn result(name: &str, outcome: Outcome) -> AnalyticalQueryResult {
@@ -772,6 +856,98 @@ mod tests {
         assert!(msg.contains("chbench_q15"));
     }
 
+    #[test]
+    fn both_sides_empty_is_vacuous_not_a_match() {
+        // An engine that returns zero rows yields no batches at all; a zero-row
+        // batch is the other shape an empty answer can take. Either way, two
+        // empty answers compare nothing, so they must not count as a match.
+        let empty = RecordBatch::new_empty(ctx_batch().schema());
+        for (expected, actual) in [(vec![], vec![]), (vec![empty.clone()], vec![empty])] {
+            let (outcome, max_rel_delta) =
+                compare_sorted("chbench_q22", &expected, &actual, &[false, false]);
+            assert!(
+                matches!(outcome, Outcome::Vacuous),
+                "expected Vacuous, got {outcome:?}"
+            );
+            assert_eq!(max_rel_delta, None);
+        }
+    }
+
+    #[test]
+    fn one_empty_side_is_a_divergence_not_vacuous() {
+        let rows = ctx_batch();
+        let (outcome, max_rel_delta) = compare_sorted("chbench_q22", &[rows], &[], &[false, false]);
+        match outcome {
+            Outcome::Divergence(m) => assert_eq!(m, "NoAnswer (source rows=5, spice rows=0)"),
+            other => panic!("expected a NoAnswer divergence, got {other:?}"),
+        }
+        assert_eq!(max_rel_delta, None);
+    }
+
+    #[test]
+    fn identical_rows_match_with_zero_delta() {
+        let rows = ctx_batch();
+        let side = std::slice::from_ref(&rows);
+        let (outcome, max_rel_delta) = compare_sorted("chbench_q1", side, side, &[false, false]);
+        assert!(
+            matches!(outcome, Outcome::Pass),
+            "expected Pass, got {outcome:?}"
+        );
+        assert_eq!(max_rel_delta, Some(0.0));
+    }
+
+    #[test]
+    fn verdict_counts_vacuous_queries_apart_from_matches() {
+        let report = AnalyticalReport {
+            results: vec![
+                result("chbench_q1", Outcome::Pass),
+                result("chbench_q11", Outcome::Vacuous),
+                result(
+                    "chbench_q15",
+                    Outcome::Divergence("NoAnswer (source rows=1, spice rows=0)".to_string()),
+                ),
+                result("chbench_q22", Outcome::Vacuous),
+            ],
+        };
+        assert_eq!(
+            report.verdict_line(),
+            "verdict: PASSED — 1/4 queries match (2 vacuous, no rows on either side: chbench_q11, chbench_q22; 1 advisory, non-gating)"
+        );
+        assert_eq!(report.failure_message(), None);
+    }
+
+    #[test]
+    fn verdict_without_vacuous_or_advisory_queries_is_unchanged() {
+        let report = AnalyticalReport {
+            results: vec![
+                result("chbench_q1", Outcome::Pass),
+                result("chbench_q2", Outcome::Pass),
+            ],
+        };
+        assert_eq!(report.verdict_line(), "verdict: PASSED — 2/2 queries match");
+        assert_eq!(report.failure_message(), None);
+    }
+
+    #[test]
+    fn a_gate_that_compared_nothing_fails() {
+        let report = AnalyticalReport {
+            results: vec![
+                result("chbench_q11", Outcome::Vacuous),
+                result("chbench_q22", Outcome::Vacuous),
+            ],
+        };
+        assert_eq!(
+            report.verdict_line(),
+            "verdict: FAILED — no query compared any rows: all 2 returned no rows from the source or Spice"
+        );
+        assert_eq!(
+            report.failure_message().as_deref(),
+            Some(
+                "HTAP analytical-query gate compared nothing: all 2 queries returned no rows from the source or Spice"
+            )
+        );
+    }
+
     fn ctx_batch() -> RecordBatch {
         let ids: ArrayRef = Arc::new(Int64Array::from((0..5).collect::<Vec<_>>()));
         let cities: ArrayRef = Arc::new(StringArray::from(vec![
@@ -791,39 +967,129 @@ mod tests {
         .expect("valid batch")
     }
 
+    /// The window `print_windowed_table` renders for all five rows of
+    /// `ctx_batch()`, absolute row index first.
+    const FIVE_ROW_TABLE: &str = concat!(
+        "      +-----+----+---------+\n",
+        "      | row | id | city    |\n",
+        "      +-----+----+---------+\n",
+        "      | 0   | 0  | Berlin  |\n",
+        "      | 1   | 1  |         |\n",
+        "      | 2   | 2  | Munich  |\n",
+        "      | 3   | 3  | Hamburg |\n",
+        "      | 4   | 4  | Cologne |\n",
+        "      +-----+----+---------+\n",
+    );
+
+    /// The window for the first two rows of `ctx_batch()`.
+    const TWO_ROW_TABLE: &str = concat!(
+        "      +-----+----+--------+\n",
+        "      | row | id | city   |\n",
+        "      +-----+----+--------+\n",
+        "      | 0   | 0  | Berlin |\n",
+        "      | 1   | 1  |        |\n",
+        "      +-----+----+--------+\n",
+    );
+
+    const REFERENCE_LABEL: &str = "    reference (source of truth, Postgres):\n";
+    const SPICE_LABEL: &str = "    spice (Spice):\n";
+
     #[test]
     fn mismatch_context_clamps_window_to_bounds() {
-        // Must not panic when the mismatch sits at row 0 (lo underflow) or beyond
-        // the end; the window is clamped to the rows present.
-        let batch = ctx_batch();
-        print_mismatch_context("chbench_q10", &batch, &batch, 0, Some("city"));
-        print_mismatch_context("chbench_q10", &batch, &batch, 999, Some("city"));
-        // Empty batches print nothing rather than underflowing `total - 1`.
-        let empty = RecordBatch::new_empty(batch.schema());
-        print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
+        // A mismatch at row 0 (lo would underflow) and one far past the end both
+        // clamp to the five rows present; an empty pair prints nothing rather
+        // than underflowing `total - 1`.
+        let printed = printed_by(
+            concat!(module_path!(), "::mismatch_context_clamps_window_to_bounds"),
+            || {
+                let batch = ctx_batch();
+                print_mismatch_context("chbench_q10", &batch, &batch, 0, Some("city"));
+                print_mismatch_context("chbench_q10", &batch, &batch, 999, Some("city"));
+                println!("-- empty pair --");
+                let empty = RecordBatch::new_empty(batch.schema());
+                print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
+            },
+        );
+        let expected = [
+            "    ── chbench_q10 mismatch context: rows 0..=4 of 5 (0-based, lex-sorted), mismatch at row 0, diverging column 'city' ──\n",
+            REFERENCE_LABEL,
+            FIVE_ROW_TABLE,
+            SPICE_LABEL,
+            FIVE_ROW_TABLE,
+            "    ── chbench_q10 mismatch context: rows 0..=4 of 5 (0-based, lex-sorted), mismatch at row 4, diverging column 'city' ──\n",
+            REFERENCE_LABEL,
+            FIVE_ROW_TABLE,
+            SPICE_LABEL,
+            FIVE_ROW_TABLE,
+            "-- empty pair --\n",
+        ]
+        .concat();
+        assert_eq!(printed, expected);
     }
 
     #[test]
     fn mismatch_context_handles_row_count_divergence() {
         // The RowCountMismatch path centers on min(expected, actual) rows, which
-        // sits at (or past) the shorter side's end — must not panic and must
-        // clamp each side to its own length.
-        let full = ctx_batch(); // 5 rows
-        let short = full.slice(0, 2); // 2 rows
-        let boundary = full.num_rows().min(short.num_rows()); // 2
-        print_mismatch_context("chbench_q10", &full, &short, boundary, None);
-        print_mismatch_context("chbench_q10", &short, &full, boundary, None);
+        // sits at (or past) the shorter side's end: the window spans the longer
+        // side, and each side prints only the rows it has.
+        let printed = printed_by(
+            concat!(
+                module_path!(),
+                "::mismatch_context_handles_row_count_divergence"
+            ),
+            || {
+                let full = ctx_batch(); // 5 rows
+                let short = full.slice(0, 2); // 2 rows
+                let boundary = full.num_rows().min(short.num_rows()); // 2
+                print_mismatch_context("chbench_q10", &full, &short, boundary, None);
+                print_mismatch_context("chbench_q10", &short, &full, boundary, None);
+            },
+        );
+        let header = "    ── chbench_q10 mismatch context: rows 0..=4 of 5 (0-based, lex-sorted), mismatch at row 2 ──\n";
+        let expected = [
+            header,
+            REFERENCE_LABEL,
+            FIVE_ROW_TABLE,
+            SPICE_LABEL,
+            TWO_ROW_TABLE,
+            header,
+            REFERENCE_LABEL,
+            TWO_ROW_TABLE,
+            SPICE_LABEL,
+            FIVE_ROW_TABLE,
+        ]
+        .concat();
+        assert_eq!(printed, expected);
     }
 
     #[test]
     fn windowed_table_handles_unequal_side_lengths() {
-        // The shorter side of a row-count divergence must not panic: a window
-        // past its end prints "<no rows in window>", a partial window is clamped.
-        let full = ctx_batch(); // 5 rows
-        let short = full.slice(0, 2); // 2 rows
-        print_windowed_table(&full, 0, 4);
-        print_windowed_table(&short, 0, 4); // hi clamped to row 1
-        print_windowed_table(&short, 3, 4); // lo past end → no rows
+        // The shorter side of a row-count divergence: a partial window is clamped
+        // to its last row, and a window past its end prints "<no rows in window>".
+        let printed = printed_by(
+            concat!(
+                module_path!(),
+                "::windowed_table_handles_unequal_side_lengths"
+            ),
+            || {
+                let full = ctx_batch(); // 5 rows
+                let short = full.slice(0, 2); // 2 rows
+                print_windowed_table(&full, 0, 4);
+                println!("-- short, 0..=4 --");
+                print_windowed_table(&short, 0, 4);
+                println!("-- short, 3..=4 --");
+                print_windowed_table(&short, 3, 4);
+            },
+        );
+        let expected = [
+            FIVE_ROW_TABLE,
+            "-- short, 0..=4 --\n",
+            TWO_ROW_TABLE,
+            "-- short, 3..=4 --\n",
+            "      <no rows in window>\n",
+        ]
+        .concat();
+        assert_eq!(printed, expected);
     }
 
     #[test]

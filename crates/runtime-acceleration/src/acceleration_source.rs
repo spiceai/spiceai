@@ -126,6 +126,28 @@ pub trait AccelerationSource: Send + Sync {
     ) -> crate::dataset_checkpoint::DatasetCheckpointerFactory;
 }
 
+/// Whether `source`'s existing acceleration is rebuilt from the source when its stored
+/// table was built with settings it cannot adopt in place, rather than kept with the
+/// settings it was built with.
+///
+/// [`Acceleration::rebuilds_on_settings_change`] for the mode `source` actually runs
+/// with, except for a `sink:` dataset: its rows arrive only by writes to the
+/// acceleration, so whatever its refresh mode, nothing reloads them.
+#[must_use]
+pub fn rebuilds_on_settings_change(source: &dyn AccelerationSource) -> bool {
+    source
+        .acceleration()
+        .is_some_and(|acceleration| rebuilds_for_connector(acceleration, source.connector_name()))
+}
+
+/// [`rebuilds_on_settings_change`] for `acceleration` read from the connector named
+/// `connector_name`.
+fn rebuilds_for_connector(acceleration: &Acceleration, connector_name: Option<&str>) -> bool {
+    connector_name != Some("sink")
+        && acceleration
+            .rebuilds_on_settings_change(refresh_mode_for_connector(acceleration, connector_name))
+}
+
 /// The refresh mode `source` actually runs with, applying the connector's fill-in for an
 /// unset `refresh_mode`.
 ///
@@ -142,10 +164,55 @@ pub fn resolved_refresh_mode(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,
 ) -> crate::acceleration::RefreshMode {
+    refresh_mode_for_connector(acceleration, source.connector_name())
+}
+
+/// [`resolved_refresh_mode`] for `acceleration` read from the connector named
+/// `connector_name`.
+fn refresh_mode_for_connector(
+    acceleration: &Acceleration,
+    connector_name: Option<&str>,
+) -> crate::acceleration::RefreshMode {
     acceleration.refresh_mode.unwrap_or_else(|| {
-        source.connector_name().map_or(
+        connector_name.map_or(
             crate::acceleration::RefreshMode::Full,
             crate::acceleration::unset_refresh_mode_for_connector,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Acceleration, rebuilds_for_connector};
+    use crate::acceleration::{Mode, RefreshMode};
+
+    fn file_acceleration(refresh_mode: Option<RefreshMode>) -> Acceleration {
+        Acceleration {
+            mode: Mode::File,
+            refresh_mode,
+            ..Acceleration::default()
+        }
+    }
+
+    /// A `sink:` dataset holds only rows written to its acceleration, so even an explicit
+    /// `refresh_mode: full` must never rebuild it; the same acceleration over a source is.
+    #[test]
+    fn a_sink_is_never_rebuilt_for_changed_settings() {
+        let full = file_acceleration(Some(RefreshMode::Full));
+        assert!(rebuilds_for_connector(&full, Some("postgres")));
+        assert!(rebuilds_for_connector(&full, None));
+        assert!(!rebuilds_for_connector(&full, Some("sink")));
+    }
+
+    /// An unset refresh mode is the connector's: `full` for most, `changes` for a CDC
+    /// stream, which resumes from a recorded position and so must not be rebuilt.
+    #[test]
+    fn an_unset_refresh_mode_is_judged_as_the_connector_resolves_it() {
+        let unset = file_acceleration(None);
+        assert!(rebuilds_for_connector(&unset, Some("postgres")));
+        assert!(rebuilds_for_connector(&unset, None));
+        assert!(!rebuilds_for_connector(&unset, Some("debezium")));
+        assert!(!rebuilds_for_connector(&unset, Some("cdc")));
+        assert!(!rebuilds_for_connector(&unset, Some("sink")));
+    }
 }

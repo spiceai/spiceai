@@ -147,7 +147,7 @@ jobs:
 
       - name: Upload test archive
         if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
@@ -160,7 +160,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-models-build-logs
           path: ${{ runner.temp }}/spiceio*.log
@@ -169,7 +169,14 @@ jobs:
   test-models:
     name: Test Models, AI & Search
     needs: build
-    runs-on: spiceai-macos
+    # `spiceai-macos-large`, like every other job that runs this archive: the
+    # Mac minis behind `spiceai-macos` cannot reliably start the debug
+    # `integration_models` binary. dyld fails to map the shared cache into it
+    # (`dyld cache '(null)' not loaded: syscall to map cache into shared region
+    # failed`, then `Library not loaded: /usr/lib/libiconv.2.dylib`), so
+    # `nextest --list` and every test process abort with SIGABRT before any
+    # test code runs, while the same archive starts cleanly on the MacBook Pros.
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
       HAS_OPENAI_SECRET: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
@@ -217,7 +224,7 @@ jobs:
 
       - name: Download test archive
         if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -274,6 +281,18 @@ jobs:
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
+      - name: Run Anthropic prompt caching test
+        if: ${{ !cancelled() && env.HAS_ANTHROPIC_SECRET == 'true' }}
+        env:
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- anthropic_prompt_caching_through_tool_calls
+
       - name: Run AI UDF with dataset test
         if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
         env:
@@ -296,6 +315,30 @@ jobs:
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_dataset
+
+      # Tools that Spice runs for a model: the tool calls of earlier turns reach the provider, and
+      # each provider round reuses the prompt cache.
+      - name: Run Spice tool turns test
+        if: ${{ !cancelled() && env.HAS_OPENAI_SECRET == 'true' && env.HAS_ANTHROPIC_SECRET == 'true' && env.HAS_XAI_SECRET == 'true' }}
+        env:
+          SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+        run: |
+          unset AWS_ENDPOINT_URL # spiced must not use the build cache's S3 endpoint
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
+            exit 1
+          fi
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
+            exit 1
+          fi
+          if [ -z "${SPICE_SECRET_XAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_XAI_API_KEY is required but not set"
+            exit 1
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- spice_tool_turns
 
       # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
       - name: Run AI UDF LEFT truncate test
@@ -420,7 +463,7 @@ jobs:
 
       - name: Download test archive
         if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -466,7 +509,9 @@ jobs:
     name: Test Bedrock Models
     needs: build
     if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
-    runs-on: spiceai-macos
+    # The large pool for the same reason as `test-models`: a Mac mini cannot
+    # reliably start this archive's test binary.
+    runs-on: spiceai-macos-large
     env:
       HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
@@ -509,7 +554,7 @@ jobs:
 
       - name: Download test archive
         if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ai-integration-test-archive
           path: ./integration_test
@@ -635,7 +680,7 @@ jobs:
 
       - name: Upload test archive
         if: env.HAS_SPICEIO_SECRET != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
@@ -648,7 +693,7 @@ jobs:
 
       - name: Upload spiceio logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-models-build-extended-logs
           path: ${{ runner.temp }}/spiceio*.log

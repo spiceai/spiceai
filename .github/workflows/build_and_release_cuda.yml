@@ -60,6 +60,13 @@ on:
           - 'release-lto'
         default: 'release'
 
+# A trunk push cancels the CUDA build of any older trunk push, queued or
+# running. Tag and manual runs each get a group of their own, so they never
+# cancel or wait on another run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/trunk' && 'trunk' || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
@@ -197,7 +204,7 @@ jobs:
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         continue-on-error: true
         with:
           pattern: spiced_cuda_*_linux_x86_64
@@ -240,7 +247,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}
@@ -279,7 +286,7 @@ jobs:
           # Pass the notes by path, not by value: a release body over 128 KiB
           # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
           # after every build has already succeeded.
-          if [ "$LATEST_RELEASE" = "true" ]; then
+          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
             BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
             BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")

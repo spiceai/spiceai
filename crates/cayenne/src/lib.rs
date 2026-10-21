@@ -91,14 +91,22 @@ pub fn is_clusterable_type(data_type: &arrow_schema::DataType) -> bool {
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
-pub(crate) mod partition_naming;
+pub mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
 /// Probe and build accounting for a table's secondary indexes (the
 /// acceleration's `indexes`), so a check can prove a query used row selection
 /// rather than silently falling back to an ordinary scan.
 pub mod lookup_index {
+    pub use crate::provider::IndexPersistence;
     pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
+}
+
+/// Per-file scan statistics accounting, so a check can prove concurrent cold
+/// scans shared their footer reads and metastore writes. Not a stable API.
+#[doc(hidden)]
+pub mod scan_file_statistics {
+    pub use crate::provider::ScanFileStatisticsCounters;
 }
 
 pub mod row_converter;
@@ -122,14 +130,19 @@ pub use metadata::{
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]
-pub use partition_creator::CayennePartitionCreator;
-pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+pub use partition_creator::{CayennePartitionCreator, partition_column_labels};
+pub use provider::RebuildableWrite;
+pub use provider::constants::{
+    LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
+};
 pub use provider::{
-    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
-    CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
-    LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
+    AutoKeyDeletesReason, AutoKeyTableKind, CayenneCdcWrite, CayenneContext, CayenneStagedAppend,
+    CayenneStagedUpsert, CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction,
+    DeletionModeChoice, EncodeBudgetSnapshot, FileDeletionHold, LastSmallFileCompactPath,
+    LookupIndexSnapshotHold, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
     PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, ScanViewReuse,
-    SlotAdvancer, TimeRetentionFilterBuilder, TransactionCommit, TransactionWriteToken, TxnTable,
+    SlotAdvancer, SnapshotDirPins, TableStorage, TimeRetentionFilterBuilder, TransactionCommit,
+    TransactionWriteToken, TxnTable, auto_keeps_small_tables_compacted, auto_key_deletes_reason,
     begin_compaction_shutdown, cap_global_encode_concurrency, clear_global_mem_tier_pool_account,
     compaction_budget, compaction_budget_permits, deregister_query_observations,
     drain_compaction_tasks, encode_budget_snapshot, global_mem_tier_pool_account_bytes,

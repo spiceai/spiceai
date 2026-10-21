@@ -17,10 +17,13 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::TestType;
+use test_framework::{
+    TestType, anyhow,
+    layout::Layout,
+    source_versions::{Source, source_versions},
+};
 
 use super::dataset::{QueryOverridesArg, QuerySetArg};
-use super::search::SearchDatasetArg;
 
 #[derive(Parser, Debug, Clone)]
 pub struct DispatchArgs {
@@ -71,7 +74,8 @@ pub struct DispatchArgs {
 pub enum Schedule {
     #[default]
     Daily,
-    /// For tests whose source is a hosted service.
+    /// For tests whose source is a hosted service, and for the runs of a
+    /// benchmark on every supported release line of its source database.
     Weekly,
 }
 
@@ -186,6 +190,20 @@ pub struct BenchArgs {
     pub scale_factor: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scrape_spiced_metrics: Option<bool>,
+    /// The `PostgreSQL` release line the bench workflow starts as its local
+    /// `postgres_tpch` source: one of the `postgres` versions in
+    /// `test/source_versions.json`, or `all` for one run on each of them. Unset
+    /// runs the workflow's default line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres_version: Option<String>,
+    /// The acceleration layout the run configures (`testoperator --layout`):
+    /// features from `primary_key`, `indexes`, `sort`, `cluster`,
+    /// `time_column` and `partition`, joined by commas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// Several layouts: one run each, dispatched as its `layout`.
+    #[serde(default, skip_serializing)]
+    pub layouts: Vec<String>,
 }
 
 /// Custom deserializer that accepts either a single item or a vector of items
@@ -226,11 +244,112 @@ where
     }
 }
 
+/// The `postgres_version` that expands to every listed `PostgreSQL` line.
+pub const ALL_SOURCE_VERSIONS: &str = "all";
+
+/// A test entry's runs per layout: its `layout`, or one per entry of `layouts`.
+/// Each layout is parsed here, so a misspelled feature fails the dispatch
+/// rather than the dispatched run.
+fn expand_layouts(
+    layout: Option<&String>,
+    layouts: &[String],
+) -> anyhow::Result<Vec<Option<String>>> {
+    anyhow::ensure!(
+        layout.is_none() || layouts.is_empty(),
+        "a test sets either `layout` or `layouts`, not both"
+    );
+    let layouts: Vec<Option<String>> = if layouts.is_empty() {
+        vec![layout.cloned()]
+    } else {
+        layouts.iter().cloned().map(Some).collect()
+    };
+    for layout in layouts.iter().flatten() {
+        layout
+            .parse::<Layout>()
+            .map_err(|e| anyhow::anyhow!("layout '{layout}': {e}"))?;
+    }
+    Ok(layouts)
+}
+
 impl BenchArgs {
     #[must_use]
     pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
         self.update_snapshots = Some(update_snapshots);
         self
+    }
+
+    /// The runs this entry dispatches: one per listed `PostgreSQL` line for
+    /// `postgres_version: all`, times one per entry of `layouts`.
+    ///
+    /// # Errors
+    ///
+    /// When `postgres_version` names a version `test/source_versions.json` does
+    /// not list, so a typo or a retired line fails the dispatch instead of
+    /// starting an unsupported server; when a layout does not parse; or when
+    /// the entry sets both `layout` and `layouts`.
+    pub fn expand_runs(&self) -> anyhow::Result<Vec<Self>> {
+        let layouts = expand_layouts(self.layout.as_ref(), &self.layouts)?;
+        let versions = self.postgres_versions()?;
+        Ok(versions
+            .iter()
+            .flat_map(|version| {
+                layouts.iter().map(move |layout| Self {
+                    postgres_version: version.clone(),
+                    layout: layout.clone(),
+                    layouts: Vec::new(),
+                    ..self.clone()
+                })
+            })
+            .collect())
+    }
+
+    /// Refuse the settings only the bench workflow declares inputs for, on an
+    /// entry dispatched to `workflow`: GitHub refuses a dispatch carrying an
+    /// input its workflow does not declare.
+    ///
+    /// # Errors
+    ///
+    /// When the entry sets `postgres_version`, `layout` or `layouts`.
+    pub fn ensure_only_bench_settings_unset(&self, workflow: &str) -> anyhow::Result<()> {
+        let set: Vec<&str> = [
+            ("postgres_version", self.postgres_version.is_some()),
+            ("layout", self.layout.is_some()),
+            ("layouts", !self.layouts.is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(setting, is_set)| is_set.then_some(setting))
+        .collect();
+        anyhow::ensure!(
+            set.is_empty(),
+            "a {workflow} test sets `{}`, which only the bench workflow takes; remove {}, or run the entry as a bench test",
+            set.join("`, `"),
+            if set.len() == 1 { "it" } else { "them" }
+        );
+        Ok(())
+    }
+
+    fn postgres_versions(&self) -> anyhow::Result<Vec<Option<String>>> {
+        let Some(requested) = self.postgres_version.as_deref() else {
+            return Ok(vec![None]);
+        };
+        let listed = source_versions(Source::Postgres)?;
+        let versions: Vec<&str> = listed
+            .versions
+            .iter()
+            .map(|listed| listed.version.as_str())
+            .collect();
+        if requested == ALL_SOURCE_VERSIONS {
+            return Ok(versions
+                .into_iter()
+                .map(|version| Some(version.to_string()))
+                .collect());
+        }
+        anyhow::ensure!(
+            versions.contains(&requested),
+            "postgres_version {requested} is not a supported PostgreSQL version; test/source_versions.json lists {}, or use `{ALL_SOURCE_VERSIONS}`",
+            versions.join(", ")
+        );
+        Ok(vec![Some(requested.to_string())])
     }
 }
 
@@ -293,16 +412,19 @@ pub struct AppendArgs {
 }
 
 /// Search benchmark workflow arguments, defined in the test files. Should match inputs in
-/// `.github/workflows/testoperator_run_search.yml`.
+/// `.github/workflows/testoperator_run_search.yml`. Unknown fields are rejected because each
+/// field becomes a workflow input, and GitHub rejects a dispatch with an unknown input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     pub spicepod_path: PathBuf,
     pub runner_type: RunnerType,
-    /// Built-in MTEB benchmark dataset. Omitted for a custom run against `spicepod_path` as-is.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub benchmark_dataset: Option<SearchDatasetArg>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
+    /// Parameterized SQL search pipeline: a file path or the SQL text, as `--sql-pipeline` takes
+    /// it. Omitted to search through `POST /v1/search`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_pipeline: Option<String>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -520,6 +642,85 @@ pub struct HtapDispatchArgs {
     /// Optional target OLTP transaction rate for the OLTP workload (txn/s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate: Option<u32>,
+    /// The source database's release line: one of the versions
+    /// `test/source_versions.json` lists for the spicepod's source (`MySQL` for
+    /// a `mysql*` spicepod, otherwise `PostgreSQL`), or `all` for one run on each
+    /// of them. Unset runs the workflow's default line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+    /// The acceleration layout the run configures (`testoperator --layout`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// Several layouts: one run each, dispatched as its `layout`.
+    #[serde(default, skip_serializing)]
+    pub layouts: Vec<String>,
+}
+
+impl HtapDispatchArgs {
+    /// The source database the HTAP workflow starts for this spicepod: it reads
+    /// the source from the file name, `mysql*` for `MySQL`, so this does too.
+    fn source(&self) -> Source {
+        let file_name = self
+            .spicepod_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        if file_name.starts_with("mysql") {
+            Source::MySql
+        } else {
+            Source::Postgres
+        }
+    }
+
+    /// The runs this entry dispatches: one per listed release line of its
+    /// source for `source_version: all`, times one per entry of `layouts`.
+    ///
+    /// # Errors
+    ///
+    /// When `source_version` names a version `test/source_versions.json` does
+    /// not list for the spicepod's source, when a layout does not parse, or when
+    /// the entry sets both `layout` and `layouts`.
+    pub fn expand_runs(&self) -> anyhow::Result<Vec<Self>> {
+        let layouts = expand_layouts(self.layout.as_ref(), &self.layouts)?;
+        let versions = self.source_lines()?;
+        Ok(versions
+            .iter()
+            .flat_map(|version| {
+                layouts.iter().map(move |layout| Self {
+                    source_version: version.clone(),
+                    layout: layout.clone(),
+                    layouts: Vec::new(),
+                    ..self.clone()
+                })
+            })
+            .collect())
+    }
+
+    fn source_lines(&self) -> anyhow::Result<Vec<Option<String>>> {
+        let Some(requested) = self.source_version.as_deref() else {
+            return Ok(vec![None]);
+        };
+        let source = self.source();
+        let listed = source_versions(source)?;
+        let versions: Vec<&str> = listed
+            .versions
+            .iter()
+            .map(|listed| listed.version.as_str())
+            .collect();
+        if requested == ALL_SOURCE_VERSIONS {
+            return Ok(versions
+                .into_iter()
+                .map(|version| Some(version.to_string()))
+                .collect());
+        }
+        anyhow::ensure!(
+            versions.contains(&requested),
+            "source_version {requested} is not a supported {} version; test/source_versions.json lists {}, or use `{ALL_SOURCE_VERSIONS}`",
+            source.key(),
+            versions.join(", ")
+        );
+        Ok(vec![Some(requested.to_string())])
+    }
 }
 
 fn default_queryset() -> String {
@@ -542,6 +743,159 @@ pub struct WorkflowArgs<T: Serialize> {
 mod tests {
     use super::*;
     use test_framework::queries::QuerySet;
+
+    /// Only the bench workflow declares `postgres_version` and `layout` inputs,
+    /// so a load or throughput entry that sets them is refused before dispatch
+    /// rather than sending an input GitHub would reject.
+    #[test]
+    fn load_and_throughput_entries_refuse_the_bench_only_settings() {
+        let yaml = "
+tests:
+  load:
+    spicepod_path: accelerated/file[parquet]-arrow.yaml
+    query_set: tpch
+    runner_type: spiceai-dev-large-runners
+    layout: primary_key
+  throughput:
+    - spicepod_path: accelerated/file[parquet]-arrow.yaml
+      query_set: tpch
+      runner_type: spiceai-dev-large-runners
+      postgres_version: '17'
+      layouts: [primary_key, indexes]
+    - spicepod_path: accelerated/file[parquet]-arrow.yaml
+      query_set: tpch
+      runner_type: spiceai-dev-large-runners
+";
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(
+            test_file.tests.load[0]
+                .bench_args
+                .ensure_only_bench_settings_unset("load")
+                .expect_err("a load test cannot take a layout")
+                .to_string(),
+            "a load test sets `layout`, which only the bench workflow takes; remove it, or run the entry as a bench test"
+        );
+        assert_eq!(
+            test_file.tests.throughput[0]
+                .ensure_only_bench_settings_unset("throughput")
+                .expect_err("a throughput test cannot take a version or layouts")
+                .to_string(),
+            "a throughput test sets `postgres_version`, `layouts`, which only the bench workflow takes; remove them, or run the entry as a bench test"
+        );
+        test_file.tests.throughput[1]
+            .ensure_only_bench_settings_unset("throughput")
+            .expect("an entry without them dispatches");
+    }
+
+    /// An HTAP entry's versions are its spicepod's source's: `MySQL` for a
+    /// `mysql*` spicepod, as the HTAP workflow reads it, `PostgreSQL` otherwise.
+    #[test]
+    fn htap_source_version_expands_to_the_spicepod_source_lines() {
+        let yaml = "
+tests:
+  htap:
+    - spicepod_path: accelerated/mysql-cayenne[file].yaml
+      runner_type: spiceai-dev-large-runners
+      source_version: all
+    - spicepod_path: accelerated/postgres-cayenne[file].yaml
+      runner_type: spiceai-dev-large-runners
+      source_version: '8.4'
+";
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let listed = |source| -> Vec<String> {
+            source_versions(source)
+                .expect("the version list parses")
+                .versions
+                .iter()
+                .map(|listed| listed.version.clone())
+                .collect()
+        };
+
+        let runs = test_file.tests.htap[0]
+            .expand_runs()
+            .expect("`all` expands");
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.source_version.clone().expect("each run names its line"))
+                .collect::<Vec<_>>(),
+            listed(Source::MySql)
+        );
+        assert_eq!(
+            test_file.tests.htap[1]
+                .expand_runs()
+                .expect_err("8.4 is a MySQL line, not a PostgreSQL one")
+                .to_string(),
+            format!(
+                "source_version 8.4 is not a supported postgres version; test/source_versions.json lists {}, or use `all`",
+                listed(Source::Postgres).join(", ")
+            )
+        );
+    }
+
+    /// `postgres_version: all` is what keeps the weekly source-version runs in
+    /// step with `test/source_versions.json`, and a refused version is what keeps
+    /// a typo or a retired line from starting an unsupported server.
+    #[test]
+    fn bench_postgres_version_expands_to_the_listed_lines() {
+        let yaml = "
+tests:
+  bench:
+    - spicepod_path: federated/postgres[catalog].yaml
+      query_set: tpch
+      runner_type: spiceai-dev-runners
+      postgres_version: all
+    - spicepod_path: federated/postgres[catalog].yaml
+      query_set: tpch
+      runner_type: spiceai-dev-runners
+      postgres_version: '13'
+    - spicepod_path: federated/postgres[catalog].yaml
+      query_set: tpch
+      runner_type: spiceai-dev-runners
+";
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let listed: Vec<String> = source_versions(Source::Postgres)
+            .expect("the version list parses")
+            .versions
+            .iter()
+            .map(|listed| listed.version.clone())
+            .collect();
+
+        let runs = test_file.tests.bench[0]
+            .expand_runs()
+            .expect("`all` expands");
+        assert_eq!(
+            runs.iter()
+                .map(|run| run
+                    .postgres_version
+                    .clone()
+                    .expect("each run names its line"))
+                .collect::<Vec<_>>(),
+            listed
+        );
+        let inputs = serde_json::to_value(&runs[0]).expect("Failed to serialize");
+        assert_eq!(inputs["postgres_version"], listed[0]);
+
+        assert_eq!(
+            test_file.tests.bench[1]
+                .expand_runs()
+                .expect_err("13 is not a supported line")
+                .to_string(),
+            format!(
+                "postgres_version 13 is not a supported PostgreSQL version; test/source_versions.json lists {}, or use `all`",
+                listed.join(", ")
+            )
+        );
+
+        let unset = test_file.tests.bench[2]
+            .expand_runs()
+            .expect("an unset version is one run");
+        assert_eq!(unset.len(), 1);
+        let inputs = serde_json::to_value(&unset[0]).expect("Failed to serialize");
+        assert!(
+            inputs.get("postgres_version").is_none(),
+            "an unset version must not become a workflow input: {inputs}"
+        );
+    }
 
     #[test]
     fn test_single_section_deserialization() {
@@ -846,7 +1200,6 @@ tests:
   search:
     spicepod_path: test/spicepods/search/mteb/quora/full_text_search-duckdb[file].yaml
     runner_type: spiceai-dev-runners
-    benchmark_dataset: quora_retrieval
     ready_wait: 1800
 ";
 
@@ -861,260 +1214,94 @@ tests:
             test_file.tests.search[0].runner_type,
             RunnerType::Dev
         ));
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::QuoraRetrieval)
-        ));
         assert_eq!(test_file.tests.search[0].ready_wait, Some(1800));
 
-        // Verify benchmark_dataset serializes back to the exact string the workflow expects
+        // The serialized fields are the workflow inputs, so each must be an input of
+        // `testoperator_run_search.yml`.
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "quora_retrieval");
+        let mut keys: Vec<&str> = serialized
+            .as_object()
+            .expect("search args serialize to an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["ready_wait", "runner_type", "spicepod_path"]);
     }
 
     #[test]
-    fn test_miracl_en_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/miracl_en/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: miracl_en_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::MiraclEnRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "miracl_en_retrieval");
-    }
-
-    #[test]
-    fn test_fiqa_search_section_deserialization() {
+    fn test_search_section_sql_pipeline_round_trip() {
         let yaml = "
 tests:
   search:
     spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
     runner_type: spiceai-dev-runners
-    benchmark_dataset: fiqa_retrieval
-    ready_wait: 1800
+    sql_pipeline: test/spicepods/search/pipelines/text_search.sql
 ";
 
         let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(
+            test_file.tests.search[0].sql_pipeline.as_deref(),
+            Some("test/spicepods/search/pipelines/text_search.sql")
+        );
 
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::FiqaRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "fiqa_retrieval");
-    }
-
-    #[test]
-    fn test_trec_covid_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/trec_covid/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: trec_covid_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::TrecCovidRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "trec_covid_retrieval");
-    }
-
-    #[test]
-    fn test_arguana_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/arguana/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: arguana_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::ArguanaRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "arguana_retrieval");
-    }
-
-    #[test]
-    fn test_scidocs_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/scidocs/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: scidocs_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::ScidocsRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "scidocs_retrieval");
-    }
-
-    #[test]
-    fn test_scifact_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/scifact/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: scifact_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::ScifactRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "scifact_retrieval");
-    }
-
-    #[test]
-    fn test_nfcorpus_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/nfcorpus/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: nfcorpus_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::NfcorpusRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "nfcorpus_retrieval");
-    }
-
-    #[test]
-    fn test_touche2020_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/touche2020/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: touche2020_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::Touche2020Retrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "touche2020_retrieval");
-    }
-
-    #[test]
-    fn test_msmarco_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/msmarco/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: msmarco_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::MsmarcoRetrieval)
-        ));
-        let serialized =
-            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert_eq!(serialized["benchmark_dataset"], "msmarco_retrieval");
-    }
-
-    #[test]
-    fn test_stackoverflow_qa_search_section_deserialization() {
-        let yaml = "
-tests:
-  search:
-    spicepod_path: test/spicepods/search/mteb/stackoverflow_qa/full_text_search-duckdb[file].yaml
-    runner_type: spiceai-dev-runners
-    benchmark_dataset: stackoverflow_qa_retrieval
-    ready_wait: 1800
-";
-
-        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(matches!(
-            test_file.tests.search[0].benchmark_dataset,
-            Some(SearchDatasetArg::StackoverflowQaRetrieval)
-        ));
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(
-            serialized["benchmark_dataset"],
-            "stackoverflow_qa_retrieval"
+            serialized["sql_pipeline"],
+            "test/spicepods/search/pipelines/text_search.sql"
         );
     }
 
     #[test]
-    fn test_custom_search_section_omits_benchmark_dataset() {
-        // A custom run leaves `benchmark_dataset` unset. It must deserialize to `None` and, so the
-        // dispatch workflow input stays absent (letting the workflow default to a custom run), it
-        // must not serialize the field back out.
+    fn test_search_section_inline_sql_pipeline_round_trip() {
         let yaml = "
 tests:
   search:
-    spicepod_path: test/spicepods/search/custom/my-spicepod.yaml
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
     runner_type: spiceai-dev-runners
-    ready_wait: 1800
+    sql_pipeline: |
+      SELECT _id, _score FROM text_search(corpus, :query)
+      LIMIT :limit
 ";
 
         let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
-
-        assert!(test_file.tests.search[0].benchmark_dataset.is_none());
+        let sql = "SELECT _id, _score FROM text_search(corpus, :query)\nLIMIT :limit\n";
+        assert_eq!(test_file.tests.search[0].sql_pipeline.as_deref(), Some(sql));
 
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
-        assert!(serialized.get("benchmark_dataset").is_none());
+        assert_eq!(serialized["sql_pipeline"], sql);
+    }
+
+    #[test]
+    fn test_search_section_rejects_benchmark_dataset() {
+        // The spicepod names its own dataset now. A stale `benchmark_dataset` must fail here,
+        // because the workflow no longer has that input and GitHub rejects unknown inputs.
+        let args = "
+spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+runner_type: spiceai-dev-runners
+benchmark_dataset: fiqa_retrieval
+";
+        let err = yaml::from_str::<SearchArgs>(args)
+            .expect_err("benchmark_dataset is not a search workflow input");
+        assert!(
+            err.to_string().contains("benchmark_dataset"),
+            "unexpected error: {err}"
+        );
+
+        let test_file = format!("tests:\n  search:\n{}", indent(args, "    "));
+        yaml::from_str::<DispatchTestFile>(&test_file).expect_err("file should be rejected");
+    }
+
+    fn indent(text: &str, prefix: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            out.push_str(prefix);
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 }

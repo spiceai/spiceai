@@ -712,12 +712,32 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().expect("tempdir");
+        let override_path = dir.path().join("cloud-endpoint");
+
+        // Control: the same directory serves a regular-file override, so the
+        // rejection below can only come from the leaf being a symlink.
+        std::fs::write(&override_path, "https://cloud.example.test").expect("write override");
+        assert_eq!(
+            CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+                .expect("a regular-file override must be readable")
+                .as_deref(),
+            Some("https://cloud.example.test")
+        );
+        std::fs::remove_file(&override_path).expect("remove regular override");
+
         let target = dir.path().join("target");
         std::fs::write(&target, "https://redirected.example.test").expect("write symlink target");
-        symlink(&target, dir.path().join("cloud-endpoint")).expect("create symlink");
+        symlink(&target, &override_path).expect("create symlink");
 
-        CloudConnectConfig::read_enroll_endpoint_override(dir.path())
+        let err = CloudConnectConfig::read_enroll_endpoint_override(dir.path())
             .expect_err("a state-file symlink must be rejected");
+        // The leaf is opened with `O_NOFOLLOW`, so the rejection is the kernel
+        // refusing the symlink itself, not some unrelated I/O failure.
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected the O_NOFOLLOW symlink rejection, got: {err}"
+        );
     }
     /// The one rule for a Cloud-provided link: absolute, `https`, and carrying
     /// no credentials. A create-project link keeps its query — that is how it

@@ -79,23 +79,26 @@ self-hosted runner — dispatch `signoff.yml` with `run_targeted_prechecks=true`
 to get them back.
 
 **The scoped steps build each crate the way the workspace builds it.** The
-features come from a `cargo metadata` resolve of the whole workspace,
+features come from a `cargo metadata` resolve of the whole workspace with the
+gate's feature set,
 package-qualified (`runtime/debezium,…`), rather than from the crate's own
-defaults. That matters because a crate's defaults are not what it is ever built
-with: `runtime` declares 54 features and **no `default`**, so a bare
-`cargo clippy -p runtime` compiles it with *zero* features, while the workspace
-resolve gives it 35 — `spiced`'s defaults unify them in. Linting and testing a
-configuration no real build produces is what makes a scoped pre-lint fail on code
-the full gate accepts, and it guarantees a cache miss against the gate that
-follows. The resolve is derived on every run, so there is no feature list to
-drift. If `cargo metadata` or `python3` is unavailable the steps fall back to
-package defaults rather than failing.
+defaults. A scoped crate's own defaults can omit capabilities enabled by its
+workspace consumers. `RUST_GATE_FEATURES` in the Makefile defines the features
+shared by full lint, nextest, CLI verification, and this metadata resolve. It
+includes the Cayenne DuckDB differential tests and HTTP/Wasm function features.
+If `cargo metadata` or `python3` is unavailable the targeted steps fall back to
+package defaults; the full workspace gate still runs.
 
-The CLI is built with the same profile as the lint and test passes
-(`build-cli-dev`), not a release build: a release build shares no artifacts with
-them and would recompile its whole dependency graph just to prove the binary
-links. The merge queue's required `Build (release profile)` job builds the CLI,
-`spiced`, and the release install for real.
+Nextest's test build also builds the CLI. `verify-cli` checks cargo's emitted
+artifacts and executes the CLI, using the same selection, features, and profile.
+The merge queue's required `Build (release profile)` job separately builds the
+CLI, `spiced`, and the release install.
+
+Sign-off clears inherited Make flags and nextest filters, profile, retry, and
+empty-suite overrides before invoking the gate. A focused `make nextest` remains
+available for development, but cannot silently narrow a sign-off. The default
+nextest policy retries failures **three times**; the zero-retry correctness
+overrides remain in force. A test that succeeds on a permitted retry still passes.
 
 On success it posts a `signoff` commit status on your current `HEAD`. If the
 **Attestation** check already ran and failed before the sign-off existed, the
@@ -133,7 +136,8 @@ sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
 
-A sign-off that **failed** on `HEAD` disqualifies that commit. **Attestation**
+A completed sign-off that **failed**, locally or remotely, posts a failure on
+`HEAD` and refreshes **Attestation**, replacing any previous success. **Attestation**
 rejects it before anything else, so an earlier sign-off cannot be inherited past
 it and the fast-track paths below cannot route around it: a merge of the base
 can be textually clean and still be semantically broken, and a sign-off run
@@ -178,7 +182,13 @@ only, like the other fast-tracks.
 Rust-affecting means Rust sources, the Cargo/toolchain config, **and the config
 files the gate itself reads**:
 
-- `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`
+- Every file under `crates/`, `bin/`, `tools/`, and `vendor/`, including test
+  fixtures and build inputs; `*.rs`, `*.snap`, and `*.proto` elsewhere
+- Files outside those trees that a Rust source names by a relative path —
+  compiled in with `include_bytes!`/`include_str!` or opened by a test — such
+  as the `test/tls/` PEM files, one of which a `runtime-tls` unit test pins by
+  SHA-256
+- `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`, and `version.txt`
 - `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
   the root `clippy.toml`; `[.]rustfmt.toml`
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
@@ -199,9 +209,10 @@ also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
 what must be gated from what the `lint-rust` recipe reads (including the
-`scripts/` modules its guards import), from the tracked config-file names, and
-from every tracked `.rs` file — rather than from a list someone has to remember
-— and fails when the three drift. Change them together.
+`scripts/` modules its guards import), from the tracked config-file names, from
+tracked sources, fixtures, and build inputs, and from the `../` path literals in
+Rust sources that reach outside the source trees — rather than from a list
+someone has to remember — and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going
 ungated, which the config-file derivation cannot see: top-level `vendor/` holds
@@ -215,23 +226,29 @@ runs first — a clean tree exercises only the shapes it happens to contain.
 ### The unreachable-module guard
 
 `make lint-rust` also runs `scripts/check_module_reachability.py`, which fails
-when a file under a workspace crate's `src/` is not reachable from that crate's
-roots through `mod` declarations. Such a file compiles into nothing, so
+when a file under a workspace crate's `src/`, `tests/`, `benches/` or
+`examples/` is not reachable through `mod` declarations from any of that
+crate's targets. Such a file compiles into nothing, so
 `cargo build`, `cargo clippy`, `cargo fmt --all` and `cargo test` are all silent
 about it — it looks like source and ships nothing. Four stale trees had
 accumulated this way, together holding ~2,200 lines and 26 tests that had never
 run ([#12735](https://github.com/spiceai/spiceai/issues/12735),
 [#12737](https://github.com/spiceai/spiceai/issues/12737)).
 
-Roots come from `cargo metadata`, so a `path = "…"` target override in a
-`Cargo.toml` is honoured without the script parsing manifests. Only `src/` is in
-scope: cargo auto-discovers `benches/`, `tests/` and `examples/` files as their
-own targets, so they are reachable with no `mod` declaration and including them
-reports ~200 files that are all fine.
+Roots are every target `cargo metadata` lists — library, binaries, tests,
+benches and examples — so auto-discovered targets, `autotests = false`, and a
+`path = "…"` target override are all honoured without the script parsing
+manifests. That is what catches a test that silently runs nothing: a top-level
+`tests/*.rs` that a crate with `autotests = false` never declares, or a file in
+a `tests/` subdirectory no `mod` reaches (see
+[`integration_test_layout.md`](integration_test_layout.md)).
 
 The walk handles the cases a regex over `mod` alone gets wrong — `#[path = "…"]`
-redirects, declarations behind `#[cfg(…)]` (still declarations), inline
-`mod x { … }` nesting, and `mod` tokens inside comments and string literals.
+redirects (a file loaded this way owns its directory, like `mod.rs`), every
+target root owning its directory whatever it is named, a file compiled both as
+a root and as another target's module (walked in each context), declarations
+behind `#[cfg(…)]` (still declarations), inline `mod x { … }` nesting, and
+`mod` tokens inside comments and string literals.
 `scripts/test_check_module_reachability.py` covers each one.
 
 ### Dependabot bumps are fast-tracked
@@ -269,9 +286,56 @@ Options:
 ```bash
 scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
+scripts/signoff --note TEXT   # add TEXT to the description (with --no-verify: where the checks ran)
+scripts/signoff verify        # run the checks on HEAD, post no status (HEAD need not be pushed)
 scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
+
+### Sign off several PRs with one run (`scripts/signoff-batch`)
+
+A full sign-off takes hours. `scripts/signoff-batch` runs the checks once for a
+set of PRs, and then attests each PR:
+
+```
+  trunk T ──┬── #a + T ──┐
+            ├── #b + T ──┼──▶ batch = T + #a' + #b' + #c' ──▶ scripts/signoff verify
+            └── #c + T ──┘                                         │
+                                                         pass ─────┴───── fail
+                                                           │                │
+                            push each #x' (no force push), │                │ push nothing; name the
+                            then signoff -f --no-verify    ▼                ▼ PRs that change the
+                            --note "... in batch with ..."                    failing crates
+```
+
+```bash
+scripts/signoff-batch 15040 15041 '#15047'   # merged in this order
+scripts/signoff-batch --plan 15040 15041     # build and check out the batch, then stop
+```
+
+1. The script pins `trunk` to one commit, T, and merges T into each PR head. These
+   merges are local until the checks pass.
+2. It merges the updated heads onto T, in the order given. A conflict with
+   `trunk`, or between two PRs, stops the run and names the files and PRs.
+3. It runs `scripts/signoff verify` on the batch, in a worktree that later runs
+   reuse, so the build cache stays warm. The default worktree is
+   `<checkout>-signoff-batch`; set `--worktree` or `SIGNOFF_BATCH_WORKTREE` to
+   change it. The log goes to `.git/signoff-batch/<batch>.log`.
+4. If the checks pass, the script asks for confirmation (skip it with `--yes`).
+   Then it pushes each head and attests it. The description names the other PRs
+   in the batch. A head that already had `trunk` is pushed too. Each push is
+   leased on the head the batch checked, so it is rejected if the branch moved
+   or was deleted during the run, and the script does not attest that PR.
+
+If the checks fail, the script pushes and attests nothing. It reads the log for
+crates that did not compile or had failing tests, and lists the PRs that change
+each crate or one of its workspace dependencies. The batch stays checked out, so
+you can inspect it or run the batch again without a suspect PR.
+
+A passing batch does not prove that each PR passes alone, because one PR can
+depend on another PR in the batch. The engineer who chooses the batch is
+responsible for that. The merge queue still runs the full suite on each PR
+before it reaches `trunk`.
 
 ### Remote sign-off (self-hosted runner)
 

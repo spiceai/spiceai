@@ -112,6 +112,8 @@ pub async fn with_find_max_timestamp_in_stream(
     let new_data_update = StreamingDataUpdate {
         data: out_stream,
         update_type: data_update.update_type,
+        row_versions: data_update.row_versions,
+        superseded: data_update.superseded,
     };
 
     (new_data_update, Some(max_ts))
@@ -296,10 +298,10 @@ mod tests {
         let schema = batch.schema();
         let stream = futures::stream::iter(vec![Ok(batch)]);
 
-        let data_update = StreamingDataUpdate {
-            data: Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream)),
-            update_type: UpdateType::Append,
-        };
+        let data_update = StreamingDataUpdate::new(
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream)),
+            UpdateType::Append,
+        );
 
         // Run
         let (new_data_update, max_ts_arc_opt) = with_find_max_timestamp_in_stream(

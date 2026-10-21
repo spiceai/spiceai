@@ -25,6 +25,8 @@ mod distributed_iceberg;
 mod distributed_task_history;
 pub mod harness;
 mod in_memory_shuffle;
+mod instance_identity;
+mod io_wait_lending;
 mod job_store;
 #[cfg(not(target_os = "windows"))]
 mod scheduler_failover;

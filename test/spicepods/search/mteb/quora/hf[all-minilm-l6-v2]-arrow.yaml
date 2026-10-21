@@ -1,15 +1,21 @@
 version: v1
 kind: Spicepod
 name: hf[all-minilm-l6-v2]-arrow
+
+metadata:
+  benchmark_dataset: quora_retrieval
+
 datasets:
 
-  # MTEB Quora Retrieval dataset files (*.parquet) are automatically downloaded by the test operator.
-  # https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/tree/main
+  # MTEB Quora Retrieval, read straight from Hugging Face: https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2
 
-  - from: file:./corpus.parquet
+  - from: https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/resolve/main/corpus/test-00000-of-00001.parquet
     name: corpus
+    params:
+      file_format: parquet
     acceleration:
       enabled: true
+      engine: arrow
     columns:
       - name: text
         embeddings:
@@ -17,15 +23,21 @@ datasets:
             row_id:
               - _id
 
-  - from: file:./queries.parquet
+  - from: https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/resolve/main/queries/test-00000-of-00001.parquet
     name: test_queries
+    params:
+      file_format: parquet
     acceleration:
       enabled: true
+      engine: arrow
 
-  - from: file:./data.parquet
+  - from: https://huggingface.co/datasets/mteb/QuoraRetrieval_test_top_250_only_w_correct-v2/resolve/main/data/test-00000-of-00001.parquet
     name: relevance_data
+    params:
+      file_format: parquet
     acceleration:
       enabled: true
+      engine: arrow
 
 embeddings:
   - from: huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2

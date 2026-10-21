@@ -202,14 +202,32 @@ pub(crate) fn statistics_from_record_batches(
             let mut min_value = datafusion_common::stats::Precision::Absent;
             let mut max_value = datafusion_common::stats::Precision::Absent;
             let mut null_count = 0usize;
+            // A batch with a non-null value but no bound (a float column holding a
+            // NaN, say) leaves the bound unknown, rather than contributing nothing.
+            let mut unbounded = false;
 
             for batch in batches {
                 if col_idx >= batch.num_columns() || batch.num_rows() == 0 {
                     continue;
                 }
                 let col = batch.column(col_idx);
-                null_count += col.null_count();
+                // Logical nulls: a dictionary key that names a null value, or a `Null`
+                // column's rows, carry no null bit of their own.
+                let col_nulls = col.logical_null_count();
+                null_count += col_nulls;
+                if unbounded {
+                    continue;
+                }
                 let col_stats = ColumnStatsAccumulator::compute_column_stats(col.as_ref());
+                if col_nulls < col.len()
+                    && (col_stats.min_value.get_value().is_none()
+                        || col_stats.max_value.get_value().is_none())
+                {
+                    unbounded = true;
+                    min_value = datafusion_common::stats::Precision::Absent;
+                    max_value = datafusion_common::stats::Precision::Absent;
+                    continue;
+                }
                 min_value = merge_min(&min_value, &col_stats.min_value);
                 max_value = merge_max(&max_value, &col_stats.max_value);
             }
@@ -353,6 +371,59 @@ mod tests {
                 .is_none(),
             "re-inserted keys must not be pushed into NOT IN"
         );
+    }
+
+    /// A segment's null count is the column's logical nulls. A dictionary row whose key is
+    /// valid but whose dictionary value is null, and every row of a `Null`-typed column, is
+    /// null without a null bit of its own; counting only null bits reports none, and
+    /// `IS NULL` then prunes a segment that holds a matching row.
+    #[test]
+    fn segment_statistics_count_logical_nulls() {
+        use arrow::array::{ArrayRef, DictionaryArray, Int32Array, NullArray, StringArray};
+        use arrow::datatypes::Int32Type;
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("nothing", DataType::Null, true),
+        ]));
+        // Key 0 names the null dictionary value; key 1 names "x".
+        let tags = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![None, Some("x")])) as ArrayRef,
+        )
+        .expect("dictionary");
+        let segment = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(tags),
+                Arc::new(NullArray::new(2)),
+            ],
+        )
+        .expect("batch");
+        let stats = statistics_from_record_batches(&schema, &[segment]);
+        assert_eq!(
+            stats.column_statistics[1].null_count,
+            datafusion_common::stats::Precision::Exact(1)
+        );
+        assert_eq!(
+            stats.column_statistics[2].null_count,
+            datafusion_common::stats::Precision::Exact(2)
+        );
+        for column in ["tag", "nothing"] {
+            let predicate = build_listing_pruning_predicate(&schema, &[col(column).is_null()])
+                .expect("predicate")
+                .expect("some");
+            assert!(
+                !should_prune_statistics(&stats, &schema, &predicate),
+                "a segment holding a null {column} must be kept for {column} IS NULL"
+            );
+        }
     }
 
     #[test]

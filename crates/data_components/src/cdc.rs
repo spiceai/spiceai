@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 use std::{
+    collections::BTreeMap,
     fmt::Display,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -52,19 +53,172 @@ use snafu::prelude::*;
 /// in one process, and streams started *after* a shutdown capture the new
 /// epoch and are unaffected. A stream stops when the epoch advances past the
 /// value it captured at start.
-static CDC_SHUTDOWN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+///
+/// Carried by a `watch` channel rather than a bare atomic so a source can wait
+/// for the signal ([`shutdown_signalled`]) instead of polling for it.
+static CDC_SHUTDOWN_EPOCH: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::Sender::new(0));
 
 /// Signal every currently-running CDC source in the process to stop and
 /// release its upstream resources. Sources started afterwards are unaffected.
+///
+/// Signalling is half of a shutdown. A source that still has state to record —
+/// how far its accelerations were advanced — needs the process to stay up until
+/// it has recorded it, so the runtime follows this with [`drain_shutdown`] and
+/// waits for that before it closes the accelerations.
+///
+/// The epoch advances under the guard registry's lock, the lock
+/// [`ShutdownDrainGuard::hold`] reads the epoch and registers under, so a guard
+/// is always registered under the epoch that was current when it was counted.
+/// Without that, a guard could read the old epoch, lose the lock to this
+/// signal, and register after the drain had already found nothing to wait for —
+/// a source the signal reached, stopping and recording after the accelerations
+/// had closed, which is the missed flush the drain exists to prevent.
 pub fn begin_shutdown() {
-    CDC_SHUTDOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let _registry = SHUTDOWN_DRAIN.held.lock();
+    CDC_SHUTDOWN_EPOCH.send_modify(|epoch| *epoch += 1);
 }
 
 /// The current shutdown epoch. Long-running CDC sources capture this at
 /// stream start and stop once it changes.
 #[must_use]
 pub fn shutdown_epoch() -> u64 {
-    CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+    *CDC_SHUTDOWN_EPOCH.borrow()
+}
+
+/// Resolves once the shutdown epoch has advanced past `epoch`, the value the
+/// caller captured when it started — immediately, if it already has.
+///
+/// For a source to select against while it waits on its upstream or on its own
+/// delays ([`until_shutdown`]), so it stops as shutdown is signalled rather than
+/// at its next poll: the runtime is waiting for it ([`drain_shutdown`]), and
+/// every poll interval spent not noticing is added to the shutdown.
+pub async fn shutdown_signalled(epoch: u64) {
+    let mut epochs = CDC_SHUTDOWN_EPOCH.subscribe();
+    // `wait_for` checks the current value before waiting, so a shutdown signalled
+    // between the caller's capture and this call is not missed. The sender is a
+    // static that is never dropped, so the only `Err` this can return needs that
+    // to change — treated as signalled rather than as a wait that can never end.
+    let _ = epochs.wait_for(|current| *current != epoch).await;
+}
+
+/// Run `wait` to completion unless shutdown is signalled first.
+///
+/// For a source's own delays — a reconnect backoff, a poll interval — which
+/// would otherwise hold the source, and the runtime waiting for it, until they
+/// elapse. The caller re-checks the epoch afterwards either way.
+pub async fn until_shutdown<F: Future<Output = ()>>(epoch: u64, wait: F) {
+    tokio::select! {
+        () = wait => {}
+        () = shutdown_signalled(epoch) => {}
+    }
+}
+
+/// The [`ShutdownDrainGuard`]s alive, counted by the shutdown epoch each
+/// holder captured, and a wakeup for when one is dropped.
+struct ShutdownDrain {
+    held: Mutex<BTreeMap<u64, usize>>,
+    released: tokio::sync::Notify,
+}
+
+static SHUTDOWN_DRAIN: ShutdownDrain = ShutdownDrain {
+    held: Mutex::new(BTreeMap::new()),
+    released: tokio::sync::Notify::const_new(),
+};
+
+/// Holds the process's shutdown open for a CDC source that records state on its
+/// way out.
+///
+/// The shared `PostgreSQL` and `MySQL` pumps persist how far each of their
+/// accelerations has been advanced when they stop: a source's acknowledgement
+/// moves on every keepalive, while the recorded position follows on a timer,
+/// and the stop is what reconciles the two. [`begin_shutdown`] alone does not
+/// give them the chance: without a wait, the runtime closes the accelerations
+/// those positions are written into and exits within milliseconds of the signal,
+/// the recorded position is left behind the acknowledged one, and the next start
+/// reads that as changes acknowledged but never applied and rebuilds the
+/// acceleration from the source (#14523). A pump holds one of these for its
+/// whole life, and [`drain_shutdown`] waits until every guard has been dropped.
+///
+/// The guard captures the shutdown epoch when it is taken, and that is the
+/// epoch its holder stops on: a source started after a shutdown was signalled
+/// captures the newer epoch, is not stopped by that shutdown, and is not waited
+/// for by it either. The capture and the registration happen under the one
+/// lock [`begin_shutdown`] advances the epoch under, so the two cannot
+/// interleave: a guard is either counted by a signal or started after it.
+#[must_use = "the drain is held only while the guard is alive"]
+pub struct ShutdownDrainGuard {
+    epoch: u64,
+}
+
+impl ShutdownDrainGuard {
+    /// Hold the shutdown open until the guard is dropped. Take it before the
+    /// source's task is spawned, so a source the runtime has started but not
+    /// yet polled is already counted.
+    pub fn hold() -> Self {
+        let mut held = SHUTDOWN_DRAIN.held.lock();
+        // Read the epoch under the lock, not before taking it: see
+        // `begin_shutdown`, which advances it under the same lock.
+        let epoch = shutdown_epoch();
+        *held.entry(epoch).or_insert(0) += 1;
+        Self { epoch }
+    }
+
+    /// The shutdown epoch the holder captured, for it to stop on.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for ShutdownDrainGuard {
+    fn drop(&mut self) {
+        {
+            let mut held = SHUTDOWN_DRAIN.held.lock();
+            if let Some(count) = held.get_mut(&self.epoch) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(&self.epoch);
+                }
+            }
+        }
+        SHUTDOWN_DRAIN.released.notify_waiters();
+    }
+}
+
+/// How many guards are held by sources a shutdown has been signalled to: those
+/// whose captured epoch is older than the current one.
+fn signalled_guards_held() -> usize {
+    let held = SHUTDOWN_DRAIN.held.lock();
+    let current = shutdown_epoch();
+    held.range(..current).map(|(_, count)| count).sum()
+}
+
+/// Wait until every [`ShutdownDrainGuard`] held by a source the shutdown was
+/// signalled to has been dropped, or `timeout` has elapsed.
+///
+/// Returns how many such guards were still held when it gave up: `0` means every
+/// signalled source has finished recording, and the accelerations can be
+/// closed. Call it after [`begin_shutdown`]; a guard taken since then belongs
+/// to a source that shutdown did not stop, and is not waited for.
+pub async fn drain_shutdown(timeout: Duration) -> usize {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        // Register for the wakeup before reading the count, so a guard dropped
+        // between the read and the wait still wakes this: `notify_waiters`
+        // reaches only the waiters registered when it is called.
+        let released = SHUTDOWN_DRAIN.released.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if signalled_guards_held() == 0 {
+            return 0;
+        }
+        tokio::select! {
+            () = &mut released => {}
+            () = &mut deadline => return signalled_guards_held(),
+        }
+    }
 }
 
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
@@ -171,6 +325,12 @@ pub enum ChangeBatchError {
     DeferredBatchConsumed,
     #[snafu(display("Failed to build deferred change batch: {message}"))]
     DeferredBuild { message: String },
+    #[snafu(display(
+        "Cannot project change batch for index maintenance: unknown change operation '{op}'. \
+         An index cannot tell whether to add or remove the row, so it is not applied. This is a \
+         connector bug — the change stream emitted an operation code outside c/u/d/r/t"
+    ))]
+    UnknownOperation { op: String },
 }
 
 #[derive(Debug)]
@@ -375,6 +535,65 @@ pub struct LazyChangeBatch {
     /// it on an async task still occupies that worker for the build's duration —
     /// see the `build` doc — this just means the *lock* adds no await-blocking.)
     source: Mutex<Option<Box<dyn ChangeRows>>>,
+    /// Set by [`Self::prebuild`], which builds ahead of consumption. Boxed
+    /// so [`ChangeBatchError::Arrow`] is not laid out in every envelope —
+    /// an inline [`Prebuilt`] made the `ChangeSink` `Command::Apply` variant
+    /// trip `clippy::large_enum_variant`. See [`Prebuilt`].
+    prebuilt: Option<Box<Prebuilt>>,
+}
+
+/// What [`LazyChangeBatch::prebuild`] keeps from the source it consumed.
+struct Prebuilt {
+    /// The source's own answers to the no-build metadata queries. They keep
+    /// being served after the build, so every coalescing decision and metric
+    /// reads an envelope built ahead of consumption exactly as it would have
+    /// read it unbuilt, and a failed build loses none of them.
+    metadata: RowsMetadata,
+    /// The build's error, for [`LazyChangeBatch::into_built`] to return so the
+    /// consumer sees the error the build raised.
+    error: Option<ChangeBatchError>,
+}
+
+/// A [`ChangeRows`] source's answers to the no-build metadata queries.
+struct RowsMetadata {
+    is_empty: bool,
+    num_rows_hint: usize,
+    encoded_len: usize,
+    source_commit_ts_ms: Option<i64>,
+    is_heartbeat: bool,
+}
+
+impl RowsMetadata {
+    fn of(rows: &dyn ChangeRows) -> Self {
+        Self {
+            is_empty: rows.is_empty(),
+            num_rows_hint: rows.num_rows_hint(),
+            encoded_len: rows.encoded_len(),
+            source_commit_ts_ms: rows.source_commit_ts_ms(),
+            is_heartbeat: rows.is_heartbeat(),
+        }
+    }
+}
+
+/// An owned equivalent of a build error that has to stay with the batch: the
+/// same variant where its fields can be copied, else the same message.
+fn reported_again(error: &ChangeBatchError) -> ChangeBatchError {
+    match error {
+        ChangeBatchError::SchemaMismatch { detail, schema } => ChangeBatchError::SchemaMismatch {
+            detail: detail.clone(),
+            schema: Arc::clone(schema),
+        },
+        ChangeBatchError::DeferredBatchConsumed => ChangeBatchError::DeferredBatchConsumed,
+        ChangeBatchError::DeferredBuild { message } => ChangeBatchError::DeferredBuild {
+            message: message.clone(),
+        },
+        ChangeBatchError::UnknownOperation { op } => {
+            ChangeBatchError::UnknownOperation { op: op.clone() }
+        }
+        ChangeBatchError::Arrow { .. } => ChangeBatchError::DeferredBuild {
+            message: error.to_string(),
+        },
+    }
 }
 
 impl std::fmt::Debug for LazyChangeBatch {
@@ -392,6 +611,7 @@ impl LazyChangeBatch {
         Self {
             built: OnceLock::new(),
             source: Mutex::new(Some(source)),
+            prebuilt: None,
         }
     }
 
@@ -406,7 +626,35 @@ impl LazyChangeBatch {
         Self {
             built,
             source: Mutex::new(None),
+            prebuilt: None,
         }
+    }
+
+    /// Run the deferred build now, ahead of consumption. A built batch is
+    /// cached exactly as a first [`Self::get`] would cache it; a failure is
+    /// kept for [`Self::into_built`]. Either way the source's metadata is kept
+    /// (see [`Prebuilt`]). A no-op once built or consumed.
+    fn prebuild(&mut self) {
+        if self.built.get().is_some() {
+            return;
+        }
+        let Some(source) = self.source.get_mut().take() else {
+            return;
+        };
+        let metadata = RowsMetadata::of(source.as_ref());
+        let error = match source.build() {
+            Ok(batch) => {
+                let _ = self.built.set(batch);
+                None
+            }
+            // Keep the form both `get` and `into_built` will return: `get`
+            // clones via [`reported_again`], and an `Arrow` error cannot be
+            // cloned, so store that already-reported equivalent now. A
+            // borrowed lookup and a consuming one then cannot disagree on the
+            // variant for the same failed prebuild.
+            Err(e) => Some(reported_again(&e)),
+        };
+        self.prebuilt = Some(Box::new(Prebuilt { metadata, error }));
     }
 
     /// Return the built batch, running the deferred build on first access.
@@ -414,6 +662,9 @@ impl LazyChangeBatch {
     fn get(&self) -> Result<&ChangeBatch, ChangeBatchError> {
         if let Some(batch) = self.built.get() {
             return Ok(batch);
+        }
+        if let Some(error) = self.prebuilt.as_ref().and_then(|p| p.error.as_ref()) {
+            return Err(reported_again(error));
         }
         let mut source = self.source.lock();
         // Another caller may have built it while we waited on the lock.
@@ -450,6 +701,9 @@ impl LazyChangeBatch {
         if let Some(batch) = self.built.into_inner() {
             return Ok(batch);
         }
+        if let Some(error) = self.prebuilt.and_then(|p| p.error) {
+            return Err(error);
+        }
         let src = self
             .source
             .into_inner()
@@ -457,14 +711,18 @@ impl LazyChangeBatch {
         src.build()
     }
 
-    // No-build metadata accessors: read the built batch directly (lock-free) if
-    // present, else the not-yet-built source; the `default` covers the consumed
-    // state (post-failed-build). Kept as separate methods rather than a shared
+    // No-build metadata accessors: answer from what a build ahead of
+    // consumption kept, else the built batch directly (lock-free) if present,
+    // else the not-yet-built source; the `default` covers the consumed state
+    // (post-failed-build). Kept as separate methods rather than a shared
     // higher-order helper — the built and source branches borrow at different
     // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.is_empty;
+        }
         if let Some(b) = self.built.get() {
             return b.record.num_rows() == 0;
         }
@@ -481,6 +739,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn num_rows_hint(&self) -> usize {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.num_rows_hint;
+        }
         if let Some(b) = self.built.get() {
             return b.record.num_rows();
         }
@@ -492,6 +753,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn encoded_len(&self) -> usize {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.encoded_len;
+        }
         if let Some(b) = self.built.get() {
             return b.record.get_array_memory_size();
         }
@@ -503,6 +767,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.source_commit_ts_ms;
+        }
         if let Some(b) = self.built.get() {
             return b.source_commit_ts_ms();
         }
@@ -514,6 +781,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn is_heartbeat(&self) -> bool {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.is_heartbeat;
+        }
         if let Some(b) = self.built.get() {
             return b.is_heartbeat();
         }
@@ -675,8 +945,14 @@ impl ChangeEnvelope {
 
     /// Whether the change batch is already built, so [`Self::into_parts`]
     /// resolves without running a deferred build.
-    fn is_materialized(&self) -> bool {
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
         self.change_batch.is_materialized()
+    }
+
+    /// Run a deferred build now; see [`prebuild_offloaded`].
+    fn prebuild(&mut self) {
+        self.change_batch.prebuild();
     }
 
     #[must_use]
@@ -817,6 +1093,86 @@ pub async fn into_parts_offloaded_burst(
             .collect()
     })
     .await
+}
+
+/// Build a group of envelopes' deferred batches ahead of their consumption, on
+/// one blocking-pool handoff, and hand the group back in order.
+///
+/// For a reader that queues envelopes for a consumer still busy applying earlier
+/// ones: the build then overlaps that work instead of adding to it, and
+/// [`into_parts_offloaded_burst`] later finds the batches built. Each envelope
+/// keeps its build's outcome, so a failed build is returned by
+/// [`ChangeEnvelope::into_parts`] with the error it raised, and keeps answering
+/// the no-build metadata queries as its source did. A group with nothing to
+/// build comes back untouched, without the handoff.
+///
+/// If the blocking task itself fails, the group is replaced by one envelope
+/// whose build fails with the reason, so the consumer stops the dataset as it
+/// would for any failed build. The group's committers are dropped unacked, so
+/// the source re-streams its changes.
+pub async fn prebuild_offloaded(
+    mut items: Vec<Result<ChangeEnvelope, StreamError>>,
+) -> Vec<Result<ChangeEnvelope, StreamError>> {
+    let needs_build = items.iter().any(|item| {
+        item.as_ref()
+            .is_ok_and(|envelope| !envelope.is_materialized())
+    });
+    if !needs_build {
+        return items;
+    }
+    match tokio::task::spawn_blocking(move || {
+        for envelope in items.iter_mut().flatten() {
+            envelope.prebuild();
+        }
+        items
+    })
+    .await
+    {
+        Ok(items) => items,
+        Err(join_err) => vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(FailedBuild {
+                message: format!("deferred CDC batch build task failed: {join_err}"),
+            }),
+            false,
+        ))],
+    }
+}
+
+/// Stands in for a group whose build [`prebuild_offloaded`] lost: it is not
+/// empty and not a heartbeat, so the consumer cannot skip it, and its build
+/// fails with the reason.
+struct FailedBuild {
+    message: String,
+}
+
+impl ChangeRows for FailedBuild {
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn num_rows_hint(&self) -> usize {
+        0
+    }
+
+    fn encoded_len(&self) -> usize {
+        0
+    }
+
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        None
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        false
+    }
+
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        DeferredBuildSnafu {
+            message: self.message,
+        }
+        .fail()
+    }
 }
 
 /// A [`CommitChange`] implementation that does nothing. Useful when emitting
@@ -1433,6 +1789,49 @@ impl ChangeBatch {
         Some(record_batch)
     }
 
+    /// Project this change batch into the operations an [`spice_table::Index`]
+    /// maintains: the upsert rows (create/update/read), the delete rows, and
+    /// whether the batch truncates — in original row order.
+    ///
+    /// `op` is the sole authority on what a row is (see [`Self::before_batch`]);
+    /// an unknown op is a typed error rather than a guess, because misclassifying
+    /// it would index a row that should be deleted, or the reverse.
+    ///
+    /// Rows are not coalesced per key: the upsert and delete rows keep their
+    /// original positions so the caller can materialize the upsert data and the
+    /// delete keys, and scatter the augmented output back into the full change
+    /// batch for the accelerator.
+    ///
+    /// # Errors
+    /// Returns [`ChangeBatchError::UnknownOperation`] for an op outside c/u/d/r/t.
+    pub fn index_change_set(&self) -> Result<IndexChangeSet, ChangeBatchError> {
+        let num_rows = self.record.num_rows();
+
+        let pk_columns: Arc<[String]> = if num_rows == 0 {
+            Arc::from(Vec::<String>::new())
+        } else {
+            Arc::from(self.primary_keys(0))
+        };
+
+        let mut truncated = false;
+        let mut upsert_rows: Vec<usize> = Vec::new();
+        let mut delete_rows: Vec<usize> = Vec::new();
+        for row in 0..num_rows {
+            match classify_op(&self.op(row))? {
+                RowClass::Upsert => upsert_rows.push(row),
+                RowClass::Delete => delete_rows.push(row),
+                RowClass::Truncate => truncated = true,
+            }
+        }
+
+        Ok(IndexChangeSet::new(
+            pk_columns,
+            Arc::from(upsert_rows),
+            Arc::from(delete_rows),
+            truncated,
+        ))
+    }
+
     /// Accepts both the base [`changes_schema`] and the before-image-carrying
     /// [`changes_schema_with_before`], so a source that gains before-images does
     /// not break consumers (or sources) that never had them.
@@ -1467,6 +1866,102 @@ impl ChangeBatch {
         }
 
         Ok(())
+    }
+}
+
+/// A CDC change batch split into the operations an `spice_table::Index`
+/// maintains: which rows to (re)index, which rows to delete, and whether to
+/// truncate.
+///
+/// It is pure *metadata*: the row positions of the upserts and the deletes, the
+/// primary-key columns, and the truncate flag. It holds no row data — the caller
+/// owns the change batch and materializes the upsert data and the delete keys
+/// from these indices, so there is one materialization site and upserts and
+/// deletes are described the same way.
+///
+/// Rows are partitioned by `op` — create/update/read are upserts, delete is a
+/// delete, truncate sets the flag — in the change batch's original row order,
+/// *not* coalesced per key: the upsert rows keep their positions so the augmented
+/// output can be scattered back into the full change batch for the accelerator.
+#[derive(Clone, Debug)]
+pub struct IndexChangeSet {
+    primary_key_columns: Arc<[String]>,
+    upsert_rows: Arc<[usize]>,
+    delete_rows: Arc<[usize]>,
+    truncated: bool,
+}
+
+impl IndexChangeSet {
+    /// Construct a change set from already-partitioned parts.
+    /// [`ChangeBatch::index_change_set`] is the sole caller.
+    #[must_use]
+    pub fn new(
+        primary_key_columns: Arc<[String]>,
+        upsert_rows: Arc<[usize]>,
+        delete_rows: Arc<[usize]>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            primary_key_columns,
+            upsert_rows,
+            delete_rows,
+            truncated,
+        }
+    }
+
+    /// The primary-key column names (uniform for the batch), for projecting the
+    /// delete rows down to the keys `Index::delete_by_keys` expects.
+    #[must_use]
+    pub fn primary_key_columns(&self) -> &Arc<[String]> {
+        &self.primary_key_columns
+    }
+
+    /// Original row indices of the upsert rows. The caller seeds the augmentation
+    /// accumulator by taking these rows from the change batch's data, and scatters
+    /// the augmented result back to these same positions.
+    #[must_use]
+    pub fn upsert_rows(&self) -> &Arc<[usize]> {
+        &self.upsert_rows
+    }
+
+    /// Original row indices of the delete rows. The caller takes these rows,
+    /// projected to [`Self::primary_key_columns`], as the delete keys.
+    #[must_use]
+    pub fn delete_rows(&self) -> &Arc<[usize]> {
+        &self.delete_rows
+    }
+
+    /// Whether the batch truncated the table (clear the index first).
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether this change set carries no index work at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.truncated && self.upsert_rows.is_empty() && self.delete_rows.is_empty()
+    }
+}
+
+/// How a change row maps onto the operation classes an index maintains.
+enum RowClass {
+    /// Create / Update / Read (snapshot): the after-image must be (re)indexed.
+    Upsert,
+    /// Delete: the key must be removed from the index.
+    Delete,
+    /// Truncate: the whole index must be cleared.
+    Truncate,
+}
+
+fn classify_op(op: &ChangeOperation) -> Result<RowClass, ChangeBatchError> {
+    match op {
+        ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
+            Ok(RowClass::Upsert)
+        }
+        ChangeOperation::Delete => Ok(RowClass::Delete),
+        ChangeOperation::Truncate => Ok(RowClass::Truncate),
+        ChangeOperation::Unknown(op) => UnknownOperationSnafu { op: op.clone() }.fail(),
     }
 }
 
@@ -1991,6 +2486,90 @@ mod tests {
         assert_eq!(data_column.len(), 3);
         assert_eq!(data_column.num_columns(), 2);
     }
+
+    /// A base-schema change batch whose single `id` column is both the primary
+    /// key and the data, one row per `(op, id)`.
+    fn keyed_change_batch(rows: &[(&str, i32)]) -> ChangeBatch {
+        use arrow_array::StructArray;
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let table = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let wrapper = changes_schema(&table);
+
+        let data = StructArray::from(vec![(
+            Arc::new(Field::new("id", DataType::Int32, true)),
+            Arc::new(Int32Array::from(
+                rows.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            )) as arrow_array::ArrayRef,
+        )]);
+
+        let mut pk_builder = ListBuilder::new(StringBuilder::new())
+            .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+        for _ in rows {
+            pk_builder.values().append_value("id");
+            pk_builder.append(true);
+        }
+
+        let record = RecordBatch::try_new(
+            Arc::new(wrapper),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(op, _)| *op).collect::<Vec<_>>(),
+                )),
+                Arc::new(pk_builder.finish()) as arrow_array::ArrayRef,
+                Arc::new(data),
+            ],
+        )
+        .expect("keyed change batch must match the base wrapper schema");
+        ChangeBatch::try_new(record).expect("keyed change batch should validate")
+    }
+
+    #[test]
+    fn index_change_set_splits_ops_by_operation() {
+        // create id=1, update id=2, delete id=3, create id=1 again.
+        let batch = keyed_change_batch(&[("c", 1), ("u", 2), ("d", 3), ("c", 1)]);
+        let cs = batch.index_change_set().expect("projection succeeds");
+
+        assert_eq!(
+            cs.primary_key_columns().as_ref(),
+            &["id".to_string()],
+            "primary key columns come from the change batch"
+        );
+
+        // Rows keep their original positions — not coalesced — so the
+        // create/update/create rows are the upserts and the delete row (index 2)
+        // is the delete. The caller materializes data and keys from these indices.
+        assert_eq!(cs.upsert_rows().as_ref(), &[0usize, 1, 3]);
+        assert_eq!(
+            cs.delete_rows().as_ref(),
+            &[2usize],
+            "only id=3 (row 2) deletes"
+        );
+        assert!(!cs.truncated());
+    }
+
+    #[test]
+    fn index_change_set_rejects_unknown_operation() {
+        let batch = keyed_change_batch(&[("x", 1)]);
+        let err = batch
+            .index_change_set()
+            .expect_err("an unknown op cannot be classified");
+        assert!(
+            matches!(err, ChangeBatchError::UnknownOperation { .. }),
+            "unknown op must be a typed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn index_change_set_projects_before_image_batches() {
+        // `before_image_batch`: row 0 create (id=1), row 1 update (id=2). Both are
+        // upserts; the before-image column does not change the projection.
+        let batch = before_image_batch();
+        let cs = batch.index_change_set().expect("projection succeeds");
+
+        assert_eq!(cs.upsert_rows().as_ref(), &[0usize, 1]);
+        assert!(cs.delete_rows().is_empty(), "no deletes in the batch");
+    }
 }
 
 #[cfg(test)]
@@ -2001,6 +2580,7 @@ mod deferred_tests {
     //! empty batch) that converts to a `StreamError` for the dataset's stream.
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::error::ArrowError;
     use arrow_array::Int32Array;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2254,6 +2834,351 @@ mod deferred_tests {
         }
     }
 
+    // ----- build ahead of consumption -----
+
+    #[test]
+    fn prebuilt_stays_behind_a_pointer_so_the_arrow_error_is_not_in_every_envelope() {
+        // An inline `Option<Prebuilt>` on every `LazyChangeBatch` grew the
+        // ChangeSink `Command::Apply` variant past `clippy::large_enum_variant`
+        // (sign-off 37368765686). Boxing keeps unbuilt envelopes at the
+        // source-only size.
+        let lazy = std::mem::size_of::<LazyChangeBatch>();
+        let once = std::mem::size_of::<OnceLock<ChangeBatch>>();
+        let mutex = std::mem::size_of::<Mutex<Option<Box<dyn ChangeRows>>>>();
+        let boxed = std::mem::size_of::<Option<Box<Prebuilt>>>();
+        let inline = std::mem::size_of::<Option<Prebuilt>>();
+        assert!(
+            lazy <= once + mutex + boxed + 16,
+            "LazyChangeBatch is {lazy} bytes; boxed Prebuilt should keep it near {} \
+             (OnceLock {once} + Mutex {mutex} + pointer {boxed})",
+            once + mutex + boxed
+        );
+        assert!(
+            lazy < once + mutex + inline,
+            "LazyChangeBatch is {lazy} bytes; an inline Prebuilt would be at least {} \
+             and re-inflates Command::Apply",
+            once + mutex + inline
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prebuilt_envelopes_reach_the_consumer_built_once_and_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group: Vec<Result<ChangeEnvelope, StreamError>> = [1i32, 2, 3]
+            .into_iter()
+            .map(|rows| {
+                Ok(deferred(
+                    MockRows {
+                        result: Some(sample_batch(rows)),
+                        builds: Arc::clone(&builds),
+                        rows_hint: usize::try_from(rows).expect("positive row count"),
+                        empty: false,
+                        ts: None,
+                    },
+                    false,
+                ))
+            })
+            .collect();
+
+        let envelopes: Vec<ChangeEnvelope> = prebuild_offloaded(group)
+            .await
+            .into_iter()
+            .map(|item| item.expect("an envelope"))
+            .collect();
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert!(envelopes.iter().all(ChangeEnvelope::is_materialized));
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("prebuilt burst resolves");
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, _, _)| batch.record.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "group order must be preserved — committers pair with their batches"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            3,
+            "the consumer must not build a prebuilt envelope again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuilt_envelope_answers_metadata_as_its_source_did() {
+        // The source's hint (7) deliberately differs from the built batch's 3
+        // rows, and its encoded length (0) from the batch's Arrow size, so a
+        // metadata read served from the built batch would show.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![Ok(deferred(
+            MockRows {
+                result: Some(sample_batch(3)),
+                builds: Arc::clone(&builds),
+                rows_hint: 7,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        ))];
+
+        let envelope = prebuild_offloaded(group)
+            .await
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+
+        assert!(envelope.is_materialized());
+        assert_eq!(envelope.num_rows_hint(), 7);
+        assert_eq!(envelope.encoded_len(), 0);
+        assert_eq!(envelope.source_commit_ts_ms(), Some(42));
+        assert!(!envelope.is_empty());
+        assert!(!envelope.is_heartbeat());
+        assert_eq!(
+            envelope
+                .change_batch()
+                .expect("built batch")
+                .record
+                .num_rows(),
+            3
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_prebuild_fails_the_consumer_with_the_build_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![Ok(deferred(
+            MockRows {
+                result: None, // build fails
+                builds: Arc::clone(&builds),
+                rows_hint: 5,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        ))];
+
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(!envelope.is_materialized());
+        assert!(
+            !envelope.is_empty() && !envelope.is_heartbeat(),
+            "a failed envelope must not read as skippable"
+        );
+        assert_eq!(
+            (envelope.num_rows_hint(), envelope.source_commit_ts_ms()),
+            (5, Some(42)),
+            "a failed build keeps its source's metadata"
+        );
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        assert!(
+            matches!(
+                &borrowed,
+                ChangeBatchError::DeferredBuild { message } if message == "mock build failure"
+            ),
+            "expected the build's own error, not the consumed source, got {borrowed:?}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => assert!(
+                matches!(
+                    &err,
+                    ChangeBatchError::DeferredBuild { message } if message == "mock build failure"
+                ),
+                "expected the build's own error, not the consumed source, got {err:?}"
+            ),
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "no second build");
+    }
+
+    /// A [`ChangeRows`] whose build fails as [`ChangeBatchError::Arrow`], the
+    /// variant [`reported_again`] cannot clone by value.
+    struct ArrowFailingRows;
+
+    impl ChangeRows for ArrowFailingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            Err(ChangeBatchError::Arrow {
+                source: ArrowError::ExternalError(Box::new(std::io::Error::other(
+                    "synthetic arrow failure",
+                ))),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuild_arrow_failure_is_the_same_variant_on_borrow_and_consume() {
+        let group = vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(ArrowFailingRows),
+            false,
+        ))];
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        let ChangeBatchError::DeferredBuild {
+            message: borrowed_message,
+        } = &borrowed
+        else {
+            panic!("borrowed lookup must report DeferredBuild, got {borrowed:?}");
+        };
+        assert!(
+            borrowed_message.contains("synthetic arrow failure"),
+            "borrowed error must keep the build's cause, got {borrowed_message}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => {
+                let ChangeBatchError::DeferredBuild { message } = &err else {
+                    panic!("consuming lookup must report the same DeferredBuild, got {err:?}");
+                };
+                assert_eq!(
+                    message, borrowed_message,
+                    "borrowed and consuming lookups must report the same error"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prebuild_keeps_eager_envelopes_and_stream_errors_in_place() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![
+            Ok(ChangeEnvelope::new(
+                Box::new(NoOpCommitter),
+                sample_batch(2),
+                false,
+            )),
+            Err(StreamError::External("transient".to_string())),
+            Ok(deferred(
+                MockRows {
+                    result: Some(sample_batch(3)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 3,
+                    empty: false,
+                    ts: None,
+                },
+                true,
+            )),
+        ];
+
+        let group = prebuild_offloaded(group).await;
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(group.len(), 3);
+        assert!(matches!(&group[1], Err(StreamError::External(m)) if m == "transient"));
+        assert_eq!(
+            group
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .map(|e| (e.num_rows_hint(), e.is_materialized(), e.is_dataset_ready()))
+                .collect::<Vec<_>>(),
+            vec![(2, true, false), (3, true, true)]
+        );
+    }
+
+    /// A [`ChangeRows`] whose build panics, to lose the blocking build task.
+    struct PanickingRows;
+
+    impl ChangeRows for PanickingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            panic!("build panicked");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_prebuild_task_fails_the_consumer_instead_of_dropping_the_group() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![
+            Ok(deferred(
+                MockRows {
+                    result: Some(sample_batch(1)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            )),
+            Ok(ChangeEnvelope::new_from_rows(
+                Box::new(NoOpCommitter),
+                Box::new(PanickingRows),
+                false,
+            )),
+        ];
+
+        let group = prebuild_offloaded(group).await;
+        assert_eq!(group.len(), 1, "the lost group is replaced by one envelope");
+        let envelopes: Vec<ChangeEnvelope> = group
+            .into_iter()
+            .map(|item| item.expect("an envelope"))
+            .collect();
+        assert!(
+            envelopes
+                .iter()
+                .all(|e| !e.is_no_op_heartbeat() && !e.is_empty()),
+            "the consumer must not be able to strip or skip it"
+        );
+
+        match into_parts_offloaded_burst(envelopes).await {
+            Ok(_) => panic!("a lost prebuild must fail the consumer"),
+            Err(err) => assert!(
+                matches!(
+                    &err,
+                    ChangeBatchError::DeferredBuild { message }
+                        if message.starts_with("deferred CDC batch build task failed")
+                ),
+                "expected the lost build's reason, got {err:?}"
+            ),
+        }
+    }
+
     // ----- lag-based readiness helpers -----
 
     #[test]
@@ -2452,5 +3377,134 @@ mod deferred_tests {
             "wrappers that rewrite `data` must keep the listing-rebuild flag"
         );
         assert_eq!(replaced.source_commit_ts_ms(), Some(1_700_000_000_000));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_drain_tests {
+    use super::*;
+
+    /// One test rather than several: the guard count and the epoch are
+    /// process-wide, so the phases must run in sequence, not in parallel with
+    /// each other.
+    #[tokio::test]
+    async fn drain_waits_for_the_signalled_guards_and_reports_what_it_gave_up_on() {
+        assert_eq!(
+            drain_shutdown(Duration::from_secs(1)).await,
+            0,
+            "nothing held: returns at once"
+        );
+
+        let epoch = shutdown_epoch();
+        let first = ShutdownDrainGuard::hold();
+        let second = ShutdownDrainGuard::hold();
+        assert_eq!(
+            first.epoch(),
+            epoch,
+            "a guard captures the epoch it is taken at"
+        );
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            0,
+            "no shutdown has been signalled to the holders, so there is nothing to wait for"
+        );
+
+        // Signal: a source that was waiting for it wakes, and the two guards
+        // taken before it now hold the drain.
+        let waiter = tokio::spawn(shutdown_signalled(epoch));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "nothing has been signalled yet");
+        begin_shutdown();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("signalled promptly")
+            .expect("waiter task");
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            2,
+            "gave up with both signalled guards held"
+        );
+
+        // A source started after the signal captures the new epoch: it is not
+        // stopped by that shutdown, and not waited for by it.
+        let later = shutdown_epoch();
+        assert!(later > epoch, "the epoch advanced");
+        let unaffected = ShutdownDrainGuard::hold();
+        assert_eq!(unaffected.epoch(), later);
+        let later_waiter = tokio::spawn(shutdown_signalled(later));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!later_waiter.is_finished(), "a later source is unaffected");
+        later_waiter.abort();
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            2,
+            "a guard taken after the signal is not counted"
+        );
+
+        drop(first);
+        assert_eq!(
+            drain_shutdown(Duration::from_millis(50)).await,
+            1,
+            "gave up with one signalled guard held"
+        );
+
+        let drained = tokio::spawn(drain_shutdown(Duration::from_secs(10)));
+        // Time is what is under test here: the drain must still be waiting after a
+        // delay long enough for it to have returned if it were not.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !drained.is_finished(),
+            "must wait while a signalled guard is held"
+        );
+        drop(second);
+        assert_eq!(
+            drained.await.expect("drain task"),
+            0,
+            "released by the last signalled guard's drop"
+        );
+        drop(unaffected);
+
+        // A delay races the signal, not the other way round.
+        let started = std::time::Instant::now();
+        until_shutdown(epoch, tokio::time::sleep(Duration::from_secs(30))).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an already-signalled shutdown cuts the delay short"
+        );
+
+        // Registration and the signal are serialized (regression test for the
+        // interleaving raised on #14702): a guard taken while a shutdown is being
+        // signalled registers under the epoch the signal leaves behind, so the
+        // drain that follows the signal counts every source it reached. Hold the
+        // registry's lock from here, so both a signal and a registration started
+        // now have to wait for it; then advance the epoch underneath the waiting
+        // registration, which must read the epoch only once it holds the lock.
+        let before = shutdown_epoch();
+        let registry = SHUTDOWN_DRAIN.held.lock();
+        let signal = std::thread::spawn(begin_shutdown);
+        let registration = std::thread::spawn(ShutdownDrainGuard::hold);
+        // Time is under test: both threads must still be waiting after a delay
+        // long enough for either to have finished if it did not take the lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !signal.is_finished(),
+            "begin_shutdown must wait for the guard registry's lock"
+        );
+        assert!(
+            !registration.is_finished(),
+            "hold must wait for the guard registry's lock"
+        );
+        // The test's own advance, bypassing the lock it is itself holding.
+        CDC_SHUTDOWN_EPOCH.send_modify(|current| *current += 1);
+        drop(registry);
+        signal.join().expect("signal thread");
+        let registered = registration.join().expect("registration thread");
+        assert!(
+            registered.epoch() > before,
+            "a registration that waited for the lock captures the epoch current once it holds \
+             it ({} > {before}), never one read before the wait",
+            registered.epoch()
+        );
+        drop(registered);
     }
 }

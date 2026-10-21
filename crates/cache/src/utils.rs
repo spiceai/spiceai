@@ -255,9 +255,10 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 /// `read_started_at` is when the query began, and is recorded on the entry so
 /// every later cache hit can check it — see
 /// [`QueryResultsCacheProvider::tables_changed_since`], which documents why
-/// the comparison is deliberately conservative. It must be the start of the
-/// read, not the moment the result is stored: a change landing in between has
-/// to disqualify the entry as fresh too.
+/// the comparison is deliberately conservative. It must be no later than the
+/// start of the read, not the moment the result is stored: a change landing in
+/// between has to disqualify the entry. The same instant anchors the entry's TTL
+/// and stale window.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
@@ -344,7 +345,7 @@ pub fn to_cached_record_batch_stream(
                 // Not the guard — correctness comes from the check every cache
                 // hit performs. This only skips encoding an unservable result.
                 tracing::debug!(
-                    "A table read by this query changed while it ran and no stale-while-revalidate window could serve the result, skipping cache storage"
+                    "Query result is invalidated or past its TTL and stale window, skipping cache storage"
                 );
             } else if !batches_cacheable(&records) {
                 tracing::debug!(
@@ -418,7 +419,7 @@ pub fn to_cached_record_batch_stream(
 ///
 /// The set must be complete: it is what
 /// [`crate::TabledCacheProvider::invalidate_for_table`] matches on, so a table
-/// missing here yields a cache entry that no refresh and no DML can ever evict,
+/// missing here yields a cache entry that no mutation can evict,
 /// and stale rows are served as fresh hits until `item_ttl` expires.
 ///
 /// Traversal therefore uses [`LogicalPlan::apply_with_subqueries`] rather than
@@ -807,7 +808,7 @@ pub(crate) mod tests {
             .expect("table_names should match expected for JOIN with subquery in FROM clause");
     }
 
-    fn create_session_context() -> SessionContext {
+    pub(crate) fn create_session_context() -> SessionContext {
         let config = SessionConfig::new().with_information_schema(true);
         let ctx = SessionContext::new_with_config(config);
         register_tables(&ctx);
@@ -946,42 +947,23 @@ pub(crate) mod tests {
         );
     }
 
-    /// Regression test for #14686: inside a stale window, a result overtaken
-    /// during its read is stored and served stale.
+    /// A stale window does not admit a result invalidated during its read.
     #[tokio::test]
-    async fn to_cached_record_batch_stream_keeps_result_invalidated_during_read_inside_a_stale_window()
-     {
+    async fn to_cached_record_batch_stream_rejects_invalidated_results_with_a_stale_window() {
         let provider = test_cache_provider_with_stale_window("5m");
-        let key = RawCacheKey::new(5);
-        let read_started_at = std::time::Instant::now();
-
+        let read = std::time::Instant::now();
         provider
             .invalidate_for_table(TableReference::bare("customer"))
             .await
-            .expect("invalidation should succeed");
-
-        drain_through_cache(
-            &provider,
-            key,
-            HashSet::from([TableReference::bare("customer")]),
-            read_started_at,
-        )
-        .await;
-
-        let (entry, validity) = provider
-            .get_raw_key_with_validity(&key)
-            .await
-            .expect("cache access should succeed")
-            .expect("the result must be stored inside the stale window");
-        assert_eq!(validity, crate::EntryValidity::StaleWhileRevalidate);
-        assert_eq!(entry.read_started_at, read_started_at);
+            .expect("invalidate table");
         assert!(
-            provider
-                .get_raw_key(&key)
-                .await
-                .expect("cache access should succeed")
-                .is_none(),
-            "a result overtaken by a change must never be served as fresh"
+            !stored_after_drain(
+                &provider,
+                RawCacheKey::new(5),
+                HashSet::from([TableReference::bare("customer")]),
+                read
+            )
+            .await
         );
     }
 

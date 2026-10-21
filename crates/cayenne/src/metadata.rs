@@ -360,7 +360,8 @@ pub enum SortColumnsOrigin {
 }
 
 /// Which compression strategy the table's FULL encoding tier uses — i.e.
-/// maintenance writes (compaction outputs, rewrites, overwrites) and delta
+/// maintenance writes (compaction outputs, rewrites, overwrites, a load into
+/// an empty table) and delta
 /// writes that resolve to a full level (`7..=10`, or `auto` on large /
 /// unknown-size writes). Light delta levels (`0..=6`) are a fixed
 /// `BtrBlocks`-subset effort ladder and are not affected by this choice.
@@ -393,8 +394,8 @@ pub enum CompressionStrategy {
 ///   pre-feature write behavior (`7` is the explicit opt-out of `auto`;
 ///   `8`–`10` are reserved for future heavier-effort search).
 ///
-/// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
-/// NOT affected by this setting — they always use the full default encoding,
+/// Maintenance writes (compaction outputs, sorted rewrites, overwrites, and a
+/// load into an empty table) are NOT affected by this setting — they always use the full default encoding,
 /// because their output is the long-lived artifact whose encoding quality
 /// pays for scan throughput and storage footprint.
 ///
@@ -516,13 +517,22 @@ impl PkConflictDetection {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DeletionMode {
-    /// Resolve the mode from the table's configuration (the default). `Auto`
-    /// resolves to [`Self::Position`] — the merge-on-read path — for every table:
-    /// a primary-key table captures positions via the `row_idx()` read-back
-    /// (with key-based fallback for not-yet-captured rows), and a PK-less table
-    /// uses the long-standing `PositionBased` strategy. The presence of a primary
-    /// key selects the *mechanism*; the resolved *mode* is position either way.
-    /// Use [`Self::Key`] to explicitly opt out. See [`Self::resolved`].
+    /// Let Cayenne choose (the default). On a table with a primary key, `Auto`
+    /// keeps [`Self::Position`] deletes while the table is small enough to
+    /// reclaim them by rewriting it whole — at most 1/32 of the target file
+    /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
+    /// deletes once it outgrows that. The switch holds until the table is next
+    /// opened, which sizes it again. On a runtime with fewer than 8 physical CPU
+    /// cores, or not on Linux, an `Auto` table keeps key deletes from the start
+    /// ([`VortexConfig::auto_keeps_key_deletes`]); it is still `Auto`, so it still
+    /// reclaims, by its paced whole-table rewrite, deletes of rows the bake
+    /// cannot reach. A table on object storage, in `mode: memory`, partitioned,
+    /// or with a cold tier uses key deletes throughout, as does a
+    /// `refresh_mode: changes` table, which the accelerator pins to [`Self::Key`].
+    /// While it uses position deletes, `Auto` rewrites alongside writers rather
+    /// than holding them off, and folds a key repeated within one write out of
+    /// the files as key mode does. A table without a primary key has no key to
+    /// record and always uses position deletes. See [`Self::resolved`].
     #[default]
     Auto,
     /// Record deletions by primary-key bytes + sequence number and apply them
@@ -539,6 +549,19 @@ pub enum DeletionMode {
     /// (cold-rebuilt keysets, over-budget bloom tables, inlined rows) fall back
     /// to the `Key` path, so a table can mix both within one snapshot.
     Position,
+}
+
+/// What a [`DeletionMode`] means for one table once its primary key is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedDeletionMode {
+    /// Key deletes.
+    Key,
+    /// Position deletes, falling back to key deletes for rows whose position is
+    /// unknown.
+    Position,
+    /// `auto` on a primary-key table: position deletes while the table is small
+    /// enough to rewrite whole, key deletes once it is not.
+    Adaptive,
 }
 
 impl DeletionMode {
@@ -563,46 +586,24 @@ impl DeletionMode {
         }
     }
 
-    /// Resolve `Auto` against the table's configuration, returning a concrete
-    /// [`Self::Key`] or [`Self::Position`].
+    /// Resolve the mode for a table, given whether it has a primary key.
     ///
-    /// `Auto` resolves to **position** — the merge-on-read path that pushes
-    /// per-file position deletes into the Vortex scan. For a table **with** a
-    /// primary key, positions are captured by the `row_idx()` read-back after
-    /// each write (and any row whose position isn't yet known falls back to a
-    /// key-based delete, so this is always correct — under bursty back-to-back
-    /// writes the capture may not have run yet and the key path is used); for a
-    /// table **without** a primary key it is the long-standing `PositionBased`
-    /// strategy. So the *mechanism* is chosen by the presence of a PK, but the
-    /// resolved *mode* is position either way.
+    /// [`Self::Key`] is only honored when there is a key to record; a table
+    /// without a primary key resolves every mode to position deletes. On a table
+    /// with a primary key, [`Self::Auto`] resolves to
+    /// [`ResolvedDeletionMode::Adaptive`]: the table chooses as it grows (see
+    /// [`Self::Auto`]).
     ///
-    /// NOTE: the Spice accelerator's auto-tune layer pre-resolves `Auto` to
-    /// [`Self::Key`] for `refresh_mode: changes` (CDC) tables that have a
-    /// primary key BEFORE the config reaches this engine-level resolution —
-    /// position-delete compaction must serialize with writers and starves
-    /// under continuous CDC, while key-delete compaction runs concurrently.
-    /// This function therefore only sees `Auto` for non-CDC tables (and PK-less
-    /// CDC tables), where position remains the right resolution.
-    ///
-    /// `Key` is the explicit opt-out (apply deletes above the scan). It only has
-    /// meaning with a PK; a PK-less table can only do position-based deletion, so
-    /// `Key` there resolves to `Position`.
+    /// The accelerator pins `Auto` to [`Self::Key`] before the table opens for a
+    /// `refresh_mode: changes` table with a primary key and for a table with a
+    /// datalake tier, so neither reaches the adaptive resolution.
     #[must_use]
-    pub const fn resolved(self, has_primary_key: bool) -> Self {
+    pub const fn resolved(self, has_primary_key: bool) -> ResolvedDeletionMode {
         match self {
-            // `Key` is only honored when there is a key to record.
-            Self::Key if has_primary_key => Self::Key,
-            // Everything else is position-based: `Auto` and `Position` always,
-            // and `Key` on a PK-less table (there is no key to record).
-            Self::Auto | Self::Position | Self::Key => Self::Position,
+            Self::Key if has_primary_key => ResolvedDeletionMode::Key,
+            Self::Auto if has_primary_key => ResolvedDeletionMode::Adaptive,
+            Self::Auto | Self::Position | Self::Key => ResolvedDeletionMode::Position,
         }
-    }
-
-    /// Whether this mode (already resolved via [`Self::resolved`]) records and
-    /// applies deletions as per-file row positions.
-    #[must_use]
-    pub const fn is_position(self) -> bool {
-        matches!(self, Self::Position)
     }
 }
 
@@ -826,9 +827,9 @@ pub struct VortexConfig {
     /// ranks BELOW the hot filter columns actually observed on scans, so the
     /// default-on adaptive layout can override a guess with evidence.
     ///
-    /// Deliberately NOT compared by `configuration_matches`: it is provenance
-    /// about a value, not a data-affecting field. Comparing it would make every
-    /// existing table look config-changed on upgrade and trip the recreate path.
+    /// Persisted with `sort_columns` when a reopened table takes the requested
+    /// layout settings in place, but never reported as a changed setting: it is
+    /// provenance about a value, not a setting an operator configures.
     #[serde(default)]
     pub sort_columns_origin: SortColumnsOrigin,
     /// Columns to hash-cluster rows by during intra-write sharding (the parallel
@@ -844,8 +845,9 @@ pub struct VortexConfig {
     /// `auto` (default) encodes every delta light (deltas are transient and
     /// folded into properly-encoded files by compaction); explicit `0..=10`
     /// pins the level (`7` = the full default cascade, the pre-feature
-    /// behavior). Maintenance writes (compaction, rewrites) always use the full
-    /// default encoding. See [`DeltaEncoding`].
+    /// behavior). Maintenance writes (compaction, rewrites, overwrites, a load
+    /// into an empty table) always use the full default encoding. See
+    /// [`DeltaEncoding`].
     #[serde(default)]
     pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
@@ -972,13 +974,22 @@ pub struct VortexConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_keyset_cache_mb: Option<usize>,
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// Defaults to [`DeletionMode::Auto`], which resolves to `position`
-    /// (merge-on-read): deletes are pushed into the Vortex scan as per-file
-    /// row-position bitmaps, eliminating the per-row `RowConverter` deletion tax
-    /// above the scan. Set `cayenne_deletion_mode: key` to opt out and keep the
-    /// above-scan key-based filter.
+    /// Defaults to [`DeletionMode::Auto`], which keeps a PK table on position
+    /// deletes while it is small enough to reclaim them by rewriting it whole and
+    /// moves it to key deletes once it outgrows that; a PK-less table always uses
+    /// position deletes. `key` and `position` pin the mode.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Whether `deletion_mode: auto` keeps key deletes from the start on this
+    /// runtime. The accelerator and the Cayenne catalog set it where `auto` may not
+    /// keep a small table compacted whole alongside its writes: with fewer than 8
+    /// physical CPU cores, or not on Linux
+    /// ([`crate::auto_keeps_small_tables_compacted`]). Such a table is still
+    /// `auto`, as one past its bound is, so it still reclaims, by the paced
+    /// whole-table rewrite, deletes of rows the bake cannot reach. Never stored
+    /// with the table, so a table chooses again wherever it next opens.
+    #[serde(skip)]
+    pub auto_keeps_key_deletes: bool,
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
     /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
     /// data files are ever written (checkpoint + compaction disabled), it is
@@ -1071,8 +1082,8 @@ pub struct VortexConfig {
     #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
     pub cdc_mem_tier_seal_age_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
-    /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
-    /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
+    /// the runtime-wide `runtime.adaptive_tuning` mode: `disabled` (default) → `false` (static derivation
+    /// only); `enabled` → `true` (static warm-start + the closed loop). When on,
     /// a per-table controller measures the CDC ingest rate *and the runtime's
     /// whole-system response* (apply latency vs offered load, read amplification
     /// that slows queries, cgroup-aware memory pressure) and nudges the safe
@@ -1113,17 +1124,22 @@ pub struct VortexConfig {
     /// (`append_new_columns` / `sync_all_columns`); the default
     /// [`SchemaEvolutionMode::Disabled`] keeps the legacy pin-stored-schema
     /// behavior verbatim (`on_schema_change: block`/`fail`, or omitted).
-    /// Runtime-only — never compared by `configuration_matches`.
+    /// Runtime-only — never compared against a reopened table's stored settings.
     #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
     pub schema_evolution: SchemaEvolutionMode,
+    /// What opening an existing table does when a setting that defines its stored
+    /// rows differs from the requested one; see [`SettingsChangeAction`]. Runtime-only
+    /// — `#[serde(skip)]`, never persisted and never compared.
+    #[serde(skip)]
+    pub settings_change: SettingsChangeAction,
     /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
-    /// `cayenne_goal_*` params. A goal declares a target, not a controller, so it
+    /// `runtime.params.target_*` params. A goal declares a target, not a controller, so it
     /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
-    /// accelerator warns). Runtime-only — never compared by
-    /// `configuration_matches` (does not affect data layout).
+    /// accelerator warns). Runtime-only — never compared against a reopened
+    /// table's stored settings (does not affect data layout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_replication_lag_secs: Option<f64>,
     /// Freshness goal target in seconds (age of the newest queryable data).
@@ -1143,7 +1159,7 @@ pub struct VortexConfig {
     /// and mapped from the runtime's acceleration storage class. A slow tier
     /// (EBS / object store / undetected) biases the tuner toward fewer, larger
     /// files. Detected runtime fact — `#[serde(skip)]` (never a spicepod knob,
-    /// never compared by `configuration_matches`).
+    /// never compared against a reopened table's stored settings).
     #[serde(skip)]
     pub data_storage_class: StorageClass,
     /// Storage medium of the METASTORE (where publish commits + inline re-reads
@@ -1197,9 +1213,9 @@ pub struct VortexConfig {
     /// Absolute object-store URL prefix for the cold tier (e.g.
     /// `s3://bucket/prefix`). `None`/empty (the default) disables the cold tier.
     /// Set from the `cayenne_datalake_location` spicepod param. Persisted so a
-    /// reopened table knows where its cold files live; NOT compared by
-    /// `configuration_matches`, so toggling it never recreates the table (the
-    /// cold tier is a strict superset of behavior over an unchanged warm tier).
+    /// reopened table knows where its cold files live; a change is applied to
+    /// the table in place rather than rebuilding it (the cold tier is a strict
+    /// superset of behavior over an unchanged warm tier).
     pub cold_tier_location: Option<String>,
     /// Hilbert-clustering key columns for warm and datalake files.
     /// Empty leaves layout selection to the existing automatic policy. Set from
@@ -1300,6 +1316,33 @@ impl SchemaEvolutionMode {
             SchemaEvolutionMode::Widen => true,
         }
     }
+}
+
+/// What opening an existing table does when a setting that defines its stored rows —
+/// its primary key, effective `on_conflict`, partition column, location, or a
+/// `pk_conflict_detection` that would start enforcing keys the rows were not written
+/// under — differs from the requested one. Those settings cannot be applied to stored
+/// rows in place; layout settings (sort order, clustering, encoding) always can, and
+/// are applied whatever this says.
+///
+/// Set by the runtime accelerator from the dataset's storage and refresh modes, and
+/// never persisted: it describes what the caller can afford to lose, not the table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettingsChangeAction {
+    /// Keep the settings the table was built with and warn that the requested ones do
+    /// not take effect. Right whenever the table can hold rows a reload from the source
+    /// would not bring back.
+    #[default]
+    KeepStored,
+    /// Keep the settings the table was built with while its source cannot be read on
+    /// the table's schema — unreachable, or with a schema change the runtime holds back:
+    /// a rebuilt table could not reload until it can. Warns why, and how to let the
+    /// rebuild happen.
+    HoldUntilSourceReadable,
+    /// Refuse to open the table with
+    /// [`crate::catalog::CatalogError::SettingsChangeRequiresRebuild`], so the caller
+    /// drops it and creates it again with the requested settings.
+    Rebuild,
 }
 
 fn default_concurrency() -> usize {
@@ -1559,6 +1602,7 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            auto_keeps_key_deletes: false,
             memory_mode: false,
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
@@ -1573,6 +1617,7 @@ impl Default for VortexConfig {
             // manifest is a dual-source supplement until proven complete.
             scan_from_manifest: false,
             schema_evolution: SchemaEvolutionMode::default(),
+            settings_change: SettingsChangeAction::default(),
             goal_replication_lag_secs: None,
             goal_freshness_secs: None,
             goal_query_latency_ms: None,
@@ -1602,7 +1647,33 @@ impl Default for VortexConfig {
     reason = "these tests assert the defaults against the host the test process sees, which is the value the budget resolves to when nothing is configured"
 )]
 mod tests {
-    use super::{PkConflictDetection, ScanConcurrency, VortexConfig};
+    use super::{DeletionMode, PkConflictDetection, ScanConcurrency, VortexConfig};
+
+    #[test]
+    fn test_deletion_mode_resolved() {
+        use super::ResolvedDeletionMode;
+        assert_eq!(
+            DeletionMode::Auto.resolved(true),
+            ResolvedDeletionMode::Adaptive
+        );
+        assert_eq!(
+            DeletionMode::Auto.resolved(false),
+            ResolvedDeletionMode::Position
+        );
+        assert_eq!(DeletionMode::Key.resolved(true), ResolvedDeletionMode::Key);
+        assert_eq!(
+            DeletionMode::Key.resolved(false),
+            ResolvedDeletionMode::Position
+        );
+        assert_eq!(
+            DeletionMode::Position.resolved(true),
+            ResolvedDeletionMode::Position
+        );
+        assert_eq!(
+            DeletionMode::Position.resolved(false),
+            ResolvedDeletionMode::Position
+        );
+    }
 
     /// `scan_concurrency` must survive a metastore round trip, and a config
     /// written before the field existed must still load.
@@ -2093,6 +2164,27 @@ pub struct TableStatistics {
     pub ndv_sketches: Option<Vec<u8>>,
 }
 
+/// A persisted secondary index run of a table, recorded in the metastore.
+///
+/// The run's bytes live in the table's object store at
+/// `<table>/_lookup_index/<index_key>/<run_name>`: the metastore records which
+/// runs exist, so opening a table reads the runs it lists rather than listing
+/// the directory, and a file the metastore does not list is an orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRunRecord {
+    /// Table the run indexes (`UUIDv7`).
+    pub table_id: String,
+    /// The index key's directory: a digest of the key's columns, their stored
+    /// types and the run format.
+    pub index_key: String,
+    /// The run's file name, a digest of its content.
+    pub run_name: String,
+    /// Rows the run indexes.
+    pub row_count: u64,
+    /// Size of the run's file.
+    pub size_bytes: u64,
+}
+
 /// A small batch of insert data inlined directly in the metastore.
 ///
 /// For streaming workloads that produce many tiny writes, storing data as
@@ -2179,6 +2271,8 @@ pub struct TableStorageStats {
     pub file_statistics_rows: i64,
     /// Re-insert records held in the metastore.
     pub insert_records: i64,
+    /// Registered persisted secondary-index runs.
+    pub index_run_rows: i64,
     /// Inline (level-0) data entries not yet checkpointed to Vortex files.
     pub inlined_entries: i64,
     /// Rows held in those inline entries.

@@ -361,6 +361,7 @@ pub async fn snapshot_before_recreate(
             tracing::debug!(dataset = %dataset_name, "No snapshot created before recreation");
         }
         Err(e) => {
+            metrics::record_snapshot_failure(dataset_name);
             tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create pre-recreation snapshot; proceeding with recreation");
         }
     }

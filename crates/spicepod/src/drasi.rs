@@ -214,11 +214,11 @@ pub enum OnDeliveryError {
 /// change-data-captured from an external source, so this is configured
 /// separately from a dataset's `drasi:` block.
 ///
-/// It deliberately has no `on_delivery_error`. That setting trades a CDC stall
-/// for zero loss, which works because an unacknowledged replication position
-/// replays. There is no such position here: these rows are the runtime's own
-/// telemetry, so delivery is queued per table, and an unreachable Drasi is
-/// counted and dropped rather than allowed to stall the writer.
+/// It deliberately has no `on_delivery_error` and rejects the field. There is
+/// no replication position to replay: these rows are the runtime's own
+/// telemetry, so delivery is always queued per table. An unreachable Drasi
+/// does not stall the writer. A change that cannot be delivered is retried
+/// from the dead-letter store, or counted and discarded when it cannot succeed.
 ///
 /// # Example
 ///
@@ -269,10 +269,14 @@ pub struct RuntimeDrasiTable {
 
     /// Columns that identify a row, used to derive the Drasi element id.
     ///
-    /// Defaults to the table's declared primary key. A table with neither — the
-    /// runtime's `metrics` table declares none — is refused rather than
-    /// forwarded under a synthesized id, which would publish a duplicate node
-    /// every time a delivery is retried.
+    /// Defaults to the table's declared primary key. A table with neither is
+    /// refused rather than forwarded under a synthesized id, which would
+    /// publish a duplicate node every time a delivery is retried.
+    ///
+    /// `runtime.metrics` declares no primary key. Key it by `time_unix_nano`,
+    /// `name`, and `series_id`. `series_id` is a scalar identity of the
+    /// attribute set, so series that share a name and an export time stay
+    /// distinct. The list-typed `attributes` column is not a key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key: Vec<String>,
 
@@ -310,7 +314,7 @@ tables:
     /// telemetry writer buys nothing, so the knob is not offered at all.
     #[test]
     fn runtime_block_rejects_on_delivery_error() {
-        yaml::from_str::<RuntimeDrasi>(
+        let err = yaml::from_str::<RuntimeDrasi>(
             r"
 source_id: spice-runtime
 on_delivery_error: block
@@ -319,6 +323,10 @@ tables:
 ",
         )
         .expect_err("on_delivery_error is not part of the runtime surface");
+        assert_eq!(
+            err.to_string(),
+            "unknown field `on_delivery_error`, expected one of `source_id`, `forwarding`, `tables`, `transport`, `params`"
+        );
     }
 
     /// Nothing is forwarded until a table is named.
@@ -336,13 +344,23 @@ tables:
 source_id: spice-runtime
 tables:
   - name: metrics
-    key: [time_unix_nano, name]
+    key: [time_unix_nano, name, series_id]
     labels: [Metric]
 ",
         )
         .expect("valid runtime drasi config");
 
-        assert_eq!(drasi.tables[0].key, vec!["time_unix_nano", "name"]);
+        assert_eq!(
+            drasi.tables[0].key,
+            vec!["time_unix_nano", "name", "series_id"]
+        );
+        assert!(
+            !drasi.tables[0]
+                .key
+                .iter()
+                .any(|column| column == "attributes"),
+            "the list-typed attributes column is not a key"
+        );
         assert_eq!(drasi.tables[0].labels, vec!["Metric".to_string()]);
     }
 
@@ -448,7 +466,8 @@ delivery: queued
 
     #[test]
     fn source_id_is_required() {
-        yaml::from_str::<Drasi>("labels: [orders]")
+        let err = yaml::from_str::<Drasi>("labels: [orders]")
             .expect_err("source_id has no default and must be rejected when absent");
+        assert_eq!(err.to_string(), "missing field `source_id`");
     }
 }

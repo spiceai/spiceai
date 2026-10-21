@@ -65,6 +65,16 @@ pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
 /// runtime to fill `acceleration.primary_key` when the user left it unset.
 pub const INFERRED_PRIMARY_KEY_METADATA_KEY: &str = "spice.inferred_primary_key";
 
+/// Schema-level metadata key for the primary key an acceleration was built with,
+/// recorded in its checkpoint schema.
+///
+/// The value is a JSON array of column names in key order, e.g. `["tenant_id","id"]`.
+/// Written when the acceleration's refresher starts, and read to rebuild the key
+/// when the dataset registers while its source is unreachable. Unlike
+/// [`INFERRED_PRIMARY_KEY_METADATA_KEY`], it describes the existing acceleration,
+/// not a setting to fill in.
+pub const ACCELERATION_PRIMARY_KEY_METADATA_KEY: &str = "spice.acceleration_primary_key";
+
 /// Schema-level metadata key for inferred secondary indexes (schema inference).
 ///
 /// The value is a JSON array of objects, each describing one index:

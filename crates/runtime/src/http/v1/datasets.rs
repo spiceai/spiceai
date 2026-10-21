@@ -199,6 +199,17 @@ fn dataset_infos(
     datasets: &[Arc<Dataset>],
     include_status: bool,
 ) -> Vec<DatasetResponseItem> {
+    let datasets_by_name = if include_status {
+        let mut by_name = HashMap::with_capacity(datasets.len());
+        for dataset in datasets {
+            by_name
+                .entry(dataset.name.clone())
+                .or_insert(dataset.as_ref());
+        }
+        by_name
+    } else {
+        HashMap::new()
+    };
     datasets
         .iter()
         .map(|d| {
@@ -220,6 +231,11 @@ fn dataset_infos(
             let error_message = status
                 .as_ref()
                 .and_then(|s| s.error_message().map(String::from));
+            let (last_refresh, next_refresh) = if include_status {
+                dataset_freshness(df, d, &datasets_by_name)
+            } else {
+                (None, None)
+            };
             DatasetResponseItem {
                 from: d.from.clone(),
                 name: d.name.to_quoted_string(),
@@ -229,9 +245,53 @@ fn dataset_infos(
                 status,
                 error,
                 error_message,
+                last_refresh,
+                next_refresh,
             }
         })
         .collect()
+}
+
+/// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
+/// accelerated dataset, following its active parent scheduler when synchronized.
+/// Only a dataset with a schedule has a next refresh. For a
+/// `refresh_cron` dataset it is the next cron time after now, or, once a refresh
+/// has been triggered, its recorded due time including jitter until completion.
+fn dataset_freshness(
+    df: &DataFusion,
+    ds: &Dataset,
+    datasets: &HashMap<TableReference, &Dataset>,
+) -> (Option<String>, Option<String>) {
+    let Some(_) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+        return (None, None);
+    };
+    let freshness = df.runtime_status().dataset_freshness(&ds.name);
+    let next_refresh = df
+        .runtime_status()
+        .dataset_refresh_source(&ds.name)
+        .and_then(|source| {
+            let source_dataset = datasets.get(&source)?;
+            let acceleration = source_dataset.acceleration.as_ref().filter(|a| a.enabled)?;
+            let scheduled = acceleration.refresh_check_interval.is_some()
+                || acceleration.refresh_cron.is_some();
+            df.runtime_status()
+                .dataset_freshness(&source)
+                .next_refresh
+                .filter(|_| scheduled)
+                .or_else(|| {
+                    let cron = acceleration.refresh_cron.as_deref()?;
+                    scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now())
+                        .ok()
+                })
+        });
+    (
+        freshness.last_refresh.map(rfc3339),
+        next_refresh.map(rfc3339),
+    )
+}
+
+fn rfc3339(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

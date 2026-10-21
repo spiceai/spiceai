@@ -158,7 +158,7 @@ impl FileOpener for VortexOpener {
         let reader =
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
-        let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
+        let mut file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
         let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
@@ -194,6 +194,12 @@ impl FileOpener for VortexOpener {
                 replace_columns_with_literals(Arc::clone(&expr), &literal_value_cols)
             })?;
             filter = filter
+                .map(|p| replace_columns_with_literals(p, &literal_value_cols))
+                .transpose()?;
+            // `FilePruner` evaluates its predicate against the file schema, which
+            // has no partition columns, so it expects them already folded to this
+            // file's values.
+            file_pruning_predicate = file_pruning_predicate
                 .map(|p| replace_columns_with_literals(p, &literal_value_cols))
                 .transpose()?;
         }
@@ -979,6 +985,7 @@ mod tests {
     use datafusion::arrow::array::record_batch;
     use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::datatypes::Schema;
+    use datafusion::arrow::datatypes::TimeUnit;
     use datafusion::arrow::datatypes::UInt32Type;
     use datafusion::arrow::util::display::FormatOptions;
     use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
@@ -1782,31 +1789,19 @@ mod tests {
         let format_opts = FormatOptions::new().with_types_info(true);
 
         let data = stream.try_collect::<Vec<_>>().await?;
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+
-        | a     |
-        | Int32 |
-        +-------+
-        | 1     |
-        | 2     |
-        | 3     |
-        +-------+
-        ");
+        assert_snapshot!(
+            "open_files_different_table_schema_int32_file",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         let opener2 = make_opener(filter.clone());
         let stream = opener2.open(file2)?.await?;
 
         let data = stream.try_collect::<Vec<_>>().await?;
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+
-        | a     |
-        | Int32 |
-        +-------+
-        | -1    |
-        | -2    |
-        | -3    |
-        +-------+
-        ");
+        assert_snapshot!(
+            "open_files_different_table_schema_int16_file_widened",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -1871,16 +1866,10 @@ mod tests {
 
         // Verify the output has columns in table schema order (a, b, c)
         // not file order (c, b, a)
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+-------+-------+
-        | a     | b     | c     |
-        | Int32 | Int32 | Int32 |
-        +-------+-------+-------+
-        | 100   | 200   | 300   |
-        | 101   | 201   | 301   |
-        | 102   | 202   | 302   |
-        +-------+-------+-------+
-        ");
+        assert_snapshot!(
+            "schema_different_column_order_table_order",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2030,14 +2019,10 @@ mod tests {
         // Verify the columns are in the right order and have the right values
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
         let format_opts = FormatOptions::new().with_types_info(true);
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+--------------------------+
-        | c     | b                        |
-        | Int32 | Dictionary(UInt32, Utf8) |
-        +-------+--------------------------+
-        | 2     | test                     |
-        +-------+--------------------------+
-        ");
+        assert_snapshot!(
+            "projection_bug_minimal_repro_projected_and_cast",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2152,17 +2137,10 @@ mod tests {
         let data = stream.try_collect::<Vec<_>>().await?;
         let format_opts = FormatOptions::new().with_types_info(true);
 
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+------+
-        | a     | b    |
-        | Int32 | Utf8 |
-        +-------+------+
-        | 1     | r1   |
-        | 3     | r3   |
-        | 5     | r5   |
-        | 7     | r7   |
-        +-------+------+
-        ");
+        assert_snapshot!(
+            "selection_include_by_index_rows",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2196,18 +2174,10 @@ mod tests {
         let data = stream.try_collect::<Vec<_>>().await?;
         let format_opts = FormatOptions::new().with_types_info(true);
 
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+------+
-        | a     | b    |
-        | Int32 | Utf8 |
-        +-------+------+
-        | 1     | r1   |
-        | 3     | r3   |
-        | 5     | r5   |
-        | 7     | r7   |
-        | 9     | r9   |
-        +-------+------+
-        ");
+        assert_snapshot!(
+            "selection_exclude_by_index_rows",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2337,16 +2307,11 @@ mod tests {
         // row 0: 1 + 10 * 2 = 21
         // row 1: 2 + 20 * 2 = 42
         // row 2: 3 + 30 * 2 = 63
-        assert_snapshot!(pretty_format_batches_with_options(&data, &FormatOptions::new().with_types_info(true))?.to_string(), @r"
-        +--------+
-        | result |
-        | Int32  |
-        +--------+
-        | 21     |
-        | 42     |
-        | 63     |
-        +--------+
-        ");
+        assert_snapshot!(
+            "projection_expr_pushdown_result",
+            pretty_format_batches_with_options(&data, &FormatOptions::new().with_types_info(true))?
+                .to_string()
+        );
 
         Ok(())
     }
@@ -2465,5 +2430,208 @@ mod tests {
             "the InList membership conjunct is declined"
         );
         assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+    }
+
+    /// A dynamic filter over the columns of `bounds`, each `(name, index, lo,
+    /// hi)` naming a column at `index` of the scanned table. Its current value
+    /// is `lo <= name AND name <= hi` for every column, as a hash join builds
+    /// it for its keys.
+    fn bounds_dynamic_filter(bounds: &[(&str, usize, i32, i32)]) -> PhysicalExprRef {
+        let columns: Vec<PhysicalExprRef> = bounds
+            .iter()
+            .map(|&(name, index, _, _)| {
+                Arc::new(df_expr::Column::new(name, index)) as PhysicalExprRef
+            })
+            .collect();
+        let current = bounds
+            .iter()
+            .zip(&columns)
+            .flat_map(|(&(_, _, lo, hi), column)| {
+                [(Operator::GtEq, lo), (Operator::LtEq, hi)].map(|(op, value)| {
+                    Arc::new(df_expr::BinaryExpr::new(
+                        Arc::clone(column),
+                        op,
+                        Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(value)))),
+                    )) as PhysicalExprRef
+                })
+            })
+            .reduce(|left, right| {
+                Arc::new(df_expr::BinaryExpr::new(left, Operator::And, right)) as PhysicalExprRef
+            })
+            .expect("a dynamic filter needs at least one bound");
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            columns,
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(current)
+            .expect("dynamic filter update should succeed");
+        dynamic_filter as PhysicalExprRef
+    }
+
+    /// A hash-join dynamic filter on a partition column, scanned through the
+    /// source `try_pushdown_filters` plans for it. `FilePruner` evaluates its
+    /// predicate against the file schema, which has no partition columns, so
+    /// the opener folds each file's partition value into it first. With file
+    /// statistics the pruner runs: it skips a file whose partition value the
+    /// bound excludes, and keeps a NULL partition, whose bound is unknown.
+    #[tokio::test]
+    async fn dynamic_filter_on_a_partition_column_prunes_by_partition_value() -> anyhow::Result<()>
+    {
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_datasource::file::FileSource;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+
+        use crate::VortexSource;
+
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("partition test batch should build");
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "/path/partitioned.vortex";
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::builder(batch.schema())
+            .with_table_partition_cols(vec![Arc::new(Field::new("part", DataType::Int32, true))])
+            .build();
+
+        // `part` follows the file's `a` in the table schema.
+        let planned = VortexSource::new(table_schema, SESSION.clone()).try_pushdown_filters(
+            vec![bounds_dynamic_filter(&[("part", 1, 3, 7)])],
+            &ConfigOptions::default(),
+        )?;
+        let source = planned
+            .updated_node
+            .expect("pushing a filter should update the source")
+            .with_batch_size(100);
+
+        let mut scanned = Vec::new();
+        for partition_value in [None, Some(5), Some(100)] {
+            for with_statistics in [false, true] {
+                let mut file = PartitionedFile::new(file_path.to_string(), data_size);
+                file.partition_values = vec![ScalarValue::Int32(partition_value)];
+                file.statistics = with_statistics
+                    .then(|| Arc::new(datafusion_common::Statistics::new_unknown(&batch.schema())));
+                let config = FileScanConfigBuilder::new(
+                    ObjectStoreUrl::parse("memory:///")?,
+                    Arc::clone(&source),
+                )
+                .with_file(file.clone())
+                .build();
+                let rows: usize = source
+                    .create_file_opener(Arc::clone(&object_store), &config, 0)?
+                    .open(file)?
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum();
+                scanned.push((partition_value, with_statistics, rows));
+            }
+        }
+
+        // Without statistics no pruner runs and the row filter leaves the file
+        // whole; with them only the partition outside `3..=7` is skipped.
+        assert_eq!(
+            scanned,
+            vec![
+                (None, false, 3),
+                (None, true, 3),
+                (Some(5), false, 3),
+                (Some(5), true, 3),
+                (Some(100), false, 3),
+                (Some(100), true, 0),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A `TopK` dynamic filter over a view
+    /// that casts a `timestamp[ms]` column to `TIMESTAMP` reaches the scan as
+    /// `CAST(ts AS Timestamp(ns)) >= <ns literal>` once another `UNION` branch has
+    /// filled it. Vortex has no kernel for a timestamp unit change, so pushing that
+    /// conjunct into the scan failed the whole query while building zone pruning. The
+    /// conjunct must stay above the scan, where `DataFusion` evaluates it, and the scan
+    /// must return every row.
+    ///
+    /// The identity cast and the cast to the stored integer are controls: Vortex
+    /// evaluates both, so the scan filters.
+    #[rstest]
+    #[case::unit_change(
+        "kept_above",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ScalarValue::TimestampNanosecond(Some(2_000_000_000), None)
+    )]
+    #[case::unit_change_keeping_timezone(
+        "kept_above",
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        ScalarValue::TimestampNanosecond(Some(2_000_000_000), Some(Arc::from("UTC")))
+    )]
+    #[case::timezone_change(
+        "kept_above",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        ScalarValue::TimestampMillisecond(Some(2_000), None)
+    )]
+    #[case::identity(
+        "pushed_down",
+        DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        ScalarValue::TimestampMillisecond(Some(2_000), Some(Arc::from("UTC")))
+    )]
+    #[case::stored_integer("pushed_down", DataType::Int64, ScalarValue::Int64(Some(2_000)))]
+    #[tokio::test]
+    async fn dynamic_filter_casting_a_timestamp(
+        #[case] expected: &str,
+        #[case] target: DataType,
+        #[case] threshold: ScalarValue,
+    ) -> anyhow::Result<()> {
+        use datafusion::arrow::array::Array as _;
+        use datafusion::arrow::array::TimestampMillisecondArray;
+
+        let column = TimestampMillisecondArray::from(vec![Some(1_000), None, Some(3_000)])
+            .with_timezone("UTC");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                column.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(column)],
+        )?;
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "/path/timestamps.vortex";
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::builder(batch.schema()).build();
+
+        let ts = Arc::new(df_expr::Column::new("ts", 0)) as PhysicalExprRef;
+        let current = Arc::new(df_expr::BinaryExpr::new(
+            Arc::new(df_expr::CastExpr::new(Arc::clone(&ts), target, None)),
+            Operator::GtEq,
+            Arc::new(df_expr::Literal::new(threshold)),
+        )) as PhysicalExprRef;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![ts],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter.update(current)?;
+
+        let opener = make_opener(
+            object_store,
+            table_schema,
+            Some(dynamic_filter as PhysicalExprRef),
+        );
+        let batches = opener
+            .open(PartitionedFile::new(file_path.to_string(), data_size))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let format_options = FormatOptions::default().with_null("NULL");
+        assert_snapshot!(
+            format!("dynamic_filter_casting_a_timestamp_{expected}"),
+            pretty_format_batches_with_options(&batches, &format_options)?.to_string()
+        );
+        Ok(())
     }
 }

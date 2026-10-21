@@ -1,0 +1,10 @@
+---
+source: crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs
+expression: converted(&block)
+---
++-----------+--------+----------------+
+| array     | map    | tuple          |
++-----------+--------+----------------+
+| [1, 2, 3] | {a: 7} | {1: 1, 2: one} |
+| []        | {k: 7} | {1: -2, 2: }   |
++-----------+--------+----------------+

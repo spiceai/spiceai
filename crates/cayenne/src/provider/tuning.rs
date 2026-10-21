@@ -267,8 +267,8 @@ const MEM_TIER_BUDGET_FRACTION: u64 = 16;
 // ---------------------------------------------------------------------------
 
 /// Default convergence window: the time budget the goal-seeking controller aims
-/// to reach its targets within. Operators override it per dataset
-/// (`cayenne_goal_convergence_window`).
+/// to reach its targets within. Operators override it runtime-wide
+/// (`runtime.params.target_convergence_window`).
 pub(crate) const DEFAULT_GOAL_CONVERGENCE_WINDOW: Duration = Duration::from_mins(1);
 
 /// How long a per-batch write / publish latency sample stays a live controller
@@ -512,11 +512,151 @@ fn adaptive_mem_tier_bounds_for_budget(
 /// ([`global_memory_budget`]) is the tightest `memory.max` along the whole cgroup
 /// path (`telemetry::hardware::cgroup_memory_limit`). Where the binding limit sits
 /// on an ancestor shared with other processes, the ratio reads low.
+///
+/// The charge also holds the anonymous pages the allocator has released with
+/// `MADV_FREE` and the kernel has not yet taken back; those are subtracted too
+/// (see [`lazy_free_bytes`]).
 #[cfg(target_os = "linux")]
 fn current_memory_bytes() -> Option<u64> {
+    raw_working_set_bytes().map(|working_set| working_set.saturating_sub(lazy_free_bytes()))
+}
+
+/// The cgroup charge less its reclaimable page cache, before lazily freed
+/// allocator pages are subtracted.
+#[cfg(target_os = "linux")]
+fn raw_working_set_bytes() -> Option<u64> {
     cgroup_v2_working_set()
         .or_else(cgroup_v1_working_set)
         .or_else(proc_self_rss_bytes)
+}
+
+/// Raw memory pressure below which no lazily freed bytes are sampled: no
+/// controller decision depends on them while even the raw working set sits
+/// under [`MEM_PRESSURE_OK`].
+#[cfg(target_os = "linux")]
+const LAZY_FREE_SAMPLE_FLOOR: f64 = 0.70;
+
+/// Shortest wait between two reads of `/proc/self/smaps_rollup`.
+#[cfg(target_os = "linux")]
+const LAZY_FREE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The wait between reads is at least this many times the last read's own
+/// duration, so the sampler costs at most a twentieth of one core however large
+/// the process grows.
+#[cfg(target_os = "linux")]
+const LAZY_FREE_INTERVAL_PER_READ: u32 = 20;
+
+/// The latest lazily-freed byte count, valid until [`LAZY_FREE_VALID_UNTIL_MS`].
+#[cfg(target_os = "linux")]
+static LAZY_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since [`LAZY_FREE_EPOCH`] after which [`LAZY_FREE_BYTES`] no
+/// longer counts; `0` when there is no usable sample.
+#[cfg(target_os = "linux")]
+static LAZY_FREE_VALID_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+static LAZY_FREE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+#[cfg(target_os = "linux")]
+static LAZY_FREE_SAMPLER: std::sync::Once = std::sync::Once::new();
+
+/// This process's anonymous memory that the allocator has released with
+/// `MADV_FREE` and the kernel has not reclaimed (`LazyFree` in
+/// `/proc/self/smaps_rollup`), or `0` without a current sample.
+///
+/// Such pages stay resident and charged to the cgroup until the kernel needs
+/// the memory, and then go without any I/O, so they are reclaimable rather than
+/// demand. An allocator that returns memory this way (snmalloc on Linux) can hold
+/// tens of GiB of them: one SF100 CDC run read a cgroup charge at 0.92 of its
+/// limit with 52 GB live and 33 GB lazily freed, and the controller collapsed
+/// every live buffer under pressure that was not there.
+///
+/// One read walks every page table of the process — 0.6 s of system time at
+/// 85 GB resident — so a background thread samples it, only while the raw
+/// working set is high enough to matter, at least
+/// [`LAZY_FREE_INTERVAL_PER_READ`] read-durations apart. A page the allocator
+/// reuses after a sample is live again with no cheaper counter showing it, so a
+/// sample counts for two sampling intervals and is then dropped rather than
+/// trusted.
+#[cfg(target_os = "linux")]
+fn lazy_free_bytes() -> u64 {
+    LAZY_FREE_SAMPLER.call_once(|| {
+        if let Err(error) = std::thread::Builder::new()
+            .name("cayenne-lazyfree-sampler".to_string())
+            .spawn(lazy_free_sampler_loop)
+        {
+            tracing::debug!(target: "cayenne::tuning", "Lazily freed memory will count as demand: failed to start its sampler: {error}");
+        }
+    });
+    let now_ms = lazy_free_now_ms();
+    if now_ms < LAZY_FREE_VALID_UNTIL_MS.load(Ordering::Acquire) {
+        LAZY_FREE_BYTES.load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn lazy_free_now_ms() -> u64 {
+    u64::try_from(LAZY_FREE_EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The sampler thread's body: runs for the life of the process, and stops early
+/// only when `/proc/self/smaps_rollup` cannot be read, leaving the raw working
+/// set in force.
+#[cfg(target_os = "linux")]
+fn lazy_free_sampler_loop() {
+    loop {
+        let needed = match (raw_working_set_bytes(), global_memory_budget()) {
+            (Some(working_set), Some(budget)) if budget > 0 => {
+                u64_to_f64(working_set) / u64_to_f64(budget) >= LAZY_FREE_SAMPLE_FLOOR
+            }
+            _ => false,
+        };
+        let mut interval = LAZY_FREE_MIN_INTERVAL;
+        if needed {
+            let started = Instant::now();
+            let Some(bytes) = std::fs::read_to_string("/proc/self/smaps_rollup")
+                .ok()
+                .as_deref()
+                .and_then(parse_smaps_lazy_free)
+            else {
+                LAZY_FREE_VALID_UNTIL_MS.store(0, Ordering::Release);
+                return;
+            };
+            interval = interval.max(
+                started
+                    .elapsed()
+                    .saturating_mul(LAZY_FREE_INTERVAL_PER_READ),
+            );
+            let valid_ms =
+                u64::try_from(interval.saturating_mul(2).as_millis()).unwrap_or(u64::MAX);
+            LAZY_FREE_BYTES.store(bytes, Ordering::Release);
+            LAZY_FREE_VALID_UNTIL_MS.store(
+                lazy_free_now_ms().saturating_add(valid_ms),
+                Ordering::Release,
+            );
+        } else {
+            LAZY_FREE_VALID_UNTIL_MS.store(0, Ordering::Release);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// `LazyFree` from a `/proc/<pid>/smaps_rollup` body, in bytes (the kernel
+/// reports kB).
+#[cfg(target_os = "linux")]
+fn parse_smaps_lazy_free(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let kb = line
+            .strip_prefix("LazyFree:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        kb.checked_mul(1024)
+    })
 }
 
 /// cgroup v2 charge less its freely-reclaimable page cache. An unreadable or
@@ -918,7 +1058,7 @@ impl WindowMax {
     /// Peak window width, DERIVED from [`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s) so
     /// the value and its doc can never drift if the default changes: the peak spans
     /// a full goal-convergence window — the horizon the SLO is stated over. FIXED to
-    /// the DEFAULT: it does NOT track a per-dataset `cayenne_goal_convergence_window`
+    /// the DEFAULT: it does NOT track a configured `runtime.params.target_convergence_window`
     /// override (that override retunes the controller's step dwell, not this
     /// observability window), so a table with a non-default convergence window still
     /// reports its freshness peak over this ~60s horizon. Making it track the
@@ -4827,6 +4967,106 @@ mod tests {
         );
         // The raw charge is what used to drive the collapse.
         assert!(u64_to_f64(current) / u64_to_f64(limit) > MEM_PRESSURE_OK);
+    }
+
+    /// The same accounting for memory the allocator released with `MADV_FREE`.
+    /// Numbers are the spiced cgroup of a CH-benCHmark SF100 `PostgreSQL` run and
+    /// its `LazyFree`, read in one command: past `MEM_PRESSURE_HIGH` after the
+    /// page cache is excluded, which shrank every table's memtable, while 33 GB
+    /// of the charge was lazily freed and only 52 GB live. The `smaps_rollup`
+    /// block is that run's sampler output 30 s earlier, verbatim.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn working_set_excludes_lazily_freed_allocator_memory() {
+        let smaps = "Rss:            85498116 kB\n\
+                     Pss:            85483086 kB\n\
+                     Pss_Dirty:      52499260 kB\n\
+                     Pss_Anon:       85220784 kB\n\
+                     Pss_File:         262302 kB\n\
+                     Pss_Shmem:             0 kB\n\
+                     Shared_Clean:      22644 kB\n\
+                     Shared_Dirty:          0 kB\n\
+                     Private_Clean:  32976212 kB\n\
+                     Private_Dirty:  52499260 kB\n\
+                     Referenced:     56296584 kB\n\
+                     Anonymous:      85220784 kB\n\
+                     KSM:                   0 kB\n\
+                     LazyFree:       32721484 kB\n\
+                     AnonHugePages:         0 kB\n\
+                     Swap:                  0 kB\n";
+        assert_eq!(parse_smaps_lazy_free(smaps), Some(32_721_484 * 1024));
+        assert_eq!(parse_smaps_lazy_free("Rss: 10 kB\n"), None);
+
+        let stat = "anon 87266103296\n\
+                    file 7355432960\n\
+                    kernel 535212032\n\
+                    shmem 0\n\
+                    file_dirty 7917568\n\
+                    file_writeback 0\n\
+                    inactive_file 84873224192\n\
+                    active_anon 9747853312\n";
+        let current = 95_160_868_864_u64;
+        let limit = 103_079_215_104_u64; // MemoryMax=96G
+        let lazy = parse_smaps_lazy_free("LazyFree:       32723192 kB\n")
+            .expect("smaps_rollup carries `LazyFree`");
+        let reclaimable = reclaimable_page_cache(stat, "file", RECLAIM_EXCLUDED_V2)
+            .expect("memory.stat carries `file`");
+        let working_set = current.saturating_sub(reclaimable);
+        assert!(
+            u64_to_f64(working_set) / u64_to_f64(limit) >= MEM_PRESSURE_HIGH,
+            "the page-cache-only signal is what shrank the memtables"
+        );
+        let pressure = u64_to_f64(working_set.saturating_sub(lazy)) / u64_to_f64(limit);
+        assert!(
+            pressure < MEM_PRESSURE_OK,
+            "lazily freed memory must read as headroom, got {pressure}"
+        );
+    }
+
+    /// `LazyFree` is what this kernel reports for pages released with
+    /// `MADV_FREE`: release 64 MiB of touched anonymous memory and the process's
+    /// own `smaps_rollup` must show nearly all of it more. The kernel moves
+    /// released pages onto its lazy-free list through per-CPU batches, so up to
+    /// a batch per CPU can still be in flight when the count is read (16 pages
+    /// were on the Spark this was written on); 1/16 of the region bounds that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn smaps_rollup_reports_madv_free_pages_as_lazy_free() {
+        const LEN: usize = 64 * 1024 * 1024;
+        let lazy_free = || {
+            parse_smaps_lazy_free(
+                &std::fs::read_to_string("/proc/self/smaps_rollup").expect("read smaps_rollup"),
+            )
+            .expect("smaps_rollup carries `LazyFree`")
+        };
+        // SAFETY: a fresh private anonymous mapping that only this test touches
+        // and unmaps below.
+        let region = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(region, libc::MAP_FAILED, "mmap of the test region");
+        // SAFETY: `region` is LEN writable bytes mapped above.
+        unsafe { std::ptr::write_bytes(region.cast::<u8>(), 0xA5, LEN) };
+        let before = lazy_free();
+        // SAFETY: `region` is the LEN-byte mapping this test owns.
+        let rc = unsafe { libc::madvise(region, LEN, libc::MADV_FREE) };
+        assert_eq!(rc, 0, "madvise(MADV_FREE)");
+        let after = lazy_free();
+        // SAFETY: unmaps the region mapped above; nothing references it after.
+        unsafe { libc::munmap(region, LEN) };
+        let released = u64::try_from(LEN).expect("64 MiB fits in u64");
+        assert!(
+            after.saturating_sub(before) >= released - released / 16,
+            "LazyFree grew by {} bytes after releasing {released}",
+            after.saturating_sub(before)
+        );
     }
 
     #[cfg(target_os = "linux")]

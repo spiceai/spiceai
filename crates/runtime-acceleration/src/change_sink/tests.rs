@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, Float32Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
+    ArrayRef, AsArray, Float32Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
     StructArray,
 };
 use arrow::buffer::OffsetBuffer;
@@ -38,14 +38,15 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 use super::batching::{
-    AppendBurst, AppendIngress, CdcBurst, CdcIngress, CoalescingBurst, CoalescingLimits,
+    AppendBurst, AppendIngress, ApplyingGuard, CdcBurst, CdcIngress, CoalescingBurst,
+    CoalescingLimits,
 };
 use super::provider::{ProviderChangeSinkBackend, refusal::is_before_mutation};
 use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangeSink, ChangeSinkBackend,
-    ChangeSinkContext, DurabilityObserver, ReplacementSupport, SchemaEvolutionSupport, SetKey,
-    StorageDurability, WriteOptions,
+    ChangeSinkContext, DurabilityObserver, Recovery, ReplacementSupport, SchemaEvolutionSupport,
+    SetKey, StorageDurability, WriteOptions,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -120,7 +121,8 @@ fn append_merge_preserves_unconsumed_replacement() {
     assert_eq!(first.num_rows(), 1);
     assert_eq!(
         returned
-            .replacement_scope()
+            .replaced_scopes()
+            .next()
             .expect("scope retained")
             .filters(),
         scope.filters()
@@ -193,6 +195,26 @@ impl CdcPolicy for UnchangedSchema {
 }
 
 #[test]
+fn applying_guard_clears_the_flag_when_dropped() {
+    let ingress = Arc::new(CdcIngress::new(
+        &TableReference::bare("cdc"),
+        Arc::new(UnchangedSchema),
+        two_input_limits(),
+    ));
+    {
+        let _guard = ApplyingGuard::enter(&ingress);
+        assert!(
+            ingress.is_applying(),
+            "enter must mark the apply as in flight"
+        );
+    }
+    assert!(
+        !ingress.is_applying(),
+        "drop must clear the flag so a cancelled apply cannot leave the producer building ahead"
+    );
+}
+
+#[test]
 fn cdc_burst_returns_unconsumed_input_at_capacity() {
     let ingress = Arc::new(CdcIngress::new(
         &TableReference::bare("cdc"),
@@ -241,6 +263,10 @@ async fn overlapping_scope_shapes_reject_equal_full_keys() {
     .await;
     let error = result.expect_err("different overlapping scopes must not share a physical key");
     assert!(is_before_mutation(&error));
+    assert_eq!(
+        error.to_string(),
+        "External error: Error during planning: Unique key conflicts between scoped appends for dataset 'scoped'"
+    );
 }
 
 #[tokio::test]
@@ -256,6 +282,10 @@ async fn overlapping_scope_shapes_reject_equal_partial_keys() {
     .await;
     let error = result.expect_err("membership in both scopes must not authorize a key collision");
     assert!(is_before_mutation(&error));
+    assert_eq!(
+        error.to_string(),
+        "External error: Error during planning: Unique key conflicts between scoped appends for dataset 'scoped'"
+    );
 }
 
 #[tokio::test]
@@ -624,4 +654,484 @@ async fn callback_survives_cancelled_close_waiter() {
         .expect("drain must succeed");
     assert_eq!(backend.finalized.load(Ordering::SeqCst), 1);
     assert_eq!(backend.flushed.load(Ordering::SeqCst), 1);
+}
+
+fn scoped_lane(max_age: Duration) -> Arc<AppendIngress> {
+    Arc::new(AppendIngress::new(
+        &TableReference::bare("scoped"),
+        CoalescingLimits {
+            max_inputs: 64,
+            max_bytes: usize::MAX,
+            max_age,
+        },
+    ))
+}
+
+fn scoped_write(
+    schema: &SchemaRef,
+    ingress: &Arc<AppendIngress>,
+    (tenant, region): (&str, &str),
+    ids: &[i64],
+    replaces: bool,
+) -> ChangeBatch {
+    let scope = SetKey::from_filters(
+        Arc::clone(schema),
+        &[col("tenant").eq(lit(tenant)), col("region").eq(lit(region))],
+    )
+    .expect("scope");
+    let rows = ids
+        .iter()
+        .map(|&id| scope_row(schema, tenant, region, id))
+        .collect();
+    if replaces {
+        ChangeBatch::replace_set(scope, Arc::clone(schema), rows)
+    } else {
+        ChangeBatch::append_scoped(scope, Arc::clone(schema), rows)
+    }
+    .expect("scoped write")
+    .with_append_ingress(Arc::clone(ingress))
+    .expect("append lane")
+}
+
+async fn id_keyed_table(rows: Vec<RecordBatch>) -> Arc<dyn TableProvider> {
+    Arc::new(
+        data_components::arrow::write::MemTable::try_new(scope_schema(), vec![rows])
+            .expect("Arrow accelerator")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![2],
+            )]))
+            .await
+            .expect("primary key on id"),
+    )
+}
+
+async fn stored_rows(table: &Arc<dyn TableProvider>) -> Vec<(String, String, i64)> {
+    let batches = SessionContext::new()
+        .read_table(Arc::clone(table))
+        .expect("read table")
+        .collect()
+        .await
+        .expect("collect table");
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let tenant = batch.column(0).as_string::<i32>();
+        let region = batch.column(1).as_string::<i32>();
+        let id = batch
+            .column(2)
+            .as_primitive::<arrow::datatypes::Int64Type>();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                tenant.value(row).to_string(),
+                region.value(row).to_string(),
+                id.value(row),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+#[test]
+fn append_burst_admits_only_scopes_no_replacement_can_overlap() {
+    let schema = scope_schema();
+    let ingress = scoped_lane(Duration::ZERO);
+    let options = WriteOptions::default();
+    let write = |scope, replaces| scoped_write(&schema, &ingress, scope, &[1], replaces);
+    let mut burst = AppendBurst::new(write(("A", "west"), true), options).expect("burst");
+    assert!(
+        burst
+            .push(write(("B", "west"), false), options)
+            .is_continue(),
+        "an append to a disjoint scope joins"
+    );
+    assert!(
+        burst
+            .push(write(("C", "west"), true), options)
+            .is_continue(),
+        "a disjoint replacement joins"
+    );
+    for (scope, replaces, why) in [
+        (
+            ("A", "west"),
+            true,
+            "a second replacement of a replaced scope",
+        ),
+        (("C", "west"), false, "an append into a replaced scope"),
+        (("B", "west"), true, "a replacement of an appended scope"),
+    ] {
+        assert!(
+            burst.push(write(scope, replaces), options).is_break(),
+            "{why} must start the next burst"
+        );
+    }
+    let tenant_only =
+        SetKey::from_filters(Arc::clone(&schema), &[col("tenant").eq(lit("D"))]).expect("scope");
+    let wider = ChangeBatch::replace_set(
+        tenant_only,
+        Arc::clone(&schema),
+        vec![scope_row(&schema, "D", "east", 1)],
+    )
+    .expect("replacement")
+    .with_append_ingress(Arc::clone(&ingress))
+    .expect("append lane");
+    assert!(
+        burst.push(wider, options).is_break(),
+        "a replacement over other grouping columns may overlap the burst"
+    );
+    let (batch, _) = burst.finish();
+    let members = batch
+        .scoped_inputs()
+        .iter()
+        .map(|input| (input.batch_range(), input.replaces()))
+        .collect::<Vec<_>>();
+    assert_eq!(members, vec![(0..1, true), (1..2, false), (2..3, true)]);
+}
+
+/// Forwards to a provider backend and records how writes were grouped.
+struct CountingBackend {
+    inner: ProviderChangeSinkBackend,
+    applies: AtomicUsize,
+    most_replaced: AtomicUsize,
+}
+
+#[async_trait]
+impl ChangeSinkBackend for CountingBackend {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn capabilities(&self) -> ChangeCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn apply(
+        &self,
+        batch: ChangeBatch,
+        options: WriteOptions,
+        context: &SessionContext,
+    ) -> Result<BackendWrite> {
+        self.applies.fetch_add(1, Ordering::SeqCst);
+        self.most_replaced
+            .fetch_max(batch.replaced_scopes().count(), Ordering::SeqCst);
+        self.inner.apply(batch, options, context).await
+    }
+
+    fn set_durability_observer(&self, observer: Arc<dyn DurabilityObserver>) {
+        self.inner.set_durability_observer(observer);
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.inner.flush().await
+    }
+
+    async fn evolve_schema(&self, plan: &WideningPlan) -> Result<()> {
+        self.inner.evolve_schema(plan).await
+    }
+}
+
+/// Seeded xorshift, so a failing history can be replayed from its seed.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn below(&mut self, bound: usize) -> usize {
+        let mut state = self.0;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        self.0 = state;
+        usize::try_from(state % u64::try_from(bound).expect("bound fits u64"))
+            .expect("remainder fits usize")
+    }
+}
+
+/// Differential: random histories of scoped appends and replacements go
+/// through a real owner, which coalesces them, and both each write's outcome and
+/// the stored rows must equal the same history applied one write at a time to
+/// an in-memory model. Some writes reuse a key another scope holds, which the
+/// model refuses exactly when that scope still holds it at the write's turn.
+#[tokio::test]
+async fn coalesced_scoped_writes_match_writes_applied_in_order() {
+    const TENANTS: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    const REGIONS: [&str; 8] = ["n", "s", "e", "w", "ne", "nw", "se", "sw"];
+    const WRITES: usize = 300;
+    let mut refused_total = 0;
+    for seed in 1..=16_u64 {
+        let schema = scope_schema();
+        let table = id_keyed_table(Vec::new()).await;
+        let backend = Arc::new(CountingBackend {
+            inner: ProviderChangeSinkBackend::new(ChangeSinkContext::new(
+                TableReference::bare("model"),
+                Arc::clone(&table),
+            ))
+            .with_ordered_replacement(),
+            applies: AtomicUsize::new(0),
+            most_replaced: AtomicUsize::new(0),
+        });
+        let selected: Arc<dyn ChangeSinkBackend> = Arc::<CountingBackend>::clone(&backend);
+        let sink = ChangeSink::new(selected, SessionContext::new(), &Handle::current(), 1024);
+        let ingress = scoped_lane(Duration::from_millis(50));
+        let mut random = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut model: std::collections::BTreeMap<(usize, usize), Vec<i64>> =
+            std::collections::BTreeMap::new();
+        let mut expected_outcomes = Vec::with_capacity(WRITES);
+        let mut next_id = 0_i64;
+        let (done, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        for index in 0..WRITES {
+            let scope = (random.below(TENANTS.len()), random.below(REGIONS.len()));
+            let held = model.get(&scope).cloned().unwrap_or_default();
+            // A scope is appended only while it holds nothing, as a proven-fresh fill is.
+            let replaces = !held.is_empty() || random.below(3) == 0;
+            let mut ids = held
+                .iter()
+                .copied()
+                .filter(|_| replaces && random.below(2) == 0)
+                .collect::<Vec<_>>();
+            for _ in 0..random.below(3) + usize::from(!replaces) {
+                next_id += 1;
+                ids.push(next_id);
+            }
+            // Sometimes reuse a key held by another scope.
+            if random.below(6) == 0
+                && let Some(foreign) = model
+                    .iter()
+                    .filter(|(other, _)| **other != scope)
+                    .flat_map(|(_, held)| held.iter().copied())
+                    .nth(random.below(4))
+            {
+                ids.push(foreign);
+            }
+            let conflicts = model
+                .iter()
+                .any(|(other, held)| *other != scope && held.iter().any(|id| ids.contains(id)));
+            expected_outcomes.push(!conflicts);
+            if !conflicts {
+                if ids.is_empty() {
+                    model.remove(&scope);
+                } else {
+                    model.insert(scope, ids.clone());
+                }
+            }
+            let write = scoped_write(
+                &schema,
+                &ingress,
+                (TENANTS[scope.0], REGIONS[scope.1]),
+                &ids,
+                replaces,
+            );
+            let done = done.clone();
+            sink.enqueue(
+                write,
+                WriteOptions {
+                    recovery: Recovery::Rebuildable,
+                    ..WriteOptions::default()
+                },
+                Box::new(move |result| {
+                    let _ = done.send((index, result.map_err(|error| error.to_string())));
+                }),
+            )
+            .await
+            .expect("admitted");
+        }
+        sink.flush().await.expect("flush");
+        let mut outcomes = vec![None; WRITES];
+        for _ in 0..WRITES {
+            let (index, result) = tokio::time::timeout(WAIT, completions.recv())
+                .await
+                .expect("every write completes")
+                .expect("completion delivered");
+            if let Err(error) = &result {
+                assert!(
+                    error.contains("conflicts with a row outside the declared scope")
+                        || error.contains("Unique key conflicts between scoped appends"),
+                    "seed {seed}: write {index} failed for another reason: {error}"
+                );
+            }
+            outcomes[index] = Some(result.is_ok());
+        }
+        let outcomes = outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("each write completes once"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes, expected_outcomes,
+            "seed {seed}: per-write outcomes"
+        );
+        refused_total += expected_outcomes
+            .iter()
+            .filter(|applied| !**applied)
+            .count();
+        let mut expected = model
+            .iter()
+            .flat_map(|(&(tenant, region), ids)| {
+                ids.iter()
+                    .map(move |&id| (TENANTS[tenant].to_string(), REGIONS[region].to_string(), id))
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(stored_rows(&table).await, expected, "seed {seed}");
+        let applies = backend.applies.load(Ordering::SeqCst);
+        assert!(
+            applies <= WRITES / 2,
+            "seed {seed}: {applies} applies for {WRITES} writes; writes did not coalesce"
+        );
+        assert!(
+            backend.most_replaced.load(Ordering::SeqCst) >= 2,
+            "seed {seed}: no apply coalesced two replacements"
+        );
+    }
+    assert!(refused_total > 0, "no history exercised a refused write");
+}
+
+#[tokio::test]
+async fn coalesced_probe_exempts_only_keys_in_replaced_scopes() {
+    let schema = scope_schema();
+    let table = id_keyed_table(vec![scope_row(&schema, "A", "west", 1)]).await;
+    let backend = ProviderChangeSinkBackend::new(ChangeSinkContext::new(
+        TableReference::bare("probe"),
+        Arc::clone(&table),
+    ))
+    .with_ordered_replacement();
+    let ingress = scoped_lane(Duration::ZERO);
+    let options = WriteOptions::default();
+
+    let Err(error) = backend
+        .apply(
+            scoped_write(&schema, &ingress, ("B", "west"), &[1], false),
+            options,
+            &SessionContext::new(),
+        )
+        .await
+    else {
+        panic!("a key held by an untouched scope conflicts");
+    };
+    assert!(is_before_mutation(&error), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("incoming unique key (id) conflicts with a row outside the declared scope"),
+        "{error}"
+    );
+    assert_eq!(
+        stored_rows(&table).await,
+        vec![("A".to_string(), "west".to_string(), 1)]
+    );
+
+    let mut burst = AppendBurst::new(
+        scoped_write(&schema, &ingress, ("A", "west"), &[], true),
+        options,
+    )
+    .expect("burst");
+    assert!(
+        burst
+            .push(
+                scoped_write(&schema, &ingress, ("B", "west"), &[1], false),
+                options
+            )
+            .is_continue()
+    );
+    let (batch, options) = burst.finish();
+    backend
+        .apply(batch, options, &SessionContext::new())
+        .await
+        .expect("the held row is deleted before the append");
+    assert_eq!(
+        stored_rows(&table).await,
+        vec![("B".to_string(), "west".to_string(), 1)]
+    );
+}
+
+/// One ordering of two coalesced writes and how it must end.
+struct ArrivalOrderCase {
+    initial: Vec<(&'static str, i64)>,
+    /// Each write's tenant, ids and whether it replaces its scope.
+    writes: Vec<(&'static str, Vec<i64>, bool)>,
+    outcomes: Vec<bool>,
+    rows: Vec<(&'static str, i64)>,
+}
+
+/// Two writes the owner coalesces must end as they would applied in arrival
+/// order: a key held by a scope replaced only later still conflicts, and that
+/// conflict refuses only its own write.
+#[tokio::test]
+async fn coalesced_burst_keeps_arrival_order_outcomes() {
+    let cases = [
+        ArrivalOrderCase {
+            initial: vec![("A", 1), ("B", 2)],
+            writes: vec![("B", vec![1], true), ("A", vec![], true)],
+            outcomes: vec![false, true],
+            rows: vec![("B", 2)],
+        },
+        ArrivalOrderCase {
+            initial: vec![("A", 1), ("C", 2)],
+            writes: vec![("A", vec![], true), ("B", vec![2], true)],
+            outcomes: vec![true, false],
+            rows: vec![("C", 2)],
+        },
+    ];
+    for ArrivalOrderCase {
+        initial,
+        writes,
+        outcomes: expected_outcomes,
+        rows: expected_rows,
+    } in cases
+    {
+        let schema = scope_schema();
+        let table = id_keyed_table(
+            initial
+                .iter()
+                .map(|&(tenant, id)| scope_row(&schema, tenant, "west", id))
+                .collect(),
+        )
+        .await;
+        let backend = Arc::new(CountingBackend {
+            inner: ProviderChangeSinkBackend::new(ChangeSinkContext::new(
+                TableReference::bare("order"),
+                Arc::clone(&table),
+            ))
+            .with_ordered_replacement(),
+            applies: AtomicUsize::new(0),
+            most_replaced: AtomicUsize::new(0),
+        });
+        let selected: Arc<dyn ChangeSinkBackend> = Arc::<CountingBackend>::clone(&backend);
+        let sink = ChangeSink::new(selected, SessionContext::new(), &Handle::current(), 16);
+        let ingress = scoped_lane(Duration::from_millis(200));
+        let mut completions = Vec::new();
+        for (tenant, ids, replaces) in &writes {
+            let (done, completion) = oneshot::channel();
+            sink.enqueue(
+                scoped_write(&schema, &ingress, (tenant, "west"), ids, *replaces),
+                WriteOptions {
+                    recovery: Recovery::Rebuildable,
+                    ..WriteOptions::default()
+                },
+                Box::new(move |result| {
+                    let _ = done.send(result.is_ok());
+                }),
+            )
+            .await
+            .expect("admitted");
+            completions.push(completion);
+        }
+        sink.flush().await.expect("flush");
+        let mut outcomes = Vec::new();
+        for completion in completions {
+            outcomes.push(
+                tokio::time::timeout(WAIT, completion)
+                    .await
+                    .expect("completes")
+                    .expect("delivered"),
+            );
+        }
+        assert_eq!(
+            backend.most_replaced.load(Ordering::SeqCst),
+            2,
+            "both replacements must reach the backend as one write"
+        );
+        assert_eq!(outcomes, expected_outcomes, "writes {writes:?}");
+        let expected = expected_rows
+            .iter()
+            .map(|&(tenant, id)| (tenant.to_string(), "west".to_string(), id))
+            .collect::<Vec<_>>();
+        assert_eq!(stored_rows(&table).await, expected, "writes {writes:?}");
+    }
 }

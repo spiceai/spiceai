@@ -31,8 +31,8 @@ use arrow::{
 };
 use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::Schema;
-use datafusion::common::metadata::ScalarAndMetadata;
-use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
+use datafusion_common::metadata::ScalarAndMetadata;
+use datafusion_common::{DataFusionError, ParamValues, ScalarValue};
 use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
@@ -236,6 +236,11 @@ fn is_overflow_error(e: &ArrowError) -> bool {
 /// Field names and metadata have to match. A rename is a different question from a nullability
 /// flag, and admitting one here would make a reorder of same-typed sibling fields indistinguishable
 /// from a pair of renames, which positional pairing would then carry across transposed.
+///
+/// Under a field that carries an extension type, nothing may differ at all: the extension is
+/// declared over one storage layout, nullability included, so [`relabel_array_data`] refuses a
+/// storage change beneath a kept label. Such a pair keeps its cast path, which converts the
+/// values rather than republishing them under a label their storage no longer satisfies.
 fn is_nullability_relaxing_relabel(source: &DataType, target: &DataType) -> bool {
     match (source, target) {
         (DataType::List(source_item), DataType::List(target_item))
@@ -277,6 +282,8 @@ fn is_field_nullability_relaxing_relabel(source: &FieldRef, target: &FieldRef) -
         && source.dict_is_ordered() == target.dict_is_ordered()
         // At least as permissive: a nullable source under a non-nullable target is a narrowing.
         && (target.is_nullable() || !source.is_nullable())
+        // Metadata already matches above, so one side naming an extension type means both do.
+        && (source.extension_type_name().is_none() || source.data_type() == target.data_type())
         && is_nullability_relaxing_relabel(source.data_type(), target.data_type())
 }
 
@@ -1553,10 +1560,26 @@ mod test {
             true,
         )]));
 
-        let result = try_cast_to(batch, target_schema);
+        let casted = try_cast_to(batch, Arc::clone(&target_schema))
+            .expect("Decimal cast should succeed when value fits");
+        assert_eq!(casted.schema(), target_schema);
+        assert_eq!(casted.num_rows(), 1);
+        let amounts = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("the cast column is a Decimal128Array");
+        assert_eq!(amounts.data_type(), &DataType::Decimal128(38, 27));
+        // The same number rescaled from 9 to 27 fractional digits, not a NULL from an
+        // overflow fallback and not a value rescaled by the wrong power of ten.
         assert!(
-            result.is_ok(),
-            "Decimal cast should succeed when value fits: {result:?}"
+            amounts.is_valid(0),
+            "the value fits and must not become NULL"
+        );
+        assert_eq!(amounts.value(0), value_i128 * 10_i128.pow(18));
+        assert_eq!(
+            amounts.value_as_string(0),
+            format!("99999999999.{}", "0".repeat(27))
         );
     }
 
@@ -1679,10 +1702,21 @@ mod test {
             true,
         )]));
 
-        let result = try_cast_to(batch, target_schema);
+        let err = try_cast_to(batch, target_schema)
+            .expect_err("non-timestamp overflow should still return an error");
         assert!(
-            result.is_err(),
-            "non-timestamp overflow should still return an error"
+            matches!(
+                err,
+                Error::UnableToConvertRecordBatch {
+                    source: ArrowError::InvalidArgumentError(_)
+                }
+            ),
+            "Expected the precision overflow from the strict cast, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Error converting record batch: Invalid argument error: 99999999999.00 is too large \
+             to store in a Decimal128 of precision 10. Max is 99999999.99"
         );
     }
 
@@ -2713,8 +2747,11 @@ mod test {
 #[cfg(test)]
 mod nullability_alignment_tests {
     use super::*;
-    use arrow::array::{ArrayData, Int32Array, MapArray, StringArray, StructArray};
-    use arrow::buffer::NullBuffer;
+    use arrow::array::{
+        Array, ArrayData, Int16Array, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+        StructArray,
+    };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
     use arrow::datatypes::Fields;
 
     fn entry_fields() -> Fields {
@@ -3074,6 +3111,71 @@ mod nullability_alignment_tests {
             &DataType::List(extension("arrow.uuid")),
             &DataType::List(extension("arrow.opaque")),
         ));
+    }
+
+    /// A field that carries an extension type owns the storage layout under it, so relaxing a
+    /// storage child's nullability beneath the label is not a nullability-only relabel: the pair
+    /// keeps its cast path, which converts the values rather than republishing them under a label
+    /// their storage no longer satisfies (#13456).
+    #[test]
+    fn a_nullability_change_under_an_extension_type_is_not_relabelled() {
+        use crate::type_rewrite::tests::{extension_item, extension_storage};
+
+        let source_item = extension_item(extension_storage("timestamp", false), None);
+        let source = DataType::List(Arc::clone(&source_item));
+        let target = DataType::List(extension_item(extension_storage("timestamp", true), None));
+
+        assert!(
+            !is_nullability_relaxing_relabel(&source, &target),
+            "a storage change under an extension type must not take the relabel path"
+        );
+
+        // The conversion itself is still served, through `arrow_cast`, so the pair is routed
+        // differently rather than refused — and the values come through it unchanged.
+        let DataType::Struct(fields) = source_item.data_type() else {
+            unreachable!("built as a struct above")
+        };
+        let timestamps = Int64Array::from(vec![1, 2]);
+        let offsets = Int16Array::from(vec![60, -30]);
+        let values = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(timestamps.clone()) as ArrayRef,
+                Arc::new(offsets.clone()) as ArrayRef,
+            ],
+            None,
+        );
+        let list = ListArray::new(
+            source_item,
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        let batch = batch_of("stamps", Arc::new(list) as ArrayRef);
+        let casted = try_cast_to(batch, schema_of("stamps", target.clone()))
+            .expect("relaxing a storage child's nullability is a cast arrow performs");
+        assert_eq!(casted.schema().field(0).data_type(), &target);
+        assert_eq!(casted.num_rows(), 1);
+        let list = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("the cast column is still a list");
+        let structs = list.values();
+        let structs = structs
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("the list items are still structs");
+        assert_eq!(
+            structs.column(0).as_ref(),
+            &timestamps as &dyn Array,
+            "the `timestamp` child must come through the cast unchanged"
+        );
+        assert_eq!(
+            structs.column(1).as_ref(),
+            &offsets as &dyn Array,
+            "the `offset_minutes` child must come through the cast unchanged"
+        );
     }
 
     /// The relabel path must not swallow the casts that already worked: a genuine type change

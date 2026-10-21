@@ -26,7 +26,7 @@ limitations under the License.
 //!     the source is `gtid_mode = ON`, GTID auto-positioning from an executed
 //!     set (failover-safe),
 //!   - [`buffer_rows_event`] to decode a rows event into a [`TransactionBuffer`],
-//!   - [`readiness_heartbeat`] / [`record_watermark`] / [`commit_ts_ms`] for
+//!   - [`readiness_heartbeat`] / [`record_watermark`] / [`transaction_commit_ts_ms`] for
 //!     lag-based readiness and freshness metrics,
 //!   - [`adopt_current_layout`] + [`compute_pk_source_indexes`] for compatible
 //!     mid-stream `ALTER` adoption, and [`layout_event_mismatch`] to check an
@@ -571,15 +571,39 @@ pub(super) fn readiness_heartbeat(
     })
 }
 
-pub(super) fn record_watermark(metrics: &MetricsCollector, event_timestamp: u32) {
-    if event_timestamp > 0 {
-        metrics.record_commit_watermark(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(event_timestamp)),
-        );
+pub(super) fn record_watermark(metrics: &MetricsCollector, commit_ts_ms: Option<i64>) {
+    if let Some(ms) = commit_ts_ms
+        .and_then(|ms| u64::try_from(ms).ok())
+        .filter(|&ms| ms > 0)
+    {
+        metrics.record_commit_watermark(SystemTime::UNIX_EPOCH + Duration::from_millis(ms));
     }
 }
 
-pub(super) fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
+/// The commit time of a transaction, in milliseconds since the epoch: its GTID event's
+/// commit time when the server wrote one, else its event header's.
+///
+/// `MySQL` 8.0.1 and later write the commit time, in microseconds, into every
+/// transaction's GTID event, anonymous or not. An event header carries whole seconds
+/// only, so a commit time read from one is up to a second old; it is the fallback for a
+/// server that writes no commit time, such as `MariaDB`.
+pub(super) fn transaction_commit_ts_ms(
+    immediate_commit_ts_ms: Option<i64>,
+    event_timestamp: u32,
+) -> Option<i64> {
+    immediate_commit_ts_ms.or_else(|| commit_ts_ms(event_timestamp))
+}
+
+/// A GTID event's `immediate_commit_timestamp`, in microseconds since the epoch, as
+/// milliseconds; `None` when the server wrote none, which it records as zero.
+pub(super) fn immediate_commit_ts_ms(immediate_commit_timestamp_us: u64) -> Option<i64> {
+    if immediate_commit_timestamp_us == 0 {
+        return None;
+    }
+    i64::try_from(immediate_commit_timestamp_us / 1000).ok()
+}
+
+fn commit_ts_ms(event_timestamp: u32) -> Option<i64> {
     (event_timestamp > 0).then(|| i64::from(event_timestamp) * 1000)
 }
 
@@ -1096,6 +1120,30 @@ mod tests {
     use super::*;
     use crate::mysql_replication::setup::SourceColumn;
 
+    /// A transaction's commit time comes from its GTID event, to the millisecond, and
+    /// from its event header's whole seconds only when the server wrote no commit time.
+    #[test]
+    fn a_commit_time_is_the_gtid_events_and_falls_back_to_the_header() {
+        // 2026-10-15T15:20:26.123456Z, as a GTID event records it.
+        let immediate_us = 1_792_077_626_123_456_u64;
+        assert_eq!(
+            immediate_commit_ts_ms(immediate_us),
+            Some(1_792_077_626_123)
+        );
+        assert_eq!(
+            transaction_commit_ts_ms(immediate_commit_ts_ms(immediate_us), 1_792_077_626),
+            Some(1_792_077_626_123)
+        );
+        // No commit time in the GTID event: the header's whole second.
+        assert_eq!(immediate_commit_ts_ms(0), None);
+        assert_eq!(
+            transaction_commit_ts_ms(immediate_commit_ts_ms(0), 1_792_077_626),
+            Some(1_792_077_626_000)
+        );
+        // Neither: no commit time at all.
+        assert_eq!(transaction_commit_ts_ms(None, 0), None);
+    }
+
     /// `MySQL`'s documented default for `net_write_timeout`, which is what aborts
     /// a dump whose socket the pump stopped draining (#12527).
     const SERVER_DEFAULT_NET_WRITE_TIMEOUT_SECS: u32 = 60;
@@ -1385,7 +1433,9 @@ mod tests {
     }
 
     /// Widths within the integer family are distinct classes — a swap between
-    /// two integer columns of different widths still scrambles values.
+    /// two integer columns of different widths still scrambles values — while
+    /// each declared width still matches its own wire type, so a healthy
+    /// stream is never failed.
     #[test]
     fn integer_widths_are_distinguished() {
         for (declared, event) in [
@@ -1394,9 +1444,28 @@ mod tests {
             ("mediumint(9)", ColumnType::MYSQL_TYPE_LONG),
             ("bigint(20)", ColumnType::MYSQL_TYPE_LONG),
         ] {
-            assert!(
-                mismatch_against(&[("n", declared)], &[Some(event)]).is_some(),
+            assert_eq!(
+                mismatch_against(&[("n", declared)], &[Some(event)]),
+                Some(LayoutEventMismatch {
+                    ordinal: 0,
+                    column: "n".to_string(),
+                    source_type: declared.to_string(),
+                }),
                 "{declared} must not be accepted against {event:?}"
+            );
+        }
+
+        for (declared, event) in [
+            ("tinyint(4)", ColumnType::MYSQL_TYPE_TINY),
+            ("smallint(6)", ColumnType::MYSQL_TYPE_SHORT),
+            ("mediumint(9)", ColumnType::MYSQL_TYPE_INT24),
+            ("int(11)", ColumnType::MYSQL_TYPE_LONG),
+            ("bigint(20)", ColumnType::MYSQL_TYPE_LONGLONG),
+        ] {
+            assert_eq!(
+                mismatch_against(&[("n", declared)], &[Some(event)]),
+                None,
+                "{declared} must be accepted against its own wire type {event:?}"
             );
         }
     }

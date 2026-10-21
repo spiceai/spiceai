@@ -213,10 +213,15 @@ impl Fixture {
             .caching_stale_while_revalidate_ttl(Some(swr))
             .caching_stale_if_error(stale_if_error);
         let mut table = builder.build().await.expect("accelerated table");
-        // Keep write-side scans out of the read-plan counter. The channel still
-        // exercises real enqueueing and the in-flight claim stays held by it.
-        for handler in table.handlers.drain(..) {
+        // Keep write-side and eviction scans out of the read-plan counter. The
+        // channel still exercises real enqueueing and the in-flight claim stays
+        // held by it. Abort every task before awaiting any: awaiting yields, and
+        // a task not yet aborted could then run its first sweep.
+        let handlers = std::mem::take(table.handlers.get_mut());
+        for handler in &handlers {
             handler.abort();
+        }
+        for handler in handlers {
             let _ = handler.await;
         }
         let (tx, rx) = caching::create_cache_write_channel();

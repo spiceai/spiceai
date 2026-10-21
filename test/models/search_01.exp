@@ -2,8 +2,12 @@
 
 source [file join [file dirname [info script]] repl_helpers.exp]
 
-# spiced runtime response timeout
-set timeout 5
+# How long the runtime may go silent before the script calls it stalled — see
+# repl_idle_timeout. A search answers in one piece once the embedding model has
+# run, and its spinner writes no newline (see repl_helpers.exp), so for a search
+# this is the whole time the runtime has to answer (job 112954591167 failed a
+# fixed 5s budget on a search that was still running).
+set timeout [repl_idle_timeout]
 
 spawn spice search {*}[repl_endpoint_args]
 
@@ -25,12 +29,17 @@ proc perform_search {search_term expected_term} {
             send_user "Error detected\n"
             exit 1
         }
+        -re {[^\n]*\n} {
+            # A line the REPL printed before the result — the echoed query, a
+            # table header — so it is still at work: restart the wait. Whole
+            # lines only, for the reason given in repl_helpers.exp.
+            exp_continue
+        }
         eof {
             repl_died "Searching for \"$search_term\""
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Searching for \"$search_term\""
         }
     }
 }
@@ -42,12 +51,15 @@ proc expect_search_prompt {} {
         "search>" {
             # runtime is ready for input
         }
+        -re {[^\n]*\n} {
+            # Banner and connection lines the CLI prints on its way to the prompt.
+            exp_continue
+        }
         eof {
             repl_died "Waiting for the search prompt"
         }
         timeout {
-            send_user "Timeout waiting for search prompt\n"
-            exit 1
+            repl_stalled "Waiting for the search prompt"
         }
     }
 }

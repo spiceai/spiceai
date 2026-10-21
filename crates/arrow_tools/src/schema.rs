@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::common::DFSchema;
+use datafusion_common::DFSchema;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -393,7 +393,7 @@ pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     /// The schema JSON encoding is a persisted format: CDC connectors record the schema
     /// they last read into an accelerator sidecar row, and a later run has to parse what
@@ -422,8 +422,15 @@ mod tests {
 
     #[test]
     fn schema_from_json_rejects_a_non_schema() {
-        schema_from_json(r#"{"not":"a schema"}"#)
+        let err = schema_from_json(r#"{"not":"a schema"}"#)
             .expect_err("an object that is not a serialized schema must not parse as one");
+        // Well-formed JSON of the wrong shape is refused as data for lacking the schema's
+        // `fields`, rather than as a syntax error or by defaulting to an empty schema.
+        assert_eq!(err.classify(), serde_json::error::Category::Data);
+        assert_eq!(
+            err.to_string(),
+            "missing field `fields` at line 1 column 18"
+        );
     }
 
     fn create_test_schema_with_embeddings() -> Schema {

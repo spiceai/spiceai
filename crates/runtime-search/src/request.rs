@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub struct SearchRequestBaseJson {
-    /// The text to search documents for similarity
+    /// The text to search documents for similarity. Must contain at least one non-whitespace character.
     pub text: String,
 
     /// The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.
@@ -93,10 +93,21 @@ pub struct SearchRequest {
     pub keywords: Vec<String>,
 }
 
+/// Rejects empty or whitespace-only search text for every consumer of
+/// [`SearchRequestBaseJson`] / [`SearchRequestHTTPJson`] (HTTP `/v1/search` and
+/// the MCP/search tool).
+fn reject_empty_search_text(text: &str) -> std::result::Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Search text must not be empty".to_string());
+    }
+    Ok(())
+}
+
 impl TryFrom<SearchRequestHTTPJson> for SearchRequest {
     type Error = String;
 
     fn try_from(req: SearchRequestHTTPJson) -> Result<Self, Self::Error> {
+        reject_empty_search_text(&req.base.text)?;
         Ok(SearchRequest::new(
             req.base.text,
             req.base.datasets,
@@ -116,6 +127,7 @@ impl TryFrom<SearchRequestBaseJson> for SearchRequest {
     type Error = String;
 
     fn try_from(req: SearchRequestBaseJson) -> Result<Self, Self::Error> {
+        reject_empty_search_text(&req.text)?;
         Ok(SearchRequest::new(
             req.text,
             req.datasets,
@@ -341,68 +353,68 @@ pub(crate) mod tests {
     #[test]
     fn test_parse_additional_columns_good() {
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["column"]).as_str(),
-            @r#"[Column { relation: None, name: "column" }]"#
+            "additional_columns_bare_column",
+            run_parse_additional_columns(&["column"]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["\"quoted_column\""]).as_str(),
-            @r#"[Column { relation: None, name: "quoted_column" }]"#
+            "additional_columns_quoted_column",
+            run_parse_additional_columns(&["\"quoted_column\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["tbl.column"]).as_str(),
-            @r#"[Column { relation: Some(Bare { table: "tbl" }), name: "column" }]"#
+            "additional_columns_table_qualified",
+            run_parse_additional_columns(&["tbl.column"]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["schema.tbl.column"]).as_str(),
-            @r#"[Column { relation: Some(Partial { schema: "schema", table: "tbl" }), name: "column" }]"#
+            "additional_columns_schema_qualified",
+            run_parse_additional_columns(&["schema.tbl.column"]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["catalog.schema.tbl.column"]).as_str(),
-            @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "column" }]"#
+            "additional_columns_catalog_qualified",
+            run_parse_additional_columns(&["catalog.schema.tbl.column"]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["catalog.schema.tbl.\"quoted_column\""]).as_str(),
-            @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "quoted_column" }]"#
+            "additional_columns_catalog_qualified_quoted_column",
+            run_parse_additional_columns(&["catalog.schema.tbl.\"quoted_column\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["catalog.schema.tbl.\"quoted.with_dot\""]).as_str(),
-            @r#"[Column { relation: Some(Full { catalog: "catalog", schema: "schema", table: "tbl" }), name: "quoted.with_dot" }]"#
+            "additional_columns_catalog_qualified_quoted_dotted_column",
+            run_parse_additional_columns(&["catalog.schema.tbl.\"quoted.with_dot\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["schema.tbl.\"quoted.with_dot\""]).as_str(),
-            @r#"[Column { relation: Some(Partial { schema: "schema", table: "tbl" }), name: "quoted.with_dot" }]"#
+            "additional_columns_schema_qualified_quoted_dotted_column",
+            run_parse_additional_columns(&["schema.tbl.\"quoted.with_dot\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["tbl.\"quoted.with_dot\""]).as_str(),
-            @r#"[Column { relation: Some(Bare { table: "tbl" }), name: "quoted.with_dot" }]"#
+            "additional_columns_table_qualified_quoted_dotted_column",
+            run_parse_additional_columns(&["tbl.\"quoted.with_dot\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["\"quoted.with_dot\""]).as_str(),
-            @r#"[Column { relation: None, name: "quoted.with_dot" }]"#
+            "additional_columns_quoted_dotted_column",
+            run_parse_additional_columns(&["\"quoted.with_dot\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["table.\"column with spaces\""]).as_str(),
-            @r#"[Column { relation: Some(Bare { table: "table" }), name: "column with spaces" }]"#
+            "additional_columns_quoted_column_with_spaces",
+            run_parse_additional_columns(&["table.\"column with spaces\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["schema.\"table with spaces\".column"]).as_str(),
-            @r#"[Column { relation: Some(Partial { schema: "schema", table: "table with spaces" }), name: "column" }]"#
+            "additional_columns_quoted_table_with_spaces",
+            run_parse_additional_columns(&["schema.\"table with spaces\".column"]).as_str()
         );
     }
 
     #[test]
     fn test_parse_additional_columns_casing() {
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["CoLuMn"]).as_str(),
-            @r#"[Column { relation: None, name: "CoLuMn" }]"#
+            "additional_columns_mixed_case_column",
+            run_parse_additional_columns(&["CoLuMn"]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.\"QuOtEd.WiTh_DoT\""]).as_str(),
-            @r#"[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "QuOtEd.WiTh_DoT" }]"#
+            "additional_columns_mixed_case_quoted_dotted_column",
+            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.\"QuOtEd.WiTh_DoT\""]).as_str()
         );
         insta::assert_snapshot!(
-            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.CoLuMn"]).as_str(),
-            @r#"[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "CoLuMn" }]"#
+            "additional_columns_mixed_case_catalog_qualified",
+            run_parse_additional_columns(&["CaTaLoG.sChEmA.tBl.CoLuMn"]).as_str()
         );
     }
 
@@ -461,10 +473,16 @@ pub(crate) mod tests {
             vec!["(column)".to_string()],
             vec!["table.(column)".to_string()],
         ] {
-            assert!(
-                SearchRequest::parse_additional_columns(&bad).is_err(),
-                "'additional_columns'={bad:?} is not allowed"
-            );
+            // The validator itself must reject the value, and name it back to the user.
+            match SearchRequest::parse_additional_columns(&bad) {
+                Err(Error::InvalidAdditionalColumns { additional_column }) => assert_eq!(
+                    additional_column, bad[0],
+                    "the error must name the rejected additional column"
+                ),
+                other => panic!(
+                    "'additional_columns'={bad:?} must be rejected as an invalid additional column, got {other:?}"
+                ),
+            }
         }
     }
 
@@ -504,65 +522,63 @@ pub(crate) mod tests {
 
     #[test]
     fn test_malformed_conditions() {
-        // Test semicolon injection
-        let result =
-            SearchRequest::parse_where_cond("column = 'value'; DROP TABLE users;".to_string());
-        assert!(result.is_err(), "{}", result.expect("!"));
+        for (where_cond, case) in [
+            ("column = 'value'; DROP TABLE users;", "semicolon injection"),
+            (
+                "column = 'value' UNION SELECT * FROM users",
+                "UNION injection",
+            ),
+            (
+                "column = 'value'; SELECT * FROM users",
+                "multiple statements",
+            ),
+            (
+                "column = 'value'); SELECT * FROM users; --",
+                "stacked queries",
+            ),
+            ("column =", "incomplete expression"),
+            ("column === value", "invalid operator"),
+            ("column = 'value", "unclosed string"),
+            ("", "empty condition"),
+        ] {
+            // Each must be rejected by the WHERE validator, which names the condition
+            // back to the user.
+            match SearchRequest::parse_where_cond(where_cond.to_string()) {
+                Err(Error::InvalidWhereCondition {
+                    where_cond: rejected,
+                }) => assert_eq!(
+                    rejected, where_cond,
+                    "the {case} error must name the rejected condition"
+                ),
+                other => panic!(
+                    "{case} ({where_cond:?}) must be rejected as an invalid WHERE condition, got {other:?}"
+                ),
+            }
+        }
 
-        // Test UNION injection
-        let result = SearchRequest::parse_where_cond(
-            "column = 'value' UNION SELECT * FROM users".to_string(),
-        );
-        result.expect_err("should error on UNION injection");
-
-        // Test multiple statements
-        let result =
-            SearchRequest::parse_where_cond("column = 'value'; SELECT * FROM users".to_string());
-        result.expect_err("should error on multiple statements");
-
-        // Test stacked queries
-        let result = SearchRequest::parse_where_cond(
-            "column = 'value'); SELECT * FROM users; --".to_string(),
-        );
-        result.expect_err("should error on stacked queries");
-
-        // Test incomplete expression
-        let result = SearchRequest::parse_where_cond("column =".to_string());
-        result.expect_err("should error on incomplete expression");
-
-        // Test invalid operator
-        let result = SearchRequest::parse_where_cond("column === value".to_string());
-        result.expect_err("should error on invalid operator");
-        // Test unclosed string
-        let result = SearchRequest::parse_where_cond("column = 'value".to_string());
-        result.expect_err("should error on unclosed string");
-
-        // Test invalid column name
-        let result = SearchRequest::parse_where_cond("'column' = 'value'".to_string());
-        result.expect("should parse valid SQL syntax with quoted column name");
-        // Test empty condition
-        let result = SearchRequest::parse_where_cond(String::new());
-        result.expect_err("should error on empty condition");
+        // A quoted string on the left of a comparison is still valid SQL syntax.
+        let parsed = SearchRequest::parse_where_cond("'column' = 'value'".to_string())
+            .expect("should parse valid SQL syntax with quoted column name");
+        assert_eq!(parsed.to_string(), "'column' = 'value'");
     }
 
     #[test]
     fn test_complex_valid_conditions() {
-        // Test nested AND/OR
-        let result = SearchRequest::parse_where_cond(
-            "age > 18 AND (is_active = true OR role = 'admin')".to_string(),
-        );
-        result.expect("should parse nested AND/OR condition");
-
-        // Test IN clause
-        let result = SearchRequest::parse_where_cond("status IN ('active', 'pending')".to_string());
-        result.expect("should parse IN clause");
-        // Test BETWEEN
-        let result = SearchRequest::parse_where_cond("age BETWEEN 18 AND 65".to_string());
-        result.expect("should parse BETWEEN clause");
-
-        // Test IS NULL
-        let result = SearchRequest::parse_where_cond("last_login IS NULL".to_string());
-        result.expect("should parse IS NULL clause");
+        // Each condition must parse to an expression that prints back as written, so a
+        // mis-grouped (the nested AND/OR) or truncated parse fails.
+        for (where_cond, case) in [
+            (
+                "age > 18 AND (is_active = true OR role = 'admin')",
+                "nested AND/OR",
+            ),
+            ("status IN ('active', 'pending')", "IN clause"),
+            ("age BETWEEN 18 AND 65", "BETWEEN clause"),
+            ("last_login IS NULL", "IS NULL clause"),
+        ] {
+            let parsed = SearchRequest::parse_where_cond(where_cond.to_string())
+                .unwrap_or_else(|err| panic!("should parse the {case} condition: {err}"));
+            assert_eq!(parsed.to_string(), where_cond, "the {case} condition");
+        }
     }
 
     #[test]
@@ -596,5 +612,46 @@ pub(crate) mod tests {
         } else {
             panic!("Expected BinaryOp expression");
         }
+    }
+
+    #[test]
+    fn try_from_rejects_empty_and_whitespace_text() {
+        for text in ["", "   ", "\t\n "] {
+            let base = SearchRequestBaseJson {
+                text: text.to_string(),
+                datasets: Some(vec!["products".to_string()]),
+                limit: Some(3),
+                where_cond: None,
+                additional_columns: vec![],
+            };
+            let err = SearchRequest::try_from(base).expect_err("empty text must fail");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+
+            let http = SearchRequestHTTPJson {
+                base: SearchRequestBaseJson {
+                    text: text.to_string(),
+                    datasets: Some(vec!["products".to_string()]),
+                    limit: Some(3),
+                    where_cond: None,
+                    additional_columns: vec![],
+                },
+                keywords: None,
+            };
+            let err = SearchRequest::try_from(http).expect_err("empty text must fail");
+            assert_eq!(err, "Search text must not be empty", "text={text:?}");
+        }
+    }
+
+    #[test]
+    fn try_from_accepts_non_empty_text() {
+        let base = SearchRequestBaseJson {
+            text: " boots ".to_string(),
+            datasets: Some(vec!["products".to_string()]),
+            limit: Some(3),
+            where_cond: None,
+            additional_columns: vec![],
+        };
+        let req = SearchRequest::try_from(base).expect("non-empty text must succeed");
+        assert_eq!(req.text, " boots ");
     }
 }

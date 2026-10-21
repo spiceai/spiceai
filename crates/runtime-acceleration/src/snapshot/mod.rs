@@ -16,26 +16,31 @@ limitations under the License.
 use arrow_schema::{Schema, SchemaRef};
 use arrow_tools::map_entries::conforming_schema;
 use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
-use aws_sdk_credential_bridge::object_store_builder::{
-    S3ObjectStoreBuilder, S3ObjectStoreBuilderError,
-};
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use object_store::{
-    GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
-    path::Path as ObjectPath,
+    GetOptions, ObjectStore, ObjectStoreExt, PutPayload, PutResult, UpdateVersion,
+    path::{Path as ObjectPath, PathPart},
+};
+use object_store_occ::{
+    Attempt, ConditionalWriteError, ConditionalWriteSupport, ConflictRetry, Expected,
+    RetryOnConflictError, cleanup, conditional_put, probe_conditional_writes, retry_on_conflict,
 };
 use opentelemetry::KeyValue;
-use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_secrets::{Secrets, get_params_with_secrets};
+use runtime_parameters::Parameters;
+use runtime_secrets::Secrets;
+use runtime_state_location::StateFeature;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
-use spicepod::{component::snapshot::BootstrapOnFailureBehavior, param::Params};
+use spicepod::component::{
+    runtime::{StateLocation, StateSource},
+    snapshot::BootstrapOnFailureBehavior,
+};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Write,
     ops::Not,
     path::{Path, PathBuf},
@@ -66,10 +71,13 @@ pub mod directory_archive;
 pub mod engine;
 pub mod metrics;
 pub mod notifications;
+mod retention;
+pub mod section_deprecation;
 mod writer_lease;
 pub use crate::layout::AccelerationLayout;
 pub use behavior::{SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE, SnapshotBehavior, snapshots_enabled};
 use engine::{SnapshotEngine, create_snapshot_engine};
+use retention::{CleanupClock, FILE_GRACE, Retention, SNAPSHOT_RETENTION};
 use writer_lease::{WriterLease, WriterPermit, claim_publication, superseded_message};
 
 /// Size of each ranged GET used to download a snapshot.
@@ -121,9 +129,12 @@ pub mod api {
 }
 use spicepod::acceleration::{SnapshotsCompaction, SnapshotsCreationPolicy};
 
+/// The `format-version` of `metadata.json`, the same number a `runtime.state`
+/// location's `_spice/format.json` records.
+use runtime_state_location::FORMAT_VERSION as SNAPSHOT_METADATA_FORMAT_VERSION;
+
 const SNAPSHOT_TIMESTAMP_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 const SNAPSHOT_MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
-const SNAPSHOT_METADATA_FORMAT_VERSION: u32 = 1;
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
@@ -321,11 +332,39 @@ enum MetadataRead {
 /// The outcome of one [`SnapshotManager::download_if_newer`] poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPoll {
-    /// The snapshot that was downloaded, or `None` when nothing newer was available.
-    pub download: Option<SnapshotDownloadInfo>,
+    /// What the poll found at the snapshot location.
+    pub outcome: SnapshotPollOutcome,
     /// The `ETag` of the metadata this poll acted on, when the store reports one. Passing
     /// it to the next poll lets that poll skip entirely if the metadata has not changed.
+    /// Withheld when the poll did not load the published snapshot, so the next poll reads
+    /// the metadata again.
     pub metadata_e_tag: Option<String>,
+}
+
+impl SnapshotPoll {
+    /// The snapshot this poll downloaded, if any.
+    #[must_use]
+    pub fn download(&self) -> Option<&SnapshotDownloadInfo> {
+        match &self.outcome {
+            SnapshotPollOutcome::Downloaded(info) => Some(info),
+            _ => None,
+        }
+    }
+}
+
+/// What one [`SnapshotManager::download_if_newer`] poll found at the snapshot location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotPollOutcome {
+    /// A newer snapshot was downloaded.
+    Downloaded(SnapshotDownloadInfo),
+    /// The published snapshot is the loaded one, or the metadata is unchanged since the
+    /// last poll.
+    UpToDate,
+    /// `metadata.json` does not exist or names no current snapshot for the dataset.
+    NotPublished,
+    /// The published snapshot is older than the loaded one, as after the location was
+    /// recreated and the writer's ids restarted. It is never loaded.
+    OlderThanLoaded { published_id: u64, loaded_id: u64 },
 }
 
 /// A dataset's current snapshot as its `metadata.json` records it: what a dataset that
@@ -409,6 +448,13 @@ impl CurrentSnapshotError {
     }
 }
 
+/// Logged once, by the writer that removes the entry of a snapshot whose file is gone.
+fn lost_snapshot_message(dataset: &str, snapshot_id: u64, snapshot: &str) -> String {
+    format!(
+        "The file '{snapshot}' of snapshot {snapshot_id} of dataset '{dataset}' is gone from the snapshot location, for example deleted by a bucket lifecycle rule, so the snapshot was removed from the dataset's snapshot list and can no longer be restored or made current."
+    )
+}
+
 /// `'a', 'b'` for the datasets a `metadata.json` lists, for [`CurrentSnapshotError`].
 fn describe_datasets(datasets: &[String]) -> String {
     if datasets.is_empty() {
@@ -424,7 +470,7 @@ fn describe_datasets(datasets: &[String]) -> String {
 
 /// The engine that created `entry`: the engine recorded on the entry, then the one
 /// recorded for its dataset, then the engine the snapshot file's extension names —
-/// each writer names its snapshots `<dataset>_<timestamp>.<engine>`.
+/// each writer ends its snapshot names with `.<engine>`.
 fn recorded_snapshot_engine(entry: &SnapshotEntry, dataset: &DatasetMetadata) -> Option<String> {
     entry
         .snapshot_engine
@@ -454,6 +500,24 @@ enum MetadataLoadError {
     UnsupportedVersion {
         path: String,
         version: u32,
+    },
+}
+
+/// Why [`SnapshotManager::update_metadata`] did not rewrite `metadata.json`.
+#[derive(Debug)]
+enum MetadataUpdateError<E> {
+    Load(MetadataLoadError),
+    /// The caller's update refused the document it was given.
+    Update(E),
+    Serialize(serde_json::Error),
+    /// The store returned neither an `ETag` nor a version for the document, so it
+    /// cannot be rewritten without risking another writer's changes.
+    Unversioned,
+    /// The write failed for a reason other than another writer changing the document.
+    Write(ConditionalWriteError),
+    /// Another writer changed the document before each of `attempts` attempts.
+    Contention {
+        attempts: usize,
     },
 }
 
@@ -522,6 +586,14 @@ pub enum SnapshotDownloadError {
     Download {
         path: String,
         source: object_store::Error,
+    },
+    #[snafu(display(
+        "Snapshot {snapshot_id} of dataset '{dataset}' has no file at '{location}': it was deleted from the snapshot location, for example by a bucket lifecycle rule"
+    ))]
+    SnapshotFileMissing {
+        dataset: String,
+        snapshot_id: u64,
+        location: String,
     },
     #[snafu(display("Failed to read snapshot bytes for {path}: {source}"))]
     DownloadBytes {
@@ -629,6 +701,24 @@ impl From<MetadataLoadError> for SnapshotUploadError {
     }
 }
 
+impl From<MetadataLoadError> for SnapshotApiError {
+    fn from(err: MetadataLoadError) -> Self {
+        match err {
+            MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
+                path,
+                reason: source.to_string(),
+            },
+            MetadataLoadError::UnsupportedVersion { path, version } => {
+                SnapshotApiError::UnsupportedVersion { path, version }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum SnapshotUploadError {
     #[snafu(display("Failed to open local snapshot file {}: {source}", path.display()))]
@@ -681,7 +771,36 @@ pub enum SnapshotUploadError {
     #[snafu(display("Failed to write snapshot metadata to {path}: {source}"))]
     UploadWriteMetadata {
         path: String,
-        source: object_store::Error,
+        #[snafu(source(from(ConditionalWriteError, Box::new)))]
+        source: Box<ConditionalWriteError>,
+    },
+    #[snafu(display(
+        "Failed to publish a snapshot of dataset '{dataset}': the object store returned neither an ETag nor a version for '{path}', so the snapshot metadata cannot be updated without risking a concurrent writer's changes. Use a snapshot location that supports conditional writes. See: {SNAPSHOTS_DOCS}"
+    ))]
+    MetadataUnversioned { dataset: String, path: String },
+    #[snafu(display(
+        "Failed to publish a snapshot of dataset '{dataset}': another writer changed '{path}' before each of {attempts} attempts, so this snapshot was not recorded. Check that the Spice instances creating snapshots at this location are not publishing continuously; the next snapshot retries. See: {SNAPSHOTS_DOCS}"
+    ))]
+    MetadataContention {
+        dataset: String,
+        path: String,
+        attempts: usize,
+    },
+    #[snafu(display(
+        "Failed to create a snapshot of dataset '{dataset}': the snapshot location '{location}' {reason}, so concurrent writers could overwrite each other's snapshot metadata. Use a location that enforces conditional writes (If-None-Match and If-Match), such as Amazon S3, Azure Blob Storage, Google Cloud Storage or a local directory. See: {SNAPSHOTS_DOCS}"
+    ))]
+    ConditionalWritesNotEnforced {
+        dataset: String,
+        location: String,
+        reason: String,
+    },
+    #[snafu(display(
+        "Failed to create a snapshot of dataset '{dataset}': could not confirm that the snapshot location '{location}' enforces conditional writes, so the snapshot was not published. The next attempt checks again. If this persists, allow Spice to create, update and delete `.spice-conditional-write-probe-*` objects under '{location}'. Cause: {reason}. See: {SNAPSHOTS_DOCS}"
+    ))]
+    ConditionalWritesUnconfirmed {
+        dataset: String,
+        location: String,
+        reason: String,
     },
     #[snafu(display("Failed to serialize snapshot metadata at {path}: {source}"))]
     UploadSerializeMetadata {
@@ -733,8 +852,12 @@ pub enum SnapshotUploadError {
 
 impl SnapshotUploadError {
     /// Whether a fresh attempt may succeed. Schema and format errors need a change
-    /// outside the runtime; everything else (network, local I/O, an archive walk that
-    /// raced engine maintenance) may pass on retry.
+    /// outside the runtime, and so does a store that cannot update the snapshot metadata
+    /// conditionally; everything else (network, local I/O, an archive walk that raced
+    /// engine maintenance, a conditional-write probe that could not tell) may pass on
+    /// retry. A metadata update that loses to another writer is retried by the metadata
+    /// update loop itself, so neither a conflict nor an exhausted conflict budget is
+    /// retried here: the next scheduled snapshot tries again.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
@@ -742,8 +865,14 @@ impl SnapshotUploadError {
             | Self::UploadPart { source, .. }
             | Self::CompleteUpload { source, .. }
             | Self::AbortUpload { source, .. }
-            | Self::UploadReadMetadata { source, .. }
-            | Self::UploadWriteMetadata { source, .. } => is_retriable_object_store_error(source),
+            | Self::UploadReadMetadata { source, .. } => is_retriable_object_store_error(source),
+            Self::UploadWriteMetadata { source, .. } => match source.as_ref() {
+                ConditionalWriteError::Store { source, .. } => {
+                    is_retriable_object_store_error(source)
+                }
+                ConditionalWriteError::Conflict { .. }
+                | ConditionalWriteError::Unsupported { .. } => false,
+            },
             Self::UploadSchemaSerialize { .. }
             | Self::UploadParseMetadata { .. }
             | Self::UploadUnsupportedMetadataVersion { .. }
@@ -752,7 +881,10 @@ impl SnapshotUploadError {
             | Self::UploadMetadataSchemaMissing { .. }
             | Self::UploadSchemaMismatch { .. }
             | Self::MissingAccelerationFile { .. }
-            | Self::AdapterDisabled { .. } => false,
+            | Self::AdapterDisabled { .. }
+            | Self::MetadataUnversioned { .. }
+            | Self::ConditionalWritesNotEnforced { .. }
+            | Self::MetadataContention { .. } => false,
             _ => true,
         }
     }
@@ -772,11 +904,14 @@ impl<'a> SnapshotPathLayout<'a> {
         }
     }
 
+    /// `<dataset>_<timestamp>_<uuid>.<ext>`. The timestamp has one-second resolution, so
+    /// the UUID keeps two publishes in the same second from writing the same object.
     fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
         format!(
-            "{}_{}{}",
+            "{}_{}_{}{}",
             self.dataset_name,
             instant.format(SNAPSHOT_TIMESTAMP_FORMAT),
+            uuid::Uuid::now_v7().simple(),
             self.engine.snapshot_extension()
         )
     }
@@ -785,6 +920,7 @@ impl<'a> SnapshotPathLayout<'a> {
         format!("dataset={}", self.dataset_name)
     }
 
+    /// Every call names a new object.
     fn build_location(&self, base: &ObjectPath, instant: DateTime<Utc>) -> ObjectPath {
         let month_partition = format!("month={}", instant.format("%Y-%m"));
         let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
@@ -863,7 +999,27 @@ pub struct SnapshotManager {
     checkpointer_factory: Option<DatasetCheckpointerFactory>,
     snapshots_creation_policy: SnapshotsCreationPolicy,
     network_retry_strategy: RetryBackoff,
+    /// How a metadata update backs off while other writers keep changing `metadata.json`.
+    conflict_retry: ConflictRetry,
+    /// Whether this manager's store enforces conditional writes, once a probe has told.
+    conditional_write_check: Arc<ConditionalWriteCheck>,
     writer_lease: WriterLease,
+    /// When this dataset's writer next lists its snapshot location for files no
+    /// entry names and entries whose file is gone: `None` at its next publish.
+    next_sweep: Arc<parking_lot::Mutex<Option<Instant>>>,
+    /// The time snapshot retention measures ages against.
+    cleanup_clock: CleanupClock,
+}
+
+/// The conditional-write probe result for one [`SnapshotManager`]'s store.
+///
+/// Kept per manager rather than per location URI: two managers can reach different
+/// stores through the same URI (another endpoint, or a configuration reload).
+#[derive(Debug, Default)]
+struct ConditionalWriteCheck {
+    /// A conclusive probe result. An inconclusive one is not kept, so the next publish
+    /// probes again.
+    conclusive: tokio::sync::OnceCell<ConditionalWriteSupport>,
 }
 
 impl std::fmt::Debug for SnapshotManager {
@@ -887,6 +1043,33 @@ impl std::fmt::Debug for SnapshotManager {
 #[derive(Clone, Copy)]
 pub struct ForceCreate(pub bool);
 
+/// What a snapshot holds until the acceleration is copied or archived: the
+/// accelerator write lock, and optionally an engine guard such as a Cayenne pin.
+pub struct SnapshotLockGuard {
+    _write: OwnedMutexGuard<()>,
+    _engine: Option<Box<dyn Send>>,
+}
+
+impl SnapshotLockGuard {
+    /// Also hold `guard` until the acceleration is copied or archived.
+    #[must_use]
+    pub fn with(self, guard: impl Send + 'static) -> Self {
+        Self {
+            _engine: Some(Box::new(guard)),
+            ..self
+        }
+    }
+}
+
+impl From<OwnedMutexGuard<()>> for SnapshotLockGuard {
+    fn from(write: OwnedMutexGuard<()>) -> Self {
+        Self {
+            _write: write,
+            _engine: None,
+        }
+    }
+}
+
 /// Whether an uploaded snapshot was made current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Publication {
@@ -894,6 +1077,42 @@ enum Publication {
     /// A later generation of the dataset's writer lease published a snapshot
     /// first, so this one was left unpublished.
     Superseded,
+}
+
+/// The retention applied by the write of `metadata.json` that published a snapshot.
+struct Committed {
+    retention: Retention,
+    /// The snapshots whose files the dataset still needs after the write: its
+    /// entries and the snapshots it dropped less than the file grace ago.
+    named: Vec<String>,
+    /// The `location` recorded in the `metadata.json` written, which its snapshot
+    /// URIs resolve against.
+    metadata_location: String,
+}
+
+/// This dataset's snapshot files as one listing of the snapshot location found
+/// them, and the entries whose file is gone.
+struct Sweep {
+    /// Every object in this dataset's snapshot partition, with when it was last
+    /// written, in milliseconds since the UNIX epoch.
+    files: Vec<(ObjectPath, i64)>,
+    /// The snapshots of entries at least the file grace old whose file the listing
+    /// did not find and a `HEAD` request found gone.
+    gone: HashSet<String>,
+}
+
+/// Why a publish's metadata update refused the `metadata.json` it read.
+#[derive(Debug)]
+enum PublishRefusal {
+    /// A later generation of the dataset's writer lease published a snapshot first.
+    Superseded,
+    Failed(Box<SnapshotUploadError>),
+}
+
+impl From<SnapshotUploadError> for PublishRefusal {
+    fn from(source: SnapshotUploadError) -> Self {
+        Self::Failed(Box::new(source))
+    }
 }
 
 impl Not for ForceCreate {
@@ -1208,7 +1427,7 @@ impl SnapshotManager {
         tracing::debug!(dataset = %dataset_name, "Snapshots enabled");
 
         let Some(snapshot_location) = &snapshot_config.location else {
-            tracing::warn!(dataset = %dataset_name, "Snapshots enabled but no location configured");
+            tracing::warn!(dataset = %dataset_name, "{}", no_location_warning(&dataset_name));
             return None;
         };
         let snapshot_location_uri = snapshot_location.clone();
@@ -1258,7 +1477,11 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            conflict_retry: ConflictRetry::default(),
+            conditional_write_check: Arc::default(),
             writer_lease: WriterLease::default(),
+            next_sweep: Arc::default(),
+            cleanup_clock: CleanupClock::default(),
         })
     }
 
@@ -1294,7 +1517,7 @@ impl SnapshotManager {
         };
 
         let Some(snapshot_location) = &snapshot_config.location else {
-            tracing::warn!(dataset = %dataset_name, "Snapshots enabled but no location configured");
+            tracing::warn!(dataset = %dataset_name, "{}", no_location_warning(&dataset_name));
             return None;
         };
         let snapshot_location_uri = snapshot_location.clone();
@@ -1335,7 +1558,11 @@ impl SnapshotManager {
             bootstrap_failure_behavior: snapshot_config.bootstrap_on_failure_behavior,
             snapshots_creation_policy: SnapshotsCreationPolicy::default(),
             network_retry_strategy,
+            conflict_retry: ConflictRetry::default(),
+            conditional_write_check: Arc::default(),
             writer_lease: WriterLease::default(),
+            next_sweep: Arc::default(),
+            cleanup_clock: CleanupClock::default(),
         })
     }
 
@@ -1583,50 +1810,42 @@ impl SnapshotManager {
             .read_metadata(known_metadata_e_tag)
             .await
             .map_err(|err| RetryError::permanent(err.into()))?;
+        let not_published = SnapshotPoll {
+            outcome: SnapshotPollOutcome::NotPublished,
+            metadata_e_tag: None,
+        };
         let handle = match read {
             MetadataRead::Unchanged => {
                 return Ok(SnapshotPoll {
-                    download: None,
+                    outcome: SnapshotPollOutcome::UpToDate,
                     metadata_e_tag: known_metadata_e_tag.map(str::to_string),
                 });
             }
-            MetadataRead::Current(None) => {
-                return Ok(SnapshotPoll {
-                    download: None,
-                    metadata_e_tag: None,
-                });
-            }
+            MetadataRead::Current(None) => return Ok(not_published),
             MetadataRead::Current(Some(handle)) => Arc::new(handle),
         };
-        let nothing_newer = SnapshotPoll {
-            download: None,
-            metadata_e_tag: handle.e_tag(),
-        };
         let Some(dataset_metadata) = handle.metadata.datasets.get(&self.dataset_name) else {
-            return Ok(nothing_newer);
+            return Ok(not_published);
         };
         let Some(remote_id) = dataset_metadata.current_snapshot_id else {
-            return Ok(nothing_newer);
+            return Ok(not_published);
         };
         if let Some(local_id) = current_local_id
             && remote_id <= local_id
         {
             if remote_id < local_id {
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    remote_snapshot_id = remote_id,
-                    local_snapshot_id = local_id,
-                    "snapshot metadata current id is older than the locally loaded snapshot; \
-                     skipping reload to avoid regression"
-                );
-                // Withheld so the next poll reads the metadata again and repeats this warning
-                // for as long as the rollback lasts.
                 return Ok(SnapshotPoll {
-                    download: None,
+                    outcome: SnapshotPollOutcome::OlderThanLoaded {
+                        published_id: remote_id,
+                        loaded_id: local_id,
+                    },
                     metadata_e_tag: None,
                 });
             }
-            return Ok(nothing_newer);
+            return Ok(SnapshotPoll {
+                outcome: SnapshotPollOutcome::UpToDate,
+                metadata_e_tag: handle.e_tag(),
+            });
         }
 
         // Inspect the metadata-recorded schema first, before touching the file: an
@@ -1677,18 +1896,20 @@ impl SnapshotManager {
                     RetryError::transient(err)
                 })?
         } else {
-            self.download_latest(Some(handle))
+            self.download_latest(Some(handle), current_local_id)
                 .await
                 .map_err(RetryError::permanent)?
         };
-        // The bootstrap failure behavior can turn a failed download into no download, or fall
-        // back to an older snapshot. Neither loaded the current snapshot, so the `ETag` is
-        // withheld and the next poll reads the metadata again instead of skipping.
+        // A tolerated download failure or a fallback to an older snapshot did not load the
+        // current one, so the `ETag` is withheld and the next poll reads the metadata again.
         let loaded_current = download
             .as_ref()
             .is_some_and(|info| info.snapshot_id == remote_id);
         Ok(SnapshotPoll {
-            download,
+            outcome: download.map_or(
+                SnapshotPollOutcome::UpToDate,
+                SnapshotPollOutcome::Downloaded,
+            ),
             metadata_e_tag: e_tag.filter(|_| loaded_current),
         })
     }
@@ -1701,7 +1922,8 @@ impl SnapshotManager {
     ///
     /// # Arguments
     /// * `schema` - The schema of the dataset.
-    /// * `lock_guard` - Lock guard protecting accelerator writes during snapshot.
+    /// * `lock_guard` - The accelerator write lock, with any engine guard, held until the
+    ///   acceleration is copied or archived.
     /// * `last_updated_at` - Optional timestamp (ms since epoch) of the last `insert_into`.
     /// * `row_count` - Optional number of rows in the accelerated dataset at snapshot time.
     ///
@@ -1717,11 +1939,15 @@ impl SnapshotManager {
     pub async fn create_snapshot(
         &self,
         schema: &SchemaRef,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: impl Into<SnapshotLockGuard>,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         force_create: ForceCreate,
     ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
+        // The writer lease and the metadata update both rely on the store enforcing
+        // conditional writes, so a store that does not is refused before either is written.
+        self.ensure_conditional_writes().await?;
+
         // Of the instances creating this dataset's snapshots in this location,
         // only the holder of its writer lease creates them.
         let writer_generation = match self.hold_writer_lease().await? {
@@ -1732,7 +1958,7 @@ impl SnapshotManager {
         let created = self
             .create_snapshot_as_writer(
                 schema,
-                lock_guard,
+                lock_guard.into(),
                 last_updated_at,
                 row_count,
                 force_create,
@@ -1751,7 +1977,7 @@ impl SnapshotManager {
     async fn create_snapshot_as_writer(
         &self,
         schema: &SchemaRef,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: SnapshotLockGuard,
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         force_create: ForceCreate,
@@ -1826,6 +2052,8 @@ impl SnapshotManager {
             }
         };
 
+        let sweep = self.sweep_if_due().await;
+        let committed = parking_lot::Mutex::new(None);
         let publication = self
             .update_metadata_after_upload(
                 &destination_location,
@@ -1836,6 +2064,8 @@ impl SnapshotManager {
                 last_updated_at,
                 row_count,
                 writer_generation,
+                sweep.as_ref().map(|sweep| &sweep.gone),
+                &committed,
             )
             .await?;
         if publication == Publication::Superseded {
@@ -1864,7 +2094,243 @@ impl SnapshotManager {
             "Snapshot created"
         );
 
+        if let Some(committed) = committed.into_inner() {
+            self.clean_up_after_publish(&committed, sweep.as_ref())
+                .await;
+        }
+
         Ok(Some(destination_location))
+    }
+
+    /// Lists this dataset's snapshot files and finds the entries whose file is gone,
+    /// at most about once an hour. Returns `None` when it is not yet time, or when
+    /// the listing failed; the publish then cleans up only what its own write of
+    /// `metadata.json` drops.
+    async fn sweep_if_due(&self) -> Option<Sweep> {
+        {
+            let mut next_sweep = self.next_sweep.lock();
+            if next_sweep.is_some_and(|due| Instant::now() < due) {
+                return None;
+            }
+            *next_sweep = Some(Instant::now() + cleanup::next_pass_delay());
+        }
+        match self.sweep().await {
+            Ok(sweep) => Some(sweep),
+            Err(source) => {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    "Failed to list the snapshot location '{}' of dataset '{}', so snapshot files no entry names stay until the next attempt. Cause: {source}",
+                    self.snapshot_location_uri,
+                    self.dataset_name
+                );
+                None
+            }
+        }
+    }
+
+    async fn sweep(&self) -> Result<Sweep, object_store::Error> {
+        let partition = PathPart::from(
+            SnapshotPathLayout::new(&self.dataset_name, &self.engine).dataset_partition_raw(),
+        );
+        let mut files = Vec::new();
+        let mut listing = self.object_store.list(Some(&self.snapshots_location));
+        while let Some(object) = listing.try_next().await? {
+            if self.is_dataset_snapshot_file(&object.location, &partition) {
+                files.push((object.location, object.last_modified.timestamp_millis()));
+            }
+        }
+
+        let listed: HashSet<&ObjectPath> = files.iter().map(|(path, _)| path).collect();
+        let lost_by_ms = self
+            .cleanup_clock
+            .now_ms()
+            .saturating_sub(retention::millis(cleanup::age(FILE_GRACE)));
+        let mut gone = HashSet::new();
+        if let Ok(Some(handle)) = self.load_metadata().await
+            && let Some(dataset) = handle.metadata.datasets.get(&self.dataset_name)
+        {
+            for entry in &dataset.snapshots {
+                if entry.timestamp_ms > lost_by_ms {
+                    continue;
+                }
+                let Ok(path) = self
+                    .snapshot_uri_to_object_path(&entry.snapshot, Some(&handle.metadata.location))
+                else {
+                    continue;
+                };
+                if !listed.contains(&path) && self.file_is_gone(&path).await {
+                    gone.insert(entry.snapshot.clone());
+                }
+            }
+        }
+        Ok(Sweep { files, gone })
+    }
+
+    /// Whether the store answers that `path` does not exist. A request that keeps
+    /// failing for another reason does not count as an answer.
+    async fn file_is_gone(&self, path: &ObjectPath) -> bool {
+        let head = retry(self.network_retry_strategy.clone(), || async {
+            match self.object_store.head(path).await {
+                Ok(_) => Ok(false),
+                Err(object_store::Error::NotFound { .. }) => Ok(true),
+                Err(err) if is_retriable_object_store_error(&err) => {
+                    Err(RetryError::transient(err))
+                }
+                Err(err) => Err(RetryError::permanent(err)),
+            }
+        })
+        .await;
+        head.unwrap_or(false)
+    }
+
+    /// Whether `path` is a snapshot file of this dataset:
+    /// `<location>/month=…/day=…/dataset=<name>/<file>`.
+    fn is_dataset_snapshot_file(&self, path: &ObjectPath, partition: &PathPart<'_>) -> bool {
+        let Some(parts) = path.prefix_match(&self.snapshots_location) else {
+            return false;
+        };
+        let parts: Vec<PathPart<'_>> = parts.collect();
+        matches!(
+            parts.as_slice(),
+            [month, day, dataset, _file]
+                if month.as_ref().starts_with("month=")
+                    && day.as_ref().starts_with("day=")
+                    && dataset == partition
+        )
+    }
+
+    /// Deletes the files a publish left unneeded: those of snapshots dropped at least
+    /// the file grace ago, and, after a sweep, the dataset's files no entry or recent
+    /// drop names that are at least the file grace old. Logs what the publish's write
+    /// dropped and how many files went.
+    async fn clean_up_after_publish(&self, committed: &Committed, sweep: Option<&Sweep>) {
+        let resolve = |snapshot: &str| {
+            self.snapshot_uri_to_object_path(snapshot, Some(&committed.metadata_location))
+        };
+        let mut handled = HashSet::new();
+        let mut deleted = 0;
+        for snapshot in &committed.retention.expired {
+            if let Ok(path) = resolve(snapshot) {
+                deleted += usize::from(self.delete_snapshot_file(&path, &mut handled).await);
+            }
+        }
+
+        // A file is deleted only if every snapshot the dataset still needs resolved, so
+        // one that did not cannot have its file mistaken for an orphan.
+        let named: Option<HashSet<ObjectPath>> = committed
+            .named
+            .iter()
+            .map(|snapshot| resolve(snapshot).ok())
+            .collect();
+        if let (Some(sweep), Some(named)) = (sweep, named) {
+            let orphaned_by_ms = self
+                .cleanup_clock
+                .now_ms()
+                .saturating_sub(retention::millis(cleanup::age(FILE_GRACE)));
+            for (path, last_written_ms) in &sweep.files {
+                if *last_written_ms <= orphaned_by_ms
+                    && !named.contains(path)
+                    && !handled.contains(path)
+                {
+                    deleted += usize::from(self.delete_snapshot_file(path, &mut handled).await);
+                }
+            }
+        }
+
+        for entry in &committed.retention.lost {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "{}",
+                lost_snapshot_message(&self.dataset_name, entry.snapshot_id, &entry.snapshot)
+            );
+        }
+        runtime_state_location::metrics::record_cleanup_deleted(StateFeature::Snapshots, deleted);
+        let aged_out = committed.retention.aged_out.len();
+        if aged_out > 0 || deleted > 0 {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                "Snapshot cleanup of dataset '{}' dropped {aged_out} snapshots older than {} and deleted {deleted} snapshot files.",
+                self.dataset_name,
+                cleanup::describe(cleanup::age(SNAPSHOT_RETENTION)),
+            );
+        }
+    }
+
+    /// Deletes one snapshot file and adds it to `handled` once it is gone. Returns
+    /// whether it is gone.
+    async fn delete_snapshot_file(
+        &self,
+        path: &ObjectPath,
+        handled: &mut HashSet<ObjectPath>,
+    ) -> bool {
+        match cleanup::delete_if_present(self.object_store.as_ref(), path).await {
+            Ok(()) => {
+                handled.insert(path.clone());
+                true
+            }
+            Err(source) => {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    "Failed to delete the unneeded snapshot file '{}' of dataset '{}', so it stays in the snapshot location until the next cleanup. Cause: {source}",
+                    self.object_path_uri(path),
+                    self.dataset_name
+                );
+                false
+            }
+        }
+    }
+
+    /// Refuses to publish to a location whose store does not enforce conditional writes.
+    ///
+    /// Publishing rewrites `metadata.json` at the version it read. On a store that ignores
+    /// the condition, two instances publishing at once would each overwrite the other's
+    /// entry, and both could take the dataset's writer lease, so this manager probes its
+    /// store before its first snapshot. A probe that cannot tell — after a transient
+    /// error, or because it may not write its probe object — refuses the publish too,
+    /// since only the probe can tell a store that ignores conditions from one that
+    /// enforces them. A lasting refusal (`Ignored` / `Unsupported`, even when the other
+    /// check is still `Unknown`) is kept so later publishes do not re-probe a known-bad
+    /// store; a genuinely unknown result is not kept, so the next attempt probes again.
+    async fn ensure_conditional_writes(&self) -> Result<(), SnapshotUploadError> {
+        let probed = self
+            .conditional_write_check
+            .conclusive
+            .get_or_try_init(|| async {
+                let support =
+                    probe_conditional_writes(self.object_store.as_ref(), &self.snapshots_location)
+                        .await;
+                // Cache conclusive answers and partial refusals (Ignored/Unsupported on
+                // either side). Retry only when both sides are still Unknown.
+                if support.is_conclusive() || support.refusal_reason().is_some() {
+                    Ok(support)
+                } else {
+                    Err(support)
+                }
+            })
+            .await;
+        let support = match probed {
+            Ok(support) if support.is_enforced() => return Ok(()),
+            Ok(support) => support.clone(),
+            Err(inconclusive) => inconclusive,
+        };
+
+        if let Some(reason) = support.refusal_reason() {
+            return Err(SnapshotUploadError::ConditionalWritesNotEnforced {
+                dataset: self.dataset_name.clone(),
+                location: self.snapshot_location_uri.clone(),
+                reason: reason.to_string(),
+            });
+        }
+
+        // Inconclusive: the probe could not tell, so the store may be one that ignores
+        // write conditions.
+        Err(SnapshotUploadError::ConditionalWritesUnconfirmed {
+            dataset: self.dataset_name.clone(),
+            location: self.snapshot_location_uri.clone(),
+            reason: support
+                .inconclusive_reason()
+                .map_or_else(|| format!("{support:?}"), str::to_string),
+        })
     }
 
     /// Creates a snapshot from a single file-based accelerator.
@@ -1872,7 +2338,7 @@ impl SnapshotManager {
         &self,
         source_local_path: &PathBuf,
         destination_location: &ObjectPath,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: SnapshotLockGuard,
     ) -> Result<(u64, String), SnapshotUploadError> {
         // Every engine hook below opens the accelerator file as a database, and each
         // driver's open CREATES one at a path that has none — so an absent file would be
@@ -1956,7 +2422,7 @@ impl SnapshotManager {
         &self,
         dirs: &[(PathBuf, String)],
         destination_location: &ObjectPath,
-        lock_guard: OwnedMutexGuard<()>,
+        lock_guard: SnapshotLockGuard,
     ) -> Result<(u64, String), SnapshotUploadError> {
         use crate::snapshot::directory_archive::archive_directories_to_file_with_plan;
 
@@ -1974,6 +2440,11 @@ impl SnapshotManager {
             .into_iter()
             .map(|e| (e.archive_path, e.bytes))
             .collect();
+        let optional_files: Vec<(PathBuf, String)> = plan
+            .optional_files
+            .into_iter()
+            .map(|file| (file.source, file.archive_path))
+            .collect();
 
         // Step 1: Create a temporary tar archive of all directories
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -1988,6 +2459,7 @@ impl SnapshotManager {
             &temp_archive_path,
             &skip_paths,
             &extras,
+            &optional_files,
         )
         .await
         {
@@ -2185,14 +2657,16 @@ impl SnapshotManager {
     pub async fn download_latest_snapshot(
         &self,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
-        self.download_latest(None).await
+        self.download_latest(None, None).await
     }
 
     /// Downloads the current snapshot described by `pinned`, or by a fresh metadata read
-    /// on each attempt when `pinned` is `None`.
+    /// on each attempt when `pinned` is `None`. Under `fallback`, only snapshots with an
+    /// id above `newer_than` are tried after the current one fails.
     async fn download_latest(
         &self,
         pinned: Option<Arc<MetadataHandle>>,
+        newer_than: Option<u64>,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let checkpointer_factory = Arc::clone(
             self.checkpointer_factory
@@ -2242,7 +2716,7 @@ impl SnapshotManager {
             }
             BootstrapOnFailureBehavior::Fallback => {
                 match self
-                    .download_with_fallback(checkpointer_factory, pinned)
+                    .download_with_fallback(checkpointer_factory, pinned, newer_than)
                     .await
                 {
                     Ok(result) => Ok(result),
@@ -2320,10 +2794,14 @@ impl SnapshotManager {
         .map(Some)
     }
 
+    /// Downloads the current snapshot, or when it fails, the newest older snapshot that
+    /// does not. A reader that already holds a snapshot passes its id as `newer_than`,
+    /// so it never falls back to that snapshot or an older one.
     async fn download_with_fallback(
         &self,
         checkpointer_factory: DatasetCheckpointerFactory,
         pinned: Option<Arc<MetadataHandle>>,
+        newer_than: Option<u64>,
     ) -> Result<Option<SnapshotDownloadInfo>, SnapshotDownloadError> {
         let metadata_handle = match self.pinned_or_load_metadata(pinned).await {
             Ok(Some(handle)) => handle,
@@ -2356,6 +2834,8 @@ impl SnapshotManager {
             .collect();
         remaining.sort_by_key(|b| std::cmp::Reverse(b.snapshot_id));
         ordered_snapshots.extend(remaining);
+        ordered_snapshots
+            .retain(|snapshot| newer_than.is_none_or(|loaded| snapshot.snapshot_id > loaded));
 
         let current_engine = self.engine.to_string();
         for snapshot in ordered_snapshots {
@@ -2413,6 +2893,12 @@ impl SnapshotManager {
                             "Snapshot engine mismatch; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snapshot_engine} current_engine={current_engine}",
                             self.dataset_name,
                             snapshot_uri,
+                        );
+                    }
+                    SnapshotDownloadError::SnapshotFileMissing { .. } => {
+                        tracing::warn!(
+                            "{err}; attempting next available snapshot. dataset={}",
+                            self.dataset_name,
                         );
                     }
                     SnapshotDownloadError::InvalidSnapshotUri { ref uri, .. } => {
@@ -2604,15 +3090,21 @@ impl SnapshotManager {
         // bucket), so a log still ties the restore back to the writer's metadata entry.
         let recorded_as = (snapshot_uri != entry.snapshot).then_some(entry.snapshot.as_str());
 
-        let object_size = self
-            .object_store
-            .head(&object_path)
-            .await
-            .map_err(|source| SnapshotDownloadError::Download {
-                path: path_display.clone(),
-                source,
-            })?
-            .size;
+        let file_missing = || SnapshotDownloadError::SnapshotFileMissing {
+            dataset: self.dataset_name.clone(),
+            snapshot_id: entry.snapshot_id,
+            location: snapshot_uri.clone(),
+        };
+        let object_size = match self.object_store.head(&object_path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Err(file_missing()),
+            Err(source) => {
+                return Err(SnapshotDownloadError::Download {
+                    path: path_display.clone(),
+                    source,
+                });
+            }
+        };
         let chunks = self.snapshot_chunks(&object_path, object_size);
 
         tracing::debug!(
@@ -2623,7 +3115,7 @@ impl SnapshotManager {
             "Downloading snapshot"
         );
 
-        let (actual_size, actual_checksum) = match &self.layout {
+        let downloaded = match &self.layout {
             AccelerationLayout::None => {
                 return Err(SnapshotDownloadError::SnapshotDisabled {
                     dataset: self.dataset_name.clone(),
@@ -2631,13 +3123,21 @@ impl SnapshotManager {
             }
             AccelerationLayout::File { path } => {
                 self.download_to_file(path, chunks, entry, &path_display)
-                    .await?
+                    .await
             }
             AccelerationLayout::Directories { dirs } => {
                 self.download_to_directories(dirs, chunks, entry, &path_display)
-                    .await?
+                    .await
             }
         };
+        // A file deleted while it was being downloaded is as gone as one deleted before.
+        let (actual_size, actual_checksum) = downloaded.map_err(|err| match err {
+            SnapshotDownloadError::DownloadBytes {
+                source: object_store::Error::NotFound { .. },
+                ..
+            } => file_missing(),
+            err => err,
+        })?;
 
         let checkpointer = (checkpointer_factory)()
             .await
@@ -3110,30 +3610,47 @@ impl SnapshotManager {
         last_updated_at: Option<i64>,
         row_count: Option<u64>,
         writer_generation: Option<u64>,
+        gone: Option<&HashSet<String>>,
+        committed: &parking_lot::Mutex<Option<Committed>>,
     ) -> Result<Publication, SnapshotUploadError> {
-        let metadata_path = self.metadata_path();
-        let metadata_path_display = metadata_path.to_string();
-        let dataset_name = self.dataset_name.clone();
+        let dataset_name = &self.dataset_name;
         let snapshot_uri = self.snapshot_uri_for_location(location);
+        let none_gone = HashSet::new();
+        let gone = gone.unwrap_or(&none_gone);
 
-        // Retry loop to handle precondition failures due to concurrent updates.
-        loop {
-            let handle = self
-                .load_metadata()
-                .await
-                .map_err(SnapshotUploadError::from)?;
+        // Whether `metadata` already holds this publish: an earlier attempt whose write
+        // landed but whose response was lost. Every recorded field must match, including the
+        // object name, which is unique to this publish.
+        let already_published = |metadata: Option<&SnapshotMetadata>| {
+            metadata
+                .and_then(|metadata| metadata.datasets.get(dataset_name))
+                .is_some_and(|entry| {
+                    entry.snapshots.iter().any(|published| {
+                        published.snapshot == snapshot_uri
+                            && published.snapshot_checksum == checksum
+                            && published.timestamp_ms == timestamp_ms
+                            && published.snapshot_row_count == row_count
+                            && published.snapshot_last_updated_at_ms == last_updated_at
+                    })
+                })
+        };
+
+        let add_entry = |current: Option<SnapshotMetadata>| -> Result<_, PublishRefusal> {
+            *committed.lock() = None;
+            if already_published(current.as_ref()) {
+                return Ok(None);
+            }
 
             let now_ms = Utc::now().timestamp_millis();
-            let mut metadata = if let Some(existing) = handle.as_ref() {
-                existing.metadata.clone()
-            } else {
+            let mut metadata = current.unwrap_or_else(|| {
                 SnapshotMetadata::empty(self.snapshot_location_uri.clone(), now_ms)
-            };
+            });
 
             if metadata.location.is_empty() {
                 metadata.location.clone_from(&self.snapshot_location_uri);
             }
             metadata.last_updated_ms = now_ms;
+            let metadata_location = metadata.location.clone();
 
             let engine_str = self.engine.to_string();
             let dataset_entry = metadata
@@ -3144,7 +3661,7 @@ impl SnapshotManager {
                     engine: Some(engine_str.clone()),
                     ..Default::default()
                 });
-            dataset_entry.name.clone_from(&dataset_name);
+            dataset_entry.name.clone_from(dataset_name);
             // Always update engine to match the current engine
             dataset_entry.engine = Some(engine_str);
 
@@ -3153,7 +3670,7 @@ impl SnapshotManager {
             if let Some(generation) = writer_generation
                 && !claim_publication(dataset_entry, generation)
             {
-                return Ok(Publication::Superseded);
+                return Err(PublishRefusal::Superseded);
             }
 
             // Metadata written before recorded schemas were conformed keeps the invalid
@@ -3261,7 +3778,8 @@ impl SnapshotManager {
                             return Err(SnapshotUploadError::UploadSchemaMismatch {
                                 dataset: dataset_name.clone(),
                                 details: reason,
-                            });
+                            }
+                            .into());
                         }
                     }
                 }
@@ -3274,70 +3792,138 @@ impl SnapshotManager {
                 .max()
                 .map_or(0, |max_id| max_id + 1);
 
-            let checksum_for_metadata = checksum.clone();
-            let snapshot_entry = SnapshotEntry {
+            dataset_entry.snapshots.push(SnapshotEntry {
                 snapshot_id: next_snapshot_id,
                 timestamp_ms,
                 snapshot: snapshot_uri.clone(),
-                snapshot_checksum: checksum_for_metadata,
+                snapshot_checksum: checksum.clone(),
                 snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
                 snapshot_size: size,
                 snapshot_engine: Some(self.engine.to_string()),
                 snapshot_row_count: row_count,
                 snapshot_last_updated_at_ms: last_updated_at,
-            };
-
-            dataset_entry.snapshots.push(snapshot_entry);
+            });
             dataset_entry.current_snapshot_id = Some(next_snapshot_id);
 
-            let serialized = serde_json::to_vec_pretty(&metadata).map_err(|source| {
+            // Retention is applied in the write that publishes, so an entry and the record
+            // of its drop are written together.
+            let retention = retention::apply(
+                dataset_entry,
+                self.cleanup_clock.now_ms(),
+                gone,
+                cleanup::age(SNAPSHOT_RETENTION),
+                cleanup::age(FILE_GRACE),
+            );
+            *committed.lock() = Some(Committed {
+                retention,
+                named: retention::named_snapshots(dataset_entry)
+                    .map(str::to_string)
+                    .collect(),
+                metadata_location,
+            });
+
+            Ok(Some(metadata))
+        };
+
+        let err = match self.update_metadata(add_entry).await {
+            Ok(()) => return Ok(Publication::Published),
+            Err(err) => err,
+        };
+
+        // The last attempt's write may have landed with its response lost, whether the
+        // loop ran out of conflict attempts or of network retries. Read once more before
+        // reporting a snapshot as unpublished when it is recorded.
+        if matches!(
+            err,
+            MetadataUpdateError::Contention { .. }
+                | MetadataUpdateError::Write(ConditionalWriteError::Store { .. })
+        ) && let Ok(handle) = self.load_metadata().await
+            && already_published(handle.as_ref().map(|handle| &handle.metadata))
+        {
+            // Which attempt's write landed is unknown, so nothing is deleted on its account.
+            *committed.lock() = None;
+            return Ok(Publication::Published);
+        }
+
+        let metadata_path = self.metadata_path().to_string();
+        Err(match err {
+            MetadataUpdateError::Load(err) => err.into(),
+            MetadataUpdateError::Update(PublishRefusal::Superseded) => {
+                return Ok(Publication::Superseded);
+            }
+            MetadataUpdateError::Update(PublishRefusal::Failed(err)) => *err,
+            MetadataUpdateError::Serialize(source) => {
                 SnapshotUploadError::UploadSerializeMetadata {
-                    path: metadata_path_display.clone(),
+                    path: metadata_path,
                     source,
                 }
-            })?;
-
-            let version = handle.as_ref().and_then(|h| h.version.clone());
-            let put_mode = match (handle.is_some(), version) {
-                (false, _) => PutMode::Create,
-                (true, Some(version)) => PutMode::Update(version),
-                (true, None) => PutMode::Overwrite,
-            };
-
-            let payload = PutPayload::from(serialized);
-
-            match self
-                .put_opts_with_retry(&metadata_path, payload.clone(), put_mode.clone())
-                .await
-            {
-                Ok(_) => return Ok(Publication::Published),
-                Err(object_store::Error::AlreadyExists { .. })
-                    if matches!(put_mode, PutMode::Create) => {}
-                Err(object_store::Error::Precondition { .. }) => {}
-                Err(object_store::Error::NotSupported { .. })
-                    if matches!(put_mode, PutMode::Update(_)) =>
-                {
-                    match self
-                        .put_opts_with_retry(&metadata_path, payload, PutMode::Overwrite)
-                        .await
-                    {
-                        Ok(_) => return Ok(Publication::Published),
-                        Err(err) => {
-                            return Err(SnapshotUploadError::UploadWriteMetadata {
-                                path: metadata_path_display.clone(),
-                                source: err,
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    return Err(SnapshotUploadError::UploadWriteMetadata {
-                        path: metadata_path_display.clone(),
-                        source: err,
-                    });
+            }
+            MetadataUpdateError::Unversioned => SnapshotUploadError::MetadataUnversioned {
+                dataset: dataset_name.clone(),
+                path: metadata_path,
+            },
+            MetadataUpdateError::Write(source) => SnapshotUploadError::UploadWriteMetadata {
+                path: metadata_path,
+                source: Box::new(source),
+            },
+            MetadataUpdateError::Contention { attempts } => {
+                SnapshotUploadError::MetadataContention {
+                    dataset: dataset_name.clone(),
+                    path: metadata_path,
+                    attempts,
                 }
             }
-        }
+        })
+    }
+
+    /// Rewrites `metadata.json` with `update` applied to the document stored now.
+    ///
+    /// Each attempt re-reads the document and applies `update` to what it read, so an
+    /// update that loses the race to another writer is re-applied on top of that writer's
+    /// change instead of overwriting it. `update` returns `None` when there is nothing to
+    /// write.
+    async fn update_metadata<E>(
+        &self,
+        update: impl Fn(Option<SnapshotMetadata>) -> Result<Option<SnapshotMetadata>, E>,
+    ) -> Result<(), MetadataUpdateError<E>> {
+        let path = self.metadata_path();
+        retry_on_conflict(&self.conflict_retry, || async {
+            let (current, version) = match self
+                .load_metadata()
+                .await
+                .map_err(MetadataUpdateError::Load)?
+            {
+                None => (None, None),
+                Some(MetadataHandle { metadata, version }) => (Some(metadata), Some(version)),
+            };
+            let Some(updated) = update(current).map_err(MetadataUpdateError::Update)? else {
+                return Ok(Attempt::Done(()));
+            };
+            let expected = match version {
+                None => Expected::Absent,
+                Some(version) => version
+                    .and_then(Expected::at_version)
+                    .ok_or(MetadataUpdateError::Unversioned)?,
+            };
+            let payload =
+                serde_json::to_vec_pretty(&updated).map_err(MetadataUpdateError::Serialize)?;
+
+            match self
+                .conditional_put_with_retry(&path, PutPayload::from(payload), &expected)
+                .await
+            {
+                Ok(_) => Ok(Attempt::Done(())),
+                Err(err) if err.is_conflict() => Ok(Attempt::Conflict),
+                Err(err) => Err(MetadataUpdateError::Write(err)),
+            }
+        })
+        .await
+        .map_err(|err| match err {
+            RetryOnConflictError::ConflictsExhausted { attempts } => {
+                MetadataUpdateError::Contention { attempts }
+            }
+            RetryOnConflictError::Failed(err) => err,
+        })
     }
 
     /// Returns the snapshot location URI for this dataset.
@@ -3362,19 +3948,7 @@ impl SnapshotManager {
         &self,
         limit: usize,
     ) -> Result<api::SnapshotSummary, SnapshotApiError> {
-        let handle = self.load_metadata().await.map_err(|e| match e {
-            MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
-                path,
-                reason: source.to_string(),
-            },
-            MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
-                path,
-                reason: source.to_string(),
-            },
-            MetadataLoadError::UnsupportedVersion { path, version } => {
-                SnapshotApiError::UnsupportedVersion { path, version }
-            }
-        })?;
+        let handle = self.load_metadata().await?;
 
         let (location, last_updated_ms, dataset_metadata) = match handle {
             Some(h) => {
@@ -3456,31 +4030,34 @@ impl SnapshotManager {
         })
     }
 
-    /// Wraps `object_store.put_opts()` with retry for transient network errors.
-    ///
-    /// Non-retriable errors (`NotFound`, `AlreadyExists`, `Precondition`, `NotSupported`)
-    /// are returned immediately so callers can handle them (e.g., OCC retry loops).
-    async fn put_opts_with_retry(
+    /// Writes `path` only if it is in the `expected` state, retrying transient network
+    /// errors. A conflict, or a store that cannot evaluate the condition, is returned at
+    /// once: the caller re-reads on a conflict, and nothing here ever falls back to an
+    /// unconditional write.
+    async fn conditional_put_with_retry(
         &self,
         path: &ObjectPath,
         payload: PutPayload,
-        put_mode: PutMode,
-    ) -> Result<object_store::PutResult, object_store::Error> {
+        expected: &Expected,
+    ) -> Result<PutResult, ConditionalWriteError> {
         retry(self.network_retry_strategy.clone(), || async {
-            self.object_store
-                .put_opts(path, payload.clone(), put_mode.clone().into())
-                .await
-                .map_err(|err| {
-                    if is_retriable_object_store_error(&err) {
-                        tracing::warn!(
-                            "Transient error writing to object store, retrying. dataset={} path={path} error={err}",
-                            self.dataset_name,
-                        );
-                        RetryError::transient(err)
-                    } else {
-                        RetryError::permanent(err)
-                    }
-                })
+            match conditional_put(self.object_store.as_ref(), path, payload.clone(), expected).await
+            {
+                Ok(result) => Ok(result),
+                Err(ConditionalWriteError::Store { path, source })
+                    if is_retriable_object_store_error(&source) =>
+                {
+                    tracing::warn!(
+                        "Transient error writing to object store, retrying. dataset={} path={path} error={source}",
+                        self.dataset_name,
+                    );
+                    Err(RetryError::transient(ConditionalWriteError::Store {
+                        path,
+                        source,
+                    }))
+                }
+                Err(err) => Err(RetryError::permanent(err)),
+            }
         })
         .await
     }
@@ -3537,19 +4114,7 @@ impl SnapshotManager {
         &self,
         snapshot_id: u64,
     ) -> Result<api::SnapshotInfo, SnapshotApiError> {
-        let handle = self.load_metadata().await.map_err(|e| match e {
-            MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
-                path,
-                reason: source.to_string(),
-            },
-            MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
-                path,
-                reason: source.to_string(),
-            },
-            MetadataLoadError::UnsupportedVersion { path, version } => {
-                SnapshotApiError::UnsupportedVersion { path, version }
-            }
-        })?;
+        let handle = self.load_metadata().await?;
 
         let Some(h) = handle else {
             return Err(SnapshotApiError::SnapshotNotFound {
@@ -3608,104 +4173,101 @@ impl SnapshotManager {
     ///
     /// Returns an error if reading/writing the metadata fails or the snapshot is not found.
     pub async fn set_current_snapshot(&self, snapshot_id: u64) -> Result<(), SnapshotApiError> {
-        loop {
-            let handle = self.load_metadata().await.map_err(|e| match e {
-                MetadataLoadError::Read { path, source } => SnapshotApiError::ReadMetadata {
-                    path,
-                    reason: source.to_string(),
-                },
-                MetadataLoadError::Parse { path, source } => SnapshotApiError::ParseMetadata {
-                    path,
-                    reason: source.to_string(),
-                },
-                MetadataLoadError::UnsupportedVersion { path, version } => {
-                    SnapshotApiError::UnsupportedVersion { path, version }
-                }
-            })?;
+        let write_error = |reason: String| SnapshotApiError::WriteMetadata {
+            path: self.metadata_path().to_string(),
+            reason,
+        };
 
-            let Some(h) = handle.as_ref() else {
-                return Err(SnapshotApiError::SnapshotNotFound {
-                    dataset: self.dataset_name.clone(),
-                    snapshot_id,
-                });
-            };
+        // Selecting a snapshot rewrites the shared metadata document too.
+        self.ensure_conditional_writes()
+            .await
+            .map_err(|err| write_error(err.to_string()))?;
 
-            let mut metadata = h.metadata.clone();
+        // A snapshot whose file is gone cannot be restored, so it is never made current.
+        if let Some(handle) = self.load_metadata().await?
+            && let Some(entry) =
+                handle
+                    .metadata
+                    .datasets
+                    .get(&self.dataset_name)
+                    .and_then(|dataset| {
+                        dataset
+                            .snapshots
+                            .iter()
+                            .find(|e| e.snapshot_id == snapshot_id)
+                    })
+            && let Ok(path) =
+                self.snapshot_uri_to_object_path(&entry.snapshot, Some(&handle.metadata.location))
+            && self.file_is_gone(&path).await
+        {
+            return Err(SnapshotApiError::SnapshotFileMissing {
+                dataset: self.dataset_name.clone(),
+                snapshot_id,
+                location: self.object_path_uri(&path),
+            });
+        }
 
+        let not_found = || SnapshotApiError::SnapshotNotFound {
+            dataset: self.dataset_name.clone(),
+            snapshot_id,
+        };
+        let select = |current: Option<SnapshotMetadata>| {
+            let mut metadata = current.ok_or_else(not_found)?;
             let dataset_entry = metadata
                 .datasets
                 .get_mut(&self.dataset_name)
-                .ok_or_else(|| SnapshotApiError::SnapshotNotFound {
-                    dataset: self.dataset_name.clone(),
-                    snapshot_id,
-                })?;
-
-            // Verify the snapshot exists
+                .ok_or_else(not_found)?;
             if !dataset_entry
                 .snapshots
                 .iter()
                 .any(|e| e.snapshot_id == snapshot_id)
             {
-                return Err(SnapshotApiError::SnapshotNotFound {
-                    dataset: self.dataset_name.clone(),
-                    snapshot_id,
-                });
+                return Err(not_found());
             }
-
+            // Already current: nothing to write. This also recognizes an earlier attempt
+            // whose write landed but whose response was lost.
+            if dataset_entry.current_snapshot_id == Some(snapshot_id) {
+                return Ok(None);
+            }
             dataset_entry.current_snapshot_id = Some(snapshot_id);
             metadata.last_updated_ms = Utc::now().timestamp_millis();
+            Ok(Some(metadata))
+        };
 
-            let metadata_path = self.metadata_path();
-            let metadata_path_display = metadata_path.to_string();
+        let err = match self.update_metadata(select).await {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
 
-            let serialized = serde_json::to_vec_pretty(&metadata).map_err(|err| {
-                SnapshotApiError::WriteMetadata {
-                    path: metadata_path_display.clone(),
-                    reason: err.to_string(),
-                }
-            })?;
-
-            let version = h.version.clone();
-            let put_mode = match version {
-                Some(v) => PutMode::Update(v),
-                None => PutMode::Overwrite,
-            };
-
-            let payload = PutPayload::from(serialized);
-
-            match self
-                .put_opts_with_retry(&metadata_path, payload.clone(), put_mode.clone())
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(object_store::Error::Precondition { .. }) => {
-                    // Concurrent update, retry
-                }
-                Err(object_store::Error::NotSupported { .. })
-                    if matches!(put_mode, PutMode::Update(_)) =>
-                {
-                    // Object store doesn't support conditional updates, fall back to overwrite
-                    match self
-                        .put_opts_with_retry(&metadata_path, payload, PutMode::Overwrite)
-                        .await
-                    {
-                        Ok(_) => return Ok(()),
-                        Err(err) => {
-                            return Err(SnapshotApiError::WriteMetadata {
-                                path: metadata_path_display,
-                                reason: err.to_string(),
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    return Err(SnapshotApiError::WriteMetadata {
-                        path: metadata_path_display,
-                        reason: err.to_string(),
-                    });
-                }
-            }
+        // The last attempt's write may have landed with its response lost, whether the
+        // loop ran out of conflict attempts or of network retries. Read once more before
+        // reporting a selection that is in place as failed.
+        if matches!(
+            err,
+            MetadataUpdateError::Contention { .. }
+                | MetadataUpdateError::Write(ConditionalWriteError::Store { .. })
+        ) && let Ok(Some(handle)) = self.load_metadata().await
+            && handle
+                .metadata
+                .datasets
+                .get(&self.dataset_name)
+                .is_some_and(|dataset| dataset.current_snapshot_id == Some(snapshot_id))
+        {
+            return Ok(());
         }
+
+        Err(match err {
+            MetadataUpdateError::Load(err) => err.into(),
+            MetadataUpdateError::Update(err) => err,
+            MetadataUpdateError::Serialize(err) => write_error(err.to_string()),
+            MetadataUpdateError::Unversioned => write_error(
+                "the object store returned neither an ETag nor a version for the snapshot metadata, so it cannot be updated without risking a concurrent writer's changes".to_string(),
+            ),
+            MetadataUpdateError::Write(err) => write_error(err.to_string()),
+            MetadataUpdateError::Contention { attempts } => write_error(format!(
+                "another writer changed the snapshot metadata before each of {attempts} attempts"
+            )),
+        })
     }
 }
 
@@ -3725,6 +4287,15 @@ pub enum SnapshotApiError {
     #[snafu(display("Snapshot {snapshot_id} not found for dataset {dataset}"))]
     SnapshotNotFound { dataset: String, snapshot_id: u64 },
 
+    #[snafu(display(
+        "Snapshot {snapshot_id} of dataset '{dataset}' cannot be made current: its file '{location}' is gone from the snapshot location, for example deleted by a bucket lifecycle rule. Choose a snapshot whose file exists."
+    ))]
+    SnapshotFileMissing {
+        dataset: String,
+        snapshot_id: u64,
+        location: String,
+    },
+
     #[snafu(display("Failed to write snapshot metadata to {path}: {reason}"))]
     WriteMetadata { path: String, reason: String },
 }
@@ -3743,32 +4314,11 @@ fn encode_hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
-    vec![
-        ParameterSpec::component("region").secret(),
-        ParameterSpec::component("endpoint").secret(),
-        ParameterSpec::component("key").secret(),
-        ParameterSpec::component("secret").secret(),
-        ParameterSpec::component("session_token").secret(),
-        ParameterSpec::component("auth")
-            .description("Configures the authentication method for S3. Supported methods are: iam_role, key.")
-            .default("iam_role")
-            .one_of(&["iam_role", "key"])
-            .secret(),
-        ParameterSpec::runtime("client_timeout")
-            .description("The timeout setting for S3 client."),
-        ParameterSpec::runtime("allow_http")
-            .description("Allow HTTP protocol for S3 endpoint."),
-        ParameterSpec::component(notifications::QUEUE_URL_PARAM)
-            .description("The URL of an SQS queue that receives the snapshot location's S3 event notifications. Datasets with `refresh_mode: snapshot` reload as soon as a new snapshot is published instead of waiting for `refresh_check_interval`.")
-            .secret(),
-    ]
-});
-
-#[derive(Debug, Snafu)]
-enum S3ObjectStoreError {
-    #[snafu(display("Failed to build S3 object store: {source}"))]
-    BuilderError { source: S3ObjectStoreBuilderError },
+/// The warning for a dataset that enables snapshots without a snapshot location.
+fn no_location_warning(dataset_name: &str) -> String {
+    format!(
+        "Snapshots are enabled for dataset '{dataset_name}', but no snapshot location is configured. Set `runtime.state.location`, or `acceleration.snapshots_location` on the dataset. See: {SNAPSHOTS_DOCS}"
+    )
 }
 
 /// The object path of an `s3://` snapshot location inside its bucket. The
@@ -3778,8 +4328,7 @@ fn s3_location_path(url: &Url) -> ObjectPath {
     ObjectPath::from(url.path())
 }
 
-/// Build the object store backing a snapshot location, dispatching on the
-/// URL scheme to the correct credential-aware builder.
+/// Build the object store backing a snapshot location.
 ///
 /// Returns `None` on failure after logging the error — matching the existing
 /// behavior of snapshot construction, which treats a failed store as "no
@@ -3791,130 +4340,152 @@ async fn build_snapshot_object_store(
     io_runtime: Handle,
     dataset_name: &str,
 ) -> Option<(Arc<dyn ObjectStore>, ObjectPath)> {
-    match snapshots_location_url.scheme() {
-        "s3" => {
-            let store = build_s3_object_store(
-                snapshots_location_url,
-                secrets,
-                snapshot_config.params.as_ref().map(Params::as_string_map),
-                io_runtime,
-            )
-            .await
-            .inspect_err(|e| {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    error = %e,
-                    "Failed to connect to S3 snapshot location",
-                );
-            })
-            .ok()?;
-            Some((store, s3_location_path(snapshots_location_url)))
-        }
-        "abfss" | "abfs" => {
-            let params = snapshot_config
-                .params
-                .as_ref()
-                .map(Params::as_string_map)
-                .unwrap_or_default();
-            let store = runtime_object_store::build_azure_object_store(
-                snapshots_location_url,
-                &params,
-                io_runtime,
-            )
-            .inspect_err(|e| {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    error = %e,
-                    "Failed to connect to Azure ADLS snapshot location",
-                );
-            })
-            .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
-            Some((store, path))
-        }
-        "gs" | "gcs" => {
-            let Some(bucket_name) = snapshots_location_url.host_str() else {
-                tracing::error!(
-                    dataset = %dataset_name,
-                    location = %snapshots_location_url,
-                    "GCS snapshot location is missing a bucket name",
-                );
-                return None;
-            };
-            let params = snapshot_config
-                .params
-                .as_ref()
-                .map(Params::as_string_map)
-                .unwrap_or_default();
-            let store =
-                runtime_object_store::build_gcs_object_store(bucket_name, &params, io_runtime)
-                    .inspect_err(|e| {
-                        tracing::error!(
-                            dataset = %dataset_name,
-                            location = %snapshots_location_url,
-                            error = %e,
-                            "Failed to connect to GCS snapshot location",
-                        );
-                    })
-                    .ok()?;
-            let path = ObjectPath::from(snapshots_location_url.path().trim_start_matches('/'));
-            Some((store, path))
-        }
-        _ => {
-            let (store, path) = object_store::parse_url(snapshots_location_url)
-                .inspect_err(|e| {
-                    tracing::error!(
-                        dataset = %dataset_name,
-                        location = %snapshots_location_url,
-                        error = %e,
-                        "Failed to build snapshot object store",
-                    );
-                })
-                .ok()?;
-            Some((store.into(), path))
+    let location = StateLocation {
+        location: snapshots_location_url.to_string(),
+        params: snapshot_config.params.clone(),
+        source: StateSource::FeatureSetting,
+    };
+    match runtime_state_location::build_object_store(
+        secrets,
+        io_runtime,
+        &location,
+        StateFeature::Snapshots,
+    )
+    .await
+    {
+        Ok((store, prefix)) => Some((store, ObjectPath::from(prefix))),
+        Err(error) => {
+            log_snapshot_store_error(dataset_name, snapshots_location_url, &error);
+            None
         }
     }
 }
 
-async fn build_s3_object_store(
-    snapshots_url: &Url,
-    secrets: Arc<RwLock<Secrets>>,
-    params: Option<HashMap<String, String>>,
-    io_runtime: Handle,
-) -> Result<Arc<dyn ObjectStore>, S3ObjectStoreError> {
-    let s3_params = build_s3_parameters(Arc::clone(&secrets), params.as_ref()).await;
-
-    S3ObjectStoreBuilder::from_url(snapshots_url, io_runtime)
-        .context(BuilderSnafu)?
-        .with_secret_params(&s3_params.to_secret_map())
-        .context(BuilderSnafu)?
-        .build()
-        .await
-        .context(BuilderSnafu)
+/// Logs why a snapshot location's store could not be built, which disables
+/// snapshots for the dataset.
+fn log_snapshot_store_error(
+    dataset_name: &str,
+    snapshots_location_url: &Url,
+    error: &runtime_state_location::Error,
+) {
+    use runtime_state_location::Error;
+    match error {
+        Error::S3ParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because its S3 params are invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::GcsParameterValidation { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not used because its GCS parameters are invalid: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::S3ObjectStoreInit { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %format!("Failed to build S3 object store: {source}"),
+                "Failed to connect to S3 snapshot location",
+            );
+        }
+        Error::ObjectStoreInit { source, .. }
+            if matches!(snapshots_location_url.scheme(), "abfs" | "abfss") =>
+        {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to connect to Azure ADLS snapshot location",
+            );
+        }
+        Error::ObjectStoreInit { source, .. }
+            if matches!(snapshots_location_url.scheme(), "gs" | "gcs") =>
+        {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to connect to GCS snapshot location",
+            );
+        }
+        Error::InvalidGcsLocation { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "GCS snapshot location is missing a bucket name",
+            );
+        }
+        Error::InvalidFileLocation { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': the snapshot location '{snapshots_location_url}' is not a local directory path. See: {SNAPSHOTS_DOCS}",
+            );
+        }
+        Error::CreateLocalDirectory {
+            location: path,
+            source,
+            ..
+        } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                "Snapshots are disabled for dataset '{dataset_name}': failed to create the snapshot directory '{path}'. Cause: {source}",
+            );
+        }
+        Error::LocalFileSystemInit { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to build snapshot object store",
+            );
+        }
+        Error::ObjectStoreParse { source, .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %source,
+                "Failed to build snapshot object store",
+            );
+        }
+        Error::InvalidStateLocation { .. } | Error::ObjectStoreInit { .. } => {
+            tracing::error!(
+                dataset = %dataset_name,
+                location = %snapshots_location_url,
+                error = %error,
+                "Failed to build snapshot object store",
+            );
+        }
+    }
 }
 
+/// Validates a snapshot location's S3 `params`, which also take the queue that
+/// receives its S3 event notifications.
+///
+/// An invalid parameter is an error, not a reason to fall back to the defaults: the
+/// defaults drop every other parameter too — the endpoint, the region and the keys — so
+/// the fallback would silently point snapshots at a different store than the one
+/// configured.
 async fn build_s3_parameters(
     secrets: Arc<RwLock<Secrets>>,
     params: Option<&HashMap<String, String>>,
-) -> Parameters {
-    let default_params = || Parameters::new(vec![], "s3", &S3_PARAMETERS);
-    match params {
-        Some(p) => {
-            let secret_params = get_params_with_secrets(Arc::clone(&secrets), p).await;
-            Parameters::try_new(
-                "snapshot",
-                secret_params.into_iter().collect(),
-                "s3",
-                secrets,
-                &S3_PARAMETERS,
-            )
-            .await
-            .unwrap_or_else(|_| default_params())
-        }
-        None => default_params(),
-    }
+) -> Result<Parameters, Box<dyn std::error::Error + Send + Sync>> {
+    runtime_state_location::build_s3_parameters(
+        secrets,
+        params,
+        StateFeature::Snapshots,
+        StateSource::FeatureSetting,
+    )
+    .await
+    .map_err(|error| match error {
+        runtime_state_location::Error::S3ParameterValidation { source, .. } => source,
+        other => Box::new(other),
+    })
 }
 
 #[cfg(test)]
@@ -3973,6 +4544,15 @@ mod tests {
 
         async fn delete(&self) -> DatasetCheckpointResult<()> {
             Ok(())
+        }
+    }
+
+    /// A conflict budget that keeps contention tests fast.
+    fn test_conflict_retry() -> ConflictRetry {
+        ConflictRetry {
+            max_attempts: 4,
+            initial_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(4),
         }
     }
 
@@ -4047,7 +4627,11 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            conflict_retry: test_conflict_retry(),
+            conditional_write_check: Arc::default(),
             writer_lease: WriterLease::default(),
+            next_sweep: Arc::default(),
+            cleanup_clock: CleanupClock::default(),
         }
     }
 
@@ -4474,7 +5058,10 @@ mod tests {
             .download_if_newer(Some(7), None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.download.is_none(), "matching ids must not download");
+        assert!(
+            result.download().is_none(),
+            "matching ids must not download"
+        );
         assert!(
             result.metadata_e_tag.is_some(),
             "an up-to-date poll reports the ETag so the next poll can skip"
@@ -4492,13 +5079,17 @@ mod tests {
             .download_if_newer(Some(8), None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(
-            result.download.is_none(),
-            "local id ahead of remote must not regress"
+        assert_eq!(
+            result.outcome,
+            SnapshotPollOutcome::OlderThanLoaded {
+                published_id: 7,
+                loaded_id: 8,
+            },
+            "local id ahead of remote must not regress, and the poll says so"
         );
         assert_eq!(
             result.metadata_e_tag, None,
-            "a rollback withholds the ETag so every poll re-checks and warns again"
+            "a rollback withholds the ETag so every poll re-checks and reports it again"
         );
         assert!(
             !local_path.exists(),
@@ -4506,11 +5097,12 @@ mod tests {
         );
 
         // A strictly older local id (6) than the remote (7) should download.
-        let info = manager
+        let poll = manager
             .download_if_newer(Some(6), None, None)
             .await
-            .expect("download_if_newer should succeed")
-            .download
+            .expect("download_if_newer should succeed");
+        let info = poll
+            .download()
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
     }
@@ -4559,6 +5151,7 @@ mod tests {
                 (data_dir, "data/".to_string()),
             ],
             &archive,
+            &[],
             &[],
             &[],
         )
@@ -4627,10 +5220,7 @@ mod tests {
             .download_if_newer(None, None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert_eq!(
-            loaded.download.as_ref().map(|info| info.snapshot_id),
-            Some(0)
-        );
+        assert_eq!(loaded.download().map(|info| info.snapshot_id), Some(0));
         let e_tag = loaded
             .metadata_e_tag
             .expect("the in-memory store reports an ETag");
@@ -4644,7 +5234,7 @@ mod tests {
         assert_eq!(
             unchanged,
             SnapshotPoll {
-                download: None,
+                outcome: SnapshotPollOutcome::UpToDate,
                 metadata_e_tag: Some(e_tag.clone()),
             }
         );
@@ -4661,7 +5251,7 @@ mod tests {
             .await
             .expect("download_if_newer should succeed");
         assert_eq!(
-            changed.download.as_ref().map(|info| info.snapshot_id),
+            changed.download().map(|info| info.snapshot_id),
             Some(1),
             "changed metadata must be read again"
         );
@@ -4703,7 +5293,7 @@ mod tests {
                 .await
                 .expect("download_if_newer should succeed");
             assert_eq!(
-                poll.download.as_ref().map(|info| info.snapshot_id),
+                poll.download().map(|info| info.snapshot_id),
                 expected_snapshot,
                 "{behavior:?}"
             );
@@ -4727,28 +5317,26 @@ mod tests {
             &metadata_with(&schema, vec![broken.clone()], 7),
         )
         .await;
+        // The replacement's archive is stored up front; it only becomes the current snapshot
+        // once metadata naming it is published.
+        let replacement = put_cayenne_snapshot_entry(&store, 8, 2, b"replacement").await;
+        let replacement_metadata = metadata_with(&schema, vec![broken, replacement], 8);
+        let replacement_payload =
+            serde_json::to_vec_pretty(&replacement_metadata).expect("serialize metadata");
 
         let root = TempDir::new().expect("create temp dir");
         let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
         manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
 
-        let writer_store = Arc::clone(&store);
-        let writer_path = metadata_path.clone();
-        let writer_schema = Arc::clone(&schema);
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let replacement = put_cayenne_snapshot_entry(&writer_store, 8, 2, b"replacement").await;
-            write_metadata(
-                &writer_store,
-                &writer_path,
-                &metadata_with(&writer_schema, vec![broken, replacement], 8),
-            )
-            .await;
-        });
-
+        // The first validation runs after the first attempt has read, and pinned, the broken
+        // snapshot's metadata. Publishing the replacement from inside it means only a retry
+        // that reads the metadata again can find snapshot 8, whatever the task scheduling.
         let validated = std::sync::atomic::AtomicUsize::new(0);
         let validator = |_: &SchemaRef| {
-            validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                let publish = store.put(&metadata_path, replacement_payload.clone().into());
+                futures::executor::block_on(publish).expect("publish replacement metadata");
+            }
             true
         };
         let poll = tokio::time::timeout(
@@ -4758,13 +5346,25 @@ mod tests {
         .await
         .expect("retry must observe the replacement snapshot instead of retrying forever")
         .expect("download_if_newer should succeed");
-        writer.await.expect("writer task");
 
-        assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
-        assert!(poll.metadata_e_tag.is_some());
+        assert_eq!(poll.download().map(|info| info.snapshot_id), Some(8));
+        let current_e_tag = store
+            .head(&metadata_path)
+            .await
+            .expect("head replacement metadata")
+            .e_tag;
         assert!(
-            validated.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-            "each retry validates the snapshot it downloads"
+            current_e_tag.is_some(),
+            "the in-memory store reports an ETag"
+        );
+        assert_eq!(
+            poll.metadata_e_tag, current_e_tag,
+            "the poll reports the ETag of the metadata it loaded"
+        );
+        assert_eq!(
+            validated.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the failed attempt and the retry that downloaded the replacement each validate"
         );
         let restored = fs::read(root.path().join("data").join("part-8.vortex"))
             .await
@@ -4801,12 +5401,11 @@ mod tests {
             true
         };
 
-        let info = manager
+        let poll = manager
             .download_if_newer(Some(6), None, Some(&validator))
             .await
-            .expect("download_if_newer should succeed")
-            .download
-            .expect("expected a newer snapshot");
+            .expect("download_if_newer should succeed");
+        let info = poll.download().expect("expected a newer snapshot");
         assert_eq!(info.snapshot_id, 7);
         let data_dir = root.path().join("data");
         let restored = fs::read(data_dir.join("part-7.vortex"))
@@ -4837,7 +5436,7 @@ mod tests {
             .download_if_newer(None, None, None)
             .await
             .expect("download_if_newer should succeed");
-        assert!(result.download.is_none());
+        assert_eq!(result.outcome, SnapshotPollOutcome::NotPublished);
         assert!(!local_path.exists());
     }
 
@@ -4948,11 +5547,12 @@ mod tests {
             false,
         );
 
-        let info = manager
+        let poll = manager
             .download_if_newer(Some(6), None, None)
             .await
-            .expect("refresh from a replicated prefix should succeed")
-            .download
+            .expect("refresh from a replicated prefix should succeed");
+        let info = poll
+            .download()
             .expect("expected newer snapshot to be downloaded");
         assert_eq!(info.snapshot_id, 7);
         let downloaded = fs::read(&local_path)
@@ -5078,6 +5678,727 @@ mod tests {
             .await
             .expect("read downloaded snapshot");
         assert_eq!(downloaded.as_slice(), second_contents.as_ref());
+    }
+
+    /// How [`ScriptedStore`] misbehaves.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Script {
+        /// Accepts `If-None-Match`/`If-Match` and ignores them.
+        IgnoreConditions,
+        /// Every conditional write of `metadata.json` reports that another writer changed
+        /// it first. Write number `landing_write`, if any, lands anyway.
+        ConflictOnMetadata { landing_write: Option<usize> },
+        /// The first write of `metadata.json` lands but its response is lost.
+        LoseFirstMetadataResponse,
+        /// The first write of a conditional-write probe object fails transiently.
+        FailFirstProbeWrite,
+    }
+
+    /// An in-memory store that misbehaves in one scripted way.
+    #[derive(Debug)]
+    struct ScriptedStore {
+        inner: Arc<InMemory>,
+        script: Script,
+        /// The writes the script has applied to so far.
+        scripted_writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedStore {
+        fn new(script: Script) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                script,
+                scripted_writes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Numbers the next write the script applies to, from 1.
+        fn next_scripted_write(&self) -> usize {
+            self.scripted_writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1
+        }
+    }
+
+    impl std::fmt::Display for ScriptedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ScriptedStore({:?})", self.script)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ScriptedStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let is_metadata = location.as_ref().ends_with(METADATA_FILE_NAME);
+            let conditional = !matches!(opts.mode, object_store::PutMode::Overwrite);
+            match self.script {
+                Script::IgnoreConditions => {
+                    let opts = object_store::PutOptions {
+                        mode: object_store::PutMode::Overwrite,
+                        ..opts
+                    };
+                    self.inner.put_opts(location, payload, opts).await
+                }
+                Script::ConflictOnMetadata { landing_write } if is_metadata && conditional => {
+                    if landing_write == Some(self.next_scripted_write()) {
+                        let opts = object_store::PutOptions {
+                            mode: object_store::PutMode::Overwrite,
+                            ..opts
+                        };
+                        self.inner.put_opts(location, payload, opts).await?;
+                    }
+                    Err(object_store::Error::Precondition {
+                        path: location.to_string(),
+                        source: "changed by another writer".into(),
+                    })
+                }
+                Script::LoseFirstMetadataResponse
+                    if is_metadata && self.next_scripted_write() == 1 =>
+                {
+                    self.inner.put_opts(location, payload, opts).await?;
+                    Err(object_store::Error::Generic {
+                        store: "ScriptedStore",
+                        source: "connection reset after the write landed".into(),
+                    })
+                }
+                Script::FailFirstProbeWrite
+                    if location.as_ref().contains(".spice-conditional-write-probe")
+                        && self.next_scripted_write() == 1 =>
+                {
+                    Err(object_store::Error::Generic {
+                        store: "ScriptedStore",
+                        source: "connection reset".into(),
+                    })
+                }
+                _ => self.inner.put_opts(location, payload, opts).await,
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+
+    /// A Cayenne manager that publishes the file at `local_path` to `store`.
+    fn build_manager_over(
+        store: Arc<dyn ObjectStore>,
+        local_path: PathBuf,
+        schema: &SchemaRef,
+    ) -> SnapshotManager {
+        let mut manager = build_manager_for_engine(
+            Arc::new(InMemory::new()),
+            local_path,
+            BootstrapOnFailureBehavior::Warn,
+            schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        manager.object_store = store;
+        manager
+    }
+
+    async fn publish(
+        manager: &SnapshotManager,
+        schema: &SchemaRef,
+    ) -> Result<Option<ObjectPath>, SnapshotUploadError> {
+        let mutex = Arc::new(Mutex::new(()));
+        let lock_guard = mutex.lock_owned().await;
+        manager
+            .create_snapshot(schema, lock_guard, None, None, ForceCreate(true))
+            .await
+    }
+
+    async fn dataset_entries(store: &dyn ObjectStore, metadata_path: &Path) -> Vec<SnapshotEntry> {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(DATASET_NAME)
+            .map(|dataset| dataset.snapshots.clone())
+            .unwrap_or_default()
+    }
+
+    /// A manager that publishes `<dir>/accelerated.db` to a `file://` location in `dir`,
+    /// with the location's store and the path of its `metadata.json`.
+    async fn file_location_manager(
+        dir: &TempDir,
+        schema: &SchemaRef,
+    ) -> (SnapshotManager, Arc<dyn ObjectStore>, Path) {
+        let location =
+            Url::from_directory_path(dir.path().join("snapshots")).expect("directory url");
+        let config = spicepod::component::snapshot::Snapshots {
+            enabled: true,
+            location: Some(location.to_string()),
+            bootstrap_on_failure_behavior: BootstrapOnFailureBehavior::Warn,
+            params: None,
+        };
+        let (store, snapshots_location) = build_snapshot_object_store(
+            &location,
+            &config,
+            Arc::new(RwLock::new(Secrets::new())),
+            Handle::current(),
+            DATASET_NAME,
+        )
+        .await
+        .expect("a file location builds a store");
+
+        let local_path = dir.path().join("accelerated.db");
+        let mut manager = build_manager_over(Arc::clone(&store), local_path, schema);
+        manager.snapshots_location = snapshots_location.clone();
+        manager.snapshot_location_uri = location.to_string();
+        (manager, store, snapshots_location.join(METADATA_FILE_NAME))
+    }
+
+    /// A `file://` location keeps accepting snapshots after the first: every later publish
+    /// updates `metadata.json` at the version it read, which a plain `LocalFileSystem`
+    /// refuses with `NotImplemented`.
+    #[tokio::test]
+    async fn file_location_publishes_more_than_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let (manager, store, metadata_path) = file_location_manager(&dir, &schema).await;
+
+        for content in [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ] {
+            std::fs::write(dir.path().join("accelerated.db"), content)
+                .expect("write accelerator file");
+            publish(&manager, &schema)
+                .await
+                .expect("publish to a file location")
+                .expect("snapshot created");
+        }
+
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
+        assert_eq!(entries.len(), 3, "every publish is recorded: {entries:?}");
+    }
+
+    /// Two publishes of one dataset in the same second each keep their own object, so
+    /// every recorded entry still names the bytes its checksum describes.
+    #[tokio::test]
+    async fn publishes_in_the_same_second_keep_their_own_objects() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let (manager, store, metadata_path) = file_location_manager(&dir, &schema).await;
+
+        // Publish until the last two snapshots share a second, the resolution of the
+        // timestamp in a snapshot's name.
+        let mut entries = Vec::new();
+        for publish_number in 0..10 {
+            std::fs::write(
+                dir.path().join("accelerated.db"),
+                format!("publish {publish_number}"),
+            )
+            .expect("write accelerator file");
+            publish(&manager, &schema)
+                .await
+                .expect("publish to a file location")
+                .expect("snapshot created");
+            entries = dataset_entries(store.as_ref(), &metadata_path).await;
+            if let [.., previous, last] = entries.as_slice()
+                && previous.timestamp_ms / 1000 == last.timestamp_ms / 1000
+            {
+                break;
+            }
+        }
+        let [.., previous, last] = entries.as_slice() else {
+            panic!("expected at least two snapshots: {entries:?}");
+        };
+        assert_eq!(
+            previous.timestamp_ms / 1000,
+            last.timestamp_ms / 1000,
+            "no two publishes shared a second: {entries:?}"
+        );
+
+        for entry in &entries {
+            let path = manager
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot object path");
+            let stored = store
+                .get(&path)
+                .await
+                .expect("snapshot object stored")
+                .bytes()
+                .await
+                .expect("read snapshot object");
+            assert_eq!(
+                compute_sha256_hex(&stored),
+                entry.snapshot_checksum,
+                "snapshot {} names an object that holds another publish's bytes: {entries:?}",
+                entry.snapshot_id
+            );
+        }
+    }
+
+    /// A store that accepts write conditions and ignores them is refused before anything
+    /// is uploaded: publishing to it would let concurrent writers overwrite each other.
+    #[tokio::test]
+    async fn publishing_refuses_a_store_that_ignores_write_conditions() {
+        let store = Arc::new(ScriptedStore::new(Script::IgnoreConditions));
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        std::fs::write(&local_path, b"bytes").expect("write accelerator file");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path,
+            &schema,
+        );
+
+        let err = publish(&manager, &schema)
+            .await
+            .expect_err("publishing must be refused");
+        assert!(
+            matches!(
+                err,
+                SnapshotUploadError::ConditionalWritesNotEnforced { .. }
+            ),
+            "{err}"
+        );
+        let listed: Vec<_> = futures::TryStreamExt::try_collect(store.inner.list(None))
+            .await
+            .expect("list");
+        assert!(listed.is_empty(), "nothing may be uploaded: {listed:?}");
+        assert!(
+            manager
+                .conditional_write_check
+                .conclusive
+                .get()
+                .is_some_and(|s| s.refusal_reason().is_some()),
+            "a lasting refusal is kept so later publishes do not re-probe"
+        );
+    }
+
+    /// A store that cannot update conditionally, as a plain `LocalFileSystem` cannot, is
+    /// refused rather than overwritten blindly, which is what the metadata write used to
+    /// fall back to.
+    #[tokio::test]
+    async fn publishing_refuses_a_store_without_conditional_updates() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(&root).expect("store root");
+        let store = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(&root).expect("local store"),
+        );
+        let local_path = dir.path().join("accelerated.db");
+        std::fs::write(&local_path, b"bytes").expect("write accelerator file");
+        let schema = sample_schema();
+        let manager = build_manager_over(store, local_path, &schema);
+
+        let err = publish(&manager, &schema)
+            .await
+            .expect_err("publishing must be refused");
+        match err {
+            SnapshotUploadError::ConditionalWritesNotEnforced { reason, .. } => {
+                assert!(reason.contains("does not support"), "{reason}");
+            }
+            other => panic!("expected ConditionalWritesNotEnforced, got {other}"),
+        }
+    }
+
+    /// When another writer changes `metadata.json` before every attempt, the publish gives
+    /// up after its conflict budget instead of spinning forever.
+    #[tokio::test]
+    async fn publishing_gives_up_after_the_conflict_budget() {
+        let store = Arc::new(ScriptedStore::new(Script::ConflictOnMetadata {
+            landing_write: None,
+        }));
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(
+            &store.inner,
+            &metadata_path,
+            &SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0),
+        )
+        .await;
+
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        std::fs::write(&local_path, b"bytes").expect("write accelerator file");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path,
+            &schema,
+        );
+
+        let err = publish(&manager, &schema)
+            .await
+            .expect_err("publishing must give up");
+        match err {
+            SnapshotUploadError::MetadataContention { attempts, .. } => {
+                assert_eq!(attempts, test_conflict_retry().max_attempts);
+            }
+            other => panic!("expected MetadataContention, got {other}"),
+        }
+    }
+
+    /// A metadata write that landed but whose response was lost is recognized on the next
+    /// read, so the snapshot is recorded once, not twice.
+    #[tokio::test]
+    async fn a_publish_whose_response_was_lost_is_recorded_once() {
+        let store = Arc::new(ScriptedStore::new(Script::LoseFirstMetadataResponse));
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        std::fs::write(&local_path, b"bytes").expect("write accelerator file");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path,
+            &schema,
+        );
+
+        publish(&manager, &schema)
+            .await
+            .expect("publish succeeds despite the lost response")
+            .expect("snapshot created");
+
+        let entries = dataset_entries(
+            store.inner.as_ref(),
+            &Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME),
+        )
+        .await;
+        assert_eq!(entries.len(), 1, "recorded exactly once: {entries:?}");
+    }
+
+    /// An inconclusive probe (here a transient error) defers the publish before anything
+    /// is uploaded, since only a conclusive probe tells a store that ignores write
+    /// conditions from one that enforces them. The result is not kept: the next publish
+    /// probes again and goes ahead.
+    #[tokio::test]
+    async fn an_inconclusive_probe_defers_the_publish_until_a_probe_concludes() {
+        let store = Arc::new(ScriptedStore::new(Script::FailFirstProbeWrite));
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+
+        std::fs::write(&local_path, b"first").expect("write accelerator file");
+        let err = publish(&manager, &schema)
+            .await
+            .expect_err("an inconclusive probe must defer the publish");
+        assert!(
+            matches!(
+                err,
+                SnapshotUploadError::ConditionalWritesUnconfirmed { .. }
+            ),
+            "{err}"
+        );
+        assert!(err.is_retriable(), "a retry probes again: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("dataset '{DATASET_NAME}'")),
+            "names the dataset: {message}"
+        );
+        assert!(
+            message.contains("`.spice-conditional-write-probe-*`"),
+            "names the probe objects to allow: {message}"
+        );
+        assert!(
+            message.contains("Cause: could not write a probe object"),
+            "carries the probe's reason: {message}"
+        );
+        assert!(
+            message.contains(SNAPSHOTS_DOCS),
+            "links the docs: {message}"
+        );
+        let listed: Vec<_> = futures::TryStreamExt::try_collect(store.inner.list(None))
+            .await
+            .expect("list");
+        assert!(listed.is_empty(), "nothing may be uploaded: {listed:?}");
+        assert!(
+            manager.conditional_write_check.conclusive.get().is_none(),
+            "an inconclusive result is not kept"
+        );
+
+        std::fs::write(&local_path, b"second").expect("write accelerator file");
+        publish(&manager, &schema)
+            .await
+            .expect("second publish")
+            .expect("snapshot created");
+        assert!(
+            manager
+                .conditional_write_check
+                .conclusive
+                .get()
+                .is_some_and(ConditionalWriteSupport::is_enforced),
+            "the second publish probed again"
+        );
+    }
+
+    /// Selecting the current snapshot rewrites the shared metadata document, so it is
+    /// refused on a store that ignores write conditions.
+    #[tokio::test]
+    async fn selecting_a_snapshot_refuses_a_store_that_ignores_write_conditions() {
+        let store = Arc::new(ScriptedStore::new(Script::IgnoreConditions));
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            dir.path().join("accelerated.db"),
+            &schema,
+        );
+
+        let err = manager
+            .set_current_snapshot(0)
+            .await
+            .expect_err("selection must be refused");
+        match err {
+            SnapshotApiError::WriteMetadata { reason, .. } => {
+                assert!(reason.contains("did not hold"), "{reason}");
+            }
+            other => panic!("expected WriteMetadata, got {other}"),
+        }
+    }
+
+    /// The last attempt's write lands but reports a conflict; the publish reads once more
+    /// and succeeds instead of reporting a snapshot it recorded as unpublished.
+    #[tokio::test]
+    async fn a_last_attempt_that_landed_is_not_reported_as_failed() {
+        let attempts = test_conflict_retry().max_attempts;
+        let store = Arc::new(ScriptedStore::new(Script::ConflictOnMetadata {
+            landing_write: Some(attempts),
+        }));
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(
+            &store.inner,
+            &metadata_path,
+            &SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0),
+        )
+        .await;
+
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        std::fs::write(&local_path, b"bytes").expect("write accelerator file");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path,
+            &schema,
+        );
+
+        publish(&manager, &schema)
+            .await
+            .expect("the landed publish is reported as published")
+            .expect("snapshot created");
+        let entries = dataset_entries(store.inner.as_ref(), &metadata_path).await;
+        assert_eq!(entries.len(), 1, "recorded exactly once: {entries:?}");
+    }
+
+    /// `metadata.json` listing snapshots 100 and 200 of the dataset, with 200 current.
+    fn metadata_with_two_snapshots() -> SnapshotMetadata {
+        let entry = |snapshot_id: u64| SnapshotEntry {
+            snapshot_id,
+            timestamp_ms: 1_704_153_600_000,
+            snapshot: format!("snapshots/snapshot{snapshot_id}.db"),
+            snapshot_checksum: "abc123".to_string(),
+            snapshot_checksum_algorithm: SNAPSHOT_CHECKSUM_ALGORITHM.to_string(),
+            snapshot_size: 1024,
+            snapshot_engine: None,
+            snapshot_row_count: None,
+            snapshot_last_updated_at_ms: None,
+        };
+        let dataset = DatasetMetadata {
+            name: DATASET_NAME.to_string(),
+            snapshots: vec![entry(100), entry(200)],
+            current_snapshot_id: Some(200),
+            ..DatasetMetadata::default()
+        };
+        SnapshotMetadata {
+            datasets: HashMap::from([(DATASET_NAME.to_string(), dataset)]),
+            ..SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0)
+        }
+    }
+
+    /// Stores the files of the snapshots [`metadata_with_two_snapshots`] lists.
+    async fn put_files_of_two_snapshots(store: &InMemory) {
+        for snapshot_id in [100, 200] {
+            store
+                .put(
+                    &Path::from(format!("snapshots/snapshot{snapshot_id}.db")),
+                    Bytes::from_static(b"bytes").into(),
+                )
+                .await
+                .expect("write snapshot file");
+        }
+    }
+
+    async fn current_snapshot_id(store: &dyn ObjectStore, metadata_path: &Path) -> Option<u64> {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(DATASET_NAME)
+            .and_then(|dataset| dataset.current_snapshot_id)
+    }
+
+    /// A selection whose write landed but reported a conflict (a retry after a lost
+    /// response) finds the snapshot already current on the next read, so it writes
+    /// nothing more and succeeds instead of spending the conflict budget.
+    #[tokio::test]
+    async fn a_selection_whose_write_landed_is_not_written_again() {
+        let store = Arc::new(ScriptedStore::new(Script::ConflictOnMetadata {
+            landing_write: Some(1),
+        }));
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(&store.inner, &metadata_path, &metadata_with_two_snapshots()).await;
+        put_files_of_two_snapshots(&store.inner).await;
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            dir.path().join("accelerated.db"),
+            &schema,
+        );
+
+        manager
+            .set_current_snapshot(100)
+            .await
+            .expect("the landed selection is reported as selected");
+        assert_eq!(
+            current_snapshot_id(store.inner.as_ref(), &metadata_path).await,
+            Some(100)
+        );
+        assert_eq!(
+            store
+                .scripted_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the selection is written once"
+        );
+    }
+
+    /// The last attempt's selection lands but reports a conflict; the selection reads
+    /// once more and succeeds instead of reporting a selection that is in place as failed.
+    #[tokio::test]
+    async fn a_last_selection_attempt_that_landed_is_not_reported_as_failed() {
+        let store = Arc::new(ScriptedStore::new(Script::ConflictOnMetadata {
+            landing_write: Some(test_conflict_retry().max_attempts),
+        }));
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        write_metadata(&store.inner, &metadata_path, &metadata_with_two_snapshots()).await;
+        put_files_of_two_snapshots(&store.inner).await;
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let manager = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            dir.path().join("accelerated.db"),
+            &schema,
+        );
+
+        manager
+            .set_current_snapshot(100)
+            .await
+            .expect("the landed selection is reported as selected");
+        assert_eq!(
+            current_snapshot_id(store.inner.as_ref(), &metadata_path).await,
+            Some(100)
+        );
+    }
+
+    /// An invalid S3 parameter is an error: falling back to the defaults would also drop
+    /// the endpoint, region and keys, pointing snapshots at a different store.
+    #[tokio::test]
+    async fn invalid_s3_parameters_are_an_error_not_a_fallback() {
+        let params = HashMap::from([
+            ("s3_auth".to_string(), "public".to_string()),
+            (
+                "s3_endpoint".to_string(),
+                "http://127.0.0.1:9000".to_string(),
+            ),
+        ]);
+        let result =
+            build_s3_parameters(Arc::new(RwLock::new(Secrets::new())), Some(&params)).await;
+        assert!(
+            result.is_err(),
+            "s3_auth: public is not a valid snapshot auth mode"
+        );
+
+        let valid = HashMap::from([(
+            "s3_endpoint".to_string(),
+            "http://127.0.0.1:9000".to_string(),
+        )]);
+        let params = build_s3_parameters(Arc::new(RwLock::new(Secrets::new())), Some(&valid))
+            .await
+            .expect("valid parameters");
+        assert!(
+            params.get("endpoint").expose().ok().is_some(),
+            "the endpoint is kept"
+        );
     }
 
     #[tokio::test]
@@ -6175,18 +7496,48 @@ mod tests {
 
     #[test]
     fn upload_error_retriability() {
-        let store_err = |source| SnapshotUploadError::UploadWriteMetadata {
+        let write_err = |source| SnapshotUploadError::UploadWriteMetadata {
             path: "metadata.json".to_string(),
-            source,
+            source: Box::new(source),
         };
-        let transient = store_err(object_store::Error::Generic {
-            store: "S3",
-            source: "connection reset".into(),
-        });
-        let precondition = store_err(object_store::Error::Precondition {
+        let transient = write_err(ConditionalWriteError::Store {
             path: "metadata.json".to_string(),
-            source: "etag changed".into(),
+            source: object_store::Error::Generic {
+                store: "S3",
+                source: "connection reset".into(),
+            },
         });
+        let conflict = write_err(ConditionalWriteError::Conflict {
+            path: "metadata.json".to_string(),
+        });
+        // `NotImplemented` passes `is_retriable_object_store_error`, so this checks that an
+        // unsupported conditional write is not classified by its store error.
+        let unsupported = write_err(ConditionalWriteError::Unsupported {
+            path: "metadata.json".to_string(),
+            source: object_store::Error::NotImplemented {
+                operation: "put_opts with mode PutMode::Update".to_string(),
+                implementer: "LocalFileSystem".to_string(),
+            },
+        });
+        let contention = SnapshotUploadError::MetadataContention {
+            dataset: "t".to_string(),
+            path: "metadata.json".to_string(),
+            attempts: 10,
+        };
+        let unversioned = SnapshotUploadError::MetadataUnversioned {
+            dataset: "t".to_string(),
+            path: "metadata.json".to_string(),
+        };
+        let not_enforced = SnapshotUploadError::ConditionalWritesNotEnforced {
+            dataset: "t".to_string(),
+            location: "s3://bucket/snapshots".to_string(),
+            reason: "accepted a write whose condition should have failed".to_string(),
+        };
+        let unconfirmed = SnapshotUploadError::ConditionalWritesUnconfirmed {
+            dataset: "t".to_string(),
+            location: "s3://bucket/snapshots".to_string(),
+            reason: "could not write a probe object: connection reset".to_string(),
+        };
         let missing_bucket = SnapshotUploadError::StartUpload {
             path: "t.cayenne".to_string(),
             source: object_store::Error::NotFound {
@@ -6215,8 +7566,28 @@ mod tests {
             "an archive walk may race maintenance"
         );
         assert!(
-            !precondition.is_retriable(),
-            "a precondition failure is handled by the metadata update loop"
+            !conflict.is_retriable(),
+            "a conflicting write is handled by the metadata update loop"
+        );
+        assert!(
+            !contention.is_retriable(),
+            "the metadata update loop has already spent its conflict budget"
+        );
+        assert!(
+            !unsupported.is_retriable(),
+            "a store that cannot write conditionally will not start to on retry"
+        );
+        assert!(
+            !unversioned.is_retriable(),
+            "a store that returns no version needs user action"
+        );
+        assert!(
+            !not_enforced.is_retriable(),
+            "a store that does not enforce write conditions needs user action"
+        );
+        assert!(
+            unconfirmed.is_retriable(),
+            "a conditional-write probe that could not tell may conclude on retry"
         );
         assert!(
             !missing_bucket.is_retriable(),
@@ -6780,7 +8151,7 @@ mod tests {
         let newer = manager
             .create_snapshot_as_writer(
                 &schema,
-                Arc::clone(&mutex).lock_owned().await,
+                Arc::clone(&mutex).lock_owned().await.into(),
                 None,
                 None,
                 ForceCreate(true),
@@ -6795,7 +8166,7 @@ mod tests {
         let older = manager
             .create_snapshot_as_writer(
                 &schema,
-                Arc::clone(&mutex).lock_owned().await,
+                Arc::clone(&mutex).lock_owned().await.into(),
                 None,
                 None,
                 ForceCreate(true),
@@ -7502,7 +8873,11 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            conflict_retry: test_conflict_retry(),
+            conditional_write_check: Arc::default(),
             writer_lease: WriterLease::default(),
+            next_sweep: Arc::default(),
+            cleanup_clock: CleanupClock::default(),
         }
     }
 
@@ -8148,7 +9523,11 @@ mod tests {
             network_retry_strategy: RetryBackoffBuilder::new()
                 .max_retries(Some(NETWORK_RETRY_MAX))
                 .build(),
+            conflict_retry: test_conflict_retry(),
+            conditional_write_check: Arc::default(),
             writer_lease: WriterLease::default(),
+            next_sweep: Arc::default(),
+            cleanup_clock: CleanupClock::default(),
         }
     }
 
@@ -9159,5 +10538,493 @@ mod tests {
             !err.is_retriable(),
             "only a different build of Spice can read this metadata"
         );
+    }
+
+    const DAY: std::time::Duration = std::time::Duration::from_hours(24);
+
+    /// Publishes `contents` as the writer's acceleration file.
+    async fn publish_contents(
+        writer: &SnapshotManager,
+        local_path: &std::path::Path,
+        contents: &str,
+        schema: &SchemaRef,
+    ) {
+        std::fs::write(local_path, contents).expect("write accelerator file");
+        publish(writer, schema)
+            .await
+            .expect("publish")
+            .expect("snapshot created");
+    }
+
+    fn entry_ids(entries: &[SnapshotEntry]) -> Vec<u64> {
+        entries.iter().map(|entry| entry.snapshot_id).collect()
+    }
+
+    async fn object_exists(store: &dyn ObjectStore, path: &ObjectPath) -> bool {
+        match store.head(path).await {
+            Ok(_) => true,
+            Err(object_store::Error::NotFound { .. }) => false,
+            Err(err) => panic!("HEAD {path} failed: {err}"),
+        }
+    }
+
+    async fn dataset_properties(
+        store: &dyn ObjectStore,
+        metadata_path: &Path,
+    ) -> HashMap<String, String> {
+        let bytes = store
+            .get(metadata_path)
+            .await
+            .expect("metadata stored")
+            .bytes()
+            .await
+            .expect("read metadata");
+        let metadata: SnapshotMetadata = serde_json::from_slice(&bytes).expect("parse metadata");
+        metadata
+            .datasets
+            .get(DATASET_NAME)
+            .map(|dataset| dataset.properties.clone())
+            .unwrap_or_default()
+    }
+
+    /// A publish drops the snapshots older than 28 days but keeps their files for a day,
+    /// so a reader that read `metadata.json` before the drop still downloads them. The
+    /// first publish after that day deletes the files; a snapshot it drops itself keeps
+    /// its file for another day.
+    #[tokio::test]
+    async fn publishing_drops_old_snapshots_and_deletes_their_files_a_day_later() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let mut writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        let old_entries = dataset_entries(store.as_ref(), &metadata_path).await;
+        assert_eq!(entry_ids(&old_entries), vec![0, 1, 2]);
+        let old_paths: Vec<ObjectPath> = old_entries
+            .iter()
+            .map(|entry| {
+                writer
+                    .snapshot_uri_to_object_path(&entry.snapshot, None)
+                    .expect("snapshot path")
+            })
+            .collect();
+
+        let reader_dir = TempDir::new().expect("tempdir");
+        let reader = build_manager_for_engine(
+            Arc::clone(&store),
+            reader_dir.path().join("restored.db"),
+            BootstrapOnFailureBehavior::Warn,
+            &schema,
+            &AccelerationEngine::Cayenne,
+            false,
+        );
+        let read_before_drop = reader
+            .load_metadata()
+            .await
+            .expect("read metadata")
+            .expect("metadata exists");
+        let dataset_before_drop = read_before_drop.metadata.datasets[DATASET_NAME].clone();
+        let download_first = || {
+            reader.download_snapshot_entry(
+                &old_entries[0],
+                &dataset_before_drop,
+                &read_before_drop.metadata.location,
+                Arc::clone(
+                    reader
+                        .checkpointer_factory
+                        .as_ref()
+                        .expect("checkpointer factory"),
+                ),
+            )
+        };
+
+        writer.cleanup_clock = CleanupClock::ahead_by(29 * DAY);
+        publish_contents(&writer, &local_path, "publish 3", &schema).await;
+        assert_eq!(
+            entry_ids(&dataset_entries(store.as_ref(), &metadata_path).await),
+            vec![3]
+        );
+        for path in &old_paths {
+            assert!(
+                object_exists(store.as_ref(), path).await,
+                "{path} stays for a day"
+            );
+        }
+        let restored = download_first()
+            .await
+            .expect("a dropped snapshot downloads within a day of the drop");
+        assert_eq!(restored.snapshot_id, 0);
+
+        let third = dataset_entries(store.as_ref(), &metadata_path).await[0].clone();
+        writer.cleanup_clock = CleanupClock::ahead_by(30 * DAY);
+        publish_contents(&writer, &local_path, "publish 4", &schema).await;
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
+        assert_eq!(entry_ids(&entries), vec![4]);
+        for path in &old_paths {
+            assert!(
+                !object_exists(store.as_ref(), path).await,
+                "{path} is deleted"
+            );
+        }
+        for entry in [&third, &entries[0]] {
+            let path = writer
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot path");
+            assert!(object_exists(store.as_ref(), &path).await, "{path} stays");
+        }
+        let records: Vec<String> = dataset_properties(store.as_ref(), &metadata_path)
+            .await
+            .into_keys()
+            .filter(|key| key.starts_with("dropped-snapshot:"))
+            .collect();
+        assert_eq!(
+            records,
+            vec![format!("dropped-snapshot:{}", third.snapshot)],
+            "the drop records of deleted files go with them"
+        );
+        let err = download_first()
+            .await
+            .expect_err("the file of a snapshot dropped more than a day ago is gone");
+        assert!(
+            matches!(
+                err,
+                SnapshotDownloadError::SnapshotFileMissing { snapshot_id: 0, .. }
+            ),
+            "{err}"
+        );
+    }
+
+    /// A file in the dataset's snapshot folder that no entry names is deleted only once
+    /// it is a day old, so an upload still in progress survives. Other datasets' files,
+    /// files outside the snapshot layout and the location's own objects stay.
+    #[tokio::test]
+    async fn a_file_no_entry_names_is_deleted_once_it_is_a_day_old() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let mut writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let orphan = Path::from(
+            "snapshots/month=2026-10/day=2026-10-01/dataset=dataset/dataset_20261001T000000Z_orphan.cayenne",
+        );
+        let kept = [
+            Path::from(
+                "snapshots/month=2026-10/day=2026-10-01/dataset=dataset_two/dataset_two_20261001T000000Z_x.cayenne",
+            ),
+            Path::from("snapshots/dataset=dataset/dataset_20261001T000000Z_x.cayenne"),
+            Path::from("snapshots/month=2026-10/day=2026-10-01/dataset=dataset/nested/x.cayenne"),
+        ];
+        for path in kept.iter().chain([&orphan]) {
+            store
+                .put(path, Bytes::from_static(b"bytes").into())
+                .await
+                .expect("put");
+        }
+
+        writer.cleanup_clock = CleanupClock::ahead_by(std::time::Duration::from_mins(24 * 60 - 1));
+        publish_contents(&writer, &local_path, "publish 0", &schema).await;
+        assert!(
+            object_exists(store.as_ref(), &orphan).await,
+            "a younger file stays"
+        );
+
+        *writer.next_sweep.lock() = None;
+        writer.cleanup_clock = CleanupClock::ahead_by(DAY + std::time::Duration::from_mins(1));
+        publish_contents(&writer, &local_path, "publish 1", &schema).await;
+        assert!(
+            !object_exists(store.as_ref(), &orphan).await,
+            "the orphan is deleted"
+        );
+        for path in &kept {
+            assert!(object_exists(store.as_ref(), path).await, "{path} stays");
+        }
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        assert!(object_exists(store.as_ref(), &metadata_path).await);
+        for entry in dataset_entries(store.as_ref(), &metadata_path).await {
+            let path = writer
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot path");
+            assert!(object_exists(store.as_ref(), &path).await, "{path} stays");
+        }
+    }
+
+    /// An entry whose file a bucket lifecycle rule deleted is dropped from the list at the
+    /// writer's next sweep once it is a day old. A younger one may still be uploading, and
+    /// the newest entry stays whatever happened to its file.
+    #[tokio::test]
+    async fn an_entry_whose_file_is_gone_is_dropped_at_the_next_sweep() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let mut writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        for entry in &dataset_entries(store.as_ref(), &metadata_path).await[..2] {
+            let path = writer
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot path");
+            store
+                .delete(&path)
+                .await
+                .expect("delete as a lifecycle rule would");
+        }
+
+        *writer.next_sweep.lock() = None;
+        writer.cleanup_clock = CleanupClock::ahead_by(std::time::Duration::from_mins(24 * 60 - 1));
+        publish_contents(&writer, &local_path, "publish 3", &schema).await;
+        assert_eq!(
+            entry_ids(&dataset_entries(store.as_ref(), &metadata_path).await),
+            vec![0, 1, 2, 3]
+        );
+
+        *writer.next_sweep.lock() = None;
+        writer.cleanup_clock = CleanupClock::ahead_by(DAY + std::time::Duration::from_mins(1));
+        publish_contents(&writer, &local_path, "publish 4", &schema).await;
+        assert_eq!(
+            entry_ids(&dataset_entries(store.as_ref(), &metadata_path).await),
+            vec![2, 3, 4]
+        );
+        assert!(
+            !dataset_properties(store.as_ref(), &metadata_path)
+                .await
+                .keys()
+                .any(|key| key.starts_with("dropped-snapshot:")),
+            "an entry whose file is gone leaves no file to delete later"
+        );
+    }
+
+    /// When `metadata.json` and the writer lease are gone, the next publish creates both
+    /// again.
+    #[tokio::test]
+    async fn a_publish_recreates_missing_metadata_and_writer_lease() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let lease_path = Path::from(format!("{SNAPSHOT_BASE_PATH}/leases/{DATASET_NAME}.json"));
+        publish_contents(&writer, &local_path, "publish 0", &schema).await;
+        assert!(object_exists(store.as_ref(), &lease_path).await);
+        store.delete(&metadata_path).await.expect("delete metadata");
+        store.delete(&lease_path).await.expect("delete lease");
+
+        publish_contents(&writer, &local_path, "publish 1", &schema).await;
+
+        assert_eq!(
+            dataset_entries(store.as_ref(), &metadata_path).await.len(),
+            1
+        );
+        assert!(object_exists(store.as_ref(), &lease_path).await);
+    }
+
+    /// A rollback to a snapshot whose file is gone is refused, naming the snapshot and
+    /// its file; a rollback to one whose file exists goes ahead.
+    #[tokio::test]
+    async fn a_rollback_to_a_snapshot_whose_file_is_gone_is_refused() {
+        let store = Arc::new(InMemory::new());
+        let dir = TempDir::new().expect("tempdir");
+        let local_path = dir.path().join("accelerated.db");
+        let schema = sample_schema();
+        let writer = build_manager_over(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            local_path.clone(),
+            &schema,
+        );
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for publish_number in 0..3 {
+            publish_contents(
+                &writer,
+                &local_path,
+                &format!("publish {publish_number}"),
+                &schema,
+            )
+            .await;
+        }
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
+        let gone = writer
+            .snapshot_uri_to_object_path(&entries[0].snapshot, None)
+            .expect("snapshot path");
+        store
+            .delete(&gone)
+            .await
+            .expect("delete as a lifecycle rule would");
+
+        let err = writer
+            .set_current_snapshot(0)
+            .await
+            .expect_err("a snapshot without its file is not made current");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Snapshot 0 of dataset 'dataset' cannot be made current: its file '{}' is gone from the snapshot location, for example deleted by a bucket lifecycle rule. Choose a snapshot whose file exists.",
+                writer.object_path_uri(&gone)
+            )
+        );
+        assert_eq!(
+            current_snapshot_id(store.as_ref(), &metadata_path).await,
+            Some(2)
+        );
+
+        writer
+            .set_current_snapshot(1)
+            .await
+            .expect("a snapshot whose file exists is made current");
+        assert_eq!(
+            current_snapshot_id(store.as_ref(), &metadata_path).await,
+            Some(1)
+        );
+    }
+
+    /// `metadata.json` naming Cayenne snapshots 1, 2 and 3, with 3 current; the files of
+    /// the snapshots in `gone` are not stored.
+    async fn metadata_with_gone_files(
+        store: &InMemory,
+        schema: &SchemaRef,
+        gone: &[u64],
+    ) -> SnapshotMetadata {
+        let mut entries = Vec::new();
+        for snapshot_id in 1..=3 {
+            let second = u32::try_from(snapshot_id).expect("small id");
+            let entry = put_cayenne_snapshot_entry(store, snapshot_id, second, b"rows").await;
+            if gone.contains(&snapshot_id) {
+                let relative = entry
+                    .snapshot
+                    .strip_prefix(&format!("{SNAPSHOT_URI_PREFIX}/"))
+                    .expect("entry under the prefix");
+                let path = Path::from(format!("{SNAPSHOT_BASE_PATH}/{relative}"));
+                store.delete(&path).await.expect("delete snapshot file");
+            }
+            entries.push(entry);
+        }
+        metadata_with(schema, entries, 3)
+    }
+
+    /// A bootstrap whose current snapshot's file is gone treats it as a failed snapshot:
+    /// `fallback` restores the next older one and `warn` continues without one.
+    #[tokio::test]
+    async fn bootstrap_treats_a_snapshot_whose_file_is_gone_as_failed() {
+        let schema = sample_schema();
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for (behavior, expected) in [
+            (BootstrapOnFailureBehavior::Fallback, Some(2)),
+            (BootstrapOnFailureBehavior::Warn, None),
+        ] {
+            let store = Arc::new(InMemory::new());
+            let metadata = metadata_with_gone_files(&store, &schema, &[3]).await;
+            write_metadata(&store, &metadata_path, &metadata).await;
+            let root = TempDir::new().expect("create temp dir");
+            let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+            manager.bootstrap_failure_behavior = behavior;
+
+            let restored = manager
+                .download_latest_snapshot()
+                .await
+                .expect("bootstrap continues");
+
+            assert_eq!(
+                restored.map(|info| info.snapshot_id),
+                expected,
+                "{behavior:?}"
+            );
+        }
+    }
+
+    /// Under `retry`, a bootstrap whose current snapshot's file is gone reads
+    /// `metadata.json` again and restores the snapshot published after it.
+    #[tokio::test]
+    async fn bootstrap_under_retry_waits_for_a_snapshot_whose_file_exists() {
+        let store = Arc::new(InMemory::new());
+        let schema = sample_schema();
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        let metadata = metadata_with_gone_files(&store, &schema, &[3]).await;
+        write_metadata(&store, &metadata_path, &metadata).await;
+        let replacement = put_cayenne_snapshot_entry(&store, 4, 4, b"replacement").await;
+        let mut entries = metadata.datasets[DATASET_NAME].snapshots.clone();
+        entries.push(replacement);
+        let replacement_metadata = metadata_with(&schema, entries, 4);
+        let root = TempDir::new().expect("create temp dir");
+        let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+        manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
+
+        let publisher = {
+            let store = Arc::clone(&store);
+            let metadata_path = metadata_path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                write_metadata(&store, &metadata_path, &replacement_metadata).await;
+            })
+        };
+        let restored = manager
+            .download_latest_snapshot()
+            .await
+            .expect("bootstrap succeeds")
+            .expect("a snapshot is restored");
+        publisher.await.expect("publisher task");
+
+        assert_eq!(restored.snapshot_id, 4);
+    }
+
+    /// A reader that serves snapshot 1 skips a newer snapshot whose file is gone and
+    /// loads the newest one whose file exists; it never falls back to the snapshot it
+    /// already serves or an older one.
+    #[tokio::test]
+    async fn a_serving_reader_skips_a_newer_snapshot_whose_file_is_gone() {
+        let schema = sample_schema();
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
+        for (gone, expected) in [(vec![3], Some(2)), (vec![2, 3], None)] {
+            let store = Arc::new(InMemory::new());
+            let metadata = metadata_with_gone_files(&store, &schema, &gone).await;
+            write_metadata(&store, &metadata_path, &metadata).await;
+            let root = TempDir::new().expect("create temp dir");
+            let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
+            manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Fallback;
+
+            let poll = manager
+                .download_if_newer(Some(1), None, None)
+                .await
+                .expect("the poll succeeds");
+
+            assert_eq!(
+                poll.download().map(|info| info.snapshot_id),
+                expected,
+                "files gone: {gone:?}"
+            );
+        }
     }
 }

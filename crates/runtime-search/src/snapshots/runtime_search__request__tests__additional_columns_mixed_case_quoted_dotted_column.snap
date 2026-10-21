@@ -1,0 +1,5 @@
+---
+source: crates/runtime-search/src/request.rs
+expression: "run_parse_additional_columns(&[\"CaTaLoG.sChEmA.tBl.\\\"QuOtEd.WiTh_DoT\\\"\"]).as_str()"
+---
+[Column { relation: Some(Full { catalog: "CaTaLoG", schema: "sChEmA", table: "tBl" }), name: "QuOtEd.WiTh_DoT" }]

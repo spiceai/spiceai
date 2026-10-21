@@ -147,6 +147,9 @@ impl ListModels for DatabricksModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_from_params_missing_endpoint() {
@@ -176,8 +179,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_from_params_success() {
+    #[tokio::test]
+    async fn test_from_params_success() {
         let mut params = HashMap::new();
         params.insert(
             "databricks_endpoint".to_string(),
@@ -187,13 +190,59 @@ mod tests {
             "databricks_token".to_string(),
             SecretString::from("test-token"),
         );
-        let result = DatabricksModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = DatabricksModelLister::from_params(&params).expect("should succeed");
+        assert_eq!(lister.endpoint, "https://test.databricks.com");
+        assert_eq!(lister.token.expose_secret(), "test-token");
+
+        // The configured endpoint and token are the ones the listing uses, and
+        // each serving endpoint is listed by name, in order.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/serving-endpoints"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "endpoints": [{"name": "my-llm"}, {"name": "my-embedder"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        params.insert(
+            "databricks_endpoint".to_string(),
+            SecretString::from(server.uri()),
+        );
+        let models = DatabricksModelLister::from_params(&params)
+            .expect("should succeed")
+            .list_models()
+            .await
+            .expect("the mock serves the endpoint list");
+        assert_eq!(
+            models,
+            vec!["my-llm".to_string(), "my-embedder".to_string()]
+        );
     }
 
-    #[test]
-    fn test_common_models_not_empty() {
-        let models = DatabricksModelLister::common_models();
-        assert!(!models.is_empty());
+    /// A workspace with no custom serving endpoints still offers the Foundation
+    /// Model API, so an empty or absent endpoint list falls back to it.
+    #[tokio::test]
+    async fn list_models_falls_back_to_common_models_without_serving_endpoints() {
+        for body in [json!({"endpoints": []}), json!({})] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/serving-endpoints"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let lister = DatabricksModelLister::new(server.uri(), SecretString::from("test-token"));
+            let models = lister
+                .list_models()
+                .await
+                .unwrap_or_else(|e| panic!("listing {body} must succeed: {e}"));
+            assert_eq!(
+                models,
+                DatabricksModelLister::common_models(),
+                "response body: {body}"
+            );
+        }
     }
 }

@@ -65,7 +65,7 @@ pub(crate) fn create_timestamp_filter_convert(
 /// [`data_type_to_timestamp_format`] for integer columns.
 ///
 /// Returns `None` for formats that don't represent unix epoch integers.
-fn time_format_to_unix_scale(time_format: Option<TimeFormat>) -> Option<u128> {
+pub(crate) fn time_format_to_unix_scale(time_format: Option<TimeFormat>) -> Option<u128> {
     match time_format {
         Some(TimeFormat::UnixSeconds) => Some(1_000_000_000),
         Some(TimeFormat::UnixMillis) => Some(1_000_000),

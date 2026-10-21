@@ -32,7 +32,7 @@ use runtime::{
         access::AccessMode,
         dataset::{
             TimeFormat,
-            acceleration::{Acceleration, RefreshMode},
+            acceleration::{Acceleration, Engine, RefreshMode},
             builder::DatasetBuilder,
             replication::Replication,
         },
@@ -195,7 +195,10 @@ impl SpiceExtension {
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
-            Acceleration::default(),
+            Acceleration {
+                engine: Engine::Arrow,
+                ..Acceleration::default()
+            },
             refresh,
             retention,
             runtime.secrets(),
@@ -401,6 +404,7 @@ pub async fn create_synced_internal_accelerated_table(
     builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
+    builder.node_local();
 
     let accelerated_table = builder
         .build()

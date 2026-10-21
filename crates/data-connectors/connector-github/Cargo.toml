@@ -18,6 +18,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "GitHub data connector for Spice.ai runtime"
 
 [dependencies]
@@ -60,6 +61,7 @@ zip = "8.3.0"
 runtime = { path = "../../runtime" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 spicepod = { path = "../../spicepod" }
+wiremock = "0.6"
 
 [features]
 default = []

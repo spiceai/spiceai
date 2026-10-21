@@ -135,11 +135,6 @@ fn runtime_state_uses_s3(spicepod_yaml: &str) -> bool {
             .scheduler
             .as_ref()
             .and_then(|scheduler| scheduler.state_location.as_deref()),
-        spicepod
-            .runtime
-            .source_rate_control
-            .as_ref()
-            .and_then(|rate_control| rate_control.state_location.as_deref()),
     ];
     locations.into_iter().flatten().any(|location| {
         let location = location.trim();
