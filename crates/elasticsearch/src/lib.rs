@@ -608,7 +608,6 @@ impl Client {
         index: &str,
         docs: &[(Option<String>, serde_json::Value)],
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/_bulk", self.base_url);
         let mut ndjson = String::new();
         for (id, doc) in docs {
             let action = if let Some(id) = id {
@@ -621,13 +620,19 @@ impl Client {
             ndjson.push_str(&serde_json::to_string(doc).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }
+        self.post_bulk("bulk_index", ndjson).await
+    }
+
+    /// Send an NDJSON `_bulk` body, retrying transient failures.
+    async fn post_bulk(&self, op: &'static str, ndjson: String) -> Result<serde_json::Value> {
+        let url = format!("{}/_bulk", self.base_url);
         let url_ref = &url;
         // Freeze the NDJSON payload into `Bytes` so retries reuse the same
         // underlying buffer (cheap refcount clone) instead of copying the
         // entire payload on every attempt.
         let ndjson_bytes = Bytes::from(ndjson);
         let ndjson_ref = &ndjson_bytes;
-        self.with_retry("bulk_index", |c| async move {
+        self.with_retry(op, |c| async move {
             let resp = c
                 .auth(c.http.post(url_ref))
                 .header(CONTENT_TYPE, "application/x-ndjson")
@@ -650,7 +655,6 @@ impl Client {
         index: &str,
         docs: &[DocumentVersion],
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/_bulk", self.base_url);
         let mut ndjson = String::new();
         for doc in docs {
             let action = serde_json::json!({"delete": {
@@ -662,23 +666,9 @@ impl Client {
             ndjson.push_str(&serde_json::to_string(&action).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }
-        let url_ref = &url;
-        let ndjson_bytes = Bytes::from(ndjson);
-        let ndjson_ref = &ndjson_bytes;
         // Safe to retry: a delete that already applied reports `404` on the retry, and one
         // whose document was rewritten in between reports `409`; neither removes anything new.
-        self.with_retry("bulk_delete_if_unchanged", |c| async move {
-            let resp = c
-                .auth(c.http.post(url_ref))
-                .header(CONTENT_TYPE, "application/x-ndjson")
-                .body(ndjson_ref.clone())
-                .send()
-                .await
-                .context(HttpRequestSnafu)?;
-            let resp = check_status_without_body(resp).await?;
-            resp.json().await.context(JsonParseSnafu)
-        })
-        .await
+        self.post_bulk("bulk_delete_if_unchanged", ndjson).await
     }
 
     /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.

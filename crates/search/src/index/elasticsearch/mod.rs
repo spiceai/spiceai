@@ -325,9 +325,8 @@ impl ReplaceSnapshot {
         self.renewal.abort();
         let mut pit_id = self.pit_id.lock().clone();
         let result = Self::delete_pages(client, es_index, &mut pit_id).await;
-        if let Err(e) = client.close_point_in_time(&pit_id).await {
-            tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
-        }
+        *self.pit_id.lock() = pit_id;
+        self.close(client, es_index).await;
         result.map_err(|cause| {
             DataFusionError::Execution(format!(
                 "Failed to remove the documents for rows a full refresh dropped from the search index '{es_index}' (elasticsearch), so searches can return rows the dataset no longer has until the next full refresh succeeds. Cause: {cause}"
@@ -396,6 +395,18 @@ impl ReplaceSnapshot {
     }
 }
 
+impl ReplaceSnapshot {
+    /// Stops the renewal and releases the reader. A failure only delays the release until
+    /// the keep-alive lapses, so it is not reported.
+    async fn close(self, client: &dyn Elasticsearch, es_index: &str) {
+        self.renewal.abort();
+        let pit_id = self.pit_id.lock().clone();
+        if let Err(e) = client.close_point_in_time(&pit_id).await {
+            tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
+        }
+    }
+}
+
 impl Drop for ReplaceSnapshot {
     fn drop(&mut self) {
         self.renewal.abort();
@@ -404,32 +415,25 @@ impl Drop for ReplaceSnapshot {
 
 /// Counts the documents a conditional bulk delete removed. A `409` is a document rewritten
 /// since the snapshot and a `404` one already deleted; both are expected and left alone. Any
-/// other per-item failure is an error, since that document may still be served.
+/// other per-item outcome is an error, since that document may still be served. Failures are
+/// described without the document id, which is the row's primary key.
 fn count_conditional_deletes(response: &serde_json::Value) -> Result<u64, String> {
     let items = response
         .get("items")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("the bulk response carries no `items`: {response}"))?;
+        .ok_or_else(|| {
+            format!(
+                "the bulk response carries no `items`; got {}",
+                write::describe_unexpected_response(response)
+            )
+        })?;
     let mut deleted = 0;
-    for item in items {
+    for (position, item) in items.iter().enumerate() {
         let outcome = item.get("delete").unwrap_or(item);
         match outcome.get("status").and_then(serde_json::Value::as_u64) {
             Some(200) => deleted += 1,
             Some(404 | 409) => {}
-            status => {
-                let id = outcome
-                    .get("_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<unknown>");
-                let error = outcome.get("error").map_or_else(
-                    || "no error detail".to_string(),
-                    serde_json::Value::to_string,
-                );
-                return Err(format!(
-                    "deleting document '{id}' failed with status {}: {error}",
-                    status.map_or_else(|| "<none>".to_string(), |s| s.to_string())
-                ));
-            }
+            _ => return Err(write::describe_bulk_failure(position, outcome)),
         }
     }
     Ok(deleted)
@@ -472,47 +476,38 @@ impl ElasticsearchIndexWriteMaintenance {
         }
     }
 
-    /// Starts a write cycle for `window`. A [`WriteWindow::ReplaceAll`] write first snapshots
-    /// the index (see [`ReplaceSnapshot`]), so [`Self::on_write_complete`] can delete the
-    /// documents of every row the write dropped.
+    /// Starts a write cycle for `window`. The `refresh_interval` tuning is applied once per
+    /// cycle; later calls in the same cycle skip it.
     ///
-    /// The snapshot is taken only by the call that opens the cycle: a later call in the same
-    /// cycle may come after rows were already written, and a snapshot taken then would miss
-    /// documents the write is about to leave out.
-    pub async fn on_write_window_start(
+    /// A [`WriteWindow::ReplaceAll`] write snapshots the index (see [`ReplaceSnapshot`]) so
+    /// [`Self::on_write_complete`] can delete the documents of every row the write dropped.
+    /// Every call takes a fresh snapshot, replacing any it finds: the sinks run each index's
+    /// `on_write_start` before the write sends any row, so a fresh snapshot never misses one
+    /// of this write's rows, while a snapshot left by a write that was cancelled (dropped
+    /// without `on_write_failed`) predates that write's rows and would keep a row it rewrote
+    /// from being deleted.
+    ///
+    /// A failed start leaves no cycle open: the caller does not call `on_write_failed` on an
+    /// index whose own start failed, so the next write would otherwise skip the tuning.
+    pub async fn on_write_start(
         &self,
         client: &Arc<dyn Elasticsearch>,
         es_index: &str,
         window: WriteWindow,
     ) -> Result<(), DataFusionError> {
-        match window {
-            WriteWindow::Append => self.on_write_start(client.as_ref(), es_index).await,
-            WriteWindow::ReplaceAll => {
-                if self.write_cycle_active.swap(true, Ordering::AcqRel) {
-                    return Ok(());
-                }
-                match ReplaceSnapshot::open(client, es_index).await {
-                    Ok(snapshot) => *self.replace_snapshot.lock() = snapshot,
-                    Err(e) => {
-                        self.abandon_write_cycle();
-                        return Err(e);
-                    }
-                }
-                self.tune_refresh_interval(client.as_ref(), es_index).await
-            }
-        }
-    }
-
-    async fn on_write_start(
-        &self,
-        client: &dyn Elasticsearch,
-        es_index: &str,
-    ) -> Result<(), DataFusionError> {
         let first_start = !self.write_cycle_active.swap(true, Ordering::AcqRel);
-        if !first_start {
-            return Ok(());
-        }
-        self.tune_refresh_interval(client, es_index).await
+        let started = async {
+            if window == WriteWindow::ReplaceAll {
+                let snapshot = ReplaceSnapshot::open(client, es_index).await?;
+                *self.replace_snapshot.lock() = snapshot;
+            }
+            if first_start {
+                self.tune_refresh_interval(client.as_ref(), es_index)
+                    .await?;
+            }
+            Ok(())
+        };
+        started.await.inspect_err(|_| self.abandon_write_cycle())
     }
 
     async fn tune_refresh_interval(
@@ -531,19 +526,15 @@ impl ElasticsearchIndexWriteMaintenance {
             return Ok(());
         }
 
-        let previous = match client.get_index_refresh_interval(es_index).await {
-            Ok(previous) => previous,
-            Err(e) => {
-                self.abandon_write_cycle();
-                return Err(DataFusionError::External(Box::new(e)));
-            }
-        };
+        let previous = client
+            .get_index_refresh_interval(es_index)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let body = serde_json::json!({ "index": { "refresh_interval": refresh_interval } });
-
-        if let Err(e) = client.put_index_settings(es_index, &body).await {
-            self.abandon_write_cycle();
-            return Err(DataFusionError::External(Box::new(e)));
-        }
+        client
+            .put_index_settings(es_index, &body)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         *self.previous_refresh_interval.lock().await = match previous {
             Some(refresh_interval) => PreviousRefreshInterval::Value(refresh_interval),
@@ -555,13 +546,7 @@ impl ElasticsearchIndexWriteMaintenance {
         Ok(())
     }
 
-    /// Undo everything [`Self::on_write_start`] set before it failed, so a failed start
-    /// leaves no write cycle open.
-    ///
-    /// A caller that abandons the write does not call `on_write_failed` on the index whose
-    /// start failed — a start that fails partway owns its own cleanup — so without this the
-    /// cycle stays open forever and every later write's start short-circuits as a
-    /// second-batch no-op, silently dropping the `refresh_interval` tuning.
+    /// Undo everything [`Self::on_write_start`] set before it failed.
     fn abandon_write_cycle(&self) {
         // Dropping the snapshot stops its renewal; Elasticsearch releases the reader once
         // its keep-alive lapses.
@@ -583,11 +568,7 @@ impl ElasticsearchIndexWriteMaintenance {
         // nothing; the next full refresh reconciles the index.
         let snapshot = self.replace_snapshot.lock().take();
         if let Some(snapshot) = snapshot {
-            snapshot.renewal.abort();
-            let pit_id = snapshot.pit_id.lock().clone();
-            if let Err(e) = client.close_point_in_time(&pit_id).await {
-                tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
-            }
+            snapshot.close(client, es_index).await;
         }
         self.restore_refresh_interval(client, es_index).await?;
         Ok(())
@@ -844,11 +825,8 @@ impl Index for ElasticsearchIndex {
     }
 
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        // Clearing the index up front for `WriteWindow::ReplaceAll` would serve an empty or
-        // half-populated index for the length of the refresh; the documents of dropped rows
-        // are removed when the write completes instead (see `ReplaceSnapshot`).
         self.write_maintenance
-            .on_write_window_start(&self.client, &self.es_index, window)
+            .on_write_start(&self.client, &self.es_index, window)
             .await
     }
 
@@ -1133,11 +1111,8 @@ impl Index for ElasticsearchTextIndex {
     }
 
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
-        // Clearing the index up front for `WriteWindow::ReplaceAll` would serve an empty or
-        // half-populated index for the length of the refresh; the documents of dropped rows
-        // are removed when the write completes instead (see `ReplaceSnapshot`).
         self.write_maintenance
-            .on_write_window_start(&self.client, &self.es_index, window)
+            .on_write_start(&self.client, &self.es_index, window)
             .await
     }
 
@@ -1343,6 +1318,10 @@ mod write_maintenance_tests {
         }
     }
 
+    fn dyn_es(client: &Arc<MockElasticsearch>) -> Arc<dyn Elasticsearch> {
+        Arc::clone(client) as Arc<dyn Elasticsearch>
+    }
+
     fn make_maintenance(
         opts: ElasticsearchIndexWriteOptions,
     ) -> ElasticsearchIndexWriteMaintenance {
@@ -1352,10 +1331,10 @@ mod write_maintenance_tests {
     /// `on_write_start` with no options configured is a pure no-op: no ES calls.
     #[tokio::test]
     async fn write_start_no_options_is_noop() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions::default());
 
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("on_write_start should succeed");
 
@@ -1369,20 +1348,20 @@ mod write_maintenance_tests {
     /// This is the core correctness guarantee of the fix for issue #3.
     #[tokio::test]
     async fn write_start_fires_once_per_cycle_not_per_batch() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
         // Simulate three batches before on_write_complete.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("first start");
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("second start — must be no-op");
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("third start — must be no-op");
 
@@ -1405,23 +1384,23 @@ mod write_maintenance_tests {
     /// partway start owns its cleanup — so this has to be self-contained.
     #[tokio::test]
     async fn a_failed_write_start_leaves_no_write_cycle_open() {
-        let failing = MockElasticsearch {
+        let failing = Arc::new(MockElasticsearch {
             fail_put_settings: true,
             ..Default::default()
-        };
+        });
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
-        m.on_write_start(&failing, "my-index")
+        m.on_write_start(&dyn_es(&failing), "my-index", WriteWindow::Append)
             .await
             .expect_err("the override was rejected");
 
         // A second write, against a healthy cluster, must apply the override rather than
         // treat itself as another batch of the abandoned cycle.
-        let healthy = MockElasticsearch::default();
-        m.on_write_start(&healthy, "my-index")
+        let healthy = Arc::new(MockElasticsearch::default());
+        m.on_write_start(&dyn_es(&healthy), "my-index", WriteWindow::Append)
             .await
             .expect("a later write starts a fresh cycle");
 
@@ -1436,17 +1415,19 @@ mod write_maintenance_tests {
     /// `force_merge` must NOT be called when `force_merge_segments` is `None`.
     #[tokio::test]
     async fn write_complete_restores_interval_and_refreshes() {
-        let client = MockElasticsearch {
+        let client = Arc::new(MockElasticsearch {
             refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
             ..Default::default()
-        };
+        });
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
-        m.on_write_start(&client, "my-index").await.expect("start");
-        m.on_write_complete(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
+            .await
+            .expect("start");
+        m.on_write_complete(client.as_ref(), "my-index")
             .await
             .expect("complete");
 
@@ -1471,14 +1452,16 @@ mod write_maintenance_tests {
     /// `on_write_complete` calls `force_merge` with the configured segment count.
     #[tokio::test]
     async fn write_complete_calls_force_merge_when_configured() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: None,
             force_merge_segments: Some(1),
         });
 
-        m.on_write_start(&client, "my-index").await.expect("start");
-        m.on_write_complete(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
+            .await
+            .expect("start");
+        m.on_write_complete(client.as_ref(), "my-index")
             .await
             .expect("complete");
 
@@ -1501,25 +1484,25 @@ mod write_maintenance_tests {
     /// correctly re-applies the refresh_interval override for a subsequent cycle.
     #[tokio::test]
     async fn write_failed_resets_cycle_so_next_start_reapplies_override() {
-        let client = MockElasticsearch {
+        let client = Arc::new(MockElasticsearch {
             refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
             ..Default::default()
-        };
+        });
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: None,
         });
 
         // First write cycle fails.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("start cycle 1");
-        m.on_write_failed(&client, "my-index")
+        m.on_write_failed(client.as_ref(), "my-index")
             .await
             .expect("failed cycle 1");
 
         // Second write cycle — must re-apply the override.
-        m.on_write_start(&client, "my-index")
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
             .await
             .expect("start cycle 2");
 
@@ -1541,13 +1524,13 @@ mod write_maintenance_tests {
     /// The `write_cycle_active` guard prevents spurious maintenance calls.
     #[tokio::test]
     async fn write_complete_without_start_is_noop() {
-        let client = MockElasticsearch::default();
+        let client = Arc::new(MockElasticsearch::default());
         let m = make_maintenance(ElasticsearchIndexWriteOptions {
             refresh_interval_during_write: Some("-1".to_string()),
             force_merge_segments: Some(1),
         });
 
-        m.on_write_complete(&client, "my-index")
+        m.on_write_complete(client.as_ref(), "my-index")
             .await
             .expect("complete without start must be no-op");
 

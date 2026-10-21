@@ -56,8 +56,26 @@ fn rows(ids: impl IntoIterator<Item = i64>, text: &str) -> RecordBatch {
     .expect("valid test batch")
 }
 
+/// Waits for the cluster to answer, so a test started alongside the container does not fail
+/// on its first request.
+async fn wait_for_es(http: &reqwest::Client) {
+    for _ in 0..30 {
+        if let Ok(resp) = http
+            .get(format!("{}/_cluster/health", es_url()))
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    panic!("Elasticsearch not available at {}", es_url());
+}
+
 struct TestIndex {
     http: reqwest::Client,
+    client: Arc<Client>,
     name: String,
     index: ElasticsearchTextIndex,
 }
@@ -65,12 +83,12 @@ struct TestIndex {
 impl TestIndex {
     async fn new(test: &str) -> Self {
         let http = reqwest::Client::new();
+        wait_for_es(&http).await;
         let name = format!("search-12413-{test}-{}", std::process::id());
         let _ = http.delete(format!("{}/{name}", es_url())).send().await;
-        let client: Arc<dyn Elasticsearch> =
-            Arc::new(Client::new(&es_url(), None, None).expect("valid Elasticsearch URL"));
+        let client = Arc::new(Client::new(&es_url(), None, None).expect("valid Elasticsearch URL"));
         let index = ElasticsearchTextIndex {
-            client,
+            client: Arc::clone(&client) as Arc<dyn Elasticsearch>,
             es_index: name.clone(),
             search_column_name: "body".to_string(),
             search_fields: vec!["body".to_string()],
@@ -79,7 +97,12 @@ impl TestIndex {
             batch_write_rows: 500,
             write_maintenance: Arc::new(ElasticsearchIndexWriteMaintenance::default()),
         };
-        Self { http, name, index }
+        Self {
+            http,
+            client,
+            name,
+            index,
+        }
     }
 
     /// Runs one complete write the way the accelerated-table sink does.
@@ -100,30 +123,23 @@ impl TestIndex {
 
     /// Every document `_id` the index holds, after a refresh makes the last write visible.
     async fn ids(&self) -> BTreeSet<i64> {
-        let url = es_url();
-        self.http
-            .post(format!("{url}/{}/_refresh", self.name))
-            .send()
+        self.client
+            .refresh_index(&self.name)
             .await
             .expect("refresh request");
-        let resp: serde_json::Value = self
-            .http
-            .post(format!("{url}/{}/_search", self.name))
-            .json(&serde_json::json!({ "size": 10_000, "_source": false }))
-            .send()
+        let resp = self
+            .client
+            .search_raw(
+                &self.name,
+                &serde_json::json!({ "size": 10_000, "_source": false }),
+            )
             .await
-            .expect("search request")
-            .json()
-            .await
-            .expect("search response");
-        resp["hits"]["hits"]
-            .as_array()
-            .expect("hits array")
+            .expect("search request");
+        resp.hits
+            .hits
             .iter()
             .map(|hit| {
-                hit["_id"]
-                    .as_str()
-                    .expect("string _id")
+                hit.id
                     .parse::<i64>()
                     .expect("integer key renders as its own _id")
             })
@@ -262,6 +278,37 @@ async fn a_document_written_during_the_refresh_by_another_writer_is_kept() {
         t.ids().await,
         BTreeSet::from([1, 3]),
         "row 2 was dropped; row 3 was rewritten after the snapshot and must survive"
+    );
+    t.drop_index().await;
+}
+
+/// The refresh runner drops a superseded refresh mid-write, without `on_write_failed`. The next
+/// full refresh must not reconcile against the abandoned write's snapshot: that snapshot predates
+/// the abandoned write's rows, so a row it rewrote would survive the next refresh dropping it.
+#[tokio::test]
+async fn a_full_refresh_after_a_cancelled_one_removes_the_rows_it_dropped() {
+    let t = TestIndex::new("cancelled").await;
+    t.write(WriteWindow::ReplaceAll, rows([1, 2, 3], "first"))
+        .await;
+
+    // A refresh starts, rewrites row 1, and is dropped before it completes.
+    t.index
+        .on_write_start(WriteWindow::ReplaceAll)
+        .await
+        .expect("on_write_start succeeds");
+    t.index
+        .compute_index(vec![rows([1], "cancelled")])
+        .await
+        .expect("the cancelled refresh's rows land");
+
+    // The next refresh no longer has row 1.
+    t.write(WriteWindow::ReplaceAll, rows([2, 3], "second"))
+        .await;
+
+    assert_eq!(
+        t.ids().await,
+        BTreeSet::from([2, 3]),
+        "row 1 is gone from the source; the cancelled refresh rewriting it must not keep it"
     );
     t.drop_index().await;
 }
