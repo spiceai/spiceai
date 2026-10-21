@@ -517,10 +517,23 @@ impl SpiceObjectStoreRegistry {
             format!("http://{host_and_port}/")
         };
 
-        let mut client_options = ClientOptions::new().with_allow_http(true);
+        // `allow_http` is the operator's setting, carried in the URL fragment
+        // the way the S3 store reads it. The default is HTTPS-only, so reqwest
+        // refuses an `http://` target — including one a redirect `Location`
+        // names. The HTTP connector sets the fragment when the dataset URL
+        // itself is `http://`.
         let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
+        let mut client_options = ClientOptions::new();
+        if let Some(allow_http) = params.get("allow_http") {
+            let as_bool = allow_http.parse::<bool>().map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "{allow_http} is not a valid boolean for allow_http"
+                ))
+            })?;
+            client_options = client_options.with_allow_http(as_bool);
+        }
         if let Some(timeout) = params.get("client_timeout") {
             client_options =
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
@@ -1012,7 +1025,10 @@ mod tests {
         );
         let with_token = |base: &Url| {
             let mut url = base.join("items.csv").expect("valid path");
-            url.set_fragment(Some(&format!("{}={token}", http_auth::FRAGMENT_KEY)));
+            url.set_fragment(Some(&format!(
+                "allow_http=true&{}={token}",
+                http_auth::FRAGMENT_KEY
+            )));
             url
         };
 
@@ -1035,12 +1051,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_store_without_allow_http_does_not_connect() {
+        use object_store::ObjectStoreExt;
+
+        let (origin, seen) = header_recording_server().await;
+        let url = origin.join("items.csv").expect("valid path");
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&url)
+            .expect("the registry builds an HTTP store");
+        let err = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("plaintext is refused without allow_http")
+            .to_string();
+        assert!(
+            seen.lock().expect("not poisoned").is_empty(),
+            "the store fetched {url} without allow_http: {err}"
+        );
+        assert!(
+            err.contains("builder error") || err.to_ascii_lowercase().contains("scheme"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_redirect_is_followed_only_when_allow_http_is_set() {
+        use axum::{Router, body::Body, extract::State, http::Request, response::Response};
+        use object_store::ObjectStoreExt;
+
+        async fn record(
+            State(seen): State<Arc<Mutex<Vec<String>>>>,
+            request: Request<Body>,
+        ) -> Response<Body> {
+            seen.lock()
+                .expect("the request log is not poisoned")
+                .push(request.uri().path().to_string());
+            Response::builder()
+                .status(404)
+                .body(Body::empty())
+                .expect("a 404 response builds")
+        }
+
+        let target_seen = Arc::new(Mutex::new(Vec::new()));
+        let target = Router::new()
+            .fallback(axum::routing::any(record))
+            .with_state(Arc::clone(&target_seen));
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the redirect target binds");
+        let target_addr = target_listener
+            .local_addr()
+            .expect("the redirect target has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(target_listener, target).await;
+        });
+
+        let origin_seen = Arc::new(Mutex::new(Vec::new()));
+        let location = format!("http://{target_addr}/secret");
+        let origin = Router::new()
+            .fallback(axum::routing::any(
+                move |State(seen): State<Arc<Mutex<Vec<String>>>>, request: Request<Body>| {
+                    let location = location.clone();
+                    async move {
+                        seen.lock()
+                            .expect("the request log is not poisoned")
+                            .push(request.uri().path().to_string());
+                        Response::builder()
+                            .status(302)
+                            .header("location", location)
+                            .body(Body::empty())
+                            .expect("a redirect response builds")
+                    }
+                },
+            ))
+            .with_state(Arc::clone(&origin_seen));
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the redirect origin binds");
+        let origin_addr = origin_listener
+            .local_addr()
+            .expect("the redirect origin has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(origin_listener, origin).await;
+        });
+
+        let mut blocked =
+            Url::parse(&format!("http://{origin_addr}/items.csv")).expect("valid URL");
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&blocked)
+            .expect("the registry builds an HTTP store");
+        let blocked_err = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("plaintext is refused")
+            .to_string();
+        assert!(
+            origin_seen.lock().expect("not poisoned").is_empty(),
+            "refused store still connected: {blocked_err}"
+        );
+        assert!(
+            target_seen.lock().expect("not poisoned").is_empty(),
+            "refused store followed the redirect: {blocked_err}"
+        );
+
+        blocked.set_fragment(Some("allow_http=true"));
+        let store = SpiceObjectStoreRegistry::new(Handle::current())
+            .get_store(&blocked)
+            .expect("allow_http builds an HTTP store");
+        let _ = store
+            .head(&object_store::path::Path::from("items.csv"))
+            .await
+            .expect_err("the redirect target answers 404");
+        assert_eq!(
+            origin_seen.lock().expect("not poisoned").as_slice(),
+            ["/items.csv"]
+        );
+        assert_eq!(
+            target_seen.lock().expect("not poisoned").as_slice(),
+            ["/secret"],
+            "allow_http follows an http redirect"
+        );
+    }
+
+    #[tokio::test]
     async fn http_store_errors_do_not_show_url_user_information() {
         let (origin, seen) = header_recording_server().await;
         let mut url = origin.join("items.csv").expect("valid path");
         url.set_username("url_user").expect("http URL takes a user");
         url.set_password(Some("url-pass"))
             .expect("http URL takes a password");
+        url.set_fragment(Some("allow_http=true"));
 
         let error = head_through_registry(&url).await;
 
