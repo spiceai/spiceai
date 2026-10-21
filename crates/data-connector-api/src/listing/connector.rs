@@ -2542,21 +2542,60 @@ async fn probe_column_count(
 /// `Schema::try_merge`. One value is enough to refuse a single wide record before
 /// that merge; a later record that widens the union is still refused once the
 /// schema is resolved.
+///
+/// The object is read as a stream, decompressed as those bytes arrive, and the
+/// read stops once the first value is complete. Buffering the whole object would
+/// pull every later record just to count the keys of the first one.
 async fn probe_json_column_count(
     store: &Arc<dyn ObjectStore>,
     object: &ObjectMeta,
     compression: Option<FileCompressionType>,
 ) -> Option<usize> {
-    let bytes = store.get(&object.location).await.ok()?.bytes().await.ok()?;
+    let stream = store
+        .get(&object.location)
+        .await
+        .ok()?
+        .into_stream()
+        .map_err(|err| DataFusionError::ObjectStore(Box::new(err)));
     let compression = compression.unwrap_or(FileCompressionType::UNCOMPRESSED);
-    let mut reader = compression.convert_read(std::io::Cursor::new(bytes)).ok()?;
-    // `from_reader` rejects trailing bytes, so a second JSONL record would skip
-    // this probe. Take the first value and leave the rest unread.
-    let value = serde_json::Deserializer::from_reader(&mut reader)
+    let mut stream = compression.convert_stream(stream.boxed()).ok()?;
+    let mut buffered = Vec::new();
+    loop {
+        match classify_json_prefix(&buffered) {
+            JsonPrefix::Done(width) => return width,
+            JsonPrefix::Invalid => return None,
+            JsonPrefix::NeedMore => {}
+        }
+        match stream.next().await {
+            Some(Ok(chunk)) if !chunk.is_empty() => buffered.extend_from_slice(&chunk),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return None,
+        }
+    }
+}
+
+enum JsonPrefix {
+    NeedMore,
+    Invalid,
+    Done(Option<usize>),
+}
+
+/// `NeedMore` while `bytes` is only a prefix of a JSON value. A complete first
+/// value is `Done`, and trailing bytes after that value are ignored so a second
+/// JSONL record does not fail the probe.
+fn classify_json_prefix(bytes: &[u8]) -> JsonPrefix {
+    if bytes.is_empty() {
+        return JsonPrefix::NeedMore;
+    }
+    match serde_json::Deserializer::from_slice(bytes)
         .into_iter::<serde_json::Value>()
-        .next()?
-        .ok()?;
-    json_value_width(&value)
+        .next()
+    {
+        Some(Ok(value)) => JsonPrefix::Done(json_value_width(&value)),
+        Some(Err(err)) if err.is_eof() => JsonPrefix::NeedMore,
+        Some(Err(_)) => JsonPrefix::Invalid,
+        None => JsonPrefix::NeedMore,
+    }
 }
 
 fn json_value_width(value: &serde_json::Value) -> Option<usize> {
@@ -2768,6 +2807,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, RecordBatch};
+    use bytes::Bytes;
     use chrono::{TimeZone, Utc};
     use datafusion::common::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
@@ -2776,6 +2816,7 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::runtime::Handle;
     use url::Url;
 
@@ -2991,6 +3032,151 @@ mod tests {
                 .expect("a file at the column limit must still resolve");
             assert_eq!(inferred, columns, "{file_format}");
         }
+    }
+
+    /// Yields each chunk only when the consumer polls, and counts bytes yielded.
+    #[derive(Debug)]
+    struct ChunkedJsonStore {
+        chunks: Arc<Vec<Bytes>>,
+        delivered: Arc<AtomicUsize>,
+        meta: ObjectMeta,
+    }
+
+    impl std::fmt::Display for ChunkedJsonStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ChunkedJsonStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ChunkedJsonStore {
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            stream::iter(std::iter::empty()).boxed()
+        }
+
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: object_store::PutPayload,
+            _opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn get_opts(
+            &self,
+            _location: &Path,
+            _options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let chunks = Arc::clone(&self.chunks);
+            let delivered = Arc::clone(&self.delivered);
+            let cursor = Arc::new(AtomicUsize::new(0));
+            let payload = futures::stream::unfold(
+                (chunks, delivered, cursor),
+                |(chunks, delivered, cursor)| async move {
+                    let index = cursor.fetch_add(1, Ordering::SeqCst);
+                    let chunk = chunks.get(index).cloned()?;
+                    delivered.fetch_add(chunk.len(), Ordering::SeqCst);
+                    Some((
+                        Ok::<Bytes, object_store::Error>(chunk),
+                        (chunks, delivered, cursor),
+                    ))
+                },
+            )
+            .boxed();
+            let size = self.chunks.iter().map(chunk_len_u64).sum();
+            Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(payload),
+                attributes: object_store::Attributes::default(),
+                range: 0..size,
+                meta: self.meta.clone(),
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            unimplemented!()
+        }
+
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    fn chunk_len_u64(chunk: &Bytes) -> u64 {
+        u64::try_from(chunk.len()).expect("a probe chunk fits in u64")
+    }
+
+    #[tokio::test]
+    async fn jsonl_width_probe_stops_after_the_first_value() {
+        let first = r#"{"k0":1,"k1":2}"#;
+        let mut tail = String::from("\n{\"pad\":\"");
+        tail.push_str(&"x".repeat(64 * 1024));
+        tail.push_str("\"}\n");
+        let tail = Bytes::from(tail);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let chunks = Arc::new(vec![Bytes::from(first), tail.clone()]);
+        let meta = create_meta("wide.jsonl", 0, chunks.iter().map(chunk_len_u64).sum());
+        let store: Arc<dyn ObjectStore> = Arc::new(ChunkedJsonStore {
+            meta: meta.clone(),
+            chunks: Arc::clone(&chunks),
+            delivered: Arc::clone(&delivered),
+        });
+        let width = probe_json_column_count(&store, &meta, None).await;
+        assert_eq!(width, Some(2));
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            first.len(),
+            "the probe must not pull the chunk after the first JSON value"
+        );
+
+        // The same stop applies when the first value itself arrives in pieces.
+        let head = "{\"k0\":1,\"";
+        let rest = "k1\":2}";
+        let split_delivered = Arc::new(AtomicUsize::new(0));
+        let split_chunks = Arc::new(vec![Bytes::from(head), Bytes::from(rest), tail]);
+        let split_meta = create_meta(
+            "split.jsonl",
+            0,
+            split_chunks.iter().map(chunk_len_u64).sum(),
+        );
+        let split_store: Arc<dyn ObjectStore> = Arc::new(ChunkedJsonStore {
+            meta: split_meta.clone(),
+            chunks: Arc::clone(&split_chunks),
+            delivered: Arc::clone(&split_delivered),
+        });
+        let split_width = probe_json_column_count(&split_store, &split_meta, None).await;
+        assert_eq!(split_width, Some(2));
+        assert_eq!(
+            split_delivered.load(Ordering::SeqCst),
+            head.len() + rest.len(),
+            "a value split across chunks must not pull the record after it"
+        );
     }
 
     #[tokio::test]
