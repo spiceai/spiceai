@@ -20,6 +20,11 @@ limitations under the License.
 //! The mock's model writes [`PREAMBLE`] and calls the `sql` tool, then answers with [`ANSWER`]
 //! once it has the tool result.
 
+#![expect(
+    clippy::expect_used,
+    reason = "set-up and helpers outside `#[test]` functions fail fast with `expect`"
+)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -1580,7 +1580,6 @@ async fn counts_the_polls_that_cannot_advance_to_the_published_snapshot() -> Res
         .await
 }
 
-#[expect(clippy::float_cmp)] // counters are whole numbers
 async fn metrics_scenario(
     rustfs: Rustfs,
     container: &RunningContainer,

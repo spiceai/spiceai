@@ -677,7 +677,8 @@ fn report(_cc: &crash_handler::CrashContext) {
     flush(&buf, position);
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     /// Set in the child process to select the crashing role.
     const CHILD: &str = "SPICED_CRASH_HANDLER_TEST_CHILD";

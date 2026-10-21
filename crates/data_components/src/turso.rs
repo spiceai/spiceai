@@ -575,7 +575,6 @@ impl TursoTableProvider {
     /// several columns of the same type to guess. It is user-chosen, so every message escapes
     /// it: a name carrying a newline must not break a message that has to stay on one line.
     #[expect(
-        clippy::too_many_lines,
         clippy::match_same_arms,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation
