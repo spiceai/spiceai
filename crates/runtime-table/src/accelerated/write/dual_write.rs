@@ -17,10 +17,10 @@ limitations under the License.
 //! Dual-write execution path for [`WriteMode::DualWrite`].
 //!
 //! Writes are applied simultaneously to the Cayenne accelerator (via staged
-//! append) and the federated source. On success both sides commit; on
-//! failure the accelerator stage is rolled back and the error is surfaced
-//! synchronously. Supports both non-partitioned and partitioned Cayenne
-//! accelerators.
+//! append) and the federated source. On success the source commits, then the
+//! accelerator; a write that fails or stops before the source commits commits
+//! neither, and the error is surfaced synchronously. Supports both
+//! non-partitioned and partitioned Cayenne accelerators.
 //!
 //! This path is reserved for the Iceberg federated catalog cache use case
 //! where Cayenne acts as a write-through cache in front of an Iceberg catalog
@@ -53,9 +53,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedMutexGuard, mpsc};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::accelerated::refresh;
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
@@ -189,80 +188,175 @@ impl DataSink for DualWriteDataSink {
             target_partitions,
         );
 
-        // `upstream_error` captures real upstream failures (`data.next()` yielding `Err`).
-        // `channels_closed_early` records the *symptom* of a downstream task aborting
-        // (its receiver got dropped). The real cause then lives in `staged_result` /
-        // `source_result`; using the channel-close sentinel here would mask it.
-        let mut upstream_error: Option<DataFusionError> = None;
-        let mut channels_closed_early = false;
-
+        let mut input_end = InputEnd::Complete;
         while let Some(batch_result) = data.next().await {
             match batch_result {
                 Ok(batch) => {
-                    if source_tx.send(Ok(batch.clone())).await.is_err()
-                        || accelerator_tx.send(Ok(batch)).await.is_err()
+                    if source_tx
+                        .send(PathMessage::Batch(Ok(batch.clone())))
+                        .await
+                        .is_err()
                     {
-                        channels_closed_early = true;
+                        input_end = InputEnd::SourceClosed;
+                        break;
+                    }
+                    if accelerator_tx
+                        .send(PathMessage::Batch(Ok(batch)))
+                        .await
+                        .is_err()
+                    {
+                        input_end = InputEnd::AcceleratorClosed;
                         break;
                     }
                 }
                 Err(error) => {
                     let message = error.to_string();
                     let _ = source_tx
-                        .send(Err(DataFusionError::Execution(message.clone())))
+                        .send(PathMessage::Batch(Err(DataFusionError::Execution(
+                            message.clone(),
+                        ))))
                         .await;
                     let _ = accelerator_tx
-                        .send(Err(DataFusionError::Execution(message.clone())))
+                        .send(PathMessage::Batch(Err(DataFusionError::Execution(
+                            message.clone(),
+                        ))))
                         .await;
-                    upstream_error = Some(DataFusionError::Execution(message));
+                    input_end = InputEnd::Failed(DataFusionError::Execution(message));
                     break;
                 }
             }
         }
 
-        drop(source_tx);
+        if !matches!(input_end, InputEnd::Failed(_)) {
+            let _ = accelerator_tx.send(PathMessage::End).await;
+        }
         drop(accelerator_tx);
+        let staged = join_staged_task(staged_task).await.map(StagedAppends::from);
 
-        let staged_result = join_staged_task(staged_task).await;
-        let source_result = join_source_task(source_task).await;
+        complete_dual_write(
+            input_end,
+            staged,
+            source_tx,
+            source_task,
+            None,
+            Arc::clone(&self.refresher),
+        )
+        .await
+    }
+}
 
-        match (staged_result, source_result, upstream_error) {
-            (Ok(staged), Ok(()), None) => {
-                if channels_closed_early {
+/// What a dual write sends to each of its write paths.
+enum PathMessage {
+    Batch(datafusion::common::Result<RecordBatch>),
+    /// Ends the path's input. A path whose sender is dropped before this message fails instead
+    /// of ending, so a dual write that stops early cannot commit what it already passed on.
+    /// The source's input is ended only once the accelerator has staged the whole input; the
+    /// accelerator's is ended unless the input failed, since a staged append commits only when
+    /// told to.
+    End,
+}
+
+/// The input of one write path: the batches sent to it, until [`PathMessage::End`].
+fn path_input(
+    schema: SchemaRef,
+    receiver: mpsc::Receiver<PathMessage>,
+) -> SendableRecordBatchStream {
+    let batches = futures::stream::unfold(Some(receiver), |receiver| async move {
+        let mut receiver = receiver?;
+        match receiver.recv().await {
+            Some(PathMessage::Batch(batch)) => {
+                let next = batch.is_ok().then_some(receiver);
+                Some((batch, next))
+            }
+            Some(PathMessage::End) => None,
+            None => Some((
+                Err(DataFusionError::Execution(
+                    "The dual write stopped before its input was complete".to_string(),
+                )),
+                None,
+            )),
+        }
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, batches))
+}
+
+/// How the input loop of a dual write ended.
+enum InputEnd {
+    /// Every batch reached both write paths.
+    Complete,
+    /// The input failed.
+    Failed(DataFusionError),
+    /// The source stopped taking batches; its error is the cause.
+    SourceClosed,
+    /// The accelerator stopped taking batches; its error is the cause.
+    AcceleratorClosed,
+}
+
+/// Completes a dual write after its input loop.
+///
+/// The source commits when its input ends, so it is told the input is complete only after the
+/// accelerator has staged all of it, and the accelerator commits after the source. From that
+/// point both commits run in a task of their own, so a caller that stops waiting cannot separate
+/// them. Otherwise neither path commits: the source's input fails and the staged rows are rolled
+/// back.
+async fn complete_dual_write(
+    input_end: InputEnd,
+    staged: datafusion::common::Result<StagedAppends>,
+    source_tx: mpsc::Sender<PathMessage>,
+    source_task: JoinHandle<datafusion::common::Result<()>>,
+    write_coordinator: Option<OwnedMutexGuard<()>>,
+    refresher: Arc<refresh::Refresher>,
+) -> datafusion::common::Result<u64> {
+    let staged = match (input_end, staged) {
+        (InputEnd::Complete, Ok(staged)) => staged,
+        (input_end, staged) => {
+            drop(source_tx);
+            let source_result = join_source_task(source_task).await;
+            let staged_error = match staged {
+                Ok(staged) => {
                     if let Err(error) = staged.rollback().await {
                         tracing::error!("Failed to roll back staged Cayenne write: {error}");
                     }
-                    return Err(DataFusionError::Execution(
-                        "Dual-write insert stream terminated before both write paths completed"
-                            .to_string(),
-                    ));
+                    None
                 }
-                let row_count = staged.commit().await?;
-                self.refresher.set_initial_load_completed(true);
-                Ok(row_count)
-            }
-            (Ok(staged), source_result, upstream_error) => {
-                if let Err(error) = staged.rollback().await {
-                    tracing::error!("Failed to roll back staged Cayenne write: {error}");
+                Err(error) => Some(error),
+            };
+            let cause = match input_end {
+                InputEnd::Failed(error) => Some(error),
+                InputEnd::SourceClosed => source_result.err().or(staged_error),
+                InputEnd::Complete | InputEnd::AcceleratorClosed => {
+                    staged_error.or(source_result.err())
                 }
-
-                if let Some(error) = upstream_error {
-                    return Err(error);
-                }
-
-                match source_result {
-                    Ok(()) => Err(DataFusionError::Execution(
-                        "Cayenne staged write failed before commit".to_string(),
-                    )),
-                    Err(error) => Err(error),
-                }
-            }
-            (Err(staged_error), Ok(()), _) => Err(staged_error),
-            (Err(staged_error), Err(source_error), _) => Err(DataFusionError::Execution(format!(
-                "Dual-write insert failed for both accelerator and federated source: accelerator={staged_error}; source={source_error}"
-            ))),
+            };
+            return Err(cause.unwrap_or_else(|| {
+                DataFusionError::Execution(
+                    "Dual-write insert stream terminated before both write paths completed"
+                        .to_string(),
+                )
+            }));
         }
-    }
+    };
+
+    tokio::spawn(async move {
+        let _write_coordinator = write_coordinator;
+        let _ = source_tx.send(PathMessage::End).await;
+        drop(source_tx);
+        if let Err(error) = join_source_task(source_task).await {
+            if let Err(rollback_error) = staged.rollback().await {
+                tracing::error!("Failed to roll back staged Cayenne write: {rollback_error}");
+            }
+            return Err(error);
+        }
+        let committed = staged.commit().await;
+        if committed.is_ok() {
+            refresher.set_initial_load_completed(true);
+        }
+        committed
+    })
+    .await
+    .map_err(|error| {
+        DataFusionError::Execution(format!("Dual-write commit task failed: {error}"))
+    })?
 }
 
 async fn write_all_with_partitioned_cayenne(
@@ -285,7 +379,7 @@ async fn write_all_with_partitioned_cayenne(
     // input reaches them. Holding the table's write coordinator for the whole
     // write keeps this from taking those locks in the opposite order to a
     // concurrent refresh, append, or dual write on the same table.
-    let _write_coordinator = partitioned.write_coordinator().lock_owned().await;
+    let write_coordinator = partitioned.write_coordinator().lock_owned().await;
 
     let schema = data.schema();
     let physical_exprs = create_partition_physical_exprs(partitioned, Arc::clone(&schema))?;
@@ -293,13 +387,8 @@ async fn write_all_with_partitioned_cayenne(
     let source_task =
         spawn_federated_insert(Arc::clone(&federated), Arc::clone(&schema), source_rx);
 
-    // See note in the non-partitioned path. `upstream_error` is for real upstream
-    // failures; `channels_closed_early` is the downstream-abort symptom and must not
-    // mask the underlying `staged_error` / `source_error`.
-    let mut upstream_error: Option<DataFusionError> = None;
-    let mut channels_closed_early = false;
-    let mut partition_senders =
-        HashMap::<String, mpsc::Sender<datafusion::common::Result<RecordBatch>>>::new();
+    let mut input_end = InputEnd::Complete;
+    let mut partition_senders = HashMap::<String, mpsc::Sender<PathMessage>>::new();
     let mut partition_handles = Vec::new();
 
     while let Some(batch_result) = data.next().await {
@@ -332,81 +421,62 @@ async fn write_all_with_partitioned_cayenne(
                         partition_tx
                     };
 
-                    if sender.send(Ok(partition_batch)).await.is_err() {
-                        channels_closed_early = true;
+                    if sender
+                        .send(PathMessage::Batch(Ok(partition_batch)))
+                        .await
+                        .is_err()
+                    {
+                        input_end = InputEnd::AcceleratorClosed;
                         break;
                     }
                 }
 
-                if channels_closed_early {
+                if !matches!(input_end, InputEnd::Complete) {
                     break;
                 }
 
-                if source_tx.send(Ok(batch)).await.is_err() {
-                    channels_closed_early = true;
+                if source_tx.send(PathMessage::Batch(Ok(batch))).await.is_err() {
+                    input_end = InputEnd::SourceClosed;
                     break;
                 }
             }
             Err(error) => {
                 let message = error.to_string();
                 let _ = source_tx
-                    .send(Err(DataFusionError::Execution(message.clone())))
+                    .send(PathMessage::Batch(Err(DataFusionError::Execution(
+                        message.clone(),
+                    ))))
                     .await;
                 for sender in partition_senders.values() {
                     let _ = sender
-                        .send(Err(DataFusionError::Execution(message.clone())))
+                        .send(PathMessage::Batch(Err(DataFusionError::Execution(
+                            message.clone(),
+                        ))))
                         .await;
                 }
-                upstream_error = Some(DataFusionError::Execution(message));
+                input_end = InputEnd::Failed(DataFusionError::Execution(message));
                 break;
             }
         }
     }
 
-    drop(source_tx);
-    drop(partition_senders);
-
-    let staged_result = join_partitioned_staged_tasks(partition_handles).await;
-    let source_result = join_source_task(source_task).await;
-
-    match (staged_result, source_result, upstream_error) {
-        (Ok(staged), Ok(()), None) => {
-            if channels_closed_early {
-                if let Err(error) = staged.rollback().await {
-                    tracing::error!(
-                        "Failed to roll back staged partitioned Cayenne write: {error}"
-                    );
-                }
-                return Err(DataFusionError::Execution(
-                    "Dual-write partitioned insert stream terminated before both write paths completed"
-                        .to_string(),
-                ));
-            }
-            let row_count = staged.commit().await?;
-            refresher.set_initial_load_completed(true);
-            Ok(row_count)
+    if !matches!(input_end, InputEnd::Failed(_)) {
+        for sender in partition_senders.values() {
+            let _ = sender.send(PathMessage::End).await;
         }
-        (Ok(staged), source_result, upstream_error) => {
-            if let Err(error) = staged.rollback().await {
-                tracing::error!("Failed to roll back staged partitioned Cayenne write: {error}");
-            }
-
-            if let Some(error) = upstream_error {
-                return Err(error);
-            }
-
-            match source_result {
-                Ok(()) => Err(DataFusionError::Execution(
-                    "Partitioned Cayenne staged write failed before commit".to_string(),
-                )),
-                Err(error) => Err(error),
-            }
-        }
-        (Err(staged_error), Ok(()), _) => Err(staged_error),
-        (Err(staged_error), Err(source_error), _) => Err(DataFusionError::Execution(format!(
-            "Dual-write insert failed for both partitioned accelerator and federated source: accelerator={staged_error}; source={source_error}"
-        ))),
     }
+    drop(partition_senders);
+    let staged = join_partitioned_staged_tasks(partition_handles).await;
+
+    complete_dual_write(
+        input_end,
+        staged,
+        source_tx,
+        source_task,
+        Some(write_coordinator),
+        refresher,
+    )
+    .await
 }
 
 /// Attempts to downcast a partition provider to [`CayenneTableProvider`].
@@ -417,13 +487,14 @@ fn downcast_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTabl
 fn spawn_federated_insert(
     federated: Arc<dyn TableProvider>,
     schema: SchemaRef,
-    receiver: mpsc::Receiver<datafusion::common::Result<arrow::record_batch::RecordBatch>>,
+    receiver: mpsc::Receiver<PathMessage>,
 ) -> JoinHandle<datafusion::common::Result<()>> {
     tokio::spawn(async move {
         let ctx = util::session_state::session_context();
-        let stream = RecordBatchStreamAdapter::new(schema, ReceiverStream::new(receiver));
         let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
-            Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(stream))),
+            Arc::new(StreamingDataUpdateExecutionPlan::new(path_input(
+                schema, receiver,
+            ))),
             federated.schema(),
         ));
 
@@ -435,21 +506,32 @@ fn spawn_federated_insert(
     })
 }
 
-struct PartitionedCayenneStagedAppend {
+/// The staged appends of one dual write: one for a table, one per partition for a partitioned
+/// table.
+struct StagedAppends {
     staged_appends: Vec<CayenneStagedAppend>,
     row_count: u64,
 }
 
-impl std::fmt::Debug for PartitionedCayenneStagedAppend {
+impl std::fmt::Debug for StagedAppends {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PartitionedCayenneStagedAppend")
+        f.debug_struct("StagedAppends")
             .field("staged_appends", &self.staged_appends.len())
             .field("row_count", &self.row_count)
             .finish()
     }
 }
 
-impl PartitionedCayenneStagedAppend {
+impl From<CayenneStagedAppend> for StagedAppends {
+    fn from(staged_append: CayenneStagedAppend) -> Self {
+        Self {
+            row_count: staged_append.row_count(),
+            staged_appends: vec![staged_append],
+        }
+    }
+}
+
+impl StagedAppends {
     async fn commit(self) -> datafusion::common::Result<u64> {
         for staged_append in self.staged_appends {
             staged_append
@@ -460,14 +542,17 @@ impl PartitionedCayenneStagedAppend {
         Ok(self.row_count)
     }
 
+    /// Rolls back every staged append, even after one fails, and returns the first failure.
     async fn rollback(self) -> datafusion::common::Result<()> {
+        let mut failure = None;
         for staged_append in self.staged_appends {
-            staged_append
-                .rollback()
-                .await
-                .map_err(DataFusionError::from)?;
+            if let Err(error) = staged_append.rollback().await
+                && failure.is_none()
+            {
+                failure = Some(DataFusionError::from(error));
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -491,22 +576,40 @@ fn create_partition_physical_exprs(
         .collect()
 }
 
+/// Joins every partition's staging task. If any failed, the rows the others staged are rolled
+/// back and the first failure, in partition order, is returned.
 async fn join_partitioned_staged_tasks(
     handles: Vec<JoinHandle<datafusion::common::Result<CayenneStagedAppend>>>,
-) -> datafusion::common::Result<PartitionedCayenneStagedAppend> {
+) -> datafusion::common::Result<StagedAppends> {
     let mut staged_appends = Vec::with_capacity(handles.len());
     let mut row_count = 0_u64;
+    let mut failure = None;
 
     for handle in handles {
-        let staged_append = join_staged_task(handle).await?;
-        row_count += staged_append.row_count();
-        staged_appends.push(staged_append);
+        match join_staged_task(handle).await {
+            Ok(staged_append) => {
+                row_count += staged_append.row_count();
+                staged_appends.push(staged_append);
+            }
+            Err(error) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+        }
     }
 
-    Ok(PartitionedCayenneStagedAppend {
+    let staged = StagedAppends {
         staged_appends,
         row_count,
-    })
+    };
+    let Some(failure) = failure else {
+        return Ok(staged);
+    };
+    if let Err(error) = staged.rollback().await {
+        tracing::error!("Failed to roll back staged Cayenne write: {error}");
+    }
+    Err(failure)
 }
 
 pub fn extract_cayenne_write_target(
@@ -582,13 +685,12 @@ pub async fn quiesce_cayenne_maintenance(table_provider: &Arc<dyn TableProvider>
 fn spawn_staged_append(
     accelerator: CayenneTableProvider,
     schema: SchemaRef,
-    receiver: mpsc::Receiver<datafusion::common::Result<arrow::record_batch::RecordBatch>>,
+    receiver: mpsc::Receiver<PathMessage>,
     target_partitions: usize,
 ) -> JoinHandle<datafusion::common::Result<CayenneStagedAppend>> {
     tokio::spawn(async move {
-        let stream = RecordBatchStreamAdapter::new(schema, ReceiverStream::new(receiver));
         accelerator
-            .begin_staged_append(Box::pin(stream), target_partitions)
+            .begin_staged_append(path_input(schema, receiver), target_partitions)
             .await
             .map_err(Into::into)
     })
@@ -969,133 +1071,27 @@ mod tests {
     async fn partitioned_dual_write_serializes_with_other_multi_partition_writers() {
         use std::time::Duration;
 
-        use arrow::array::{Int64Array, StringArray};
-        use cayenne::metadata::{CreateTableOptions, VortexConfig};
-        use cayenne::{
-            CayenneCatalog, CayennePartitionCreator, CayenneTableProvider, MetadataCatalog,
-        };
         use datafusion::catalog::TableProvider;
-        use datafusion::common::TableReference;
         use datafusion::datasource::MemTable;
-        use datafusion::logical_expr::col;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-        use datafusion::scalar::ScalarValue;
-        use datafusion_table_providers::UnsupportedTypeAction;
-        use runtime_component::dataset::acceleration::RefreshMode;
-        use runtime_table_partition::expression::PartitionedBy;
-        use runtime_table_partition::provider::PartitionTableProvider;
-        use tokio::sync::{Mutex, RwLock, mpsc};
-        use tokio_stream::wrappers::ReceiverStream;
 
-        use crate::accelerated::refresh::{Refresh, Refresher};
-        use crate::federated::FederatedTable;
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("k", DataType::Utf8, false),
-        ]));
-        let rows = |ids: Vec<i64>, key: &str| {
-            let keys = vec![key; ids.len()];
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(ids)),
-                    Arc::new(StringArray::from(keys)),
-                ],
-            )
-            .expect("rows match the schema")
-        };
+        let events = fixture::Events::new(Vec::new()).await;
+        let partitioned = &events.partitioned;
         let nothing = || -> SendableRecordBatchStream {
             Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&schema),
+                Arc::clone(&events.schema),
                 futures::stream::empty(),
             ))
         };
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let catalog = Arc::new(
-            CayenneCatalog::new(format!(
-                "sqlite://{}",
-                dir.path().join("cayenne.db").display()
-            ))
-            .expect("catalog"),
-        );
-        catalog.init().await.expect("catalog initializes");
-        let data_path = dir.path().join("data");
-        std::fs::create_dir_all(&data_path).expect("data dir");
-        let table_id = catalog
-            .create_table(CreateTableOptions {
-                table_name: "events".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: Vec::new(),
-                on_conflict: None,
-                base_path: data_path.display().to_string(),
-                partition_column: Some("k".to_string()),
-                vortex_config: VortexConfig::default(),
-            })
-            .await
-            .expect("partitioned table registers");
-        let partition_by = vec![PartitionedBy {
-            name: "k".to_string(),
-            expression: col("k"),
-        }];
-        let creator = Arc::new(
-            CayennePartitionCreator::new(
-                "events".to_string(),
-                data_path,
-                partition_by.clone(),
-                Arc::clone(&schema),
-                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
-                table_id,
-                UnsupportedTypeAction::Error,
-                Vec::new(),
-                None,
-                VortexConfig::default(),
-                None,
-                Vec::new(),
-                None,
-                SessionContext::new().runtime_env(),
-            )
-            .with_direct_partition_writes(),
-        );
-        let partitioned = Arc::new(
-            PartitionTableProvider::new(creator, partition_by, Arc::clone(&schema))
-                .await
-                .expect("partitioned provider"),
-        );
-        let partition = |key: &str| {
-            let partitioned = Arc::clone(&partitioned);
-            let key = key.to_string();
-            async move {
-                partitioned
-                    .get_or_create_partition_provider(vec![ScalarValue::Utf8(Some(key))])
-                    .await
-                    .expect("partition")
-                    .downcast_ref::<CayenneTableProvider>()
-                    .expect("a Cayenne partition")
-                    .clone_for_write_operations()
-            }
-        };
-
         let federated = Arc::new(
-            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated table"),
+            MemTable::try_new(Arc::clone(&events.schema), vec![vec![]]).expect("federated table"),
         ) as Arc<dyn TableProvider>;
-        let refresher = Arc::new(Refresher::new(
-            runtime_status::RuntimeStatus::new(),
-            TableReference::bare("events"),
-            Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated))),
-            None,
-            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
-            Arc::clone(&partitioned) as Arc<dyn TableProvider>,
-            None,
-            None,
-            tokio::runtime::Handle::current(),
-            Arc::new(Mutex::new(())),
-        ));
 
         // Another multi-partition writer holds the coordinator and has staged `a`.
         let coordinator = partitioned.write_coordinator().lock_owned().await;
-        let staged_a = partition("a")
+        let staged_a = events
+            .partition("a")
             .await
             .begin_overwrite(nothing(), 1)
             .await
@@ -1109,17 +1105,10 @@ mod tests {
         let idle_holders = Arc::strong_count(&coordinator_handle);
 
         // The dual write would reach `b` first, then `a`.
-        let (input, input_rx) = mpsc::channel(4);
-        let dual_write = tokio::spawn(super::write_all_with_partitioned_cayenne(
-            refresher,
-            Arc::clone(&partitioned) as Arc<dyn TableProvider>,
-            Arc::clone(&federated),
-            Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&schema),
-                ReceiverStream::new(input_rx),
-            )),
-            1,
-        ));
+        let (input, data) = events.input(4);
+        let dual_write = events
+            .spawn_dual_write(fixture::Shape::Partitioned, federated, data)
+            .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&coordinator_handle) == idle_holders {
             assert!(
@@ -1133,11 +1122,11 @@ mod tests {
         // Parked on the coordinator it reads none of its input, so it cannot take
         // `b` whatever order the input reaches the partitions in.
         input
-            .send(Ok(rows(vec![1, 2], "b")))
+            .send(Ok(events.rows(vec![1, 2], "b")))
             .await
             .expect("the dual write accepts input");
         input
-            .send(Ok(rows(vec![3], "a")))
+            .send(Ok(events.rows(vec![3], "a")))
             .await
             .expect("the dual write accepts input");
         assert_eq!(
@@ -1146,7 +1135,7 @@ mod tests {
             "a dual write parked on the coordinator must not have read its input"
         );
 
-        let b = partition("b").await;
+        let b = events.partition("b").await;
         let staged_b =
             tokio::time::timeout(Duration::from_secs(10), b.begin_overwrite(nothing(), 1))
                 .await
@@ -1163,5 +1152,513 @@ mod tests {
             .expect("the dual write task joins")
             .expect("the dual write succeeds");
         assert_eq!(written, 3);
+    }
+
+    /// A dual write that is dropped partway, as when its client disconnects or a `DoPut` times
+    /// out, commits neither path: the source's input fails instead of ending, so the source
+    /// cannot commit the batches it already received.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dual_write_dropped_partway_commits_neither_path() {
+        use std::time::Duration;
+
+        for shape in [fixture::Shape::Table, fixture::Shape::Partitioned] {
+            let events = fixture::Events::new(Vec::new()).await;
+            let (federated, mut inserts) = fixture::RecordingTable::create(&events.schema);
+            let (input, data) = events.input(1);
+            let dual_write = events.spawn_dual_write(shape, federated, data).await;
+
+            // The input holds one batch, so the third send returns only after the dual write
+            // has passed the first batch to both paths.
+            for id in 1..=3 {
+                input
+                    .send(Ok(events.rows(vec![id], "a")))
+                    .await
+                    .expect("the dual write takes its input");
+            }
+            dual_write.abort();
+            let cancelled = matches!(dual_write.await, Err(error) if error.is_cancelled());
+            assert!(cancelled, "{shape:?}: the dual write must be cancelled");
+
+            let insert = tokio::time::timeout(Duration::from_secs(10), inserts.recv())
+                .await
+                .expect("the source insert ends")
+                .expect("the source insert reports how it ended");
+            assert!(
+                insert.is_err(),
+                "{shape:?}: the source committed a dual write that was dropped: {insert:?}"
+            );
+
+            // The next dual write on the partition stages only once the dropped one's staging
+            // has released the partition, so after it commits the partition holds its row alone.
+            let (federated, _inserts) = fixture::RecordingTable::create(&events.schema);
+            let (input, data) = events.input(1);
+            let next = events.spawn_dual_write(shape, federated, data).await;
+            input
+                .send(Ok(events.rows(vec![100], "a")))
+                .await
+                .expect("the next dual write takes its input");
+            drop(input);
+            tokio::time::timeout(Duration::from_secs(10), next)
+                .await
+                .expect("the next dual write ends")
+                .expect("the next dual write task joins")
+                .expect("the next dual write succeeds");
+            assert_eq!(
+                events.cayenne_rows("a").await,
+                1,
+                "{shape:?}: the dropped dual write published rows to the accelerator"
+            );
+        }
+    }
+
+    /// Once the source has been told the input is complete, the dual write runs to its end even
+    /// if its caller stops waiting: the source commits, then the accelerator, and a partitioned
+    /// table's write coordinator stays held until then.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dual_write_dropped_while_the_source_commits_still_commits_the_accelerator() {
+        use std::time::Duration;
+
+        for shape in [fixture::Shape::Table, fixture::Shape::Partitioned] {
+            let events = fixture::Events::new(Vec::new()).await;
+            let (federated, mut inserts, gate) = fixture::RecordingTable::gated(&events.schema);
+            let (input, data) = events.input(1);
+            let dual_write = events.spawn_dual_write(shape, federated, data).await;
+            input
+                .send(Ok(events.rows(vec![1, 2], "a")))
+                .await
+                .expect("the dual write takes its input");
+            drop(input);
+
+            tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+                .await
+                .expect("the source reads its whole input");
+            dual_write.abort();
+            let cancelled = matches!(dual_write.await, Err(error) if error.is_cancelled());
+            assert!(cancelled, "{shape:?}: the dual write must be cancelled");
+            if matches!(shape, fixture::Shape::Partitioned) {
+                let held = events.partitioned.write_coordinator().try_lock().is_err();
+                assert!(
+                    held,
+                    "the write coordinator must stay held until the accelerator commits"
+                );
+            }
+            gate.release.notify_one();
+
+            let insert = tokio::time::timeout(Duration::from_secs(10), inserts.recv())
+                .await
+                .expect("the source insert ends")
+                .expect("the source insert reports how it ended");
+            assert_eq!(insert, Ok(2), "{shape:?}");
+            let committed = tokio::time::timeout(Duration::from_secs(10), async {
+                while events.cayenne_rows("a").await != 2 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                committed,
+                "{shape:?}: the accelerator did not commit after the caller stopped waiting"
+            );
+        }
+    }
+
+    /// When the accelerator cannot stage a write, the source commits none of it either, and the
+    /// dual write fails with the accelerator's error.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_accelerator_that_cannot_stage_keeps_the_source_from_committing() {
+        use std::time::Duration;
+
+        for shape in [fixture::Shape::Table, fixture::Shape::Partitioned] {
+            // A Cayenne table with a primary key refuses a staged append.
+            let events = fixture::Events::new(vec!["id".to_string()]).await;
+            let (federated, mut inserts) = fixture::RecordingTable::create(&events.schema);
+            let (input, data) = events.input(1);
+            let dual_write = events.spawn_dual_write(shape, federated, data).await;
+
+            input
+                .send(Ok(events.rows(vec![1, 2], "a")))
+                .await
+                .expect("the dual write takes its input");
+            drop(input);
+
+            let error = tokio::time::timeout(Duration::from_secs(10), dual_write)
+                .await
+                .expect("the dual write ends")
+                .expect("the dual write task joins")
+                .expect_err("the dual write fails");
+            assert!(
+                error.to_string().contains("primary-key deletion handling"),
+                "{shape:?}: the dual write must fail with the accelerator's error: {error}"
+            );
+            let insert = tokio::time::timeout(Duration::from_secs(10), inserts.recv())
+                .await
+                .expect("the source insert ends")
+                .expect("the source insert reports how it ended");
+            assert!(
+                insert.is_err(),
+                "{shape:?}: the source committed a write the accelerator refused: {insert:?}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    mod fixture {
+        use std::sync::Arc;
+
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        use arrow::record_batch::RecordBatch;
+        use async_trait::async_trait;
+        use cayenne::metadata::{CreateTableOptions, VortexConfig};
+        use cayenne::{
+            CayenneCatalog, CayennePartitionCreator, CayenneTableProvider, MetadataCatalog,
+        };
+        use datafusion::catalog::{Session, TableProvider};
+        use datafusion::common::TableReference;
+        use datafusion::datasource::TableType;
+        use datafusion::error::{DataFusionError, Result as DataFusionResult};
+        use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::logical_expr::{Expr, col};
+        use datafusion::physical_plan::metrics::MetricsSet;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        use datafusion::scalar::ScalarValue;
+        use datafusion_datasource::sink::{DataSink, DataSinkExec};
+        use datafusion_table_providers::UnsupportedTypeAction;
+        use futures::StreamExt;
+        use runtime_component::dataset::acceleration::RefreshMode;
+        use runtime_table_partition::expression::PartitionedBy;
+        use runtime_table_partition::provider::PartitionTableProvider;
+        use tokio::sync::{Mutex, RwLock, mpsc};
+        use tokio::task::JoinHandle;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        use crate::accelerated::refresh::{Refresh, Refresher};
+        use crate::federated::FederatedTable;
+
+        /// Which of the two dual-write paths a test drives.
+        #[derive(Clone, Copy, Debug)]
+        pub(super) enum Shape {
+            /// One Cayenne table: partition `a` of [`Events`], written as a table of its own.
+            Table,
+            /// The whole partitioned [`Events`] table.
+            Partitioned,
+        }
+
+        /// A Cayenne table `events (id BIGINT, k VARCHAR)` partitioned by `k`, in a temporary
+        /// directory.
+        pub(super) struct Events {
+            _dir: tempfile::TempDir,
+            pub(super) schema: SchemaRef,
+            pub(super) partitioned: Arc<PartitionTableProvider>,
+        }
+
+        impl Events {
+            pub(super) async fn new(primary_key: Vec<String>) -> Self {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("k", DataType::Utf8, false),
+                ]));
+                let dir = tempfile::tempdir().expect("temp dir");
+                let catalog = Arc::new(
+                    CayenneCatalog::new(format!(
+                        "sqlite://{}",
+                        dir.path().join("cayenne.db").display()
+                    ))
+                    .expect("catalog"),
+                );
+                catalog.init().await.expect("catalog initializes");
+                let data_path = dir.path().join("data");
+                std::fs::create_dir_all(&data_path).expect("data dir");
+                let table_id = catalog
+                    .create_table(CreateTableOptions {
+                        table_name: "events".to_string(),
+                        schema: Arc::clone(&schema),
+                        primary_key: primary_key.clone(),
+                        on_conflict: None,
+                        base_path: data_path.display().to_string(),
+                        partition_column: Some("k".to_string()),
+                        vortex_config: VortexConfig::default(),
+                    })
+                    .await
+                    .expect("partitioned table registers");
+                let partition_by = vec![PartitionedBy {
+                    name: "k".to_string(),
+                    expression: col("k"),
+                }];
+                let creator = Arc::new(
+                    CayennePartitionCreator::new(
+                        "events".to_string(),
+                        data_path,
+                        partition_by.clone(),
+                        Arc::clone(&schema),
+                        Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                        table_id,
+                        UnsupportedTypeAction::Error,
+                        Vec::new(),
+                        None,
+                        VortexConfig::default(),
+                        None,
+                        primary_key,
+                        None,
+                        SessionContext::new().runtime_env(),
+                    )
+                    .with_direct_partition_writes(),
+                );
+                let partitioned = Arc::new(
+                    PartitionTableProvider::new(creator, partition_by, Arc::clone(&schema))
+                        .await
+                        .expect("partitioned provider"),
+                );
+                Self {
+                    _dir: dir,
+                    schema,
+                    partitioned,
+                }
+            }
+
+            pub(super) fn rows(&self, ids: Vec<i64>, key: &str) -> RecordBatch {
+                let keys = vec![key; ids.len()];
+                RecordBatch::try_new(
+                    Arc::clone(&self.schema),
+                    vec![
+                        Arc::new(Int64Array::from(ids)),
+                        Arc::new(StringArray::from(keys)),
+                    ],
+                )
+                .expect("rows match the schema")
+            }
+
+            pub(super) async fn partition(&self, key: &str) -> CayenneTableProvider {
+                self.partitioned
+                    .get_or_create_partition_provider(vec![ScalarValue::Utf8(Some(
+                        key.to_string(),
+                    ))])
+                    .await
+                    .expect("partition")
+                    .downcast_ref::<CayenneTableProvider>()
+                    .expect("a Cayenne partition")
+                    .clone_for_write_operations()
+            }
+
+            /// The rows committed to the Cayenne partition `key`.
+            pub(super) async fn cayenne_rows(&self, key: &str) -> usize {
+                SessionContext::new()
+                    .read_table(Arc::new(self.partition(key).await))
+                    .expect("the partition reads")
+                    .count()
+                    .await
+                    .expect("the partition counts")
+            }
+
+            /// A dual write's input, fed through the returned sender, which holds `capacity`
+            /// batches.
+            pub(super) fn input(
+                &self,
+                capacity: usize,
+            ) -> (
+                mpsc::Sender<DataFusionResult<RecordBatch>>,
+                SendableRecordBatchStream,
+            ) {
+                let (input, receiver) = mpsc::channel(capacity);
+                let data = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&self.schema),
+                    ReceiverStream::new(receiver),
+                ));
+                (input, data)
+            }
+
+            pub(super) async fn spawn_dual_write(
+                &self,
+                shape: Shape,
+                federated: Arc<dyn TableProvider>,
+                data: SendableRecordBatchStream,
+            ) -> JoinHandle<DataFusionResult<u64>> {
+                let refresher = Arc::new(Refresher::new(
+                    runtime_status::RuntimeStatus::new(),
+                    TableReference::bare("events"),
+                    Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated))),
+                    None,
+                    Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+                    Arc::clone(&self.partitioned) as Arc<dyn TableProvider>,
+                    None,
+                    None,
+                    tokio::runtime::Handle::current(),
+                    Arc::new(Mutex::new(())),
+                ));
+                match shape {
+                    Shape::Partitioned => {
+                        tokio::spawn(super::super::write_all_with_partitioned_cayenne(
+                            refresher,
+                            Arc::clone(&self.partitioned) as Arc<dyn TableProvider>,
+                            federated,
+                            data,
+                            1,
+                        ))
+                    }
+                    Shape::Table => {
+                        let sink = super::super::DualWriteDataSink::new(
+                            super::super::CayenneWriteTarget::Staged(Box::new(
+                                self.partition("a").await,
+                            )),
+                            federated,
+                            refresher,
+                            Arc::clone(&self.schema),
+                        );
+                        let context =
+                            Arc::new(TaskContext::default().with_session_config(
+                                SessionConfig::new().with_target_partitions(1),
+                            ));
+                        tokio::spawn(async move { sink.write_all(data, &context).await })
+                    }
+                }
+            }
+        }
+
+        /// How each insert into a [`RecordingTable`] ended: the rows it committed, or its error.
+        pub(super) type Inserts = mpsc::UnboundedReceiver<Result<usize, String>>;
+
+        /// A federated table whose inserts, like an Iceberg table's, commit the rows they read
+        /// when their input ends and nothing when it fails. Each insert reports how it ended:
+        /// the rows it committed, or its error.
+        #[derive(Debug)]
+        pub(super) struct RecordingTable {
+            schema: SchemaRef,
+            inserts: mpsc::UnboundedSender<Result<usize, String>>,
+            gate: Option<Arc<SourceGate>>,
+        }
+
+        /// Holds a recording table's insert after it has read its whole input and before it
+        /// commits, until the test releases it.
+        #[derive(Debug, Default)]
+        pub(super) struct SourceGate {
+            pub(super) reached: tokio::sync::Notify,
+            pub(super) release: tokio::sync::Notify,
+        }
+
+        impl RecordingTable {
+            pub(super) fn create(schema: &SchemaRef) -> (Arc<dyn TableProvider>, Inserts) {
+                Self::with_gate(schema, None)
+            }
+
+            /// A recording table whose inserts wait at the returned gate before they commit.
+            pub(super) fn gated(
+                schema: &SchemaRef,
+            ) -> (Arc<dyn TableProvider>, Inserts, Arc<SourceGate>) {
+                let gate = Arc::new(SourceGate::default());
+                let (table, outcomes) = Self::with_gate(schema, Some(Arc::clone(&gate)));
+                (table, outcomes, gate)
+            }
+
+            fn with_gate(
+                schema: &SchemaRef,
+                gate: Option<Arc<SourceGate>>,
+            ) -> (Arc<dyn TableProvider>, Inserts) {
+                let (inserts, outcomes) = mpsc::unbounded_channel();
+                let table = Arc::new(Self {
+                    schema: Arc::clone(schema),
+                    inserts,
+                    gate,
+                });
+                (table, outcomes)
+            }
+        }
+
+        #[async_trait]
+        impl TableProvider for RecordingTable {
+            fn schema(&self) -> SchemaRef {
+                Arc::clone(&self.schema)
+            }
+
+            fn table_type(&self) -> TableType {
+                TableType::Base
+            }
+
+            async fn scan(
+                &self,
+                _state: &dyn Session,
+                _projection: Option<&Vec<usize>>,
+                _filters: &[Expr],
+                _limit: Option<usize>,
+            ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                Err(DataFusionError::NotImplemented(
+                    "the recording table is written, not read".to_string(),
+                ))
+            }
+
+            async fn insert_into(
+                &self,
+                _state: &dyn Session,
+                input: Arc<dyn ExecutionPlan>,
+                _insert_op: InsertOp,
+            ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(DataSinkExec::new(
+                    input,
+                    Arc::new(RecordingSink {
+                        schema: Arc::clone(&self.schema),
+                        inserts: self.inserts.clone(),
+                        gate: self.gate.clone(),
+                    }),
+                    None,
+                )))
+            }
+        }
+
+        #[derive(Debug)]
+        struct RecordingSink {
+            schema: SchemaRef,
+            inserts: mpsc::UnboundedSender<Result<usize, String>>,
+            gate: Option<Arc<SourceGate>>,
+        }
+
+        impl DisplayAs for RecordingSink {
+            fn fmt_as(
+                &self,
+                _t: DisplayFormatType,
+                f: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                write!(f, "RecordingSink")
+            }
+        }
+
+        #[async_trait]
+        impl DataSink for RecordingSink {
+            fn metrics(&self) -> Option<MetricsSet> {
+                None
+            }
+
+            fn schema(&self) -> &SchemaRef {
+                &self.schema
+            }
+
+            async fn write_all(
+                &self,
+                mut data: SendableRecordBatchStream,
+                _context: &Arc<TaskContext>,
+            ) -> DataFusionResult<u64> {
+                let mut rows = 0;
+                while let Some(batch) = data.next().await {
+                    match batch {
+                        Ok(batch) => rows += batch.num_rows(),
+                        Err(error) => {
+                            let _ = self.inserts.send(Err(error.to_string()));
+                            return Err(error);
+                        }
+                    }
+                }
+                if let Some(gate) = &self.gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+                let _ = self.inserts.send(Ok(rows));
+                Ok(rows as u64)
+            }
+        }
     }
 }
