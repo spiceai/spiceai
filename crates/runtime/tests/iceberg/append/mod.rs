@@ -1099,3 +1099,76 @@ async fn a_memory_mode_acceleration_follows_snapshots_too() -> anyhow::Result<()
     );
     Ok(())
 }
+
+/// `rows` without their times, which the engines render as text differently.
+fn key_vals(rows: Rows) -> Vec<(String, String)> {
+    rows.into_iter().map(|(key, _, val)| (key, val)).collect()
+}
+
+/// Regression test for #15273: DuckDB and SQLite with `on_conflict: upsert` read by time,
+/// so a late older version does not overwrite the newer stored one. A late row below the
+/// window start is not loaded, unlike on Cayenne.
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_last_arrival_engine_reads_by_time_and_keeps_the_newer_version() -> anyhow::Result<()> {
+    let _tracing = crate::init_tracing(Some(
+        "integration=debug,data_components=debug,runtime_table=debug,info",
+    ));
+    let engines = [
+        #[cfg(feature = "duckdb")]
+        "duckdb",
+        #[cfg(feature = "sqlite")]
+        "sqlite",
+    ];
+    for engine in engines {
+        let lab = Lab::start(TimeKind::Timestamp).await?;
+        // c1: k1..k100 at 10:00.
+        lab.append(&keys("k", 1..=100, 0, "v1")).await?;
+        let accel = Accel {
+            engine,
+            ..Accel::default()
+        };
+        let (rt, _) = start_spice(&lab, &accel).await?;
+        assert_eq!(accelerated_count(&rt).await?, 100, "{engine}: initial load");
+
+        // c2: k1..k10 updated at 10:30, so the window starts at 10:10.
+        lab.append(&keys("k", 1..=10, 1800, "v2")).await?;
+        refresh(&rt).await?;
+        assert_eq!(
+            key_vals(accelerated_rows(&rt).await?),
+            key_vals(source_newest_rows(&rt, TimeKind::Timestamp).await?),
+            "{engine}: after c2"
+        );
+
+        // c3: stale k1..k10 and new k201 at 10:05 (below the window), new k202 at 10:25.
+        lab.append(
+            &[
+                keys("k", 1..=10, 300, "stale"),
+                vec![
+                    Row::at("k201", 300, "late_out"),
+                    Row::at("k202", 1500, "late_in"),
+                ],
+            ]
+            .concat(),
+        )
+        .await?;
+        refresh(&rt).await?;
+        let expected: Vec<(String, String)> =
+            key_vals(source_newest_rows(&rt, TimeKind::Timestamp).await?)
+                .into_iter()
+                .filter(|(key, _)| key != "k201")
+                .collect();
+        assert_eq!(
+            key_vals(accelerated_rows(&rt).await?),
+            expected,
+            "{engine}: after c3, k1..k10 keep v2, k202 loads, and k201 (below the window start) does not"
+        );
+        assert_count(
+            counter(FALLBACKS),
+            0,
+            "a refresh that reads by time by design is no fallback",
+        );
+        rt.shutdown().await;
+    }
+    Ok(())
+}

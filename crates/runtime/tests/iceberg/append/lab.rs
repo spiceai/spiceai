@@ -52,7 +52,7 @@ use iceberg::{
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use spicepod::{
-    acceleration::{Acceleration, Mode, RefreshMode},
+    acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
     component::dataset::{Dataset, TimeFormat},
     param::Params,
 };
@@ -63,6 +63,8 @@ use crate::iceberg::metadata_file::{
 };
 pub const NAMESPACE: &str = "ns";
 pub const TABLE: &str = "events";
+/// The primary key an accelerated dataset declares.
+const PRIMARY_KEY: &str = "(sort_key, hash_key)";
 
 /// 2026-10-14T10:00:00Z in microseconds: the instant every row's time is an offset from.
 pub const BASE_MICROS: i64 = 1_792_058_400_000_000;
@@ -140,6 +142,7 @@ pub fn at_text(secs: i64) -> String {
 /// The acceleration a dataset is given.
 #[derive(Debug, Clone)]
 pub struct Accel {
+    pub engine: &'static str,
     pub mode: Mode,
     pub primary_key: bool,
     pub overlap: &'static str,
@@ -148,6 +151,7 @@ pub struct Accel {
 impl Default for Accel {
     fn default() -> Self {
         Self {
+            engine: "cayenne",
             mode: Mode::File,
             primary_key: true,
             overlap: "20m",
@@ -294,18 +298,27 @@ impl Lab {
             TimeKind::Text => TimeFormat::ISO8601,
         });
         let data_path = self.temp.path().join(format!("accelerator-{name}"));
+        let file_param = match accel.engine {
+            "cayenne" => "cayenne_file_path",
+            "duckdb" => "duckdb_file",
+            "sqlite" => "sqlite_file",
+            other => panic!("the lab has no file parameter for engine {other}"),
+        };
         dataset.acceleration = Some(Acceleration {
             enabled: true,
-            engine: Some("cayenne".to_string()),
+            engine: Some(accel.engine.to_string()),
             mode: accel.mode.clone(),
             refresh_mode: Some(RefreshMode::Append),
             refresh_append_overlap: Some(accel.overlap.to_string()),
-            primary_key: accel
-                .primary_key
-                .then(|| "(sort_key, hash_key)".to_string()),
+            primary_key: accel.primary_key.then(|| PRIMARY_KEY.to_string()),
+            // Engines other than Cayenne need `on_conflict: upsert` to keep one row per key.
+            on_conflict: (accel.primary_key && accel.engine != "cayenne")
+                .then(|| (PRIMARY_KEY.to_string(), OnConflictBehavior::Upsert))
+                .into_iter()
+                .collect(),
             params: (accel.mode == Mode::File).then(|| {
                 Params::from_string_map(HashMap::from([(
-                    "cayenne_file_path".to_string(),
+                    file_param.to_string(),
                     data_path.to_string_lossy().to_string(),
                 )]))
             }),
