@@ -148,19 +148,33 @@ async fn iceberg_retry_uses_friendly_warning_and_preserves_debug_diagnostics() {
         read_after_connection_closes().await;
         let output = String::from_utf8(writer.0.lock().expect("writer lock").clone())
             .expect("UTF-8 log output");
-        assert_eq!(output.matches("WARN").count(), 1, "{output}");
-        assert!(
-            output.contains("Reading file 'http://127.0.0.1:"),
-            "{output}"
-        );
-        assert!(output.contains("/probe/team_app/task_history/metadata/test-m0.avro' (S3)"));
-        assert!(output.contains("Spice will retry in 1s (attempt 1)"));
+        // Both reads fail the same way on attempt 1, so they share one
+        // collapse key. The first read logs the warning. The second keeps
+        // the diagnostic and the query span, and does not log the warning again.
         assert!(output.contains("dataset=\"history\""), "{output}");
-        assert_eq!(output.contains("SendRequest"), debug, "{output}");
-        assert_eq!(
-            output.lines().count(),
-            if debug { 2 } else { 1 },
+        assert!(
+            output.contains("/probe/team_app/task_history/metadata/test-m0.avro"),
             "{output}"
         );
+        if debug {
+            assert_eq!(output.matches("WARN").count(), 0, "{output}");
+            assert!(
+                !output.contains("Reading file 'http://127.0.0.1:"),
+                "{output}"
+            );
+            assert!(output.contains("SendRequest"), "{output}");
+            assert!(output.contains("S3 read retry diagnostic"), "{output}");
+            assert_eq!(output.lines().count(), 1, "{output}");
+        } else {
+            assert_eq!(output.matches("WARN").count(), 1, "{output}");
+            assert!(
+                output.contains("Reading file 'http://127.0.0.1:"),
+                "{output}"
+            );
+            assert!(output.contains("(S3)"), "{output}");
+            assert!(output.contains("Spice will retry in 1s (attempt 1)"));
+            assert!(!output.contains("SendRequest"), "{output}");
+            assert_eq!(output.lines().count(), 1, "{output}");
+        }
     }
 }

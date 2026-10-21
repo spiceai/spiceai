@@ -782,6 +782,7 @@ impl RuntimeBuilder {
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                assignment_updates: Arc::default(),
                 outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
@@ -904,6 +905,7 @@ impl RuntimeBuilder {
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             dataset_loads: Arc::default(),
+            model_loads: Arc::default(),
             view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),

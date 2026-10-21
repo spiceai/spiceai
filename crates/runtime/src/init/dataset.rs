@@ -25,7 +25,7 @@ use std::{
 };
 
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
-use crate::cluster::partition::get_partition_filter_exprs;
+use crate::cluster::partition::combine_partition_exprs;
 use crate::config::ClusterRole;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
@@ -69,6 +69,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
+use data_components::incremental_append::incremental_append_source;
 use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
@@ -1585,6 +1586,7 @@ impl Runtime {
             return Err(err);
         }
 
+        let mut overlap_warning = None;
         if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
             let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
             let dataset_name = ds.name.to_string();
@@ -1604,10 +1606,10 @@ impl Runtime {
                 && refresh_mode == RefreshMode::Append
                 && acceleration.refresh_append_overlap.is_none()
             {
-                tracing::warn!(
-                    "{}",
-                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
-                );
+                overlap_warning = Some(newest_by_time_without_overlap_warning(
+                    &dataset_name,
+                    time_column,
+                ));
             }
         }
 
@@ -1708,6 +1710,15 @@ impl Runtime {
             )
             .await?;
         ds = resolved_ds;
+
+        // A source that follows its commits (Iceberg) loads late rows without an overlap.
+        if let Some(warning) = overlap_warning
+            && federated_table
+                .try_table_provider_sync_ref()
+                .is_none_or(|provider| incremental_append_source(provider.as_ref()).is_none())
+        {
+            tracing::warn!("{warning}");
+        }
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
@@ -2118,8 +2129,9 @@ impl Runtime {
     ///
     /// On an executor node (partition assignments present) with a `partition_by`
     /// configured dataset, returns the dataset with `partition_by` cleared and its
-    /// engine converted to unpartitioned, plus `Some` partition filters for the
-    /// partitions assigned to this executor. `Some(empty)` — no partition assigned —
+    /// engine converted to unpartitioned, plus `Some` partition expressions, one
+    /// per partition assigned to this executor; `combine_partition_exprs` turns
+    /// them into the load's filter. `Some(empty)` — no partition assigned —
     /// resolves downstream to a `false` predicate (load no rows) rather than an
     /// unfiltered full-table load. Otherwise returns `ds` unchanged with `None`
     /// (not partition-scoped; retrieve everything).
@@ -2143,11 +2155,11 @@ impl Runtime {
             crate::datafusion::SPICE_DEFAULT_CATALOG,
             crate::datafusion::SPICE_DEFAULT_SCHEMA,
         );
-        let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
+        let assigned = assignments.get(&resolved).cloned().unwrap_or_default();
         tracing::debug!(
-            "For table={}, extracted {} partition filter(s) for assigned partitions.",
+            "For table={}, {} partition(s) assigned.",
             ds.name,
-            partition_filters.len(),
+            assigned.len(),
         );
 
         // Clear partition_by and convert engine to unpartitioned.
@@ -2156,7 +2168,7 @@ impl Runtime {
             acc.partition_by = vec![];
             acc.engine = acc.engine.to_unpartitioned();
         }
-        (Arc::new(ds_mod), Some(partition_filters))
+        (Arc::new(ds_mod), Some(assigned))
     }
 
     async fn reload_accelerated_dataset(
@@ -2201,7 +2213,8 @@ impl Runtime {
         // Mirror the initial-load path: on an executor, scope the recreated table
         // to this node's assigned partitions so a hot reload doesn't load the full
         // source table (or duplicate it across executors).
-        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+        let (ds, assigned) = self.resolve_executor_partition_scoping(ds).await;
+        let initial_partition_filters = assigned.map(combine_partition_exprs);
 
         // create new accelerated table for updated data connector
         let accelerated_table = self
@@ -2459,7 +2472,17 @@ impl Runtime {
         // partitioned mode this is `Some`, so an executor with no assigned
         // partition gets `Some(empty)` — a `false` predicate that loads no rows —
         // rather than an unfiltered full load.
-        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+        let (ds, assigned) = self.resolve_executor_partition_scoping(ds).await;
+        // The partitions the initial load reads, one expression each, and the
+        // sequence its ack carries, taken before any later reload of the table
+        // takes one.
+        let initial_load = assigned.clone().map(|assigned| {
+            let load_sequence = self
+                .executor_outbound_broadcaster()
+                .map_or(0, |b| b.next_load_sequence());
+            (load_sequence, assigned)
+        });
+        let initial_partition_filters = assigned.map(combine_partition_exprs);
 
         // ACCELERATED TABLE
         let acceleration_settings =
@@ -2576,8 +2599,8 @@ impl Runtime {
                     return;
                 }
                 // After the executor's initial load for this dataset finishes,
-                // ack the scheduler with the partition expressions we currently
-                // hold. This is the executor → scheduler readiness signal that
+                // ack the scheduler with the partition expressions that load
+                // read. This is the executor → scheduler readiness signal that
                 // lets the scheduler flip the dataset to `Ready` once every
                 // assigned partition has at least one executor ack.
                 //
@@ -2589,23 +2612,20 @@ impl Runtime {
                 // the ack against the registered dataset regardless of how
                 // the user spelled the table in their spicepod.
                 if let Some(b) = broadcaster {
-                    let bytes: Vec<Vec<u8>> =
-                        if let Some(assignments_lock) = runtime.partition_assignments() {
-                            let assignments = assignments_lock.read().await;
-                            assignments
-                                .get(&resolved_name)
-                                .map(|exprs| {
-                                    runtime_cluster::encode_partition_exprs(exprs, &dataset_name)
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
+                    let (load_sequence, bytes) = initial_load.as_ref().map_or_else(
+                        || (0, Vec::new()),
+                        |(load_sequence, assigned)| {
+                            (
+                                *load_sequence,
+                                runtime_cluster::encode_partition_exprs(assigned, &dataset_name),
+                            )
+                        },
+                    );
                     let table_name = resolved_name.to_string();
                     // Statistics flow via the periodic ExecutorStatistics reporter,
                     // not this readiness ack.
                     let sent = b
-                        .broadcast_partitions_loaded(table_name.clone(), bytes)
+                        .broadcast_partitions_loaded(table_name.clone(), bytes, load_sequence)
                         .await;
                     if sent == 0 {
                         // Fast initial loads can finish before any scheduler
@@ -2619,6 +2639,20 @@ impl Runtime {
                             "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
                         );
                     }
+                }
+                // Partitions assigned after the initial load read its filters
+                // and before the table registered were not loaded: load them.
+                if let Some((_, assigned)) = &initial_load
+                    && let Err(e) = runtime
+                        .load_partitions_assigned_during_initial_load(
+                            resolved_name.clone(),
+                            assigned,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        "Failed to load the partitions of {dataset_name} assigned during its initial load: {e}"
+                    );
                 }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
@@ -3365,7 +3399,7 @@ fn deprecated_on_conflict_warning(
 }
 
 /// Warning for an append that keeps the newest version of each key by `time_column`
-/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+/// but has no `refresh_append_overlap` and reads by time, so it never re-reads a late row.
 fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
     format!(
         "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"

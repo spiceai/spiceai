@@ -24,6 +24,7 @@ limitations under the License.
 pub mod cluster_state;
 pub mod context;
 pub mod correlated;
+pub mod executor_liveness;
 pub mod executor_registry;
 pub mod executor_selection;
 pub mod flight_config;
@@ -45,10 +46,11 @@ pub use executor_registry::{
     RegisteredHandles, TablePartitions,
 };
 pub use metadata::{
-    PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,
-    encode_partition_exprs, encode_statistics, normalized_table_name, partition_value_to_bytes,
+    PartitionKey, PartitionMetadata, PartitionValue, TablePartitionMetadata, decode_statistics,
+    encode_partition_exprs, encode_statistics, normalized_table_name, partition_key,
+    partition_value_to_bytes,
 };
 pub use outbound_broadcaster::ExecutorOutboundBroadcaster;
-pub use partition_load_tracker::PartitionLoadTracker;
+pub use partition_load_tracker::{LoadedAck, PartitionLoadTracker};
 pub use service::{AssignmentConfig, PartitionService};
-pub use store::{AssignmentRequest, CopyAssignmentsResult, PartitionStore};
+pub use store::{AssignmentRequest, CopyAssignmentsResult, DiscoveryChanges, PartitionStore};

@@ -34,17 +34,32 @@ use datafusion::common::TableReference;
 use tokio::sync::RwLock;
 
 use crate::context::PartitionExprResolver;
-use crate::metadata::{TablePartitionMetadata, partition_value_to_bytes};
+use crate::executor_registry::LoadedPartitions;
+use crate::metadata::{
+    PartitionKey, TablePartitionMetadata, partition_key, partition_value_to_bytes,
+};
 
 /// Identifier for an executor on the scheduler side (matches the executor's
 /// advertise address).
 pub type ExecutorId = String;
 
+/// One executor process's report that it has loaded exactly `partitions` of a
+/// table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadedAck {
+    /// The process that sent the report; empty from executors that send none.
+    pub process_id: String,
+    /// Orders the process's reports for the table: a report with a lower
+    /// sequence describes an older load. 0 from executors that send none.
+    pub load_sequence: u64,
+    /// The partition expression bytes of the loaded partitions.
+    pub partitions: HashSet<Bytes>,
+}
+
 #[derive(Default, Debug)]
 pub struct PartitionLoadTracker {
-    /// (table, `executor_id`) -> set of partition expression bytes the
-    /// executor has acked as loaded.
-    loaded: RwLock<HashMap<TableReference, HashMap<ExecutorId, HashSet<Bytes>>>>,
+    /// (table, `executor_id`) -> the executor's latest report for the table.
+    loaded: RwLock<HashMap<TableReference, HashMap<ExecutorId, LoadedAck>>>,
 }
 
 impl PartitionLoadTracker {
@@ -56,18 +71,78 @@ impl PartitionLoadTracker {
     /// Replaces the loaded-partition set for `(table, executor_id)` with the
     /// new snapshot from the executor. The snapshot is authoritative — a
     /// missing partition implies the executor is no longer holding it
-    /// loaded.
+    /// loaded. A report older than the one recorded from the same process is
+    /// ignored; returns whether `ack` was recorded.
     pub async fn replace(
         &self,
         table: TableReference,
         executor_id: ExecutorId,
-        partition_expr_bytes: HashSet<Bytes>,
-    ) {
+        ack: LoadedAck,
+    ) -> bool {
         let mut guard = self.loaded.write().await;
-        guard
-            .entry(table)
-            .or_default()
-            .insert(executor_id, partition_expr_bytes);
+        let acks = guard.entry(table).or_default();
+        if let Some(recorded) = acks.get(&executor_id)
+            && recorded.process_id == ack.process_id
+            && ack.load_sequence != 0
+            && ack.load_sequence < recorded.load_sequence
+        {
+            return false;
+        }
+        acks.insert(executor_id, ack);
+        true
+    }
+
+    /// The latest report of each executor for `table`.
+    pub async fn acks(&self, table: &TableReference) -> HashMap<ExecutorId, LoadedAck> {
+        self.loaded
+            .read()
+            .await
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// For each executor that reported on `table`, the process that reported
+    /// and the partitions of `metadata` it has loaded, by
+    /// [`partition_key`](crate::metadata::partition_key).
+    pub async fn loaded_partitions(
+        &self,
+        table: &TableReference,
+        metadata: &TablePartitionMetadata,
+        resolver: &dyn PartitionExprResolver,
+    ) -> HashMap<ExecutorId, LoadedPartitions> {
+        let mut keys: HashMap<Bytes, PartitionKey> =
+            HashMap::with_capacity(metadata.partitions.len());
+        for p in &metadata.partitions {
+            match partition_value_to_bytes(p.partition_value.clone(), table, resolver).await {
+                Ok(bytes) => {
+                    keys.insert(bytes, partition_key(&p.partition_value));
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "Failed to encode partition bytes for coverage of {table}: {err}"
+                    );
+                }
+            }
+        }
+        self.acks(table)
+            .await
+            .into_iter()
+            .map(|(executor_id, ack)| {
+                let partitions = ack
+                    .partitions
+                    .iter()
+                    .filter_map(|bytes| keys.get(bytes).cloned())
+                    .collect();
+                (
+                    executor_id,
+                    LoadedPartitions {
+                        process_id: ack.process_id,
+                        partitions,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Drops all loaded entries for `executor_id`. Called when the executor
@@ -140,9 +215,11 @@ impl PartitionLoadTracker {
             return false;
         };
         for (assigned_executors, bytes) in &required {
-            let covered = assigned_executors
-                .iter()
-                .any(|exec| table_map.get(exec).is_some_and(|set| set.contains(bytes)));
+            let covered = assigned_executors.iter().any(|exec| {
+                table_map
+                    .get(exec)
+                    .is_some_and(|ack| ack.partitions.contains(bytes))
+            });
             if !covered {
                 return false;
             }
@@ -189,6 +266,13 @@ mod tests {
             .expect("partition_value_to_bytes")
     }
 
+    fn loaded(partitions: HashSet<Bytes>) -> LoadedAck {
+        LoadedAck {
+            partitions,
+            ..LoadedAck::default()
+        }
+    }
+
     fn partition(value: &[(&str, &str)], assigned_executors: Vec<&str>) -> PartitionMetadata {
         let pv: crate::metadata::PartitionValue = value
             .iter()
@@ -212,16 +296,16 @@ mod tests {
 
         let bytes = HashSet::from([Bytes::from_static(b"part-1")]);
         tracker
-            .replace(table_a.clone(), "exec-1".to_string(), bytes.clone())
+            .replace(table_a.clone(), "exec-1".to_string(), loaded(bytes.clone()))
             .await;
         tracker
-            .replace(table_b.clone(), "exec-1".to_string(), bytes)
+            .replace(table_b.clone(), "exec-1".to_string(), loaded(bytes))
             .await;
         tracker
             .replace(
                 table_a.clone(),
                 "exec-2".to_string(),
-                HashSet::from([Bytes::from_static(b"part-2")]),
+                loaded(HashSet::from([Bytes::from_static(b"part-2")])),
             )
             .await;
 
@@ -239,6 +323,43 @@ mod tests {
         assert!(acks_other.get("exec-1").is_none());
     }
 
+    /// A report of an older load from the same process does not replace a
+    /// newer one; a new process's report replaces the old process's.
+    #[tokio::test]
+    async fn an_older_load_report_does_not_replace_a_newer_one() {
+        let tracker = PartitionLoadTracker::new();
+        let table = TableReference::parse_str("t");
+        let newer = LoadedAck {
+            process_id: "p1".into(),
+            load_sequence: 2,
+            partitions: HashSet::from([Bytes::from_static(b"part-1")]),
+        };
+        let older = LoadedAck {
+            process_id: "p1".into(),
+            load_sequence: 1,
+            partitions: HashSet::new(),
+        };
+        assert!(
+            tracker
+                .replace(table.clone(), "exec-1".into(), newer.clone())
+                .await
+        );
+        assert!(!tracker.replace(table.clone(), "exec-1".into(), older).await);
+        assert_eq!(tracker.acks(&table).await["exec-1"], newer);
+
+        let restarted = LoadedAck {
+            process_id: "p2".into(),
+            load_sequence: 1,
+            partitions: HashSet::new(),
+        };
+        assert!(
+            tracker
+                .replace(table.clone(), "exec-1".into(), restarted.clone())
+                .await
+        );
+        assert_eq!(tracker.acks(&table).await["exec-1"], restarted);
+    }
+
     #[tokio::test]
     async fn acked_tables_lists_tables_with_recorded_acks() {
         let tracker = PartitionLoadTracker::new();
@@ -247,7 +368,7 @@ mod tests {
         let table = TableReference::parse_str("t");
         // An empty ack (zero-partition dataset) still counts as an ack.
         tracker
-            .replace(table.clone(), "exec-1".to_string(), HashSet::new())
+            .replace(table.clone(), "exec-1".to_string(), loaded(HashSet::new()))
             .await;
         assert_eq!(tracker.acked_tables().await, vec![table.clone()]);
 
@@ -267,10 +388,18 @@ mod tests {
         // Each executor acks only its own assigned partition; coverage is
         // satisfied when *some* assigned executor reports it.
         tracker
-            .replace(table.clone(), "exec-1".into(), HashSet::from([p1.clone()]))
+            .replace(
+                table.clone(),
+                "exec-1".into(),
+                loaded(HashSet::from([p1.clone()])),
+            )
             .await;
         tracker
-            .replace(table.clone(), "exec-2".into(), HashSet::from([p2.clone()]))
+            .replace(
+                table.clone(),
+                "exec-2".into(),
+                loaded(HashSet::from([p2.clone()])),
+            )
             .await;
 
         let metadata = TablePartitionMetadata {
@@ -301,7 +430,7 @@ mod tests {
 
         // Only the first partition has an ack; the second is uncovered.
         tracker
-            .replace(table.clone(), "exec-1".into(), HashSet::from([p1]))
+            .replace(table.clone(), "exec-1".into(), loaded(HashSet::from([p1])))
             .await;
 
         let metadata = TablePartitionMetadata {

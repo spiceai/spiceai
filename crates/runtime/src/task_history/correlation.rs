@@ -327,6 +327,7 @@ mod tests {
             .with_trace_parent(Some(TraceParent {
                 trace_id: other_trace,
                 span_id,
+                trace_flags: TraceFlags::SAMPLED,
             }))
             .build();
         assert_eq!(same_trace_parent_span(&conflicting, PINNED), None);
@@ -336,6 +337,7 @@ mod tests {
             .with_trace_parent(Some(TraceParent {
                 trace_id: other_trace,
                 span_id,
+                trace_flags: TraceFlags::SAMPLED,
             }))
             .build();
         assert_eq!(

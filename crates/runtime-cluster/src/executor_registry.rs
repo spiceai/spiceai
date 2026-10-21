@@ -20,11 +20,12 @@ limitations under the License.
 //! control streams between schedulers and executors. Schedulers use this
 //! registry to request metrics from executors on-demand.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{
     catalog::TableProvider,
@@ -35,12 +36,16 @@ use datafusion::{
 use datafusion_expr::{Expr, TableScan};
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::{PartitionProviders, TablePartitionProvider};
-use runtime_proto::{Ack, MetricsRequest, MetricsResponse, SchedulerControlMessage};
+use runtime_datafusion::error::SpiceExternalError;
+use runtime_proto::{
+    Ack, BytesArray, MetricsRequest, MetricsResponse, SchedulerControlMessage, UpdatePartitions,
+};
 use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::Instant;
 
 use crate::correlated::{CorrelatedResponses, CorrelationError, send_correlated};
-use crate::metadata::normalized_table_name;
+use crate::metadata::{PartitionKey, normalized_table_name, partition_key};
 use crate::{PartitionStore, PartitionValue, executor_selection, metrics};
 
 /// Error type for executor registry operations.
@@ -91,6 +96,10 @@ pub struct ExecutorConnection {
     /// Used by commands (e.g. `UpdatePartitions`) that need delivery
     /// confirmation rather than fire-and-forget.
     pending_acks: CorrelatedResponses<Ack>,
+    /// Per table, the partition expression bytes this connection has acked as
+    /// added by an `UpdatePartitions`, and when. A new connection starts with
+    /// none.
+    delivered: Arc<parking_lot::Mutex<HashMap<String, HashMap<Bytes, Instant>>>>,
 }
 
 impl ExecutorConnection {
@@ -101,6 +110,7 @@ impl ExecutorConnection {
             request_tx,
             pending_metrics: CorrelatedResponses::new(),
             pending_acks: CorrelatedResponses::new(),
+            delivered: Arc::default(),
         }
     }
 
@@ -151,6 +161,24 @@ impl ExecutorConnection {
 }
 
 pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
+
+/// The partitions of a table one executor process has reported loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadedPartitions {
+    /// The process that loaded them; empty for executors that send no process id.
+    pub process_id: String,
+    pub partitions: HashSet<PartitionKey>,
+}
+
+/// What a scheduler knows of the data executors hold for one accelerated table.
+#[derive(Debug, Default)]
+struct TableCoverage {
+    /// Per executor, the partitions it has reported loaded.
+    loaded: HashMap<String, LoadedPartitions>,
+    /// The partitions of the table when a query last found every partition
+    /// loaded on a ready executor.
+    last_complete: Option<HashSet<PartitionKey>>,
+}
 
 /// Cheap-to-clone handles returned to the control-stream inbound dispatcher
 /// at registration time. Routes correlated executor→scheduler messages
@@ -401,6 +429,10 @@ pub struct ExecutorRegistry {
     executor_statistics:
         Arc<parking_lot::RwLock<HashMap<String, HashMap<String, ExecutorTableStatistics>>>>,
 
+    /// Per accelerated table (by [`normalized_table_name`]), the partitions
+    /// executors have reported loaded. Queries route by it.
+    coverage: Arc<parking_lot::RwLock<HashMap<String, TableCoverage>>>,
+
     /// Append-only log of DDL SQL statements applied to the cluster.
     ddl_log: Arc<RwLock<DdlLog>>,
 
@@ -445,6 +477,7 @@ impl ExecutorRegistry {
             accelerations_partition_store,
             federated_partition_store,
             executor_statistics: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            coverage: Arc::default(),
             ddl_log: Arc::new(RwLock::new(DdlLog::default())),
             node_id,
         }
@@ -829,27 +862,14 @@ impl ExecutorRegistry {
             };
             (connection.request_tx.clone(), connection.pending_acks())
         };
-
-        match send_correlated(&request_tx, &pending_acks, build_command, Some(timeout)).await {
-            Ok(ack) => match ack.error {
-                Some(error) if !error.is_empty() => Err(Error::AckFailed {
-                    executor_id: executor_id.to_string(),
-                    error,
-                }),
-                _ => Ok(()),
-            },
-            Err(CorrelationError::SendFailed) => Err(Error::SendFailed {
-                executor_id: executor_id.to_string(),
-            }),
-            Err(CorrelationError::Cancelled) => Err(Error::ReceiveFailed {
-                executor_id: executor_id.to_string(),
-                reason: "ack channel closed".to_string(),
-            }),
-            Err(CorrelationError::Timeout { duration }) => Err(Error::AckTimeout {
-                executor_id: executor_id.to_string(),
-                duration,
-            }),
-        }
+        send_ack(
+            executor_id,
+            &request_tx,
+            &pending_acks,
+            build_command,
+            timeout,
+        )
+        .await
     }
 
     /// Sends a control message to a specific executor without waiting for
@@ -913,6 +933,7 @@ impl ExecutorRegistry {
                     request_tx,
                     pending_metrics,
                     pending_acks: CorrelatedResponses::new(),
+                    delivered: Arc::default(),
                 };
                 let result = temp_connection.request_metrics(&executor_id).await;
                 (executor_id, result)
@@ -948,10 +969,119 @@ impl ExecutorRegistry {
         }
     }
 
+    /// Records, for an accelerated table, the partitions each executor process
+    /// has reported loaded. A query reads a partition only from an executor
+    /// whose current process reported it loaded.
+    pub fn set_loaded_partitions(
+        &self,
+        table: &TableReference,
+        loaded: HashMap<String, LoadedPartitions>,
+    ) {
+        self.coverage
+            .write()
+            .entry(normalized_table_name(table))
+            .or_default()
+            .loaded = loaded;
+    }
+
+    /// The process registered last under `executor_id`; empty when it sent none.
+    #[must_use]
+    pub fn current_process(&self, executor_id: &str) -> String {
+        self.processes
+            .lock()
+            .get(executor_id)
+            .and_then(|seen| seen.current.clone())
+            .unwrap_or_default()
+    }
+
+    /// The partition expression bytes of `table` that the registered connection
+    /// of `executor_id` has acked as added, and when it acked each.
+    pub async fn delivered_partitions(
+        &self,
+        executor_id: &str,
+        table: &str,
+    ) -> HashMap<Bytes, Instant> {
+        let connections = self.connections.read().await;
+        connections
+            .get(executor_id)
+            .and_then(|connection| connection.delivered.lock().get(table).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Sends `executor_id` an `UpdatePartitions` that adds `added` and removes
+    /// `removed` partitions of `table`, and waits for its ack. Once acked, the
+    /// connection it went out on counts `added` as delivered and `removed` as
+    /// no longer delivered.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::send_command_with_ack`].
+    pub async fn send_partition_update(
+        &self,
+        executor_id: &str,
+        table: &str,
+        added: &[Bytes],
+        removed: &[Bytes],
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let (request_tx, pending_acks, delivered) = {
+            let connections = self.connections.read().await;
+            let Some(connection) = connections.get(executor_id) else {
+                return Err(Error::ExecutorNotRegistered {
+                    executor_id: executor_id.to_string(),
+                });
+            };
+            (
+                connection.request_tx.clone(),
+                connection.pending_acks(),
+                Arc::clone(&connection.delivered),
+            )
+        };
+        let items = |partitions: &[Bytes]| {
+            if partitions.is_empty() {
+                HashMap::new()
+            } else {
+                HashMap::from([(
+                    table.to_string(),
+                    BytesArray {
+                        items: partitions.iter().map(|b| b.to_vec()).collect(),
+                    },
+                )])
+            }
+        };
+        let (new_partitions, removed_partitions) = (items(added), items(removed));
+        let build = move |request_id| SchedulerControlMessage {
+            message: Some(
+                runtime_proto::scheduler_control_message::Message::UpdatePartitions(
+                    UpdatePartitions {
+                        new_partitions,
+                        removed_partitions,
+                        request_id,
+                    },
+                ),
+            ),
+        };
+        send_ack(executor_id, &request_tx, &pending_acks, build, timeout).await?;
+        let now = Instant::now();
+        let mut delivered = delivered.lock();
+        let table_delivered = delivered.entry(table.to_string()).or_default();
+        table_delivered.extend(added.iter().map(|bytes| (bytes.clone(), now)));
+        for bytes in removed {
+            table_delivered.remove(bytes);
+        }
+        Ok(())
+    }
+
     /// Resolves a table's partitions using the accelerations partition store and returns
     /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
+    ///
+    /// `discovered` says whether the table's partitions come from discovery (a
+    /// spicepod dataset or view with `partition_by`): such a table without
+    /// partition metadata has not been discovered yet, and its query fails. Any
+    /// other accelerated table without partition metadata is read from one
+    /// executor.
     ///
     /// # Errors
     ///
@@ -960,6 +1090,7 @@ impl ExecutorRegistry {
         &self,
         table: &TableReference,
         schema: &SchemaRef,
+        discovered: bool,
     ) -> DataFusionResult<PartitionProviders> {
         let (Ok(connections), Ok(flight_sql_clients)) = (
             self.connections.try_read(),
@@ -969,21 +1100,121 @@ impl ExecutorRegistry {
         };
         let executors = ready_executors(&connections, &flight_sql_clients);
         let executor_statistics = self.executor_statistics_snapshot(table);
-        get_partitions_from_store(
-            &self.accelerations_partition_store,
-            &executors,
-            table,
-            schema,
-            &executor_statistics,
-            self.node_id.as_deref(),
-        )
+        let current: HashMap<String, String> = {
+            let processes = self.processes.lock();
+            executors
+                .keys()
+                .map(|id| {
+                    let process = processes
+                        .get(id)
+                        .and_then(|seen| seen.current.clone())
+                        .unwrap_or_default();
+                    (id.clone(), process)
+                })
+                .collect()
+        };
+        let key = normalized_table_name(table);
+        let routed = {
+            let coverage = self.coverage.read();
+            let gate = LoadGate {
+                coverage: coverage.get(&key),
+                current: &current,
+                discovered,
+            };
+            get_partitions_from_store(
+                &self.accelerations_partition_store,
+                &executors,
+                table,
+                schema,
+                &executor_statistics,
+                self.node_id.as_deref(),
+                Some(&gate),
+            )?
+        };
+        if let Some(complete) = routed.complete {
+            self.coverage.write().entry(key).or_default().last_complete = Some(complete);
+        }
+        Ok(routed.providers)
+    }
+}
+
+/// Lets a query read a partition only from an executor whose current process
+/// reported it loaded.
+struct LoadGate<'a> {
+    coverage: Option<&'a TableCoverage>,
+    /// The current process of each ready executor.
+    current: &'a HashMap<String, String>,
+    /// Whether the table's partitions come from discovery, so a table without
+    /// partition metadata has not been discovered yet.
+    discovered: bool,
+}
+
+impl LoadGate<'_> {
+    /// The partitions the current process of `executor_id` reported loaded.
+    fn loaded(&self, executor_id: &str) -> Option<&HashSet<PartitionKey>> {
+        let loaded = self.coverage?.loaded.get(executor_id)?;
+        (self.current.get(executor_id) == Some(&loaded.process_id)).then_some(&loaded.partitions)
+    }
+
+    /// Whether every partition of the last set read whole is still `covered`,
+    /// so a query reads that complete set while the partitions added since
+    /// load. A partition of that set that was removed or is no longer loaded
+    /// means the rows it held may now be in a partition that has not loaded.
+    fn can_skip(&self, covered: &HashSet<PartitionKey>) -> bool {
+        self.coverage
+            .and_then(|coverage| coverage.last_complete.as_ref())
+            .is_some_and(|complete| complete.is_subset(covered))
+    }
+}
+
+/// Partitions resolved for one table scan.
+struct Routed {
+    providers: PartitionProviders,
+    /// With a [`LoadGate`], the table's partitions when every one of them was
+    /// loaded on a ready executor.
+    complete: Option<HashSet<PartitionKey>>,
+}
+
+/// A routing failure a later retry can overcome.
+fn partitions_unavailable(message: String) -> DataFusionError {
+    DataFusionError::External(SpiceExternalError::partitions_unavailable(message))
+}
+
+/// Sends the command `build_command` makes on `request_tx` and waits for the
+/// executor's ack on `pending_acks`.
+async fn send_ack(
+    executor_id: &str,
+    request_tx: &mpsc::Sender<SchedulerControlMessage>,
+    pending_acks: &CorrelatedResponses<Ack>,
+    build_command: impl FnOnce(String) -> SchedulerControlMessage + Send,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    match send_correlated(request_tx, pending_acks, build_command, Some(timeout)).await {
+        Ok(ack) => match ack.error {
+            Some(error) if !error.is_empty() => Err(Error::AckFailed {
+                executor_id: executor_id.to_string(),
+                error,
+            }),
+            _ => Ok(()),
+        },
+        Err(CorrelationError::SendFailed) => Err(Error::SendFailed {
+            executor_id: executor_id.to_string(),
+        }),
+        Err(CorrelationError::Cancelled) => Err(Error::ReceiveFailed {
+            executor_id: executor_id.to_string(),
+            reason: "ack channel closed".to_string(),
+        }),
+        Err(CorrelationError::Timeout { duration }) => Err(Error::AckTimeout {
+            executor_id: executor_id.to_string(),
+            duration,
+        }),
     }
 }
 
 /// The error for a query planned while an executor connects or disconnects. Planning cannot
 /// wait for the registry's locks, and a partial executor list would drop rows.
 fn executors_changing(table: &TableReference) -> DataFusionError {
-    DataFusionError::Plan(format!(
+    partitions_unavailable(format!(
         "Cannot query {table}: the scheduler's executors are changing; retry the query"
     ))
 }
@@ -1055,21 +1286,46 @@ fn stamp_executor_statistics(
     statistics
 }
 
-/// Returns an empty list only when the table's partition metadata lists no partitions.
+/// Returns an empty list only when the table's partition metadata lists no
+/// partitions, or, with a `gate`, none that a query can read yet.
+///
+/// With a `gate`, a partition is read only from an executor whose current process
+/// reported it loaded, and only from an executor that has not loaded a partition
+/// the table assigns to another executor (its scan would return those rows too).
+/// A partition no ready executor has loaded fails the query, unless it is newer
+/// than the last time the whole table was loaded: the query then reads that
+/// complete set, as a single node reads its last refresh while the next one
+/// loads.
 ///
 /// # Errors
 ///
-/// Returns an error when no ready executor serves the table, or one of its partitions.
-pub(crate) fn get_partitions_from_store(
+/// Returns an error when the table has no partition metadata and `gate` says its
+/// partitions come from discovery, or when no ready executor serves the table, or
+/// one of its partitions.
+fn get_partitions_from_store(
     partition_store: &PartitionStore,
     executors: &HashMap<String, (&ExecutorConnection, &FlightSqlClient)>,
     table: &TableReference,
     schema: &SchemaRef,
     executor_statistics: &HashMap<String, ExecutorTableStatistics>,
     node_id: Option<&str>,
-) -> DataFusionResult<PartitionProviders> {
+    gate: Option<&LoadGate<'_>>,
+) -> DataFusionResult<Routed> {
     let Some(table_metadata) = partition_store.get_cached_table_metadata(table) else {
+        if gate.is_some_and(|gate| gate.discovered) {
+            if let Some(node_id) = node_id {
+                metrics::record_query_planning_failure(
+                    node_id,
+                    metrics::PlanningFailure::MissingPartitions,
+                );
+            }
+            return Err(partitions_unavailable(format!(
+                "Cannot query {table}: its partitions have not been discovered yet; retry the query"
+            )));
+        }
         // No partition metadata — route to a single live executor to avoid duplicate results.
+        // A table whose executors each hold all of it, such as an accelerated
+        // table created by DDL.
         let Some((executor_id, (_, client))) = executors.iter().min_by_key(|(id, _)| id.as_str())
         else {
             tracing::warn!(
@@ -1081,7 +1337,7 @@ pub(crate) fn get_partitions_from_store(
                     metrics::PlanningFailure::NoExecutors,
                 );
             }
-            return Err(DataFusionError::Plan(format!(
+            return Err(partitions_unavailable(format!(
                 "Cannot query {table}: no ready executor serves it"
             )));
         };
@@ -1093,103 +1349,164 @@ pub(crate) fn get_partitions_from_store(
         // so the coordinator can size joins even on this no-partition-metadata
         // fallback path (previously this passed `None`, silently degrading plans).
         let statistics = stamp_executor_statistics(executor_statistics, executor_id, table, schema);
-        return Ok(vec![(
-            flight_sql_table_provider(
-                executor_id,
-                (*client).clone(),
-                table,
-                Arc::clone(schema),
-                statistics,
-            ),
-            Vec::new(),
-        )]);
+        return Ok(Routed {
+            providers: vec![(
+                flight_sql_table_provider(
+                    executor_id,
+                    (*client).clone(),
+                    table,
+                    Arc::clone(schema),
+                    statistics,
+                ),
+                Vec::new(),
+            )],
+            complete: None,
+        });
     };
 
-    // All required partitions (future: filter by query predicates)
-    let required_partitions: Vec<HashMap<String, Option<String>>> = table_metadata
-        .partitions
-        .iter()
-        .map(|p| p.partition_value.clone())
-        .collect();
-
-    if required_partitions.is_empty() {
+    if table_metadata.partitions.is_empty() {
         tracing::debug!("No partitions required for table {table}");
-        return Ok(Vec::new());
+        return Ok(Routed {
+            providers: Vec::new(),
+            complete: gate.map(|_| HashSet::new()),
+        });
     }
 
-    // Build executor -> partitions map, excluding dead executors. Per-executor
-    // row-count statistics (used below to size the coordinator's joins) come
-    // from `table_metadata.executor_statistics`, which each executor reports
-    // for the slice of the table it serves (see `handle_partitions_loaded`).
+    // Executors whose scans may be used: ready, and, with a gate, holding only
+    // partitions the table assigns to them.
+    let owners: HashMap<PartitionKey, &[String]> = table_metadata
+        .partitions
+        .iter()
+        .map(|p| {
+            (
+                partition_key(&p.partition_value),
+                p.assigned_executors.as_slice(),
+            )
+        })
+        .collect();
+    let usable: HashMap<&str, Option<&HashSet<PartitionKey>>> = executors
+        .keys()
+        .filter_map(|executor_id| {
+            let Some(gate) = gate else {
+                return Some((executor_id.as_str(), None));
+            };
+            let loaded = gate.loaded(executor_id)?;
+            let holds_others = loaded.iter().any(|key| {
+                owners
+                    .get(key)
+                    .is_some_and(|assigned| !assigned.iter().any(|e| e == executor_id))
+            });
+            (!holds_others).then_some((executor_id.as_str(), Some(loaded)))
+        })
+        .collect();
+
+    // Build executor -> partitions map from the executors that can serve each
+    // partition. Per-executor row-count statistics (used below to size the
+    // coordinator's joins) come from the reports each executor sends for the
+    // slice of the table it serves (see `handle_executor_statistics`).
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
+    let mut holders: HashMap<PartitionKey, Vec<&str>> = HashMap::new();
+    let mut covered: Vec<PartitionValue> = Vec::new();
+    let mut covered_keys: HashSet<PartitionKey> = HashSet::new();
+    let mut uncovered: Vec<PartitionKey> = Vec::new();
     for partition_meta in &table_metadata.partitions {
+        let key = partition_key(&partition_meta.partition_value);
+        let mut served = false;
         for executor_id in &partition_meta.assigned_executors {
-            if !executors.contains_key(executor_id) {
+            let Some(loaded) = usable.get(executor_id.as_str()) else {
                 tracing::debug!(
-                    "Executor '{}' has partition assignment but is no longer alive; excluding from selection",
-                    executor_id
+                    "Executor '{executor_id}' has partition assignment but is not ready or holds other executors' partitions; excluding from selection"
                 );
                 continue;
+            };
+            if loaded.is_some_and(|loaded| !loaded.contains(&key)) {
+                continue;
             }
+            served = true;
+            holders.entry(key.clone()).or_default().push(executor_id);
             executor_partition_map
                 .entry(executor_id.clone())
                 .or_default()
                 .push(partition_meta.partition_value.clone());
         }
+        if served {
+            covered.push(partition_meta.partition_value.clone());
+            covered_keys.insert(key);
+        } else {
+            uncovered.push(key);
+        }
     }
 
-    // Select minimal set of executors to cover all partitions
-    let selected_executors = match executor_selection::select_executors(
-        &required_partitions,
-        &executor_partition_map,
-    ) {
-        Ok(executors) => executors,
-        Err(executor_selection::Error::MissingPartitions(missing)) => {
-            tracing::error!(
-                "Cannot execute query on table {}: {} partition(s) not assigned to any alive executor. Missing: {:?}",
-                table,
-                missing.len(),
-                missing.iter().take(5).collect::<Vec<_>>()
+    let total = table_metadata.partitions.len();
+    let complete = uncovered.is_empty();
+    if !complete && !gate.is_some_and(|gate| gate.can_skip(&covered_keys)) {
+        tracing::error!(
+            "Cannot execute query on table {}: {} partition(s) not served by any ready executor. Missing: {:?}",
+            table,
+            uncovered.len(),
+            uncovered.iter().take(5).collect::<Vec<_>>()
+        );
+        if let Some(node_id) = node_id {
+            metrics::record_query_planning_failure(
+                node_id,
+                metrics::PlanningFailure::MissingPartitions,
             );
-            if let Some(node_id) = node_id {
-                metrics::record_query_planning_failure(
-                    node_id,
-                    metrics::PlanningFailure::MissingPartitions,
-                );
-            }
-            return Err(DataFusionError::Plan(format!(
-                "Cannot query {table}: no ready executor serves {} of its {} partitions",
-                missing.len(),
-                required_partitions.len()
-            )));
         }
-    };
+        return Err(partitions_unavailable(format!(
+            "Cannot query {table}: no ready executor serves {} of its {total} partitions; retry the query",
+            uncovered.len()
+        )));
+    }
+
+    // Select minimal set of executors to cover all servable partitions
+    let selected_executors =
+        executor_selection::select_executors(&covered, &executor_partition_map)
+            .map_err(|err| partitions_unavailable(format!("Cannot query {table}: {err}")))?;
 
     if let Some(node_id) = node_id {
         metrics::record_query_executor_count(node_id, selected_executors.len() as u64);
     }
 
     tracing::debug!(
-        "Selected {} executor(s) from {} available for table {} (covering {} partition(s))",
+        "Selected {} executor(s) from {} available for table {} (covering {} of {} partition(s))",
         selected_executors.len(),
         executor_partition_map.len(),
         table,
-        required_partitions.len()
+        covered.len(),
+        total
     );
 
-    Ok(selected_executors
-        .into_iter()
+    // Each partition is read from one selected executor, so a scan filtered to the
+    // partitions its executor serves returns no partition twice.
+    let mut to_read: HashMap<&str, Vec<PartitionValue>> = HashMap::new();
+    for partition_value in &covered {
+        let reader = holders
+            .get(&partition_key(partition_value))
+            .and_then(|ids| {
+                ids.iter()
+                    .find(|id| selected_executors.iter().any(|selected| selected == **id))
+            });
+        if let Some(reader) = reader {
+            to_read
+                .entry(*reader)
+                .or_default()
+                .push(partition_value.clone());
+        }
+    }
+
+    let providers = selected_executors
+        .iter()
         .filter_map(|executor_id| {
-            let (_, client) = executors.get(&executor_id)?;
-            let partition_values = executor_partition_map.remove(&executor_id)?;
+            let (_, client) = executors.get(executor_id)?;
+            let partition_values = to_read.remove(executor_id.as_str())?;
             // Stamp the executor-reported statistics onto this leaf scan so the
             // coordinator's planner can size joins. Project the reported per-column
             // stats onto the leaf's (possibly projected) schema by name, carrying
             // num_rows and per-column min/max.
             let statistics =
-                stamp_executor_statistics(executor_statistics, &executor_id, table, schema);
+                stamp_executor_statistics(executor_statistics, executor_id, table, schema);
             let provider = flight_sql_table_provider(
-                &executor_id,
+                executor_id,
                 (*client).clone(),
                 table,
                 Arc::clone(schema),
@@ -1197,7 +1514,11 @@ pub(crate) fn get_partitions_from_store(
             );
             Some((provider, partition_values))
         })
-        .collect())
+        .collect();
+    Ok(Routed {
+        providers,
+        complete: (gate.is_some() && complete).then(|| owners.into_keys().collect()),
+    })
 }
 
 /// Partition provider for federated (non-accelerated) tables such as Cayenne tables.
@@ -1255,6 +1576,8 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             .cloned()
             .unwrap_or_default();
 
+        // Each scan is filtered to the partitions its executor serves: an executor can
+        // hold rows of other partitions, such as a table it loaded whole.
         Ok(get_partitions_from_store(
             &self.partition_store,
             &executors,
@@ -1262,10 +1585,9 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             schema,
             &executor_statistics,
             self.node_id.as_deref(),
+            None,
         )?
-        .into_iter()
-        .map(|(provider, _)| (provider, vec![]))
-        .collect())
+        .providers)
     }
 }
 
@@ -1840,16 +2162,281 @@ mod tests {
         ]))
     }
 
+    /// A table with no partition metadata has not been discovered: reading
+    /// one executor would return only that executor's rows, or none.
     #[tokio::test]
-    async fn a_table_without_a_ready_executor_does_not_resolve() {
+    async fn a_table_without_partition_metadata_does_not_resolve() {
         let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
         let table = TableReference::bare("t");
 
         let error = registry
-            .resolve_accelerated_partitions(&table, &id_schema())
-            .expect_err("no executor is ready");
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("the table has no partition metadata");
         assert!(
-            error.to_string().contains("no ready executor serves it"),
+            runtime_datafusion::error::is_partitions_unavailable(&error),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("have not been discovered yet"),
+            "unexpected error: {error}"
+        );
+
+        // An accelerated table whose partitions are not discovered, such as one
+        // created by DDL, is read from one executor.
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), false)
+            .expect("a table that is not discovered resolves");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    /// Each executor of a federated table is read for the partitions it serves,
+    /// so a scan filtered to them returns none of the rows it holds for others.
+    #[tokio::test]
+    async fn federated_scans_carry_the_partitions_their_executor_serves() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        ready_executor(&registry, "executor-2", "").await;
+        let table = TableReference::full("ice", "ns", "t");
+        let store = registry.federated_partition_store();
+        store
+            .initialize_metadata(&table, vec!["region".to_string()])
+            .await
+            .expect("initialize");
+        let region = |value: &str| HashMap::from([("region".to_string(), Some(value.to_string()))]);
+        let (east, west, north) = (region("'east'"), region("'west'"), region("'north'"));
+        store
+            .add_and_assign_partitions(
+                &table,
+                &[
+                    (&east, "executor-1"),
+                    (&west, "executor-2"),
+                    (&north, "executor-1"),
+                ],
+            )
+            .await
+            .expect("assign");
+
+        let mut served: Vec<Vec<String>> = FederatedPartitionProvider::from_registry(&registry)
+            .get_partitions(&table, &id_schema())
+            .expect("resolve")
+            .into_iter()
+            .map(|(_, values)| {
+                let mut regions: Vec<String> = values
+                    .iter()
+                    .filter_map(|value| value.get("region").cloned().flatten())
+                    .collect();
+                regions.sort();
+                regions
+            })
+            .collect();
+        served.sort();
+        assert_eq!(served, [vec!["'east'", "'north'"], vec!["'west'"]]);
+    }
+
+    async fn ready_executor(registry: &ExecutorRegistry, executor_id: &str, process_id: &str) {
+        let (tx, rx) = mpsc::channel(1);
+        std::mem::forget(rx);
+        registry
+            .register(executor_id.to_string(), process_id, tx)
+            .await;
+        registry
+            .insert_flight_sql_client(
+                executor_id.to_string(),
+                "127.0.0.1:1".to_string(),
+                process_id,
+                dummy_flight_sql_client(),
+            )
+            .await;
+    }
+
+    fn bucket(value: i64) -> PartitionValue {
+        HashMap::from([("bucket(2, id)".to_string(), Some(value.to_string()))])
+    }
+
+    /// Seeds `t` with one partition per entry of `owners`, assigned to it.
+    async fn seed_assigned(registry: &ExecutorRegistry, owners: &[&str]) -> TableReference {
+        let table = TableReference::bare("t");
+        let store = registry.accelerations_partition_store();
+        let partitions: Vec<PartitionValue> = (0_i64..).take(owners.len()).map(bucket).collect();
+        store
+            .set_unassigned_partitions(
+                &table,
+                partitions.clone(),
+                vec!["bucket(2, id)".to_string()],
+            )
+            .await
+            .expect("seed partitions");
+        for (partition, owner) in partitions.iter().zip(owners) {
+            store
+                .assign_partition(&table, partition, owner)
+                .await
+                .expect("assign partition");
+        }
+        table
+    }
+
+    fn loaded(process_id: &str, buckets: &[i64]) -> LoadedPartitions {
+        LoadedPartitions {
+            process_id: process_id.to_string(),
+            partitions: buckets.iter().map(|b| partition_key(&bucket(*b))).collect(),
+        }
+    }
+
+    /// A partition assigned to a ready executor that has not reported it loaded
+    /// is not read: the executor would answer from data that lacks it.
+    #[tokio::test]
+    async fn an_assigned_partition_not_reported_loaded_does_not_resolve() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = seed_assigned(&registry, &["executor-1", "executor-1"]).await;
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("no partition is loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 2 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+        assert!(runtime_datafusion::error::is_partitions_unavailable(&error));
+
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[0, 1]))]),
+        );
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("every partition is loaded");
+        assert_eq!(partitions.len(), 1);
+    }
+
+    /// Partitions an earlier process of the executor reported loaded do not
+    /// count for the process now registered.
+    #[tokio::test]
+    async fn partitions_an_earlier_process_loaded_do_not_count() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "p2").await;
+        let table = seed_assigned(&registry, &["executor-1"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("p1", &[0]))]),
+        );
+
+        registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("the loaded partition belongs to an earlier process");
+    }
+
+    /// A partition added after the whole table was last loaded is skipped
+    /// until it loads; a partition of that complete set that is no longer
+    /// loaded fails the query.
+    #[tokio::test]
+    async fn a_new_partition_is_read_once_loaded_and_a_lost_one_fails() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = seed_assigned(&registry, &["executor-1"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[0]))]),
+        );
+        registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("the whole table is loaded");
+
+        let store = registry.accelerations_partition_store();
+        store
+            .apply_discovery(&table, &["bucket(2, id)".to_string()], &[bucket(1)], &[])
+            .await
+            .expect("discover a partition");
+        store
+            .assign_partition(&table, &bucket(1), "executor-1")
+            .await
+            .expect("assign partition");
+        let partitions = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("the new partition is skipped until it loads");
+        assert_eq!(partitions.len(), 1);
+
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[1]))]),
+        );
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("a partition of the complete set is no longer loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 1 of its 2 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// When a partition replaces one of the last set read whole, its rows may
+    /// have moved there, so the table is not read until it loads.
+    #[tokio::test]
+    async fn a_partition_that_replaces_a_read_one_is_not_skipped() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        let table = seed_assigned(&registry, &["executor-1"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([("executor-1".to_string(), loaded("", &[0]))]),
+        );
+        registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect("the whole table is loaded");
+
+        let store = registry.accelerations_partition_store();
+        store
+            .apply_discovery(
+                &table,
+                &["bucket(2, id)".to_string()],
+                &[bucket(1)],
+                &[bucket(0)],
+            )
+            .await
+            .expect("replace the partition");
+        store
+            .assign_partition(&table, &bucket(1), "executor-1")
+            .await
+            .expect("assign partition");
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("the replacement has not loaded");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 1 of its 1 partitions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// An executor that holds a partition the table assigns to another
+    /// executor is not read: its scan would return that partition's rows too.
+    #[tokio::test]
+    async fn an_executor_holding_another_executors_partition_is_not_read() {
+        let registry = make_registry().await;
+        ready_executor(&registry, "executor-1", "").await;
+        ready_executor(&registry, "executor-2", "").await;
+        let table = seed_assigned(&registry, &["executor-1", "executor-2"]).await;
+        registry.set_loaded_partitions(
+            &table,
+            HashMap::from([
+                ("executor-1".to_string(), loaded("", &[0, 1])),
+                ("executor-2".to_string(), loaded("", &[1])),
+            ]),
+        );
+
+        let error = registry
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
+            .expect_err("executor-1 also holds executor-2's partition");
+        assert!(
+            error
+                .to_string()
+                .contains("no ready executor serves 1 of its 2 partitions"),
             "unexpected error: {error}"
         );
     }
@@ -1879,7 +2466,7 @@ mod tests {
         registry.register("executor-1".to_string(), "", tx).await;
 
         let error = registry
-            .resolve_accelerated_partitions(&table, &id_schema())
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
             .expect_err("no partition has a ready executor");
         assert!(
             error
@@ -1900,7 +2487,7 @@ mod tests {
             .expect("seed partitions");
 
         let partitions = registry
-            .resolve_accelerated_partitions(&table, &id_schema())
+            .resolve_accelerated_partitions(&table, &id_schema(), true)
             .expect("a table with no partitions resolves");
         assert!(partitions.is_empty());
     }

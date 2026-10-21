@@ -1366,7 +1366,10 @@ impl DataFusionBuilder {
                 // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                    Arc::new(AcceleratedPartitionProvider::from_registry(
+                        Arc::clone(executor_registry),
+                        self.partition_service.as_ref().map(|service| Arc::clone(&service.app)),
+                    ))
                         as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
@@ -1455,6 +1458,7 @@ impl DataFusionBuilder {
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             change_generations: super::change_generations::ChangeGenerations::default(),
             bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_writers: parking_lot::Mutex::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
@@ -1479,6 +1483,7 @@ impl DataFusionBuilder {
             task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            interactive_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),

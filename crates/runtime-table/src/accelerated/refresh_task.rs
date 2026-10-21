@@ -65,8 +65,8 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::{StreamExt, stream};
 use opentelemetry::KeyValue;
-use runtime_acceleration::SnapshotPoll;
 use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
+use runtime_acceleration::{SnapshotPoll, SnapshotPollOutcome};
 use runtime_component::dataset::TimeFormat;
 use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_datafusion::analyzer_rule::AnalyzerRulesBuilder;
@@ -890,7 +890,8 @@ impl RefreshTask {
         // optimization does not apply: skipping would silently drop the override and retain the
         // previously-materialized rows (issue #11353). When an override is present, bypass the
         // skip check and reset the provider's cached version so the *next* plain refresh
-        // re-materializes the full source instead of skipping against the narrowed data.
+        // re-materializes the full source instead of skipping against the narrowed data. A reload
+        // reads the source whether or not it changed, so it skips the check.
         if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
             let table_provider = self.federated.table_provider().await;
 
@@ -899,7 +900,7 @@ impl RefreshTask {
                     table_provider.as_ref(),
                 )
                 .await;
-            } else {
+            } else if !refresh.reload {
                 match data_components::refresh_skip::should_skip_refresh_for_table_provider(
                     table_provider.as_ref(),
                 )
@@ -998,7 +999,9 @@ impl RefreshTask {
                 // For snapshot mode, poll the snapshot store for a newer snapshot
                 // and reload the accelerator from it. The federated source is
                 // never queried for refreshes in this mode.
-                return self.refresh_from_snapshot(refresh).await;
+                return self
+                    .refresh_from_snapshot(refresh, &dataset_metrics_label_sets)
+                    .await;
             }
         };
 
@@ -1288,8 +1291,7 @@ impl RefreshTask {
         );
 
         let record_batch_stream = Box::pin(observed_record_batch_stream);
-        let sink_lock = self.sink.read().await;
-        let sink = &*sink_lock;
+        let sink_lock = Arc::clone(&self.sink).read_owned().await;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
         // Ordering versions by time, the refresh may have counted the rows it did not
@@ -1305,10 +1307,29 @@ impl RefreshTask {
             superseded: table_counts.then(|| Arc::clone(&superseded)),
             row_versions,
         };
-        if let Err(e) = sink
-            .insert_into(record_batch_stream, overwrite, &write)
-            .await
-        {
+        let insert = async move {
+            sink_lock
+                .insert_into(record_batch_stream, overwrite, &write)
+                .await
+        };
+        // The write is CPU-heavy (sort, encode): run it on the dedicated refresh runtime, when
+        // provided, to keep it off the main runtime, which serves queries.
+        let result = match self.cpu_runtime.clone() {
+            Some(refresh_runtime) => {
+                let request_context = RequestContext::current(AsyncMarker::new().await);
+                let task = refresh_runtime
+                    .spawn(request_context.scope(insert).instrument(Span::current()));
+                tokio_util::task::AbortOnDropHandle::new(task)
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(RetryError::transient(super::Error::FailedToWriteData {
+                            source: DataFusionError::External(Box::new(join_error)),
+                        }))
+                    })
+            }
+            None => insert.await,
+        };
+        if let Err(e) = result {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
@@ -1993,6 +2014,7 @@ impl RefreshTask {
     async fn refresh_from_snapshot(
         &self,
         refresh: &Refresh,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
         let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
 
@@ -2077,34 +2099,11 @@ impl RefreshTask {
 
         let (info, metadata_e_tag) = match download_result {
             Ok(SnapshotPoll {
-                download: Some(info),
+                outcome: SnapshotPollOutcome::Downloaded(info),
                 metadata_e_tag,
             }) => (info, metadata_e_tag),
-            Ok(SnapshotPoll { download: None, .. }) if current_local_id.is_none() => {
-                // No snapshot has ever been loaded and none is available at the configured location.
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    snapshot_location = %state.manager.snapshot_location(),
-                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
-                );
-                self.set_refresh_status(
-                    None,
-                    status::ComponentStatus::error_with_message(
-                        "no snapshot available".to_string(),
-                    ),
-                )
-                .await;
-                return Err(RetryError::transient(
-                    super::Error::FailedToRefreshDataset {
-                        source: datafusion::error::DataFusionError::Internal(
-                            "refresh_mode: snapshot - no snapshot found at the configured location"
-                                .to_string(),
-                        ),
-                    },
-                ));
-            }
             Ok(SnapshotPoll {
-                download: None,
+                outcome: SnapshotPollOutcome::UpToDate,
                 metadata_e_tag,
             }) => {
                 state.record_metadata_e_tag(metadata_e_tag);
@@ -2113,10 +2112,52 @@ impl RefreshTask {
                     current_snapshot_id = ?current_local_id,
                     "refresh_mode: snapshot - no newer snapshot available; skipping reload"
                 );
-                let dataset_metrics_label_sets =
-                    self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
                 return Ok(self
-                    .finish_up_to_date(refresh, &dataset_metrics_label_sets)
+                    .finish_up_to_date(refresh, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome: SnapshotPollOutcome::NotPublished,
+                ..
+            }) => {
+                let error = super::Error::SnapshotNotPublished {
+                    location: state.manager.snapshot_location().to_string(),
+                };
+                let Some(loaded_id) = current_local_id else {
+                    // Nothing is loaded yet: fail the refresh so the retry loop counts
+                    // and retries it.
+                    tracing::warn!(
+                        "Dataset '{}' has no snapshot to load, so it cannot be queried until one is published. Cause: {error}",
+                        self.dataset_name
+                    );
+                    self.set_refresh_status(
+                        None,
+                        status::ComponentStatus::error_with_message(
+                            "no snapshot available".to_string(),
+                        ),
+                    )
+                    .await;
+                    return Err(RetryError::transient(error));
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
+                    .await);
+            }
+            Ok(SnapshotPoll {
+                outcome:
+                    SnapshotPollOutcome::OlderThanLoaded {
+                        published_id,
+                        loaded_id,
+                    },
+                ..
+            }) => {
+                let error = super::Error::SnapshotOlderThanLoaded {
+                    location: state.manager.snapshot_location().to_string(),
+                    published_id,
+                    loaded_id,
+                };
+                return Ok(self
+                    .keep_serving_loaded_snapshot(&error, loaded_id, dataset_metrics_label_sets)
                     .await);
             }
             Err(e) => {
@@ -2323,6 +2364,28 @@ impl RefreshTask {
         self.set_refresh_status(None, status::ComponentStatus::Ready)
             .await;
         Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Counts and logs a poll that could not advance to the published snapshot. The
+    /// dataset keeps serving snapshot `loaded_id`, so it stays `Ready` and the refresh
+    /// reports it up to date.
+    async fn keep_serving_loaded_snapshot(
+        &self,
+        error: &super::Error,
+        loaded_id: u64,
+        dataset_metrics_label_sets: &[Vec<KeyValue>],
+    ) -> RefreshOutcome {
+        emit_refresh_errors(
+            dataset_metrics_label_sets.to_vec(),
+            refresh_error_reason(error),
+        );
+        tracing::warn!(
+            "Dataset '{}' cannot refresh from its snapshot location, so it keeps serving snapshot {loaded_id}. Cause: {error}",
+            self.dataset_name
+        );
+        self.set_refresh_status(None, status::ComponentStatus::Ready)
+            .await;
+        RefreshOutcome::UpToDate
     }
 
     async fn trace_load_completed(
@@ -3119,6 +3182,9 @@ impl RefreshTask {
                     RefreshMode::Full => label_set.push(KeyValue::new("mode", "full".to_string())),
                     RefreshMode::Append => {
                         label_set.push(KeyValue::new("mode", "append".to_string()));
+                    }
+                    RefreshMode::Snapshot => {
+                        label_set.push(KeyValue::new("mode", "snapshot".to_string()));
                     }
                     _ => (),
                 }
@@ -3926,16 +3992,25 @@ fn terminal_generation_change_refresh_error<T>(
 
 /// `dataset_acceleration_refresh_errors{reason=...}` for the error that ended a refresh.
 ///
-/// Generation-change is checked first so a 412 wrapped in a Parquet fetch
-/// error is still filterable, not classified as decoder corruption.
+/// A snapshot poll's own errors name their reason. Otherwise generation-change is
+/// checked first so a 412 wrapped in a Parquet fetch error is still filterable, not
+/// classified as decoder corruption.
 #[must_use]
 pub fn refresh_error_reason(error: &super::Error) -> &'static str {
-    if error_chain_matches(error, looks_like_generation_change) {
-        metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
-    } else if error_chain_matches(error, looks_like_parquet_decode) {
-        metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
-    } else {
-        metrics::REFRESH_ERROR_REASON_OTHER
+    match error {
+        super::Error::SnapshotNotPublished { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND
+        }
+        super::Error::SnapshotOlderThanLoaded { .. } => {
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        }
+        _ if error_chain_matches(error, looks_like_generation_change) => {
+            metrics::REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED
+        }
+        _ if error_chain_matches(error, looks_like_parquet_decode) => {
+            metrics::REFRESH_ERROR_REASON_PARQUET_DECODE
+        }
+        _ => metrics::REFRESH_ERROR_REASON_OTHER,
     }
 }
 
@@ -4758,6 +4833,76 @@ mod tests {
         );
     }
 
+    /// A snapshot poll that cannot advance names its reason on
+    /// `dataset_acceleration_refresh_errors`.
+    #[test]
+    fn snapshot_refresh_errors_name_their_reason() {
+        let not_published = super::super::Error::SnapshotNotPublished {
+            location: "s3://bucket/snapshots/".to_string(),
+        };
+        assert_eq!(
+            refresh_error_reason(&not_published),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND
+        );
+        assert_eq!(
+            not_published.to_string(),
+            "No snapshot of the dataset is published at 's3://bucket/snapshots/'. Ensure the location is correct and that a dataset with `acceleration.snapshots` enabled has published one. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+
+        let older = super::super::Error::SnapshotOlderThanLoaded {
+            location: "s3://bucket/snapshots/".to_string(),
+            published_id: 0,
+            loaded_id: 3,
+        };
+        assert_eq!(
+            refresh_error_reason(&older),
+            metrics::REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED
+        );
+        assert_eq!(
+            older.to_string(),
+            "The snapshot published at 's3://bucket/snapshots/' (id 0) is older than the loaded snapshot (id 3), so it was not loaded. Publish a newer snapshot. See: https://spiceai.org/docs/features/data-acceleration/snapshots"
+        );
+    }
+
+    /// Snapshot refreshes carry `mode="snapshot"`, as source refreshes carry `mode="full"`.
+    #[tokio::test]
+    async fn snapshot_refresh_metrics_carry_the_snapshot_mode() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("snapshot_mode_labels"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        assert_eq!(
+            task.get_dataset_label_sets(&RefreshMode::Snapshot).await,
+            vec![vec![
+                KeyValue::new("dataset", "snapshot_mode_labels"),
+                KeyValue::new("mode", "snapshot"),
+            ]]
+        );
+        assert_eq!(
+            task.get_dataset_label_sets(&RefreshMode::Full).await,
+            vec![vec![
+                KeyValue::new("dataset", "snapshot_mode_labels"),
+                KeyValue::new("mode", "full"),
+            ]]
+        );
+    }
+
     /// The periodic caching refresh fetches under the same process-wide `SessionState` as the
     /// query path; a copy built per task would rebuild the default registry for every dataset.
     #[tokio::test]
@@ -5096,6 +5241,89 @@ mod tests {
             .expect("accelerator rows should be collected");
         let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         assert_eq!(row_count, 1, "insert should remain committed");
+    }
+
+    /// The ids an acceleration holds after `refresh`, when it held ids 7 to 12 (ts 107 to 112)
+    /// and the source holds ids 1 to 12, the first six older (ts 1 to 6).
+    async fn ids_after_refresh(refresh: Refresh) -> Vec<i64> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let rows = |ids: std::ops::RangeInclusive<i64>| {
+            let ts = ids
+                .clone()
+                .map(|id| if id <= 6 { id } else { id + 100 })
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids.collect::<Vec<_>>())),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .expect("batch builds")
+        };
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(7..=12)]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![rows(1..=12)]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let task = RefreshTaskBuilder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("reload"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+        task.run(refresh).await.expect("the refresh runs");
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("accelerator scan should succeed");
+        let mut ids: Vec<i64> = collect(plan, ctx.task_ctx())
+            .await
+            .expect("accelerator rows should be collected")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64");
+                (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_reload_of_an_append_dataset_loads_rows_older_than_its_acceleration() {
+        let append = || {
+            Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::UnixSeconds)
+        };
+        assert_eq!(
+            ids_after_refresh(append().for_run()).await,
+            (7..=12).collect::<Vec<_>>(),
+            "an append reads only rows newer than the acceleration's"
+        );
+        let mut owing = append();
+        owing.owe_reload();
+        assert_eq!(
+            ids_after_refresh(owing.for_run()).await,
+            (1..=12).collect::<Vec<_>>()
+        );
     }
 
     /// Tests that `max_timestamp_df` returns the maximum value for integer time columns
