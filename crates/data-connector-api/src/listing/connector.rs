@@ -2477,7 +2477,8 @@ impl ListingFileFilter for FormatSelectedDataFiles {
 /// column count even for one file, so the width must be known before it runs. Only
 /// formats that can report it cheaply and exactly are measured here — CSV/TSV from the
 /// header and first record, Parquet from the footer (through the session's metadata
-/// cache, which the inference that follows reads from) — and any failure to measure is
+/// cache, which the inference that follows reads from), and line-delimited JSON from
+/// the first value's top-level keys — and any failure to measure is
 /// left for the inference to report. Every other format is checked once its schema is
 /// resolved, by [`crate::column_limit::read_provider_within_column_limit`].
 async fn ensure_inferred_width_within_limit(
@@ -2529,7 +2530,39 @@ async fn probe_column_count(
                 .len(),
         );
     }
+    if format.is::<JsonFormat>() {
+        return probe_json_column_count(store, object, file_format.compression_type()).await;
+    }
     None
+}
+
+/// The top-level key count of the first JSON value in `object`.
+///
+/// Default JSONL uses `DataFusion`'s `JsonFormat`, whose schema inference ends in
+/// `Schema::try_merge`. One value is enough to refuse a single wide record before
+/// that merge; a later record that widens the union is still refused once the
+/// schema is resolved.
+async fn probe_json_column_count(
+    store: &Arc<dyn ObjectStore>,
+    object: &ObjectMeta,
+    compression: Option<FileCompressionType>,
+) -> Option<usize> {
+    let bytes = store.get(&object.location).await.ok()?.bytes().await.ok()?;
+    let compression = compression.unwrap_or(FileCompressionType::UNCOMPRESSED);
+    let mut reader = compression.convert_read(std::io::Cursor::new(bytes)).ok()?;
+    let value: serde_json::Value = serde_json::from_reader(&mut reader).ok()?;
+    json_value_width(&value)
+}
+
+fn json_value_width(value: &serde_json::Value) -> Option<usize> {
+    match value {
+        serde_json::Value::Object(map) => Some(map.len()),
+        serde_json::Value::Array(items) => items.iter().find_map(json_value_width),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+    }
 }
 
 /// List matching `ORC` objects and merge their footers. Used instead of
@@ -2875,6 +2908,18 @@ mod tests {
         format!("{header}\n{row}\n")
     }
 
+    fn jsonl_of_width(columns: usize) -> String {
+        let mut line = String::from("{");
+        for index in 0..columns {
+            if index > 0 {
+                line.push(',');
+            }
+            line.push_str(&format!("\"k{index}\":1"));
+        }
+        line.push_str("}\n");
+        line
+    }
+
     /// Resolves a single flat file through the listing schema path and returns its
     /// column count, or the error the path refused it with.
     async fn inferred_listing_width(
@@ -2886,7 +2931,8 @@ mod tests {
         match file_format {
             "csv" => std::fs::write(&path, csv_of_width(columns)).expect("write the csv"),
             "parquet" => write_flat_parquet(&path, columns),
-            other => panic!("this test only covers csv and parquet, not {other}"),
+            "jsonl" => std::fs::write(&path, jsonl_of_width(columns)).expect("write the jsonl"),
+            other => panic!("this test only covers csv, parquet, and jsonl, not {other}"),
         }
         let url = Url::from_file_path(&path).expect("a file URL");
         let mut params = HashMap::new();
@@ -2896,7 +2942,7 @@ mod tests {
             .get_file_format_and_extension(&dataset)
             .await
             .expect("the file format resolves");
-        let format = format.expect("csv and parquet are structured formats");
+        let format = format.expect("csv, parquet, and jsonl are structured formats");
         match connector
             .listing_table_template(&dataset, &url, &extension, format)
             .await
@@ -2920,7 +2966,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_past_the_column_limit_is_refused_before_its_schema_is_merged() {
         let columns = crate::column_limit::MAX_SCHEMA_COLUMNS + 1;
-        for file_format in ["csv", "parquet"] {
+        for file_format in ["csv", "parquet", "jsonl"] {
             let err = inferred_listing_width(file_format, columns)
                 .await
                 .expect_err("a file past the column limit must be refused");
@@ -2931,7 +2977,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_at_the_column_limit_still_resolves() {
         let columns = crate::column_limit::MAX_SCHEMA_COLUMNS;
-        for file_format in ["csv", "parquet"] {
+        for file_format in ["csv", "parquet", "jsonl"] {
             let inferred = inferred_listing_width(file_format, columns)
                 .await
                 .expect("a file at the column limit must still resolve");
