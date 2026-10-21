@@ -1307,14 +1307,16 @@
           {
             "name": "namespace",
             "in": "path",
+            "description": "The namespace of the table.",
             "required": true,
             "schema": {
-              "$ref": "#/components/schemas/NamespacePath"
+              "type": "string"
             }
           },
           {
             "name": "table",
             "in": "path",
+            "description": "The name of the table.",
             "required": true,
             "schema": {
               "type": "string"
@@ -5175,6 +5177,13 @@
             "description": "'Type of operation: `and` or `or`.'"
           }
         }
+      },
+      "CompoundType": {
+        "type": "string",
+        "enum": [
+          "and",
+          "or"
+        ]
       },
       "ComputerAction": {
         "oneOf": [
