@@ -1289,18 +1289,7 @@ impl GraphQLClient {
         }
 
         // Read the raw body first so we can classify it before JSON decoding.
-        // Read under a cap on the decoded size, so a compressed body cannot expand into an
-        // unbounded allocation. A failed read keeps its transport classification for retries.
-        let response_bytes =
-            match http_body_limit::read_bytes(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
-                .await
-            {
-                Ok(bytes) => bytes,
-                Err(http_body_limit::Error::Read { source }) => {
-                    return Err(Error::ReqwestInternal { source });
-                }
-                Err(source) => return Err(Error::ResponseTooLarge { source }),
-            };
+        let response_bytes = response.bytes().await.context(ReqwestInternalSnafu)?;
         let http_elapsed = http_started.elapsed();
         let response_text = String::from_utf8_lossy(&response_bytes).into_owned();
 

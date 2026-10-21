@@ -41,12 +41,6 @@ pub enum Error {
     #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
     ReqwestInternal { source: reqwest::Error },
 
-    #[snafu(display(
-        "Failed to read the GraphQL response: {source}. Request fewer rows per page so each \
-        response is smaller. See: https://spiceai.org/docs/components/data-connectors/graphql"
-    ))]
-    ResponseTooLarge { source: http_body_limit::Error },
-
     #[snafu(display("HTTP {status}: {message}"))]
     InvalidReqwestStatus {
         status: reqwest::StatusCode,

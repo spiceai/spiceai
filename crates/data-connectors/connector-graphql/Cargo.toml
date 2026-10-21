@@ -33,7 +33,6 @@ datafusion.workspace = true
 futures.workspace = true
 graphql-parser.workspace = true
 http.workspace = true
-http-body-limit = { path = "../../http-body-limit" }
 linkme.workspace = true
 paste.workspace = true
 regex.workspace = true

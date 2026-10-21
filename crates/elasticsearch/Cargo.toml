@@ -26,7 +26,6 @@ description = "Elasticsearch client for Spice.ai runtime"
 [dependencies]
 async-trait.workspace = true
 bytes = { workspace = true }
-http-body-limit = { path = "../http-body-limit" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
