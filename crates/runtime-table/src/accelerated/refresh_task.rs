@@ -4969,6 +4969,54 @@ mod tests {
         assert_eq!(refresh.state().config().target_partitions(), cores);
     }
 
+    /// File datasets fail a refresh scan, rather than loading NULLs, when their source
+    /// files lost a registered column; they tell a refresh scan apart by this marker.
+    #[tokio::test]
+    async fn refresh_session_is_marked_as_acceleration_refresh() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let source = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let refresh = RefreshTask::create_refresh_df_context(
+            source,
+            &TableReference::bare("drift_marked_refresh"),
+            &accelerator,
+            false,
+            Handle::current(),
+        )
+        .await;
+        assert!(data_components::file_schema_drift::is_acceleration_refresh(
+            &refresh.state()
+        ));
+        assert!(
+            !data_components::file_schema_drift::is_acceleration_refresh(
+                &SessionContext::new().state()
+            ),
+            "an ordinary query session must not be treated as a refresh"
+        );
+    }
+
+    /// The missing-column refresh error is permanent: retrying cannot bring the column back,
+    /// and the refresh must not write NULLs over the loaded data.
+    #[test]
+    fn missing_column_refresh_error_is_permanent() {
+        let err = retry_from_df_error(DataFusionError::Plan(
+            "Dataset 'base': registered column 'amount_cents' missing from every source file scanned".to_string(),
+        ));
+        assert!(
+            matches!(
+                err,
+                RetryError::Permanent(super::super::Error::FailedToRefreshDataset { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
     #[derive(Debug)]
     struct AlwaysFailingScan {
         schema: SchemaRef,
