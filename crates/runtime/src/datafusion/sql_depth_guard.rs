@@ -525,8 +525,9 @@ fn push_function_arguments<'a>(args: &'a FunctionArguments, out: &mut Vec<&'a Ex
     };
     for arg in &list.args {
         match arg {
-            FunctionArg::Unnamed(arg) => push_function_arg_expr(arg, out),
-            FunctionArg::Named { arg, .. } => push_function_arg_expr(arg, out),
+            FunctionArg::Unnamed(arg) | FunctionArg::Named { arg, .. } => {
+                push_function_arg_expr(arg, out);
+            }
             FunctionArg::ExprNamed { name, arg, .. } => {
                 out.push(name);
                 push_function_arg_expr(arg, out);
