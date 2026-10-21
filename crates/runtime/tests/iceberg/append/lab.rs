@@ -297,13 +297,14 @@ impl Lab {
             TimeKind::Timestamp => TimeFormat::Timestamp,
             TimeKind::Text => TimeFormat::ISO8601,
         });
-        let data_path = self.temp.path().join(format!("accelerator-{name}"));
-        let file_param = match accel.engine {
-            "cayenne" => "cayenne_file_path",
-            "duckdb" => "duckdb_file",
-            "sqlite" => "sqlite_file",
+        // Cayenne takes a directory; DuckDB and SQLite take a `.db` file.
+        let (file_param, file_name) = match accel.engine {
+            "cayenne" => ("cayenne_file_path", format!("accelerator-{name}")),
+            "duckdb" => ("duckdb_file", format!("accelerator-{name}.db")),
+            "sqlite" => ("sqlite_file", format!("accelerator-{name}.db")),
             other => panic!("the lab has no file parameter for engine {other}"),
         };
+        let data_path = self.temp.path().join(file_name);
         dataset.acceleration = Some(Acceleration {
             enabled: true,
             engine: Some(accel.engine.to_string()),
