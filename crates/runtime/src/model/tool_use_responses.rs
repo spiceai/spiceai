@@ -295,7 +295,8 @@ impl ToolUsingResponses {
 
     /// Runs the Spice tool calls in `output`, one round's output from model `model`, and returns
     /// their outcomes by `call_id`, none when `output` calls no Spice tool. Only the first
-    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls run.
+    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] calls run. A repeated `call_id` is not run again
+    /// and keeps the outcome already stored.
     async fn run_spice_tool_calls(
         &self,
         model: &str,
@@ -306,6 +307,16 @@ impl ToolUsingResponses {
         let mut runs_left = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
         let mut outcomes = HashMap::with_capacity(calls.len());
         for call in &calls {
+            // A later item that reuses a `call_id` keeps the outcome already stored. Replacing
+            // it would turn a call that ran into the not-run error once the cap is reached.
+            // The item still takes one of the round's run slots, so a duplicate does not leave
+            // a slot for a distinct id that comes after it.
+            if outcomes.contains_key(&call.call_id) {
+                if runs_left > 0 {
+                    runs_left -= 1;
+                }
+                continue;
+            }
             let outcome = self
                 .run_spice_tool_call_within_limit(call, &mut runs_left, calls.len())
                 .await;
@@ -2413,6 +2424,84 @@ mod tests {
                 .get(&format!("call_0_{}", calls - 1))
                 .map(String::as_str),
             Some(skipped.as_str())
+        );
+    }
+
+    /// One non-streaming round: how many times `list_datasets` ran, the `tools_used` count, and
+    /// the next round's function outputs by `call_id`.
+    async fn requested_list_datasets(
+        provider: &Arc<DoneOrderResponses>,
+    ) -> (usize, usize, HashMap<String, String>) {
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+        let extension = ModelContextExtension::new();
+        let context = Arc::new(RequestContext::builder(Protocol::Http).build());
+        context.insert_extension(extension.clone());
+        let provider = Arc::clone(provider);
+        let (ran_count, outputs) = context
+            .scope(async move {
+                let model = ToolUsingResponses::new(
+                    Arc::clone(&provider) as Arc<dyn Responses>,
+                    vec![],
+                    vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+                    None,
+                );
+                model
+                    .responses_request(request(false))
+                    .await
+                    .expect("a response");
+                (
+                    tool.0.load(Ordering::SeqCst),
+                    function_outputs(&provider.input(1)),
+                )
+            })
+            .await;
+        (ran_count, extension.tools_used(), outputs)
+    }
+
+    /// A non-streaming item past the cap that reuses an earlier `call_id` does not replace that
+    /// call's result with the not-run error. A repeated id still uses up one of the round's run
+    /// slots, so 64 copies of one id followed by 64 distinct ids run the tool once.
+    #[tokio::test]
+    async fn nonstreamed_reused_call_id_keeps_its_result_past_the_limit() {
+        let cap = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
+        let ran = "[\"taxi_trips\"]";
+
+        let tail = cap + 1;
+        let (dispatches, tools_used, outputs) = requested_list_datasets(
+            &DoneOrderResponses::with_id_cycle(tail, Vec::new(), Some(cap)),
+        )
+        .await;
+        assert_eq!(dispatches, cap, "reused tail");
+        assert_eq!(tools_used, cap, "reused tail");
+        assert_eq!(
+            outputs.get("call_0_0").map(String::as_str),
+            Some(ran),
+            "reused tail"
+        );
+        assert!(
+            outputs
+                .values()
+                .all(|output| output != &tool_call_not_run_message(tail)),
+            "reused tail replaced a result: {outputs:?}"
+        );
+
+        let head = cap * 2;
+        let skipped = tool_call_not_run_message(head);
+        let (dispatches, tools_used, outputs) =
+            requested_list_datasets(&DoneOrderResponses::with_shared_head(head, Vec::new(), cap))
+                .await;
+        assert_eq!(dispatches, 1, "shared head");
+        assert_eq!(tools_used, 1, "shared head");
+        assert_eq!(outputs.len(), cap + 1, "shared head");
+        assert_eq!(
+            outputs.get("call_0_0").map(String::as_str),
+            Some(ran),
+            "shared head"
+        );
+        assert_eq!(
+            outputs.get(&format!("call_0_{cap}")).map(String::as_str),
+            Some(skipped.as_str()),
+            "shared head"
         );
     }
 }
