@@ -295,14 +295,24 @@ fn request_for_redirect(
     request_uri: &http::Uri,
     target: &reqwest::Url,
 ) -> Result<Request<Buffer>> {
-    // 301, 302, and 303 drop the body and become GET. 307 and 308 keep both.
-    let (method, body) = if matches!(
+    // 301, 302, and 303 drop the body and become GET, except HEAD, which stays
+    // HEAD. `reqwest` follows operator redirects through `tower-http`, and that
+    // client keeps HEAD on these statuses. 307 and 308 keep the method and the body.
+    let drop_body = matches!(
         status,
         http::StatusCode::MOVED_PERMANENTLY | http::StatusCode::FOUND | http::StatusCode::SEE_OTHER
-    ) {
-        (http::Method::GET, Buffer::new())
+    );
+    let method = if method == http::Method::HEAD {
+        http::Method::HEAD
+    } else if drop_body {
+        http::Method::GET
     } else {
-        (method.clone(), body.clone())
+        method.clone()
+    };
+    let body = if drop_body {
+        Buffer::new()
+    } else {
+        body.clone()
     };
     let mut headers = headers.clone();
     // Scheme, host, and effective port. A new port, or https changing to http,
@@ -591,5 +601,108 @@ mod tests {
             "http://bucket.s3.amazonaws.com/key",
             "http://other.example/other",
         ));
+    }
+
+    /// Removes this test's connect and DNS overrides when the test ends.
+    struct HeadRedirectOverrides {
+        host: String,
+    }
+
+    impl HeadRedirectOverrides {
+        fn install(host: &str, authority: &str) -> Self {
+            super::set_vended_redirect_connect_override(host, authority);
+            super::super::set_vended_endpoint_resolver_override(
+                host,
+                Ok(vec![std::net::Ipv4Addr::new(8, 8, 8, 8).into()]),
+            );
+            Self {
+                host: host.to_ascii_lowercase(),
+            }
+        }
+    }
+
+    impl Drop for HeadRedirectOverrides {
+        fn drop(&mut self) {
+            super::clear_vended_redirect_connect_override(&self.host);
+            super::super::clear_vended_endpoint_resolver_override(&self.host);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_vended_head_redirect_stays_head() {
+        let host = "head-redirect.vended.test";
+        for (status, reason) in [
+            (301_u16, "Moved Permanently"),
+            (302, "Found"),
+            (303, "See Other"),
+            (307, "Temporary Redirect"),
+            (308, "Permanent Redirect"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind the redirector");
+            let addr = listener.local_addr().expect("read the redirector address");
+            let other_port = addr.port().wrapping_add(1).max(1);
+            let location = format!("http://{host}:{other_port}/object");
+            let requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let recorded = std::sync::Arc::clone(&requests);
+            let redirect_to = location.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let recorded = std::sync::Arc::clone(&recorded);
+                    let redirect_to = redirect_to.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = vec![0_u8; 8192];
+                        let n = stream.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        let is_head = line.starts_with("HEAD ");
+                        let path = line.split_whitespace().nth(1).unwrap_or_default();
+                        let response = if path == "/object" {
+                            if is_head {
+                                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                    .to_string()
+                            } else {
+                                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                    .to_string()
+                            }
+                        } else {
+                            format!(
+                                "HTTP/1.1 {status} {reason}\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        };
+                        recorded.lock().push(line);
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    });
+                }
+            });
+            let _overrides = HeadRedirectOverrides::install(host, &addr.to_string());
+            let request = http::Request::builder()
+                .method(http::Method::HEAD)
+                .uri(format!("http://{host}:{}/start", addr.port()))
+                .body(opendal::Buffer::new())
+                .expect("build the HEAD request");
+            let response = super::scope(
+                Some("dataset 't'".to_string()),
+                super::fetch_with_redirect_policy(request),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("status {status} was not followed: {err}"));
+            let recorded = requests.lock().clone();
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "status {status} was not followed as HEAD: {recorded:?}"
+            );
+            assert_eq!(
+                recorded,
+                vec![
+                    "HEAD /start HTTP/1.1".to_string(),
+                    "HEAD /object HTTP/1.1".to_string(),
+                ],
+                "status {status}"
+            );
+        }
     }
 }
