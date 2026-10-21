@@ -34,7 +34,7 @@ use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -250,42 +250,37 @@ impl ToolUsingResponses {
         outcome
     }
 
-    /// The `call_id`s Spice runs from `output`: the first
-    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] Spice tool calls, in the order `output` lists them.
-    fn runnable_spice_call_ids(&self, output: &[OutputItem]) -> HashSet<String> {
-        self.spice_tool_calls(output)
-            .into_iter()
+    /// The first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] of `calls`, keyed by `call_id`.
+    /// The first item with an id is the one that runs. A later item that reuses the id does not
+    /// replace it. `calls` is already this round's Spice calls, in output order, so building this
+    /// walks at most 64 of them.
+    fn admitted_spice_calls<'a>(
+        calls: &[&'a FunctionToolCall],
+    ) -> HashMap<&'a str, &'a FunctionToolCall> {
+        let mut admitted = HashMap::new();
+        for call in calls
+            .iter()
+            .copied()
             .take(MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
-            .map(|call| call.call_id.clone())
-            .collect()
+        {
+            admitted.entry(call.call_id.as_str()).or_insert(call);
+        }
+        admitted
     }
 
-    /// The first admitted Spice call in `output` with `call_id`. A later item that reuses the id
-    /// is not this call, so a done event for that later item does not run its arguments.
-    fn first_admitted_spice_call<'a>(
+    /// Runs the admitted call for `call_id`, or the not-run error when `call_id` is not in
+    /// `admitted`. `requested` is how many Spice tool calls the round made.
+    async fn dispatch_admitted(
         &self,
-        output: &'a [OutputItem],
         call_id: &str,
-    ) -> Option<&'a FunctionToolCall> {
-        self.spice_tool_calls(output)
-            .into_iter()
-            .take(MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
-            .find(|call| call.call_id == call_id)
-    }
-
-    /// Runs `call` when `runnable` contains its `call_id`. A call that it does not contain does
-    /// not run, and fails with [`tool_call_not_run_message`]. `requested` is how many Spice tool
-    /// calls the round made.
-    async fn run_spice_tool_call_if_runnable(
-        &self,
-        call: &FunctionToolCall,
-        runnable: &HashSet<String>,
+        admitted: &HashMap<&str, &FunctionToolCall>,
         requested: usize,
     ) -> ToolOutcome {
-        if !runnable.contains(&call.call_id) {
-            return ToolOutcome::Failed(tool_call_not_run_message(requested));
+        if let Some(call) = admitted.get(call_id) {
+            self.run_spice_tool_call(call).await
+        } else {
+            ToolOutcome::Failed(tool_call_not_run_message(requested))
         }
-        self.run_spice_tool_call(call).await
     }
 
     /// Runs `call`, a call to one of Spice's tools, if `runs_left` allows one more run in its
@@ -983,7 +978,9 @@ fn make_responses_stream(
                         req.model.as_deref().unwrap_or_default(),
                         requested,
                     );
-                    let runnable = model.runnable_spice_call_ids(&response.output);
+                    // Built once for the round. A done event must not scan `output` again: a
+                    // response can name far more calls than the 64 that run.
+                    let admitted = ToolUsingResponses::admitted_spice_calls(&spice_calls);
                     let mut outcomes: HashMap<String, ToolOutcome> = HashMap::new();
                     for event in held {
                         let ended_call = match &event {
@@ -1001,21 +998,15 @@ fn make_responses_stream(
                         };
                         let events = match ended_call {
                             Some((call, output_index)) => {
-                                // The runnable set records which call ids may run, not how many
-                                // times. A repeated done event reuses the outcome. The dispatch
-                                // is the first admitted item with that id, not whichever done
-                                // event arrived first: a later item can reuse the id with
-                                // different arguments.
+                                // A repeated done event reuses the outcome. The dispatch is the
+                                // first admitted item with that id, not whichever done event
+                                // arrived first: a later item can reuse the id with different
+                                // arguments.
                                 let outcome = if let Some(outcome) = outcomes.get(&call.call_id) {
                                     outcome.clone()
                                 } else {
-                                    let dispatch = model
-                                        .first_admitted_spice_call(&response.output, &call.call_id)
-                                        .unwrap_or(call);
                                     let outcome = model
-                                        .run_spice_tool_call_if_runnable(
-                                            dispatch, &runnable, requested,
-                                        )
+                                        .dispatch_admitted(&call.call_id, &admitted, requested)
                                         .await;
                                     outcomes.insert(call.call_id.clone(), outcome.clone());
                                     outcome
@@ -1032,11 +1023,8 @@ fn make_responses_stream(
                     // output-order selection: the next round needs every call's result.
                     for call in spice_calls {
                         if !outcomes.contains_key(&call.call_id) {
-                            let dispatch = model
-                                .first_admitted_spice_call(&response.output, &call.call_id)
-                                .unwrap_or(call);
                             let outcome = model
-                                .run_spice_tool_call_if_runnable(dispatch, &runnable, requested)
+                                .dispatch_admitted(&call.call_id, &admitted, requested)
                                 .await;
                             outcomes.insert(call.call_id.clone(), outcome);
                         }
