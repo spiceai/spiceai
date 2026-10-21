@@ -44,9 +44,10 @@ use async_openai::types::chat::{
 use messages_api::MessagesError;
 use messages_api::types::{
     ContentBlockParam, CreateMessageRequest, CustomToolParam, DocumentBlockParam, DocumentSource,
-    ImageSource, MessageContent, MessageParam, OutputFormat, Role, SystemPrompt, TextBlockParam,
-    ToolChoice, ToolParam, ToolResultBlockParam, ToolResultContent,
+    ImageBlockParam, ImageSource, MessageContent, MessageParam, OutputFormat, Role, SystemPrompt,
+    TextBlockParam, ToolChoice, ToolParam, ToolResultBlockParam, ToolResultContent,
 };
+use serde_json::{Map, Value};
 
 /// Where to read about serving the Messages API with a model.
 pub(crate) const DOCS: &str = "https://spiceai.org/docs/components/models";
@@ -72,6 +73,30 @@ fn unsupported(model: &str, what: &str, remedy: &str) -> MessagesError {
     ))
 }
 
+/// Refuses the first field of `other` that is not in `accepted`, naming it as a field `place`.
+fn refuse_other(
+    model: &str,
+    other: &Map<String, Value>,
+    accepted: &[&str],
+    place: &str,
+) -> Result<(), MessagesError> {
+    match other
+        .keys()
+        .find(|field| !accepted.contains(&field.as_str()))
+    {
+        Some(field) => Err(unsupported(
+            model,
+            &format!("`{field}` {place}"),
+            &format!("Remove `{field}`, or use a model with `from: anthropic`."),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The fields a content block may carry beside its own: its `type`, and `cache_control`, which
+/// only says how to cache the prompt.
+const BLOCK_FIELDS: [&str; 2] = ["type", "cache_control"];
+
 /// `request` as a chat completion request, or the reason it cannot be one.
 ///
 /// # Errors
@@ -95,7 +120,7 @@ pub fn chat_request(
         metadata,
         tools,
         tool_choice,
-        thinking: _,
+        thinking,
         output_config,
         output_format,
         other,
@@ -117,6 +142,29 @@ pub fn chat_request(
             "`top_k`",
             "Remove `top_k`, or use a model with `from: anthropic`.",
         ));
+    }
+    if let Some(metadata) = &metadata {
+        refuse_other(&model, &metadata.other, &[], "in `metadata`")?;
+    }
+    if let Some(thinking) = &thinking {
+        refuse_other(&model, &thinking.other, &[], "in `thinking`")?;
+    }
+    if let Some(choice) = &tool_choice {
+        let (ToolChoice::Auto { other, .. }
+        | ToolChoice::Any { other, .. }
+        | ToolChoice::Tool { other, .. }
+        | ToolChoice::None { other }) = choice;
+        refuse_other(&model, other, &[], "in `tool_choice`")?;
+    }
+    if let Some(config) = &output_config {
+        refuse_other(&model, &config.other, &[], "in `output_config`")?;
+    }
+    let output_format = match output_config.and_then(|config| config.format) {
+        Some(format) => Some((format, "in `output_config.format`")),
+        None => output_format.map(|format| (format, "in `output_format`")),
+    };
+    if let Some((format, place)) = &output_format {
+        refuse_other(&model, &format.other, &[], place)?;
     }
 
     let mut chat_messages = Vec::with_capacity(messages.len() + 1);
@@ -141,10 +189,8 @@ pub fn chat_request(
         .filter(|choice| offers_tools && choice.disables_parallel_tool_use())
         .map(|_| false);
 
-    let response_format = output_config
-        .and_then(|config| config.format)
-        .or(output_format)
-        .map(|format| response_format(&model, format))
+    let response_format = output_format
+        .map(|(format, _)| response_format(&model, format))
         .transpose()?;
 
     let streaming = stream.unwrap_or(false);
@@ -270,17 +316,7 @@ fn append_message(
 /// like that answer's thinking: the chat completion has no place for either. Any other field is
 /// refused by name.
 fn text_of(model: &str, block: TextBlockParam) -> Result<String, MessagesError> {
-    if let Some(field) = block
-        .other
-        .keys()
-        .find(|field| !matches!(field.as_str(), "type" | "cache_control"))
-    {
-        return Err(unsupported(
-            model,
-            &format!("`{field}` on a text block"),
-            &format!("Remove `{field}`, or use a model with `from: anthropic`."),
-        ));
-    }
+    refuse_other(model, &block.other, &BLOCK_FIELDS, "on a text block")?;
     Ok(block.text)
 }
 
@@ -356,7 +392,7 @@ fn append_user_part(
 ) -> Result<(), MessagesError> {
     match block {
         ContentBlockParam::Text(text) => parts.push(text_part(text_of(model, text)?)),
-        ContentBlockParam::Image(image) => parts.push(image_part(model, image.source)?),
+        ContentBlockParam::Image(image) => parts.push(image_part(model, image)?),
         ContentBlockParam::Document(document) => append_document(model, document, parts)?,
         other => {
             return Err(unsupported(
@@ -371,11 +407,22 @@ fn append_user_part(
 
 fn image_part(
     model: &str,
-    source: ImageSource,
+    image: ImageBlockParam,
 ) -> Result<ChatCompletionRequestUserMessageContentPart, MessagesError> {
-    let url = match source {
-        ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
-        ImageSource::Url { url } => url,
+    refuse_other(model, &image.other, &BLOCK_FIELDS, "on an image block")?;
+    let url = match image.source {
+        ImageSource::Base64 {
+            media_type,
+            data,
+            other,
+        } => {
+            refuse_other(model, &other, &[], "on an image source")?;
+            format!("data:{media_type};base64,{data}")
+        }
+        ImageSource::Url { url, other } => {
+            refuse_other(model, &other, &[], "on an image source")?;
+            url
+        }
         ImageSource::File { .. } => {
             return Err(unsupported(
                 model,
@@ -398,6 +445,10 @@ fn append_document(
     document: DocumentBlockParam,
     parts: &mut Vec<ChatCompletionRequestUserMessageContentPart>,
 ) -> Result<(), MessagesError> {
+    refuse_other(model, &document.other, &BLOCK_FIELDS, "on a document block")?;
+    if let Some(citations) = &document.citations {
+        refuse_other(model, &citations.other, &[], "in a document's `citations`")?;
+    }
     if document
         .citations
         .is_some_and(|citations| citations.enabled)
@@ -416,7 +467,12 @@ fn append_document(
         .collect::<Vec<_>>()
         .join("\n");
     match document.source {
-        DocumentSource::Base64 { media_type, data } => {
+        DocumentSource::Base64 {
+            media_type,
+            data,
+            other,
+        } => {
+            refuse_other(model, &other, &[], "on a document source")?;
             if !heading.is_empty() {
                 parts.push(text_part(heading));
             }
@@ -430,14 +486,16 @@ fn append_document(
                 },
             ));
         }
-        DocumentSource::Text { data, .. } => {
+        DocumentSource::Text { data, other, .. } => {
+            refuse_other(model, &other, &[], "on a document source")?;
             parts.push(text_part(if heading.is_empty() {
                 data
             } else {
                 format!("{heading}\n\n{data}")
             }));
         }
-        DocumentSource::Content { content } => {
+        DocumentSource::Content { content, other } => {
+            refuse_other(model, &other, &[], "on a document source")?;
             if !heading.is_empty() {
                 parts.push(text_part(heading));
             }
@@ -468,6 +526,12 @@ fn tool_message(
     result: ToolResultBlockParam,
     images: &mut Vec<ChatCompletionRequestUserMessageContentPart>,
 ) -> Result<ChatCompletionRequestMessage, MessagesError> {
+    refuse_other(
+        model,
+        &result.other,
+        &BLOCK_FIELDS,
+        "on a tool_result block",
+    )?;
     let text = match result.content {
         None => String::new(),
         Some(ToolResultContent::Text(text)) => text,
@@ -477,7 +541,7 @@ fn tool_message(
                 match block {
                     ContentBlockParam::Text(text) => texts.push(text_of(model, text)?),
                     ContentBlockParam::Image(image) => {
-                        images.push(image_part(model, image.source)?);
+                        images.push(image_part(model, image)?);
                     }
                     ContentBlockParam::Document(document) => {
                         let mut parts = Vec::new();
@@ -532,6 +596,7 @@ fn assistant_blocks(
                 .get_or_insert_default()
                 .push_str(&text_of(model, block)?),
             ContentBlockParam::ToolUse(tool_use) => {
+                refuse_other(model, &tool_use.other, &BLOCK_FIELDS, "on a tool_use block")?;
                 tool_calls.push(ChatCompletionMessageToolCalls::Function(
                     ChatCompletionMessageToolCall {
                         id: tool_use.id,
@@ -568,18 +633,12 @@ fn chat_tool(model: &str, tool: ToolParam) -> Result<ChatCompletionTools, Messag
             other,
         }) => {
             // `cache_control` and `eager_input_streaming` only change how a request is served.
-            if let Some(field) = other.keys().find(|field| {
-                !matches!(
-                    field.as_str(),
-                    "type" | "cache_control" | "eager_input_streaming"
-                )
-            }) {
-                return Err(unsupported(
-                    model,
-                    &format!("`{field}` on the tool '{name}'"),
-                    &format!("Remove `{field}`, or use a model with `from: anthropic`."),
-                ));
-            }
+            refuse_other(
+                model,
+                &other,
+                &["type", "cache_control", "eager_input_streaming"],
+                &format!("on the tool '{name}'"),
+            )?;
             Ok(ChatCompletionTools::Function(ChatCompletionTool {
                 function: FunctionObject {
                     name,
@@ -606,7 +665,7 @@ fn chat_tool_choice(choice: ToolChoice) -> ChatCompletionToolChoiceOption {
                 function: FunctionName { name },
             })
         }
-        ToolChoice::None => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
+        ToolChoice::None { .. } => ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::None),
     }
 }
 

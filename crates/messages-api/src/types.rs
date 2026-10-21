@@ -18,8 +18,9 @@ limitations under the License.
 //!
 //! A request is read leniently where reading cannot lose meaning and exactly where it can: a
 //! content block or tool of a type not named here is kept as [`ContentBlockParam::Other`] or
-//! [`ToolParam::Other`], and a top-level field not named here is kept in
-//! [`CreateMessageRequest::other`], so that a translation can refuse it by name.
+//! [`ToolParam::Other`], and a field not named here, at the top level or nested in a block, a
+//! source, or a configuration, is kept in that shape's `other`, so that a translation can refuse
+//! it by name.
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
@@ -201,14 +202,30 @@ pub struct TextBlockParam {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ImageBlockParam {
     pub source: ImageSource,
+    /// Every other field, `type` and `cache_control` included, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
-    File { file_id: String },
+    Base64 {
+        media_type: String,
+        data: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
+    },
+    Url {
+        url: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
+    },
+    File {
+        file_id: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -217,6 +234,9 @@ pub struct DocumentBlockParam {
     pub title: Option<String>,
     pub context: Option<String>,
     pub citations: Option<CitationsConfig>,
+    /// Every other field, `type` and `cache_control` included, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -226,28 +246,41 @@ pub enum DocumentSource {
     Base64 {
         media_type: String,
         data: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
     /// Plain text.
     Text {
         media_type: Option<String>,
         data: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
     /// Content blocks.
     Content {
         content: MessageContent,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
     Url {
         url: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
     File {
         file_id: String,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct CitationsConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Every other field, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -255,6 +288,9 @@ pub struct ToolUseBlockParam {
     pub id: String,
     pub name: String,
     pub input: Value,
+    /// Every other field, `type` and `cache_control` included, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -262,6 +298,9 @@ pub struct ToolResultBlockParam {
     pub tool_use_id: String,
     pub content: Option<ToolResultContent>,
     pub is_error: Option<bool>,
+    /// Every other field, `type` and `cache_control` included, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 /// A tool result's content: a string, or content blocks.
@@ -312,6 +351,9 @@ pub struct McpToolResultBlockParam {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Metadata {
     pub user_id: Option<String>,
+    /// Every other field, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 /// A tool the model may call, by its `type`.
@@ -349,20 +391,29 @@ pub struct CustomToolParam {
     pub other: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
     Auto {
         disable_parallel_tool_use: Option<bool>,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
     Any {
         disable_parallel_tool_use: Option<bool>,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
     Tool {
         name: String,
         disable_parallel_tool_use: Option<bool>,
+        #[serde(flatten)]
+        other: Map<String, Value>,
     },
-    None,
+    None {
+        #[serde(flatten)]
+        other: Map<String, Value>,
+    },
 }
 
 impl ToolChoice {
@@ -372,28 +423,33 @@ impl ToolChoice {
         match self {
             ToolChoice::Auto {
                 disable_parallel_tool_use,
+                ..
             }
             | ToolChoice::Any {
                 disable_parallel_tool_use,
+                ..
             }
             | ToolChoice::Tool {
                 disable_parallel_tool_use,
                 ..
             } => disable_parallel_tool_use.unwrap_or(false),
-            ToolChoice::None => false,
+            ToolChoice::None { .. } => false,
         }
     }
 }
 
 /// The `thinking` configuration. Its `type` is kept as a string: `enabled`, `adaptive`,
 /// `disabled`, and the types later models add.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub thinking_type: String,
     pub budget_tokens: Option<u32>,
     /// How thinking is shown: `summarized`, or `omitted`, which leaves the text empty.
     pub display: Option<String>,
+    /// Every other field, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 impl ThinkingConfig {
@@ -409,6 +465,9 @@ impl ThinkingConfig {
 pub struct OutputConfig {
     pub effort: Option<String>,
     pub format: Option<OutputFormat>,
+    /// Every other field, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -416,6 +475,9 @@ pub struct OutputFormat {
     #[serde(rename = "type")]
     pub format_type: String,
     pub schema: Option<Value>,
+    /// Every other field, by name.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
 }
 
 /// A Message, the response of `POST /v1/messages`.

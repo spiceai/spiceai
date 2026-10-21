@@ -1147,3 +1147,134 @@ fn a_text_block_is_carried_over_and_an_unknown_field_of_it_refused() {
         error.message
     );
 }
+
+/// A field nested in a block, a source, or a configuration is refused by name like a top-level
+/// one, and the fields that only change how a request is served are still accepted there.
+#[test]
+fn an_unknown_nested_field_is_refused_by_name() {
+    let image = |source: Value, extra: Value| {
+        let mut block = json!({"type": "image", "source": source});
+        block
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        block
+    };
+    let base64 = json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="});
+    let request = |patch: Value| {
+        let mut body = json!({
+            "model": "gpt",
+            "max_tokens": 10,
+            "metadata": {"user_id": "u"},
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high", "format": {"type": "json_schema", "schema": {"type": "object"}}},
+            "tools": [{"name": "read_file", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+            "messages": [
+                {"role": "user", "content": [
+                    image(base64.clone(), json!({"cache_control": {"type": "ephemeral"}})),
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Q3."}, "citations": {"enabled": false}, "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}, "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok", "cache_control": {"type": "ephemeral"}},
+                ]},
+            ],
+        });
+        json_patch(&mut body, &patch);
+        body
+    };
+    translated(&request(json!({}))).expect("every nested field is a supported one");
+    for choice in [
+        json!({"type": "any"}),
+        json!({"type": "tool", "name": "read_file"}),
+        json!({"type": "none"}),
+    ] {
+        translated(&request(json!({"tool_choice": choice}))).expect("a supported tool_choice");
+    }
+
+    let cases = [
+        (
+            json!({"metadata": {"user_id": "u", "tier": 1}}),
+            "`tier` in `metadata`",
+        ),
+        (
+            json!({"thinking": {"type": "adaptive", "verbosity": 1}}),
+            "`verbosity` in `thinking`",
+        ),
+        (
+            json!({"tool_choice": {"type": "auto", "strict": true}}),
+            "`strict` in `tool_choice`",
+        ),
+        (
+            json!({"tool_choice": {"type": "none", "strict": true}}),
+            "`strict` in `tool_choice`",
+        ),
+        (
+            json!({"output_config": {"effort": "high", "extra_constraint": 1}}),
+            "`extra_constraint` in `output_config`",
+        ),
+        (
+            json!({"output_config": {"format": {"type": "json_schema", "schema": {}, "extra_constraint": 1}}}),
+            "`extra_constraint` in `output_config.format`",
+        ),
+        (
+            json!({"output_config": null, "output_format": {"type": "json_schema", "schema": {}, "extra_constraint": 1}}),
+            "`extra_constraint` in `output_format`",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": [image(base64.clone(), json!({"extra_constraint": 1}))]}]}),
+            "`extra_constraint` on an image block",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": [image(json!({"type": "url", "url": "https://example.com/a.png", "detail": "high"}), json!({}))]}]}),
+            "`detail` on an image source",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "Q3."}, "summary": true}]}]}),
+            "`summary` on a document block",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "Q3.", "encoding": "utf-8"}}]}]}),
+            "`encoding` on a document source",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "text", "data": "Q3."}, "citations": {"enabled": false, "style": "apa"}}]}]}),
+            "`style` in a document's `citations`",
+        ),
+        (
+            json!({"messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}, "caller": {"type": "direct"}}]},
+            ]}),
+            "`caller` on a tool_use block",
+        ),
+        (
+            json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok", "partial": true}]}]}),
+            "`partial` on a tool_result block",
+        ),
+    ];
+    for (patch, refused) in cases {
+        let error = translated(&request(patch.clone())).expect_err(refused);
+        assert_eq!(
+            (error.status, &error.error_type),
+            (400, &ErrorType::InvalidRequest),
+            "{patch}"
+        );
+        assert!(
+            error.message.contains(&format!("cannot carry {refused}.")),
+            "{patch}: {}",
+            error.message
+        );
+    }
+}
+
+/// Replaces each top-level field of `body` that `patch` names.
+fn json_patch(body: &mut Value, patch: &Value) {
+    let body = body.as_object_mut().expect("object");
+    for (field, value) in patch.as_object().expect("object") {
+        body.insert(field.clone(), value.clone());
+    }
+}
