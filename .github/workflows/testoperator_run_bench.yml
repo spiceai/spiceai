@@ -684,7 +684,8 @@ jobs:
             BRANCH_ID=${{ github.run_id }}
           fi
 
-          BRANCH_NAME="testoperator-snapshot-update/${BRANCH_ID}"
+          BASE_BRANCH="testoperator-snapshot-update/${BRANCH_ID}"
+          BRANCH_NAME="${BASE_BRANCH}"
 
           git config --global user.name 'Spice Benchmark Snapshot Update Bot'
           git config --global user.email 'spiceaibot@spice.ai'
@@ -694,14 +695,57 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}"
-            if git ls-remote --exit-code --heads origin ${BRANCH_NAME}; then
-              git pull --rebase origin ${BRANCH_NAME}
+            SNAPSHOT_COMMIT="$(git rev-parse HEAD)"
+
+            # Every run dispatched for one spiced commit pushes to the same
+            # branch, so the push can lose in two ways that say nothing about
+            # the benchmark:
+            # - another run pushed first ("fetch first", or any rejection after
+            #   which the branch tip has moved): rebase onto the new tip and
+            #   push again;
+            # - the branch's PR is already in the merge queue (GH006: queued
+            #   branches cannot be updated): carry on in the next branch,
+            #   <base>-2, <base>-3, ..., which gets its own PR.
+            # Any other rejection fails the step.
+            remote_tip() { git ls-remote --heads origin "refs/heads/$1" | cut -f1; }
+            suffix=1
+            pushed=false
+            for attempt in 1 2 3 4 5 6 7 8; do
+              git checkout -B "${BRANCH_NAME}" "${SNAPSHOT_COMMIT}"
+              tip_before="$(remote_tip "${BRANCH_NAME}")"
+              if [ -n "${tip_before}" ]; then
+                git pull --rebase origin "${BRANCH_NAME}"
+              fi
+              # Non-interactive: a credential helper on the runner can otherwise intercept
+              # this push and block on a prompt forever. See
+              # scripts/check_ci_git_push_noninteractive.py.
+              if push_log="$(git -c credential.helper='' -c credential.interactive=false \
+                push origin "${BRANCH_NAME}" 2>&1)"; then
+                echo "${push_log}"
+                pushed=true
+                break
+              fi
+              echo "${push_log}"
+              # GH006 is any protected-branch rejection; only the merge-queue lock
+              # moves the snapshots to the next branch.
+              if grep -q 'GH006' <<<"${push_log}" && grep -q 'queued for merging' <<<"${push_log}"; then
+                suffix=$((suffix + 1))
+                echo "::notice::${BRANCH_NAME} is locked by the merge queue; pushing these snapshots to ${BASE_BRANCH}-${suffix} instead."
+                BRANCH_NAME="${BASE_BRANCH}-${suffix}"
+              elif grep -qE 'fetch first|non-fast-forward' <<<"${push_log}" \
+                || [ "$(remote_tip "${BRANCH_NAME}")" != "${tip_before}" ]; then
+                echo "::notice::Another run pushed to ${BRANCH_NAME} first (attempt ${attempt}); rebasing onto it and pushing again."
+                # Jittered, so runs that collided do not retry in lockstep.
+                if [ "${attempt}" -lt 8 ]; then sleep $((RANDOM % 5 + 1)); fi
+              else
+                echo "::error::Pushing the benchmark snapshots to ${BRANCH_NAME} was rejected for a reason other than a concurrent push or a queued branch; see the git output above."
+                exit 1
+              fi
+            done
+            if [ "${pushed}" != true ]; then
+              echo "::error::The benchmark snapshots were not pushed after 8 attempts; the last branch tried was ${BRANCH_NAME}."
+              exit 1
             fi
-            # Non-interactive: a credential helper on the runner can otherwise intercept
-            # this push and block on a prompt forever. See
-            # scripts/check_ci_git_push_noninteractive.py.
-            git -c credential.helper='' -c credential.interactive=false \
-              push origin ${BRANCH_NAME}
 
             PR_URL="$(gh pr list --head "${BRANCH_NAME}" --state open --json url --jq .[].url)"
             if [[ -n "${PR_URL}" ]]; then

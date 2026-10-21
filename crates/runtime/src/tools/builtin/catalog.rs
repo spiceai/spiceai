@@ -24,11 +24,11 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::status;
 use app::App;
 use cache::TabledCacheProvider;
 use cache::result::search::CachedSearchResult;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use runtime_status as status;
 use runtime_tools::catalog::SpiceToolCatalog;
 use runtime_tools::options::SpiceToolsOptions;
 use tokio::sync::RwLock;
