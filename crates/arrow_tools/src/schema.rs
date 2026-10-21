@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::common::DFSchema;
+use datafusion_common::DFSchema;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -393,7 +393,7 @@ pub fn to_source_native_type_name(data_type: &DataType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     /// The schema JSON encoding is a persisted format: CDC connectors record the schema
     /// they last read into an accelerator sidecar row, and a later run has to parse what
