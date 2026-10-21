@@ -107,9 +107,9 @@ own section below — a count here would be one more thing to keep true by hand.
 | Fork | Pinned revision | Branch |
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
-| [arrow-rs](#arrow-rs) | `2e2cc330c64ac8a9e44d2a5f2da171b391f775b8` | `spiceai-59` |
+| [arrow-rs](#arrow-rs) | `9aa31322f7c2ba6fa41d64868d5f5f95f3a02c23` | `spiceai-59` |
 | [async-openai](#async-openai) | `307eaf407cbf71afa967f3008250ba96c79626b7` | `spiceai` |
-| [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
+| [candle](#candle-and-its-kernel-crates) | `3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb` | `spiceai` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
@@ -123,8 +123,8 @@ own section below — a count here would be one more thing to keep true by hand.
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
 | [graph-rs-sdk](#graph-rs-sdk) | `25bc483efc3200df7a4f5426c176cddb18a84ad9` | `spiceai` |
-| [iceberg-rust](#iceberg-rust) | `1707b349584845e802a703adca1e71f544defc5f` | `spiceai-0.11.0-df-55` |
-| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
+| [iceberg-rust](#iceberg-rust) | `a6b07b8b9625e552c502c3a7229fd4bb7725bd2e` | `spiceai-0.11.0-df-55` |
+| [mistral.rs](#mistralrs-and-text-embeddings-inference) | `4450776632f7e92f5b8b1ac97f56fe3f72cf2618` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
@@ -328,7 +328,8 @@ below was re-confirmed present at the pinned revision. Upstream deprecates
 `ParquetObjectReader` in 59 (apache/arrow-rs#10354); the Spice patches to it
 merged cleanly and are kept. The pin lives in the object-store Parquet reader
 (`parquet/src/arrow/async_reader/store.rs`), in the push-decoder short-read
-path (`parquet/src/util/push_buffers.rs` and its callers), in
+path (`parquet/src/util/push_buffers.rs` and its callers), in the page decoder
+(`parquet/src/file/serialized_reader.rs`), in
 `arrow-buffer/src/buffer/immutable.rs`, in the cast kernel
 (`arrow-cast/src/cast/mod.rs`), and in the Flight SQL client
 (`arrow-flight/src/sql/client.rs`).
@@ -338,6 +339,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 | `ParquetObjectReader::new_with_meta` — take `ObjectMeta` so the file size is known up front | The reader falls back to suffix range requests, which Azure Blob Storage does not support: Parquet reads over ABFS fail or take an extra round trip per file | build (constructor) | `crates/runtime/tests/abfs/mod.rs::test_azure_parquet_reading_with_object_meta` (needs Azurite) |
 | `with_object_versioning_type` — attach `if_match`/`version` to every metadata, byte-range and suffix fetch; a `Version` pin with no version id falls back to `If-Match` on the listed ETag; `set_object_version` applies a `HEAD` version id to later page reads | The reader stops pinning the object version. A file replaced between the metadata read and the data reads is read as a mixture of both — the footer of one file, the pages of another. Losing the ETag fallback is quieter still: unversioned buckets never carry a version id, so the pin becomes a no-op | build (API) + silent (behaviour) | `crates/data-connector-api/src/listing/connector.rs::a_versioned_parquet_read_pins_every_request_to_one_object_version`, `…::a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id` |
 | `get_byte_ranges` override — coalesce ranges through `get_opts` rather than `ObjectStore::get_ranges` | Version pinning is dropped for the data reads specifically (the metadata read keeps it), and range coalescing is lost, so a scan issues one request per column chunk | silent | as above |
+| `decode_page` rejects a page whose header declares more than `max(64 MiB, 1000 × its compressed bytes)` uncompressed, before it allocates ([spiceai/arrow-rs#31](https://github.com/spiceai/arrow-rs/pull/31), apache/arrow-rs#10734) | The reader allocates whatever size a page header declares, up to ~2 GiB per page. A Parquet file of a few KiB whose pages each declare hundreds of MiB makes every scan of it allocate that much per page, and concurrent scans of it can exhaust the runtime's memory | silent (memory) | `crates/data-connector-api/src/listing/connector.rs::tests::a_page_declaring_more_than_its_compressed_bytes_can_back_is_an_error` |
 | `Buffer::has_custom_allocation` — expose whether a buffer's memory is freed by its own owner rather than by the buffer ([spiceai/arrow-rs#25](https://github.com/spiceai/arrow-rs/pull/25)) | The results cache can no longer tell that a batch rests on memory it does not own, so it shares the producer's arrays instead of copying them. `capacity` reports the size the producer declared, so such an entry looks compact and is billed as if it were: a DuckDB- or ADBC-imported result pins the driver's chunk, a Flight-decoded one pins the whole IPC message body, and `max_size` bounds none of it. Measured at ~4.5 KB per entry unbilled on a one-row DuckDB result, flat as the result widened to 10 rows | build (the predicate) + silent (the accounting, if the call is dropped rather than the function) | `crates/arrow_tools/src/record_batch.rs::a_batch_resting_on_foreign_memory_is_copied_even_with_nothing_to_reclaim` |
 | `PushBuffers::push_range` returns `ParquetError` on a short read instead of asserting (apache/arrow-rs#10564). Upstream adopted it in `60.0.0`, not in any 59 release, so it is still carried on this line; drop the row at the move to 60 | A footer prefetch that races an in-place shrink panics the reader thread (`Range length must match buffer length`) instead of a retriable decode error | silent (panic) | `crates/data-connector-api/src/listing/connector.rs::a_short_range_body_is_a_parquet_error_and_not_a_panic`, driven through `ParquetMetaDataPushDecoder`, which is the public surface `push_range` sits behind. The listing/overwrite harness cannot reach it: it 412s a pinned `If-Match` before a short *successful* range body is ever decoded |
 | `Decimal` → floating-point cast rounds from the exact decimal digits instead of widening the coefficient to `f64` and dividing by `10^scale` ([spiceai/arrow-rs#26](https://github.com/spiceai/arrow-rs/pull/26)) | A coefficient past 2^53 loses precision before the divide, so a decimal read back as a float is off in the low digits. Measured: a pushed-down Postgres `avg` read as `Decimal128(38, 20)` returned `47.50000000000001` instead of `47.5` ([#13978](https://github.com/spiceai/spiceai/issues/13978)) | silent (wrong data) | `crates/arrow_tools/src/record_batch.rs::test::decimal_to_float_cast_is_correctly_rounded` |
@@ -501,6 +503,7 @@ upstream's new REST auth API.
 | Limit push-down for `IcebergTableProvider` (fork PR #19) | `SELECT … LIMIT n` scans the whole table | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_given_a_limit_reads_no_more_rows_than_it_asked_for` for the single-node scan, counted at the provider because a `GlobalLimitExec` above it returns the right rows either way; the distributed path is covered by `crates/runtime/src/cluster/datafusion/codec/spice_physical_codec.rs`, which refuses to serialise a scan whose limit it cannot carry |
 | Pinned snapshot reads in `IcebergTableProvider` (fork PR #45) | A scan reads the current snapshot instead of the pinned one — time-travel and repeatable reads silently return live data | silent (wrong data) | `crates/data_components/src/iceberg/provider.rs::a_scan_pinned_to_a_snapshot_reads_that_snapshot_not_the_current_one` |
 | `IcebergTableScan` decodes at the session `batch_size` (fork PR #58) | Every Iceberg scan decodes 1024-row batches, the Parquet reader's default, instead of the session's 8192, and every operator downstream pays its per-batch cost 8x as often | silent (perf) | `crates/data_components/src/iceberg/provider.rs::a_scan_uses_the_session_batch_size` |
+| An unpinned scan projects the table's current schema, not the schema its current snapshot was written with (cherry-pick of apache/iceberg-rust#2904, fork PR #59) | A table whose last commit is schema-only (`ADD`/`RENAME COLUMN` with no write since) fails every query, including `SELECT *`, with `Column … not found in table`, and an accelerated copy never loads; a dropped column stays visible | silent (query failure) | `crates/runtime/tests/iceberg/schema_only_commit/mod.rs` (the `iceberg::schema_only_commit` integration tests): rename, add and drop as the last commit, read catalog-less, pinned by `iceberg_metadata_path`, through the catalog connector, and arrow-accelerated, with an unchanged table as the control |
 | Parallel file scanning with eager task bucketing (fork PR #43) | Iceberg scans lose file-level parallelism | silent (perf) | **GAP** |
 | `IcebergTableProvider::try_new` made public | No construction path from Spice | build | compile-guarded by `crates/data_components/src/iceberg/provider.rs`, which calls it |
 | `IcebergTableProvider::catalog` and `::table_ident` exposed (fork PR #49, on `spiceai-0.11.0-df-55`) | The Iceberg REST `loadTable` cannot load the table a provider reads, so no table can be served to an Iceberg client as itself | build | compile-guarded by `crates/runtime/src/http/v1/iceberg/passthrough.rs`, which calls both; what is served is guarded by `…::tests::an_iceberg_table_read_unchanged_is_served_as_itself` |
@@ -622,14 +625,21 @@ Upstream [benbrandt/text-splitter](https://github.com/benbrandt/text-splitter).
 Upstream [EricLBuehler/mistral.rs](https://github.com/EricLBuehler/mistral.rs) and
 [huggingface/text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference).
 
-The `mistral.rs` fork's base is `master@2d4ba4f16`, not a release tag, and it
-carries 71 commits. Most are Spice-side integration (dependency re-pointing onto
-`spiceai/candle`, CUDA and Windows build fixes).
+The `mistral.rs` fork's tree is upstream tag `v0.9.4` (`440093545`) plus the Spice
+patches. They landed on `spiceai` as the merge of spiceai/mistral.rs#47 (`ea48c06b`),
+and spiceai/mistral.rs#48, squash-merged as `44507766`, adds the DeepSeek-V4.1 decode fixes
+on top, so `git diff v0.9.4 44507766` is the whole fork delta. #47 built it in
+32 commits. The first replays the Spice patches from the `v0.9.0` line: `glm-dsa`
+GGUF loading, the i-quant MoE fallback, ring tensor parallelism past two ranks,
+multi-node NCCL on the GGUF path, and the `spiceai/candle` pin. The rest add the GGUF
+graphs that serve Qwen3.8-Flash-Next (`qwen4exp`), DeepSeek-V4.1-Flash (`deepseek41`)
+and GLM-5.3-Flash (`glm5-next`), and the fixes found serving them on a 3-node ring.
 
 Two rows this table used to carry — assistant messages with `tool_calls` in the
 chat template, and `tracing_subscriber.init()` removed from the loaders — are gone
 because neither is fork state any longer. Both behaviours are present in
-`master@2d4ba4f16` itself, the commit this fork line was cut from. It already
+`master@2d4ba4f16` itself, the commit the `v0.9.0` fork line was cut from and an
+ancestor of `v0.9.4`. It already
 defines `MessageContent` as `Either<String, Vec<IndexMap<String, Value>>>`, which
 is the widening the `tool_calls` patch existed to make; and no loader in either
 tree installs a global subscriber — the only `tracing_subscriber` call anywhere in
@@ -643,6 +653,13 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 |---|---|---|---|
 | `mistral.rs`: i-quant MoE `index_select` + in-place row dequant | ~34% slower local MoE inference | silent (perf) | **GAP** |
 | `mistral.rs`: candle dependency re-pointed at `spiceai/candle` | Two candle versions in the graph | build | compile-guarded |
+| `mistral.rs`: ring all-reduce rotates `world_size - 1` hops, and tensor-parallel shards may be uneven | At world size 3, every token is computed from two of the three shards with no error, or a model whose heads or experts do not divide by 3 refuses to load | silent (wrong text) | **GAP** |
+| `mistral.rs`: GGUF graphs for `qwen4exp`, `deepseek41` and `glm5-next` | Qwen3.8-Flash-Next, DeepSeek-V4.1-Flash and GLM-5.3-Flash fail to load, naming the architecture as not implemented | load failure | **GAP** |
+| `mistral.rs`: chat templates render with Jinja loop controls (`minijinja` `loop_controls`) | A template that uses `{% break %}` or `{% continue %}` fails to render, so every chat request to that model returns HTTP 500; GLM-5.3-Flash's uses `break` seven times | request failure | **GAP** |
+| `mistral.rs`: a request that sets neither `enable_thinking` nor `reasoning_effort` leaves `enable_thinking` undefined in the chat template, so each template applies its own default | Every template is rendered with thinking on; DeepSeek-V4.1 then keeps its whole reply inside an unclosed `<think>` block and `content` comes back empty | silent (wrong text) | **GAP** |
+| `mistral.rs`: `deepseek41` decode computes what its prefill and the reference graph compute: one rope rotation per tensor on CUDA, window keys at their own positions, the compressor's rope base on compressed layers, the indexer's top-k, and the routed experts' SwiGLU clamp, with each SwiGLU limit read as one value or one per layer (spiceai/mistral.rs#48) | DeepSeek-V4.1-Flash degenerates after its first few tokens (`Count from 1 to 40` gives `1, 2, 2, 2 2 2…`), and drifts from the reference past 128 and 512 tokens | silent (wrong text) | **GAP** — guarded in the fork, not here: `decoding_a_token_matches_prefilling_through_it` and its `_on_cuda` twin, `a_compressed_layer_rotates_with_the_compressor_base`, `an_index_source_attends_to_only_the_compressed_rows_it_picked`, `the_picked_rows_restrict_the_compressed_keys_and_not_the_window`, `the_gather_path_clamps_swiglu_inputs_to_the_limit` and `the_swiglu_limits_load_as_one_value_or_one_per_layer` |
+| `mistral.rs`: GGUF `eot_token_id` and `eom_token_id` stop generation, as `eos_token_id` does | GLM-5.3-Flash's reply runs past `<|user|>` into an invented next turn until `max_tokens` | silent (wrong text) | **GAP** |
+| `mistral.rs`: a `distributed` build serves a single-node model, and a ring head keeps a second request queued while one runs | A model without `distributed_backend` never finishes loading in a `distributed` build, and a second request to a ring deadlocks every rank at the next all-reduce | load failure / hang | **GAP** |
 | `text-embeddings-inference`: Spice integration + candle re-pointing | Local embedding models fail to load | build | compile-guarded |
 | `text-embeddings-inference`: pooling/model-loading fixes | Embeddings differ from the reference implementation | silent (wrong vectors) | **GAP** |
 
@@ -651,6 +668,12 @@ rather than by taking them. A re-cut cannot lose what the fork does not carry.
 Upstream [huggingface/candle](https://github.com/huggingface/candle) plus the
 `candle-cublaslt`, `candle-layer-norm`, `candle-rotary` and `candle-index-select-cu`
 kernel crates.
+
+The `candle` fork is cut from upstream `66a8cf18`, the revision `mistral.rs` `v0.9.4`
+pins, so the workspace and `mistral.rs` build against one candle. Its Spice patches
+are the i-quant and MXFP4 dequant kernels, the `moe_gemm_wmma` symbol rename,
+`matmul_with_alpha` scaling, routed-row `QTensor::dequantize_rows`, and the A10G
+flash-attention launch fix.
 
 The kernel-crate forks are build-only: Windows/MSVC build fixes, `-fPIC`, and
 `cudarc`/`candle` version bounds. They carry no Spice behaviour, so a re-cut cannot
@@ -708,7 +731,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**28 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**35 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -726,15 +749,26 @@ They are not equal in consequence; this is the order to close them in.
    a minimal repro built here.
 2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
+3. `mistral.rs` ring all-reduce rotation and uneven tensor-parallel shards — a
+   re-cut that drops the rotation computes every token from two of three shards
+   at world size 3, with no error. A guard needs either a 3-rank ring in a test
+   or the collective run over a fake transport from this repo.
+4. `mistral.rs` chat-template defaults, GGUF end-of-turn tokens, and the
+   `deepseek41` decode fixes — three rows. Losing the first renders every template
+   with thinking on, so DeepSeek-V4.1 returns an empty `content`; losing the second
+   lets GLM-5.3-Flash run past the end of its turn; losing the third makes
+   DeepSeek-V4.1 degenerate after a few tokens. The fork's own tests guard the
+   third, and only run there. A guard needs a GGUF-loaded model in a test here; today's
+   evidence is the three models served on the 3-node DGX Spark cluster.
 
 **Hangs, crashes and failures.** These take a query or the process down:
 
-3. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+5. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #36, #61–#63) — #36 is the quiet half, a `FetchFailed`
    that reaches the scheduler buried in `Shared(Arc(ArrowError(ExternalError(…))))`
    and is read as a non-retryable execution error, so the recovery that reruns
    the offending map stage never runs.
-4. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
+6. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
    and #59: a missing partition file read as an empty partition; shuffle-fetch
    clients pooled per peer; the reconciliation sweep that revives a lost stage or
    finishes a job whose graph already succeeded; job-graph persistence moved off
@@ -743,22 +777,28 @@ They are not equal in consequence; this is the order to close them in.
    active cache. Every one needs a running cluster to exhibit, and three are
    races, so each row records what the fork measured rather than what a test
    here could assert.
+7. `mistral.rs` GGUF graphs for `qwen4exp`, `deepseek41` and `glm5-next`, Jinja
+   loop controls in chat templates, and single-node loads plus the ring head's
+   request queue in a `distributed` build — three rows. Each fails loudly (a load
+   error, an HTTP 500, or a hang), never with wrong text. A guard needs a GGUF of
+   each architecture small enough for CI; today's evidence is those models served
+   on the 3-node DGX Spark cluster.
 
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-5. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+8. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-6. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+9. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+10. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-8. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+11. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -766,7 +806,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-9. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+12. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -777,7 +817,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-10. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+13. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
@@ -788,7 +828,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-11. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+14. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's

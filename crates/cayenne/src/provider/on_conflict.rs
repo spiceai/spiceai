@@ -1205,6 +1205,9 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     pub(crate) limit: Option<usize>,
     pub(crate) pk_indices_in_projection: &'a [usize],
     pub(crate) protected_snapshots: Arc<HashMap<String, i64>>,
+    /// Each protected snapshot's files, captured with `protected_snapshots`
+    /// under the scan's listing fence.
+    pub(crate) protected_files: Arc<HashMap<String, super::table::CapturedSnapshotFiles>>,
     pub(crate) deletion_snapshot: &'a PkDeletionSnapshot,
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).

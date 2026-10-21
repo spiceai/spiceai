@@ -69,6 +69,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
+use data_components::incremental_append::incremental_append_source;
 use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
@@ -1592,6 +1593,7 @@ impl Runtime {
             return Err(err);
         }
 
+        let mut overlap_warning = None;
         if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
             let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
             let dataset_name = ds.name.to_string();
@@ -1611,10 +1613,10 @@ impl Runtime {
                 && refresh_mode == RefreshMode::Append
                 && acceleration.refresh_append_overlap.is_none()
             {
-                tracing::warn!(
-                    "{}",
-                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
-                );
+                overlap_warning = Some(newest_by_time_without_overlap_warning(
+                    &dataset_name,
+                    time_column,
+                ));
             }
         }
 
@@ -1715,6 +1717,28 @@ impl Runtime {
             )
             .await?;
         ds = resolved_ds;
+
+        let records_commits = federated_table
+            .try_table_provider_sync_ref()
+            .is_some_and(|provider| incremental_append_source(provider.as_ref()).is_some());
+        if records_commits {
+            // A source that records its commits (Iceberg) needs no overlap, unless read by time.
+            if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
+                && acceleration.refresh_append_overlap.is_none()
+                && reads_by_time_despite_commits(
+                    acceleration,
+                    ds.time_column.as_deref(),
+                    resolved_refresh_mode,
+                )
+            {
+                tracing::warn!(
+                    "{}",
+                    last_arrival_without_overlap_warning(&ds.name.to_string(), acceleration.engine)
+                );
+            }
+        } else if let Some(warning) = overlap_warning {
+            tracing::warn!("{warning}");
+        }
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
@@ -2590,7 +2614,7 @@ impl Runtime {
                 if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
                     .await
-                    == crate::status::WaitOutcome::ShuttingDown
+                    == runtime_status::WaitOutcome::ShuttingDown
                 {
                     return;
                 }
@@ -3395,10 +3419,34 @@ fn deprecated_on_conflict_warning(
 }
 
 /// Warning for an append that keeps the newest version of each key by `time_column`
-/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+/// but has no `refresh_append_overlap` and reads by time, so it never re-reads a late row.
 fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
     format!(
         "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+    )
+}
+
+/// Whether a keyed append refresh reads by time instead of following its source's
+/// commits, because the engine keeps the last arrival of a key (#15273). Must match
+/// `RefreshTask::commit_cursor_store`.
+fn reads_by_time_despite_commits(
+    acceleration: &Acceleration,
+    time_column: Option<&str>,
+    refresh_mode: RefreshMode,
+) -> bool {
+    let (Some(time_column), Some(key)) = (time_column, acceleration.primary_key.as_ref()) else {
+        return false;
+    };
+    refresh_mode == RefreshMode::Append
+        && !acceleration.orders_versions_by_time(Some(time_column), refresh_mode)
+        && !key.iter().any(|column| column == time_column)
+}
+
+/// Warning for a keyed append that reads by time ([`reads_by_time_despite_commits`])
+/// without `refresh_append_overlap`, so it never loads a late row.
+fn last_arrival_without_overlap_warning(dataset_name: &str, engine: Engine) -> String {
+    format!(
+        "Dataset '{dataset_name}' (`engine: {engine}`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     )
 }
 
@@ -4112,6 +4160,45 @@ mod tests {
             newest_by_time_without_overlap_warning("events", "updated_at"),
             "Dataset 'events' keeps the newest version of each key by 'updated_at', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
         );
+    }
+
+    #[test]
+    fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
+        assert_eq!(
+            last_arrival_without_overlap_warning("acc", Engine::DuckDB),
+            "Dataset 'acc' (`engine: duckdb`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        );
+    }
+
+    /// Only a keyed append that keeps the last arrival reads by time (#15273).
+    #[test]
+    fn only_a_keyed_last_arrival_append_reads_by_time() {
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+        let key = ColumnReference::new(vec!["list_id".to_string(), "row_id".to_string()]);
+        let acceleration = |engine, primary_key: Option<&ColumnReference>| Acceleration {
+            engine,
+            primary_key: primary_key.cloned(),
+            ..Acceleration::default()
+        };
+        let with_time =
+            ColumnReference::new(vec!["row_id".to_string(), "update_timestamp".to_string()]);
+        let ts = Some("update_timestamp");
+        let (keyed, time_keyed) = (Some(&key), Some(&with_time));
+        let (append, full) = (RefreshMode::Append, RefreshMode::Full);
+        for (engine, key, mode, expected, what) in [
+            (Engine::DuckDB, keyed, append, true, "keyed"),
+            (Engine::Sqlite, keyed, append, true, "keyed"),
+            (Engine::DuckDB, None, append, false, "unkeyed"),
+            (Engine::DuckDB, keyed, full, false, "full"),
+            (Engine::Cayenne, keyed, append, false, "keeps newest"),
+            (Engine::DuckDB, time_keyed, append, false, "key holds time"),
+        ] {
+            assert_eq!(
+                reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
+                expected,
+                "{engine} {what}"
+            );
+        }
     }
 
     /// Every retention setting has to be recognised, whichever one the dataset
@@ -6281,7 +6368,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .status
             .get_dataset_status(&ds.name)
             .expect("the refused reload reports a status");
-        let crate::status::ComponentStatus::Error(Some(message)) = status else {
+        let runtime_status::ComponentStatus::Error(Some(message)) = status else {
             panic!("a refused reload must report an error status, got {status:?}");
         };
         assert!(
