@@ -486,15 +486,14 @@ async fn exchange_token(
         });
     }
 
-    let raw: RawTokenResponse =
-        http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
-            .await
-            .context(TokenResponseBodySnafu {
-                url: config.token_url.clone(),
-            })?
-            .json()
-            .await
-            .context(InvalidTokenResponseSnafu)?;
+    let raw: RawTokenResponse = http_body_limit::buffer(response, http_body_limit::Limit::METADATA)
+        .await
+        .context(TokenResponseBodySnafu {
+            url: config.token_url.clone(),
+        })?
+        .json()
+        .await
+        .context(InvalidTokenResponseSnafu)?;
 
     if let Some(token_type) = raw.token_type.as_deref()
         && !token_type.eq_ignore_ascii_case("bearer")

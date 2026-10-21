@@ -226,8 +226,7 @@ async fn fetch_schema(registry_url: &str, schema_id: u32) -> Result<Arc<AvroSche
             return Ok(Err(format!("HTTP {status}")));
         }
         let response =
-            match http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await
-            {
+            match http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await {
                 Ok(response) => response,
                 Err(http_body_limit::Error::Read { source }) => return Err(source),
                 Err(refused) => return Ok(Err(refused.to_string())),

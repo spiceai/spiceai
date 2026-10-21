@@ -143,8 +143,10 @@ fn refused_at(message: &str) -> (usize, usize) {
     let counts = message
         .split_once("when decoded (")
         .and_then(|(_, rest)| rest.split_once(" received)"))
-        .map(|(counts, _)| counts)
-        .unwrap_or_else(|| panic!("no byte counts in {message}"));
+        .map_or_else(
+            || panic!("no byte counts in {message}"),
+            |(counts, _)| counts,
+        );
     let (decoded, received) = counts
         .split_once(" bytes from ")
         .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
@@ -190,7 +192,8 @@ async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
     // Refused as soon as it passed the floor: never more than one decode block past it.
     let (decoded, received) = refused_at(&message);
     assert!(
-        decoded > RATIO_CHECK_FLOOR_BYTES && decoded <= RATIO_CHECK_FLOOR_BYTES + DECODE_BLOCK_BYTES,
+        decoded > RATIO_CHECK_FLOOR_BYTES
+            && decoded <= RATIO_CHECK_FLOOR_BYTES + DECODE_BLOCK_BYTES,
         "refused at {decoded} decoded bytes"
     );
     assert!(decoded > received * MAX_COMPRESSION_RATIO);

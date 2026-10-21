@@ -1056,9 +1056,13 @@ mod tests {
             if i > 0 {
                 body.push(',');
             }
-            body.push_str(&format!(
-                r#"{{"_id":"doc-{i}","_score":1.0,"_source":{{"n":{i},"text":"{filler}"}}}}"#
-            ));
+            std::fmt::Write::write_fmt(
+                &mut body,
+                format_args!(
+                    r#"{{"_id":"doc-{i}","_score":1.0,"_source":{{"n":{i},"text":"{filler}"}}}}"#
+                ),
+            )
+            .expect("write to a String");
         }
         body.push_str("]}}");
         assert!(body.len() > 136 * 1024 * 1024, "{} bytes", body.len());

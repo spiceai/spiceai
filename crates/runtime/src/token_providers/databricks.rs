@@ -224,8 +224,7 @@ async fn get_m2m_access_token(
             .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
     })
     .await?;
-    let response =
-        http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await?;
+    let response = http_body_limit::buffer(response, http_body_limit::Limit::METADATA).await?;
 
     if !response.status().is_success() {
         let status = response.status();

@@ -155,12 +155,11 @@ impl UnityCatalog {
 
         // Every body is read through `read_json` or `read_bounded_error_body`, which decode
         // it while refusing decompression amplification.
-        let client = http_body_limit::decode_manually(configure_client_builder(
-            reqwest::Client::builder(),
-        ))
-        .user_agent(util::spiceai_user_agent())
-            .build()
-            .context(UnableToCreateHttpClientSnafu)?;
+        let client =
+            http_body_limit::decode_manually(configure_client_builder(reqwest::Client::builder()))
+                .user_agent(util::spiceai_user_agent())
+                .build()
+                .context(UnableToCreateHttpClientSnafu)?;
 
         Ok(Self {
             endpoint: endpoint_str,

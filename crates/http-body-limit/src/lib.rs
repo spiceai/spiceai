@@ -133,7 +133,10 @@ pub enum Error {
 
     /// The body does not decode as the encoding it was sent with.
     #[snafu(display("Failed to decode the {encoding}-compressed response body: {source}"))]
-    Decode { encoding: Encoding, source: io::Error },
+    Decode {
+        encoding: Encoding,
+        source: io::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -183,7 +186,6 @@ impl std::fmt::Display for Encoding {
 /// Apply it after anything that turns decompression on. Every body read from the
 /// built client must go through [`buffer`], [`read_bytes`] or [`read_prefix`]; a body
 /// read any other way arrives still compressed.
-#[must_use]
 pub fn decode_manually(builder: ClientBuilder) -> ClientBuilder {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -341,7 +343,7 @@ fn decoder(response: Response, encoding: Encoding) -> (Decoder, Arc<AtomicUsize>
 }
 
 async fn decode(response: Response, encoding: Encoding, max_bytes: Option<usize>) -> Result<Bytes> {
-    let (mut decoder, received) = decoder(response, encoding);
+    let (mut reader, received_bytes) = decoder(response, encoding);
 
     // Decoded into blocks of a fixed size and joined once at the end, so a body that
     // is refused holds no more than the blocks it decoded, and one that is not is
@@ -354,7 +356,7 @@ async fn decode(response: Response, encoding: Encoding, max_bytes: Option<usize>
             blocks.push(block.split().freeze());
             block.reserve(DECODE_BLOCK_BYTES);
         }
-        let n = decoder
+        let n = reader
             .read_buf(&mut block)
             .await
             .map_err(|error| read_failure(error, encoding))?;
@@ -365,7 +367,7 @@ async fn decode(response: Response, encoding: Encoding, max_bytes: Option<usize>
         if let Some(max_bytes) = max_bytes {
             ensure!(decoded <= max_bytes, TooLargeSnafu { limit: max_bytes });
         }
-        let received = received.load(Ordering::Relaxed);
+        let received = received_bytes.load(Ordering::Relaxed);
         ensure!(
             decoded <= RATIO_CHECK_FLOOR_BYTES
                 || decoded <= received.saturating_mul(MAX_COMPRESSION_RATIO),
@@ -391,25 +393,9 @@ async fn decode(response: Response, encoding: Encoding, max_bytes: Option<usize>
 /// A failed read from a decoder: either reading the body failed, which is passed
 /// through, or the body does not decode.
 fn read_failure(error: io::Error, encoding: Encoding) -> Error {
-    if !error
-        .get_ref()
-        .is_some_and(|inner| inner.is::<reqwest::Error>())
-    {
-        return Error::Decode {
-            encoding,
-            source: error,
-        };
-    }
-    match error.into_inner().map(|inner| inner.downcast::<reqwest::Error>()) {
-        Some(Ok(source)) => Error::Read { source: *source },
-        Some(Err(inner)) => Error::Decode {
-            encoding,
-            source: io::Error::other(inner),
-        },
-        None => Error::Decode {
-            encoding,
-            source: io::Error::other("the response body could not be read"),
-        },
+    match error.downcast::<reqwest::Error>() {
+        Ok(source) => Error::Read { source },
+        Err(source) => Error::Decode { encoding, source },
     }
 }
 
@@ -644,7 +630,10 @@ mod tests {
         let error = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB - 1))
             .await
             .expect_err("one byte over the cap is refused");
-        assert!(matches!(error, Error::TooLarge { limit } if limit == 2 * MIB - 1), "{error:?}");
+        assert!(
+            matches!(error, Error::TooLarge { limit } if limit == 2 * MIB - 1),
+            "{error:?}"
+        );
 
         let url = serve(
             "Content-Encoding: gzip\r\n",
@@ -658,7 +647,10 @@ mod tests {
         let error = read_bytes(get(&url).await, Limit::CompressionRatioAndSize(2 * MIB - 1))
             .await
             .expect_err("one decoded byte over the cap is refused");
-        assert!(matches!(error, Error::TooLarge { limit } if limit == 2 * MIB - 1), "{error:?}");
+        assert!(
+            matches!(error, Error::TooLarge { limit } if limit == 2 * MIB - 1),
+            "{error:?}"
+        );
         assert_eq!(
             error.to_string(),
             "the response body is larger than the 2097151 bytes that is read from one HTTP response"
@@ -672,7 +664,13 @@ mod tests {
             .await
             .expect_err("a body that does not decode is refused");
         assert!(
-            matches!(error, Error::Decode { encoding: Encoding::Gzip, .. }),
+            matches!(
+                error,
+                Error::Decode {
+                    encoding: Encoding::Gzip,
+                    ..
+                }
+            ),
             "{error:?}"
         );
     }
@@ -741,13 +739,12 @@ mod tests {
             br#"{"rows":[1,2,3]}"#.to_vec(),
         )
         .await;
-        let value: serde_json::Value =
-            buffer(get(&url).await, Limit::CompressionRatioAndSize(MIB))
-                .await
-                .expect("a small body is buffered")
-                .json()
-                .await
-                .expect("decode json");
+        let value: serde_json::Value = buffer(get(&url).await, Limit::CompressionRatioAndSize(MIB))
+            .await
+            .expect("a small body is buffered")
+            .json()
+            .await
+            .expect("decode json");
         assert_eq!(value.to_string(), r#"{"rows":[1,2,3]}"#);
     }
 
