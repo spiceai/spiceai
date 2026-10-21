@@ -25,6 +25,7 @@ use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
 use super::column_stats::ColumnStatsAccumulator;
 use super::context::CayenneContext;
+use super::first_load_pk::FirstLoadPkFilter;
 use super::on_conflict::{OnConflictDeletions, PreparedOnConflictDeletionPublish};
 use super::pk_index::PkDigestSet;
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
@@ -33,12 +34,18 @@ use crate::CayenneCatalog;
 use crate::catalog::{CatalogResult, MetadataCatalog};
 use crate::metastore::MetastoreTransaction;
 
-/// Owns the write lock until durable publication, visibility, and maintenance
+/// Owns the write lock, and the mem-tier checkpoint lock a streaming write
+/// validated under, until durable publication, visibility, and maintenance
 /// bookkeeping are complete, including when the requesting task is cancelled.
 pub(super) struct PreparedResolvedAppend {
     pub table: CayenneTableProvider,
     pub context: Arc<CayenneContext>,
     pub _write_guard: OwnedMutexGuard<()>,
+    /// Holds the mem-tier checkpoint off until publication has acted on what
+    /// validation decided about where each replaced row lives
+    /// ([`CayenneTableProvider::lock_mem_tier_checkpoint_for_durable_write`]).
+    /// `None` for a transaction's staged upsert, which does not take it.
+    pub _checkpoint_guard: Option<OwnedMutexGuard<()>>,
     pub snapshot_id: String,
     pub rows: u64,
     pub stats: Arc<ColumnStatsAccumulator>,
@@ -46,6 +53,7 @@ pub(super) struct PreparedResolvedAppend {
     pub validated_keys: PkDigestSet,
     pub superseded: usize,
     pub into_empty_table: bool,
+    pub first_load_pk_bloom: Option<FirstLoadPkFilter>,
 }
 
 /// A failed publication, and whether its snapshot's files must be kept because
@@ -155,6 +163,9 @@ impl PreparedResolvedAppend {
         );
         if retention || self.into_empty_table {
             self.table.clear_cached_pk_keyset();
+            if let Some(filter) = self.first_load_pk_bloom.take() {
+                filter.install(&self.table);
+            }
         } else {
             self.table
                 .record_file_pk_keys(&self.validated_keys, sequence);

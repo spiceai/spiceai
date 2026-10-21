@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod archive;
 mod docx;
 mod pdf;
 mod pdfium;
@@ -53,9 +54,36 @@ pub enum Error {
         See: https://spiceai.org/docs/features/document-processing"
     ))]
     PdfiumUnavailable { reason: String },
+
+    #[snafu(display(
+        "Failed to parse {format} document: {reason}. \
+        Documents this large are not supported, and the file may be maliciously crafted (for example, a decompression bomb). \
+        See: https://spiceai.org/docs/features/document-processing"
+    ))]
+    DocumentTooLarge {
+        format: DocumentType,
+        reason: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Runs CPU-bound document parsing on the blocking thread pool so it cannot
+/// stall the async runtime (decompressing and parsing a large document can take
+/// well over the ~100µs budget a runtime thread may hold). A panic inside the
+/// closure, or runtime shutdown, surfaces as a structured parsing error for the
+/// given `format` rather than propagating the panic.
+pub(crate) async fn parse_blocking<T: Send + 'static>(
+    format: DocumentType,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|source| Error::InternalParsingError {
+            format,
+            source: Box::new(source),
+        })?
+}
 
 static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DocumentParserFactory>>>,
@@ -104,7 +132,7 @@ pub trait Document {
     fn type_(&self) -> DocumentType;
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentType {
     Pdf,
     Docx,

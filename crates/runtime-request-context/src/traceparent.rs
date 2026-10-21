@@ -16,15 +16,31 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use axum::http::HeaderMap;
-use opentelemetry::trace::{SpanId, TraceId};
+use opentelemetry::trace::{SpanId, TraceFlags, TraceId};
 
 const MAX_VERSION: u8 = 254;
-const TRACEPARENT_HEADER: &str = "traceparent";
+/// Name of the W3C trace context header.
+pub const TRACEPARENT_HEADER: &str = "traceparent";
 
 /// Represents W3C `traceparent` header values.
 pub struct TraceParent {
     pub trace_id: TraceId,
     pub span_id: SpanId,
+    /// The caller's trace flags, such as its sampling decision.
+    pub trace_flags: TraceFlags,
+}
+
+impl std::fmt::Display for TraceParent {
+    /// Formats the value to send downstream: version `00`, with the caller's flags.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "00-{}-{}-{:02x}",
+            self.trace_id,
+            self.span_id,
+            self.trace_flags.to_u8()
+        )
+    }
 }
 
 pub fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, String> {
@@ -79,10 +95,38 @@ pub fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, 
         format!("In traceparent header, invalid span id. Expected 16 character hex value: {e}")
     })?;
 
-    // Parse trace flags section solely to ensure they're valid.
-    let _ = u8::from_str_radix(parts[3], 16).map_err(|e| {
+    let trace_flags = u8::from_str_radix(parts[3], 16).map_err(|e| {
         format!("In traceparent header, invalid trace flags. Expected hex value, got {e}")
     })?;
 
-    Ok(Some(TraceParent { trace_id, span_id }))
+    Ok(Some(TraceParent {
+        trace_id,
+        span_id,
+        trace_flags: TraceFlags::new(trace_flags),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The caller's sampling decision is kept: an unsampled (`00`) request is
+    /// not forwarded as sampled.
+    #[test]
+    fn display_round_trips_through_extract() {
+        for value in [
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                TRACEPARENT_HEADER,
+                value.parse().expect("valid header value"),
+            );
+            let trace_parent = extract_trace_parent(&headers)
+                .expect("valid traceparent")
+                .expect("traceparent present");
+            assert_eq!(trace_parent.to_string(), value);
+        }
+    }
 }

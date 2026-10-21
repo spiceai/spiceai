@@ -81,9 +81,17 @@ fn slice_archive_path(dataset_name: &str) -> String {
 }
 
 /// File names (relative to `metadata_dir`) that must be excluded from the
-/// archive. Cayenne always opens the metastore in WAL journal mode, so the
-/// `-wal` and `-shm` sidecars may be present alongside `cayenne.db`.
-const METASTORE_FILES: &[&str] = &["cayenne.db", "cayenne.db-wal", "cayenne.db-shm"];
+/// archive: every file either metastore backend keeps beside `cayenne.db`.
+/// The `SQLite` metastore runs in WAL journal mode, so its `-wal` and `-shm`
+/// sidecars may be present; the Turso metastore keeps its MVCC log in
+/// `-log` (and may also leave a `-wal`). A reader holds its own copies of
+/// these files, so an archived one fails the restore's checksum check.
+const METASTORE_FILES: &[&str] = &[
+    "cayenne.db",
+    "cayenne.db-wal",
+    "cayenne.db-shm",
+    "cayenne.db-log",
+];
 
 /// Errors raised by the Cayenne snapshot engine.
 #[derive(Debug, Snafu)]
@@ -568,7 +576,13 @@ mod tests {
     use std::sync::Arc;
 
     async fn fresh_catalog(dir: &std::path::Path) -> Arc<CayenneCatalog> {
-        let conn = format!("sqlite://{}/cayenne.db", dir.display());
+        catalog_with_scheme(dir, "sqlite").await
+    }
+
+    /// A catalog on the metastore backend `scheme` selects: `sqlite` or
+    /// `libsql` (Turso).
+    async fn catalog_with_scheme(dir: &std::path::Path, scheme: &str) -> Arc<CayenneCatalog> {
+        let conn = format!("{scheme}://{}/cayenne.db", dir.display());
         let catalog = Arc::new(CayenneCatalog::new(conn).expect("catalog"));
         catalog.init().await.expect("init");
         catalog
@@ -1002,6 +1016,135 @@ mod tests {
         );
         assert!(reader_data.join(&table_id).join(&second).is_dir());
         assert_eq!(rows, 50, "the archive restores the refreshed table");
+    }
+
+    /// A writer's table `trips` holding ids `1..=100`, with its metastore on
+    /// the Turso backend. Returns the catalog and the snapshot directories.
+    async fn turso_writer(root: &Path) -> (Arc<CayenneCatalog>, Vec<(PathBuf, String)>) {
+        use arrow::array::{Int64Array, RecordBatch};
+        use cayenne::CayenneTableProviderBuilder;
+        use datafusion::datasource::TableProvider;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::logical_expr::dml::InsertOp;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+
+        let metadata_dir = root.join("metadata");
+        let data_dir = root.join("trips");
+        std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let catalog = catalog_with_scheme(&metadata_dir, "libsql").await;
+        let ctx = SessionContext::new();
+        let table = CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: "trips".to_string(),
+            schema: schema(),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir.to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        })
+        .await
+        .expect("create table");
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(Int64Array::from((1..=100).collect::<Vec<i64>>()))],
+        )
+        .expect("batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema(), None).expect("exec");
+        let plan = table
+            .insert_into(&ctx.state(), input, InsertOp::Append)
+            .await
+            .expect("plan");
+        collect(plan, ctx.task_ctx()).await.expect("write");
+        let dirs = vec![
+            (metadata_dir, "metadata/".to_string()),
+            (data_dir, "data/".to_string()),
+        ];
+        (catalog, dirs)
+    }
+
+    /// The Turso metastore keeps an MVCC log, `cayenne.db-log`, beside
+    /// `cayenne.db`. Every metastore file the writer has on disk must be left
+    /// out of its snapshot, whichever backend wrote it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turso_metastore_files_are_left_out_of_the_snapshot() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (catalog, dirs) = turso_writer(tmp.path()).await;
+        let (metadata_dir, data_dir) = (dirs[0].0.clone(), dirs[1].0.clone());
+        let plan =
+            CayenneSnapshotEngine::new(catalog as Arc<dyn MetadataCatalog>, "trips", data_dir)
+                .prepare_directory_snapshot(&dirs, "trips")
+                .await
+                .expect("prepare");
+
+        let mut on_disk: Vec<String> = std::fs::read_dir(&metadata_dir)
+            .expect("list metadata")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("cayenne.db"))
+            .collect();
+        on_disk.sort();
+        assert!(
+            on_disk.iter().any(|name| name == "cayenne.db-log"),
+            "the Turso metastore writes its MVCC log: {on_disk:?}"
+        );
+        let archived: Vec<&String> = on_disk
+            .iter()
+            .filter(|name| !plan.skip_relative_paths.contains(&PathBuf::from(name)))
+            .collect();
+        assert!(
+            archived.is_empty(),
+            "metastore files the snapshot would archive: {archived:?} (on disk: {on_disk:?})"
+        );
+    }
+
+    /// A reader restoring a snapshot opens its own Turso metastore first, so
+    /// its own `cayenne.db-log` already exists when the archive is extracted.
+    /// Extraction keeps existing files only if their checksum matches the
+    /// archive's copy, so a snapshot carrying the writer's log can never
+    /// restore. With the log left out, the reader restores every row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn turso_metastore_snapshot_restores_into_a_reader_with_its_own_metastore() {
+        use runtime_acceleration::snapshot::directory_archive::archive_directories_to_file_with_plan;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (catalog, dirs) = turso_writer(&tmp.path().join("writer")).await;
+        let plan = CayenneSnapshotEngine::new(
+            catalog as Arc<dyn MetadataCatalog>,
+            "trips",
+            dirs[1].0.clone(),
+        )
+        .prepare_directory_snapshot(&dirs, "trips")
+        .await
+        .expect("prepare");
+        let skip: Vec<PathBuf> = plan.skip_relative_paths.into_iter().collect();
+        let extras: Vec<(String, Vec<u8>)> = plan
+            .extra_entries
+            .into_iter()
+            .map(|e| (e.archive_path, e.bytes))
+            .collect();
+        let tar = tmp.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras, &[])
+            .await
+            .expect("archive");
+
+        let reader = tmp.path().join("reader");
+        let (_, rows) = restore_with_scheme(&tar, &reader, "libsql").await;
+        assert!(
+            reader.join("metadata").join("cayenne.db-log").is_file(),
+            "the reader keeps its own Turso metastore log"
+        );
+        assert_eq!(rows, 100, "the reader restores every row of the snapshot");
     }
 
     #[tokio::test]
@@ -1687,6 +1830,223 @@ mod tests {
                 "once caught up, the lookup is answered from the index: {after:?}"
             );
         }
+
+        /// Replaces the table's rows with `batch`, as a full refresh does.
+        async fn overwrite(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+            use datafusion::dataframe::DataFrameWriteOptions;
+            use datafusion::logical_expr::dml::InsertOp;
+            let ctx = SessionContext::new();
+            ctx.register_table(NAME, Arc::clone(table) as Arc<dyn TableProvider>)
+                .expect("register");
+            ctx.read_batch(batch)
+                .expect("read batch")
+                .write_table(
+                    NAME,
+                    DataFrameWriteOptions::new().with_insert_operation(InsertOp::Overwrite),
+                )
+                .await
+                .expect("overwrite");
+        }
+
+        /// Archives the writer's directories the way the runtime does after a
+        /// refresh: under the index persistence hold, then restores the archive
+        /// into `root` and reopens it there.
+        async fn snapshot_and_reopen(
+            env: &Arc<RuntimeEnv>,
+            table: &Arc<CayenneTableProvider>,
+            catalog: &Arc<CayenneCatalog>,
+            (meta, data): (&Path, &Path),
+            root: &Path,
+        ) -> Arc<CayenneTableProvider> {
+            let archive = root.with_extension("tar");
+            {
+                let _hold = table.persist_lookup_index_for_snapshot().await;
+                snapshot(catalog, meta, data, &archive).await;
+            }
+            let (reader_catalog, reader_data) = restore(&archive, root).await;
+            open(env, reader_catalog, &reader_data, IndexPersistence::Enabled).await
+        }
+
+        /// A snapshot taken the moment a full refresh returns carries the
+        /// refresh's index runs, so a table restored from it covers every file
+        /// without a build. The runs of a write persist in the background; the
+        /// runtime snapshots straight after a refresh, and without the hold the
+        /// archive held only the runs of the replaced files in 7 of 10 rounds
+        /// (`covered_files=0 uncovered_files=8`). Regression test for #14803.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_snapshot_right_after_a_full_refresh_carries_its_runs() {
+            if !cfg!(unix) {
+                return;
+            }
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let table = open(&env, Arc::clone(&catalog), &data, IndexPersistence::Enabled).await;
+            for round in 0..5_i64 {
+                let first = round * 1_000_000;
+                overwrite(&table, rows(first, 400_000)).await;
+                let reader = snapshot_and_reopen(
+                    &env,
+                    &table,
+                    &catalog,
+                    (&meta, &data),
+                    &tmp.path().join(format!("r{round}")),
+                )
+                .await;
+                let restored = reader
+                    .verify_lookup_index_against_read_back()
+                    .await
+                    .expect("verify");
+                let counters = reader.lookup_index_counters().expect("indexed");
+                assert!(
+                    restored.agrees()
+                        && restored.files > 1
+                        && restored.uncovered_files == 0
+                        && counters.builds_started == 0,
+                    "round {round}: the restore must be covered by the refresh's runs, not a build: {restored:?} {counters:?}"
+                );
+                assert_eq!(lookup(&reader, first + 123_457).await, 1);
+                let after = reader.lookup_index_counters().expect("indexed");
+                assert_eq!(
+                    (after.full - counters.full, after.none - counters.none),
+                    (1, 0),
+                    "round {round}: the first lookup is answered from the restored index: {after:?}"
+                );
+            }
+        }
+
+        /// While the snapshot hold is held, a write's runs are not persisted, so
+        /// no run file the archive lists is replaced or deleted under it; once
+        /// the hold drops, they are.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn the_snapshot_hold_keeps_the_persisted_runs_until_it_drops() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, _meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let table = open(&env, Arc::clone(&catalog), &data, IndexPersistence::Enabled).await;
+            let before = persisted(&catalog, &data, 2).await;
+            let hold = table.persist_lookup_index_for_snapshot().await;
+            overwrite(&table, rows(500_000, 5_000)).await;
+            // Asserting that a sync does NOT run takes a window of time: the
+            // write's sync is spawned when the write returns, so it has had
+            // this long to replace the runs were the hold not blocking it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let table_id = catalog.get_table(NAME).await.expect("table").table_id;
+            let mut registered: Vec<(String, String)> = catalog
+                .list_index_runs(&table_id)
+                .await
+                .expect("list runs")
+                .into_iter()
+                .map(|run| (run.index_key, run.run_name))
+                .collect();
+            registered.sort();
+            assert_eq!(
+                registered, before,
+                "no run is registered or removed while held"
+            );
+            assert_eq!(
+                run_files(&data),
+                before.len(),
+                "no run file changes while held"
+            );
+            drop(hold);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let now = persisted(&catalog, &data, 1).await;
+                if now != before {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the overwrite's runs were never persisted after the hold dropped"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// A table restored without its index runs (here, the archive lost
+        /// them) indexes every uncovered file in `catch_up_lookup_index`, and
+        /// is fully covered when it returns: no lookup reads a file in full.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn catching_up_indexes_a_restore_that_lost_its_runs() {
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let archive = tmp.path().join("snapshot.tar");
+            snapshot(&catalog, &meta, &data, &archive).await;
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            for run in run_file_paths(&reader_data) {
+                std::fs::remove_file(run).expect("drop a restored run file");
+            }
+            let reader = open(
+                &env,
+                reader_catalog,
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            let restored = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            assert!(
+                restored.uncovered_files > 0,
+                "the restore starts uncovered: {restored:?}"
+            );
+
+            reader.catch_up_lookup_index().await;
+            let caught_up = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            let counters = reader.lookup_index_counters().expect("indexed");
+            assert!(
+                caught_up.agrees()
+                    && caught_up.files > 0
+                    && caught_up.uncovered_files == 0
+                    && counters.builds_started == 1,
+                "catching up returns once every file is indexed: {caught_up:?} {counters:?}"
+            );
+            assert_eq!(lookup(&reader, 24_007).await, 1);
+            let after = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (after.full - counters.full, after.none - counters.none),
+                (1, 0),
+                "the first lookup is answered from the index: {after:?}"
+            );
+        }
+
+        /// Catching up a table its runs already cover starts no build.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn catching_up_a_covered_table_builds_nothing() {
+            if !cfg!(unix) {
+                return;
+            }
+            let env = Arc::new(RuntimeEnv::default());
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (catalog, meta, data) = writer(&env, &tmp.path().join("w")).await;
+            let archive = tmp.path().join("snapshot.tar");
+            snapshot(&catalog, &meta, &data, &archive).await;
+            let (reader_catalog, reader_data) = restore(&archive, &tmp.path().join("r")).await;
+            let reader = open(
+                &env,
+                reader_catalog,
+                &reader_data,
+                IndexPersistence::Enabled,
+            )
+            .await;
+            reader.catch_up_lookup_index().await;
+            let verification = reader
+                .verify_lookup_index_against_read_back()
+                .await
+                .expect("verify");
+            let counters = reader.lookup_index_counters().expect("indexed");
+            assert_eq!(
+                (verification.uncovered_files, counters.builds_started),
+                (0, 0),
+                "{verification:?} {counters:?}"
+            );
+        }
     }
 
     /// A key-upsert table holding one row, plus `orphans` orphan-eligible key
@@ -1798,6 +2158,16 @@ mod tests {
     /// Extracts `tar` under `root` into a fresh metastore and opens the table;
     /// returns the reader's data directory and the restored row count.
     async fn restore(tar: &std::path::Path, root: &std::path::Path) -> (PathBuf, usize) {
+        restore_with_scheme(tar, root, "sqlite").await
+    }
+
+    /// [`restore`] into a reader whose metastore is on the backend `scheme`
+    /// selects.
+    async fn restore_with_scheme(
+        tar: &std::path::Path,
+        root: &std::path::Path,
+        scheme: &str,
+    ) -> (PathBuf, usize) {
         use arrow::array::RecordBatch;
         use cayenne::CayenneTableProviderBuilder;
         use datafusion::datasource::TableProvider;
@@ -1810,7 +2180,7 @@ mod tests {
         let data_dir = root.join("trips");
         std::fs::create_dir_all(&metadata_dir).expect("mkdir metadata");
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
-        let catalog = fresh_catalog(&metadata_dir).await;
+        let catalog = catalog_with_scheme(&metadata_dir, scheme).await;
         extract_archive_file_with_options(
             tar,
             root,

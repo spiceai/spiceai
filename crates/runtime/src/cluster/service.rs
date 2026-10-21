@@ -20,7 +20,6 @@ limitations under the License.
 //! including app definition retrieval, secret expansion, and control stream
 //! management for sending `PollNow` commands to executors.
 
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -35,7 +34,7 @@ use datafusion::{
     common::TableReference,
     prelude::Expr,
     sql::sqlparser::{
-        ast::{Ident, ObjectNamePart, visit_relations_mut},
+        ast::{LimitClause, Statement},
         dialect::PostgreSqlDialect,
         parser::Parser,
     },
@@ -82,7 +81,13 @@ use crate::datafusion::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_RUNTIME_SCHEMA,
 };
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
+use runtime_cluster::{ExecutorRegistration, Registered};
 use telemetry::metrics_reader::MetricsReader;
+
+/// How long a scheduler waits for any message on an executor's control stream
+/// before it treats the executor as gone. Executors send a heartbeat every 10
+/// seconds.
+const CONTROL_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Handle for sending messages to a connected executor.
 struct ExecutorStreamHandle {
@@ -184,15 +189,24 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
-    allow_secret_expansion: bool,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
 
 impl ClusterServiceImpl {
+    /// Where the cluster keeps its shared state, for messages about it: the
+    /// scheduler state location, or this scheduler's address when there is none.
+    async fn state_location(&self) -> String {
+        self.app
+            .read()
+            .await
+            .as_ref()
+            .and_then(|app| app.runtime.scheduler_state())
+            .map_or_else(|| self.advertise_address.clone(), |state| state.location)
+    }
+
     /// Creates a new cluster service implementation.
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -201,7 +215,6 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
-        allow_secret_expansion: bool,
     ) -> Self {
         Self {
             app,
@@ -211,7 +224,6 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-            allow_secret_expansion,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -231,7 +243,6 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
-        allow_secret_expansion: bool,
     ) -> Self {
         Self {
             app,
@@ -241,7 +252,6 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-            allow_secret_expansion,
             executor_streams,
         }
     }
@@ -295,7 +305,10 @@ impl ClusterServiceImpl {
 struct ControlStreamOutbound {
     inner: ReceiverStream<SchedulerControlMessage>,
     cancel: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    /// The task that reads the executor's messages. The response ends when it ends, so an
+    /// executor the scheduler no longer reads (it sent nothing for
+    /// `CONTROL_STREAM_IDLE_TIMEOUT` and was unregistered) sees its stream end and reconnects.
+    reader: Option<tokio::task::JoinHandle<()>>,
     _outbound_tx: mpsc::Sender<SchedulerControlMessage>,
 }
 
@@ -305,17 +318,27 @@ impl Stream for ControlStreamOutbound {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(message)) => Poll::Ready(Some(Ok(message))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(message)) => return Poll::Ready(Some(Ok(message))),
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => {}
+        }
+        match this.reader.as_mut().map(|reader| Pin::new(reader).poll(cx)) {
+            Some(Poll::Pending) => Poll::Pending,
+            Some(Poll::Ready(_)) | None => {
+                this.reader = None;
+                Poll::Ready(None)
+            }
         }
     }
 }
 
+/// Dropped when the executor's connection ends, also without a shutdown message (a
+/// crash). Cancelling lets the task that reads the executor's messages unregister it
+/// before it ends; aborting that task would skip the unregister and keep the executor
+/// registered, so its partitions would never move.
 impl Drop for ControlStreamOutbound {
     fn drop(&mut self) {
         self.cancel.cancel();
-        self.task.abort();
     }
 }
 
@@ -331,14 +354,11 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id
         );
 
-        let app_json = {
-            let app_guard = self.app.read().await;
-            let Some(ref app) = *app_guard else {
-                return Err(Status::internal("App context not available"));
-            };
-            serde_json::to_string(app.as_ref())
-                .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?
+        let Some(app) = self.app.read().await.clone() else {
+            return Err(Status::internal("App context not available"));
         };
+        let app_json = serde_json::to_string(&executor_app_definition(&app))
+            .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?;
 
         // Snapshot the DDL log so the executor can replay DDL-created tables/schemas.
         let (ddl_statements, ddl_version) = self.executor_registry.ddl_snapshot().await;
@@ -355,16 +375,6 @@ impl ClusterService for ClusterServiceImpl {
         request: Request<ExpandSecretRequest>,
     ) -> Result<Response<ExpandSecretResponse>, Status> {
         let request = request.into_inner();
-
-        if !self.allow_secret_expansion {
-            tracing::warn!(
-                executor_id = %request.executor_id,
-                "Denied cluster secret expansion without mTLS"
-            );
-            return Err(Status::permission_denied(
-                "Secret expansion requires cluster mTLS",
-            ));
-        }
 
         // Empty key is never a valid secret reference and is rejected before
         // any store lookup or allowlist work.
@@ -407,7 +417,7 @@ impl ClusterService for ClusterServiceImpl {
                 "Secret expansion requires a loaded app definition",
             ));
         };
-        let allowed_keys = expandable_secret_keys(&app);
+        let allowed_keys = expandable_secret_keys(&executor_app_definition(&app));
 
         let Some(allowed_stores) = allowed_keys.get(request.key.as_str()) else {
             tracing::warn!(
@@ -417,7 +427,7 @@ impl ClusterService for ClusterServiceImpl {
             );
             // Same status/message shape as a miss so callers cannot distinguish
             // "not in spicepod" from "not in any store" for unallowlisted keys.
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::not_found(format!(
                 "Unable to expand secret {}",
                 request.key
             )));
@@ -446,7 +456,7 @@ impl ClusterService for ClusterServiceImpl {
             lookup.map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
         else {
             tracing::error!(target: "task_history", "Secret not found");
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::not_found(format!(
                 "Unable to expand secret {}",
                 request.key
             )));
@@ -506,21 +516,24 @@ impl ClusterService for ClusterServiceImpl {
             request.sql
         );
 
-        // Parse and rewrite the SQL to query local_task_history instead of task_history.
-        // This avoids infinite recursion: the federated task_history table would fan out
-        // to peers, but peers need to query their local data only.
-        let local_sql = rewrite_task_history_sql(&request.sql)
+        // Peers get this node's own rows: the federated task_history table would fan out
+        // again, so the query reads local_task_history.
+        let limit = peer_task_history_limit(&request.sql)
             .map_err(|e| Status::invalid_argument(format!("Invalid task history query: {e}")))?;
+        let local_sql = match limit {
+            Some(limit) => format!(
+                "SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{LOCAL_TASK_HISTORY_TABLE}\" LIMIT {limit}"
+            ),
+            None => {
+                format!("SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{LOCAL_TASK_HISTORY_TABLE}\"")
+            }
+        };
 
-        // Always run under the strict read-only validator: GetTaskHistory is a
-        // cluster-internal fan-in for observability, not a general SQL surface.
-        // Without this gate, a peer could smuggle DDL/DML that merely *mentions*
-        // task_history (e.g. `INSERT INTO writable SELECT * FROM runtime.task_history`)
-        // and execute it with the scheduler's full DataFusion context.
         let query_result = self
             .datafusion
             .query_builder(&local_sql)
             .read_only(true)
+            .for_peer_scheduler_read()
             .build()
             .run()
             .await
@@ -580,8 +593,9 @@ impl ClusterService for ClusterServiceImpl {
         let datafusion = Arc::clone(&self.datafusion);
         let outbound_tx_for_registry = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();
-        let inbound_task = tokio::spawn(async move {
-            let executor_id = match inbound.next().await {
+        let state_location = self.state_location().await;
+        let reader = tokio::spawn(async move {
+            let (executor_id, process_id) = match inbound.next().await {
                 Some(Ok(msg)) => {
                     let executor_id = msg.executor_id.clone();
                     if executor_id.is_empty() {
@@ -592,9 +606,15 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &datafusion).await;
+                        handle_executor_message(
+                            &executor_id,
+                            &msg.process_id,
+                            &message,
+                            &datafusion,
+                        )
+                        .await;
                     }
-                    executor_id
+                    (executor_id, msg.process_id)
                 }
                 Some(Err(e)) => {
                     tracing::warn!("Error receiving first executor control message: {e}");
@@ -607,9 +627,48 @@ impl ClusterService for ClusterServiceImpl {
             };
 
             // Register the executor with the registry.
-            let handles = executor_registry
-                .register(executor_id.clone(), outbound_tx_for_registry)
+            let Registered {
+                handles,
+                registration,
+                connection,
+            } = executor_registry
+                .register(executor_id.clone(), &process_id, outbound_tx_for_registry)
                 .await;
+            match registration {
+                ExecutorRegistration::Duplicate => {
+                    tracing::error!(
+                        "{}",
+                        util::instance_id::duplicate_instance_message(
+                            &executor_id,
+                            &state_location
+                        )
+                    );
+                    // Keep the stream open and ignore it, so the duplicate does not
+                    // reconnect and register again.
+                    while let Some(Ok(_)) = inbound.next().await {}
+                    return;
+                }
+                ExecutorRegistration::Restarted => {
+                    tracing::info!(
+                        "Executor '{executor_id}' restarted, so the tasks and shuffle output of its earlier run are rescheduled"
+                    );
+                    if let Err(err) = notify_scheduler_executor_shutdown(
+                        &datafusion,
+                        &executor_id,
+                        "the executor restarted",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to reschedule the work of executor '{executor_id}' after its restart, so queries running on its earlier run wait until it is reaped: {err}"
+                        );
+                    }
+                    if let Some(tracker) = datafusion.partition_load_tracker.as_ref() {
+                        tracker.drop_executor(&executor_id).await;
+                    }
+                }
+                ExecutorRegistration::New | ExecutorRegistration::Reconnected => {}
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
@@ -618,14 +677,35 @@ impl ClusterService for ClusterServiceImpl {
             // Register the executor stream for PollNow broadcasts.
             executor_streams.register(&executor_id, registration_tx);
 
+            let mut reported_duplicate = false;
             loop {
                 tokio::select! {
                     () = inbound_cancel.cancelled() => {
                         tracing::debug!("Executor control stream cancelled: {executor_id}");
                         break;
                     }
-                    result = inbound.next() => {
+                    result = tokio::time::timeout(CONTROL_STREAM_IDLE_TIMEOUT, inbound.next()) => {
+                        let Ok(result) = result else {
+                            tracing::warn!(
+                                "Executor {executor_id} sent nothing on its control stream for {CONTROL_STREAM_IDLE_TIMEOUT:?}; treating it as gone"
+                            );
+                            break;
+                        };
                         match result {
+                            // A later process registered under this id while this
+                            // one is still sending: two processes share the id.
+                            Some(Ok(_)) if !executor_registry.is_current(&executor_id, connection) => {
+                                if !reported_duplicate {
+                                    reported_duplicate = true;
+                                    tracing::error!(
+                                        "{}",
+                                        util::instance_id::duplicate_instance_message(
+                                            &executor_id,
+                                            &state_location
+                                        )
+                                    );
+                                }
+                            }
                             Some(Ok(msg)) => {
                                 if let Some(message) = msg.message {
                                     // Route correlated responses (metrics, acks) to their waiters;
@@ -653,9 +733,33 @@ impl ClusterService for ClusterServiceImpl {
                                                 );
                                             }
                                         }
+                                        ExecutorMessage::FlightEndpoint(endpoint) => {
+                                            register_executor_flight_endpoint(
+                                                &executor_registry,
+                                                &datafusion,
+                                                &executor_id,
+                                                &endpoint.executor_url,
+                                                &process_id,
+                                            )
+                                            .await;
+                                        }
+                                        ExecutorMessage::Shutdown(_) => {
+                                            handle_executor_message(
+                                                &executor_id,
+                                                &process_id,
+                                                &message,
+                                                &datafusion,
+                                            )
+                                            .await;
+                                            // The executor stops serving now:
+                                            // unregister it rather than wait
+                                            // for its stream to close.
+                                            break;
+                                        }
                                         _ => {
                                             handle_executor_message(
                                                 &executor_id,
+                                                &process_id,
                                                 &message,
                                                 &datafusion,
                                             )
@@ -677,8 +781,12 @@ impl ClusterService for ClusterServiceImpl {
                 }
             }
 
-            // Unregister the executor when the stream ends.
-            executor_registry.unregister(&executor_id).await;
+            // Unregister the executor when the stream ends, unless a later
+            // connection under its id replaced this one.
+            if !executor_registry.unregister(&executor_id, connection).await {
+                tracing::debug!("Replaced executor control stream ended: {executor_id}");
+                return;
+            }
 
             // Update active executor count metric.
             let count = executor_registry.connected_executors().await.len();
@@ -700,7 +808,7 @@ impl ClusterService for ClusterServiceImpl {
         let stream = ControlStreamOutbound {
             inner: ReceiverStream::new(outbound_rx),
             cancel,
-            task: inbound_task,
+            reader: Some(reader),
             _outbound_tx: outbound_tx,
         };
 
@@ -711,13 +819,21 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<AllocateInitialPartitionsRequest>,
     ) -> Result<Response<AllocateInitialPartitionsResponse>, Status> {
-        let AllocateInitialPartitionsRequest { executor_url } = request.into_inner();
+        let AllocateInitialPartitionsRequest {
+            executor_url,
+            executor_id,
+            process_id,
+        } = request.into_inner();
 
-        // Current standard is to have executor id be without scheme.
-        let executor_id = if let Some(index) = executor_url.find("://") {
-            &executor_url[index + 3..]
+        // The executor's advertise address, without the scheme. An executor that
+        // sends no id is identified by it.
+        let executor_address = executor_url
+            .split_once("://")
+            .map_or(executor_url.as_str(), |(_, address)| address);
+        let executor_id = if executor_id.is_empty() {
+            executor_address
         } else {
-            &executor_url
+            executor_id.as_str()
         };
 
         // Gate on dataset readiness. Partition-expression serialization needs
@@ -760,17 +876,35 @@ impl ClusterService for ClusterServiceImpl {
             ));
         }
 
-        let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
-        match create_executor_flight_client(&executor_url, tls_config_opt) {
-            Ok(client) => {
-                self.executor_registry
-                    .insert_flight_sql_client(executor_id.to_string(), client)
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create Flight SQL client for executor {executor_id}: {e}"
-                );
+        register_executor_flight_endpoint(
+            &self.executor_registry,
+            &self.datafusion,
+            executor_id,
+            &executor_url,
+            &process_id,
+        )
+        .await;
+
+        // Partitions assigned while this executor was identified by its advertise
+        // address follow it to its instance identity.
+        if executor_id != executor_address {
+            for store in [
+                self.executor_registry.accelerations_partition_store(),
+                self.executor_registry.federated_partition_store(),
+            ] {
+                match store.move_assignments(executor_address, executor_id).await {
+                    Ok(0) => {}
+                    Ok(moved) => tracing::info!(
+                        "Moved {moved} partition assignments of executor '{executor_address}' to its instance identity '{executor_id}'"
+                    ),
+                    // Unavailable makes the executor retry, rather than start with
+                    // none of the partitions still assigned to its address.
+                    Err(err) => {
+                        return Err(Status::unavailable(format!(
+                            "Failed to move the partition assignments of executor '{executor_address}' to its instance identity '{executor_id}': {err}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -887,6 +1021,42 @@ impl ClusterService for ClusterServiceImpl {
     }
 }
 
+/// Creates the Flight SQL client the scheduler sends executor-bound scans
+/// through, from the executor's advertise URL, and registers it for
+/// `executor_id` as the endpoint of executor process `process_id`.
+async fn register_executor_flight_endpoint(
+    executor_registry: &ExecutorRegistry,
+    datafusion: &DataFusion,
+    executor_id: &str,
+    executor_url: &str,
+    process_id: &str,
+) {
+    let executor_address = executor_url
+        .split_once("://")
+        .map_or(executor_url, |(_, address)| address);
+    let tls_config_opt = datafusion.cluster_config.client_tls_config();
+    match create_executor_flight_client(executor_url, tls_config_opt) {
+        Ok(client) => {
+            if !executor_registry
+                .insert_flight_sql_client(
+                    executor_id.to_string(),
+                    executor_address.to_string(),
+                    process_id,
+                    client,
+                )
+                .await
+            {
+                tracing::debug!(
+                    "Ignoring the Flight endpoint of a replaced process of executor {executor_id}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create Flight SQL client for executor {executor_id}: {e}");
+        }
+    }
+}
+
 fn create_executor_flight_client(
     endpoint: &str,
     client_tls_config: Option<ClientTlsConfig>,
@@ -916,6 +1086,7 @@ fn create_executor_flight_client(
 /// Handles an executor control message (heartbeat, shutdown, etc.)
 async fn handle_executor_message(
     executor_id: &str,
+    process_id: &str,
     message: &ExecutorMessage,
     datafusion: &DataFusion,
 ) {
@@ -938,8 +1109,15 @@ async fn handle_executor_message(
             // This shouldn't be reached, but log if it is.
             tracing::warn!("Unexpected ack in handle_executor_message for {executor_id}");
         }
+        ExecutorMessage::FlightEndpoint(_) => {
+            // Handled in the stream handler once the executor is registered. A
+            // stream's first message is its heartbeat, so this is not reached.
+            tracing::warn!(
+                "Unexpected Flight endpoint in handle_executor_message for {executor_id}"
+            );
+        }
         ExecutorMessage::PartitionsLoaded(loaded) => {
-            handle_partitions_loaded(executor_id, loaded, datafusion).await;
+            handle_partitions_loaded(executor_id, process_id, loaded, datafusion).await;
         }
         ExecutorMessage::ExecutorStatistics(stats_msg) => {
             handle_executor_statistics(executor_id, stats_msg, datafusion).await;
@@ -1054,6 +1232,7 @@ async fn handle_executor_statistics(
 /// actually has data.
 async fn handle_partitions_loaded(
     executor_id: &str,
+    process_id: &str,
     loaded: &runtime_proto::PartitionsLoaded,
     datafusion: &DataFusion,
 ) {
@@ -1103,9 +1282,26 @@ async fn handle_partitions_loaded(
 
     // Statistics now flow via the dedicated ExecutorStatistics message
     // (handle_executor_statistics); PartitionsLoaded is readiness-only.
-    tracker
-        .replace(table.clone(), executor_id.to_string(), partition_expr_bytes)
+    let recorded = tracker
+        .replace(
+            table.clone(),
+            executor_id.to_string(),
+            runtime_cluster::LoadedAck {
+                process_id: process_id.to_string(),
+                load_sequence: loaded.load_sequence,
+                partitions: partition_expr_bytes,
+            },
+        )
         .await;
+    if !recorded {
+        tracing::debug!(
+            executor_id,
+            table = %loaded.table_name,
+            load_sequence = loaded.load_sequence,
+            "Ignoring the PartitionsLoaded ack of a load older than one already reported"
+        );
+        return;
+    }
 
     // Refresh in-memory partition metadata snapshot before evaluating
     // readiness — the tracker compares against the latest assigned set.
@@ -1121,7 +1317,31 @@ async fn handle_partitions_loaded(
         return;
     }
 
+    update_table_coverage(datafusion, &table).await;
     evaluate_table_readiness(datafusion, &table).await;
+}
+
+/// Recomputes, from the executors' `PartitionsLoaded` acks, which partitions
+/// of `table` each executor process has loaded, which is what queries route
+/// by. Reads the partition store's cached metadata: callers refresh it first.
+pub(crate) async fn update_table_coverage(datafusion: &DataFusion, table: &TableReference) {
+    let (Some(tracker), Some(registry), Some(partition_store)) = (
+        datafusion.partition_load_tracker.as_ref(),
+        datafusion.executor_registry(),
+        datafusion
+            .partition_service
+            .as_ref()
+            .map(|s| Arc::clone(&s.partition_store)),
+    ) else {
+        return;
+    };
+    let Some(metadata) = partition_store.get_cached_table_metadata(table) else {
+        return;
+    };
+    let loaded = tracker
+        .loaded_partitions(table, &metadata, datafusion)
+        .await;
+    registry.set_loaded_partitions(table, loaded);
 }
 
 /// Evaluates whether every assigned partition for `table` is covered by an
@@ -1157,7 +1377,7 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
     // dataset registration can have created a canonical-key entry alongside
     // the registered bare key, and every resolve-equal entry must reach
     // `Ready` for `/v1/ready` to flip.
-    let matching: Vec<(TableReference, crate::status::ComponentStatus)> = datafusion
+    let matching: Vec<(TableReference, runtime_status::ComponentStatus)> = datafusion
         .runtime_status
         .get_dataset_statuses()
         .into_iter()
@@ -1169,7 +1389,7 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         .collect();
     let pending: Vec<TableReference> = matching
         .iter()
-        .filter(|(_, status)| !matches!(status, crate::status::ComponentStatus::Ready))
+        .filter(|(_, status)| !matches!(status, runtime_status::ComponentStatus::Ready))
         .map(|(key, _)| key.clone())
         .collect();
 
@@ -1214,12 +1434,12 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         if pending.is_empty() {
             datafusion
                 .runtime_status
-                .update_dataset(table, crate::status::ComponentStatus::Ready);
+                .update_dataset(table, runtime_status::ComponentStatus::Ready);
         } else {
             for key in pending {
                 datafusion
                     .runtime_status
-                    .update_dataset(&key, crate::status::ComponentStatus::Ready);
+                    .update_dataset(&key, runtime_status::ComponentStatus::Ready);
             }
         }
     }
@@ -1253,6 +1473,7 @@ pub(crate) async fn evaluate_acked_tables_readiness(datafusion: &DataFusion) {
         return;
     }
     for table in acked {
+        update_table_coverage(datafusion, &table).await;
         evaluate_table_readiness(datafusion, &table).await;
     }
 }
@@ -1360,6 +1581,20 @@ fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::erro
     Ok(buffer)
 }
 
+/// The app definition executors receive, and whose secret references they may expand.
+/// It leaves out `runtime.auth` (API keys) and `runtime.tls` (the public endpoints'
+/// private key): an executor builds its endpoint auth and TLS from its own config.
+fn executor_app_definition(app: &App) -> App {
+    let mut app = app.clone();
+    app.runtime.auth = None;
+    app.runtime.tls = None;
+    for spicepod in &mut app.spicepods {
+        spicepod.runtime.auth = None;
+        spicepod.runtime.tls = None;
+    }
+    app
+}
+
 /// Collects, for each secret key the cluster may expand via [`ExpandSecret`],
 /// the set of store names it was referenced through.
 ///
@@ -1440,86 +1675,59 @@ fn is_task_history_mutation_rejection(message: &str) -> bool {
         || message.contains("are not allowed in read-only")
 }
 
-/// Rewrites a task history SQL query to use `local_task_history` instead of `task_history`.
-///
-/// This function parses the SQL, validates it references the expected table, and rewrites
-/// all table references from `runtime.task_history` to `runtime.local_task_history`.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The SQL cannot be parsed
-/// - The query contains multiple statements
-/// - The query doesn't reference the `runtime.task_history` table
-fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
-    let dialect = PostgreSqlDialect {};
-    let mut statements =
-        Parser::parse_sql(&dialect, sql).map_err(|e| format!("Failed to parse SQL: {e}"))?;
+/// The row limit of `sql` when it is the query a peer scheduler sends for its federated
+/// `runtime.task_history` scan: `SELECT * FROM runtime.task_history`, with an optional
+/// `LIMIT n`. Any other statement is an error.
+fn peer_task_history_limit(sql: &str) -> Result<Option<u64>, String> {
+    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+        .map_err(|e| format!("Failed to parse SQL: {e}"))?;
+    let unsupported = || {
+        format!(
+            "Only SELECT * FROM {SPICE_RUNTIME_SCHEMA}.{DEFAULT_TASK_HISTORY_TABLE} with an optional LIMIT is supported"
+        )
+    };
+    let [Statement::Query(query)] = statements.as_mut_slice() else {
+        return Err(unsupported());
+    };
 
-    if statements.len() != 1 {
-        return Err(format!(
-            "Expected single SQL statement, got {}",
-            statements.len()
-        ));
+    let limit = match query.limit_clause.take() {
+        None => None,
+        Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset: None,
+            limit_by,
+        }) if limit_by.is_empty() => Some(
+            limit
+                .to_string()
+                .parse::<u64>()
+                .map_err(|_| unsupported())?,
+        ),
+        Some(_) => return Err(unsupported()),
+    };
+
+    let query = query.to_string();
+    let accepted = [
+        format!("SELECT * FROM {SPICE_RUNTIME_SCHEMA}.{DEFAULT_TASK_HISTORY_TABLE}"),
+        format!("SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""),
+    ];
+    if accepted.contains(&query) {
+        Ok(limit)
+    } else {
+        Err(unsupported())
     }
-
-    let statement = &mut statements[0];
-
-    // Track whether we found and rewrote the task_history table
-    let mut found_task_history = false;
-
-    // Visit all table references and rewrite task_history -> local_task_history
-    let _ = visit_relations_mut(statement, |table_name| {
-        // Check if this is runtime.task_history (2 parts) or just task_history (1 part)
-        let parts: Vec<&str> = table_name
-            .0
-            .iter()
-            .filter_map(|part| match part {
-                ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
-                ObjectNamePart::Function(_) => None,
-            })
-            .collect();
-
-        let is_task_history_table = match parts.as_slice() {
-            [schema, table] => {
-                *schema == SPICE_RUNTIME_SCHEMA && *table == DEFAULT_TASK_HISTORY_TABLE
-            }
-            [table] => *table == DEFAULT_TASK_HISTORY_TABLE,
-            _ => false,
-        };
-
-        if is_task_history_table {
-            found_task_history = true;
-
-            // Rewrite the table name: find and replace the task_history identifier
-            for part in &mut table_name.0 {
-                if let ObjectNamePart::Identifier(ident) = part
-                    && ident.value == DEFAULT_TASK_HISTORY_TABLE
-                {
-                    *ident = Ident::new(LOCAL_TASK_HISTORY_TABLE);
-                }
-            }
-        }
-
-        ControlFlow::<()>::Continue(())
-    });
-
-    if !found_task_history {
-        return Err(format!(
-            "Query must reference the \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\" table"
-        ));
-    }
-
-    Ok(statement.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::servers::internal_cluster_server;
     use app::AppBuilder;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use ballista_core::serde::protobuf::{
+        GetJobStatusParams, scheduler_grpc_client::SchedulerGrpcClient,
+    };
     use datafusion::datasource::MemTable;
     use opentelemetry_sdk::metrics::SdkMeterProvider;
     use runtime_proto::{
@@ -1528,10 +1736,11 @@ mod tests {
     use runtime_secrets::{AnyErrorResult, SecretStore};
     use secrecy::SecretString;
     use spicepod::component::dataset::Dataset;
+    use spicepod::component::runtime::{ApiKey, ApiKeyAuth, Auth, Runtime};
     use spicepod::param::Params;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::{Channel, Server};
+    use tonic::transport::Channel;
 
     /// Fixed-map secret store for `ExpandSecret` allowlist tests.
     struct FakeSecretStore(HashMap<String, String>);
@@ -1540,6 +1749,20 @@ mod tests {
     impl SecretStore for FakeSecretStore {
         async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
             Ok(self.0.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
+    /// Fixed-map secret store that records every key it is asked for.
+    struct RecordingSecretStore {
+        values: HashMap<String, String>,
+        lookups: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SecretStore for RecordingSecretStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            self.lookups.lock().push(key.to_string());
+            Ok(self.values.get(key).map(|v| SecretString::from(v.clone())))
         }
     }
 
@@ -1565,12 +1788,8 @@ mod tests {
         Arc::new(AppBuilder::new("test").with_dataset(ds).build())
     }
 
-    async fn make_test_service_with(
-        app: Option<Arc<App>>,
-        secrets: Secrets,
-        allow_secret_expansion: bool,
-    ) -> ClusterServiceImpl {
-        make_test_service_full(app, secrets, allow_secret_expansion, None, &[]).await
+    async fn make_test_service_with(app: Option<Arc<App>>, secrets: Secrets) -> ClusterServiceImpl {
+        make_test_service_full(app, secrets, None, &[]).await
     }
 
     /// Builds the service under test. `trace_ids` seed the local task history
@@ -1579,17 +1798,17 @@ mod tests {
     async fn make_test_service_full(
         app: Option<Arc<App>>,
         secrets: Secrets,
-        allow_secret_expansion: bool,
         metrics_reader: Option<MetricsReader>,
         trace_ids: &[&str],
     ) -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
                 tokio::runtime::Handle::current(),
             )
+            .max_concurrent_queries(None)
             .build(),
         );
         let task_history_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1660,17 +1879,16 @@ mod tests {
             datafusion,
             executor_registry,
             metrics_reader,
-            allow_secret_expansion,
         )
     }
 
     async fn make_test_service() -> ClusterServiceImpl {
-        make_test_service_with(None, Secrets::default(), true).await
+        make_test_service_with(None, Secrets::default()).await
     }
 
     /// A service whose local task history holds `trace_ids`.
     async fn make_test_service_with_task_history(trace_ids: &[&str]) -> ClusterServiceImpl {
-        make_test_service_full(None, Secrets::default(), true, None, trace_ids).await
+        make_test_service_full(None, Secrets::default(), None, trace_ids).await
     }
 
     /// A metrics reader holding one cumulative counter,
@@ -1731,10 +1949,14 @@ mod tests {
             .to_string()
     }
 
-    /// Serves `service` over a real tonic transport on a loopback port.
-    async fn serve_test_service(
+    /// Serves `service` on a loopback port built like the internal cluster port and returns
+    /// its address. Plain TCP stands in for the transport; the gate uses the node's
+    /// mTLS and insecure connection settings.
+    async fn spawn_cluster_server(
         service: ClusterServiceImpl,
-    ) -> (ClusterServiceClient<Channel>, CancellationToken) {
+        mtls_enabled: bool,
+        allow_insecure_connections: bool,
+    ) -> (std::net::SocketAddr, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test cluster service listener should bind");
@@ -1745,7 +1967,7 @@ mod tests {
         let shutdown_signal = shutdown.clone();
 
         tokio::spawn(async move {
-            Server::builder()
+            internal_cluster_server(mtls_enabled, allow_insecure_connections)
                 .add_service(ClusterServiceServer::new(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     shutdown_signal.cancelled().await;
@@ -1754,11 +1976,32 @@ mod tests {
                 .expect("test cluster service server should run");
         });
 
-        let client = ClusterServiceClient::connect(format!("http://{address}"))
+        (address, shutdown)
+    }
+
+    /// Serves `service` on a cluster port and returns a channel to it.
+    async fn serve_on_cluster_port(
+        service: ClusterServiceImpl,
+        mtls_enabled: bool,
+        allow_insecure_connections: bool,
+    ) -> (Channel, CancellationToken) {
+        let (address, shutdown) =
+            spawn_cluster_server(service, mtls_enabled, allow_insecure_connections).await;
+        let channel = Channel::from_shared(format!("http://{address}"))
+            .expect("test cluster service address should be a valid URI")
+            .connect()
             .await
             .expect("test cluster service client should connect");
 
-        (client, shutdown)
+        (channel, shutdown)
+    }
+
+    /// Serves `service` on a cluster port that explicitly allows insecure connections.
+    async fn serve_test_service(
+        service: ClusterServiceImpl,
+    ) -> (ClusterServiceClient<Channel>, CancellationToken) {
+        let (channel, shutdown) = serve_on_cluster_port(service, false, true).await;
+        (ClusterServiceClient::new(channel), shutdown)
     }
 
     #[test]
@@ -1785,13 +2028,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_app_definition_omits_runtime_auth_and_tls_key() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        std::fs::write(
+            dir.path().join("spicepod.yaml"),
+            "version: v1\n\
+             kind: Spicepod\n\
+             name: auth_app\n\
+             runtime:\n  \
+               auth:\n    \
+                 api_key:\n      \
+                   enabled: true\n      \
+                   keys:\n        \
+                     - ro-cluster-test-key:ro\n        \
+                     - rw-cluster-test-key:rw\n  \
+               tls:\n    \
+                 enabled: true\n    \
+                 certificate: test-certificate\n    \
+                 key: tls-private-test-key\n\
+             datasets:\n  \
+               - from: memory:data\n    \
+                 name: orders\n",
+        )
+        .expect("spicepod should be written");
+        let app = AppBuilder::build_from_path(dir.path())
+            .await
+            .expect("spicepod should load");
+        let service = make_test_service_with(Some(Arc::new(app)), Secrets::default()).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
+
+        let app_json = client
+            .get_app_definition(Request::new(GetAppDefinitionRequest {
+                executor_id: "executor-1".to_string(),
+            }))
+            .await
+            .expect("GetAppDefinition should succeed")
+            .into_inner()
+            .app_json;
+
+        for credential in ["cluster-test-key", "tls-private-test-key"] {
+            assert!(
+                !app_json.contains(credential),
+                "app definition must not carry {credential}: {app_json}"
+            );
+        }
+        let definition: App =
+            serde_json::from_str(&app_json).expect("app definition should deserialize");
+        assert_eq!(definition.datasets.len(), 1);
+        assert_eq!(definition.datasets[0].name, "orders");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
     async fn expand_secret_allows_app_referenced_key() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let secrets = secrets_with(&[
             ("PG_PASS", "correct-horse"),
             ("UNRELATED_ENV_SECRET", "should-not-leak"),
         ]);
-        let service = make_test_service_with(Some(app), secrets, true).await;
+        let service = make_test_service_with(Some(app), secrets).await;
 
         let response = service
             .expand_secret(Request::new(ExpandSecretRequest {
@@ -1813,7 +2108,7 @@ mod tests {
             ("PG_PASS", "correct-horse"),
             ("AWS_SECRET_ACCESS_KEY", "should-not-leak"),
         ]);
-        let service = make_test_service_with(Some(app), secrets, true).await;
+        let service = make_test_service_with(Some(app), secrets).await;
 
         let err = service
             .expand_secret(Request::new(ExpandSecretRequest {
@@ -1823,7 +2118,7 @@ mod tests {
             .await
             .expect_err("unreferenced secret must be denied");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(
             err.message().contains("Unable to expand secret"),
             "unexpected message: {}",
@@ -1857,7 +2152,7 @@ mod tests {
                 "correct-store-value".to_string(),
             )]))),
         );
-        let service = make_test_service_with(Some(app), secrets, true).await;
+        let service = make_test_service_with(Some(app), secrets).await;
 
         let response = service
             .expand_secret(Request::new(ExpandSecretRequest {
@@ -1870,28 +2165,141 @@ mod tests {
         assert_eq!(response.into_inner().value, "correct-store-value");
     }
 
+    /// Every RPC on the internal cluster port, the Ballista scheduler's included, is
+    /// refused without cluster mTLS or an explicit insecure opt-in.
     #[tokio::test]
-    async fn expand_secret_denies_when_mtls_disabled() {
+    async fn cluster_port_refuses_every_rpc_without_mtls_or_insecure_opt_in() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
-        let service = make_test_service_with(Some(app), secrets, false).await;
+        let service = make_test_service_full(Some(app), secrets, None, &["trace-a"]).await;
+        let (channel, shutdown) = serve_on_cluster_port(service, false, false).await;
+        let mut client = ClusterServiceClient::new(channel.clone());
+        let mut scheduler = SchedulerGrpcClient::new(channel);
 
-        let err = service
+        let outcomes = [
+            (
+                "GetAppDefinition",
+                client
+                    .get_app_definition(GetAppDefinitionRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "ExpandSecret",
+                client
+                    .expand_secret(ExpandSecretRequest {
+                        executor_id: "executor-1".to_string(),
+                        key: "PG_PASS".to_string(),
+                    })
+                    .await
+                    .map(drop),
+            ),
+            (
+                "GetSchedulers",
+                client
+                    .get_schedulers(GetSchedulersRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "GetTaskHistory",
+                client
+                    .get_task_history(GetTaskHistoryRequest {
+                        sql: format!(
+                            "SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                        ),
+                    })
+                    .await
+                    .map(drop),
+            ),
+            (
+                "GetMetrics",
+                client
+                    .get_metrics(GetMetricsRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "ControlStream",
+                client
+                    .control_stream(tokio_stream::empty::<ExecutorControlMessage>())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "AllocateInitialPartitions",
+                client
+                    .allocate_initial_partitions(AllocateInitialPartitionsRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "GetDdlCatchup",
+                client
+                    .get_ddl_catchup(GetDdlCatchupRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "SchedulerGrpc/GetJobStatus",
+                scheduler
+                    .get_job_status(GetJobStatusParams::default())
+                    .await
+                    .map(drop),
+            ),
+        ];
+
+        for (rpc, outcome) in outcomes {
+            let Err(status) = outcome else {
+                panic!("{rpc} without cluster mTLS must be refused");
+            };
+            assert_eq!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "{rpc}: {status:?}"
+            );
+            assert!(
+                status.message().contains("require cluster mTLS"),
+                "{rpc}: {status:?}"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn expand_secret_denies_key_referenced_only_by_runtime_auth() {
+        let app = AppBuilder::new("test")
+            .with_runtime(Runtime {
+                auth: Some(Auth {
+                    api_key: Some(ApiKeyAuth {
+                        enabled: true,
+                        keys: vec![ApiKey::parse_str("${ secrets:API_KEY }:rw")],
+                    }),
+                }),
+                ..Runtime::default()
+            })
+            .build();
+        let secrets = secrets_with(&[("API_KEY", "runtime-api-key")]);
+        let service = make_test_service_with(Some(Arc::new(app)), secrets).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
+
+        let err = client
             .expand_secret(Request::new(ExpandSecretRequest {
                 executor_id: "executor-1".to_string(),
-                key: "PG_PASS".to_string(),
+                key: "API_KEY".to_string(),
             }))
             .await
-            .expect_err("ExpandSecret without mTLS must be denied");
+            .expect_err("a key only runtime.auth references must not expand");
 
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(err.message().contains("requires cluster mTLS"));
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        shutdown.cancel();
     }
 
     #[tokio::test]
     async fn expand_secret_denies_when_app_missing() {
         let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
-        let service = make_test_service_with(None, secrets, true).await;
+        let service = make_test_service_with(None, secrets).await;
 
         let err = service
             .expand_secret(Request::new(ExpandSecretRequest {
@@ -1908,7 +2316,7 @@ mod tests {
     async fn expand_secret_denies_empty_key() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         let secrets = secrets_with(&[("PG_PASS", "correct-horse")]);
-        let service = make_test_service_with(Some(app), secrets, true).await;
+        let service = make_test_service_with(Some(app), secrets).await;
 
         let err = service
             .expand_secret(Request::new(ExpandSecretRequest {
@@ -1922,11 +2330,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_secret_referenced_but_missing_from_store_is_invalid_argument() {
+    async fn expand_secret_referenced_but_missing_from_store_is_not_found() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         // Allowlisted key is referenced by the app but not present in any store.
         let secrets = secrets_with(&[]);
-        let service = make_test_service_with(Some(app), secrets, true).await;
+        let service = make_test_service_with(Some(app), secrets).await;
 
         let err = service
             .expand_secret(Request::new(ExpandSecretRequest {
@@ -1936,19 +2344,260 @@ mod tests {
             .await
             .expect_err("missing allowlisted secret must fail");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(err.message().contains("Unable to expand secret PG_PASS"));
+    }
+
+    #[tokio::test]
+    async fn executor_secrets_treat_keys_the_scheduler_declines_as_not_found() {
+        let mut ds = Dataset::new("memory:data", "orders");
+        ds.params = Some(Params::from_string_map(HashMap::from([
+            ("pg_pass".to_string(), "${ secrets:PG_PASS }".to_string()),
+            ("pg_user".to_string(), "${ secrets:PG_USER }".to_string()),
+        ])));
+        let app = Arc::new(AppBuilder::new("test").with_dataset(ds).build());
+        let lookups = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(RecordingSecretStore {
+                values: HashMap::from([
+                    ("PG_PASS".to_string(), "correct-horse".to_string()),
+                    ("s3_region".to_string(), "us-west-2".to_string()),
+                ]),
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let service = make_test_service_with(Some(app), secrets).await;
+        let (client, shutdown) = serve_test_service(service).await;
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
+            "executor-1".to_string(),
+        );
+
+        // Not referenced by the app, so the scheduler declines it even though
+        // its store has a value.
+        assert!(matches!(
+            executor_secrets.get_secret("s3_region").await,
+            Ok(None)
+        ));
+        // Referenced by the app, but in no store.
+        assert!(matches!(
+            executor_secrets.get_secret("PG_USER").await,
+            Ok(None)
+        ));
+        let value = executor_secrets
+            .get_secret("PG_PASS")
+            .await
+            .expect("referenced secret lookup should succeed")
+            .expect("referenced secret should resolve");
+        assert_eq!(value.expose_secret(), "correct-horse");
+        // The declined key never reaches the store, and each key is
+        // requested once.
+        assert_eq!(
+            *lookups.lock(),
+            vec!["PG_USER".to_string(), "PG_PASS".to_string()]
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn executor_secrets_report_unreachable_scheduler_as_error() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        drop(listener);
+        let channel = Channel::from_shared(format!("http://{address}"))
+            .expect("loopback URI should parse")
+            .connect_lazy();
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(
+                ClusterServiceClient::new(channel),
+            )),
+            "executor-1".to_string(),
+        );
+
+        let err = executor_secrets
+            .get_secret("s3_region")
+            .await
+            .expect_err("an unreachable scheduler must be an error, not a missing key");
+        assert!(
+            err.to_string()
+                .contains("Failed to expand secret from scheduler"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Back-to-back requests a transport test issues: well past any burst a
     /// rate limiter would let through.
     const REPEATED_REQUESTS: usize = 20;
 
+    /// Polls `condition` until it holds or five seconds pass.
+    async fn eventually(mut condition: impl AsyncFnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if condition().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// An executor that announces its shutdown is unregistered at once, while
+    /// its control stream is still open, so queries stop routing to it.
+    #[tokio::test]
+    async fn an_executor_that_shuts_down_is_unregistered_at_once() {
+        use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown};
+
+        let service = make_test_service().await;
+        let registry = service.executor_registry();
+        let (mut client, shutdown) = serve_test_service(service).await;
+        let (tx, rx) = mpsc::channel::<ExecutorControlMessage>(8);
+        let message = |message| ExecutorControlMessage {
+            executor_id: "exec-1".to_string(),
+            message: Some(message),
+            process_id: "p1".to_string(),
+        };
+        tx.send(message(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+            timestamp_ms: 0,
+        })))
+        .await
+        .expect("send heartbeat");
+        let _inbound = client
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("open the control stream");
+        assert!(
+            eventually(async || registry.connected_executors().await == ["exec-1"]).await,
+            "the executor registers"
+        );
+
+        tx.send(message(ExecutorMessage::Shutdown(ExecutorShutdown {
+            ballista_executor_id: String::new(),
+            reason: "test".to_string(),
+        })))
+        .await
+        .expect("send shutdown");
+        assert!(
+            eventually(async || registry.connected_executors().await.is_empty()).await,
+            "the executor is unregistered while its stream is open"
+        );
+
+        drop(tx);
+        shutdown.cancel();
+    }
+
+    /// An executor whose connection ends without a shutdown message, as when its process
+    /// is killed, is unregistered, so its partitions can move to other executors.
+    #[tokio::test]
+    async fn an_executor_whose_connection_drops_is_unregistered() {
+        use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat};
+
+        let service = make_test_service().await;
+        let registry = service.executor_registry();
+        let (scheduler, shutdown) = spawn_cluster_server(service, true, false).await;
+        // The executor reaches the scheduler through this relay, so the test can cut the
+        // connection as a killed process does, while its stream of messages stays open.
+        let relay = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the relay binds");
+        let relay_address = relay.local_addr().expect("the relay has an address");
+        let connection = tokio::spawn(async move {
+            let (mut executor_side, _) = relay.accept().await.expect("the relay accepts");
+            let mut scheduler_side = tokio::net::TcpStream::connect(scheduler)
+                .await
+                .expect("the relay reaches the scheduler");
+            let _ = tokio::io::copy_bidirectional(&mut executor_side, &mut scheduler_side).await;
+        });
+        let channel = Channel::from_shared(format!("http://{relay_address}"))
+            .expect("the relay address is a valid URI")
+            .connect()
+            .await
+            .expect("the executor connects");
+        let mut client = ClusterServiceClient::new(channel);
+        let (tx, rx) = mpsc::channel::<ExecutorControlMessage>(8);
+        tx.send(ExecutorControlMessage {
+            executor_id: "exec-1".to_string(),
+            message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                timestamp_ms: 0,
+            })),
+            process_id: "p1".to_string(),
+        })
+        .await
+        .expect("send heartbeat");
+        let _inbound = client
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("open the control stream");
+        assert!(
+            eventually(async || registry.connected_executors().await == ["exec-1"]).await,
+            "the executor registers"
+        );
+
+        connection.abort();
+        assert!(
+            eventually(async || registry.connected_executors().await.is_empty()).await,
+            "the executor is unregistered"
+        );
+
+        drop(tx);
+        shutdown.cancel();
+    }
+
+    /// An executor that sends nothing for longer than the idle timeout, while its connection
+    /// stays open (its process paused), is unregistered and its control stream ends, so it
+    /// reconnects when it resumes.
+    #[tokio::test(start_paused = true)]
+    async fn the_control_stream_of_an_idle_executor_ends() {
+        use runtime_proto::{ExecutorControlMessage, ExecutorHeartbeat};
+
+        let service = make_test_service().await;
+        let registry = service.executor_registry();
+        let (mut client, shutdown) = serve_test_service(service).await;
+        let (tx, rx) = mpsc::channel::<ExecutorControlMessage>(8);
+        tx.send(ExecutorControlMessage {
+            executor_id: "exec-1".to_string(),
+            message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                timestamp_ms: 0,
+            })),
+            process_id: "p1".to_string(),
+        })
+        .await
+        .expect("send heartbeat");
+        let mut inbound = client
+            .control_stream(ReceiverStream::new(rx))
+            .await
+            .expect("open the control stream")
+            .into_inner();
+        assert!(
+            eventually(async || registry.connected_executors().await == ["exec-1"]).await,
+            "the executor registers"
+        );
+
+        tokio::time::sleep(CONTROL_STREAM_IDLE_TIMEOUT).await;
+        assert!(
+            eventually(async || registry.connected_executors().await.is_empty()).await,
+            "the idle executor is unregistered"
+        );
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.next()).await;
+        assert!(
+            matches!(end, Ok(None)),
+            "the control stream ends, got {end:?}"
+        );
+
+        drop(tx);
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn test_internal_get_metrics_transport_allows_repeated_requests() {
         let (metrics_reader, _provider) = metrics_reader_with_test_counter();
         let service =
-            make_test_service_full(None, Secrets::default(), true, Some(metrics_reader), &[]).await;
+            make_test_service_full(None, Secrets::default(), Some(metrics_reader), &[]).await;
         let (mut client, shutdown) = serve_test_service(service).await;
 
         // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
@@ -1981,7 +2630,7 @@ mod tests {
         let request = || {
             Request::new(GetTaskHistoryRequest {
                 sql: format!(
-                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\" ORDER BY trace_id"
+                    "SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
                 ),
             })
         };
@@ -2009,18 +2658,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_task_history_allows_select() {
+    async fn get_task_history_reads_local_rows_with_optional_limit() {
+        let service = make_test_service_with_task_history(&["trace-a", "trace-b"]).await;
+        let table = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
+
+        // The query names `task_history`; the rows can only come from the seeded
+        // `local_task_history`.
+        for (sql, expected) in [
+            (
+                format!("SELECT * FROM {table}"),
+                "+----------+\n\
+                 | trace_id |\n\
+                 +----------+\n\
+                 | trace-a  |\n\
+                 | trace-b  |\n\
+                 +----------+",
+            ),
+            (
+                format!("SELECT * FROM {table} LIMIT 1"),
+                "+----------+\n\
+                 | trace_id |\n\
+                 +----------+\n\
+                 | trace-a  |\n\
+                 +----------+",
+            ),
+        ] {
+            let response = service
+                .get_task_history(Request::new(GetTaskHistoryRequest { sql: sql.clone() }))
+                .await
+                .unwrap_or_else(|status| panic!("{sql} should succeed, got {status:?}"));
+            assert_eq!(
+                render_task_history(response.into_inner().arrow_ipc),
+                expected,
+                "{sql}"
+            );
+        }
+    }
+
+    /// `GetTaskHistory` serves a peer scheduler's `runtime.task_history` query,
+    /// which holds an admission permit on that peer while it waits. With every
+    /// permit here held by this scheduler's own such queries, the read must
+    /// still run, or the two schedulers wait on each other forever.
+    #[tokio::test]
+    async fn get_task_history_runs_while_every_admission_permit_is_held() {
         let service = make_test_service_with_task_history(&["trace-a"]).await;
-        let response = service
-            .get_task_history(Request::new(GetTaskHistoryRequest {
-                sql: format!(
-                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
-                ),
-            }))
+        let semaphore = service
+            .datafusion
+            .query_admission_semaphore()
+            .expect("the scheduler gates queries");
+        let permits =
+            u32::try_from(semaphore.available_permits()).expect("permit count fits in u32");
+        let _held = semaphore
+            .acquire_many_owned(permits)
             .await
-            .expect("SELECT against task_history must succeed under read-only");
-        // The query named `task_history`; the row can only have come from the
-        // seeded `local_task_history`, so the rewrite ran under the read-only gate.
+            .expect("the semaphore is open");
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            service.get_task_history(Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            })),
+        )
+        .await
+        .expect("GetTaskHistory must not wait for an admission permit")
+        .expect("GetTaskHistory should succeed");
         assert_eq!(
             render_task_history(response.into_inner().arrow_ipc),
             "+----------+\n\
@@ -2031,70 +2734,36 @@ mod tests {
         );
     }
 
+    /// `GetTaskHistory` serves only the scan a peer scheduler sends. Any other statement,
+    /// including one that reads another table next to `task_history`, is refused.
     #[tokio::test]
-    async fn get_task_history_rejects_insert_into_writable_from_task_history() {
-        let service = make_test_service().await;
-        // Target is a writable non-system table so the operations validator
-        // would allow the INSERT; the read-only gate must still reject it.
-        let err = service
-            .get_task_history(Request::new(GetTaskHistoryRequest {
-                sql: format!(
-                    "INSERT INTO task_history_sink \
-                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
-                ),
-            }))
-            .await
-            .expect_err("INSERT into writable sink must be rejected by read-only GetTaskHistory");
+    async fn get_task_history_refuses_other_sql() {
+        let service = make_test_service_with_task_history(&["trace-a"]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
+        let table = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
 
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(
-            err.message().contains("read-only"),
-            "unexpected message: {}",
-            err.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn get_task_history_rejects_delete() {
-        let service = make_test_service().await;
-        let err = service
-            .get_task_history(Request::new(GetTaskHistoryRequest {
-                sql: format!(
-                    "DELETE FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
-                ),
-            }))
-            .await
-            .expect_err("DELETE must be rejected by read-only GetTaskHistory");
-
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(
-            err.message().contains("read-only") || err.message().contains("not allowed"),
-            "unexpected message: {}",
-            err.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn get_task_history_rejects_ddl_over_task_history_select() {
-        let service = make_test_service().await;
-        // CREATE VIEW ... AS SELECT FROM task_history passes the rewrite gate
-        // (references task_history) but is DDL and must be rejected.
-        let err = service
-            .get_task_history(Request::new(GetTaskHistoryRequest {
-                sql: format!(
-                    "CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS \
-                     SELECT * FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
-                ),
-            }))
-            .await
-            .expect_err("DDL must be rejected by read-only GetTaskHistory");
-
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(
-            err.message().contains("read-only") || err.message().contains("DDL"),
-            "unexpected message: {}",
-            err.message()
-        );
+        for sql in [
+            format!("SELECT s.* FROM {table} t RIGHT JOIN task_history_sink s ON false"),
+            format!("SELECT * FROM {table}, task_history_sink"),
+            format!("SELECT trace_id FROM {table}"),
+            format!("SELECT * FROM {table} WHERE trace_id = 'trace-a'"),
+            format!("SELECT * FROM {table} ORDER BY trace_id"),
+            format!("SELECT * FROM {table} LIMIT 1 OFFSET 1"),
+            format!("SELECT * FROM {table} LIMIT (SELECT count(*) FROM task_history_sink)"),
+            format!("SELECT * FROM {table}; SELECT * FROM {table}"),
+            format!("INSERT INTO task_history_sink SELECT * FROM {table}"),
+            format!("DELETE FROM {table}"),
+            format!("CREATE VIEW \"{SPICE_RUNTIME_SCHEMA}\".\"leaked\" AS SELECT * FROM {table}"),
+        ] {
+            let Err(err) = client
+                .get_task_history(Request::new(GetTaskHistoryRequest { sql: sql.clone() }))
+                .await
+            else {
+                panic!("{sql} must be refused");
+            };
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{sql}: {err:?}");
+        }
+        shutdown.cancel();
     }
 
     #[test]
@@ -2147,76 +2816,17 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_task_history_sql_simple() {
-        let sql = r#"SELECT * FROM "runtime"."task_history""#;
-        let result = rewrite_task_history_sql(sql).expect("should rewrite");
-        assert!(
-            result.contains("local_task_history"),
-            "Expected local_task_history in: {result}"
-        );
-        assert!(
-            !result.contains(r#""task_history""#),
-            "Should not contain task_history: {result}"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_task_history_sql_with_where() {
-        let sql = r#"SELECT * FROM "runtime"."task_history" WHERE task = 'sql'"#;
-        let result = rewrite_task_history_sql(sql).expect("should rewrite");
-        assert!(
-            result.contains("local_task_history"),
-            "Expected local_task_history in: {result}"
-        );
-        assert!(
-            result.contains("task = 'sql'"),
-            "Should preserve WHERE clause: {result}"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_task_history_sql_with_limit() {
-        let sql = r#"SELECT * FROM "runtime"."task_history" LIMIT 100"#;
-        let result = rewrite_task_history_sql(sql).expect("should rewrite");
-        assert!(
-            result.contains("local_task_history"),
-            "Expected local_task_history in: {result}"
-        );
-        assert!(
-            result.contains("LIMIT 100"),
-            "Should preserve LIMIT: {result}"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_task_history_sql_rejects_other_tables() {
-        let sql = r#"SELECT * FROM "runtime"."other_table""#;
-        assert_eq!(
-            rewrite_task_history_sql(sql),
-            Err(r#"Query must reference the "runtime"."task_history" table"#.to_string())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_task_history_sql_rejects_multiple_statements() {
-        // Both statements parse, so this is the statement-smuggling guard, not a
-        // parse failure.
-        let sql = r#"SELECT * FROM "runtime"."task_history"; DROP TABLE foo"#;
-        assert_eq!(
-            rewrite_task_history_sql(sql),
-            Err("Expected single SQL statement, got 2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_task_history_sql_with_filter_and_limit() {
-        let sql =
-            r#"SELECT * FROM "runtime"."task_history" WHERE status = Utf8("completed") LIMIT 50"#;
-        let result = rewrite_task_history_sql(sql).expect("should rewrite");
-        assert!(
-            result.contains("local_task_history"),
-            "Expected local_task_history in: {result}"
-        );
+    fn peer_task_history_limit_accepts_the_peer_scan_query() {
+        for (sql, limit) in [
+            ("SELECT * FROM \"runtime\".\"task_history\"", None),
+            (
+                "SELECT * FROM \"runtime\".\"task_history\" LIMIT 5",
+                Some(5),
+            ),
+            ("select * from runtime.task_history limit 5", Some(5)),
+        ] {
+            assert_eq!(peer_task_history_limit(sql), Ok(limit), "{sql}");
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
+repository.workspace = true
 description = "Forwards Spice.ai change-data-capture events to a Drasi source"
 
 [dependencies]
@@ -34,15 +35,22 @@ redis = { version = "1.5.0", default-features = false, features = [
   "tokio-rustls-comp",
 ] }
 reqwest.workspace = true
+runtime-metrics = { path = "../runtime-metrics" }
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
-tokio.workspace = true
+# `fs` and `rt` back the on-disk dead-letter store; `sync` the delivery queue.
+tokio = { workspace = true, features = ["fs", "rt", "sync"] }
 tracing.workspace = true
 url.workspace = true
 util = { path = "../util" }
 
+[features]
+# Test helpers that the `runtime` crate's own tests call.
+test-util = []
+
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

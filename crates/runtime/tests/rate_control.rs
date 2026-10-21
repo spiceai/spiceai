@@ -84,21 +84,39 @@ fn state_url(state_dir: &Path) -> String {
         .to_string()
 }
 
-/// Two saturated replicas sharing one cluster budget should not exceed it.
-///
-/// This is the regression test for the previous "max-merge" implementation
-/// which silently allowed N×budget combined throughput.
-#[tokio::test]
-async fn cluster_lease_caps_combined_throughput_under_saturation() {
+/// What two replicas driven as hard as they can acquired from one cluster
+/// budget.
+struct SaturatedRun {
+    count_a: u64,
+    count_b: u64,
+    elapsed: Duration,
+}
+
+impl SaturatedRun {
+    fn observed_rps(&self) -> f64 {
+        let combined = u32::try_from(self.count_a + self.count_b)
+            .expect("combined acquisition count should fit in u32");
+        f64::from(combined) / self.elapsed.as_secs_f64()
+    }
+}
+
+/// Start two runtimes that share one `file://` state location with a 1s
+/// window, give each a controller for the same origin with its own config, and
+/// drive both as hard as they can for `warmup` and then `measure`, counting
+/// only the permits acquired during `measure`.
+async fn drive_two_saturated_replicas(
+    config_a: &HttpRateControlConfig,
+    config_b: &HttpRateControlConfig,
+    warmup: Duration,
+    measure: Duration,
+) -> SaturatedRun {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let state_dir = temp_dir.path().join("rate-control-state");
     let state_location = state_url(&state_dir);
 
-    // Window = 1s (refresh_interval), cluster budget = 10 RPS.
+    // Window = 1s (refresh_interval).
     let refresh_interval = "1s";
-    let cluster_rps: u32 = 10;
     let origin_url = Url::parse(ORIGIN_URL).expect("origin URL parse");
-    let config = rps_config(cluster_rps);
 
     let app_a = app_with_file_rate_control(&state_location, refresh_interval);
     let app_b = app_with_file_rate_control(&state_location, refresh_interval);
@@ -113,7 +131,7 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
         .http_rate_control_registry()
         .shared_rate_controller_for_component(
             &origin_url,
-            &config,
+            config_a,
             dataset_a.app.name.as_str(),
             &ConnectorComponent::from(&dataset_a),
             "https",
@@ -124,7 +142,7 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
         .http_rate_control_registry()
         .shared_rate_controller_for_component(
             &origin_url,
-            &config,
+            config_b,
             dataset_b.app.name.as_str(),
             &ConnectorComponent::from(&dataset_b),
             "https",
@@ -135,15 +153,13 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     let ctrl_a = shared_a.controller.expect("a enabled");
     let ctrl_b = shared_b.controller.expect("b enabled");
 
-    // Drive both replicas as hard as we can for `duration`. Count the total
-    // number of permits each acquires.
-    let duration = Duration::from_secs(5);
-    let started = tokio::time::Instant::now();
-
+    // Count the permits each replica acquires once the warmup is over.
+    let measure_from = tokio::time::Instant::now() + warmup;
+    let measure_until = measure_from + measure;
     let driver = |ctrl: Arc<runtime_rate_control::RateController>| async move {
         let mut count: u64 = 0;
-        while started.elapsed() < duration {
-            if ctrl.acquire().await.is_ok() {
+        while tokio::time::Instant::now() < measure_until {
+            if ctrl.acquire().await.is_ok() && tokio::time::Instant::now() >= measure_from {
                 count += 1;
             }
         }
@@ -151,11 +167,31 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     };
 
     let (count_a, count_b) = tokio::join!(driver(Arc::clone(&ctrl_a)), driver(Arc::clone(&ctrl_b)));
-    let combined = count_a + count_b;
-    let elapsed = started.elapsed();
-    let observed_rps =
-        f64::from(u32::try_from(combined).expect("combined acquisition count should fit in u32"))
-            / elapsed.as_secs_f64();
+    SaturatedRun {
+        count_a,
+        count_b,
+        elapsed: measure_from.elapsed(),
+    }
+}
+
+/// Two saturated replicas sharing one cluster budget should not exceed it.
+///
+/// This is the regression test for the previous "max-merge" implementation
+/// which silently allowed N×budget combined throughput.
+#[tokio::test]
+async fn cluster_lease_caps_combined_throughput_under_saturation() {
+    // Cluster budget = 10 RPS.
+    let cluster_rps: u32 = 10;
+    let config = rps_config(cluster_rps);
+    let run =
+        drive_two_saturated_replicas(&config, &config, Duration::ZERO, Duration::from_secs(5))
+            .await;
+    let observed_rps = run.observed_rps();
+    let SaturatedRun {
+        count_a,
+        count_b,
+        elapsed,
+    } = run;
 
     // Allow up to one extra window of burst above the steady-state cap (10 RPS):
     // worst-case overshoot per window = burst_per_window = 10. With ~5 windows
@@ -172,6 +208,46 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     assert!(
         observed_rps >= f64::from(cluster_rps) * 0.7,
         "combined observed {observed_rps:.1} RPS below 70% of cap {cluster_rps} (a={count_a} b={count_b})"
+    );
+}
+
+/// Two saturated replicas that set different `requests_per_second_limit`
+/// values for one origin are held together to the lower one.
+///
+/// Regression test for #14913: each value leased under its own key in the
+/// shared state, so the replicas sent the sum of both limits — 30 RPS here.
+#[tokio::test]
+async fn replicas_with_different_limits_are_held_to_the_lowest() {
+    let (lower, higher) = (10_u32, 20_u32);
+    // Grants are first-write-wins, so the replica at 20 keeps whatever it
+    // leased before it first saw the one at 10: up to three windows when the
+    // two replicas' first refreshes straddle a window boundary. The warmup
+    // covers them; the measurement is of the steady state.
+    let run = drive_two_saturated_replicas(
+        &rps_config(lower),
+        &rps_config(higher),
+        Duration::from_secs(3),
+        Duration::from_secs(5),
+    )
+    .await;
+    let observed_rps = run.observed_rps();
+    let SaturatedRun {
+        count_a,
+        count_b,
+        elapsed,
+    } = run;
+
+    // The measurement can straddle one window more than it spans; half a
+    // window of slack above the lower limit allows for that and stays below
+    // what the higher limit alone would admit.
+    let max_allowed = f64::from(lower) * 1.5;
+    assert!(
+        observed_rps <= max_allowed,
+        "replicas at {lower} and {higher} RPS sent {observed_rps:.1} RPS combined, above {max_allowed:.1} (a={count_a} b={count_b} elapsed={elapsed:?})"
+    );
+    assert!(
+        observed_rps >= f64::from(lower) * 0.7,
+        "replicas at {lower} and {higher} RPS sent {observed_rps:.1} RPS combined, below 70% of {lower} (a={count_a} b={count_b})"
     );
 }
 
@@ -571,20 +647,96 @@ mod adaptive_config_validation {
             .await
             .expect_err("a different failure threshold on the same origin must be rejected");
 
+        // The explicit 10s window resolves to the unset default, so only the
+        // failure threshold differs.
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("different rate-control settings"),
-                    "message must name the conflict: {message}"
+                    message.contains(
+                        "differs from those already targeting it: `rate_control_failure_threshold` is 50% here and 10% there. Set `rate_control_failure_threshold` to matching values"
+                    ),
+                    "message must name the differing parameter and both values: {message}"
                 );
+            }
+            other => panic!("expected an invalid-configuration error, got {other:?}"),
+        }
+    }
+
+    /// Cluster rate control resolves an unset `rate_control_window` to its
+    /// `refresh_interval` and raises a shorter one to it, so whether an
+    /// explicit window conflicts with an unset one depends on that interval.
+    #[tokio::test]
+    async fn an_explicit_window_conflicts_only_where_it_resolves_differently() {
+        let cluster_registry = |refresh_interval| {
+            Arc::new(HttpRateControlRegistry::with_persisted_governor_state(
+                Arc::new(InMemory::new()),
+                "",
+                refresh_interval,
+            ))
+        };
+        let origin = Url::parse(TEST_ORIGIN).expect("test URL should parse");
+        let unset = config(AdaptiveRateControl::default(), Some(10));
+        let explicit = config(
+            AdaptiveRateControl::new(0.1, Duration::from_secs(10))
+                .expect("test control should be valid"),
+            Some(10),
+        );
+
+        // A 30s interval raises the explicit 10s window to 30s: the same half-life.
+        let registry = cluster_registry(Duration::from_secs(30));
+        let mut controllers = Vec::new();
+        for settings in [&unset, &explicit] {
+            let shared = registry
+                .shared_rate_controller_for_component(
+                    &origin,
+                    settings,
+                    "spicepod",
+                    &test_component(),
+                    "https",
+                )
+                .await
+                .expect("windows that resolve to one half-life share the origin");
+            controllers.push(
+                shared
+                    .controller
+                    .expect("a rate-limited origin has a controller"),
+            );
+        }
+        assert!(
+            Arc::ptr_eq(&controllers[0], &controllers[1]),
+            "both components must be given the one controller of the origin"
+        );
+
+        // A 1s interval keeps the explicit 10s window, and the unset one is 1s.
+        let registry = cluster_registry(Duration::from_secs(1));
+        registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &unset,
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect("the first component sets the origin's config");
+        let error = registry
+            .shared_rate_controller_for_component(
+                &origin,
+                &explicit,
+                "spicepod",
+                &test_component(),
+                "https",
+            )
+            .await
+            .expect_err("windows that resolve to different half-lives must be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("rate_control_failure_threshold")
-                        && message.contains("rate_control_window"),
-                    "message must name the adaptive parameters: {message}"
-                );
-                assert!(
-                    !message.contains("rate_control_mode"),
-                    "message must not name a removed parameter: {message}"
+                    message.contains(
+                        "differs from those already targeting it: `rate_control_window` is 10s here and 1s there. Set `rate_control_window` to matching values on every component that targets this origin. With cluster rate control, an unset `rate_control_window` resolves to `runtime.source_rate_control.refresh_interval`"
+                    ),
+                    "message must name the window, both resolved values, and the cluster default: {message}"
                 );
             }
             other => panic!("expected an invalid-configuration error, got {other:?}"),
@@ -639,7 +791,7 @@ mod shared_origin_acquire_timeout {
         graphql_config.apply_default_acquire_timeout(DEFAULT_SPICE_CLIENT_TIMEOUT);
 
         assert_eq!(
-            https_config, graphql_config,
+            https_config.acquire_timeout, graphql_config.acquire_timeout,
             "the two connectors must derive the same acquire bound for a shared origin"
         );
 
@@ -706,4 +858,46 @@ mod shared_origin_acquire_timeout {
             other => panic!("expected an invalid-configuration error, got {other:?}"),
         }
     }
+}
+
+/// Rate control keeps its state in the `rate-control/` folder of a
+/// `runtime.state` location.
+#[tokio::test]
+async fn runtime_state_rate_control_writes_under_its_folder() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state_dir = temp_dir.path().join("state");
+    let app = app_with_file_rate_control(&state_url(&state_dir), "1s");
+    let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+    let dataset = dataset_for_runtime(&app, &runtime);
+    let shared = runtime
+        .http_rate_control_registry()
+        .shared_rate_controller_for_component(
+            &Url::parse(ORIGIN_URL).expect("origin URL parse"),
+            &rps_config(10),
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(&dataset),
+            "https",
+        )
+        .await
+        .expect("controller builds");
+    let controller = shared.controller.expect("a rate-limited origin is enabled");
+    controller.acquire().await.expect("permit");
+
+    let spicepod_dir = state_dir.join("rate-control").join(APP_NAME);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_dir(&spicepod_dir).is_ok_and(|mut entries| {
+        entries
+            .any(|entry| entry.is_ok_and(|entry| entry.path().extension() == Some("json".as_ref())))
+    }) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rate control wrote no state under {}",
+            spicepod_dir.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !state_dir.join(APP_NAME).exists(),
+        "rate control must not write at the location root"
+    );
 }

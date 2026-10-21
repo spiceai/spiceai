@@ -27,13 +27,13 @@ use spice::commands::{
 use spice::output::OutputFormat;
 use spice::{Result, RuntimeContext};
 use spice_cloud_client::endpoints::{
-    is_valid_region as is_valid_cloud_region, normalize_data_region,
+    DEFAULT_REGION as DEFAULT_CLOUD_REGION, is_valid_region as is_valid_cloud_region,
+    normalize_data_region,
 };
 use std::ffi::{OsStr, OsString};
 use std::sync::LazyLock;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_CLOUD_REGION: &str = "us-east-1";
 const MACHINE_ERROR_SERIALIZATION_FAILED: &str = r#"{"status":"error","error":{"code":"error_serialization_failed","message":"Failed to serialize CLI error"}}"#;
 const SQL_DIRECT_SHORTCUT_VALUE_FLAGS: &[&str] = &[
     "--endpoint",

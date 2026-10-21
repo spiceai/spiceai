@@ -33,6 +33,7 @@ use tokio::time::Instant;
 use tracing_futures::Instrument;
 
 use crate::model::metrics::{handle_metrics, handle_token_metrics, request_labels_responses};
+use crate::model::responses_tool_history::replay_spice_tool_calls;
 
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -79,7 +80,10 @@ impl ResponsesWrapper {
         }
     }
 
-    fn prepare_req(&self, req: CreateResponse) -> CreateResponse {
+    /// `req` as the provider receives it: with the Spicepod's system prompt and request defaults,
+    /// and with the Spice tool calls of earlier turns given back as the model saw them.
+    fn prepare_req(&self, mut req: CreateResponse) -> CreateResponse {
+        req.input = replay_spice_tool_calls(req.input);
         self.with_model_defaults(self.with_system_prompt(req))
     }
 
@@ -189,7 +193,7 @@ impl Responses for ResponsesWrapper {
                 let captured_output = &resp;
 
                 if let Some(usage) = resp.usage.clone() {
-                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.output_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.input_tokens, id=resp.id, "labels");
+                    tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.output_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.input_tokens, cached_tokens = %usage.input_tokens_details.cached_tokens, id=resp.id, "labels");
                     handle_token_metrics(usage.input_tokens, usage.output_tokens, &labels);
                 }
 
@@ -276,13 +280,16 @@ where
                             "Response completed"
                         );
 
+                        // Record usage as labels of the response's task.
                         if let Some(usage) = response.usage.clone() {
                             tracing::info!(
                                 target: "task_history",
+                                parent: &self.span,
                                 completion_tokens = %usage.output_tokens,
                                 total_tokens = %usage.total_tokens,
                                 prompt_tokens = %usage.input_tokens,
-                                "Usage info"
+                                cached_tokens = %usage.input_tokens_details.cached_tokens,
+                                "labels"
                             );
                             handle_token_metrics(
                                 usage.input_tokens,

@@ -465,6 +465,14 @@ impl FederatedTable {
         matches!(self, Self::Deferred(deferred) if deferred.awaits_source)
     }
 
+    /// Whether this table is deferred because the source it reached has a schema the
+    /// dataset's `on_schema_change` policy holds back, so the existing acceleration keeps
+    /// being served on the schema it was built with until that change is resolved.
+    #[must_use]
+    pub fn holds_schema_change(&self) -> bool {
+        matches!(self, Self::Deferred(deferred) if !deferred.awaits_source)
+    }
+
     /// The source's constraints. While the source is unreachable (a deferred
     /// provider), these are the primary key the acceleration was built with, as its
     /// checkpoint records it, so the acceleration registers with the key its

@@ -24,7 +24,9 @@ use super::refresh_task_runner::RefreshTaskRunner;
 use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshRequestId};
-use crate::accelerated::refresh_task::{RefreshOutcome, RefreshTask};
+use crate::accelerated::refresh_task::{
+    RefreshOutcome, RefreshTask, append_cursor::AppendCursorStore,
+};
 use crate::accelerated::snapshots::{
     SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
     create_periodic_snapshot_callback, spawn_snapshot_interval_task,
@@ -95,6 +97,10 @@ pub struct Refresh {
     /// Raw SQL string from an override request, not yet parsed.
     /// When set, this should be parsed into a `RefreshSQL` before use.
     pub(crate) override_sql_raw: Option<String>,
+    /// A reload is owed: see [`Self::owe_reload`].
+    pub(crate) reload: bool,
+    /// Counts [`Self::owe_reload`] calls, so a reload settles only the debt it was started for.
+    pub(crate) reload_generation: u64,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
@@ -257,6 +263,37 @@ impl Refresh {
         }
         if let Some(max_jitter) = overrides.max_jitter {
             self.max_jitter = Some(max_jitter);
+        }
+        self
+    }
+
+    /// Records that the acceleration must be loaded again in full: its partition filters
+    /// changed, so it lacks the rows of newly assigned partitions and still holds those of
+    /// removed ones. A refresh that skips an unchanged source, or an append that reads only
+    /// rows newer than the acceleration's, would leave it so.
+    pub(crate) fn owe_reload(&mut self) {
+        self.reload = true;
+        self.reload_generation += 1;
+    }
+
+    /// Records that a reload started for `generation` succeeded. A reload owed since then
+    /// stays owed.
+    pub(crate) fn reload_succeeded(&mut self, generation: u64) {
+        if self.reload_generation == generation {
+            self.reload = false;
+        }
+    }
+
+    /// The refresh to run for this request. While a reload is owed, a full or append refresh
+    /// runs as the reload: in full, and without a one-off `refresh_sql`, so that no other
+    /// refresh can complete in its place with fewer rows.
+    #[must_use]
+    pub(crate) fn for_run(mut self) -> Self {
+        if self.reload && matches!(self.mode, RefreshMode::Full | RefreshMode::Append) {
+            self.mode = RefreshMode::Full;
+            self.override_sql_raw = None;
+        } else {
+            self.reload = false;
         }
         self
     }
@@ -678,6 +715,8 @@ impl Default for Refresh {
             max_jitter: None,
             sql: None,
             override_sql_raw: None,
+            reload: false,
+            reload_generation: 0,
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
@@ -758,6 +797,8 @@ pub struct Refresher {
     /// The status an existing acceleration starts with, applied by [`Self::start`] once the
     /// dataset's indexes have been rebuilt from it, and before any refresh can report its own.
     initial_status: Option<status::ComponentStatus>,
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    append_cursor_store: Option<AppendCursorStore>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -822,7 +863,14 @@ impl Refresher {
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
             initial_status: None,
+            append_cursor_store: None,
         }
+    }
+
+    /// Where an append refresh keeps the source snapshot it last loaded.
+    pub fn with_append_cursor_store(&mut self, store: Option<AppendCursorStore>) -> &mut Self {
+        self.append_cursor_store = store;
+        self
     }
 
     pub fn in_flight_revalidations(
@@ -1287,6 +1335,9 @@ impl Refresher {
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
+        refresh_task_runner =
+            refresh_task_runner.with_append_cursor_store(self.append_cursor_store.clone());
+
         refresh_task_runner = refresh_task_runner
             .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
 
@@ -1505,13 +1556,13 @@ impl Refresher {
                                     // No cache provider means runtime is shutting down and cache is already cleaned up
                                     if let Some(cache_provider) = cache_provider_ref.upgrade() {
                                         // The refresh rewrote every synchronized (e.g. localpod) child's
-                                        // accelerator along with this dataset's, so cached results for the
-                                        // children are exactly as stale as the parent's (#12887). Children
+                                        // accelerator along with this dataset's, so their plans and search
+                                        // caches must be invalidated as well (#12887). Children
                                         // attach after their own initial load completes, so the set is
                                         // resolved live rather than captured when this loop started.
                                         for table_name in refresh_task.get_dataset_names().await {
-                                            if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
-                                                tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                            if let Err(e) = cache_provider.invalidate_for_refresh(table_name.clone()).await {
+                                                tracing::warn!("Failed to invalidate cached query plans and search results for dataset {table_name} after a refresh, so they may reflect the previous data until they expire: {e}");
                                             }
                                         }
                                     }
@@ -1739,12 +1790,12 @@ fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) ->
     )
 }
 
-/// After a refresh task finishes: invalidate cached results, then publish
+/// After a refresh task finishes: invalidate plans and search caches, then publish
 /// `initial_load_completed`, then record the outcome.
 ///
 /// Results-cache warmup waits on the outcome recorded here after the first
-/// full/append refresh. Publishing the flag before invalidation would let a
-/// poller of that flag store entries this callback then evicts. The flag still
+/// full/append refresh. Publishing the flag after derived-cache invalidation
+/// lets warmup plan against refreshed state. SQL results age independently. The flag still
 /// precedes `record_done`, so a waiter woken by a successful completion
 /// observes the initial load as done — the same pairing as
 /// `RefreshTask::signal_dataset_ready`.
@@ -1875,6 +1926,57 @@ mod tests {
         let mut out = vec![];
         sql.extend_effective_partition_filters(&mut out);
         out
+    }
+
+    #[test]
+    fn while_a_reload_is_owed_every_refresh_runs_as_one() {
+        let owing = |mode| {
+            let mut refresh = Refresh::new(mode);
+            refresh.owe_reload();
+            refresh
+        };
+        let narrowed = RefreshOverrides {
+            sql: Some("SELECT * FROM t WHERE id > 100".to_string()),
+            mode: Some(RefreshMode::Append),
+            max_jitter: None,
+        };
+
+        let run = owing(RefreshMode::Append)
+            .with_overrides(&narrowed)
+            .for_run();
+        assert!(run.reload);
+        assert_eq!(run.mode, RefreshMode::Full);
+        assert!(run.override_sql_raw.is_none());
+
+        let run = owing(RefreshMode::Full).for_run();
+        assert!(run.reload);
+        assert_eq!(run.mode, RefreshMode::Full);
+
+        let run = owing(RefreshMode::Changes).for_run();
+        assert!(!run.reload);
+        assert_eq!(run.mode, RefreshMode::Changes);
+
+        let run = Refresh::new(RefreshMode::Append)
+            .with_overrides(&narrowed)
+            .for_run();
+        assert!(!run.reload);
+        assert_eq!(run.mode, RefreshMode::Append);
+        assert!(run.override_sql_raw.is_some());
+    }
+
+    #[test]
+    fn a_reload_settles_only_the_debt_it_was_started_for() {
+        let mut refresh = Refresh::new(RefreshMode::Full);
+        refresh.owe_reload();
+        let started_for = refresh.reload_generation;
+        refresh.owe_reload();
+        refresh.reload_succeeded(started_for);
+        assert!(
+            refresh.reload,
+            "filters changed again after the reload started"
+        );
+        refresh.reload_succeeded(refresh.reload_generation);
+        assert!(!refresh.reload);
     }
 
     #[test]
@@ -2632,12 +2734,13 @@ mod tests {
         )
     }
 
-    /// Reproduction for warmup vs checkpoint-backed startup refresh: the
-    /// reusable `initial_load_completed` flag is already true, so a poller
-    /// that waits on it stores while this process's first refresh is still
-    /// in flight; that refresh then invalidates the warmed entry.
+    /// Warmup vs checkpoint-backed startup refresh: the reusable
+    /// `initial_load_completed` flag is already true, so a poller that waits on
+    /// it stores while this process's first refresh is still in flight. The
+    /// refresh does not invalidate SQL results, so the warmed entry survives it
+    /// and ages out on `item_ttl` like any other entry.
     #[tokio::test]
-    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_invalidation() {
+    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_refresh() {
         const WARMUP_KEY: u64 = 7;
         let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
             started_gated_checkpoint_always_refresher().await;
@@ -2664,18 +2767,17 @@ mod tests {
             .expect("the gated startup refresh completes after the source opens");
 
         assert!(
-            !warmup_entry_present(&cache, WARMUP_KEY).await,
-            "the startup refresh must invalidate entries stored while it was in flight"
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "a refresh leaves cached SQL results to age out on item_ttl"
         );
 
         drop(refresh_handle);
     }
 
-    /// The wait warmup must use: a store after the per-process completion
-    /// cannot be evicted by that same refresh, because invalidation already
-    /// ran.
+    /// The wait warmup uses: a store after the per-process completion reads
+    /// the refreshed data and stays cached.
     #[tokio::test]
-    async fn warmup_store_after_refresh_completion_survives_startup_invalidation() {
+    async fn warmup_store_after_refresh_completion_survives_startup_refresh() {
         const WARMUP_KEY: u64 = 11;
         let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
             started_gated_checkpoint_always_refresher().await;
@@ -2701,7 +2803,7 @@ mod tests {
         store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
         assert!(
             warmup_entry_present(&cache, WARMUP_KEY).await,
-            "a store after the completion is recorded must survive that refresh's invalidation"
+            "a store after the completion is recorded stays cached"
         );
 
         drop(refresh_handle);

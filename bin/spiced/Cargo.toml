@@ -6,6 +6,7 @@ license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 [dependencies]
@@ -84,6 +85,10 @@ runtime-secrets = { path = "../../crates/runtime-secrets", default-features = fa
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 rustls.workspace = true
+# Not used directly; sets the version floors declared in the workspace `Cargo.toml`.
+rustls-webpki.workspace = true
+webpki-root-certs.workspace = true
+webpki-roots.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
 zeroize = "1.8"
@@ -110,6 +115,10 @@ util = { path = "../../crates/util"}
 accelerator-cayenne = { path = "../../crates/accelerators/accelerator-cayenne" }
 vortex-utils.workspace = true
 
+# Raising the soft open file limit at startup (`open_file_limit.rs`).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["resource"] }
+
 # Non-default features should be added to `lint-rust` make target.
 [dev-dependencies]
 iceberg.workspace = true
@@ -122,6 +131,19 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 # ever sees one through `runtime`.
 runtime-request-context = { path = "../../crates/runtime-request-context" }
 tempfile.workspace = true
+# The OTLP log export tests serve a real OTLP endpoint for `spiced` to send to:
+# the logs and metrics services over gRPC, and `/v1/logs` over HTTP.
+axum.workspace = true
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+    "metrics",
+] }
+prost.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+# Issues the cluster nodes' mTLS certificates for the executor export test.
+test-framework = { path = "../../crates/test-framework" }
 
 [features]
 adbc = ["dep:connector-adbc", "runtime/adbc"]
@@ -227,3 +249,14 @@ vortex = ["runtime/vortex"]
 
 [lints]
 workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# What exporting the log over OTLP costs each event, at P50/P99/P99.9:
+# `cargo bench -p spiced --no-default-features --bench otel_logs`.
+[[bench]]
+name = "otel_logs"
+harness = false

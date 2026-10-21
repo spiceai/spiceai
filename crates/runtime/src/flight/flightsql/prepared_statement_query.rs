@@ -213,7 +213,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     // body is executed as a transaction at do_get, not planned as one here).
     let schema_sql = schema_statement(&query);
     let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
-        datafusion,
+        Arc::clone(&datafusion),
         &schema_sql,
     )
     .await
@@ -226,6 +226,8 @@ pub(crate) async fn do_action_create_prepared_statement(
                 || err_msg.contains("Invalid arithmetic operation")
                 || err_msg.contains("type inference")
                 || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
             {
                 tracing::debug!(
                     "Could not infer schema during prepare (will be determined at execution): {err_msg}"
@@ -272,8 +274,11 @@ pub(crate) async fn get_flight_info(
     tracing::trace!("get_flight_info_prepared_statement");
 
     // Decode the prepared statement to get the query and retrieve its schema
-    let PreparedStatement { query: sql, .. } =
-        from_bytes(&handle.prepared_statement_handle).map_err(error_to_status)?;
+    let PreparedStatement {
+        query: sql,
+        parameters,
+        parameter_schema,
+    } = from_bytes(&handle.prepared_statement_handle).map_err(error_to_status)?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
@@ -281,8 +286,33 @@ pub(crate) async fn get_flight_info(
     // Try to get schema, but if it fails due to type inference issues with parameters,
     // we'll omit the schema from FlightInfo. The actual schema will be determined during execution.
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
+    //
+    // When parameters are already bound (DoPut before GetFlightInfo), plan with
+    // them exactly as `do_get` will: same type-cast rewrite, same bound values.
+    // Otherwise an output column that depends on a parameter is advertised as
+    // `Null`/nullable while the stream carries the bound, non-null type, and
+    // clients that check the endpoint schema (ADBC, arrow-go) reject it.
     let schema_sql = schema_statement(&sql);
-    let maybe_arrow_schema = match Service::get_arrow_schema(datafusion, &schema_sql).await {
+    let schema_result = match decode_param_values(&parameters).map_err(param_error_to_status)? {
+        Some(param_values) if transaction_statements(&sql).is_none() => {
+            let sql_to_plan = match &parameter_schema {
+                Some(schema_bytes) => {
+                    let reader =
+                        StreamReader::try_new(&schema_bytes[..], None).map_err(error_to_status)?;
+                    rewrite_sql_with_type_casts(&sql, &reader.schema())
+                }
+                None => sql.clone(),
+            };
+            Service::get_arrow_schema_with_params(
+                Arc::clone(&datafusion),
+                &sql_to_plan,
+                Some(param_values),
+            )
+            .await
+        }
+        _ => Service::get_arrow_schema(Arc::clone(&datafusion), &schema_sql).await,
+    };
+    let maybe_arrow_schema = match schema_result {
         Ok((schema, _)) => Some(schema),
         Err(e) => {
             let err_msg = e.to_string();
@@ -290,6 +320,8 @@ pub(crate) async fn get_flight_info(
                 || err_msg.contains("Invalid arithmetic operation")
                 || err_msg.contains("type inference")
                 || err_msg.contains("No field named")
+                // A table function can't plan until its parameters are bound.
+                || datafusion.has_table_function_placeholders(&schema_sql)
             {
                 tracing::debug!(
                     "Could not infer schema for prepared statement (will be determined at execution): {err_msg}"
@@ -1098,8 +1130,8 @@ mod tests {
     async fn test_prepared_statement_plan_cache_setup() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
-        use crate::status::RuntimeStatus;
         use cache::{Caching, SimpleCache};
+        use runtime_status::RuntimeStatus;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -1144,17 +1176,84 @@ mod tests {
         // properly caches and reuses logical plans.
     }
 
+    /// `GetFlightInfo` for a prepared statement with bound parameters must
+    /// advertise exactly the schema `DoGet` streams, including for output
+    /// columns derived from a parameter. Otherwise ADBC / arrow-go clients fail
+    /// with "endpoint 0 returned inconsistent schema".
+    #[tokio::test]
+    async fn test_bound_param_schema_matches_stream() {
+        use crate::dataaccelerator::AcceleratorEngineRegistry;
+        use crate::datafusion::builder::DataFusionBuilder;
+        use crate::datafusion::query::builder::QueryBuilder;
+        use crate::status::RuntimeStatus;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::scalar::ScalarValue;
+        use futures::TryStreamExt;
+
+        let datafusion = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+
+        let int_param = (ScalarValue::Int64(Some(1)), DataType::Int64);
+        let str_param = (ScalarValue::Utf8(Some("a".to_string())), DataType::Utf8);
+        let cases = [
+            ("SELECT $1 AS x", int_param.clone()),
+            ("SELECT CAST($1 AS VARCHAR) AS x", int_param.clone()),
+            ("SELECT $1 || 'x' AS x", str_param),
+            ("SELECT 1 + $1 AS x", int_param),
+        ];
+
+        for (sql, (value, data_type)) in cases {
+            // Mirror do_get: rewrite with the bound parameter types, then bind.
+            let param_schema: SchemaRef =
+                Arc::new(Schema::new(vec![Field::new("$1", data_type, true)]));
+            let sql_to_run = rewrite_sql_with_type_casts(sql, &param_schema);
+            let params = ParamValues::from(vec![value]);
+
+            let (advertised, _) = Service::get_arrow_schema_with_params(
+                Arc::clone(&datafusion),
+                &sql_to_run,
+                Some(params.clone()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("schema for {sql}: {e}"));
+
+            let batches: Vec<_> = QueryBuilder::new(&sql_to_run, Arc::clone(&datafusion))
+                .parameters(Some(params))
+                .build()
+                .run()
+                .await
+                .unwrap_or_else(|e| panic!("run {sql}: {e}"))
+                .data
+                .try_collect()
+                .await
+                .unwrap_or_else(|e| panic!("collect {sql}: {e}"));
+            let streamed = batches[0].schema();
+
+            assert_eq!(advertised.fields().len(), streamed.fields().len(), "{sql}");
+            for (a, s) in advertised.fields().iter().zip(streamed.fields()) {
+                assert_eq!(a.data_type(), s.data_type(), "data type for {sql}");
+                assert_eq!(a.is_nullable(), s.is_nullable(), "nullability for {sql}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_parameter_binding_with_plan_caching() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
         use crate::datafusion::query::builder::QueryBuilder;
-        use crate::status::RuntimeStatus;
         use arrow::array::Int64Array;
         use cache::{Caching, SimpleCache};
         use datafusion::common::ParamValues;
         use datafusion::scalar::ScalarValue;
         use futures::TryStreamExt;
+        use runtime_status::RuntimeStatus;
         use std::sync::Arc;
         use std::time::Duration;
 

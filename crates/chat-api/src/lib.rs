@@ -123,7 +123,7 @@ pub enum Error {
     UnsupportedTaskForModel { from: String, task: String },
 
     #[snafu(display(
-        "Model '{model}' is an evaluation model and does not support chat completions. Use POST /v1/evaluate with `state` and typed `questions` instead. See: https://spiceai.org/docs/components/models"
+        "Model '{model}' is a decision model and does not support chat completions. Use POST /v1/decisions, or the SQL decision functions such as ai_if, instead. See: https://spiceai.org/docs/components/models"
     ))]
     EvaluateOnlyModel { model: String },
 
@@ -171,6 +171,83 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether the error is a mistake in the model's Spicepod configuration, which only a
+    /// change to the Spicepod can clear. A refusal from the provider is not one: a missing
+    /// model, a bad key or an exhausted quota can be fixed on the provider's side.
+    #[must_use]
+    pub fn is_configuration_error(&self) -> bool {
+        match self {
+            Self::LocalModelNotFound { .. }
+            | Self::LocalModelConfigNotFound { .. }
+            | Self::LocalTokenizerNotFound { .. }
+            | Self::UnsupportedModelType { .. }
+            | Self::ModelNotProvided { .. }
+            | Self::UnknownModelSource { .. }
+            | Self::UnsupportedTaskForModel { .. }
+            | Self::EvaluateOnlyModel { .. }
+            | Self::InvalidParamValueError { .. }
+            | Self::MissingParamError { .. }
+            | Self::ModelMissingWeights { .. }
+            | Self::UnsafePickleWeight { .. }
+            | Self::ModelParameterFailed { .. }
+            | Self::ResponsesNotSupported { .. } => true,
+            // A loader can wrap a configuration error, such as rejected pickle weights.
+            Self::FailedToLoadModel { source } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_configuration_error),
+            Self::HealthCheckError { .. }
+            | Self::FailedToRunModel { .. }
+            | Self::ModelNotFound { .. }
+            | Self::FailedToLoadTokenizer { .. }
+            | Self::ModelFileMissing { .. }
+            | Self::ToolNotFound { .. } => false,
+        }
+    }
+}
+
+/// The kind of failure a provider's [`ApiError`] reports.
+///
+/// Providers put the kind in either field: `OpenAI` sends `type: invalid_request_error`
+/// with a more specific `code` such as `missing_required_parameter` or `invalid_api_key`,
+/// and Anthropic sends a `type` alone. `code` is the more specific of the two, so it is
+/// read first, and `type` only when `code` names no kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// The request was refused as invalid.
+    InvalidRequest,
+    /// The provider did not accept the model's credentials.
+    Authentication,
+    /// The credentials were accepted but may not do what was asked.
+    PermissionDenied,
+    /// The requested resource, for example a model or a stored response, does not exist.
+    NotFound,
+    /// The provider is throttling requests.
+    RateLimited,
+    /// The account has no quota left.
+    InsufficientQuota,
+}
+
+impl ApiErrorKind {
+    /// The kind `error` reports, or `None` when neither its `code` nor its `type` names one.
+    #[must_use]
+    pub fn of(error: &ApiError) -> Option<Self> {
+        Self::named(error.code.as_deref()).or_else(|| Self::named(error.r#type.as_deref()))
+    }
+
+    fn named(name: Option<&str>) -> Option<Self> {
+        match name? {
+            "invalid_request_error" => Some(Self::InvalidRequest),
+            "invalid_api_key" | "authentication_error" => Some(Self::Authentication),
+            "permission_error" => Some(Self::PermissionDenied),
+            "not_found_error" => Some(Self::NotFound),
+            "rate_limit_exceeded" | "rate_limit_error" => Some(Self::RateLimited),
+            "insufficient_quota" => Some(Self::InsufficientQuota),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct QueryGenerationContext {
@@ -627,7 +704,7 @@ mod tests {
         }
         .to_string();
         assert!(message.contains("'jev'"), "{message}");
-        assert!(message.contains("POST /v1/evaluate"), "{message}");
+        assert!(message.contains("POST /v1/decisions"), "{message}");
         assert!(
             message.contains("does not support chat completions"),
             "{message}"

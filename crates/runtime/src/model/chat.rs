@@ -28,6 +28,7 @@ use llms::{
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
+use runtime_rate_control::RateController;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::ResultExt;
@@ -71,7 +72,7 @@ use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/evaluate`
+/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/decisions`
 /// uses it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
@@ -82,13 +83,16 @@ pub struct LoadedChatModel {
 }
 
 impl LoadedChatModel {
-    /// The evaluator `/v1/evaluate` uses for this model, which the Spicepod names `name`.
+    /// The evaluator decisions use for this model, which the Spicepod names `name`.
     ///
     /// It calls the model without runtime tools: an evaluation's `state` is untrusted
     /// input and must not be able to steer a tool call.
     #[must_use]
-    pub fn evaluator(&self, name: &str) -> Arc<dyn Evaluate> {
-        Arc::new(ChatEvaluator::new(name, Arc::clone(&self.without_tools)))
+    pub fn evaluator(&self, name: &str, rate_controller: Arc<RateController>) -> Arc<dyn Evaluate> {
+        Arc::new(
+            ChatEvaluator::new(name, Arc::clone(&self.without_tools))
+                .with_rate_controller(rate_controller),
+        )
     }
 }
 
@@ -148,7 +152,6 @@ pub async fn try_to_chat_model(
                 .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
             Arc::new(ToolUsingChat::new(
                 Arc::clone(&model),
-                Arc::clone(&rt),
                 tools,
                 spice_recursion_limit,
             ))
@@ -348,11 +351,14 @@ fn anthropic(
         }),
     };
 
-    let anthropic = Anthropic::new(auth, model_id, api_base, None).map_err(|_| {
-        LlmError::FailedToLoadModel {
+    let anthropic = Anthropic::new(auth, model_id, api_base, None)
+        .map_err(|_| LlmError::FailedToLoadModel {
             source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
-        }
-    })?;
+        })?
+        .with_workspace_id(params.workspace_id.as_deref())
+        .map_err(|e| LlmError::FailedToLoadModel {
+            source: format!("Invalid `anthropic_workspace_id`: {e}").into(),
+        })?;
 
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
 }
@@ -431,6 +437,9 @@ async fn huggingface(
         params.nodes.as_deref(),
     )?;
 
+    let default_reasoning_effort =
+        default_reasoning_effort(component, ModelSource::HuggingFace.short_name());
+
     llms::chat::create_hf_model(
         &id,
         model_type,
@@ -438,8 +447,26 @@ async fn huggingface(
         hf_token,
         chat_template_literal,
         distributed,
+        llms::chat::ReasoningDefault {
+            model_name: &component.name,
+            effort: default_reasoning_effort.as_ref(),
+        },
     )
     .await
+}
+
+/// The model's `reasoning_effort` default from its `params`, in any accepted spelling, for
+/// the loader to check against the chat template. A value that doesn't parse is left to the
+/// request path, which reports it.
+#[cfg(feature = "models")]
+fn default_reasoning_effort(
+    component: &spicepod::component::model::Model,
+    prefix: &str,
+) -> Option<async_openai::types::chat::ReasoningEffort> {
+    get_openai_request_overrides(component, prefix)
+        .into_iter()
+        .find(|(key, _)| key == "reasoning_effort")
+        .and_then(|(_, value)| serde_json::from_value(value).ok())
 }
 
 /// Parse the optional multi-node distributed-inference params (`distributed_backend`,
@@ -787,6 +814,8 @@ async fn file(
     let paged_attention = params.paged_attention;
 
     let chat_template_literal = params.chat_template.as_deref();
+    let default_reasoning_effort =
+        default_reasoning_effort(component, ModelSource::File.short_name());
 
     llms::chat::create_local_model(
         model_weights.as_slice(),
@@ -799,6 +828,10 @@ async fn file(
             chat_template_literal,
             context_length,
             paged_attention,
+            reasoning: llms::chat::ReasoningDefault {
+                model_name: &component.name,
+                effort: default_reasoning_effort.as_ref(),
+            },
         },
     )
     .await

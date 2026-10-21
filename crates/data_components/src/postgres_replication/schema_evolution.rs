@@ -16,8 +16,10 @@ limitations under the License.
 
 //! Stream-time schema reconciliation for pgoutput `Relation` messages.
 //!
-//! Postgres re-sends the `Relation` message whenever the source table's schema
-//! changes (and on every reconnect). With `on_schema_change` set to a policy
+//! Postgres sends a table's `Relation` message before the first change to it on
+//! a connection, and again before the first change after its schema changes.
+//! The baseline the first one is diffed against is the column types the dataset
+//! was registered from. With `on_schema_change` set to a policy
 //! other than `block`, [`RelationSchemaTracker`] diffs each `Relation` against
 //! the dataset's working schema:
 //!
@@ -71,6 +73,12 @@ pub(crate) struct RelationSchemaTracker {
     /// the runtime classifier applies), so it is rejected here too.
     constraint_columns: Vec<String>,
     column_oids: HashMap<String, u32>,
+    /// The baseline was seeded and no `Relation` has been diffed against it
+    /// yet. That first `Relation` can describe WAL written before the source
+    /// catalog the seed was read from (a resumed slot replaying changes from
+    /// before an `ALTER`), so a type it reports that the working type already
+    /// holds every value of is accepted rather than read as a narrowing.
+    seed_pending: bool,
 }
 
 impl RelationSchemaTracker {
@@ -86,7 +94,38 @@ impl RelationSchemaTracker {
             dataset_name,
             constraint_columns,
             column_oids: HashMap::new(),
+            seed_pending: false,
         }
+    }
+
+    /// Seed the per-column type OID baseline with the types the dataset's
+    /// schema was registered from (the source catalog at subscribe time).
+    ///
+    /// Without a seed, the first `Relation` is taken as the baseline. Postgres
+    /// sends that message only before the first change on the table, which can
+    /// come after the column's type has already changed, so the change would
+    /// never be diffed and its values would be decoded as the registered type.
+    #[must_use]
+    ///
+    /// The catalog is read after the schema was inferred, so a type change can
+    /// land in between. A seeded numeric type wider than the registered one is
+    /// that change, not the baseline: it is seeded as unknown (OID 0), so the
+    /// first `Relation` reports it and it is adopted per the policy.
+    pub(crate) fn with_column_type_oids(mut self, mut column_oids: HashMap<String, u32>) -> Self {
+        for field in self.working_schema.fields() {
+            if let Some(oid) = column_oids.get_mut(field.name())
+                && map_pg_oid_to_arrow(*oid, -1).is_some_and(|seeded| {
+                    seeded.is_numeric()
+                        && field.data_type().is_numeric()
+                        && is_widening_cast(field.data_type(), &seeded)
+                })
+            {
+                *oid = 0;
+            }
+        }
+        self.seed_pending = !column_oids.is_empty();
+        self.column_oids = column_oids;
+        self
     }
 
     /// The current working schema (dataset schema plus any adopted widening).
@@ -97,9 +136,10 @@ impl RelationSchemaTracker {
     /// Reconcile one `Relation` message against the working schema, adopting
     /// widening changes per the policy or returning an actionable error.
     ///
-    /// The first observation of the stream only records the per-column OID
-    /// baseline — there is no prior OID to diff against, and the dataset
-    /// schema was inferred from this same relation at registration time.
+    /// Each column's OID is diffed against the baseline: the OIDs seeded by
+    /// [`Self::with_column_type_oids`], then those of the previous `Relation`.
+    /// With no seed, the first observation only records the baseline, since
+    /// there is no prior OID to diff against.
     pub(crate) fn observe_relation(&mut self, rel: &Relation) -> Result<RelationObservation> {
         let first_observation = self.column_oids.is_empty();
         let mut incompatibilities: Vec<String> = Vec::new();
@@ -139,6 +179,16 @@ impl RelationSchemaTracker {
 
             let previous_oid = self.column_oids.get(field.name()).copied();
             if first_observation || previous_oid == Some(col.type_oid) {
+                evolved_fields.push(Arc::clone(field));
+                continue;
+            }
+
+            // WAL older than the seeded catalog: its values are widened into the
+            // working type on decode.
+            if self.seed_pending
+                && map_pg_oid_to_arrow(col.type_oid, col.type_modifier)
+                    .is_some_and(|mapped| is_widening_cast(&mapped, field.data_type()))
+            {
                 evolved_fields.push(Arc::clone(field));
                 continue;
             }
@@ -199,10 +249,10 @@ impl RelationSchemaTracker {
             }
         }
 
-        // Added-column adoption only applies to columns that appear MID-STREAM
-        // (relative to the previous Relation message). Relation columns absent
-        // from the dataset schema on the FIRST observation may be a deliberate
-        // user subset — keep ignoring them, exactly like the legacy path.
+        // Added-column adoption only applies to columns absent from the baseline
+        // (the seeded OIDs, or the previous Relation message). Relation columns
+        // absent from the dataset schema but present in the baseline may be a
+        // deliberate user subset, and are ignored.
         for col in &rel.columns {
             if first_observation {
                 break;
@@ -250,6 +300,7 @@ impl RelationSchemaTracker {
             .fail();
         }
 
+        self.seed_pending = false;
         self.column_oids = rel
             .columns
             .iter()
@@ -291,8 +342,11 @@ pub(crate) fn map_pg_oid_to_arrow(type_oid: u32, type_modifier: i32) -> Option<D
         26 => DataType::UInt32,
         700 => DataType::Float32,
         701 => DataType::Float64,
-        // text, name, bpchar, varchar, uuid, json, xml, cidr, inet, macaddr
-        25 | 19 | 1042 | 1043 | 2950 | 114 | 142 | 650 | 869 | 829 => DataType::Utf8,
+        // text, name, bpchar, varchar, uuid, json, jsonb, xml, cidr, inet,
+        // macaddr. The provider maps `json` and `jsonb` alike, and the WAL
+        // decoder reads a `jsonb` value's text past its version byte, so the
+        // two agree on `Utf8` here as well.
+        25 | 19 | 1042 | 1043 | 2950 | 114 | 3802 | 142 | 650 | 869 | 829 => DataType::Utf8,
         17 => DataType::Binary,
         1082 => DataType::Date32,
         1083 => DataType::Time64(TimeUnit::Nanosecond),
@@ -369,6 +423,126 @@ mod tests {
             .expect("observe");
         assert!(!obs.schema_changed);
         assert_eq!(t.working_schema().fields().len(), 2);
+    }
+
+    /// Regression test for #14718: seeded with the registered column types, the
+    /// first `Relation` is diffed rather than taken as the baseline, so a type
+    /// change made before the stream's first change is still adopted.
+    #[test]
+    fn seeded_baseline_adopts_a_widening_in_the_first_relation() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Int32, true),
+            ])),
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 23),
+        ]));
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect("int4 -> float8 widens");
+        assert!(obs.schema_changed);
+        assert_eq!(obs.summary, "widened `k`: Int32 -> Float64");
+        assert_eq!(t.working_schema().field(1).data_type(), &DataType::Float64);
+    }
+
+    /// A resumed slot can replay WAL from before the `ALTER` the seed already
+    /// reflects: the first `Relation` then reports the older, narrower type,
+    /// which the working type holds, so it is not a narrowing. Only that first
+    /// `Relation` is read this way; a later narrowing is still an error.
+    #[test]
+    fn seeded_baseline_accepts_older_narrower_wal_only_first() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Float64, true),
+            ])),
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 701),
+        ]));
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 23)]))
+            .expect("replayed int4 relation fits the Float64 working type");
+        assert!(!obs.schema_changed);
+        assert_eq!(t.working_schema().field(1).data_type(), &DataType::Float64);
+        t.observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect("the post-ALTER relation matches the working type");
+        let msg = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 23)]))
+            .expect_err("a later narrowing is an error")
+            .to_string();
+        assert!(msg.contains("not a lossless widening"), "{msg}");
+    }
+
+    /// The catalog can already reflect a widening the registered schema predates
+    /// (an `ALTER` between schema inference and the catalog read). The first
+    /// `Relation`, which reports the same type, is then still adopted.
+    #[test]
+    fn seeded_type_wider_than_registered_is_adopted_from_the_first_relation() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Int32, true),
+            ])),
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 701),
+        ]));
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect("float8 widens Int32");
+        assert!(obs.schema_changed);
+        assert_eq!(obs.summary, "widened `k`: Int32 -> Float64");
+    }
+
+    /// A seeded column the dataset does not project is not "added" when the
+    /// first `Relation` carries it: the dataset deliberately left it out.
+    #[test]
+    fn seeded_baseline_does_not_adopt_an_unprojected_column() {
+        let mut t = tracker(SchemaEvolutionPolicy::AppendNewColumns).with_column_type_oids(
+            HashMap::from([
+                ("id".to_string(), 23),
+                ("name".to_string(), 25),
+                ("secret".to_string(), 25),
+            ]),
+        );
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("name", 25), ("secret", 25)]))
+            .expect("observe");
+        assert!(!obs.schema_changed, "{}", obs.summary);
+        assert_eq!(t.working_schema().fields().len(), 2);
+    }
+
+    /// Under `fail`, a type change already present in the first `Relation` fails.
+    #[test]
+    fn seeded_baseline_fails_a_type_change_under_fail() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Int32, true),
+            ])),
+            SchemaEvolutionPolicy::Fail,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 23),
+        ]));
+        let msg = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect_err("fail rejects the type change")
+            .to_string();
+        assert!(
+            msg.contains("the type of column `k` changed on source relation public.users (pg type oid 23 -> 701) and `on_schema_change: fail` is set"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -556,6 +730,8 @@ mod tests {
         assert_eq!(map_pg_oid_to_arrow(700, -1), Some(DataType::Float32));
         assert_eq!(map_pg_oid_to_arrow(701, -1), Some(DataType::Float64));
         assert_eq!(map_pg_oid_to_arrow(25, -1), Some(DataType::Utf8));
+        assert_eq!(map_pg_oid_to_arrow(114, -1), Some(DataType::Utf8));
+        assert_eq!(map_pg_oid_to_arrow(3802, -1), Some(DataType::Utf8));
         assert_eq!(map_pg_oid_to_arrow(17, -1), Some(DataType::Binary));
         assert_eq!(map_pg_oid_to_arrow(1082, -1), Some(DataType::Date32));
         assert_eq!(

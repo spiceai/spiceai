@@ -168,7 +168,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Download SARIF artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: codeql-sarif-*
           path: sarif-results
@@ -183,7 +183,7 @@ jobs:
       - name: Upload SARIF to code scanning
         id: upload
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4
         with:
           sarif_file: sarif-results
           category: /language:rust

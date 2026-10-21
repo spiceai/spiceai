@@ -46,6 +46,7 @@ schemars.workspace = true
 serde.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
+shell-words.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tools = { path = "../tools" }

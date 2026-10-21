@@ -75,9 +75,9 @@ use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, factory::default_available_catalogs};
 pub use notify::Error as NotifyError;
+use runtime_status::ComponentStatus;
 use runtime_tls::TlsConfig;
 use snafu::prelude::*;
-use status::ComponentStatus;
 
 use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -123,9 +123,11 @@ pub mod jobs;
 mod management;
 mod metrics_server;
 pub mod model;
-mod object_store_state;
 pub mod opentelemetry;
-pub mod otel_push_exporter;
+pub mod opentelemetry_logs;
+pub mod opentelemetry_store;
+// Moved to `runtime-otel-push`; re-exported so `runtime::otel_push_exporter` still resolves.
+pub use runtime_otel_push as otel_push_exporter;
 // Host/container resource introspection lives in `runtime-resources`; it names
 // nothing from the runtime. Re-exported so `crate::resource_monitor::…` resolves.
 pub mod resource_monitor {
@@ -149,9 +151,12 @@ pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
-mod secrets_preflight;
+mod server_timing;
 pub mod spice_metrics;
-pub mod status;
+// The status tracker lives in `runtime-status`. Aliased so `runtime::status::…`
+// (used by tests, `spiced` and grouped `crate::{status, …}` imports) still resolves.
+pub use runtime_status as status;
+mod state_location;
 pub mod task_history;
 pub mod token_providers;
 pub mod tools;
@@ -348,7 +353,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, and also set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
         dataset_name: String,
@@ -362,6 +367,17 @@ pub enum Error {
         dataset_name: String,
         connector: String,
         retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. {advice} See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionDisabled {
+        dataset_name: String,
+        connector: String,
+        param: String,
+        consequence: String,
+        advice: String,
     },
 
     #[snafu(display(
@@ -596,6 +612,9 @@ pub enum Error {
     ))]
     FullTextSearchRequiresAcceleration { dataset_name: String },
 
+    #[snafu(display("{reason}"))]
+    StateLocationRefused { reason: String },
+
     #[snafu(display("Failed to start Ballista scheduler: {source}"))]
     FailedToStartClusterScheduler {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -643,26 +662,16 @@ pub struct LogErrors(pub bool);
 
 /// State of the initial [`Runtime::load_components`] pass.
 ///
-/// The load has no deadline: `load_dataset` retries a transient failure for as
-/// long as the runtime is up, so a spicepod the runtime cannot satisfy — an
-/// unreachable source, a `${ secrets:… }` reference nothing resolves — leaves
-/// the load running indefinitely. A caller holding the configuration that fixes
-/// that (Spice Cloud Connect applying a deployment) needs to supersede the load
-/// rather than race it: a load left running keeps registering datasets from the
-/// app it started against, after a new app has replaced it.
-///
 /// `in_flight` starts `true` — a load is pending from the moment the runtime
-/// exists — so a supersede that lands before the load begins still stops it,
-/// and `load_components` returns without starting.
+/// exists — and turns `false` once the load is over, however it ends. See
+/// [`Runtime::initial_load_in_flight`].
 struct InitialLoad {
-    cancel: CancellationToken,
     in_flight: AtomicBool,
 }
 
 impl Default for InitialLoad {
     fn default() -> Self {
         Self {
-            cancel: CancellationToken::new(),
             in_flight: AtomicBool::new(true),
         }
     }
@@ -684,9 +693,9 @@ pub struct Runtime {
     /// keeping the read-lock-for-diff / write-lock-for-swap discipline, so the
     /// diff phase can still read the app `RwLock` without deadlocking.
     apply_app_lock: Arc<tokio::sync::Mutex<()>>,
-    /// State of the process's one-time initial component load, so a caller that
-    /// cannot wait for it can stop it. See [`Runtime::supersede_initial_load`].
-    /// Shared, not copied, so every clone of the runtime supersedes the same load.
+    /// State of the process's one-time initial component load. See
+    /// [`Runtime::initial_load_in_flight`]. Shared, not copied, so every clone of
+    /// the runtime reports the same load.
     initial_load: Arc<InitialLoad>,
     df: Arc<DataFusion>,
     llm_runtime_stores: Arc<model::LlmRuntimeStores>,
@@ -695,7 +704,7 @@ pub struct Runtime {
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
     /// LLM-as-reranker usage is needed — chat models are resolved from
-    /// `completion_llms` as a fallback.
+    /// `completion_llms`, then evaluation models from `evaluate_models`, as fallbacks.
     rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
@@ -740,6 +749,11 @@ pub struct Runtime {
     /// The dataset loads still retrying, so a Spicepod change can stop the load
     /// of a configuration it replaces or removes.
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// The model loads in progress, so a Spicepod change can stop the load of a
+    /// configuration it replaces or removes.
+    model_loads: Arc<init::model::ModelLoads>,
+    /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
+    view_loads: Arc<init::view_loads::ViewLoads>,
 
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is
@@ -750,6 +764,9 @@ pub struct Runtime {
     /// The engines found to have created the snapshots of datasets that read snapshots
     /// (`file_format: snapshot`), which building those datasets needs.
     snapshot_sources: Arc<component::dataset::snapshot_source::SnapshotSourceRegistry>,
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    state_location_check: Option<Arc<runtime_state_location::StateLocationCheck>>,
 }
 
 impl Debug for Runtime {
@@ -825,34 +842,29 @@ impl Runtime {
         Arc::clone(&self.rerankers)
     }
 
-    /// How each loaded model supports the Responses API, including which models are
-    /// evaluation-only.
+    /// What each loaded model can serve, by model name.
     #[must_use]
-    pub fn responses_api_support(
-        &self,
-    ) -> Arc<RwLock<HashMap<String, crate::model::ResponsesApiSupport>>> {
-        self.llm_runtime_stores.responses_api_support()
-    }
-
-    pub async fn responses_api_support_for_model(
-        &self,
-        model_name: &str,
-    ) -> Option<crate::model::ResponsesApiSupport> {
-        self.llm_runtime_stores
-            .responses_api_support()
-            .read()
-            .await
-            .get(model_name)
-            .cloned()
+    pub fn model_capabilities(&self) -> Arc<RwLock<model_capabilities::CapabilityStore>> {
+        self.llm_runtime_stores.capabilities()
     }
 
     pub async fn responses_supported_model_names(&self) -> HashSet<String> {
-        self.llm_runtime_stores
-            .responses_api_support()
-            .read()
-            .await
-            .iter()
-            .filter_map(|(name, support)| support.supports_responses_api().then_some(name.clone()))
+        let capabilities = self.llm_runtime_stores.capabilities();
+        let capabilities = capabilities.read().await;
+        let responses = self.llm_runtime_stores.responses_llms();
+        let responses = responses.read().await;
+        capabilities
+            .keys()
+            .filter(|name| {
+                model_capabilities::require(
+                    &capabilities,
+                    &responses,
+                    name,
+                    model_capabilities::Capability::Responses,
+                )
+                .is_ok()
+            })
+            .cloned()
             .collect()
     }
 
@@ -893,6 +905,13 @@ impl Runtime {
     #[must_use]
     pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
         Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    /// The startup check of `runtime.state.location`, when it is set.
+    pub(crate) fn state_location_check(
+        &self,
+    ) -> Option<&Arc<runtime_state_location::StateLocationCheck>> {
+        self.state_location_check.as_ref()
     }
 
     /// The engines of the snapshot sources this runtime has resolved.
@@ -952,22 +971,39 @@ impl Runtime {
         }
     }
 
+    /// Adds `assignments` to the partitions this executor holds and loads the
+    /// tables whose partitions change. Partitions the scheduler pushed earlier
+    /// are kept: the scheduler removes a partition by an explicit update.
     pub async fn set_partition_assignments(&self, assignments: PartitionAssignments) {
         if let Some(DistributedNode::Executor {
             partition_assignments,
+            assignment_updates,
             ..
         }) = self.distributed.as_ref()
         {
+            let _applying = assignment_updates.lock().await;
             let mut guard = partition_assignments.write().await;
-            guard.clone_from(&assignments);
+            let mut changed = Vec::new();
+            for (table, partitions) in assignments {
+                let held = guard.entry(table.clone()).or_default();
+                let before = held.len();
+                for partition in partitions {
+                    if !held.contains(&partition) {
+                        held.push(partition);
+                    }
+                }
+                if held.len() != before {
+                    changed.push(table);
+                }
+            }
+            let merged = guard.clone();
             drop(guard); // drop lock before updating tables
 
-            self.record_executor_assigned_partitions(&assignments);
+            self.record_executor_assigned_partitions(&merged);
 
-            // Update all assigned tables
-            for table in assignments.keys() {
+            for table in changed {
                 if let Err(e) = self
-                    .update_partition_refresh_sql(table.clone(), &assignments)
+                    .update_partition_refresh_sql(table.clone(), &merged)
                     .await
                 {
                     tracing::warn!("Failed to update partition refresh SQL for {table}: {e}");
@@ -1006,6 +1042,7 @@ impl Runtime {
     ) -> Result<()> {
         let Some(DistributedNode::Executor {
             partition_assignments,
+            assignment_updates,
             ..
         }) = self.distributed.as_ref()
         else {
@@ -1017,6 +1054,7 @@ impl Runtime {
             // misconfigured here.
             return Ok(());
         };
+        let _applying = assignment_updates.lock().await;
 
         // Compute the prospective post-update state from a snapshot of the
         // current map. We apply the DataFusion filter updates against this
@@ -1064,19 +1102,29 @@ impl Runtime {
             }
         }
 
-        let affected_tables: HashSet<_> = new_partitions
-            .keys()
-            .chain(removed_partitions.keys())
-            .collect();
+        // Tables whose partitions this update changes load them. An update
+        // that repeats what the executor already holds (the scheduler re-sends
+        // partitions it has no load report for) repairs that report instead.
+        let (affected_tables, repeated_tables): (
+            HashSet<ResolvedTableReference>,
+            HashSet<ResolvedTableReference>,
+        ) = {
+            let current = partition_assignments.read().await;
+            new_partitions
+                .keys()
+                .chain(removed_partitions.keys())
+                .map(|table_name| {
+                    TableReference::parse_str(table_name)
+                        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                })
+                .partition(|table| current.get(table) != prospective.get(table))
+        };
 
         // Apply DataFusion filter updates against the prospective state. If any
         // fails, the shared partition_assignments map is not modified — the
         // scheduler retries the update and we'll re-attempt all tables.
-        for table_name in affected_tables {
-            let resolved = TableReference::parse_str(table_name)
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
-
-            self.update_partition_refresh_sql(resolved.clone(), &prospective)
+        for resolved in affected_tables {
+            self.update_partition_refresh_sql(resolved, &prospective)
                 .await?;
         }
 
@@ -1085,8 +1133,75 @@ impl Runtime {
         // All filter updates succeeded — commit the new routing state. Last
         // step so the planner's view of executor partitions never gets ahead
         // of what the AcceleratedTables actually know about.
-        *partition_assignments.write().await = prospective;
+        *partition_assignments.write().await = prospective.clone();
+
+        for resolved in repeated_tables {
+            self.repair_partition_load(resolved, &prospective).await?;
+        }
         Ok(())
+    }
+
+    /// Answers a scheduler that re-sent partitions of `table` this executor
+    /// already holds because it has no report of them loaded: replays the
+    /// report of the load of the current partitions, or loads them again when
+    /// no load of them finished (it failed) and none is running. Does nothing
+    /// before the table's initial load reports, which reports on its own.
+    async fn repair_partition_load(
+        &self,
+        table: ResolvedTableReference,
+        assignments: &PartitionAssignments,
+    ) -> Result<()> {
+        let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+            return Ok(());
+        };
+        let table_name = table.to_string();
+        if broadcaster.is_loading(&table_name) {
+            return Ok(());
+        }
+        let Some(loaded) = broadcaster.loaded_partitions(&table_name).await else {
+            return Ok(());
+        };
+        let assigned: HashSet<Vec<u8>> = assignments
+            .get(&table)
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if loaded.into_iter().collect::<HashSet<_>>() == assigned {
+            let sent = broadcaster.rebroadcast_partitions_loaded(&table_name).await;
+            tracing::debug!("Re-sent PartitionsLoaded for {table_name} to {sent} scheduler(s)");
+            return Ok(());
+        }
+        tracing::info!("Loading the assigned partitions of {table_name} again");
+        self.update_partition_refresh_sql(table, assignments).await
+    }
+
+    /// Loads the partitions of `table` assigned while its initial load read
+    /// `loaded`, the partitions that load filtered to.
+    pub(crate) async fn load_partitions_assigned_during_initial_load(
+        &self,
+        table: ResolvedTableReference,
+        loaded: &[Expr],
+    ) -> Result<()> {
+        let Some(DistributedNode::Executor {
+            partition_assignments,
+            assignment_updates,
+            ..
+        }) = self.distributed.as_ref()
+        else {
+            return Ok(());
+        };
+        let _applying = assignment_updates.lock().await;
+        let current = partition_assignments.read().await.clone();
+        let loaded: HashSet<&Expr> = loaded.iter().collect();
+        let assigned: HashSet<&Expr> = current
+            .get(&table)
+            .map(|exprs| exprs.iter().collect())
+            .unwrap_or_default();
+        if loaded == assigned {
+            return Ok(());
+        }
+        self.update_partition_refresh_sql(table, &current).await
     }
 
     pub(crate) async fn update_partition_refresh_sql(
@@ -1129,75 +1244,80 @@ impl Runtime {
         // Capturing later would tie the ack to whatever the name resolves to by
         // then, which is a different table if a rebuild has landed in between.
         let instance = self.datafusion().capture_table_instance(&table_ref).await;
+        let table_name = table.to_string();
+        let broadcaster = self.executor_outbound_broadcaster();
+        // Dropping the guard ends the load, including when this future is
+        // cancelled before the completion task below takes it over.
+        let load = broadcaster
+            .as_ref()
+            .map(|broadcaster| broadcaster.start_load(&table_name));
 
         // Propagate the filter-update error so the caller (and the executor's
         // ack to the scheduler) sees the failure rather than just logging it.
-        self.datafusion()
-            .update_partition_filters(table_ref.clone(), partition_filters)
-            .await
-            .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
-                table: table.to_string(),
-                source: Box::new(source),
-            })?;
-
-        tracing::info!("Updated partition assignments for {table}");
-
         // Trigger a refresh to load the data for the new partitions, capturing
         // the completion notifier so we can ack the scheduler with a
         // `PartitionsLoaded` once the accelerated table has actually finished
-        // loading. Refresh failures are non-fatal — the assignment is still
-        // valid; data just hasn't been pulled yet, so we skip the ack.
-        let notifier = match self.datafusion().refresh_table(&table_ref, None).await {
-            Ok(notifier) => notifier,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to trigger refresh for {table} after updating partitions: {e}"
-                );
-                return Ok(());
-            }
-        };
+        // loading. A refresh that cannot start fails the update, so the
+        // scheduler sends it again rather than count it delivered.
+        let started = async {
+            self.datafusion()
+                .update_partition_filters(table_ref.clone(), partition_filters)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })?;
+            tracing::info!("Updated partition assignments for {table}");
+            self.datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .map_err(|source| Error::UnableToUpdateClusterPartitionFilters {
+                    table: table_name.clone(),
+                    source: Box::new(source),
+                })
+        }
+        .await;
+        let notifier = started?;
 
         // Snapshot the partition exprs assigned to us for this table, encoded
         // the same way the scheduler encodes them when sending UpdatePartitions
         // (`Expr::to_bytes()`). `partition_value_to_bytes` sorts entries by
         // key so the encoding is deterministic across re-serialization.
-        let table_str = table.to_string();
         let partition_expr_bytes: Vec<Vec<u8>> = assignments
             .get(&table)
-            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_str))
+            .map(|exprs| runtime_cluster::encode_partition_exprs(exprs, &table_name))
             .unwrap_or_default();
 
-        if let Some(broadcaster) = self.executor_outbound_broadcaster() {
+        if let (Some(broadcaster), Some(load)) = (broadcaster, load) {
             // Send the ack even when `partition_expr_bytes` is empty — a
             // legitimately empty assignment (e.g. zero-partition source, or
             // partitions that all failed to serialize) still needs to flip
             // the scheduler-side readiness gate via the
             // `is_table_loaded`/`updated_at` shortcut. Suppressing the empty
             // case here would leave the dataset stuck in `Refreshing`.
-            let table_name = table.to_string();
             let df = self.datafusion();
             tokio::spawn(async move {
                 // Acking readiness for a table that did not load this partition
                 // set tells the scheduler a lie it then caches, so wait for the
                 // refresh *and* re-resolve the table before broadcasting.
-                match df.await_refresh_completion(instance, notifier).await {
-                    DeferredRefreshOutcome::Apply => {}
+                let loaded = match df.await_refresh_completion(instance, notifier).await {
+                    DeferredRefreshOutcome::Apply => true,
                     DeferredRefreshOutcome::Abandoned => {
                         // The table was removed before the refresh we triggered
                         // landed, so the partition set was never loaded.
                         tracing::debug!(
                             "{table_name} was removed before its partition refresh completed; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
                     DeferredRefreshOutcome::Failed => {
                         // A one-shot refresh failed. Advertising those
                         // partitions as queryable would tell the scheduler a
                         // lie it then caches.
-                        tracing::debug!(
+                        tracing::warn!(
                             "{table_name} partition refresh failed terminally; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
                     DeferredRefreshOutcome::TableChanged => {
                         // A refresh did land, but not on the table this ack is
@@ -1206,17 +1326,24 @@ impl Runtime {
                         tracing::debug!(
                             "{table_name} was removed or rebuilt after its partition refresh completed; not broadcasting PartitionsLoaded."
                         );
-                        return;
+                        false
                     }
+                };
+                if loaded {
+                    // Statistics flow via the periodic ExecutorStatistics
+                    // reporter, not this readiness ack.
+                    let sent = broadcaster
+                        .broadcast_partitions_loaded(
+                            table_name.clone(),
+                            partition_expr_bytes,
+                            load.load_sequence(),
+                        )
+                        .await;
+                    tracing::debug!(
+                        "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                    );
                 }
-                // Statistics flow via the periodic ExecutorStatistics reporter, not
-                // this readiness ack.
-                let sent = broadcaster
-                    .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
-                    .await;
-                tracing::debug!(
-                    "Broadcast PartitionsLoaded for {table_name} to {sent} scheduler(s)"
-                );
+                drop(load);
             });
         }
 
@@ -1462,6 +1589,7 @@ impl Runtime {
     /// [`Runtime::init_cache_metrics`].
     pub fn init_component_metrics(&self) {
         runtime_metrics::publish_component_counters_at_zero();
+        runtime_state_location::metrics::init();
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -1698,6 +1826,7 @@ impl Runtime {
                 executor_future,
                 flight_future,
                 health_http_future,
+                self.state_location_refusal(),
             )
             .map(|_| ());
         }
@@ -1789,7 +1918,8 @@ impl Runtime {
                 pods_watcher_future,
                 cache_maintenance_future,
                 cluster_future,
-                shutdown_signal_future
+                shutdown_signal_future,
+                self.state_location_refusal()
             ) {
                 Err(err) => Err(err),
                 _ => Ok(()),
@@ -1802,10 +1932,27 @@ impl Runtime {
             metrics_future,
             pods_watcher_future,
             cache_maintenance_future,
-            shutdown_signal_future
+            shutdown_signal_future,
+            self.state_location_refusal()
         ) {
             Err(err) => Err(err),
             _ => Ok(()),
+        }
+    }
+
+    /// Fails when the startup check refuses `runtime.state.location`, which
+    /// stops startup. Otherwise resolves once the check passes, or at shutdown.
+    async fn state_location_refusal(&self) -> Result<()> {
+        let Some(check) = &self.state_location_check else {
+            return Ok(());
+        };
+        let shutdown = self.status.shutdown_token();
+        tokio::select! {
+            refused = check.finished() => match refused {
+                Some(reason) => StateLocationRefusedSnafu { reason: reason.to_string() }.fail(),
+                None => Ok(()),
+            },
+            () = shutdown.cancelled() => Ok(()),
         }
     }
 
@@ -1910,32 +2057,6 @@ impl Runtime {
         }
     }
 
-    /// Abandon the initial component load.
-    ///
-    /// The load has no deadline — `load_dataset` retries a transient failure for
-    /// as long as the runtime is up — so a process that is on its way out (a
-    /// Spice Cloud deployment restarting onto a new spicepod) has to be able to
-    /// stop it: left running it keeps registering datasets from the
-    /// configuration being replaced, for the whole of the shutdown drain.
-    ///
-    /// Returns `true` only when this call is the one that stopped a pending or
-    /// running load, and `false` once the load has finished or was already
-    /// superseded.
-    ///
-    /// Components already registered when this fires stay registered; only the
-    /// load's remaining work is dropped.
-    pub fn supersede_initial_load(&self) -> bool {
-        if self.initial_load.in_flight.swap(false, Ordering::SeqCst) {
-            tracing::info!(
-                "Superseding the initial component load: a new configuration replaces the one being loaded"
-            );
-            self.initial_load.cancel.cancel();
-            true
-        } else {
-            false
-        }
-    }
-
     /// Whether the initial component load is still running.
     ///
     /// While it is, what is registered is not yet what the loaded app describes,
@@ -1976,25 +2097,14 @@ impl Runtime {
         // round trip, and holding the guard across it stalls a writer (and
         // risks the write-preferring deadlock `Secrets::snapshot` documents).
         let secrets = secrets::Secrets::snapshot(&self.secrets).await;
-        secrets_preflight::run(&app, &secrets).await;
+        runtime_secrets::preflight::run(&app, &secrets).await;
     }
 
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    ///
-    /// [`Runtime::supersede_initial_load`] abandons the load — including before
-    /// it starts, in which case this returns immediately and the superseding
-    /// caller loads the app it applied.
     pub async fn load_components(self: Arc<Self>) {
-        if self.initial_load.cancel.is_cancelled() {
-            tracing::info!(
-                "Skipping the initial component load: it was superseded before it started"
-            );
-            return;
-        }
-
         self.secrets_preflight().await;
 
         let hold_ready_for_warmup = self.df.results_cache_warmup_holds_ready();
@@ -2083,8 +2193,7 @@ impl Runtime {
         let components = vec![task_history, datasets, catalogs, models];
 
         // Signal that the load must be canceled if the runtime is shut down before the components are loaded.
-        // A child of the initial-load token so `supersede_initial_load` abandons the load through this same path.
-        let cancel_loading = self.initial_load.cancel.child_token();
+        let cancel_loading = CancellationToken::new();
 
         // Wait for all components to load returning the first error
         // or canceling spawned tokio tasks if the runtime is shutting down
@@ -2115,8 +2224,7 @@ impl Runtime {
 
         let load_outcome = load_result.await;
 
-        // The initial load is over — completed, failed, or cancelled — so a
-        // later deployment has nothing left to supersede and applies normally.
+        // The initial load is over — completed, failed, or cancelled.
         self.initial_load.in_flight.store(false, Ordering::SeqCst);
 
         if let Err(err) = load_outcome {
@@ -2233,10 +2341,19 @@ impl Runtime {
         // milliseconds. Waited on alongside the connection drain, under the same
         // timeout: a source that cannot finish in it costs a rebuild on the next
         // start, never a hung shutdown.
-        let (unfinished_sources, _) = tokio::join!(
+        //
+        // Snapshot writer leases are resigned alongside, so a replacement instance
+        // need not wait for them to lapse.
+        let (unfinished_sources, _, leases_released) = tokio::join!(
             data_components::cdc::drain_shutdown(shutdown_timeout),
             join_all(shutdown_futures),
+            tokio::time::timeout(shutdown_timeout, self.df.resign_snapshot_writer_leases()),
         );
+        if leases_released.is_err() {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} to release snapshot writer leases and gave up; another instance takes over those datasets' snapshots only after the leases lapse"
+            );
+        }
         if unfinished_sources > 0 {
             tracing::warn!(
                 "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"

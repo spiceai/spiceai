@@ -23,10 +23,10 @@ use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 use crate::utils::TEST_REQUEST_CONTEXT;
 
 use runtime::Runtime;
@@ -84,6 +84,7 @@ mod cayenne;
 mod cayenne_catalog_ddl;
 #[cfg(feature = "duckdb")]
 mod clickbench;
+mod clickhouse;
 mod cluster;
 mod cors;
 #[cfg(feature = "cosmosdb")]
@@ -136,8 +137,13 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+#[cfg(not(windows))]
+mod cayenne_catalog_tuning;
+#[cfg(not(windows))]
+mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
+mod cluster_task_history;
 mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -157,6 +163,8 @@ mod oracle;
 #[cfg(not(windows))]
 mod otel_ingest_races;
 #[cfg(not(windows))]
+mod otel_logs;
+#[cfg(not(windows))]
 mod otel_restart;
 mod plan_capture;
 #[cfg(feature = "postgres")]
@@ -164,10 +172,15 @@ mod postgres;
 mod prepared_statements;
 #[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
 mod pushdown_roundtrip;
+mod query_active_count;
+mod query_panic_is_an_error;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
+mod reload_start_time_only;
+#[cfg(all(feature = "duckdb", feature = "sqlite"))]
+mod result_correctness;
 mod results_cache;
 mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
@@ -254,7 +267,7 @@ fn pin_test_cpu_budget() {
         Err(e) => panic!("{TEST_CPU_CORES} must be a valid CPU quantity: {e}"),
     }
 }
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),

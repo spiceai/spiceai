@@ -22,13 +22,15 @@ mod tests;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::WideningPlan;
 use async_trait::async_trait;
-use cayenne::{CayenneTableProvider, RebuildableWrite, SlotAdvancer};
+use cayenne::{CayenneTableProvider, SlotAdvancer};
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::cdc::ChangeBatch as CdcBatch;
+use data_components::poly::PolyTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -36,10 +38,13 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{future::BoxFuture, stream};
 use parking_lot::RwLock;
 use runtime_acceleration::change_sink::provider::{
-    ProviderChangeSinkBackend,
+    PrimaryKeyDelete, ProviderChangeSinkBackend,
     cdc::{CdcMetrics, ChangeOperationType, group_into_sub_batches, select_rows},
-    delete_index_keys, delete_matching_rows_from_arrow_provider,
-    deletion::{build_batch_delete_expr_from_change_batch, missing_primary_keys},
+    delete_accelerator_index_keys, delete_index_keys, delete_matching_rows_from_arrow_provider,
+    deletion::{
+        build_batch_delete_expr_from_change_batch, build_primary_key_delete_expr,
+        missing_primary_keys,
+    },
     perform_change_write_maintenance,
     refusal::before_mutation,
     reject_unknown_operations,
@@ -47,7 +52,7 @@ use runtime_acceleration::change_sink::provider::{
 use runtime_acceleration::change_sink::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
     ChangeSinkContext, DurabilityObserver, Recovery, ReplacementSupport, SchemaEvolutionSupport,
-    SetKey, StorageDurability, WriteOptions,
+    StorageDurability, WriteOptions, replaced_scope_filters,
 };
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, find_concrete};
@@ -67,6 +72,36 @@ pub fn provider_schema_evolution(table: &Arc<dyn TableProvider>) -> SchemaEvolut
         return provider_schema_evolution(dedup.inner());
     }
     SchemaEvolutionSupport::Restart
+}
+
+/// Stop the background maintenance of every Cayenne instance `table` serves
+/// from — the provider itself, each partition of a partitioned table, and the
+/// table a poly or upsert-dedup wrapper writes to — and wait for maintenance
+/// they already started. See `CayenneTableProvider::quiesce`. The same walk as
+/// the runtime's generation drain (`quiesce_cayenne_maintenance`).
+pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>) {
+    let mut instances = Vec::new();
+    let mut pending = vec![Arc::clone(table)];
+    while let Some(provider) = pending.pop() {
+        if let Some(cayenne) =
+            find_concrete::<CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            instances.push(cayenne.clone_for_write_operations());
+        } else if let Some(partitioned) =
+            find_concrete::<PartitionTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(poly) =
+            spice_table::find_layer::<PolyTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.push(poly.writer());
+        } else if let Some(dedup) =
+            find_concrete::<UpsertDedupTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.push(Arc::clone(dedup.inner()));
+        }
+    }
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
 }
 
 struct StorageFenceObserver {
@@ -106,9 +141,12 @@ impl CayenneChangeSinkBackend {
         }))
     }
 
-    /// A checkpoint must cover buffered work before durable writes can supersede
-    /// it. Rebuildable writes need no source callback; a real CDC callback must
-    /// finish its outstanding acknowledgements before being removed.
+    /// Only an installed source callback lets CDC writes buffer in the RAM tier,
+    /// so a checkpoint must cover that work, and finish its acknowledgements,
+    /// before a durable write supersedes it and the callback is removed. Without
+    /// a callback the tier is empty: checkpointing there would put the
+    /// checkpoint's maintenance, such as a maintained-aggregate rebuild, on every
+    /// durable write.
     async fn select_recovery_path(&self, recovery: Recovery) -> Result<()> {
         let buffered = self.table.is_cdc_memory_mode() && !self.table.is_memory_resident_mode();
         let observer = if recovery == Recovery::Replayable && buffered {
@@ -118,8 +156,7 @@ impl CayenneChangeSinkBackend {
         };
         if let Some(observer) = observer {
             self.table.install_slot_advancer(observer);
-        } else if buffered && (recovery != Recovery::Rebuildable || self.table.has_slot_advancer())
-        {
+        } else if self.table.has_slot_advancer() {
             self.table
                 .checkpoint_mem_tier()
                 .await
@@ -307,6 +344,47 @@ impl CayenneChangeSinkBackend {
     }
 }
 
+/// Most keys one key delete carries: well inside the filter size Cayenne reads
+/// keys from without scanning the table.
+const PRIMARY_KEY_DELETE_CHUNK: usize = 4_096;
+
+/// Replaced cache scopes delete through the CDC key path. A provider `DELETE`
+/// must count the rows it removes, so Cayenne answers it by scanning every
+/// stored row; the key path writes key tombstones without reading the table.
+#[async_trait]
+impl PrimaryKeyDelete for CayenneChangeSinkBackend {
+    async fn delete_primary_keys(&self, keys: &RecordBatch) -> Result<bool> {
+        let mut offset = 0;
+        while offset < keys.num_rows() {
+            let chunk = keys.slice(
+                offset,
+                PRIMARY_KEY_DELETE_CHUNK.min(keys.num_rows() - offset),
+            );
+            let Some(filter) = build_primary_key_delete_expr(&chunk)? else {
+                break;
+            };
+            if self
+                .table
+                .delete_from_cdc_fast(std::slice::from_ref(&filter))
+                .await?
+                .is_none()
+            {
+                // The table's deletion strategy decides this, so the first chunk does.
+                if offset == 0 {
+                    return Ok(false);
+                }
+                return Err(DataFusionError::Internal(format!(
+                    "Cayenne declined a primary-key delete for dataset '{}' after deleting earlier keys of the same write",
+                    self.context.dataset_name
+                )));
+            }
+            offset += chunk.num_rows();
+        }
+        delete_accelerator_index_keys(&self.context, keys).await;
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl ChangeSinkBackend for CayenneChangeSinkBackend {
     fn schema(&self) -> SchemaRef {
@@ -330,8 +408,8 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
         options: WriteOptions,
         ctx: &SessionContext,
     ) -> Result<BackendWrite> {
-        let (payload, scope) = batch.into_parts();
-        match payload {
+        let replacement_filters = replaced_scope_filters(batch.replaced_scopes());
+        match batch.into_payload() {
             ChangePayload::Cdc(rows) => {
                 let batch = rows.into_built().map_err(before_mutation)?;
                 self.apply_cdc(batch, options, ctx).await
@@ -339,7 +417,7 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
             ChangePayload::Rows {
                 schema,
                 batches,
-                append_validations,
+                scoped_inputs,
             } => {
                 let batches = if self.table.is_memory_resident_mode()
                     && batches.iter().any(|batch| batch.num_rows() > 0)
@@ -356,9 +434,8 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                             u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
                         })
                         .fold(0_u64, u64::saturating_add);
-                    let filters = scope.as_ref().map(SetKey::filters);
                     self.table
-                        .preflight_memory_append(incoming_bytes, filters.as_deref())
+                        .preflight_memory_append(incoming_bytes, replacement_filters.as_deref())
                         .await
                         .map_err(|error| before_mutation(error.into()))?;
                     batches
@@ -372,17 +449,13 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                     Recovery::Durable
                 })
                 .await?;
-                let rebuildable_context = rebuildable.then(|| {
-                    let mut state = ctx.state();
-                    state
-                        .config_mut()
-                        .set_extension(Arc::new(RebuildableWrite::new(&self.table)));
-                    SessionContext::new_with_state(state)
-                });
-                let ctx = rebuildable_context.as_ref().unwrap_or(ctx);
+                // Rows take the normal append path, not the RAM tier. Most coalesced
+                // cache bursts replace some scope, and a delete checkpoints the RAM
+                // tier first, so buffering them there writes a small file on nearly
+                // every burst, which every point lookup then has to read.
                 let changed = self
                     .provider
-                    .apply_rows(schema, batches, scope, append_validations, options, ctx)
+                    .apply_rows(schema, batches, scoped_inputs, options, ctx, Some(self))
                     .await?;
                 Ok(BackendWrite::complete(
                     changed,

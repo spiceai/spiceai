@@ -177,6 +177,7 @@ impl DataAccelerator for PartitionedArrowAccelerator {
             }
         }
 
+        super::arrow::warn_if_unique_index(source);
         super::arrow::enable_hash_index_for_primary_key_or_indexes(&mut cmd);
 
         let schema = Arc::new(cmd.schema.as_arrow().clone());

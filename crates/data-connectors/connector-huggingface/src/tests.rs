@@ -20,8 +20,8 @@ limitations under the License.
 //! tree, `paths-info`, `resolve` redirecting LFS files to a CDN on a *different origin* and
 //! small files to the Hub's own `resolve-cache` — and records every request, so a test
 //! asserts what was sent (ranges, tokens, commits) as well as what came back. Faults (a
-//! truncated download, an expired CDN URL, rate limiting, a server that ignores `Range`) are
-//! injected per test.
+//! truncated download, an API response cut off part way, an expired CDN URL, rate limiting, a
+//! server that ignores `Range`) are injected per test.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -88,6 +88,9 @@ struct Faults {
     chunked: bool,
     /// Tree pages after the first answer 404, as a listing cut short would.
     missing_later_pages: bool,
+    /// API responses cut off half way through their body, by endpoint (`revision`, `tree`,
+    /// `paths-info`).
+    api_truncated: HashMap<&'static str, u32>,
 }
 
 #[derive(Default)]
@@ -303,7 +306,13 @@ async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
 
-    match segments.as_slice() {
+    let api_endpoint = match segments.as_slice() {
+        ["api", "datasets", _, _, "revision", ..] => Some("revision"),
+        ["api", "datasets", _, _, "tree", ..] => Some("tree"),
+        ["api", "datasets", _, _, "paths-info", ..] => Some("paths-info"),
+        _ => None,
+    };
+    let response = match segments.as_slice() {
         ["api", "datasets", owner, name, "revision", revision] => {
             if state.faults.rate_limited > 0 {
                 state.faults.rate_limited -= 1;
@@ -524,7 +533,34 @@ async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
             ranged(&file.bytes, range.as_deref(), &[])
         }
         _ => response(StatusCode::NOT_FOUND, &[], "no such endpoint"),
+    };
+    let cut_off_left = api_endpoint
+        .filter(|_| response.status() == StatusCode::OK)
+        .and_then(|endpoint| state.faults.api_truncated.get_mut(endpoint))
+        .filter(|left| **left > 0);
+    match cut_off_left {
+        Some(left) => {
+            *left -= 1;
+            cut_off(response)
+        }
+        None => response,
     }
+}
+
+/// `response` with its body cut off half way: the first half is flushed before the
+/// connection fails, as when a connection is reset part way through a response.
+fn cut_off(response: Response<Body>) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    let whole = futures::executor::block_on(axum::body::to_bytes(body, usize::MAX))
+        .expect("the response body");
+    let half = whole.slice(..whole.len() / 2);
+    let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(half) }).chain(
+        futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Err(std::io::Error::other("connection reset"))
+        }),
+    );
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 async fn cdn_handler(State(mock): State<Mock>, request: Request<Body>) -> Response<Body> {
@@ -565,19 +601,7 @@ async fn cdn_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
     let full = ranged(&bytes, range.as_deref(), &[]);
     if state.faults.truncated > 0 {
         state.faults.truncated -= 1;
-        let (parts, body) = full.into_parts();
-        let whole = futures::executor::block_on(axum::body::to_bytes(body, usize::MAX))
-            .expect("the response body");
-        let half = whole.slice(..whole.len() / 2);
-        // The first half is flushed before the connection fails, as when a download is cut
-        // off part way.
-        let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(half) }).chain(
-            futures::stream::once(async {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                Err(std::io::Error::other("connection reset"))
-            }),
-        );
-        return Response::from_parts(parts, Body::from_stream(stream));
+        return cut_off(full);
     }
     full
 }
@@ -779,6 +803,85 @@ async fn scans_read_one_commit_and_follow_the_branch() {
         table.schema(),
         registered,
         "the schema is the one the dataset registered with"
+    );
+}
+
+/// An API response that breaks off part way, as when the connection is reset, is requested
+/// again instead of failing the query. A scan of a branch looks the branch up again once its
+/// lookup expires and lists a commit it has not listed before, so both requests happen while a
+/// query runs, not only while the dataset registers.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_responses_cut_off_part_way_are_requested_again() {
+    let mock = Mock::start().await;
+    mock.commit(
+        "o/flaky",
+        C1,
+        vec![("data/part-0.parquet", parquet(&rows(0..300)))],
+    );
+    mock.branch("o/flaky", "main", C1);
+    let connector = connector(&mock, None, &[]);
+    let dataset = DatasetSpec::new("hf://datasets/o/flaky/data/", TableReference::bare("t"));
+    let table = connector
+        .table(&dataset)
+        .await
+        .expect("the dataset registers");
+    let ctx = session();
+    ctx.register_table("t", table).expect("the table registers");
+    assert_rows(
+        &query(&ctx, "SELECT id, name, score FROM t ORDER BY id").await,
+        &rows(0..300),
+    );
+
+    // The branch moves, so the next scan resolves it and lists the new commit. The first
+    // response to each request breaks off half way.
+    mock.commit(
+        "o/flaky",
+        C2,
+        vec![
+            ("data/part-0.parquet", parquet(&rows(0..300))),
+            ("data/part-1.parquet", parquet(&rows(300..450))),
+        ],
+    );
+    mock.branch("o/flaky", "main", C2);
+    connector.store.hub().forget_revisions();
+    {
+        let mut state = mock.0.lock();
+        state.faults.api_truncated.insert("revision", 1);
+        state.faults.api_truncated.insert("tree", 1);
+    }
+    mock.clear_seen();
+    assert_rows(
+        &query(&ctx, "SELECT id, name, score FROM t ORDER BY id").await,
+        &rows(0..450),
+    );
+
+    let seen = mock.seen();
+    let requests = |endpoint: &str| {
+        seen.iter()
+            .filter(|s| s.path.contains(endpoint))
+            .map(|s| s.path.clone())
+            .collect::<Vec<_>>()
+    };
+    let lookups = requests("/revision/main");
+    assert_eq!(
+        lookups.len(),
+        2,
+        "the cut-off lookup and its retry: {lookups:#?}"
+    );
+    let listings = requests(&format!("/tree/{C2}/data"));
+    assert_eq!(
+        listings.len(),
+        2,
+        "the cut-off listing and its retry: {listings:#?}"
+    );
+    assert!(
+        mock.0
+            .lock()
+            .faults
+            .api_truncated
+            .values()
+            .all(|left| *left == 0),
+        "both responses were cut off"
     );
 }
 

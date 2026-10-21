@@ -293,11 +293,11 @@ impl super::AcceleratedTable {
                 && num_records > 0
                 && let Some(cache_provider) = caching.as_ref()
                 && let Err(e) = cache_provider
-                    .invalidate_for_table(dataset_name.clone())
+                    .invalidate_for_refresh(dataset_name.clone())
                     .await
             {
                 tracing::error!(
-                    "Failed to invalidate cached results for dataset {}: {e}",
+                    "Failed to invalidate cached query plans and search results for dataset {} after retention, so they may reflect the previous data until they expire: {e}",
                     &dataset_name
                 );
             }
@@ -569,6 +569,38 @@ mod tests {
             5, // Should remain all 5 records
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn retention_sql_eviction_count_is_the_number_of_deleted_rows() {
+        let batch = create_test_data();
+        let schema = batch.schema();
+        let mem_table =
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        let delete_expr = runtime_datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("test"),
+            "DELETE FROM test WHERE deleted = true",
+            accelerator.schema(),
+        )
+        .expect("parse retention SQL")
+        .delete_expr;
+
+        let deleted = apply_retention_filters_once(
+            &TableReference::bare("test"),
+            &accelerator,
+            &federated,
+            delete_expr,
+            &Handle::current(),
+        )
+        .await
+        .expect("retention delete");
+
+        assert_eq!(
+            deleted, 2,
+            "two fixture rows have deleted = true; the logged eviction count must be that number"
+        );
     }
 
     #[test]

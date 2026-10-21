@@ -309,11 +309,45 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
 
-### Running Vector Search Tests
+### Running Search Tests
 
-Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.
+Search tests send each query in the `test_queries` table to the runtime, then calculate NDCG, recall, MRR, and precision at each rank cutoff `k` against the `relevance_data` table. Search tests support the common options.
 
-`testoperator run search [OPTIONS]`
+`testoperator run search [OPTIONS] -p <SPICEPOD>`
+
+The spicepod loads its own data (for example, parquet files on Hugging Face) and must define the `corpus`, `test_queries`, and `relevance_data` tables. The `benchmark_dataset` metric attribute comes from the spicepod's top-level `metadata.benchmark_dataset` value, or is `custom` when the spicepod does not set it. Refer to [`test/spicepods/search/README.md`](../../test/spicepods/search/README.md) for the table schema.
+
+Where options are:
+
+- `--sql-pipeline <FILE_OR_SQL>`: A parameterized SQL search pipeline. When set, each query goes to `POST /v1/sql` with this SQL, not to `POST /v1/search`. The value is a path to a file that exists, or the SQL text. A value that ends with `.sql` or has no whitespace must be a file. Thus, a mistyped path fails with `SQL pipeline file not found`, and does not run as SQL.
+
+A SQL pipeline can use these named parameters:
+
+| Parameter | Value |
+|---|---|
+| `:query` | The query text from `test_queries.text`. |
+| `:limit` | The result limit (`10`). |
+
+A SQL pipeline must return these columns:
+
+| Column | Required | Description |
+|---|---|---|
+| `_id` | Yes | The corpus id. It must match `relevance_data."corpus-id"`. |
+| `_score` | No | A numeric score. It is recorded, but evaluation does not use it. |
+
+Rows must be in rank order: the first row is the best match. For example:
+
+```bash
+# SQL in a file
+testoperator run search -p spicepod.yaml --sql-pipeline pipelines/text_search.sql
+
+# SQL text
+testoperator run search -p spicepod.yaml \
+  --sql-pipeline "SELECT _id, _score FROM text_search(corpus, :query) ORDER BY _score DESC LIMIT :limit"
+```
+
+> [!NOTE]
+> Search table functions (`text_search`, `vector_search`, `rrf`) do not accept parameters as arguments yet (#15046). Until that is fixed, a pipeline can use parameters only in other positions, for example in `WHERE` and `LIMIT`.
 
 ### Running Text-to-SQL tests
 
@@ -362,6 +396,10 @@ The spicepods in `test/spicepods/cold_start/` read a synthetic Delta Lake table 
 `testoperator dispatch <dir> --workflow <workflow>` dispatches one GitHub Actions run per test in the configs under `dir`; `.github/workflows/testoperator_dispatch.yml` runs it on a schedule over the configs in `dispatch/`. A config runs daily unless it sets `schedule: weekly`, which the configs whose source is a hosted service (Databricks, Snowflake, Oracle Cloud, BigQuery, Athena, Glue, DynamoDB, Azure Blob Storage, Spice Cloud) do, as do the source-to-accelerator checks described below. The daily run passes `--schedule daily` and the weekly run `--schedule weekly`; without `--schedule`, as in a manual dispatch, every config is dispatched.
 
 Each source is benchmarked federated, and each accelerator configuration once, from the suite's canonical source: `file[parquet]` for TPC-H and TPC-DS, `s3[parquet]` for ClickBench. An accelerated benchmark measures the accelerator once the data is loaded, so re-running the same accelerator in front of another source repeats a measurement the canonical config already makes, while the source itself is covered by its federated config. An accelerated config from another source belongs in `dispatch/` only when it exercises something that source alone provides, such as `mongodb-duckdb[file]-changes`, which loads through MongoDB change streams. The one other exception is a load into an accelerator whose values no other automated test checks. `mysql-arrow`, `mysql-duckdb[file]` and `databricks[delta_lake]-duckdb[file]` in TPC-H and `spicecloud-duckdb[file]` in TPC-DS keep a validated `bench` for that, on the weekly schedule, without the throughput and load runs.
+
+A `bench` test can set `layout` (one) or `layouts` (a list, one run each) to run its spicepod under an acceleration layout: `testoperator --layout primary_key,indexes,sort` configures those features on every accelerated dataset before `spiced` starts, on each benchmark table's columns in `crates/test-framework/src/layout/` — its unique key, the columns the benchmark joins and filters on, a sort or clustering order other than the generated one, its date column, and a partition expression. The features are `primary_key`, `indexes`, `sort` (`cayenne_sort_columns`, `on_refresh_sort_columns` or `arrow_sort_columns`), `cluster` (`cayenne_cluster_by`), `time_column` and `partition` (`partition_by`). A layout is refused rather than weakened: on an engine (or, for partitioning, a mode) that cannot take a feature, on a spicepod that already sets what it would configure, for Cayenne's `sort` with `cluster`, or when a feature would end up configured on no dataset. The `__test_reference.*` clones carry no acceleration, so `--validate` compares each layout with the same unaccelerated oracle. A layout run reports under its own test name, `<spicepod name>-layout[<features>]`, so its timings stay out of the default layout's metric series, and records no result or explain-plan snapshots: its plans legitimately differ, and `--validate` checks its answers. `testoperator run htap --layout` checks each layout against the source database with the HTAP gates instead. The `*-layouts.yaml` configs under `dispatch/{tpch,tpcds,clickbench}/sf1/accelerated/` run each engine's features alone and in the combinations that interact, and `dispatch/chbench/sf1-layouts/` runs CH-benCH's HTAP and validated bench under layouts each week.
+
+A `bench` test can also set `postgres_version`, which runs the bench workflow's local `postgres_tpch` source (TPC-H and TPC-DS at scale factor 1 or 10, and ClickBench's `s3[parquet]-postgres`) on one of the PostgreSQL release lines in `test/source_versions.json`, or `postgres_version: all` for one run on each of them. That file lists the release lines Spice supports and tests for each federated source database: LTS lines only, oldest first, so the newest is the default. Unset, a run uses the workflow's default line. `tpch/sf1/federated/postgres[catalog]-source_versions.yaml` and `tpcds/sf1/federated/postgres-source_versions.yaml` run their benchmark on every listed line each week. A CH-benCH `bench` takes `postgres_version` for its PostgreSQL source too, and an `htap` test takes `source_version`, a line of its spicepod's source (MySQL for a `mysql*` spicepod, otherwise PostgreSQL) or `all`: `dispatch/chbench/sf1-source-versions/` runs the SF1 PostgreSQL and MySQL Cayenne configs on every listed line each week, on runners that start the source in Docker (the in-cluster sources of `spiceai-dev-xlarge-runners` have fixed versions). The integration suite (`.github/workflows/integration.yml`) reads the same file: its `source-versions` job runs the tests that start a PostgreSQL, MySQL or MongoDB container on every listed line but the newest, which the main run covers.
 
 The release branch the schedule also covers changes only when a fix is cherry-picked onto it, so it dispatches its whole suite once per `spiced` build: a daily run dispatches nothing for it when the build it selects, the newest commit on the branch with a built `spiced`, was already benchmarked by an earlier scheduled run. That record is a workflow artifact kept for 60 days, the repository's artifact-retention limit, so an unchanged build is benchmarked again once that long has passed since its last run. The first scheduled run that finds a build recorded re-runs, once, the failed jobs of every run that build's dispatch created, so a failure that does not reproduce on a second attempt does not stand until the next build. A run that was cancelled is not re-run. Until every first attempt has finished, the build stays unrecorded, and each scheduled run re-runs the first attempts that have failed since.
 

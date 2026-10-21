@@ -19,7 +19,7 @@ use super::{
 };
 use crate::datafusion::{DataFusion, error::find_datafusion_root, query::error_code::ErrorCode};
 use cache::{
-    EntryValidity, QueryResultsCacheProvider, RevalidationOutcome,
+    QueryResultsCacheProvider, RevalidationOutcome,
     key::{CacheKey, RawCacheKey},
     result::CacheStatus,
     result::query::CachedQueryResult,
@@ -184,7 +184,6 @@ impl KeyUse {
 /// An entry found under a request's key that may be served to it.
 pub(super) struct ServableEntry {
     cached_result: CachedQueryResult,
-    entry_validity: EntryValidity,
     cache_status: CacheStatus,
     /// Whether serving the entry must start a background revalidation.
     revalidate: bool,
@@ -200,7 +199,7 @@ enum StalePolicy {
     /// Past `item_ttl` is served stale and revalidated; past `item_ttl` plus
     /// this window is a miss.
     Window(std::time::Duration),
-    /// The request's `max-stale` has no value: serve however old the entry is.
+    /// The request's `max-stale` has no value: only the provider age cap applies.
     AnyAge,
 }
 
@@ -218,22 +217,36 @@ fn stale_policy(
     }
 }
 
+/// The oldest an entry may be and still be served to a request with `policy`:
+/// the request's own bound, never more than the cache's `max_servable_age`
+/// (`item_ttl + stale_while_revalidate_ttl`). A request's `max-stale` can only
+/// narrow what the cache serves.
+fn max_age_for(
+    policy: StalePolicy,
+    ttl: std::time::Duration,
+    max_servable_age: std::time::Duration,
+) -> std::time::Duration {
+    let requested = match policy {
+        StalePolicy::FreshOnly => ttl,
+        StalePolicy::Window(stale_duration) => ttl.saturating_add(stale_duration),
+        StalePolicy::AnyAge => max_servable_age,
+    };
+    requested.min(max_servable_age)
+}
+
 /// Whether TTL / stale-while-revalidate age still allows the entry to be
 /// served. Does not mutate; [`apply_age_eligibility`] records revalidation
-/// when a windowed entry is past `item_ttl` but still inside the window.
+/// when an entry is past `item_ttl` but still within its bound.
 fn age_is_eligible(
     entry: &ServableEntry,
     ttl: std::time::Duration,
+    max_servable_age: std::time::Duration,
     policy: StalePolicy,
     now: std::time::Instant,
 ) -> bool {
-    match policy {
-        StalePolicy::AnyAge => true,
-        StalePolicy::FreshOnly => !entry.cached_result.is_stale(ttl, now),
-        StalePolicy::Window(stale_duration) => !entry
-            .cached_result
-            .is_stale(ttl.saturating_add(stale_duration), now),
-    }
+    !entry
+        .cached_result
+        .is_stale(max_age_for(policy, ttl, max_servable_age), now)
 }
 
 /// Re-evaluate TTL / stale-while-revalidate age. Returns `false` when the
@@ -242,39 +255,22 @@ fn age_is_eligible(
 fn apply_age_eligibility(
     entry: &mut ServableEntry,
     ttl: std::time::Duration,
+    max_servable_age: std::time::Duration,
     policy: StalePolicy,
     now: std::time::Instant,
 ) -> bool {
-    match policy {
-        StalePolicy::AnyAge => true,
-        StalePolicy::FreshOnly => {
-            if age_is_eligible(entry, ttl, policy, now) {
-                true
-            } else {
-                tracing::debug!(
-                    "Cache entry is past `item_ttl` with no stale-while-revalidate window, treating as cache miss"
-                );
-                false
-            }
-        }
-        StalePolicy::Window(stale_duration) => {
-            if !age_is_eligible(entry, ttl, policy, now) {
-                let max_age = ttl.saturating_add(stale_duration);
-                tracing::debug!(
-                    "Cache entry is beyond stale-while-revalidate window (max_age: {max_age:?}), treating as cache miss"
-                );
-                return false;
-            }
-            if entry.cached_result.is_stale(ttl, now) {
-                tracing::debug!(
-                    "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
-                );
-                entry.cache_status = CacheStatus::CacheStaleWhileRevalidate;
-                entry.revalidate = true;
-            }
-            true
-        }
+    if !age_is_eligible(entry, ttl, max_servable_age, policy, now) {
+        tracing::debug!("Cache entry is past its eligible age, treating as cache miss");
+        return false;
     }
+    if !matches!(policy, StalePolicy::FreshOnly) && entry.cached_result.is_stale(ttl, now) {
+        tracing::debug!(
+            "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
+        );
+        entry.cache_status = CacheStatus::CacheStaleWhileRevalidate;
+        entry.revalidate = true;
+    }
+    true
 }
 
 /// Serve-time TTL and table-clock checks, without a second counted lookup
@@ -291,97 +287,55 @@ fn entry_still_servable(
     };
     let now = std::time::Instant::now();
     let policy = stale_policy(cache_control, provider.stale_while_revalidate_ttl());
-    if !age_is_eligible(entry, provider.ttl(), policy, now) {
+    if !age_is_eligible(
+        entry,
+        provider.ttl(),
+        provider.max_servable_age(),
+        policy,
+        now,
+    ) {
         return false;
     }
-    let validity = provider.entry_validity(
-        &entry.cached_result.input_tables,
-        entry.cached_result.read_started_at,
-        now,
-    );
-    !matches!(validity, EntryValidity::Invalidated)
+    !entry_tables_changed(entry, provider)
 }
 
 /// Looks `raw_key` up and decides whether the entry found may be served to a
 /// request with `cache_control`.
 ///
-/// An entry beyond the stale-while-revalidate window is not servable. One past
-/// its TTL, or whose tables changed after it read them, is served stale and
-/// marked for revalidation.
+/// An entry older than the request accepts (see [`max_age_for`]) is not
+/// servable, and the lookup counts it as a miss. One past its TTL is served
+/// stale and marked for revalidation.
 async fn find_servable_entry(
     cache_provider: &QueryResultsCacheProvider,
     cache_control: CacheControl,
     raw_key: &RawCacheKey,
 ) -> super::Result<Option<ServableEntry>> {
-    // `get_raw_key_with_validity`, not `get_raw_key`: this is the path that
-    // implements stale-while-revalidate, so it is the one that can serve an
-    // entry a table invalidation has marked stale and start the background
-    // revalidation replacing it, instead of taking the miss.
-    let (cached_result, entry_validity) =
-        match cache_provider.get_raw_key_with_validity(raw_key).await {
-            Ok(Some(hit)) => hit,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
-        };
-
-    // Determine cache status based on stale-while-revalidate configuration
-    let mut cache_status = CacheStatus::CacheHit;
-    let mut revalidate = false;
-
-    // Determine the effective stale-while-revalidate duration from either:
-    // 1. The request's max-stale directive (client explicitly willing to accept stale data)
-    // 2. The cache provider's stale_while_revalidate_ttl configuration (server-side policy)
-    let stale_duration = match cache_control {
-        CacheControl::MaxStale(_, Some(duration)) => Some(duration),
-        CacheControl::MaxStale(_, None) => None, // max-stale without value means accept any staleness
-        _ => cache_provider.stale_while_revalidate_ttl(),
+    let policy = stale_policy(cache_control, cache_provider.stale_while_revalidate_ttl());
+    // The request's own bound goes into the counted lookup, so an entry this
+    // request turns away is a miss there rather than a hit followed by a query.
+    let max_age = max_age_for(
+        policy,
+        cache_provider.ttl(),
+        cache_provider.max_servable_age(),
+    );
+    let cached_result = match cache_provider.get_raw_key_within(raw_key, max_age).await {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
     };
-
-    // Check if stale-while-revalidate is enabled (from request or cache provider config)
-    if let Some(stale_duration) = stale_duration {
-        let ttl = cache_provider.ttl();
-        let now = std::time::Instant::now();
-        let max_age = ttl + stale_duration;
-
-        // If beyond the stale-while-revalidate window, treat as cache miss
-        if cached_result.is_stale(max_age, now) {
-            tracing::debug!(
-                "Cache entry is beyond stale-while-revalidate window (max_age: {:?}), treating as cache miss",
-                max_age
-            );
-            return Ok(None);
-        }
-
-        // If stale (beyond TTL but within stale-while-revalidate window), trigger background revalidation
-        if cached_result.is_stale(ttl, now) {
-            tracing::debug!(
-                "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
-            );
-            cache_status = CacheStatus::CacheStaleWhileRevalidate;
-            revalidate = true;
-        }
-    }
-
-    // An accelerated refresh, or DML, landing after this entry read its
-    // tables leaves the entry resident but stale rather than evicting it
-    // whenever `stale_while_revalidate_ttl` is configured — see
-    // `QueryResultsCacheProvider::entry_validity`. Serving it here, and
-    // revalidating behind it, is what keeps a refresh from turning every
-    // dependent entry into a synchronous miss on the same tick.
-    if entry_validity == EntryValidity::StaleWhileRevalidate {
-        tracing::debug!(
-            "A table this cache entry read was refreshed, serving it stale and triggering background revalidation"
-        );
-        cache_status = CacheStatus::CacheStaleWhileRevalidate;
-        revalidate = true;
-    }
-
-    Ok(Some(ServableEntry {
+    let mut entry = ServableEntry {
         cached_result,
-        entry_validity,
-        cache_status,
-        revalidate,
-    }))
+        cache_status: CacheStatus::CacheHit,
+        revalidate: false,
+    };
+    Ok(apply_age_eligibility(
+        &mut entry,
+        cache_provider.ttl(),
+        cache_provider.max_servable_age(),
+        policy,
+        std::time::Instant::now(),
+    )
+    .then_some(entry))
 }
 
 /// How serving a servable entry ended.
@@ -686,7 +640,7 @@ impl Query {
         parameters: Option<ParamValues>,
     ) -> super::Result<LogicalPlan> {
         let plan = match df
-            .get_or_create_logical_plan(session, sql_raw_cache_key, sql)
+            .get_or_create_logical_plan(session, sql_raw_cache_key, sql, parameters.as_ref())
             .await
         {
             Ok(plan) => plan,
@@ -710,13 +664,14 @@ impl Query {
     /// The key a cached [`LogicalPlan`] lives under: the SQL text and the
     /// cache namespace, never the parameter values bound into it.
     ///
-    /// [`DataFusion::create_logical_plan`] is never given the parameters — it
-    /// plans the placeholders, and [`Self::get_plan`] binds the values into the
-    /// plan it hands back — so one SQL text has exactly one plan whatever is
-    /// bound into it. Mixing the values into this key gives every value tuple
-    /// its own entry, which makes a parameterized query, the case the cache
-    /// exists for, a guaranteed miss, and evicts unrelated plans while it does
-    /// so. The values do key the *results*, which are keyed separately on
+    /// Plans keep their placeholders, and [`Self::get_plan`] binds the values
+    /// into the plan it hands back, so one SQL text has exactly one plan
+    /// whatever is bound into it. (Placeholders in table-function arguments are
+    /// substituted before planning instead, and those plans are never cached.)
+    /// Mixing the values into this key gives every value tuple its own entry,
+    /// which makes a parameterized query, the case the cache exists for, a
+    /// guaranteed miss, and evicts unrelated plans while it does so. The values
+    /// do key the *results*, which are keyed separately on
     /// `CacheKey::Query(sql, parameters)` or on the bound
     /// [`CacheKey::LogicalPlan`].
     ///
@@ -962,19 +917,12 @@ impl Query {
     }
 }
 
-/// Re-read the table-change clock immediately before serving a probed hit.
-/// Returns `false` when the entry must not be served.
-fn apply_serve_time_table_clock(entry: &mut ServableEntry, validity: EntryValidity) -> bool {
-    match validity {
-        EntryValidity::Invalidated => false,
-        EntryValidity::StaleWhileRevalidate => {
-            entry.entry_validity = EntryValidity::StaleWhileRevalidate;
-            entry.revalidate = true;
-            entry.cache_status = CacheStatus::CacheStaleWhileRevalidate;
-            true
-        }
-        EntryValidity::Valid => true,
-    }
+/// Checks whether a client write, reload or unload disqualifies this read.
+fn entry_tables_changed(entry: &ServableEntry, provider: &QueryResultsCacheProvider) -> bool {
+    provider.tables_changed_since(
+        &entry.cached_result.input_tables,
+        entry.cached_result.read_started_at,
+    )
 }
 
 /// Cache keys with a stale-while-revalidate background revalidation pending or
@@ -1078,8 +1026,8 @@ impl Query {
 
         // A hit too large to decode in place hops onto the query runtime after
         // the probe. Recheck TTL/SWR age and the table-change clock at serve
-        // time so an entry that waited past `item_ttl` (or past a refresh/DML)
-        // is not served as fresh. In-place hits are sequential on this task;
+        // time so an entry that waited past `item_ttl` (or past a client write)
+        // is not served. In-place hits are sequential on this task;
         // the check is the same and cheap. This is not a second cache lookup.
         if let Some(provider) = self.df.results_cache_provider() {
             let now = std::time::Instant::now();
@@ -1087,15 +1035,16 @@ impl Query {
                 request_context.cache_control(),
                 provider.stale_while_revalidate_ttl(),
             );
-            if !apply_age_eligibility(&mut entry, provider.ttl(), policy, now) {
+            if !apply_age_eligibility(
+                &mut entry,
+                provider.ttl(),
+                provider.max_servable_age(),
+                policy,
+                now,
+            ) {
                 return None;
             }
-            let validity = provider.entry_validity(
-                &entry.cached_result.input_tables,
-                entry.cached_result.read_started_at,
-                now,
-            );
-            if !apply_serve_time_table_clock(&mut entry, validity) {
+            if entry_tables_changed(&entry, &provider) {
                 return None;
             }
         }
@@ -1142,7 +1091,6 @@ impl Query {
     ) -> Served {
         let ServableEntry {
             cached_result,
-            entry_validity,
             cache_status,
             revalidate,
         } = entry;
@@ -1174,15 +1122,6 @@ impl Query {
                 return Served::Undecodable(tracker);
             }
         };
-
-        // Counted here rather than at the cache lookup: an entry the clock marked
-        // stale is still not *served* if the request's own `max-stale` is
-        // shorter than the configured window, or if it fails to decode. Both of
-        // those return a miss above, so recording earlier would overcount the
-        // refresh misses the window actually absorbed.
-        if entry_validity == EntryValidity::StaleWhileRevalidate {
-            cache::metrics::sql_results::INVALIDATION_STALE_HITS.add(1, &[]);
-        }
 
         // Duration and returned-output counters finish when this stream is
         // consumed, matching a miss. The batches are already in memory; the
@@ -1258,8 +1197,8 @@ impl Query {
     /// is found on the raw-SQL key before a plan exists. The revalidated entry
     /// must carry the same table set as the entry it replaces: the set is what
     /// [`cache::TabledCacheProvider::invalidate_for_table`] matches on, so an
-    /// entry stored with an empty set can never be evicted by an accelerated
-    /// refresh or by DML, and would be served stale until `item_ttl` expired.
+    /// entry stored with an empty set can never be evicted by a client write,
+    /// reload or unload, and would be served stale until `item_ttl` expired.
     ///
     /// `parameters` are the values the originating request bound. They matter
     /// only in the no-plan branch, which rebuilds the query from the SQL text:
@@ -1317,7 +1256,7 @@ impl Query {
             if !cache_provider.is_servable(&input_tables, revalidation_started_at) {
                 tracing::debug!(
                     cache_key = cache_key_u64,
-                    "An input table was invalidated during background revalidation and no stale-while-revalidate window could serve the result, discarding it"
+                    "Background revalidation result is invalidated or past its TTL and stale window, discarding it"
                 );
                 record_revalidation_outcome(RevalidationOutcome::InvalidatedMidFlight);
                 return;
@@ -1685,10 +1624,6 @@ mod tests {
         )
     }
 
-    fn dummy_servable_entry() -> ServableEntry {
-        dummy_servable_entry_cached_at(std::time::Instant::now())
-    }
-
     fn dummy_servable_entry_cached_at(cached_at: std::time::Instant) -> ServableEntry {
         dummy_servable_entry_for_tables(cached_at, HashSet::new())
     }
@@ -1705,7 +1640,6 @@ mod tests {
                 cached_at,
                 cached_at,
             ),
-            entry_validity: cache::EntryValidity::Valid,
             cache_status: CacheStatus::CacheHit,
             revalidate: false,
         }
@@ -1726,7 +1660,6 @@ mod tests {
                 cached_at,
                 None,
             ),
-            entry_validity: cache::EntryValidity::Valid,
             cache_status: CacheStatus::CacheHit,
             revalidate: false,
         }
@@ -1748,6 +1681,49 @@ mod tests {
     }
 
     #[test]
+    fn request_max_stale_cannot_exceed_provider_age_cap() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("1s".to_string()),
+                stale_while_revalidate_ttl: Some("1s".to_string()),
+                ..Default::default()
+            },
+            Box::new([]),
+        )
+        .expect("create a provider with a two-second age cap");
+        let now = std::time::Instant::now();
+        for directive in [
+            CacheControl::MaxStale(CacheKeyType::Default, Some(Duration::from_secs(5))),
+            CacheControl::MaxStale(CacheKeyType::Default, None),
+        ] {
+            let policy = stale_policy(directive, Some(Duration::from_secs(1)));
+            let mut expired =
+                dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(2_100)));
+            assert!(
+                !apply_age_eligibility(
+                    &mut expired,
+                    provider.ttl(),
+                    provider.max_servable_age(),
+                    policy,
+                    now
+                ),
+                "{directive:?} must not serve beyond the provider's two-second age cap"
+            );
+            let mut stale =
+                dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(1_500)));
+            assert!(apply_age_eligibility(
+                &mut stale,
+                provider.ttl(),
+                provider.max_servable_age(),
+                policy,
+                now
+            ));
+            assert_eq!(stale.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+            assert!(stale.revalidate);
+        }
+    }
+
+    #[test]
     fn a_probed_entry_past_item_ttl_is_not_served() {
         let now = std::time::Instant::now();
         let mut entry =
@@ -1756,6 +1732,7 @@ mod tests {
             !apply_age_eligibility(
                 &mut entry,
                 Duration::from_secs(1),
+                Duration::from_secs(2),
                 StalePolicy::FreshOnly,
                 now,
             ),
@@ -1770,6 +1747,7 @@ mod tests {
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::FreshOnly,
             now,
         ));
@@ -1785,6 +1763,7 @@ mod tests {
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::Window(Duration::from_secs(1)),
             now,
         ));
@@ -1800,6 +1779,7 @@ mod tests {
         assert!(!apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::Window(Duration::from_secs(1)),
             now,
         ));
@@ -1813,6 +1793,7 @@ mod tests {
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::AnyAge,
             now,
         ));
@@ -1845,26 +1826,6 @@ mod tests {
             ),
             StalePolicy::AnyAge
         );
-    }
-
-    #[test]
-    fn an_invalidated_probed_entry_is_not_served() {
-        let mut entry = dummy_servable_entry();
-        assert!(
-            !apply_serve_time_table_clock(&mut entry, cache::EntryValidity::Invalidated),
-            "a table-change invalidation after the probe must not be served"
-        );
-    }
-
-    #[test]
-    fn a_stale_probed_entry_is_marked_for_revalidation() {
-        let mut entry = dummy_servable_entry();
-        assert!(apply_serve_time_table_clock(
-            &mut entry,
-            cache::EntryValidity::StaleWhileRevalidate
-        ));
-        assert!(entry.revalidate);
-        assert_eq!(entry.cache_status, CacheStatus::CacheStaleWhileRevalidate);
     }
 
     #[tokio::test]
@@ -2201,6 +2162,151 @@ mod tests {
         assert_eq!(value, 1);
     }
 
+    /// [`run_i64_query`] as a request that keys the results cache the way
+    /// `key_type` configures it: by the logical plan, or by the SQL text, whose
+    /// hit is answered before the query is planned.
+    async fn run_i64_query_keyed(
+        df: &Arc<DataFusion>,
+        sql: &str,
+        key_type: spicepod::component::caching::CacheKeyType,
+    ) -> (CacheStatus, i64) {
+        let cache_key_type = if matches!(key_type, spicepod::component::caching::CacheKeyType::Sql)
+        {
+            CacheKeyType::Raw
+        } else {
+            CacheKeyType::Default
+        };
+        create_test_request_context(CacheControl::Cache(cache_key_type), None)
+            .scope(run_i64_query(df, sql, ResultsCacheMode::Default))
+            .await
+    }
+
+    /// Plans with volatile functions (`random()`, `uuid()`) or time functions
+    /// (`now()`, `current_date`) must never be served from, or stored in, the
+    /// results cache, under every cache key type. A deterministic control
+    /// query on the same runtime still hits.
+    #[tokio::test]
+    async fn test_results_cache_skips_non_deterministic_plans() {
+        for key_type in [
+            spicepod::component::caching::CacheKeyType::Plan,
+            spicepod::component::caching::CacheKeyType::Sql,
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+
+            for sql in [
+                "SELECT CAST(random() * 1000000000000 AS BIGINT)",
+                "SELECT CAST(length(uuid()) AS BIGINT) + CAST(random() * 1000000000000 AS BIGINT)",
+                "SELECT CAST(date_part('epoch', now()) * 1000000 AS BIGINT)",
+                "SELECT CAST(date_part('day', current_date) AS BIGINT)",
+            ] {
+                for _ in 0..2 {
+                    let (status, _) = run_i64_query_keyed(&df, sql, key_type).await;
+                    assert_eq!(
+                        status,
+                        CacheStatus::CacheDisabled,
+                        "{key_type:?}: non-deterministic query must not use the results cache: {sql}"
+                    );
+                }
+            }
+
+            let (status, _) = run_i64_query_keyed(&df, "SELECT 42", key_type).await;
+            assert_eq!(status, CacheStatus::CacheMiss, "{key_type:?}");
+            let (status, value) = run_i64_query_keyed(&df, "SELECT 42", key_type).await;
+            assert_eq!(status, CacheStatus::CacheHit, "{key_type:?}");
+            assert_eq!(value, 42);
+        }
+    }
+
+    /// Registers `name()`, a `from: sql` table function whose one `v` row is
+    /// drawn from `random()`, parsed from YAML in the shape a spicepod
+    /// declares it. `volatility: None` leaves the key out, so the declaration
+    /// takes the spicepod default (`volatile`).
+    async fn register_random_sql_table_function(
+        df: &DataFusion,
+        name: &str,
+        volatility: Option<&str>,
+    ) {
+        use runtime_datafusion_udfs::user_functions::{BuiltFunction, build_function};
+
+        let volatility = volatility.map_or_else(String::new, |v| format!("volatility: {v}\n"));
+        let decl: spicepod::component::function::Function = yaml::from_str(&format!(
+            "
+name: {name}
+from: sql
+kind: table
+{volatility}signature:
+  returns:
+    - {{ name: v, type: int64 }}
+body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
+"
+        ))
+        .expect("the function declaration should parse");
+        let BuiltFunction::Table(udtf) = build_function(&decl)
+            .await
+            .expect("the function should build")
+        else {
+            panic!("a `kind: table` declaration should build a table function");
+        };
+        df.ctx.register_udtf(name, udtf);
+    }
+
+    /// A SQL table function's body is planned only inside its provider's
+    /// `scan`, so the plan the results cache checks holds a `TableScan` of the
+    /// function and never the `random()` in its body. A table function not
+    /// declared `immutable` (the default is `volatile`) must never be served
+    /// from, or stored in, the results cache, whether the query scans it
+    /// directly or in a scalar subquery. The same body declared `immutable`
+    /// is still cached, so the declaration is what decides.
+    #[tokio::test]
+    async fn test_results_cache_skips_non_immutable_sql_table_functions() {
+        for key_type in [
+            spicepod::component::caching::CacheKeyType::Plan,
+            spicepod::component::caching::CacheKeyType::Sql,
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+            register_random_sql_table_function(&df, "default_rows", None).await;
+            register_random_sql_table_function(&df, "stable_rows", Some("stable")).await;
+            register_random_sql_table_function(&df, "immutable_rows", Some("immutable")).await;
+
+            for sql in [
+                "SELECT v FROM default_rows()",
+                "SELECT v FROM stable_rows()",
+                "SELECT (SELECT max(v) FROM default_rows())",
+            ] {
+                let (first_status, first) = run_i64_query_keyed(&df, sql, key_type).await;
+                let (second_status, second) = run_i64_query_keyed(&df, sql, key_type).await;
+                assert_eq!(
+                    (first_status, second_status),
+                    (CacheStatus::CacheDisabled, CacheStatus::CacheDisabled),
+                    "{key_type:?}: a non-immutable table function must not use the results cache: {sql}"
+                );
+                // Each run executes the body again. Two independent draws of
+                // `random() * 1e12` collide with probability about 1e-12.
+                assert_ne!(
+                    first, second,
+                    "{key_type:?}: the second run must not replay the first run's rows: {sql}"
+                );
+            }
+
+            let sql = "SELECT v FROM immutable_rows()";
+            let (status, first) = run_i64_query_keyed(&df, sql, key_type).await;
+            assert_eq!(status, CacheStatus::CacheMiss, "{key_type:?}");
+            let (status, second) = run_i64_query_keyed(&df, sql, key_type).await;
+            assert_eq!(status, CacheStatus::CacheHit, "{key_type:?}");
+            assert_eq!(first, second, "{key_type:?}");
+        }
+    }
+
     /// A one-row table whose value is the cache namespace of the request that
     /// planned the scan. It reads the namespace the way the caching accelerator
     /// scopes its rows: from the `RequestContext` that `Query::run_internal`
@@ -2451,11 +2557,7 @@ mod tests {
             "background revalidation never refreshed the cache entry"
         );
 
-        // The revalidated entry must still be tied to its input table. With a
-        // stale window configured the invalidation marks it stale rather than
-        // evicting it, so what proves the tie is the status moving off
-        // CacheHit: an entry that had lost its table set would match no
-        // invalidation at all and stay a plain hit.
+        // A mutation must hard-evict the revalidated entry by its input table.
         df.caching()
             .invalidate_for_table(TableReference::bare("swr_table"))
             .await
@@ -2466,24 +2568,18 @@ mod tests {
 
         assert_eq!(
             run_and_drain(df, request_context, SQL).await,
-            CacheStatus::CacheStaleWhileRevalidate,
-            "a revalidated entry must still be invalidated by a refresh of its input table"
+            CacheStatus::CacheMiss,
+            "a mutation must hard-evict a revalidated entry by its input table"
         );
     }
 
-    /// An accelerated refresh must not turn every dependent cached result into
-    /// a synchronous miss on the same tick. With `stale_while_revalidate_ttl`
-    /// configured, the invalidation marks dependent entries stale as of the
-    /// refresh instead of evicting them: the next hit on each key is served
-    /// from the previous result and starts the one background revalidation that
-    /// replaces it.
+    /// Refresh leaves a recent SQL result fresh until its read-start TTL expires.
     #[tokio::test]
-    async fn test_invalidation_serves_stale_while_revalidating_when_a_window_is_configured() {
+    async fn test_refresh_leaves_results_fresh_with_a_stale_window() {
         const SQL: &str = "SELECT count(*) FROM refreshed_table";
 
         let df = prepare_runtime(Some(SQLResultsCacheConfig {
-            // Long enough that nothing expires on the ordinary TTL, so only the
-            // invalidation can make an entry stale.
+            // Long enough that the result remains fresh during the refresh.
             item_ttl: Some("10m".to_string()),
             cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
             stale_while_revalidate_ttl: Some("5m".to_string()),
@@ -2505,7 +2601,7 @@ mod tests {
         );
 
         df.caching()
-            .invalidate_for_table(TableReference::bare("refreshed_table"))
+            .invalidate_for_refresh(TableReference::bare("refreshed_table"))
             .await
             .expect("invalidation should succeed");
         if let Some(cache_provider) = df.results_cache_provider() {
@@ -2514,32 +2610,12 @@ mod tests {
 
         assert_eq!(
             run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await,
-            CacheStatus::CacheStaleWhileRevalidate,
+            CacheStatus::CacheHit,
             "a refresh must leave the previous result servable rather than flushing it"
-        );
-
-        // The revalidation stores a result whose read began after the refresh,
-        // so the entry becomes a plain hit again. Poll for it rather than
-        // sleeping a fixed interval.
-        let mut revalidated = false;
-        for _ in 0..100 {
-            if run_and_drain(Arc::clone(&df), Arc::clone(&request_context), SQL).await
-                == CacheStatus::CacheHit
-            {
-                revalidated = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            revalidated,
-            "background revalidation never replaced the entry the refresh marked stale"
         );
     }
 
-    /// Without a stale window there is no staleness anyone has agreed to be
-    /// served, so a refresh stays a hard invalidation and the next query is a
-    /// miss.
+    /// A mutation hard-evicts results when no stale window is configured.
     #[tokio::test]
     async fn test_invalidation_stays_hard_without_a_stale_window() {
         const SQL: &str = "SELECT count(*) FROM evicted_table";
@@ -2575,7 +2651,7 @@ mod tests {
         assert_eq!(
             run_and_drain(df, request_context, SQL).await,
             CacheStatus::CacheMiss,
-            "with no stale window configured a refresh must still flush dependent results"
+            "a mutation flushes dependent results without a stale window"
         );
     }
 
@@ -2583,7 +2659,7 @@ mod tests {
     /// invalidated *while the revalidation was running*. The revalidation may
     /// have read the pre-invalidation snapshot, and because invalidation can
     /// only remove entries that already exist, storing the result afterwards
-    /// resurrects data the refresh (or DML) had just evicted.
+    /// resurrects data the mutation had evicted.
     ///
     /// Driving `cache_revalidation_result` directly makes the ordering
     /// deterministic; interleaving a spawned revalidation task with an
@@ -2605,7 +2681,7 @@ mod tests {
         // The revalidation begins its read here...
         let revalidation_started_at = std::time::Instant::now();
 
-        // ...and a refresh invalidates the table before the result is stored.
+        // ...and a mutation invalidates the table before the result is stored.
         df.caching()
             .invalidate_for_table(TableReference::bare("revalidated_table"))
             .await
@@ -2673,8 +2749,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
-    /// A table invalidated during every scan, as under CDC. Each scan returns
-    /// its sequence number.
+    /// A table hard-invalidated by a client mutation during every scan. Each
+    /// scan returns its sequence number.
     #[derive(Debug)]
     struct ChangesDuringEveryScan {
         name: TableReference,
@@ -2732,53 +2808,22 @@ mod tests {
             .expect("should register table");
     }
 
-    /// Regression test for #14686 through the full query path: with a stale
-    /// window, results overtaken by every change are served stale, never as a
-    /// hit, and background revalidation keeps advancing them.
+    /// Every hard invalidation rejects the in-flight result, even with a stale window.
     #[tokio::test]
-    async fn test_results_overtaken_by_every_change_are_served_stale_and_advance() {
+    async fn test_results_overtaken_by_every_change_are_not_cached_with_a_window() {
         const SQL: &str = "SELECT scan FROM changing_table";
-
         let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
         register_table_changing_during_every_scan(&df, "changing_table");
-        let request_context =
-            create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
-
-        let (status, first) = Arc::clone(&request_context)
-            .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
-            .await;
-        assert_eq!(status, CacheStatus::CacheMiss);
-
-        let (status, served) = Arc::clone(&request_context)
-            .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
-            .await;
-        assert_eq!(
-            (status, served),
-            (CacheStatus::CacheStaleWhileRevalidate, first),
-            "the first result must be stored and served stale, not dropped"
-        );
-
-        // Poll until the background revalidation replaces the first result.
-        let mut advanced = None;
-        for _ in 0..100 {
-            let (status, served) = Arc::clone(&request_context)
+        let context = create_test_request_context(CacheControl::Cache(CacheKeyType::Raw), None);
+        let mut previous = 0;
+        for _ in 0..3 {
+            let (status, value) = Arc::clone(&context)
                 .scope(run_i64_query(&df, SQL, ResultsCacheMode::Default))
                 .await;
-            assert_eq!(
-                status,
-                CacheStatus::CacheStaleWhileRevalidate,
-                "a result overtaken by a change must never be served as a fresh hit"
-            );
-            if served > first {
-                advanced = Some(served);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(status, CacheStatus::CacheMiss);
+            assert!(value > previous);
+            previous = value;
         }
-        assert!(
-            advanced.is_some(),
-            "background revalidation never replaced the first result; it was discarded because the table changed while it ran"
-        );
     }
 
     /// Without a stale window, nothing is cached and every request runs.
@@ -2814,88 +2859,45 @@ mod tests {
         (schema, batch)
     }
 
-    /// Regression test for #14686: each revalidation overtaken by a change
-    /// replaces the older stale entry, and an older one never replaces a newer.
+    /// Hard invalidations reject revalidation results that began before the change.
     #[tokio::test]
-    async fn test_swr_revalidation_advances_a_stale_entry_under_continuous_changes() {
+    async fn test_swr_revalidation_rejects_results_under_continuous_changes() {
         let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
-        let cache_provider = df
+        let provider = df
             .results_cache_provider()
-            .expect("results cache should be configured");
+            .expect("results cache configured");
         let (schema, batch) = one_row_batch();
         let table = TableReference::bare("cdc_table");
         let tables = Arc::new(HashSet::from([table.clone()]));
         let key = RawCacheKey::new(44);
-
-        let mut reads = Vec::new();
         for _ in 0..3 {
-            tick().await;
-            let revalidation_started_at = std::time::Instant::now();
+            let read = std::time::Instant::now();
             df.caching()
                 .invalidate_for_table(table.clone())
                 .await
-                .expect("invalidation should succeed");
+                .expect("invalidate table");
             Query::cache_revalidation_result(
                 &df,
                 &key,
                 vec![batch.clone()],
                 Arc::clone(&schema),
                 Arc::clone(&tables),
-                revalidation_started_at,
+                read,
                 None,
             )
             .await;
-            cache_provider.run_pending_tasks().await;
-
-            let (entry, validity) = cache_provider
-                .get_raw_key_with_validity(&key)
-                .await
-                .expect("cache access should succeed")
-                .expect("servable inside the window");
-            assert_eq!(validity, cache::EntryValidity::StaleWhileRevalidate);
-            assert_eq!(
-                entry.read_started_at, revalidation_started_at,
-                "each revalidation must replace the older entry"
-            );
             assert!(
-                cache_provider
+                provider
                     .get_raw_key(&key)
                     .await
-                    .expect("cache access should succeed")
-                    .is_none(),
-                "a result overtaken by a change must never be served as fresh"
+                    .expect("lookup result")
+                    .is_none()
             );
-            reads.push(revalidation_started_at);
         }
-
-        // An older revalidation must not replace the newest result.
-        let straggler_started_at = reads[0];
-        Query::cache_revalidation_result(
-            &df,
-            &key,
-            vec![batch],
-            schema,
-            tables,
-            straggler_started_at,
-            None,
-        )
-        .await;
-        cache_provider.run_pending_tasks().await;
-        let (entry, _) = cache_provider
-            .get_raw_key_with_validity(&key)
-            .await
-            .expect("cache access should succeed")
-            .expect("servable inside the window");
-        assert_eq!(
-            Some(&entry.read_started_at),
-            reads.last(),
-            "an older revalidation must not replace a newer result"
-        );
     }
 
-    /// Both revalidations are still fresh — no table change — so this is the
-    /// admission that used an unconditional insert. The later resident must
-    /// stay.
+    /// With no table change, both revalidations are eligible for storage.
+    /// A result from an older read must preserve the later resident.
     #[tokio::test]
     async fn test_swr_revalidation_keeps_a_newer_fresh_resident() {
         let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
@@ -2923,8 +2925,8 @@ mod tests {
         Query::cache_revalidation_result(&df, &key, vec![batch], schema, tables, older, None).await;
         cache_provider.run_pending_tasks().await;
 
-        let (entry, validity) = cache_provider
-            .get_raw_key_with_validity(&key)
+        let entry = cache_provider
+            .get_raw_key(&key)
             .await
             .expect("cache access should succeed")
             .expect("the newer result must still be cached");
@@ -2932,7 +2934,7 @@ mod tests {
             entry.read_started_at, newer,
             "a fresh admission must not replace a resident that began reading later"
         );
-        assert_eq!(validity, cache::EntryValidity::Valid);
+        assert!(!cache_provider.tables_changed_since(&entry.input_tables, entry.read_started_at));
     }
 
     /// Reports a fixed [`MetricsSet`], standing in for an `HttpExec` whose

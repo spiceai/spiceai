@@ -22,7 +22,6 @@ use crate::cluster::partition::{
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
-use crate::status::ComponentStatus;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
@@ -65,6 +64,7 @@ use runtime_proto::{
     GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest, TaskCancelInfo,
 };
 use runtime_secrets::Secrets;
+use runtime_status::ComponentStatus;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -243,6 +243,11 @@ pub enum DistributedNode {
         /// This is populated during startup when the executor registers with the scheduler.
         /// It contains the list of partition filters (expressions) that this executor is responsible for.
         partition_assignments: Arc<RwLock<HashMap<ResolvedTableReference, Vec<Expr>>>>,
+
+        /// Held while an assignment change from any scheduler is applied, so
+        /// changes that arrive together on different schedulers' streams
+        /// apply one after another rather than overwrite each other.
+        assignment_updates: Arc<tokio::sync::Mutex<()>>,
 
         /// Shared map of per-scheduler outbound senders. Lets the runtime
         /// broadcast unsolicited messages (e.g. `PartitionsLoaded`) without
@@ -596,30 +601,28 @@ fn update_scheduler_pollers(
 pub(crate) mod accelerated_partition_provider;
 pub(crate) use runtime_cluster::cluster_state;
 mod composite_flight_service;
-mod control_stream_client;
 pub mod datafusion;
 mod heartbeat;
-pub mod metrics_collector;
 pub mod partition;
-pub mod pki;
 mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
-pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use control_stream_client::ControlStreamManager;
-pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
+pub use heartbeat::{SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
+pub use runtime_cluster::ControlStreamManager;
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
-pub use scheduler_registry::SchedulerPeers;
+// Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
+pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::start_scheduler_registry;
+pub use scheduler_registry::{SchedulerPeers, remote_scheduler_addresses};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 #[cfg(not(windows))]
 pub(crate) use service::discover_cayenne_tables;
@@ -636,7 +639,7 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 ///
 /// * All three pieces (server cert, client verifier, outbound
 ///   `ClientTlsConfig`) live in a single
-///   [`crate::cluster::pki::ClusterPkiBundle`] backed by one
+///   [`pki::ClusterPkiBundle`] backed by one
 ///   `ArcSwap<ClusterPkiSnapshot>`. When any of CA / cert / key change
 ///   on disk we re-parse and validate the **whole** bundle; if anything
 ///   is invalid the previous snapshot is kept (last-known-good).
@@ -672,7 +675,7 @@ struct ClusterTlsConfigInner {
     /// Atomic bundle of (server cert+key, client verifier, outbound
     /// `ClientTlsConfig`). All three rotate together via a single
     /// `ArcSwap` swap inside the bundle.
-    bundle: Arc<crate::cluster::pki::ClusterPkiBundle>,
+    bundle: Arc<pki::ClusterPkiBundle>,
     /// Drop-guard for the watcher. In the centralized path the binary
     /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
@@ -707,8 +710,8 @@ impl ClusterTlsConfig {
         // Build + register the atomic bundle. `try_new` performs the
         // initial parse + chain validation before returning, so any
         // bad starting state surfaces here as an `io::Error`.
-        let bundle = crate::cluster::pki::ClusterPkiBundle::try_new(
-            &crate::cluster::pki::ClusterPkiPaths {
+        let bundle = pki::ClusterPkiBundle::try_new(
+            &pki::ClusterPkiPaths {
                 ca: ca_path_buf.clone(),
                 cert: cert_path_buf.clone(),
                 key: key_path_buf.clone(),
@@ -769,10 +772,13 @@ impl ClusterTlsConfig {
     /// tests that introspect the bundle (e.g. fingerprint comparisons).
     #[must_use]
     #[doc(hidden)]
-    pub fn bundle_for_tests(&self) -> Arc<crate::cluster::pki::ClusterPkiBundle> {
+    pub fn bundle_for_tests(&self) -> Arc<pki::ClusterPkiBundle> {
         Arc::clone(&self.inner.bundle)
     }
 }
+
+/// Logged when a cluster node is started with `--allow-insecure-connections`.
+const INSECURE_CONNECTIONS_WARNING: &str = "Cluster connections are not authenticated or encrypted because `--allow-insecure-connections` is set. Use only on a trusted network for local development and testing. For secure clusters, create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>` and set the `--node-mtls-*` flags.";
 
 fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
@@ -793,6 +799,8 @@ pub struct ResolvedClusterConfig {
     scheduler_address_url: Option<Url>,
     /// Advertise address with port stripped (if present in the original input).
     node_advertise_host: Option<String>,
+    /// Instance identity set for this runtime instead of the process-wide one.
+    instance_id: Option<String>,
 }
 
 impl ResolvedClusterConfig {
@@ -861,20 +869,31 @@ impl ResolvedClusterConfig {
             let mut missing_flags = Vec::new();
 
             if tls_config.is_none() && !config.allow_insecure_connections {
-                missing_flags.push("--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file (or --allow-insecure-connections)");
+                missing_flags.push(
+                    "--node-mtls-ca-certificate-file, --node-mtls-certificate-file, --node-mtls-key-file",
+                );
             }
             if config.node_advertise_address.is_none() {
                 missing_flags.push("--node-advertise-address");
             }
 
             if !missing_flags.is_empty() {
+                let certificate_hint = if tls_config.is_none() {
+                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use `--allow-insecure-connections` for local development and testing."
+                } else {
+                    ""
+                };
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "Cluster mode requires the following flags: {}",
+                        "Cluster mode requires the following flags: {}.{certificate_hint}",
                         missing_flags.join(", ")
                     ),
                 ));
+            }
+
+            if tls_config.is_none() && config.allow_insecure_connections {
+                tracing::warn!("{INSECURE_CONNECTIONS_WARNING}");
             }
         }
 
@@ -949,7 +968,27 @@ impl ResolvedClusterConfig {
             scheduler_url,
             scheduler_address_url,
             node_advertise_host,
+            instance_id: None,
         })
+    }
+
+    /// Sets the instance identity of this runtime, for processes that run several
+    /// cluster nodes, such as integration tests.
+    #[must_use]
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = Some(instance_id.into());
+        self
+    }
+
+    /// The identity this node registers under in shared cluster state:
+    /// [`util::instance_id::instance_id`] unless set with [`Self::with_instance_id`].
+    /// Distinct from the advertise address, which is how other nodes reach it.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        match &self.instance_id {
+            Some(instance_id) => instance_id,
+            None => util::instance_id::instance_id(),
+        }
     }
 
     /// Returns the cluster role.
@@ -1212,6 +1251,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let self_ref = Arc::clone(rt);
         let cluster_state = rt.cluster_state();
         let heartbeats = rt.scheduler_heartbeats();
+        let scheduler_state = app.runtime.scheduler_state();
         let scheduler_registry_fut = self_for_task
             .start_runtime_task(
                 CLUSTER_SCHEDULER_REGISTRY,
@@ -1227,7 +1267,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     };
                     start_scheduler_registry(
                         self_ref,
-                        &config,
+                        scheduler_state.as_ref(),
                         registry_shutdown.clone(),
                         peers,
                         cluster_state,
@@ -1318,7 +1358,10 @@ pub async fn initialize_cluster_executor(
             (hostname, bind_addr.port())
         };
 
-    let executor_id = format!("{advertise_host}:{advertise_port}");
+    let executor_id = rt.df.cluster_config.instance_id().to_string();
+    // Tells the scheduler this process apart from an earlier run under the same
+    // id. A UUIDv7 sorts by creation time, so a later run's id compares greater.
+    let process_id = uuid::Uuid::now_v7().to_string();
 
     // Fetch the app definition from the scheduler to get temp_directory for the work_dir.
     // This ensures shuffle files are written to the configured directory.
@@ -1374,9 +1417,6 @@ pub async fn initialize_cluster_executor(
 
     // Resolve executor settings from the scheduler's app definition before the
     // executor Flight server starts.
-    if let Some(ref telemetry_config) = rt.telemetry_config {
-        let _ = telemetry_config.set(app_def.runtime.telemetry.clone());
-    }
     rt.rate_limits.set_flight_write_enabled(
         app_def
             .runtime
@@ -1583,6 +1623,7 @@ pub async fn initialize_cluster_executor(
     let available_task_slots_for_manager = Arc::clone(&available_task_slots);
 
     let control_stream_executor_id = executor_id.clone();
+    let control_stream_process_id = process_id.clone();
     let control_stream_ballista_id = executor_id.clone();
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
@@ -1599,7 +1640,7 @@ pub async fn initialize_cluster_executor(
 
     let partition_update_handler_rt = Arc::clone(&rt);
     let partition_update_handler: Option<
-        crate::cluster::control_stream_client::PartitionUpdateHandler,
+        runtime_cluster::control_stream_client::PartitionUpdateHandler,
     > = Some(Arc::new(move |new_partitions, removed_partitions| {
         let rt = Arc::clone(&partition_update_handler_rt);
         Box::pin(async move {
@@ -1611,7 +1652,7 @@ pub async fn initialize_cluster_executor(
 
     let refresh_dataset_handler_rt = Arc::clone(&rt);
     let refresh_dataset_handler: Option<
-        crate::cluster::control_stream_client::RefreshDatasetHandler,
+        runtime_cluster::control_stream_client::RefreshDatasetHandler,
     > = Some(Arc::new(move |dataset_name, overrides_json| {
         let rt = Arc::clone(&refresh_dataset_handler_rt);
         Box::pin(async move {
@@ -1650,6 +1691,7 @@ pub async fn initialize_cluster_executor(
         // Initialize control stream manager for metrics collection
         let mut control_stream_manager = ControlStreamManager::new(
             control_stream_executor_id,
+            control_stream_process_id,
             control_stream_ballista_id,
             control_stream_tls_config,
             control_stream_metrics_reader,
@@ -1783,6 +1825,8 @@ pub async fn initialize_cluster_executor(
                 match executor_request_initial_partitions(
                     cluster_client.clone(),
                     rt.datafusion().cluster_config.node_advertise_url(),
+                    rt.datafusion().cluster_config.instance_id().to_string(),
+                    process_id.clone(),
                     task_ctx.as_ref(),
                 )
                 .await
@@ -1822,6 +1866,15 @@ pub async fn initialize_cluster_executor(
             rt.datafusion().cluster_config.node_advertise_url(),
             initial_partitions.clone()
         );
+
+        // The scheduler that allocated the partitions now holds this executor's
+        // Flight endpoint. Every other scheduler, and each scheduler again after
+        // its control stream reconnects, gets it over the control stream.
+        if let Some(broadcaster) = rt.executor_outbound_broadcaster() {
+            broadcaster
+                .announce_flight_endpoint(rt.datafusion().cluster_config.node_advertise_url())
+                .await;
+        }
         rt.set_partition_assignments(initial_partitions).await;
 
         // Replay DDL statements from the scheduler to create tables/schemas
@@ -2143,7 +2196,7 @@ async fn create_scheduler_server(
     // a fibonacci backoff and keep retrying until it loads (warning periodically)
     // rather than giving up — when a state location is configured we must honor it,
     // not silently degrade to in-memory.
-    let scheduler_cfg = {
+    let scheduler_state = {
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(None)
             .build();
@@ -2156,7 +2209,7 @@ async fn create_scheduler_server(
         tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
-                break app.runtime.resolved_scheduler();
+                break app.runtime.scheduler_state();
             }
             if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
                 tracing::warn!(
@@ -2180,39 +2233,31 @@ async fn create_scheduler_server(
             }
         }
     };
-    let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
-        if let Some(state_location) = scheduler_cfg.state_location.as_deref() {
-            tracing::info!(
-                state_location = %state_location,
-                "Scheduler using shared object-store job state"
-            );
-            let (store, base_prefix) =
-                scheduler_registry::build_object_store(rt.as_ref(), state_location, &scheduler_cfg)
-                    .await
-                    .map_err(|e| crate::Error::FailedToStartClusterScheduler {
-                        source: Box::new(e),
-                    })?;
-            let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
-                SpiceLogicalCodec::new_codec(),
-                SpicePhysicalCodec::new(Arc::clone(rt))
-                    .boxed()
-                    .context(FailedToStartClusterSchedulerSnafu)?,
-            );
-            Arc::new(shared_job_state::SharedJobState::new(
-                metrics_node_id,
-                store,
-                base_prefix,
-                codec,
-                session_builder,
-                config_producer,
-            ))
-        } else {
-            Arc::new(InMemoryJobState::new(
-                metrics_node_id,
-                session_builder,
-                config_producer,
-            ))
-        }
+    let job_state: Arc<dyn JobState> = if let Some(scheduler_state) = scheduler_state {
+        tracing::info!(
+            state_location = %scheduler_state.location,
+            "Scheduler using shared object-store job state"
+        );
+        let (store, base_prefix) =
+            scheduler_registry::build_object_store(rt.as_ref(), &scheduler_state)
+                .await
+                .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+                    source: Box::new(e),
+                })?;
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+            SpiceLogicalCodec::new_codec(),
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        );
+        Arc::new(runtime_cluster::shared_job_state::SharedJobState::new(
+            metrics_node_id,
+            store,
+            base_prefix,
+            codec,
+            session_builder,
+            config_producer,
+        ))
     } else {
         Arc::new(InMemoryJobState::new(
             metrics_node_id,
@@ -2356,22 +2401,21 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
         &self,
         executor_id: &str,
         key: &str,
-    ) -> Result<secrecy::SecretString, String> {
+    ) -> Result<Option<secrecy::SecretString>, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
         };
 
-        let response = self
-            .client
-            .clone()
-            .expand_secret(request)
-            .await
-            .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
-
-        // Wrap at the earliest point we own the plaintext so downstream code
-        // cannot accidentally stash it in a non-zeroizing buffer.
-        Ok(secrecy::SecretString::from(response.into_inner().value))
+        match self.client.clone().expand_secret(request).await {
+            // Wrap at the earliest point we own the plaintext so downstream code
+            // cannot accidentally stash it in a non-zeroizing buffer.
+            Ok(response) => Ok(Some(secrecy::SecretString::from(
+                response.into_inner().value,
+            ))),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(format!("Failed to expand secret from scheduler: {status}")),
+        }
     }
 }
 
@@ -2395,6 +2439,14 @@ async fn executor_bind_app(
     };
 
     let grpc_client = ClusterGrpcClientConfig::from_params(&app_def.runtime.params);
+    let telemetry = app_def.runtime.telemetry.clone();
+    rt.df.set_runtime_state_location(
+        app_def
+            .runtime
+            .state
+            .as_ref()
+            .map(|state| state.location.clone()),
+    );
     *rt.app.write().await = Some(app_def);
 
     // Create a cluster client for secrets. This channel outlives every secret
@@ -2405,6 +2457,14 @@ async fn executor_bind_app(
 
     let expander = Box::new(ClusterSecretExpanderImpl::new(secrets_cluster_client));
     *rt.secrets.write().await = Secrets::new_for_cluster_executor(expander, executor_id);
+
+    // Published once the scheduler's secrets are bound, which the log exporter
+    // resolves its header templates through, and before the components below
+    // load: a catalog that cannot be reached retries for as long as it takes,
+    // and the executor's log should reach the endpoint while it does.
+    if let Some(ref telemetry_config) = rt.telemetry_config {
+        let _ = telemetry_config.set(telemetry);
+    }
 
     // Task history is created by `load_components` on a normal bring-up, but
     // Fix B Ready/slots gate on this bind path — and the test harness skips
@@ -2592,6 +2652,64 @@ mod tests {
         CapturedX509Certificate, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, Sign, Signer,
         X509Certificate,
     };
+
+    #[test]
+    fn cluster_roles_require_cluster_mtls_files() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole};
+
+        let advertised = || ClusterConfig {
+            node_advertise_address: Some("127.0.0.1".to_string()),
+            ..ClusterConfig::default()
+        };
+        for (node, config) in [
+            ("scheduler", advertised().with_role(ClusterRole::Scheduler)),
+            ("executor", advertised().with_role(ClusterRole::Executor)),
+            (
+                "executor implied by --scheduler-address",
+                ClusterConfig {
+                    scheduler_address: Some("https://127.0.0.1:50052".to_string()),
+                    ..advertised()
+                },
+            ),
+        ] {
+            let Err(err) = ResolvedClusterConfig::try_new(config) else {
+                panic!("a {node} without cluster mTLS files must not start");
+            };
+            assert_eq!(
+                err.to_string(),
+                "Cluster mode requires the following flags: --node-mtls-ca-certificate-file, \
+                 --node-mtls-certificate-file, --node-mtls-key-file. Create cluster certificates \
+                 with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use \
+                 `--allow-insecure-connections` for local development and testing.",
+                "{node}"
+            );
+        }
+    }
+
+    /// Local development nodes can explicitly opt out of cluster mTLS.
+    #[test]
+    fn insecure_connections_flag_starts_a_node_without_mtls() {
+        use super::ResolvedClusterConfig;
+        use crate::config::{ClusterConfig, ClusterRole};
+        use clap::Parser;
+
+        let config = ClusterConfig::try_parse_from([
+            "spiced",
+            "--role",
+            "scheduler",
+            "--node-advertise-address",
+            "127.0.0.1",
+            "--allow-insecure-connections",
+        ])
+        .expect("--allow-insecure-connections should parse");
+        assert!(config.allow_insecure_connections);
+        assert_eq!(config.role, Some(ClusterRole::Scheduler));
+
+        let resolved = ResolvedClusterConfig::try_new(config)
+            .expect("a node started with the insecure flag should start");
+        assert!(!resolved.tls_enabled());
+    }
 
     #[test]
     fn cluster_grpc_client_config_from_params() {

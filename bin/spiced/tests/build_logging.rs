@@ -83,6 +83,7 @@ impl<'a> MakeWriter<'a> for ProbeWriter {
 
 #[tokio::test]
 async fn build_time_warnings_reach_the_installed_subscriber() {
+    crate::require_process_per_test("this test installs the process-global tracing subscriber");
     let probe = ProbeWriter::default();
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(
@@ -118,13 +119,15 @@ async fn build_time_warnings_reach_the_installed_subscriber() {
 #[test]
 fn a_spiced_process_prints_what_the_runtime_build_emits() {
     let dir = tempfile::tempdir().expect("creates the spicepod directory");
+    let stderr_log = dir.path().join("spiced.stderr.log");
+    let stderr = std::fs::File::create(&stderr_log).expect("creates the stderr log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_spiced"))
         .arg(spicepod_dir(&dir))
         .args(["--http", &unused_local_addr().to_string()])
         .args(["--flight", &unused_local_addr().to_string()])
         .args(["--metrics", &unused_local_addr().to_string()])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .expect("start spiced");
 
@@ -159,12 +162,20 @@ fn a_spiced_process_prints_what_the_runtime_build_emits() {
         }
     };
 
-    child.kill().expect("stop spiced");
-    child.wait().expect("reap spiced");
+    // Polled before the kill, which would otherwise be the only status seen:
+    // a `spiced` that already ended says how (an exit code, or a signal).
+    let state = if let Some(status) = child.try_wait().expect("poll spiced") {
+        format!("exited: {status}")
+    } else {
+        child.kill().expect("stop spiced");
+        child.wait().expect("reap spiced");
+        "was still running".to_string()
+    };
 
     assert!(
         found,
-        "spiced printed nothing from the runtime build, got:\n{}",
-        printed.join("\n")
+        "spiced printed nothing from the runtime build; spiced {state}\nspiced stdout:\n{}\nspiced stderr:\n{}",
+        printed.join("\n"),
+        std::fs::read_to_string(&stderr_log).unwrap_or_default()
     );
 }

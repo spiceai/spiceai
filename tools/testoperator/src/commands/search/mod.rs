@@ -14,25 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod dataset;
 mod harness;
-mod mteb;
-use self::dataset::SearchDataset;
+mod per_query;
+mod spicepod;
+use self::spicepod::BenchmarkDataset;
 use super::{duration_millis_between, get_app_and_start_request};
-use crate::{args::SearchTestArgs, health::HealthMonitor};
+use crate::{
+    args::{SearchTestArgs, SqlPipelineArg},
+    health::HealthMonitor,
+};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use test_framework::{
-    TestType, anyhow,
-    app::App,
-    git,
+    TestType, anyhow, git,
     metrics::{MetricCollector, QueryMetrics},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
     spicetest::{
         SpiceTest,
-        search::{NotStarted, RetrievalMetrics, SearchRunMetric},
+        search::{NotStarted, RetrievalMetrics, SearchMethod, SearchRunMetric, SqlPipeline},
     },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
@@ -41,22 +42,11 @@ use test_framework::{
 use tokio::time::sleep;
 
 pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
-    let dataset = SearchDataset::from(args.benchmark_dataset);
+    // The spicepod loads its own data; the run only needs the tables it queries and the label.
+    let benchmark_dataset = BenchmarkDataset::from_spicepod_file(&args.common.spicepod_path)?;
+    let search_method = load_search_method(args.sql_pipeline.as_ref())?;
     let (app, start_request) = get_app_and_start_request(&args.common).await?;
-
-    if matches!(dataset, SearchDataset::Custom) {
-        validate_custom_spicepod(&app)?;
-    }
-
-    dataset
-        .prepare(
-            &args
-                .common
-                .data_dir
-                .clone()
-                .unwrap_or(start_request.get_tempdir_path()),
-        )
-        .await?;
+    spicepod::validate_required_tables(&app)?;
 
     let started_at = Instant::now();
 
@@ -85,9 +75,13 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
         KeyValue::new("branch_name", git::get_branch_name()),
         KeyValue::new("config_name", app.name.clone()),
-        KeyValue::new("benchmark_dataset", dataset.name()),
+        KeyValue::new("benchmark_dataset", benchmark_dataset.as_str().to_string()),
+        KeyValue::new("search_method", search_method.name()),
     ];
-    search_attributes.extend(search_dataset_attributes(&app));
+    if let Some(sql_pipeline) = &args.sql_pipeline {
+        search_attributes.push(KeyValue::new("sql_pipeline", sql_pipeline.name()));
+    }
+    search_attributes.extend(spicepod::corpus_attributes(&app));
 
     let search_resource = Resource::builder_empty()
         .with_attributes(search_attributes)
@@ -103,14 +97,14 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     // Allow Spicepod traces to be fully printed before running the test
     sleep(Duration::from_millis(200)).await;
 
-    println!("Running search");
+    println!("Running search ({})", search_method.name());
 
-    let config = dataset
-        .init_search_config(&spiced_instance, Some(10))
-        .await?;
+    let config = harness::init_search_config(&spiced_instance, Some(10))
+        .await?
+        .with_method(search_method);
 
     // retrieve query relevance data
-    let qrels = dataset.query_relevance_data(&spiced_instance).await?;
+    let qrels = harness::get_query_relevance_data(&spiced_instance).await?;
 
     let search_started_at = Instant::now();
 
@@ -138,18 +132,15 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let p95 = test.get_p95_response_time_metric()?;
     let rps = test.get_rps_metric()?;
-    let retrieval_metrics_at_all_k = test
-        .calculate_search_score_metrics_at_all_k(&qrels, |results| {
-            dataset.transform_results(results)
-        })?;
+    let evaluation =
+        test.evaluate_search_results(&qrels, harness::transform_search_results_for_eval)?;
+    let retrieval_metrics_at_all_k = evaluation.mean_at_all_k();
 
     // Report the metric-vs-k curve, then pick the primary cutoff (k=10, matching MTEB; falling back
     // to the largest available k when fewer results were returned) for the fixed-schema run row.
     print_retrieval_metrics_table(&retrieval_metrics_at_all_k);
-    let retrieval_metrics = retrieval_metrics_at_all_k
-        .get(&10)
-        .or_else(|| retrieval_metrics_at_all_k.values().next_back())
-        .copied()
+    let (primary_k, retrieval_metrics) = per_query::primary_k(&evaluation)
+        .and_then(|k| evaluation.mean_at_k(k).map(|metrics| (k, metrics)))
         .ok_or_else(|| anyhow::anyhow!("No retrieval metrics were computed for any rank cutoff"))?;
 
     let metrics: QueryMetrics<_, _> =
@@ -195,6 +186,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         crate::metrics::SEARCH_MRR.record(metrics_at_k.mrr, &k_attr);
         crate::metrics::SEARCH_PRECISION.record(metrics_at_k.precision, &k_attr);
     }
+    per_query::record_metrics(&evaluation, primary_k)?;
     if let Some((max_memory, median_memory)) = memory_usage {
         crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
         crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
@@ -215,6 +207,29 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Gets the `--sql-pipeline` SQL, if set, before spiced starts so that an empty pipeline fails
+/// fast. Without the flag, the run uses `POST /v1/search`.
+fn load_search_method(sql_pipeline: Option<&SqlPipelineArg>) -> anyhow::Result<SearchMethod> {
+    let sql = match sql_pipeline {
+        None => return Ok(SearchMethod::SearchApi),
+        Some(SqlPipelineArg::Inline(sql)) => sql.clone(),
+        Some(SqlPipelineArg::File(path)) => {
+            let sql = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("Failed to read --sql-pipeline {}: {e}", path.display())
+            })?;
+            if sql.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "--sql-pipeline {} has no SQL",
+                    path.display()
+                ));
+            }
+            sql
+        }
+    };
+
+    Ok(SearchMethod::Sql(SqlPipeline::new(sql)))
+}
+
 /// Print the retrieval-quality metrics at every computed rank cutoff `k` as an aligned table.
 fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics>) {
     if metrics_by_k.is_empty() {
@@ -233,75 +248,4 @@ fn print_retrieval_metrics_table(metrics_by_k: &BTreeMap<usize, RetrievalMetrics
             metrics.ndcg, metrics.recall, metrics.mrr, metrics.precision
         );
     }
-}
-
-/// Fails fast with an actionable message when a custom run's spicepod is missing one of the fixed
-/// tables the harness queries. Each of `corpus`, `test_queries`, and `relevance_data` may be a
-/// dataset or a view. Without this check the run would fail later with a raw `table not found` from
-/// the harness SQL.
-fn validate_custom_spicepod(app: &App) -> anyhow::Result<()> {
-    let missing: Vec<&str> = ["corpus", "test_queries", "relevance_data"]
-        .into_iter()
-        .filter(|name| !spicepod_has_table(app, name))
-        .collect();
-
-    if !missing.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Failed to run custom search test ({}): spicepod is missing required table(s): {}. \
-            A custom search run (no --benchmark-dataset) must define `corpus`, `test_queries`, and \
-            `relevance_data` (each may be a dataset or a view). \
-            See: https://github.com/spiceai/spiceai/issues/12935",
-            app.name,
-            missing.join(", ")
-        ));
-    }
-
-    Ok(())
-}
-
-/// Whether the spicepod defines a table with `name` as either a dataset or a view.
-fn spicepod_has_table(app: &App, name: &str) -> bool {
-    app.datasets.iter().any(|ds| ds.name == name) || app.views.iter().any(|v| v.name == name)
-}
-
-fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {
-    let Some(ds) = app.datasets.iter().find(|ds| ds.name == "corpus") else {
-        return vec![];
-    };
-    let mut attributes = vec![];
-    if let Some(engine) = ds
-        .acceleration
-        .as_ref()
-        .map(|acc| acc.engine_name().to_string())
-    {
-        attributes.push(KeyValue::new("engine", engine));
-    }
-
-    if let Some(acc) = ds.acceleration.as_ref() {
-        attributes.push(KeyValue::new("engine_mode", acc.mode.to_string()));
-    }
-
-    let Some(text_col) = ds.columns.iter().find(|c| c.name == "text") else {
-        return attributes;
-    };
-
-    if let Some(embed) = text_col.embeddings.first()
-        && let Some(e) = app.embeddings.iter().find(|e| e.name == embed.model)
-    {
-        attributes.push(KeyValue::new("vector_search", "true"));
-        attributes.push(KeyValue::new("model", e.from.clone()));
-    } else {
-        attributes.push(KeyValue::new("vector_search", "false"));
-    }
-
-    attributes.push(KeyValue::new(
-        "full_text_search",
-        text_col
-            .full_text_search
-            .as_ref()
-            .is_some_and(|fts| fts.enabled)
-            .to_string(),
-    ));
-
-    attributes
 }

@@ -33,7 +33,7 @@ use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
 use rmcp::ErrorData as McpError;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,18 +43,20 @@ pub enum Error {
     #[snafu(display("Could not construct tool `{}`. Error: {}", name, e))]
     CouldNotConstructTool { name: String, e: String },
 
-    #[snafu(display("Invalid params 'mcp_args': '{}'.", args_str))]
-    InvalidMcpArgs { args_str: String },
+    #[snafu(display(
+        "Invalid param 'mcp_args': {source}. Quote arguments with spaces, e.g. `--flag \"a b\"`."
+    ))]
+    InvalidMcpArgs { source: shell_words::ParseError },
 
     #[snafu(display(
-        "Error occured in underlying communication to MCP tool. Error: {}",
+        "Error occurred in underlying communication to MCP tool. Error: {}",
         source
     ))]
     UnderlyingTransportError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[snafu(display(
-        "Error occured in initialization client connection with underlying MCP server. Error: {}",
+        "Error occurred in initialization client connection with underlying MCP server. Error: {}",
         source
     ))]
     UnderlyingInitilizationError { source: McpError },
@@ -84,6 +86,9 @@ pub(crate) fn task_name_for_exposed_tool(exposed_name: &str) -> String {
 }
 
 const MCP_AUTH_TOKEN_PARAM: &str = "mcp_auth_token";
+/// Custom HTTP headers, formatted `Name: Value` and delimited like the HTTP
+/// connector's `http_headers`. If the value contains `;`, only `;` separates
+/// headers (so values may contain `,`); otherwise `,` separates them.
 const MCP_HEADERS_PARAM: &str = "mcp_headers";
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -125,16 +130,17 @@ impl MCPConfig {
         mcp_type: &MCPType,
         params: &HashMap<String, SecretString>,
         env: &HashMap<String, SecretString>,
-    ) -> Self {
-        match mcp_type.clone() {
+    ) -> Result<Self> {
+        Ok(match mcp_type.clone() {
             MCPType::Stdio(command) => {
-                let args = params
-                    .get("mcp_args")
-                    .map(ExposeSecret::expose_secret)
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .map(ToString::to_string)
-                    .collect();
+                // Shell-word rules: quotes and backslash escapes group arguments.
+                let args = shell_words::split(
+                    params
+                        .get("mcp_args")
+                        .map(ExposeSecret::expose_secret)
+                        .unwrap_or_default(),
+                )
+                .context(InvalidMcpArgsSnafu)?;
 
                 let env = env
                     .iter()
@@ -157,7 +163,7 @@ impl MCPConfig {
                     headers,
                 }
             }
-        }
+        })
     }
 }
 
@@ -171,7 +177,8 @@ fn parse_custom_headers(
     let param_name = MCP_HEADERS_PARAM;
 
     // Same UX as the HTTP connector's `http_headers` parameter:
-    // `Header1: Value1, Header2: Value2` (or semicolon-delimited).
+    // `Header1: Value1, Header2: Value2` (or semicolon-delimited). Any `;`
+    // makes `;` the only delimiter.
     let headers_str = headers.expose_secret();
     let delimiter = if headers_str.contains(';') { ';' } else { ',' };
     for header in headers_str.split(delimiter) {
@@ -253,7 +260,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("FOO".to_string(), SecretString::from("bar"));
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &env);
+        let cfg = MCPConfig::from_type(&mcp_type, &params, &env).expect("valid MCP config");
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 assert_eq!(command, "docker");
@@ -268,7 +275,8 @@ mod tests {
     fn mcp_config_from_https_preserves_url() {
         let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
         let mcp_type = MCPType::StreamableHttp(url.clone());
-        let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new());
+        let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new())
+            .expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp {
                 url: u,
@@ -293,7 +301,8 @@ mod tests {
             SecretString::from("test-api-key"),
         );
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        let cfg =
+            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp {
                 auth_token,
@@ -320,7 +329,8 @@ mod tests {
             SecretString::from("X-API-Key: test-api-key, X-Tenant: acme"),
         );
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        let cfg =
+            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp { headers, .. } => {
                 assert_eq!(
@@ -354,7 +364,8 @@ mod tests {
             SecretString::from("Authorization: Basic abc, X-Tenant: acme"),
         );
 
-        let cfg = MCPConfig::from_type(&mcp_type, &params, &HashMap::new());
+        let cfg =
+            MCPConfig::from_type(&mcp_type, &params, &HashMap::new()).expect("valid MCP config");
         match cfg {
             MCPConfig::StreamableHttp { headers, .. } => {
                 assert!(!headers.contains_key(&AUTHORIZATION));

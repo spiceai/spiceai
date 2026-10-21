@@ -34,9 +34,14 @@ pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_wor
 /// Always emit this label. A listed object replaced mid-scan is
 /// `object_generation_changed` so it can be filtered without hiding genuine
 /// Parquet corruption (`parquet_decode`) or other refresh failures (`other`).
+/// A snapshot reader (`refresh_mode: snapshot`) reports why it could not advance:
+/// `snapshot_not_found` when none is published, `snapshot_older_than_loaded` when
+/// loading the published one would regress the dataset.
 pub const REFRESH_ERROR_REASON: &str = "reason";
 pub const REFRESH_ERROR_REASON_OBJECT_GENERATION_CHANGED: &str = "object_generation_changed";
 pub const REFRESH_ERROR_REASON_PARQUET_DECODE: &str = "parquet_decode";
+pub const REFRESH_ERROR_REASON_SNAPSHOT_NOT_FOUND: &str = "snapshot_not_found";
+pub const REFRESH_ERROR_REASON_SNAPSHOT_OLDER_THAN_LOADED: &str = "snapshot_older_than_loaded";
 pub const REFRESH_ERROR_REASON_OTHER: &str = "other";
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
@@ -52,6 +57,15 @@ pub static REFRESH_DATA_FETCHES_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(
     METER
         .u64_counter("dataset_acceleration_refresh_data_fetches_skipped")
         .with_description("Number of refresh data fetches skipped due to unchanged file metadata.")
+        .build()
+});
+
+pub static REFRESH_FALLBACKS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_fallbacks")
+        .with_description(
+            "Number of append refreshes that read by time instead of following the source's commits, by reason.",
+        )
         .build()
 });
 

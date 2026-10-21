@@ -14,7 +14,7 @@ limitations under the License.
 #![allow(clippy::borrowed_box)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::chat::{LocalModelOptions, PagedAttentionMode, message_to_mistral};
+use crate::chat::{LocalModelOptions, PagedAttentionMode, ReasoningDefault, message_to_mistral};
 use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
@@ -26,20 +26,22 @@ use async_openai::{
         ChatCompletionResponseStream, ChatCompletionStreamResponseDelta,
         ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionUsage,
         CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType, Role,
-        StopConfiguration, ToolChoiceAllowedMode, ToolChoiceOptions,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType,
+        ReasoningEffort, Role, StopConfiguration, ToolChoiceAllowedMode, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
+use either::Either;
 use futures::{Stream, TryStreamExt};
+use indexmap::IndexMap;
 use mistralrs::core::{
     AdapterPaths, AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice,
     AllowedToolsToolChoiceType, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder,
     GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
     MistralRsBuilder, ModelPaths, MultimodalLoaderBuilder, MultimodalLoaderType,
     MultimodalSpecificConfig, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig,
-    Pipeline, RequestMessage, TokenSource,
+    Pipeline, ReasoningEffort as TemplateReasoningEffort, RequestMessage, TokenSource,
 };
 use mistralrs::{
     ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
@@ -70,6 +72,10 @@ const LOCAL_LLM_MAX_SEQS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4);
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
     counter: AtomicUsize,
+    /// The Spicepod name a refused `reasoning_effort` names.
+    model_name: String,
+    /// What the chat template does with each `reasoning_effort` value.
+    reasoning_support: ReasoningSupport,
     /// RAII drop guard that keeps the per-node `RING_CONFIG` temp file alive for
     /// the model's lifetime (its `Drop` deletes the file on model teardown).
     /// `None` for single-node models. Never read directly.
@@ -100,6 +106,7 @@ impl MistralLlama {
             chat_template_literal,
             context_length,
             paged_attention,
+            reasoning,
         } = options;
         for weight in model_weights {
             if !weight.exists() {
@@ -189,7 +196,7 @@ impl MistralLlama {
             )?,
         };
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
+        Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path, reasoning).await
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -221,6 +228,7 @@ impl MistralLlama {
             adapter_paths: AdapterPaths::None,
             gen_conf: generation_config.map(PathBuf::from),
             preprocessor_config: None,
+            video_preprocessor_config: None,
             processor_config: None,
             chat_template_json_filename: None,
         })
@@ -246,7 +254,7 @@ impl MistralLlama {
         .build(None) // Infer loader type
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
         .load_model_from_path(
-            &paths,
+            &*paths,
             &ModelDType::Auto,
             device,
             true,
@@ -307,7 +315,7 @@ impl MistralLlama {
         )
         .build()
         .load_model_from_path(
-            &paths,
+            &*paths,
             &ModelDType::Auto,
             device,
             true,
@@ -339,7 +347,7 @@ impl MistralLlama {
         )
         .build()
         .load_model_from_path(
-            &paths,
+            &*paths,
             &ModelDType::Auto,
             device,
             true,
@@ -403,6 +411,10 @@ impl MistralLlama {
             if let Some(config) = cache_config {
                 return mistralrs::SchedulerConfig::PagedAttentionMeta {
                     max_num_seqs: LOCAL_LLM_MAX_SEQS.get(),
+                    max_num_batched_tokens: mistralrs_core::DEFAULT_MAX_NUM_BATCHED_TOKENS,
+                    max_prefill_chunk_tokens: mistralrs_core::DEFAULT_MAX_PREFILL_CHUNK_TOKENS,
+                    max_decode_steps_before_prefill:
+                        mistralrs_core::DEFAULT_MAX_DECODE_STEPS_BEFORE_PREFILL,
                     config,
                 };
             }
@@ -439,6 +451,7 @@ impl MistralLlama {
         gguf_filename: Option<PathBuf>,
         chat_template_literal: Option<&str>,
         ring_config_path: Option<tempfile::TempPath>,
+        reasoning: ReasoningDefault<'_>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         let chat_template = chat_template_literal.map(ToString::to_string);
@@ -531,22 +544,80 @@ impl MistralLlama {
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path).await)
+        Self::from_pipeline(pipeline, paged_attn_requested, ring_config_path, reasoning).await
     }
 
+    /// Starts the engine for a loaded pipeline. A `reasoning_effort` default that the chat
+    /// template can't honor fails here, so the model doesn't load to refuse every request.
     async fn from_pipeline(
         pipeline: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
         paged_attn_requested: bool,
         ring_config: Option<tempfile::TempPath>,
-    ) -> Self {
+        reasoning: ReasoningDefault<'_>,
+    ) -> Result<Self> {
+        let reasoning_support = Self::reasoning_support(&pipeline).await;
+        if let Some(effort) = reasoning.effort {
+            reasoning_controls(Some(effort), &reasoning_support, reasoning.model_name).map_err(
+                |message| ChatError::InvalidParamValueError {
+                    param: "reasoning_effort".to_string(),
+                    message,
+                },
+            )?;
+        }
+
         let scheduler_config = Self::scheduler_config(&pipeline, paged_attn_requested).await;
-        Self {
+        Ok(Self {
             pipeline: MistralRsBuilder::new(pipeline, scheduler_config, false, None)
                 .build()
                 .await,
             counter: AtomicUsize::new(0),
+            model_name: reasoning.model_name.to_string(),
+            reasoning_support,
             ring_config,
-        }
+        })
+    }
+
+    /// Renders the generation prompt of a one-message conversation once per reasoning
+    /// control, to learn what the chat template does with each. Rendering a large template
+    /// and tokenizing it is CPU work, so it runs off the async runtime.
+    async fn reasoning_support(
+        pipeline: &Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>,
+    ) -> ReasoningSupport {
+        let pipeline = Arc::clone(pipeline);
+        tokio::task::spawn_blocking(move || {
+            let pipeline = pipeline.blocking_lock();
+            let processor = pipeline.get_processor();
+            ReasoningSupport::from_renders(|enable_thinking, reasoning_effort| {
+                let message = IndexMap::from([
+                    ("role".to_string(), Either::Left("user".to_string())),
+                    ("content".to_string(), Either::Left("Hi".to_string())),
+                ]);
+                processor
+                    .process(
+                        &*pipeline,
+                        vec![message],
+                        true,
+                        false,
+                        enable_thinking,
+                        reasoning_effort,
+                        Vec::new(),
+                    )
+                    .map(|(_, prompt)| prompt)
+                    .inspect_err(|e| {
+                        tracing::debug!(
+                            "The chat template failed to render with enable_thinking {enable_thinking:?} and reasoning_effort {reasoning_effort:?}, so `reasoning_effort` is passed to it unchecked: {e}"
+                        );
+                    })
+                    .ok()
+            })
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(
+                "Checking the chat template's reasoning controls stopped, so `reasoning_effort` is passed to it unchecked: {e}"
+            );
+            ReasoningSupport::default()
+        })
     }
 
     // TODO: handle passing in [`SamplingParams`] from request.
@@ -562,10 +633,12 @@ impl MistralLlama {
         MistralRequest::Normal(Box::new(NormalRequest {
             messages: message,
             sampling_params: sampling.unwrap_or(SamplingParams::deterministic()),
+            seed: None,
             response: tx,
             return_logprobs: false,
             is_streaming,
             id: self.counter.fetch_add(1, Ordering::SeqCst),
+            queued_at: None,
             constraint: Constraint::None,
             suffix: None,
             web_search_options: None,
@@ -590,26 +663,53 @@ impl MistralLlama {
             session_id: None,
             files: None,
             input_files: Vec::new(),
+            adapter: None,
         }))
+    }
+
+    /// The reasoning controls to render `req` with, or an invalid-argument error when its
+    /// `reasoning_effort` asks for something this model's chat template can't do.
+    fn request_reasoning(
+        &self,
+        req: &CreateChatCompletionRequest,
+    ) -> Result<ReasoningControls, OpenAIError> {
+        reasoning_controls(
+            req.reasoning_effort.as_ref(),
+            &self.reasoning_support,
+            &self.model_name,
+        )
+        .map_err(OpenAIError::InvalidArgument)
+    }
+
+    /// The most tokens a completion may generate. `max_tokens` is the deprecated spelling
+    /// most clients still send; `max_completion_tokens` wins when both are set.
+    #[expect(deprecated)]
+    fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
+        req.max_completion_tokens
+            .or(req.max_tokens)
+            .map(|limit| limit as usize)
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
     ///
-    /// `tool_choice` is converted by the caller ([`convert_tool_choice`]) so a choice this
-    /// pipeline cannot enforce is refused as an invalid argument before anything is sent.
+    /// `tool_choice` and `reasoning` are converted by the caller ([`convert_tool_choice`],
+    /// [`reasoning_controls`]) so a value this pipeline cannot honor is refused as an invalid
+    /// argument before anything is sent.
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
         tool_choice: Option<ToolChoice>,
+        reasoning: ReasoningControls,
     ) -> Result<Receiver<MistralResponse>> {
+        let max_len = Self::completion_limit(&req);
         let message = RequestMessage::Chat {
             messages: req
                 .messages
                 .iter()
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
-            enable_thinking: None,
-            reasoning_effort: None,
+            enable_thinking: reasoning.enable_thinking,
+            reasoning_effort: reasoning.reasoning_effort,
         };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
@@ -627,7 +727,8 @@ impl MistralLlama {
                 StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
                 StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
-            max_len: req.max_completion_tokens.map(|x| x as usize),
+            ignore_eos: false,
+            max_len,
             logits_bias: None,
             n_choices: req.n.unwrap_or(1) as usize,
             dry_params: None,
@@ -772,14 +873,18 @@ impl Chat for MistralLlama {
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
-        let recver = self.send_message(req, tool_choice).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
+        let reasoning = self.request_reasoning(&req)?;
+        let recver = self
+            .send_message(req, tool_choice, reasoning)
+            .await
+            .map_err(|e| {
+                OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                })
+            })?;
         Ok(stream_from_response(recver))
     }
 
@@ -788,14 +893,18 @@ impl Chat for MistralLlama {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let tool_choice = request_tool_choice(&req)?;
-        let mut recver = self.send_message(req, tool_choice).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
+        let reasoning = self.request_reasoning(&req)?;
+        let mut recver = self
+            .send_message(req, tool_choice, reasoning)
+            .await
+            .map_err(|e| {
+                OpenAIError::ApiError(ApiError {
+                    message: e.to_string(),
+                    r#type: None,
+                    param: None,
+                    code: None,
+                })
+            })?;
         let Some(resp) = recver.recv().await else {
             return Err(OpenAIError::ApiError(ApiError {
                 message: "model pipeline unexpectedly closed".to_string(),
@@ -953,12 +1062,186 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
     })
 }
 
+/// Where a refused `reasoning_effort` points the caller.
+const REASONING_DOCS: &str = "https://spiceai.org/docs/components/models";
+
+/// The opening tag of a `<think>…</think>` reasoning block.
+const THINK_OPEN_TAG: &str = "<think>";
+
+/// The token Gemma 4 chat templates add to the prompt to turn reasoning on.
+const GEMMA_THINK_TOKEN: &str = "<|think|>";
+
+/// The levels a request can ask a chat template for, lowest first.
+const REASONING_LEVELS: [TemplateReasoningEffort; 4] = [
+    TemplateReasoningEffort::Low,
+    TemplateReasoningEffort::Medium,
+    TemplateReasoningEffort::High,
+    TemplateReasoningEffort::XHigh,
+];
+
+/// What a model's chat template does with `reasoning_effort`, learned by rendering its
+/// generation prompt once per value when the model loads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReasoningSupport {
+    /// Turning reasoning off can't stop the model reasoning: the prompt rendered with it off
+    /// still opens a reasoning block, as GLM-5.3's does, or matches the template's own
+    /// reasoning default, as gpt-oss's does by rendering `Reasoning: medium`.
+    always_reasons: bool,
+    /// The levels the template takes, lowest first. `None` when it takes every level alike,
+    /// as an on/off switch does.
+    levels: Option<Vec<TemplateReasoningEffort>>,
+}
+
+impl ReasoningSupport {
+    /// Classifies a chat template from `render`, which renders its generation prompt for an
+    /// `enable_thinking` and a level, or returns `None` when the template fails. A template
+    /// that fails to render with reasoning off or unset, or at every level, is left
+    /// unchecked, so requests reach it as they would without this check.
+    fn from_renders(
+        render: impl Fn(Option<bool>, Option<TemplateReasoningEffort>) -> Option<String>,
+    ) -> Self {
+        let (Some(off), Some(unset)) = (render(Some(false), None), render(None, None)) else {
+            return Self::default();
+        };
+        // A level the template fails to render at is one it refuses, as Qwen3.8-Flash-Next
+        // refuses `high`.
+        let renders: Vec<_> = REASONING_LEVELS
+            .iter()
+            .filter_map(|&level| render(None, Some(level)).map(|prompt| (level, prompt)))
+            .collect();
+        let Some((_, first)) = renders.first() else {
+            return Self::default();
+        };
+        let refuses_a_level = renders.len() < REASONING_LEVELS.len();
+        let distinguishes = renders.iter().any(|(_, prompt)| prompt != first);
+        // Off renders the template's default, and that default is one of its reasoning
+        // levels: the template has a reasoning control but no off switch. A template with no
+        // reasoning control at all renders the same prompt for everything, and doesn't reason.
+        let off_is_a_level = off == unset && renders.iter().any(|(_, prompt)| *prompt == unset);
+        // A template that names its levels takes those, and any level whose prompt is its own,
+        // unlike the default's and every other level's. GLM-5.3 renders `medium` and `xhigh`
+        // as its default, `Max`; Qwen3.8-Flash-Next takes `medium` without naming it. A
+        // template that names no level encodes levels its own way, and takes every level it
+        // renders.
+        let names_levels = renders
+            .iter()
+            .any(|(level, prompt)| names_level(prompt, *level));
+        let taken: Vec<_> = renders
+            .iter()
+            .filter(|(level, prompt)| {
+                !names_levels
+                    || names_level(prompt, *level)
+                    || (*prompt != unset
+                        && renders.iter().filter(|(_, other)| other == prompt).count() == 1)
+            })
+            .map(|(level, _)| *level)
+            .collect();
+        let restricts = (distinguishes && names_levels) || refuses_a_level;
+        Self {
+            always_reasons: opens_reasoning(&off) || (distinguishes && off_is_a_level),
+            levels: (restricts && !taken.is_empty()).then_some(taken),
+        }
+    }
+}
+
+/// Whether a rendered prompt starts the model inside a reasoning block, by the test
+/// `mistral.rs` applies to parse the reply: a prompt that ends in `<think>`, or one that
+/// carries Gemma 4's `<|think|>`.
+fn opens_reasoning(prompt: &str) -> bool {
+    prompt.trim_end().ends_with(THINK_OPEN_TAG) || prompt.contains(GEMMA_THINK_TOKEN)
+}
+
+/// Whether `prompt` names `level` as a whole word, ignoring case, as GLM-5.3 does with
+/// `Reasoning Effort: High`.
+fn names_level(prompt: &str, level: TemplateReasoningEffort) -> bool {
+    prompt
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case(level.as_str()))
+}
+
+/// The reasoning controls a chat template is rendered with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReasoningControls {
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<TemplateReasoningEffort>,
+}
+
+/// The controls for a request's `reasoning_effort`. Unset leaves both to the chat template,
+/// `none` turns reasoning off, and a level turns it on at that level. `minimal` asks for
+/// `low`, the least a template can be asked for. A value the template can't honor is
+/// refused with the message to show the caller.
+fn reasoning_controls(
+    effort: Option<&ReasoningEffort>,
+    support: &ReasoningSupport,
+    model: &str,
+) -> Result<ReasoningControls, String> {
+    let (requested, level) = match effort {
+        None => return Ok(ReasoningControls::default()),
+        Some(ReasoningEffort::None) if support.always_reasons => {
+            return Err(always_reasons_message(model, support));
+        }
+        Some(ReasoningEffort::None) => {
+            return Ok(ReasoningControls {
+                enable_thinking: Some(false),
+                reasoning_effort: None,
+            });
+        }
+        Some(ReasoningEffort::Minimal) => ("minimal", TemplateReasoningEffort::Low),
+        Some(ReasoningEffort::Low) => ("low", TemplateReasoningEffort::Low),
+        Some(ReasoningEffort::Medium) => ("medium", TemplateReasoningEffort::Medium),
+        Some(ReasoningEffort::High) => ("high", TemplateReasoningEffort::High),
+        Some(ReasoningEffort::Xhigh) => ("xhigh", TemplateReasoningEffort::XHigh),
+    };
+    if let Some(levels) = &support.levels
+        && !levels.contains(&level)
+    {
+        return Err(ignored_level_message(model, levels, requested));
+    }
+    Ok(ReasoningControls {
+        enable_thinking: None,
+        reasoning_effort: Some(level),
+    })
+}
+
+/// The refusal for `reasoning_effort: none` on a model whose chat template always reasons.
+fn always_reasons_message(model: &str, support: &ReasoningSupport) -> String {
+    let least = support
+        .levels
+        .as_ref()
+        .and_then(|levels| levels.first().copied())
+        .map_or("low", TemplateReasoningEffort::as_str);
+    format!(
+        "Model '{model}' always reasons, so `reasoning_effort: none` can't turn reasoning off. Omit `reasoning_effort`, or set '{least}' for the least reasoning. See: {REASONING_DOCS}"
+    )
+}
+
+/// The refusal for a level the chat template doesn't name, which it would run at its own
+/// default instead.
+fn ignored_level_message(
+    model: &str,
+    levels: &[TemplateReasoningEffort],
+    requested: &str,
+) -> String {
+    let names: Vec<String> = levels
+        .iter()
+        .map(|level| format!("'{}'", level.as_str()))
+        .collect();
+    let names = match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => names.concat(),
+    };
+    format!(
+        "Model '{model}' takes `reasoning_effort` {names}, and ignores '{requested}'. Set {names}, or omit `reasoning_effort` for the model's default. See: {REASONING_DOCS}"
+    )
+}
+
 /// Where a refused `tool_choice` points the caller.
 const TOOL_CHOICE_DOCS: &str = "https://spiceai.org/docs/components/models/huggingface";
 
 /// The `tool_choice` to hand `mistral.rs` for `req`, or an invalid-argument error when the
 /// request asks for a constraint that cannot be enforced — including a tool call required of a
-/// request that offers no tools, which `mistral.rs` would otherwise answer in prose.
+/// request that offers no tools, which `mistral.rs` would otherwise answer in prose, and a tool
+/// the request does not offer, which `mistral.rs` would otherwise fail as an internal error.
 fn request_tool_choice(
     req: &CreateChatCompletionRequest,
 ) -> Result<Option<ToolChoice>, OpenAIError> {
@@ -981,6 +1264,29 @@ fn request_tool_choice(
     if requires_call && req.tools.as_ref().is_none_or(Vec::is_empty) {
         return Err(OpenAIError::InvalidArgument(format!(
             "tool_choice requires a tool call, but the request lists no tools. Add the tools the model may call to 'tools', or use tool_choice 'auto'. See: {TOOL_CHOICE_DOCS}"
+        )));
+    }
+
+    let named: Vec<&str> = match &choice {
+        ToolChoice::Tool(tool) => vec![tool.function.name.as_str()],
+        ToolChoice::AllowedTools(allowed) => allowed
+            .tools
+            .iter()
+            .filter_map(|tool| match tool {
+                AllowedToolChoice::Function { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let offered = |name: &str| {
+        req.tools.iter().flatten().any(
+            |tool| matches!(tool, ChatCompletionTools::Function(tool) if tool.function.name == name),
+        )
+    };
+    if let Some(name) = named.into_iter().find(|name| !offered(name)) {
+        return Err(OpenAIError::InvalidArgument(format!(
+            "tool_choice names tool '{name}', which the request does not list in 'tools'. Add '{name}' to 'tools', or name one of the tools the request lists. See: {TOOL_CHOICE_DOCS}"
         )));
     }
     Ok(Some(choice))
@@ -1006,9 +1312,8 @@ fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> Result<ToolChoice,
     }
 }
 
-/// Maps an `allowed_tools` choice onto `mistral.rs`'s single-mode equivalent. `mistral.rs` takes
-/// one mode over one tool list, so a choice carrying several entries is refused unless they
-/// agree on the mode.
+/// Maps an `allowed_tools` choice onto `mistral.rs`'s equivalent, which can restrict the model
+/// only to named function tools.
 fn convert_allowed_tools(
     choice: &ChatCompletionAllowedToolsChoice,
 ) -> Result<ToolChoice, OpenAIError> {
@@ -1018,36 +1323,27 @@ fn convert_allowed_tools(
         ))
     };
 
-    let mut mode = None;
-    let mut tools = Vec::new();
-    for entry in &choice.allowed_tools {
-        let entry_mode = match entry.mode {
-            ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
-            ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
-        };
-        if mode.is_some_and(|m| m != entry_mode) {
-            return Err(invalid(
-                "mixes 'auto' and 'required' modes, which locally hosted models cannot combine",
-            ));
-        }
-        mode = Some(entry_mode);
-
-        for tool in &entry.tools {
-            let Ok(ChatCompletionTools::Function(tool)) = ChatCompletionTools::deserialize(tool)
-            else {
-                return Err(invalid(
-                    "lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to",
-                ));
-            };
-            tools.push(AllowedToolChoice::Function {
-                name: tool.function.name,
-            });
-        }
-    }
-
-    let Some(mode) = mode else {
+    let allowed = &choice.allowed_tools;
+    if allowed.tools.is_empty() {
         return Err(invalid("lists no tools"));
+    }
+    let mode = match allowed.mode {
+        ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
+        ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
     };
+    let tools = allowed
+        .tools
+        .iter()
+        .map(|tool| match ChatCompletionTools::deserialize(tool) {
+            Ok(ChatCompletionTools::Function(tool)) => Ok(AllowedToolChoice::Function {
+                name: tool.function.name,
+            }),
+            _ => Err(invalid(
+                "lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(ToolChoice::AllowedTools(AllowedToolsToolChoice {
         tp: AllowedToolsToolChoiceType::AllowedTools,
         mode,
@@ -1115,6 +1411,36 @@ fn parse_tool_call_response(
 mod tests {
     use super::*;
 
+    #[test]
+    fn max_tokens_limits_the_completion() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512
+        }));
+        assert_eq!(MistralLlama::completion_limit(&req), Some(512));
+    }
+
+    #[test]
+    fn max_completion_tokens_wins_when_both_are_set() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512,
+            "max_completion_tokens": 2048
+        }));
+        assert_eq!(MistralLlama::completion_limit(&req), Some(2048));
+    }
+
+    #[test]
+    fn no_limit_is_invented_when_neither_is_set() {
+        let req = request(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(MistralLlama::completion_limit(&req), None);
+    }
+
     fn choice(json: serde_json::Value) -> ChatCompletionToolChoiceOption {
         serde_json::from_value(json).expect("tool_choice should deserialize")
     }
@@ -1161,13 +1487,13 @@ mod tests {
     fn allowed_tools_keeps_its_mode_and_tools() {
         let converted = convert_tool_choice(&choice(serde_json::json!({
             "type": "allowed_tools",
-            "allowed_tools": [{
+            "allowed_tools": {
                 "mode": "required",
                 "tools": [
                     { "type": "function", "function": { "name": "get_weather" } },
                     { "type": "function", "function": { "name": "get_time" } }
                 ]
-            }]
+            }
         })))
         .expect("function tools with one mode are supported");
         let ToolChoice::AllowedTools(allowed) = converted else {
@@ -1187,26 +1513,376 @@ mod tests {
 
     #[test]
     fn allowed_tools_that_cannot_be_enforced_are_refused() {
-        let mixed = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
-            "type": "allowed_tools",
-            "allowed_tools": [
-                { "mode": "auto", "tools": [{ "type": "function", "function": { "name": "a" } }] },
-                { "mode": "required", "tools": [{ "type": "function", "function": { "name": "b" } }] }
-            ]
-        }))));
-        assert!(mixed.contains("mixes 'auto' and 'required'"), "{mixed}");
-
         let hosted = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
             "type": "allowed_tools",
-            "allowed_tools": [{ "mode": "auto", "tools": [{ "type": "web_search" }] }]
+            "allowed_tools": { "mode": "auto", "tools": [{ "type": "web_search" }] }
         }))));
-        assert!(hosted.contains("not a named 'function' tool"), "{hosted}");
+        assert_eq!(
+            hosted,
+            format!(
+                "tool_choice 'allowed_tools' lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to. See: {TOOL_CHOICE_DOCS}"
+            )
+        );
 
         let empty = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
             "type": "allowed_tools",
-            "allowed_tools": []
+            "allowed_tools": { "mode": "auto", "tools": [] }
         }))));
-        assert!(empty.contains("lists no tools"), "{empty}");
+        assert_eq!(
+            empty,
+            format!("tool_choice 'allowed_tools' lists no tools. See: {TOOL_CHOICE_DOCS}")
+        );
+    }
+
+    /// `mistral.rs` fails a choice naming a tool the request does not offer as an internal
+    /// error; the caller named the tool, so it is refused as an invalid argument first.
+    #[test]
+    fn a_choice_naming_a_tool_the_request_does_not_offer_is_refused() {
+        let messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let tools = serde_json::json!([{ "type": "function", "function": { "name": "a" } }]);
+        for tool_choice in [
+            serde_json::json!({ "type": "function", "function": { "name": "nope" } }),
+            serde_json::json!({
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "required",
+                    "tools": [
+                        { "type": "function", "function": { "name": "a" } },
+                        { "type": "function", "function": { "name": "nope" } }
+                    ]
+                }
+            }),
+        ] {
+            let message = invalid_argument(request_tool_choice(&request(serde_json::json!({
+                "model": "m", "messages": messages, "tools": tools, "tool_choice": tool_choice
+            }))));
+            assert_eq!(
+                message,
+                format!(
+                    "tool_choice names tool 'nope', which the request does not list in 'tools'. Add 'nope' to 'tools', or name one of the tools the request lists. See: {TOOL_CHOICE_DOCS}"
+                ),
+                "{tool_choice}"
+            );
+        }
+
+        let offered = request_tool_choice(&request(serde_json::json!({
+            "model": "m",
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": { "type": "function", "function": { "name": "a" } }
+        })))
+        .expect("a tool the request offers is supported");
+        let Some(ToolChoice::Tool(tool)) = offered else {
+            panic!("expected a forced tool, got {offered:?}");
+        };
+        assert_eq!(tool.function.name, "a");
+    }
+
+    /// GLM-5.3-Flash's template as rendered for a one-message conversation: it takes
+    /// `low` and `high`, maps every other value to `Max`, and always opens `<think>`.
+    fn glm_5_3_render(_: Option<bool>, effort: Option<TemplateReasoningEffort>) -> String {
+        let shown = match effort {
+            Some(TemplateReasoningEffort::Low) => "Low",
+            Some(TemplateReasoningEffort::High) => "High",
+            _ => "Max",
+        };
+        format!("[gMASK]<sop><|system|>Reasoning Effort: {shown}<|user|>Hi<|assistant|><think>")
+    }
+
+    /// A Qwen3 template: thinking off closes an empty block; any level only turns it on.
+    fn qwen3_render(enable_thinking: Option<bool>, _: Option<TemplateReasoningEffort>) -> String {
+        let close = if enable_thinking == Some(false) {
+            "<think>\n\n</think>\n\n"
+        } else {
+            ""
+        };
+        format!("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n{close}")
+    }
+
+    /// A `DeepSeek-V4.1` template: answers directly unless asked, closing the block up front.
+    fn deepseek_v4_1_render(
+        enable_thinking: Option<bool>,
+        effort: Option<TemplateReasoningEffort>,
+    ) -> String {
+        let thinks = enable_thinking.unwrap_or(effort.is_some());
+        let open = if thinks { "<think>" } else { "</think>" };
+        format!("<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜>{open}")
+    }
+
+    /// A Gemma 4 template: `<|think|>` turns reasoning on.
+    fn gemma_4_render(
+        enable_thinking: Option<bool>,
+        effort: Option<TemplateReasoningEffort>,
+    ) -> String {
+        let think = if enable_thinking.unwrap_or(effort.is_some()) {
+            "<|think|>"
+        } else {
+            ""
+        };
+        format!("{think}<bos><|turn>user\nHi<turn|>\n<|turn>model\n")
+    }
+
+    /// gpt-oss's template: it ignores `enable_thinking`, defaults to `medium`, and renders
+    /// whatever level it is given as `Reasoning: <level>`.
+    fn gpt_oss_render(_: Option<bool>, effort: Option<TemplateReasoningEffort>) -> String {
+        let level = effort.map_or("medium", TemplateReasoningEffort::as_str);
+        format!(
+            "<|start|>system<|message|>Reasoning: {level}\n\n<|end|><|start|>user<|message|>Hi<|end|><|start|>assistant"
+        )
+    }
+
+    /// A template with no reasoning control, as Llama 3's: every control renders alike.
+    fn llama_3_render(_: Option<bool>, _: Option<TemplateReasoningEffort>) -> String {
+        "<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n".to_string()
+    }
+
+    /// Qwen3.8-Flash-Next's template: it takes `low`, `medium` and its default `xhigh`, adds
+    /// instructions naming only `low` and `xhigh`, and raises on any other level.
+    fn qwen_3_8_render(
+        enable_thinking: Option<bool>,
+        effort: Option<TemplateReasoningEffort>,
+    ) -> Option<String> {
+        let (instructions, open) = if enable_thinking == Some(false) {
+            ("", "<think>\n\n</think>\n\n")
+        } else {
+            let instructions = match effort.unwrap_or(TemplateReasoningEffort::XHigh) {
+                TemplateReasoningEffort::XHigh => {
+                    "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task.<|im_end|>\n"
+                }
+                TemplateReasoningEffort::Low => {
+                    "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused.<|im_end|>\n"
+                }
+                TemplateReasoningEffort::Medium => "",
+                _ => return None,
+            };
+            (instructions, "<think>\n")
+        };
+        Some(format!(
+            "{instructions}<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n{open}"
+        ))
+    }
+
+    /// Classifies a template from one of the renders above, none of which fails.
+    fn classify(
+        render: fn(Option<bool>, Option<TemplateReasoningEffort>) -> String,
+    ) -> ReasoningSupport {
+        ReasoningSupport::from_renders(|enable_thinking, effort| {
+            Some(render(enable_thinking, effort))
+        })
+    }
+
+    fn effort(json: serde_json::Value) -> ReasoningEffort {
+        serde_json::from_value(json).expect("reasoning_effort should deserialize")
+    }
+
+    #[test]
+    fn glm_5_3_always_reasons_and_names_only_low_and_high() {
+        assert_eq!(
+            classify(glm_5_3_render),
+            ReasoningSupport {
+                always_reasons: true,
+                levels: Some(vec![
+                    TemplateReasoningEffort::Low,
+                    TemplateReasoningEffort::High
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn templates_with_an_off_switch_take_none_and_every_level() {
+        for (name, render) in [
+            ("qwen3", qwen3_render as fn(_, _) -> _),
+            ("deepseek-v4.1", deepseek_v4_1_render),
+            ("gemma-4", gemma_4_render),
+        ] {
+            assert_eq!(
+                classify(render),
+                ReasoningSupport {
+                    always_reasons: false,
+                    levels: None
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpt_oss_always_reasons_and_names_every_level() {
+        assert_eq!(
+            classify(gpt_oss_render),
+            ReasoningSupport {
+                always_reasons: true,
+                levels: Some(REASONING_LEVELS.to_vec()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_template_without_reasoning_controls_takes_any_value() {
+        assert_eq!(classify(llama_3_render), ReasoningSupport::default());
+    }
+
+    // Regression test: Qwen3.8-Flash-Next's template raises on `high`, which made the whole
+    // template unchecked, so a request for `high` failed in the template with HTTP 500.
+    #[test]
+    fn qwen_3_8_takes_the_levels_it_renders_and_not_high() {
+        assert_eq!(
+            ReasoningSupport::from_renders(qwen_3_8_render),
+            ReasoningSupport {
+                always_reasons: false,
+                levels: Some(vec![
+                    TemplateReasoningEffort::Low,
+                    TemplateReasoningEffort::Medium,
+                    TemplateReasoningEffort::XHigh
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn a_level_the_template_fails_to_render_is_refused_with_the_levels_it_takes() {
+        let support = ReasoningSupport::from_renders(qwen_3_8_render);
+        assert_eq!(
+            reasoning_controls(Some(&ReasoningEffort::High), &support, "qwen3.8-flash-next"),
+            Err("Model 'qwen3.8-flash-next' takes `reasoning_effort` 'low', 'medium' or 'xhigh', and ignores 'high'. Set 'low', 'medium' or 'xhigh', or omit `reasoning_effort` for the model's default. See: https://spiceai.org/docs/components/models".to_string())
+        );
+        let accepted = [
+            ("none", Some(false), None),
+            ("minimal", None, Some(TemplateReasoningEffort::Low)),
+            ("medium", None, Some(TemplateReasoningEffort::Medium)),
+            ("xhigh", None, Some(TemplateReasoningEffort::XHigh)),
+        ];
+        for (value, enable_thinking, reasoning_effort) in accepted {
+            assert_eq!(
+                reasoning_controls(
+                    Some(&effort(serde_json::json!(value))),
+                    &support,
+                    "qwen3.8-flash-next"
+                ),
+                Ok(ReasoningControls {
+                    enable_thinking,
+                    reasoning_effort
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_that_encodes_levels_without_naming_them_takes_every_level() {
+        let render = |enable_thinking: Option<bool>, effort: Option<TemplateReasoningEffort>| {
+            let instruction = match (enable_thinking, effort) {
+                (Some(false), _) => "Answer directly.",
+                (_, Some(TemplateReasoningEffort::Low)) => "Think briefly.",
+                (_, Some(TemplateReasoningEffort::High | TemplateReasoningEffort::XHigh)) => {
+                    "Think hard."
+                }
+                _ => "Think.",
+            };
+            Some(format!("{instruction}<|user|>Hi<|assistant|>"))
+        };
+        assert_eq!(
+            ReasoningSupport::from_renders(render),
+            ReasoningSupport::default()
+        );
+    }
+
+    #[test]
+    fn a_template_that_renders_no_level_is_left_unchecked() {
+        assert_eq!(
+            ReasoningSupport::from_renders(|_, effort| effort.is_none().then(|| "Hi".to_string())),
+            ReasoningSupport::default()
+        );
+    }
+
+    #[test]
+    fn a_template_that_fails_to_render_is_left_unchecked() {
+        assert_eq!(
+            ReasoningSupport::from_renders(|_, _| None),
+            ReasoningSupport::default()
+        );
+    }
+
+    #[test]
+    fn unset_reasoning_effort_leaves_the_template_default() {
+        let support = classify(glm_5_3_render);
+        assert_eq!(
+            reasoning_controls(None, &support, "glm-5.3-flash"),
+            Ok(ReasoningControls::default())
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_maps_to_template_controls() {
+        let support = classify(qwen3_render);
+        let cases = [
+            ("none", Some(false), None),
+            ("minimal", None, Some(TemplateReasoningEffort::Low)),
+            ("low", None, Some(TemplateReasoningEffort::Low)),
+            ("medium", None, Some(TemplateReasoningEffort::Medium)),
+            ("high", None, Some(TemplateReasoningEffort::High)),
+            ("xhigh", None, Some(TemplateReasoningEffort::XHigh)),
+        ];
+        for (value, enable_thinking, reasoning_effort) in cases {
+            assert_eq!(
+                reasoning_controls(Some(&effort(serde_json::json!(value))), &support, "qwen3"),
+                Ok(ReasoningControls {
+                    enable_thinking,
+                    reasoning_effort
+                }),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn none_is_refused_by_a_model_that_always_reasons() {
+        let support = classify(glm_5_3_render);
+        assert_eq!(
+            reasoning_controls(Some(&ReasoningEffort::None), &support, "glm-5.3-flash"),
+            Err("Model 'glm-5.3-flash' always reasons, so `reasoning_effort: none` can't turn reasoning off. Omit `reasoning_effort`, or set 'low' for the least reasoning. See: https://spiceai.org/docs/components/models".to_string())
+        );
+    }
+
+    #[test]
+    fn a_level_the_template_ignores_is_refused_with_the_levels_it_takes() {
+        let support = classify(glm_5_3_render);
+        for value in ["medium", "xhigh"] {
+            assert_eq!(
+                reasoning_controls(
+                    Some(&effort(serde_json::json!(value))),
+                    &support,
+                    "glm-5.3-flash"
+                ),
+                Err(format!(
+                    "Model 'glm-5.3-flash' takes `reasoning_effort` 'low' or 'high', and ignores '{value}'. Set 'low' or 'high', or omit `reasoning_effort` for the model's default. See: https://spiceai.org/docs/components/models"
+                ))
+            );
+        }
+        assert_eq!(
+            reasoning_controls(Some(&ReasoningEffort::Minimal), &support, "glm-5.3-flash"),
+            Ok(ReasoningControls {
+                enable_thinking: None,
+                reasoning_effort: Some(TemplateReasoningEffort::Low)
+            })
+        );
+    }
+
+    #[test]
+    fn three_named_levels_are_listed_with_commas() {
+        assert_eq!(
+            ignored_level_message(
+                "m",
+                &[
+                    TemplateReasoningEffort::Low,
+                    TemplateReasoningEffort::Medium,
+                    TemplateReasoningEffort::High
+                ],
+                "xhigh"
+            ),
+            "Model 'm' takes `reasoning_effort` 'low', 'medium' or 'high', and ignores 'xhigh'. Set 'low', 'medium' or 'high', or omit `reasoning_effort` for the model's default. See: https://spiceai.org/docs/components/models"
+        );
     }
 
     fn request(json: serde_json::Value) -> CreateChatCompletionRequest {
@@ -1221,7 +1897,7 @@ mod tests {
             serde_json::json!("required"),
             serde_json::json!({
                 "type": "allowed_tools",
-                "allowed_tools": [{ "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }]
+                "allowed_tools": { "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }
             }),
         ] {
             let message = invalid_argument(request_tool_choice(&request(serde_json::json!({

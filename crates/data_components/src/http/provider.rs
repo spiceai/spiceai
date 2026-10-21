@@ -29,7 +29,7 @@ use arrow_array::UInt16Array;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraints, TableReference, project_schema},
+    common::{Constraints, TableReference, project_schema, runtime::IoWaitExt},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -50,6 +50,7 @@ use reqwest::{
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
 use runtime_rate_control::{Permit, RateController, RequestOutcome};
+use runtime_request_context::{TRACEPARENT_HEADER, resolve_request_context};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -738,6 +739,25 @@ impl RequestFilterOptions {
 
     fn is_enabled(&self, kind: RequestFilterKind) -> bool {
         self.enabled_filters.contains(&kind)
+    }
+}
+
+/// The W3C `traceparent` of the query that a fetch serves. It is sent to the
+/// origin, so that a trace links the query to the origin call. It is not part of
+/// the response cache key: a response does not depend on the trace that asked for it.
+#[derive(Clone, Debug)]
+struct ForwardedTraceParent(HeaderValue);
+
+impl ForwardedTraceParent {
+    /// The trace context of the request that `context` executes, if it has one.
+    /// On a cluster executor, the context arrives as a serialized config extension.
+    fn from_task_context(context: &TaskContext) -> Option<Self> {
+        let request_context = resolve_request_context(context, false)?;
+        let trace_parent = request_context.trace_parent().as_ref()?;
+        // Hex digits and dashes only, so the conversion does not fail.
+        HeaderValue::try_from(trace_parent.to_string())
+            .ok()
+            .map(Self)
     }
 }
 
@@ -1759,6 +1779,7 @@ impl HttpTableProvider {
         url: Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
+        trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
     ) -> Result<HttpFetchResult> {
         let retry_strategy = self.retry_strategy.clone();
@@ -1766,6 +1787,7 @@ impl HttpTableProvider {
         let url_clone = url.clone();
         let body_owned = body.map(ToOwned::to_owned);
         let request_headers_owned = request_headers.cloned();
+        let trace_parent_owned = trace_parent.cloned();
         let path_owned = path_label.to_string();
 
         // The ladder spends exactly the configured budget: no request follows the last
@@ -1777,11 +1799,18 @@ impl HttpTableProvider {
             let url = url_clone.clone();
             let body = body_owned.clone();
             let request_headers = request_headers_owned.clone();
+            let trace_parent = trace_parent_owned.clone();
             let path = path_owned.clone();
 
             async move {
-                this.perform_single_request(&url, body.as_deref(), request_headers.as_ref(), &path)
-                    .await
+                this.perform_single_request(
+                    &url,
+                    body.as_deref(),
+                    request_headers.as_ref(),
+                    trace_parent.as_ref(),
+                    &path,
+                )
+                .await
             }
         })
         .await
@@ -1812,6 +1841,7 @@ impl HttpTableProvider {
         url: &Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
+        trace_parent: Option<&ForwardedTraceParent>,
         path_label: &str,
     ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
         // Held until the body below has been read, so a response still streaming counts
@@ -1852,11 +1882,20 @@ impl HttpTableProvider {
             }
         }
 
+        // A `traceparent` that the dataset or the query sets is sent as written.
+        if let Some(trace_parent) = trace_parent
+            && !self.custom_headers.contains_key(TRACEPARENT_HEADER)
+            && !request_headers.is_some_and(|headers| headers.contains_key(TRACEPARENT_HEADER))
+        {
+            request_builder = request_builder.header(TRACEPARENT_HEADER, trace_parent.0.clone());
+        }
+
         if let Some(auth) = self.auth.as_ref() {
             request_builder = auth.apply(request_builder);
         }
 
-        let response = request_builder.send().await.map_err(|e| {
+        // Waiting on the origin: a distributed task can lend its slot meanwhile.
+        let response = request_builder.send().io_wait().await.map_err(|e| {
             let err = Error::http_request(&self.base_url, e);
             tracing::debug!("{err}");
             // A timeout or connection error is a failure signal for adaptive
@@ -2062,6 +2101,7 @@ impl HttpTableProvider {
         // is_timeout/is_connect/is_body/is_decode together as transient.
         let content = response
             .text()
+            .io_wait()
             .await
             .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
@@ -2096,6 +2136,7 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
+        trace_parent: Option<&ForwardedTraceParent>,
     ) -> Result<HttpFetchResult> {
         let url = self.build_request_url(path, query)?;
         let path_owned = path.to_string();
@@ -2111,6 +2152,7 @@ impl HttpTableProvider {
                 url,
                 body_owned.as_deref(),
                 parsed_request_headers.as_ref(),
+                trace_parent,
                 &path_owned,
             )
             .await?;
@@ -2127,11 +2169,12 @@ impl HttpTableProvider {
         query: Option<&str>,
         body: Option<&str>,
         request_headers: Option<&str>,
+        trace_parent: Option<&ForwardedTraceParent>,
     ) -> Result<HttpFetchResult> {
         // When acceleration is enabled, skip HTTP-level caching - the acceleration layer handles it.
         if self.acceleration_enabled {
             return self
-                .fetch_response(path, query, body, request_headers)
+                .fetch_response(path, query, body, request_headers, trace_parent)
                 .await;
         }
 
@@ -2153,7 +2196,7 @@ impl HttpTableProvider {
         }
 
         let fetch_result = self
-            .fetch_response(path, query, body, request_headers)
+            .fetch_response(path, query, body, request_headers, trace_parent)
             .await?;
 
         // Retention is resolved here because this is the only place both the
@@ -2512,6 +2555,7 @@ impl HttpExec {
         &self,
         provider: &HttpTableProvider,
         partition: usize,
+        trace_parent: Option<&ForwardedTraceParent>,
     ) -> DataFusionResult<RecordBatch> {
         let (path, query, body, request_headers) = &self.partitions[partition];
 
@@ -2532,7 +2576,13 @@ impl HttpExec {
 
         // Fetch content with path, query, and body
         let result = provider
-            .get_response(path_val, query_val, body_val, request_headers_val)
+            .get_response(
+                path_val,
+                query_val,
+                body_val,
+                request_headers_val,
+                trace_parent,
+            )
             .await
             .map_err(DataFusionError::from)?;
 
@@ -3065,7 +3115,7 @@ impl ExecutionPlan for HttpExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         tracing::trace!(
             "HttpExec::execute called for partition {}, total partitions: {}",
@@ -3076,6 +3126,7 @@ impl ExecutionPlan for HttpExec {
         let exec = Arc::new(self.clone());
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
+        let trace_parent = ForwardedTraceParent::from_task_context(&context);
         let completion = self
             .completion
             .as_ref()
@@ -3107,6 +3158,7 @@ impl ExecutionPlan for HttpExec {
                 let exec = Arc::clone(&exec);
                 let provider = Arc::clone(&provider);
                 let progress = progress.clone();
+                let trace_parent = trace_parent.clone();
 
                 async move {
                     loop {
@@ -3171,6 +3223,7 @@ impl ExecutionPlan for HttpExec {
                                     merged_query.as_deref(),
                                     body_val,
                                     state.request_headers.as_deref(),
+                                    trace_parent.as_ref(),
                                 )
                                 .await
                                 .map_err(DataFusionError::from)?
@@ -3216,6 +3269,7 @@ impl ExecutionPlan for HttpExec {
                                             url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
+                                            trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -3244,6 +3298,7 @@ impl ExecutionPlan for HttpExec {
                                             url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
+                                            trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -3273,6 +3328,7 @@ impl ExecutionPlan for HttpExec {
                                             url,
                                             state.body.as_deref(),
                                             parsed_request_headers.as_ref(),
+                                            trace_parent.as_ref(),
                                             &format!("page_{}", state.page),
                                         )
                                         .await
@@ -3414,7 +3470,9 @@ impl ExecutionPlan for HttpExec {
             // Non-paginated: single fetch
             let stream = futures::stream::once(async move {
                 tracing::trace!("Fetching partition {}", partition);
-                let batch = exec.fetch_and_create_batch(&provider, partition).await?;
+                let batch = exec
+                    .fetch_and_create_batch(&provider, partition, trace_parent.as_ref())
+                    .await?;
                 if batch
                     .schema()
                     .metadata()
@@ -3466,6 +3524,47 @@ struct PaginationState {
     last_page_path: Option<String>,
     last_page_query: Option<String>,
     recent_page_urls: VecDeque<String>,
+}
+
+const REQUEST_PATH_DOT_SEGMENT_MESSAGE: &str = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+
+const REQUEST_PATH_REWRITTEN_MESSAGE: &str = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
+/// Rejects a `request_path` the HTTP request would not send as written.
+///
+/// `allowed_request_paths` is matched against the path as written, but the request goes to
+/// the path `Url::set_path` produces, and WHATWG URL parsing resolves percent-encoded dot
+/// segments (`%2e%2e`, `.%2e`), removes tabs and newlines, and turns `\` into `/`. Each of
+/// these lets a path that matches an allowed pattern reach one that does not, or climb out
+/// of the path in the dataset's `from` URL. Comparing the decoded path before and after
+/// parsing catches every such rewrite rather than a list of known encodings. The segment
+/// check also rejects a dot segment behind an encoded slash (`%2e%2e%2fadmin`), which the
+/// URL parser leaves alone but an origin that decodes `%2f` before routing would resolve.
+///
+/// The messages do not repeat the value: a path can carry identifiers or tokens, and these
+/// errors reach logs and query history.
+fn ensure_request_path_is_sent_as_written(raw: &str, base_url: &Url) -> Result<()> {
+    let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+    if decoded
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(Error::FilterRejected {
+            message: REQUEST_PATH_DOT_SEGMENT_MESSAGE.to_string(),
+        });
+    }
+
+    // Only the request path is compared, so replacing the base path here is deliberate: the
+    // base path is joined in front of an accepted value, which cannot remove a segment of it.
+    let mut url = base_url.clone();
+    url.set_path(raw);
+    if percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy() != decoded {
+        return Err(Error::FilterRejected {
+            message: REQUEST_PATH_REWRITTEN_MESSAGE.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn pagination_request_label(url: &Url) -> String {
@@ -4201,6 +4300,7 @@ impl HttpTableProvider {
                 ),
             });
         }
+        ensure_request_path_is_sent_as_written(raw, &self.base_url)?;
 
         let Some((globset, patterns)) = &self.allowed_paths else {
             tracing::warn!("Path filter attempted but allowed_paths is None");
@@ -4590,7 +4690,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":1}"#);
@@ -4631,7 +4731,7 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for id in 0..200 {
             provider
-                .get_response(&format!("/report/{id}"), None, None, None)
+                .get_response(&format!("/report/{id}"), None, None, None, None)
                 .await
                 .expect("each response is served");
         }
@@ -4667,7 +4767,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served to its caller");
         assert_eq!(served.content, r#"{"rows":6}"#);
@@ -4699,7 +4799,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4734,7 +4834,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         let served = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is served rather than panicking the query");
         assert_eq!(served.content, r#"{"rows":8}"#);
@@ -4860,14 +4960,14 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(4096, None);
         provider
-            .get_response("/small", None, None, None)
+            .get_response("/small", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
         assert_eq!(provider.cache.entry_count(), 1, "the small entry is held");
 
         provider
-            .get_response("/huge", None, None, None)
+            .get_response("/huge", None, None, None, None)
             .await
             .expect("the oversized response is still served to its caller");
         settle(&provider.cache).await;
@@ -4897,7 +4997,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -4926,7 +5026,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5058,7 +5158,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5088,7 +5188,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5132,7 +5232,7 @@ mod response_cache_tests {
         // `Vary` naming anything at all.
         let unauthenticated = provider_for(&origin);
         unauthenticated
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&unauthenticated.cache).await;
@@ -5140,7 +5240,7 @@ mod response_cache_tests {
 
         let authenticated = provider_for(&origin).with_auth(Arc::new(RotatingAuth));
         authenticated
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&authenticated.cache).await;
@@ -5172,7 +5272,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5204,7 +5304,7 @@ mod response_cache_tests {
         let provider = provider_for(&origin);
         for _ in 0..3 {
             let served = provider
-                .get_response("/report", None, None, None)
+                .get_response("/report", None, None, None, None)
                 .await
                 .expect("the response is served");
             assert_eq!(served.content, r#"{"rows":2}"#);
@@ -5233,7 +5333,7 @@ mod response_cache_tests {
 
         let without_fallback = provider_for(&origin);
         without_fallback
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&without_fallback.cache).await;
@@ -5246,7 +5346,7 @@ mod response_cache_tests {
         let with_fallback =
             provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::from_mins(5)));
         with_fallback
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&with_fallback.cache).await;
@@ -5270,7 +5370,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(1024 * 1024, Some(Duration::ZERO));
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("served");
         settle(&provider.cache).await;
@@ -5293,7 +5393,7 @@ mod response_cache_tests {
 
         let provider = provider_for(&origin).with_cache_limits(0, None);
         provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("the response is still served");
         settle(&provider.cache).await;
@@ -5323,7 +5423,7 @@ mod response_cache_tests {
         let provider = provider_for(&origin)
             .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
         let fetched = provider
-            .get_response("/report", None, None, None)
+            .get_response("/report", None, None, None, None)
             .await
             .expect("`store` must answer a 404 with its body, or this asserts nothing");
         assert_eq!(
@@ -5770,7 +5870,7 @@ mod tests {
             let (provider, permits) =
                 retry_test_provider(url.clone(), budget, Duration::from_secs(2));
             let Err(error) = provider
-                .perform_request_with_retry(url.clone(), None, None, "/lookup")
+                .perform_request_with_retry(url.clone(), None, None, None, "/lookup")
                 .await
             else {
                 panic!("connection refusal should fail");
@@ -5783,7 +5883,7 @@ mod tests {
             retry_test_server(vec![(200, "{}".to_string())], Duration::from_millis(300)).await;
         let (provider, permits) = retry_test_provider(url.clone(), 0, Duration::from_millis(50));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, "/lookup")
+            .perform_request_with_retry(url, None, None, None, "/lookup")
             .await
         else {
             panic!("timed out origin should fail");
@@ -5811,7 +5911,7 @@ mod tests {
         let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
 
         let Err(send_error) = provider
-            .perform_request_with_retry(url, None, None, "/path-secret")
+            .perform_request_with_retry(url, None, None, None, "/path-secret")
             .await
         else {
             panic!("connection refusal should fail");
@@ -5879,7 +5979,7 @@ mod tests {
                         retry_test_provider(url.clone(), budget, Duration::from_secs(3));
                     let provider = provider.with_error_response_action(action);
                     let Err(error) = provider
-                        .perform_request_with_retry(url, None, None, "/lookup")
+                        .perform_request_with_retry(url, None, None, None, "/lookup")
                         .await
                     else {
                         panic!("{status} under `{action}` must fail the request");
@@ -5959,7 +6059,7 @@ mod tests {
         let second_url = url.clone();
         let request = tokio::spawn(async move {
             provider
-                .perform_request_with_retry(url, None, None, "/lookup")
+                .perform_request_with_retry(url, None, None, None, "/lookup")
                 .await
         });
         tokio::time::timeout(Duration::from_secs(2), headers_received)
@@ -5968,7 +6068,7 @@ mod tests {
             .expect("headers signal sent");
         let second_request = tokio::spawn(async move {
             second_provider
-                .perform_request_with_retry(second_url, None, None, "/lookup")
+                .perform_request_with_retry(second_url, None, None, None, "/lookup")
                 .await
         });
         assert!(
@@ -6041,7 +6141,7 @@ mod tests {
             .with_error_response_action(ErrorResponseAction::Store);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            provider.perform_request_with_retry(url, None, None, "/lookup"),
+            provider.perform_request_with_retry(url, None, None, None, "/lookup"),
         )
         .await
         .expect("the refusal must not wait for the withheld body");
@@ -6087,7 +6187,7 @@ mod tests {
             // `store`, so the 404 body is data and the case can assert what was read.
             let provider = provider.with_error_response_action(ErrorResponseAction::Store);
             let result = provider
-                .perform_request_with_retry(url, None, None, "/lookup")
+                .perform_request_with_retry(url, None, None, None, "/lookup")
                 .await
                 .expect("HTTP response should remain available");
             assert_eq!(result.response_status, expected_status);
@@ -6106,7 +6206,7 @@ mod tests {
         .await;
         let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
         let Err(error) = provider
-            .perform_request_with_retry(url, None, None, "/lookup")
+            .perform_request_with_retry(url, None, None, None, "/lookup")
             .await
         else {
             panic!("a 404 under the default `on_error_response` must fail the request");
@@ -6956,6 +7056,57 @@ mod tests {
         assert_eq!(url.as_str(), "https://api.example.com/v1/users");
     }
 
+    /// Every rejected value here matches `/shows/**` as written, yet `Url::set_path` would
+    /// send it somewhere else — outside `/shows/`, or outside the `/api/v1` base path.
+    #[test]
+    fn test_request_path_rewritten_by_url_parsing_is_rejected() {
+        let base_url = Url::parse("https://api.example.com/api/v1").expect("valid URL");
+        // The messages are asserted in full so a reword cannot reintroduce the path, which
+        // may carry identifiers or tokens, or a raw newline from it.
+        let dot_segment = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+        let rewritten = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
+        let cases = [
+            ("/shows/%2e%2e/people/1", dot_segment),
+            ("/shows/%2E%2E/people/1", dot_segment),
+            ("/shows/%2E%2e/people/1", dot_segment),
+            ("/shows/.%2e/people/1", dot_segment),
+            ("/shows/%2e./people/1", dot_segment),
+            ("/shows/%2e/people/1", dot_segment),
+            ("/shows/./people/1", dot_segment),
+            ("/shows/%2e%2e/%2e%2e/%2e%2e/admin", dot_segment),
+            ("/shows/%2e%2e%2fadmin", dot_segment),
+            ("/shows/%2e%2e%5cadmin", dot_segment),
+            ("/shows/.\t./people/1", rewritten),
+            ("/shows/.\n./people/1", rewritten),
+            ("/shows/a\\b", rewritten),
+        ];
+        for (raw, expected) in cases {
+            match ensure_request_path_is_sent_as_written(raw, &base_url) {
+                Err(Error::FilterRejected { message }) => {
+                    assert_eq!(message, expected, "request_path {raw:?}");
+                }
+                other => panic!("request_path {raw:?} must be rejected, got {other:?}"),
+            }
+        }
+
+        // Percent-encoding the URL parser applies or leaves alone does not change the path
+        // the origin sees, and an encoded slash inside a segment is an ordinary value.
+        for raw in [
+            "/shows/1",
+            "/shows/a b",
+            "/shows/caf\u{e9}",
+            "/shows/%2e%2e-not-a-dot-segment",
+            "/shows/group%2Fproject",
+            "/shows/%252e%252e",
+            "/shows/a..b",
+        ] {
+            if let Err(err) = ensure_request_path_is_sent_as_written(raw, &base_url) {
+                panic!("request_path {raw:?} must be accepted, got {err:?}");
+            }
+        }
+    }
+
     #[test]
     fn test_url_construction_without_base_path() {
         let base_url = Url::parse("https://api.example.com/").expect("valid URL");
@@ -7171,7 +7322,7 @@ mod tests {
         );
 
         let batch = exec
-            .fetch_and_create_batch(provider.as_ref(), 0)
+            .fetch_and_create_batch(provider.as_ref(), 0, None)
             .await
             .expect("batch should be created from cached response");
 
@@ -7412,6 +7563,201 @@ mod tests {
 
     fn row(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(String::from).collect()
+    }
+
+    const CALLER_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    /// A session whose queries run as a request that arrived with `traceparent`,
+    /// the way the runtime installs the caller's `RequestContext` on a query.
+    fn traced_session(
+        table: &str,
+        provider: HttpTableProvider,
+        traceparent: &str,
+    ) -> datafusion::prelude::SessionContext {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            http::HeaderValue::from_str(traceparent).expect("the traceparent is a valid header"),
+        );
+        let request_context = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Http,
+        )
+        .from_headers(&headers)
+        .build();
+        let config =
+            datafusion::prelude::SessionConfig::new().with_extension(Arc::new(request_context));
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        ctx.register_table(table, Arc::new(provider))
+            .expect("the HTTP table registers");
+        ctx
+    }
+
+    /// Every `traceparent` value of each request the origin received, in order.
+    async fn received_traceparents(origin: &MockServer) -> Vec<Vec<String>> {
+        origin
+            .received_requests()
+            .await
+            .expect("the mock origin records requests")
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get_all("traceparent")
+                    .iter()
+                    .map(|value| value.to_str().expect("ASCII header").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The origin call joins the caller's trace: it carries the `traceparent`
+    /// of the query that caused it.
+    #[tokio::test]
+    async fn test_origin_request_carries_the_callers_traceparent() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let ctx = traced_session("posts", origin_provider(&origin), CALLER_TRACEPARENT);
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts").await,
+            vec![row(&[POST_1])]
+        );
+
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![CALLER_TRACEPARENT.to_string()]]
+        );
+    }
+
+    /// On a cluster executor, the request context arrives as the serialized
+    /// `SpiceRequestContextConfig`, not as a typed extension. The origin call
+    /// still carries the caller's `traceparent`, with its sampling decision.
+    #[tokio::test]
+    async fn test_executor_origin_request_carries_the_callers_unsampled_traceparent() {
+        const UNSAMPLED: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("traceparent", http::HeaderValue::from_static(UNSAMPLED));
+        let scheduler_context = runtime_request_context::RequestContextBuilder::new(
+            runtime_request_context::Protocol::Http,
+        )
+        .from_headers(&headers)
+        .build();
+        let config = datafusion::prelude::SessionConfig::new().with_option_extension(
+            runtime_request_context::SpiceRequestContextConfig::from_request_context(
+                &scheduler_context,
+            ),
+        );
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        ctx.register_table("posts", Arc::new(origin_provider(&origin)))
+            .expect("the HTTP table registers");
+
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts").await,
+            vec![row(&[POST_1])]
+        );
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![UNSAMPLED.to_string()]]
+        );
+    }
+
+    /// Each page after the first is fetched outside the response cache path,
+    /// and still carries the caller's `traceparent`.
+    #[tokio::test]
+    async fn test_every_page_carries_the_callers_traceparent() {
+        let origin = MockServer::start().await;
+        for (offset, body) in [
+            ("0", format!("[{POST_1},{POST_2}]")),
+            ("2", format!("[{POST_3}]")),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/posts"))
+                .and(query_param("offset", offset))
+                .respond_with(json_response(200, body))
+                .expect(1)
+                .mount(&origin)
+                .await;
+        }
+
+        let base_url = Url::parse(&format!("{}/posts", origin.uri()))
+            .expect("the mock server's URI is a valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(2),
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config");
+        let ctx = traced_session("posts", provider, CALLER_TRACEPARENT);
+        assert_eq!(
+            sql_rows(&ctx, "SELECT content FROM posts ORDER BY content")
+                .await
+                .len(),
+            3
+        );
+
+        origin.verify().await;
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![
+                vec![CALLER_TRACEPARENT.to_string()],
+                vec![CALLER_TRACEPARENT.to_string()],
+            ]
+        );
+    }
+
+    /// A query with no trace context sends no `traceparent`.
+    #[tokio::test]
+    async fn test_untraced_query_sends_no_traceparent() {
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let ctx = http_session("posts", origin_provider(&origin));
+        sql_rows(&ctx, "SELECT content FROM posts").await;
+
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![Vec::<String>::new()]
+        );
+    }
+
+    /// A `traceparent` the dataset sets in its own headers is sent as written:
+    /// the caller's trace context does not replace it or add a second value.
+    #[tokio::test]
+    async fn test_configured_traceparent_header_is_not_replaced() {
+        const CONFIGURED: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_response(200, format!("[{POST_1}]")))
+            .mount(&origin)
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", HeaderValue::from_static(CONFIGURED));
+        let ctx = traced_session(
+            "posts",
+            origin_provider(&origin).with_headers(headers),
+            CALLER_TRACEPARENT,
+        );
+        sql_rows(&ctx, "SELECT content FROM posts").await;
+
+        assert_eq!(
+            received_traceparents(&origin).await,
+            vec![vec![CONFIGURED.to_string()]]
+        );
     }
 
     /// A `request_query` filter is sent to the origin exactly as written, in

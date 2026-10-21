@@ -25,7 +25,8 @@ use std::{
 };
 
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
-use crate::cluster::partition::get_partition_filter_exprs;
+use crate::cluster::partition::combine_partition_exprs;
+use crate::config::ClusterRole;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataconnector::reconnecting::{
     ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
@@ -68,6 +69,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
+use data_components::incremental_append::incremental_append_source;
 use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
@@ -77,6 +79,7 @@ use runtime_metrics::{self as metrics, components::register_component_metric};
 use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use util::{error_spaced, warn_spaced};
 
@@ -288,22 +291,32 @@ impl Runtime {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
         let startup_datasets = valid_datasets;
 
-        if let Some(snapshots) = app.snapshots.as_deref() {
-            let any_snapshot_mode_dataset = startup_datasets.iter().any(|ds| {
-                ds.acceleration.as_ref().is_some_and(|acceleration| {
-                    acceleration.enabled
-                        && acceleration
-                            .refresh_mode
-                            .is_some_and(|mode| mode.is_snapshot_only())
-                })
-            });
+        // An executor runs the scheduler's spicepod, whose own startup logs these warnings.
+        if self.df.cluster_config.effective_role() != Some(ClusterRole::Executor) {
             if let Some(warning) =
-                runtime_acceleration::snapshot::notifications::unread_queue_warning(
-                    snapshots,
-                    any_snapshot_mode_dataset,
+                runtime_state_location::scheduler_deprecation::scheduler_deprecation_warning(
+                    &app.runtime,
                 )
             {
                 tracing::warn!("{warning}");
+            }
+            if let Some(section) = app.snapshots.as_deref() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::section_deprecation::section_deprecation_warning(
+                        section,
+                        app.runtime.state.as_ref(),
+                    )
+                );
+            }
+        }
+        // A scheduler loads no accelerations, so it reads no queue whatever its datasets.
+        if self.df.snapshot_notifications().is_some() {
+            for setting in app.unread_snapshot_queues() {
+                tracing::warn!(
+                    "{}",
+                    runtime_acceleration::snapshot::notifications::unread_queue_warning(&setting)
+                );
             }
         }
 
@@ -379,12 +392,7 @@ impl Runtime {
             let resolved = resolve_table_reference(ds.name.clone());
             let future = if pending {
                 background_roots.insert(resolved.clone());
-                self.track_snapshot_bootstrap(
-                    &ds.name,
-                    future,
-                    Some(self.initial_load.cancel.clone()),
-                )
-                .await
+                self.track_snapshot_bootstrap(&ds.name, future).await
             } else {
                 future
             };
@@ -394,6 +402,11 @@ impl Runtime {
         // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
         // dataset reading from another `localpod` dataset loads after that one, so every chain
         // hangs off the load of a non-`localpod` dataset.
+        // The done-token of each startup dataset that loads in a chain: the parent of
+        // each chain, and every `localpod` dataset in a chain component startup waits
+        // for. Each is cancelled when that dataset's own load ends, not when the
+        // chain does, so a view waits only for the datasets it reads.
+        let mut chain_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
         let roots: Vec<_> = localpod_by_parent
             .extract_if(|parent, _| dataset_futures.contains_key(parent))
             .collect();
@@ -402,6 +415,9 @@ impl Runtime {
             // Signalled once the parent's load ends, however it ends, so a chain running in
             // the background starts only after its parent.
             let parent_done = tokio_util::sync::CancellationToken::new();
+            if !parent_background {
+                chain_done.insert(parent.clone(), parent_done.clone());
+            }
             let mut chains = Vec::new();
             for (ds, bootstrap_status) in children {
                 let background = parent_background
@@ -412,6 +428,7 @@ impl Runtime {
                     bootstrap_status,
                     &mut localpod_by_parent,
                     ReplacesRegistration::No,
+                    (!background).then_some(&mut chain_done),
                 );
                 if background {
                     let parent_done = parent_done.clone();
@@ -419,13 +436,7 @@ impl Runtime {
                         parent_done.cancelled().await;
                         chain.await;
                     });
-                    let chain = self
-                        .track_snapshot_bootstrap(
-                            &name,
-                            chain,
-                            Some(self.initial_load.cancel.clone()),
-                        )
-                        .await;
+                    let chain = self.track_snapshot_bootstrap(&name, chain).await;
                     background_chains.push((name, chain));
                 } else {
                     chains.push(chain);
@@ -465,13 +476,26 @@ impl Runtime {
         let mut spawned_tasks = vec![];
         let dispatched = dataset_futures.len() + background_chains.len();
 
+        // Signalled when a startup dataset's load task ends, however it ends, so
+        // each view waits only on the datasets it reads from rather than on every
+        // dataset in the Spicepod: one dataset still retrying must not keep views
+        // over healthy datasets from registering.
+        let mut dataset_done = chain_done;
         for (resolved, (ds, dataset_load_future)) in dataset_futures {
+            let background = background_roots.contains(&resolved);
+            let done = if background {
+                None
+            } else {
+                let token = dataset_done.entry(resolved.clone()).or_default().clone();
+                Some(token)
+            };
             let handle = tokio::spawn(async move {
+                let _done = done.map(CancellationToken::drop_guard);
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
             // A reader's first publication is independent of component startup.
-            if !background_roots.contains(&resolved) {
+            if !background {
                 spawned_tasks.push(handle);
             }
         }
@@ -529,10 +553,13 @@ impl Runtime {
             });
         }
 
-        let _ = join_all(spawned_tasks).await;
+        // Views are loaded as soon as the datasets each one reads from have loaded,
+        // not after every dataset has: a dataset that keeps failing must only hold
+        // back the views that depend on it.
+        let view_tasks = Arc::clone(&self).load_views(&app, &dataset_done);
 
-        // After all datasets have loaded, load the views.
-        Arc::clone(&self).load_views(&app);
+        let _ = join_all(spawned_tasks).await;
+        let _ = join_all(view_tasks).await;
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
@@ -928,6 +955,11 @@ impl Runtime {
             if restored {
                 update_cached_dataset_timestamps(ds.as_ref()).await;
             }
+            // Rows restored from an acceleration snapshot are not the rows an append
+            // cursor saved here before describes.
+            if bootstrap_status.is_bootstrapped() {
+                self.clear_append_cursor(&ds).await;
+            }
             self.load_dataset_with_retry(Arc::clone(&ds), bootstrap_status, load_semaphore, &load)
                 .await;
             if restored {
@@ -1046,7 +1078,6 @@ impl Runtime {
         self: &Arc<Self>,
         name: &TableReference,
         load: Pin<Box<dyn Future<Output = ()> + Send>>,
-        initial_load_cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let cancel = self.status.shutdown_token().child_token();
         let task_cancel = cancel.clone();
@@ -1055,16 +1086,9 @@ impl Runtime {
                 &Self::snapshot_bootstrap_task_name(name),
                 Some(cancel),
                 async move {
-                    let initial_load_cancel = async move {
-                        match initial_load_cancel {
-                            Some(token) => token.cancelled().await,
-                            None => std::future::pending().await,
-                        }
-                    };
                     tokio::select! {
                         biased;
                         () = task_cancel.cancelled() => {},
-                        () = initial_load_cancel => {},
                         () = load => {},
                     }
                     Ok(())
@@ -1193,6 +1217,32 @@ impl Runtime {
     fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
         ds.acceleration.as_ref().is_some_and(|a| a.enabled)
             && Self::waits_for_source_reason(ds).is_none()
+    }
+
+    /// Discards the source commit `ds`'s append refresh last loaded, so its next refresh
+    /// starts without a cursor.
+    async fn clear_append_cursor(&self, ds: &Dataset) {
+        let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+            return;
+        };
+        let refresh_mode = acceleration.refresh_mode.unwrap_or_else(|| {
+            runtime_acceleration::acceleration::unset_refresh_mode_for_connector(ds.source())
+        });
+        if refresh_mode != RefreshMode::Append {
+            return;
+        }
+        let store = crate::dataaccelerator::spice_sys::append_cursor_store_for(
+            ds,
+            Arc::clone(&self.accelerator_engine_registry),
+            runtime_acceleration::sidecar::OpenOption::OpenExisting,
+        )
+        .await;
+        if let Err(e) = store.clear().await {
+            tracing::debug!(
+                "Dataset '{}' could not clear its append cursor after restoring its acceleration snapshot: {e}",
+                ds.name
+            );
+        }
     }
 
     /// The configuration that makes an accelerated dataset wait for its source
@@ -1397,14 +1447,14 @@ impl Runtime {
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 let spaced_tracer = Arc::clone(&self.spaced_tracer);
                 if !err.is_retriable() {
-                    error_spaced!(spaced_tracer, "{}{err}", "");
+                    error_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                     return PermanentDatasetFailureSnafu {
                         dataset: ds.name.clone(),
                         reason: err.to_string(),
                     }
                     .fail();
                 }
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                 UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -1532,10 +1582,11 @@ impl Runtime {
                 dataset_name: ds.name.to_string(),
             }
             .build();
-            warn_spaced!(spaced_tracer, "{}{err}", "");
+            warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
             return Err(err);
         }
 
+        let mut overlap_warning = None;
         if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
             let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
             let dataset_name = ds.name.to_string();
@@ -1547,7 +1598,7 @@ impl Runtime {
                 let warning = if acceleration.engine == Engine::Cayenne {
                     cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
                 } else {
-                    deprecated_on_conflict_warning(&dataset_name)
+                    deprecated_on_conflict_warning(&dataset_name, acceleration, refresh_mode)
                 };
                 tracing::warn!("{warning}");
             }
@@ -1555,10 +1606,10 @@ impl Runtime {
                 && refresh_mode == RefreshMode::Append
                 && acceleration.refresh_append_overlap.is_none()
             {
-                tracing::warn!(
-                    "{}",
-                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
-                );
+                overlap_warning = Some(newest_by_time_without_overlap_warning(
+                    &dataset_name,
+                    time_column,
+                ));
             }
         }
 
@@ -1593,7 +1644,7 @@ impl Runtime {
                     reason,
                 }
                 .build();
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                 return Err(err);
             }
         }
@@ -1659,6 +1710,28 @@ impl Runtime {
             )
             .await?;
         ds = resolved_ds;
+
+        let records_commits = federated_table
+            .try_table_provider_sync_ref()
+            .is_some_and(|provider| incremental_append_source(provider.as_ref()).is_some());
+        if records_commits {
+            // A source that records its commits (Iceberg) needs no overlap, unless read by time.
+            if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled)
+                && acceleration.refresh_append_overlap.is_none()
+                && reads_by_time_despite_commits(
+                    acceleration,
+                    ds.time_column.as_deref(),
+                    resolved_refresh_mode,
+                )
+            {
+                tracing::warn!(
+                    "{}",
+                    last_arrival_without_overlap_warning(&ds.name.to_string(), acceleration.engine)
+                );
+            }
+        } else if let Some(warning) = overlap_warning {
+            tracing::warn!("{warning}");
+        }
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
@@ -1750,14 +1823,14 @@ impl Runtime {
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if is_permanent_dataset_failure(&err) {
-                    error_spaced!(spaced_tracer, "{}{err}", "");
+                    error_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                     return PermanentDatasetFailureSnafu {
                         dataset: ds.name.clone(),
                         reason: err.to_string(),
                     }
                     .fail();
                 }
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
 
                 Err(err)
             }
@@ -1889,7 +1962,7 @@ impl Runtime {
         self.df.clear_cached_plans().await;
 
         // A reload can change what the dataset reads, so results read from its
-        // previous contents must stop being served as fresh, and a query that
+        // previous contents must stop being served, and a query that
         // planned against the previous registration must not store its result.
         // Both of those read the table-change clock this marks. The replacement
         // below marks it again: this mark cannot reject a result whose read
@@ -1914,8 +1987,8 @@ impl Runtime {
                     {
                         Ok(()) => {
                             // Mark again now the swap has happened. The mark above
-                            // stops results read before the reload from being served
-                            // as fresh, but a query that started after it and read the
+                            // stops results read before the reload from being served,
+                            // but a query that started after it and read the
                             // previous registration finishes with a `read_started_at`
                             // the clock would accept, so its result must be rejected by
                             // a mark at the replacement itself.
@@ -2005,7 +2078,7 @@ impl Runtime {
     }
 
     /// Marks the results-cache table clock for `dataset`, so results read from
-    /// what it held before this point stop being served as fresh and a result
+    /// what it held before this point stop being served and a result
     /// read before it cannot be stored as fresh afterwards.
     ///
     /// Degrade and continue, as the write paths that mark the same clock do: a
@@ -2028,14 +2101,8 @@ impl Runtime {
         cause: CacheInvalidation,
     ) {
         let caching = self.df.caching();
-        // An unload takes the evicting path, which a `cache_key_type: sql` hit needs
-        // because such a hit is answered before planning and the plan cache therefore
-        // never reaches it. See [`cache::QueryResultsCacheProvider::evict_for_table`]
-        // for why the stale-serving window must not absorb an unload.
-        let outcome = match cause {
-            CacheInvalidation::Reload => caching.invalidate_for_table(dataset.clone()).await,
-            CacheInvalidation::Unload => caching.evict_for_table(dataset.clone()).await,
-        };
+        // Reload and unload hard-evict results, including raw SQL hits served before planning.
+        let outcome = caching.invalidate_for_table(dataset.clone()).await;
 
         if let Err(e) = outcome {
             tracing::warn!("{}", cache_invalidation_warning(dataset, cause, &e));
@@ -2075,8 +2142,9 @@ impl Runtime {
     ///
     /// On an executor node (partition assignments present) with a `partition_by`
     /// configured dataset, returns the dataset with `partition_by` cleared and its
-    /// engine converted to unpartitioned, plus `Some` partition filters for the
-    /// partitions assigned to this executor. `Some(empty)` — no partition assigned —
+    /// engine converted to unpartitioned, plus `Some` partition expressions, one
+    /// per partition assigned to this executor; `combine_partition_exprs` turns
+    /// them into the load's filter. `Some(empty)` — no partition assigned —
     /// resolves downstream to a `false` predicate (load no rows) rather than an
     /// unfiltered full-table load. Otherwise returns `ds` unchanged with `None`
     /// (not partition-scoped; retrieve everything).
@@ -2100,11 +2168,11 @@ impl Runtime {
             crate::datafusion::SPICE_DEFAULT_CATALOG,
             crate::datafusion::SPICE_DEFAULT_SCHEMA,
         );
-        let partition_filters = get_partition_filter_exprs(&resolved, &assignments);
+        let assigned = assignments.get(&resolved).cloned().unwrap_or_default();
         tracing::debug!(
-            "For table={}, extracted {} partition filter(s) for assigned partitions.",
+            "For table={}, {} partition(s) assigned.",
             ds.name,
-            partition_filters.len(),
+            assigned.len(),
         );
 
         // Clear partition_by and convert engine to unpartitioned.
@@ -2113,7 +2181,7 @@ impl Runtime {
             acc.partition_by = vec![];
             acc.engine = acc.engine.to_unpartitioned();
         }
-        (Arc::new(ds_mod), Some(partition_filters))
+        (Arc::new(ds_mod), Some(assigned))
     }
 
     async fn reload_accelerated_dataset(
@@ -2158,7 +2226,8 @@ impl Runtime {
         // Mirror the initial-load path: on an executor, scope the recreated table
         // to this node's assigned partitions so a hot reload doesn't load the full
         // source table (or duplicate it across executors).
-        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+        let (ds, assigned) = self.resolve_executor_partition_scoping(ds).await;
+        let initial_partition_filters = assigned.map(combine_partition_exprs);
 
         // create new accelerated table for updated data connector
         let accelerated_table = self
@@ -2416,7 +2485,17 @@ impl Runtime {
         // partitioned mode this is `Some`, so an executor with no assigned
         // partition gets `Some(empty)` — a `false` predicate that loads no rows —
         // rather than an unfiltered full load.
-        let (ds, initial_partition_filters) = self.resolve_executor_partition_scoping(ds).await;
+        let (ds, assigned) = self.resolve_executor_partition_scoping(ds).await;
+        // The partitions the initial load reads, one expression each, and the
+        // sequence its ack carries, taken before any later reload of the table
+        // takes one.
+        let initial_load = assigned.clone().map(|assigned| {
+            let load_sequence = self
+                .executor_outbound_broadcaster()
+                .map_or(0, |b| b.next_load_sequence());
+            (load_sequence, assigned)
+        });
+        let initial_partition_filters = assigned.map(combine_partition_exprs);
 
         // ACCELERATED TABLE
         let acceleration_settings =
@@ -2448,6 +2527,24 @@ impl Runtime {
         {
             crate::AccelerationWriteModeWithChangesSnafu {
                 dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+        if let Some((param, writes)) = pk_conflict_detection_refusal(
+            acceleration_settings,
+            data_connector.resolve_refresh_mode(acceleration_settings.refresh_mode),
+            crate::datafusion::select_accelerated_write_mode(
+                ds.source(),
+                ds.access().allows_write(),
+                acceleration_settings.write_mode,
+            ),
+        ) {
+            crate::PkConflictDetectionDisabledSnafu {
+                dataset_name: ds.name.to_string(),
+                connector: ds.source().to_string(),
+                param,
+                consequence: writes.consequence(),
+                advice: pk_conflict_detection_advice(acceleration_settings),
             }
             .fail()?;
         }
@@ -2510,13 +2607,13 @@ impl Runtime {
                 if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
                     .await
-                    == crate::status::WaitOutcome::ShuttingDown
+                    == runtime_status::WaitOutcome::ShuttingDown
                 {
                     return;
                 }
                 // After the executor's initial load for this dataset finishes,
-                // ack the scheduler with the partition expressions we currently
-                // hold. This is the executor → scheduler readiness signal that
+                // ack the scheduler with the partition expressions that load
+                // read. This is the executor → scheduler readiness signal that
                 // lets the scheduler flip the dataset to `Ready` once every
                 // assigned partition has at least one executor ack.
                 //
@@ -2528,23 +2625,20 @@ impl Runtime {
                 // the ack against the registered dataset regardless of how
                 // the user spelled the table in their spicepod.
                 if let Some(b) = broadcaster {
-                    let bytes: Vec<Vec<u8>> =
-                        if let Some(assignments_lock) = runtime.partition_assignments() {
-                            let assignments = assignments_lock.read().await;
-                            assignments
-                                .get(&resolved_name)
-                                .map(|exprs| {
-                                    runtime_cluster::encode_partition_exprs(exprs, &dataset_name)
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
+                    let (load_sequence, bytes) = initial_load.as_ref().map_or_else(
+                        || (0, Vec::new()),
+                        |(load_sequence, assigned)| {
+                            (
+                                *load_sequence,
+                                runtime_cluster::encode_partition_exprs(assigned, &dataset_name),
+                            )
+                        },
+                    );
                     let table_name = resolved_name.to_string();
                     // Statistics flow via the periodic ExecutorStatistics reporter,
                     // not this readiness ack.
                     let sent = b
-                        .broadcast_partitions_loaded(table_name.clone(), bytes)
+                        .broadcast_partitions_loaded(table_name.clone(), bytes, load_sequence)
                         .await;
                     if sent == 0 {
                         // Fast initial loads can finish before any scheduler
@@ -2558,6 +2652,20 @@ impl Runtime {
                             "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
                         );
                     }
+                }
+                // Partitions assigned after the initial load read its filters
+                // and before the table registered were not loaded: load them.
+                if let Some((_, assigned)) = &initial_load
+                    && let Err(e) = runtime
+                        .load_partitions_assigned_during_initial_load(
+                            resolved_name.clone(),
+                            assigned,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        "Failed to load the partitions of {dataset_name} assigned during its initial load: {e}"
+                    );
                 }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
@@ -2809,8 +2917,7 @@ impl Runtime {
                     .await;
             });
             let load_future = if pending {
-                self.track_snapshot_bootstrap(&ds.name, load_future, None)
-                    .await
+                self.track_snapshot_bootstrap(&ds.name, load_future).await
             } else {
                 load_future
             };
@@ -2839,6 +2946,7 @@ impl Runtime {
                         bootstrap_status,
                         &mut localpod_by_parent,
                         ReplacesRegistration::Yes,
+                        None,
                     )
                 })
                 .collect();
@@ -2898,6 +3006,11 @@ impl Runtime {
     /// queued behind it, recursively, so a child never binds before its parent registers. Each
     /// dataset's children are taken out of `localpod_by_parent` as its chain is built, so a
     /// `localpod` cycle — which can never load — is built once and ends.
+    ///
+    /// When `loaded` is given, each dataset in the chain gets a token in it,
+    /// cancelled as soon as that dataset's own load ends, however it ends, and
+    /// before the datasets reading from it load: a view over one `localpod`
+    /// dataset must not wait for a sibling that keeps failing.
     fn localpod_load_chain(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -2907,9 +3020,11 @@ impl Runtime {
             Vec<(Arc<Dataset>, AcceleratorBootstrap)>,
         >,
         replaces_registration: ReplacesRegistration,
+        mut loaded: Option<&mut HashMap<ResolvedTableReference, CancellationToken>>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let resolved = resolve_table_reference(ds.name.clone());
         let children: Vec<_> = localpod_by_parent
-            .remove(&resolve_table_reference(ds.name.clone()))
+            .remove(&resolved)
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
@@ -2918,18 +3033,23 @@ impl Runtime {
                     child_status,
                     localpod_by_parent,
                     replaces_registration,
+                    loaded.as_deref_mut(),
                 )
             })
             .collect();
+        let done = loaded.map(|loaded| loaded.entry(resolved).or_default().clone());
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
         // Registered now rather than once the parent has loaded, so a Spicepod
         // change can supersede the load while it waits.
         let load = self.dataset_loads.begin(&ds.name);
         Box::pin(async move {
             let name = ds.name.clone();
-            Arc::clone(&self)
-                .load_dataset(ds, bootstrap_status, load_semaphore, load)
-                .await;
+            {
+                let _done = done.map(CancellationToken::drop_guard);
+                Arc::clone(&self)
+                    .load_dataset(ds, bootstrap_status, load_semaphore, load)
+                    .await;
+            }
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
             // from the previous registration after the mark above must not be stored as fresh.
@@ -3274,17 +3394,52 @@ fn cayenne_on_conflict_warning(
 }
 
 /// The warning for a dataset on another accelerator that sets `on_conflict`.
-fn deprecated_on_conflict_warning(dataset_name: &str) -> String {
+fn deprecated_on_conflict_warning(
+    dataset_name: &str,
+    acceleration: &Acceleration,
+    refresh_mode: RefreshMode,
+) -> String {
+    let persistence = if matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
+        && refresh_mode == RefreshMode::Changes
+    {
+        " Set `mode: file` to preserve CDC data across restarts and resume replication."
+    } else {
+        ""
+    };
     format!(
-        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it.{persistence}"
     )
 }
 
 /// Warning for an append that keeps the newest version of each key by `time_column`
-/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+/// but has no `refresh_append_overlap` and reads by time, so it never re-reads a late row.
 fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
     format!(
         "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+    )
+}
+
+/// Whether a keyed append refresh reads by time instead of following its source's
+/// commits, because the engine keeps the last arrival of a key (#15273). Must match
+/// `RefreshTask::commit_cursor_store`.
+fn reads_by_time_despite_commits(
+    acceleration: &Acceleration,
+    time_column: Option<&str>,
+    refresh_mode: RefreshMode,
+) -> bool {
+    let (Some(time_column), Some(key)) = (time_column, acceleration.primary_key.as_ref()) else {
+        return false;
+    };
+    refresh_mode == RefreshMode::Append
+        && !acceleration.orders_versions_by_time(Some(time_column), refresh_mode)
+        && !key.iter().any(|column| column == time_column)
+}
+
+/// Warning for a keyed append that reads by time ([`reads_by_time_despite_commits`])
+/// without `refresh_append_overlap`, so it never loads a late row.
+fn last_arrival_without_overlap_warning(dataset_name: &str, engine: Engine) -> String {
+    format!(
+        "Dataset '{dataset_name}' (`engine: {engine}`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     )
 }
 
@@ -3310,6 +3465,7 @@ pub(crate) fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::FullTextSearchRequiresAcceleration { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
         | Error::AccelerationWriteModeWithChanges { .. }
+        | Error::PkConflictDetectionDisabled { .. }
         // Durable write-back configurations that would acknowledge a write the
         // dataset cannot then deliver.
         | Error::DurableWriteBackWithRetention { .. }
@@ -3376,6 +3532,76 @@ fn configured_retention_setting(acceleration: &Acceleration) -> Option<String> {
     }
 }
 
+/// The fix the conflict-detection refusal offers: set the canonical
+/// `cayenne_pk_conflict_detection` to `auto`, which takes precedence over the
+/// unprefixed spelling, and drop that spelling, which parameter validation
+/// warns is ignored.
+fn pk_conflict_detection_advice(acceleration: &Acceleration) -> String {
+    if acceleration.params.contains_key("pk_conflict_detection") {
+        "Set 'cayenne_pk_conflict_detection' to 'auto', its default, and remove 'pk_conflict_detection'.".to_string()
+    } else {
+        "Set 'cayenne_pk_conflict_detection' to 'auto', its default.".to_string()
+    }
+}
+
+/// A way a dataset rewrites a key it already stores, which Cayenne can do
+/// correctly only with its primary-key check on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyedWrites {
+    /// `write_mode: write_back`: the check also records each committed write
+    /// for delivery to the source.
+    WriteBack,
+    /// `refresh_mode: changes`: the source's changes replace stored rows.
+    Changes,
+    /// Writes land only in the accelerator: `write_mode: acceleration`, or a
+    /// `sink` source.
+    AcceleratorWrites,
+}
+
+impl KeyedWrites {
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::WriteBack => {
+                "this dataset uses 'acceleration.write_mode: write_back', which records each committed write for delivery from that check, so every write would be acknowledged and never reach the source"
+            }
+            Self::Changes => {
+                "this dataset applies its source's changes ('refresh_mode: changes'), so a change to an existing key would add a second row for that key instead of replacing it"
+            }
+            Self::AcceleratorWrites => {
+                "this dataset keeps its writes in the accelerator ('acceleration.write_mode: acceleration', or a 'sink' source), so a write to an existing key would add a second row for that key instead of replacing it"
+            }
+        }
+    }
+}
+
+/// The conflict-detection parameter to refuse, and the keyed writes it would
+/// break, for an acceleration whose refresh mode resolves to `refresh_mode` and
+/// whose writes are routed as `write_mode` (`select_accelerated_write_mode`, so a
+/// dataset that cannot be written is judged by its refresh alone).
+///
+/// With the check off, a staged upsert neither supersedes the stored row for
+/// its key nor records the key for write-back delivery, so every configuration
+/// that rewrites a stored key would keep duplicate rows or drop writes. The
+/// refusal is decided from the configuration alone, without the source's
+/// constraints: a key can come from those as well as from `primary_key`, and
+/// they are only known once the source is reachable. A full or append refresh
+/// is not refused; how those behave under `none` is tracked in #14883.
+fn pk_conflict_detection_refusal(
+    acceleration: &Acceleration,
+    refresh_mode: RefreshMode,
+    write_mode: crate::datafusion::AcceleratedWriteMode,
+) -> Option<(&'static str, KeyedWrites)> {
+    use crate::datafusion::AcceleratedWriteMode;
+    let param = data_accelerator_api::cayenne_pk_conflict_detection_disabled_by(acceleration)?;
+    let writes = match (write_mode, refresh_mode) {
+        (AcceleratedWriteMode::WriteBack, _) => KeyedWrites::WriteBack,
+        (_, RefreshMode::Changes) => KeyedWrites::Changes,
+        (AcceleratedWriteMode::AcceleratorOnly, _) => KeyedWrites::AcceleratorWrites,
+        (AcceleratedWriteMode::WriteThrough, _) => return None,
+    };
+    Some((param, writes))
+}
+
 /// Refuse a dataset whose configuration cannot be made to work, reporting the
 /// refusal once.
 ///
@@ -3398,6 +3624,16 @@ fn preflight_dataset(
     // Everything `validate_dataset` raises is a pure function of the Spicepod, so
     // retrying cannot change the answer.
     Err(refuse_permanently(ds, status, spaced_tracer, &err))
+}
+
+/// The key that rate-limits `dataset`'s load-failure lines on the runtime's
+/// shared `SpacedTracer`.
+///
+/// It is per dataset, so one dataset's failure cannot hide another's. It also
+/// differs from the dataset-name key of the connector and accelerator failure
+/// lines, so a load failure does not hide those lines for the same dataset.
+fn load_failure_log_key(dataset: &TableReference) -> String {
+    format!("load failure: {dataset}")
 }
 
 /// Report a refusal and return it as permanent.
@@ -3866,10 +4102,48 @@ mod tests {
 
         #[test]
         fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            assert_eq!(
-                deprecated_on_conflict_warning("orders"),
-                "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
-            );
+            for engine in ["arrow", "duckdb"] {
+                let mut acceleration = acceleration(engine, Some("upsert"));
+                for (mode, refresh_mode) in [
+                    (Mode::File, None),
+                    (Mode::File, Some(RefreshMode::Changes)),
+                    (Mode::FileUpdate, None),
+                    (Mode::FileUpdate, Some(RefreshMode::Changes)),
+                    (Mode::Memory, None),
+                    (Mode::Memory, Some(RefreshMode::Full)),
+                    (Mode::Memory, Some(RefreshMode::Append)),
+                ] {
+                    acceleration.mode = mode;
+                    acceleration.refresh_mode = refresh_mode;
+                    assert_eq!(
+                        deprecated_on_conflict_warning(
+                            "orders",
+                            &acceleration,
+                            refresh_mode.unwrap_or(RefreshMode::Full),
+                        ),
+                        "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn changes_recommend_persistent_cayenne() {
+            let mut acceleration = acceleration("duckdb", Some("upsert"));
+            assert_eq!(acceleration.mode, Mode::Memory);
+            for (mode, refresh_mode) in [
+                (Mode::Memory, None),
+                (Mode::Memory, Some(RefreshMode::Changes)),
+                (Mode::FileCreate, None),
+                (Mode::FileCreate, Some(RefreshMode::Changes)),
+            ] {
+                acceleration.mode = mode;
+                acceleration.refresh_mode = refresh_mode;
+                assert_eq!(
+                    deprecated_on_conflict_warning("orders", &acceleration, RefreshMode::Changes),
+                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it. Set `mode: file` to preserve CDC data across restarts and resume replication."
+                );
+            }
         }
     }
 
@@ -3879,6 +4153,45 @@ mod tests {
             newest_by_time_without_overlap_warning("events", "updated_at"),
             "Dataset 'events' keeps the newest version of each key by 'updated_at', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
         );
+    }
+
+    #[test]
+    fn the_last_arrival_warning_says_which_rows_are_missed_and_how_to_load_them() {
+        assert_eq!(
+            last_arrival_without_overlap_warning("acc", Engine::DuckDB),
+            "Dataset 'acc' (`engine: duckdb`) has no `refresh_append_overlap`, so a row that arrives after a newer one is never loaded. Use `engine: cayenne` to load every new row, or set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        );
+    }
+
+    /// Only a keyed append that keeps the last arrival reads by time (#15273).
+    #[test]
+    fn only_a_keyed_last_arrival_append_reads_by_time() {
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+        let key = ColumnReference::new(vec!["list_id".to_string(), "row_id".to_string()]);
+        let acceleration = |engine, primary_key: Option<&ColumnReference>| Acceleration {
+            engine,
+            primary_key: primary_key.cloned(),
+            ..Acceleration::default()
+        };
+        let with_time =
+            ColumnReference::new(vec!["row_id".to_string(), "update_timestamp".to_string()]);
+        let ts = Some("update_timestamp");
+        let (keyed, time_keyed) = (Some(&key), Some(&with_time));
+        let (append, full) = (RefreshMode::Append, RefreshMode::Full);
+        for (engine, key, mode, expected, what) in [
+            (Engine::DuckDB, keyed, append, true, "keyed"),
+            (Engine::Sqlite, keyed, append, true, "keyed"),
+            (Engine::DuckDB, None, append, false, "unkeyed"),
+            (Engine::DuckDB, keyed, full, false, "full"),
+            (Engine::Cayenne, keyed, append, false, "keeps newest"),
+            (Engine::DuckDB, time_keyed, append, false, "key holds time"),
+        ] {
+            assert_eq!(
+                reads_by_time_despite_commits(&acceleration(engine, key), ts, mode),
+                expected,
+                "{engine} {what}"
+            );
+        }
     }
 
     /// Every retention setting has to be recognised, whichever one the dataset
@@ -3935,10 +4248,6 @@ mod tests {
             mode: spicepod::acceleration::Mode::File,
             write_mode: spicepod::acceleration::WriteMode::WriteBack,
             refresh_mode: Some(spicepod::acceleration::RefreshMode::Changes),
-            on_conflict: HashMap::from([(
-                "id".to_string(),
-                spicepod::acceleration::OnConflictBehavior::Upsert,
-            )]),
             // Declared, single-column: durable write-back has nothing to key a
             // delivery on otherwise, so this is part of the valid shape.
             primary_key: Some("id".to_string()),
@@ -4057,9 +4366,9 @@ mod tests {
     /// unremarkable there, because nothing depends on the accelerator holding a row
     /// until a delivery carries it away.
     ///
-    /// Leaving the regime any *other* way — the engine, `on_conflict` or
-    /// `refresh_mode` — still requests `write_mode: write_back`, which cannot be
-    /// delivered and is refused by the prerequisites gate instead. Those doors are
+    /// Leaving the regime any *other* way — the engine or `refresh_mode` — still
+    /// requests `write_mode: write_back`, which cannot be delivered and is refused
+    /// by the prerequisites gate instead. Those doors are
     /// covered by `validate_dataset_refuses_write_back_without_the_durable_prerequisites`.
     #[tokio::test]
     async fn validate_dataset_allows_all_of_them_when_write_back_is_not_requested() {
@@ -4097,13 +4406,6 @@ mod tests {
             ),
             (
                 spicepod::acceleration::Acceleration {
-                    on_conflict: HashMap::new(),
-                    ..durable_write_back_acceleration()
-                },
-                "acceleration.on_conflict",
-            ),
-            (
-                spicepod::acceleration::Acceleration {
                     refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
                     ..durable_write_back_acceleration()
                 },
@@ -4134,6 +4436,33 @@ mod tests {
         );
     }
 
+    /// Regression test for #14886: Cayenne keeps one row per primary key without
+    /// `on_conflict`, and the runtime warns users to remove it, so write-back must
+    /// load without it — and still load with it, for Spicepods that still set it.
+    #[tokio::test]
+    async fn validate_dataset_loads_write_back_with_or_without_on_conflict() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let without = durable_write_back_acceleration();
+        assert!(without.on_conflict.is_empty());
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, without)).is_ok(),
+            "write-back keys on primary_key, not on_conflict"
+        );
+
+        let with = spicepod::acceleration::Acceleration {
+            on_conflict: HashMap::from([(
+                "id".to_string(),
+                spicepod::acceleration::OnConflictBehavior::Upsert,
+            )]),
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, with)).is_ok(),
+            "a leftover on_conflict must not stop the dataset loading"
+        );
+    }
+
     /// A disabled acceleration accelerates nothing, so its write-back settings
     /// acknowledge nothing for delivery and are not judged — a configuration
     /// write-back could not deliver is unremarkable there.
@@ -4153,6 +4482,279 @@ mod tests {
             validate_dataset(&dataset_with_acceleration(&runtime, acceleration)).is_ok(),
             "write-back settings on a disabled acceleration are inert, not refused"
         );
+    }
+
+    /// The way out must be a configuration that loads: write-back requires
+    /// `refresh_mode: changes`, and `write_mode: acceleration` is refused with it.
+    #[test]
+    fn the_unsupported_source_rejection_offers_a_write_mode_that_loads() {
+        let message = DurableWriteBackUnsupportedBySourceSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "mysql".to_string(),
+        }
+        .build()
+        .to_string();
+        // Write-through loads for a source that takes writes; a read-only
+        // source such as MySQL also needs `access: read`, and `access: read`
+        // alone does not clear this refusal.
+        assert_eq!(
+            message,
+            "Failed to register dataset orders (mysql): durable write-back needs a source that can apply a delivered row in one atomic step, and the mysql connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, and also set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        );
+    }
+
+    fn acceleration_with_params(
+        write_mode: spicepod::acceleration::WriteMode,
+        params: &[(&str, &str)],
+    ) -> Acceleration {
+        Acceleration {
+            engine: Engine::Cayenne,
+            write_mode,
+            primary_key: Some(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..Acceleration::default()
+        }
+    }
+
+    /// Regression test for #14889 and its siblings: `cayenne_pk_conflict_detection:
+    /// none` is refused on every dataset that rewrites a stored key, and loads
+    /// everywhere else.
+    #[test]
+    fn pk_conflict_detection_none_is_refused_wherever_a_stored_key_is_rewritten() {
+        use spicepod::acceleration::WriteMode;
+        let none = [("cayenne_pk_conflict_detection", "none")];
+        // (source, writable, configured write mode, resolved refresh mode, refusal)
+        for (source, writable, write_mode, refresh_mode, expected) in [
+            (
+                "postgres",
+                true,
+                WriteMode::WriteBack,
+                RefreshMode::Changes,
+                Some(KeyedWrites::WriteBack),
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Changes,
+                Some(KeyedWrites::Changes),
+            ),
+            (
+                "postgres",
+                false,
+                WriteMode::WriteThrough,
+                RefreshMode::Changes,
+                Some(KeyedWrites::Changes),
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::Acceleration,
+                RefreshMode::Full,
+                Some(KeyedWrites::AcceleratorWrites),
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::Acceleration,
+                RefreshMode::Append,
+                Some(KeyedWrites::AcceleratorWrites),
+            ),
+            // A sink source keeps every write in the accelerator, whatever
+            // `write_mode` says.
+            (
+                "sink",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Disabled,
+                Some(KeyedWrites::AcceleratorWrites),
+            ),
+            // A dataset that cannot be written takes no accelerator write, so only
+            // its refresh is judged.
+            (
+                "postgres",
+                false,
+                WriteMode::Acceleration,
+                RefreshMode::Full,
+                None,
+            ),
+            (
+                "postgres",
+                false,
+                WriteMode::WriteBack,
+                RefreshMode::Full,
+                None,
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Full,
+                None,
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Append,
+                None,
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Disabled,
+                None,
+            ),
+        ] {
+            let label = format!("{source} writable={writable} {write_mode:?} + {refresh_mode:?}");
+            let acceleration = acceleration_with_params(write_mode, &none);
+            let routed =
+                crate::datafusion::select_accelerated_write_mode(source, writable, write_mode);
+            assert_eq!(
+                pk_conflict_detection_refusal(&acceleration, refresh_mode, routed),
+                expected.map(|writes| ("cayenne_pk_conflict_detection", writes)),
+                "{label}"
+            );
+        }
+
+        // Both spellings take effect in the accelerator, the prefixed one first,
+        // and the value is matched without regard to case.
+        for (params, expected) in [
+            (
+                vec![("pk_conflict_detection", "none")],
+                Some("pk_conflict_detection"),
+            ),
+            (
+                vec![("cayenne_pk_conflict_detection", "NONE")],
+                Some("cayenne_pk_conflict_detection"),
+            ),
+            (
+                vec![
+                    ("cayenne_pk_conflict_detection", "auto"),
+                    ("pk_conflict_detection", "none"),
+                ],
+                None,
+            ),
+            (vec![("cayenne_pk_conflict_detection", "auto")], None),
+            (vec![], None),
+        ] {
+            let acceleration = acceleration_with_params(WriteMode::WriteThrough, &params);
+            assert_eq!(
+                pk_conflict_detection_refusal(
+                    &acceleration,
+                    RefreshMode::Changes,
+                    crate::datafusion::AcceleratedWriteMode::WriteThrough
+                )
+                .map(|(param, _)| param),
+                expected,
+                "{params:?}"
+            );
+        }
+
+        // Following the refusal's advice must load the dataset with no ignored
+        // parameter left behind, whichever spellings were set: the canonical key
+        // set to `auto`, and the unprefixed spelling removed when it is present.
+        for params in [
+            vec![
+                ("cayenne_pk_conflict_detection", "none"),
+                ("pk_conflict_detection", "none"),
+            ],
+            vec![("pk_conflict_detection", "none")],
+        ] {
+            let refused = acceleration_with_params(WriteMode::WriteThrough, &params);
+            assert!(
+                pk_conflict_detection_refusal(
+                    &refused,
+                    RefreshMode::Changes,
+                    crate::datafusion::AcceleratedWriteMode::WriteThrough
+                )
+                .is_some(),
+                "{params:?}: none on a CDC dataset is refused"
+            );
+            let advice = pk_conflict_detection_advice(&refused);
+            let mut advised = refused.clone();
+            advised.params.insert(
+                "cayenne_pk_conflict_detection".to_string(),
+                "auto".to_string(),
+            );
+            if advice.contains("remove 'pk_conflict_detection'") {
+                advised.params.remove("pk_conflict_detection");
+            }
+            assert_eq!(
+                pk_conflict_detection_refusal(
+                    &advised,
+                    RefreshMode::Changes,
+                    crate::datafusion::AcceleratedWriteMode::WriteThrough
+                ),
+                None,
+                "{params:?}: following {advice:?} must load"
+            );
+            assert!(
+                !advised.params.contains_key("pk_conflict_detection"),
+                "{params:?}: following {advice:?} must not leave the ignored spelling: {:?}",
+                advised.params
+            );
+        }
+
+        let not_cayenne = Acceleration {
+            engine: Engine::DuckDB,
+            ..acceleration_with_params(WriteMode::WriteThrough, &none)
+        };
+        assert_eq!(
+            pk_conflict_detection_refusal(
+                &not_cayenne,
+                RefreshMode::Changes,
+                crate::datafusion::AcceleratedWriteMode::WriteThrough
+            ),
+            None,
+            "only Cayenne reads the parameter"
+        );
+    }
+
+    #[test]
+    fn the_pk_conflict_detection_refusal_names_the_setting_and_the_consequence() {
+        for (writes, consequence) in [
+            (KeyedWrites::WriteBack, "never reach the source"),
+            (KeyedWrites::Changes, "add a second row for that key"),
+            (
+                KeyedWrites::AcceleratorWrites,
+                "add a second row for that key",
+            ),
+        ] {
+            let message = crate::PkConflictDetectionDisabledSnafu {
+                dataset_name: "orders".to_string(),
+                connector: "postgres".to_string(),
+                param: "cayenne_pk_conflict_detection",
+                consequence: writes.consequence(),
+                advice: pk_conflict_detection_advice(&acceleration_with_params(
+                    spicepod::acceleration::WriteMode::WriteThrough,
+                    &[("cayenne_pk_conflict_detection", "none")],
+                )),
+            }
+            .build()
+            .to_string();
+            for expected in [
+                "Failed to register dataset orders (postgres)",
+                "'cayenne_pk_conflict_detection: none'",
+                consequence,
+                "Set 'cayenne_pk_conflict_detection' to 'auto'",
+                "https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{writes:?}: the refusal must contain {expected:?}: {message}"
+                );
+            }
+            assert!(!message.contains('\n'), "{writes:?}: one line: {message}");
+        }
     }
 
     /// The rejection is the only account a user gets of why the dataset will not
@@ -5203,6 +5805,93 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
+    /// Regression test for #14918: every dataset's load-failure line goes through
+    /// the runtime's one rate limiter, so the limiter has to be keyed on the
+    /// dataset. A shared key would let the first dataset to fail suppress every
+    /// other dataset's failure for the whole interval, leaving them in `Error`
+    /// with no line naming them.
+    #[test]
+    fn each_failing_dataset_logs_its_own_load_failure() {
+        let lines = crate::tracing_util::warn_lines_emitted_by(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("to build a test runtime")
+                .block_on(async {
+                    register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory))
+                        .await;
+                    let runtime = Arc::new(crate::Runtime::builder().build().await);
+                    // The `_a` dataset fails a second time inside the interval in
+                    // each loop, and must still log only once.
+                    //
+                    // A missing `time_column` is a permanent failure (`error_spaced!`).
+                    for name in ["time_column_a", "time_column_b", "time_column_a"] {
+                        let ds = accelerated_schema_only_dataset(&runtime, name, |dataset| {
+                            dataset.time_column = Some("not_in_the_source_schema".to_string());
+                        });
+                        runtime
+                            .try_load_dataset_once(ds, BootstrapStatus::None, None)
+                            .await
+                            .expect_err("a missing time column should fail the load");
+                    }
+                    // `refresh_mode: changes` over a source without a change stream
+                    // is a retriable failure (`warn_spaced!`).
+                    for name in ["changes_a", "changes_b", "changes_a"] {
+                        let ds = accelerated_schema_only_dataset(&runtime, name, |dataset| {
+                            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                                acceleration.refresh_mode =
+                                    Some(spicepod::acceleration::RefreshMode::Changes);
+                            }
+                        });
+                        runtime
+                            .try_load_dataset_once(ds, BootstrapStatus::None, None)
+                            .await
+                            .expect_err(
+                                "a changes load over a source without a change stream should fail",
+                            );
+                    }
+                });
+        });
+
+        let failures_of = |name: &str| {
+            lines
+                .iter()
+                .filter(|line| line.contains(&format!(" {name} ")))
+                .count()
+        };
+        assert_eq!(
+            ["time_column_a", "time_column_b", "changes_a", "changes_b"].map(failures_of),
+            [1, 1, 1, 1],
+            "each failing dataset must log its own failure, once per interval: {lines:#?}"
+        );
+    }
+
+    /// An accelerated `schema_only` dataset named `name`, adjusted by `configure`.
+    fn accelerated_schema_only_dataset(
+        runtime: &Arc<crate::Runtime>,
+        name: &str,
+        configure: impl FnOnce(&mut spicepod::component::dataset::Dataset),
+    ) -> Arc<Dataset> {
+        let mut dataset = spicepod::component::dataset::Dataset::new("schema_only:any", name);
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            ..spicepod::acceleration::Acceleration::default()
+        });
+        configure(&mut dataset);
+
+        let app = app::AppBuilder::new(name)
+            .with_dataset(dataset.clone())
+            .build();
+        Arc::new(
+            DatasetBuilder::try_from(dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        )
+    }
+
     /// `access: read_write` over a source that only supports reads is a Spicepod
     /// mistake no retry clears: it fails the load once, naming
     /// `write_mode: acceleration`, instead of retrying for the life of the process.
@@ -5294,6 +5983,14 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             mode: "file_create".to_string(),
         }
         .build();
+        let pk_detection_off = crate::PkConflictDetectionDisabledSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "postgres".to_string(),
+            param: "cayenne_pk_conflict_detection",
+            consequence: KeyedWrites::Changes.consequence(),
+            advice: "Set 'cayenne_pk_conflict_detection' to 'auto', its default.",
+        }
+        .build();
         let undeclared_key = DurableWriteBackUndeclaredPrimaryKeySnafu {
             dataset_name: "orders".to_string(),
             connector: "postgres".to_string(),
@@ -5321,6 +6018,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         for err in [
             &with_retention,
             &recreating_mode,
+            &pk_detection_off,
             &composite_key,
             &undeclared_key,
             &prerequisites,
@@ -5663,7 +6361,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .status
             .get_dataset_status(&ds.name)
             .expect("the refused reload reports a status");
-        let crate::status::ComponentStatus::Error(Some(message)) = status else {
+        let runtime_status::ComponentStatus::Error(Some(message)) = status else {
             panic!("a refused reload must report an error status, got {status:?}");
         };
         assert!(
@@ -5684,11 +6382,11 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
     /// A reload marks the results-cache table clock for the dataset it reloads.
     ///
     /// The reload replaces what the dataset reads, so a result read from its previous
-    /// contents must stop being served as fresh, and a query that planned against the
+    /// contents must stop being served, and a query that planned against the
     /// previous registration must not store the result it reads. Both of those are
-    /// decided by that mark: `entry_validity` reads it on every hit, and
+    /// decided by that mark: `tables_changed_since` reads it on every hit, and
     /// `tables_changed_since` reads it before a result is stored. Clearing the cached
-    /// plans, which is all the reload used to do, changes neither.
+    /// plans alone does not prevent reuse of cached results.
     #[tokio::test]
     async fn updating_a_dataset_invalidates_the_results_cached_from_it() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);

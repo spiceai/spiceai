@@ -25,10 +25,12 @@ pub mod cancel_guard_body;
 pub mod column_reference;
 pub mod fibonacci_backoff;
 pub mod home_dir;
+pub mod instance_id;
 pub mod levenshtein;
 pub mod retry_strategy;
 #[cfg(feature = "datafusion")]
 pub mod security;
+pub mod spice_paths;
 pub mod topological_ordering;
 pub mod tracers;
 pub use backoff::Error as RetryError;

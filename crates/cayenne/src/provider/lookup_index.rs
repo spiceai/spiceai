@@ -30,11 +30,9 @@ limitations under the License.
 //! A file no run covers — written before a restart, or by a write whose run
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
-//! so it takes a bounded share of a core. With the hidden
-//! `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled` switch (for testing), each run also
-//! persists as a file under the table's `_lookup_index` directory, registered
-//! in the metastore, so a reopened table loads its runs instead of reading its
-//! files back; otherwise nothing is persisted.
+//! so it takes a bounded share of a core. Each run also persists as a file
+//! under the table's `_lookup_index` directory, registered in the metastore,
+//! so a reopened table loads its runs instead of reading its files back.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -658,6 +656,15 @@ impl LookupIndexView {
             views,
             rows,
         }
+    }
+
+    /// Every key's view, each with the directory its runs persist in.
+    fn persisted_views(&self) -> Vec<(String, IndexView)> {
+        self.shapes
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .zip(self.views.iter().cloned())
+            .collect()
     }
 
     /// Whether every key's view covers the file `path` names.
@@ -1549,16 +1556,29 @@ impl LookupIndexState {
     fn repin(&self) {
         let view = LookupIndexView::of(self.shapes.load_full());
         if let Some(persisted_runs) = self.persisted_runs.get() {
-            persisted_runs.schedule(
-                view.shapes
-                    .iter()
-                    .map(|shape| shape.persisted_dir())
-                    .zip(view.views.iter().cloned())
-                    .collect(),
-            );
+            persisted_runs.schedule(view.persisted_views());
         }
         self.index.store(Arc::new(view));
         self.scan_input_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Writes every published run to disk and registers it, then holds off
+    /// further syncs until the returned hold drops, so an acceleration snapshot
+    /// taken meanwhile archives runs that cover the files it archives: the
+    /// runs of a write that just returned, which otherwise persist in the
+    /// background, and no run file a later merge retires disappears from under
+    /// the archive. A large append whose runs are still being finished in the
+    /// background is not waited for: its files restore uncovered, and the
+    /// restored table indexes them before it serves queries. `None` when the
+    /// runs do not persist (memory mode, persistence off, or not loaded yet);
+    /// an error when they could not all be written.
+    pub(crate) async fn persist_for_snapshot(&self) -> Option<Result<PersistedRunsHold, String>> {
+        let persisted_runs = Arc::clone(self.persisted_runs.get()?);
+        Some(
+            persisted_runs
+                .flush(|| self.index.load().persisted_views())
+                .await,
+        )
     }
 
     /// Persists every key's runs as run files under `root`, registered in
@@ -2566,10 +2586,6 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
 
-/// Whether a table's secondary index runs persist as run files. Hidden,
-/// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
-pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
-
 /// Serializes persistence for one durable table location across provider opens.
 /// The weak owner fences work queued by providers that have been replaced.
 struct PersistenceCoordinator {
@@ -2591,6 +2607,12 @@ impl PersistenceCoordinator {
         registry.insert(location, Arc::downgrade(&coordinator));
         coordinator
     }
+}
+
+/// Keeps the table's persisted runs exactly as [`LookupIndexState::persist_for_snapshot`]
+/// left them until dropped: no run is written, registered, or deleted meanwhile.
+pub(crate) struct PersistedRunsHold {
+    _owner: tokio::sync::OwnedMutexGuard<std::sync::Weak<()>>,
 }
 
 /// Every key's runs, persisted one file per run under the table's
@@ -2756,6 +2778,27 @@ impl PersistedRuns {
                 tracing::debug!(table = %self.table_name, %error, "Persisted secondary index runs were not synced; the next change retries");
             }
         }
+    }
+
+    /// Syncs the views `views` returns, taken once no other sync is running, and
+    /// holds off every later sync until the returned hold drops.
+    async fn flush(
+        &self,
+        views: impl FnOnce() -> Vec<(String, IndexView)>,
+    ) -> Result<PersistedRunsHold, String> {
+        if !self.loaded.load(Ordering::Acquire) {
+            return Err("the persisted runs have not been loaded".to_string());
+        }
+        let generation = Arc::clone(&self.coordinator.owner).lock_owned().await;
+        if !std::sync::Weak::ptr_eq(&generation, &Arc::downgrade(&self.owner)) {
+            return Err("a newer instance of the table persists its runs".to_string());
+        }
+        let views = views();
+        if !distinct_dirs(views.iter().map(|(dir, _)| dir.as_str())) {
+            return Err("two keys share a run directory".to_string());
+        }
+        self.sync_views(&views).await?;
+        Ok(PersistedRunsHold { _owner: generation })
     }
 
     fn path(&self, key: &str, run_name: &str) -> object_store::path::Path {
@@ -3177,13 +3220,14 @@ pub(crate) type ListLive =
 /// background by reading them back, and publishes the runs against the file
 /// set `list_live` reports once they are built, so a file that left the set
 /// meanwhile is never covered. Failures leave those files read in full
-/// until the schedule allows another attempt.
+/// until the schedule allows another attempt. The returned handle finishes once
+/// the build has published or given up.
 pub(crate) fn spawn_build(
     claim: BuildClaim,
     store: Arc<dyn ObjectStore>,
     files: Vec<IndexedFile>,
     list_live: ListLive,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let state = Arc::clone(&claim.state);
         let table = state.table_name.clone();
@@ -3228,7 +3272,7 @@ pub(crate) fn spawn_build(
                 claim.unpublished();
             }
         }
-    });
+    })
 }
 
 /// One run builder per key over `files`, read back from the finished files.
@@ -4815,6 +4859,161 @@ mod tests {
             state.counters().partial,
             1,
             "one probe per filter generation"
+        );
+    }
+
+    /// The files at the bottom of `plan`'s chain of single-child nodes.
+    fn planned_files(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Vec<String> {
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+        if let Some(config) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        {
+            return config
+                .file_groups
+                .iter()
+                .flat_map(FileGroup::iter)
+                .map(|file| file.object_meta.location.to_string())
+                .collect();
+        }
+        plan.children()
+            .into_iter()
+            .flat_map(planned_files)
+            .collect()
+    }
+
+    /// A runtime-restricted scan of two indexed files, holding keys 1 and 2,
+    /// whose hash-join filter has not been published yet, with that filter
+    /// and its key column.
+    async fn restricted_scan_of_two_files() -> (
+        super::super::runtime_restricted_scan::RuntimeRestrictedScanExec,
+        Arc<DynamicFilterPhysicalExpr>,
+        Arc<dyn PhysicalExpr>,
+    ) {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[
+                ("a.vortex", 0, keyed_batch(&[Some(1)], &[None])),
+                ("b.vortex", 0, keyed_batch(&[Some(2)], &[None])),
+            ],
+        )
+        .await;
+        let provider = Arc::new(DynamicLookupAccessPlanProvider::new(
+            Arc::clone(&state),
+            state.published(),
+            Arc::new([
+                scan_file(path("a.vortex").as_ref()),
+                scan_file(path("b.vortex").as_ref()),
+            ]),
+            None,
+        ));
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        let file = |name: &str| PartitionedFile::new(path(name).to_string(), 1);
+        let input = DataSourceExec::from_data_source(
+            FileScanConfigBuilder::new(
+                ObjectStoreUrl::local_filesystem(),
+                Arc::new(
+                    ParquetSource::new(keyed_schema())
+                        .with_predicate(Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>),
+                ),
+            )
+            .with_file_groups(vec![
+                FileGroup::new(vec![file("a.vortex")]),
+                FileGroup::new(vec![file("b.vortex")]),
+            ])
+            .build(),
+        );
+        (
+            super::super::runtime_restricted_scan::RuntimeRestrictedScanExec::new(input, provider),
+            dynamic,
+            column,
+        )
+    }
+
+    /// Regression test: a partition that starts after the join publishes its
+    /// keys runs the scan a partition that started before them chose. A file
+    /// scan's partitions drain one queue of files per plan, so the narrowed
+    /// scan it would otherwise run reads files the unrestricted scan's
+    /// partitions also read. TPC-H q11 over an index on `supplier.s_nationkey`
+    /// read every German supplier twice that way and returned 6 of its 1048
+    /// rows.
+    #[tokio::test]
+    async fn a_partition_starting_after_the_keys_runs_the_scan_chosen_before_them() {
+        let (scan, dynamic, column) = restricted_scan_of_two_files().await;
+
+        let before_keys = scan
+            .chosen_scan()
+            .await
+            .expect("the first partition's scan");
+        dynamic
+            .update(tenant_in_list(&column, &[1]))
+            .expect("the build side's keys");
+        dynamic.mark_complete();
+        let after_keys = scan
+            .chosen_scan()
+            .await
+            .expect("the second partition's scan");
+
+        assert_eq!(
+            planned_files(&before_keys),
+            vec![
+                "table/snapshot/a.vortex".to_string(),
+                "table/snapshot/b.vortex".to_string()
+            ],
+            "with no keys published the scan reads every file"
+        );
+        assert!(
+            Arc::ptr_eq(&before_keys, &after_keys),
+            "the second partition ran a separately narrowed scan over {:?}, which the first \
+             partition's unrestricted scan also reads",
+            planned_files(&after_keys)
+        );
+    }
+
+    /// Regression test: every partition of one execution runs the scan the
+    /// first partition chose, even when a later probe resolves the same keys to
+    /// a new selection, as a new generation of the filter does.
+    #[tokio::test]
+    async fn every_partition_of_a_restricted_scan_runs_the_plan_the_first_chose() {
+        let (scan, dynamic, column) = restricted_scan_of_two_files().await;
+        dynamic
+            .update(tenant_in_list(&column, &[1]))
+            .expect("the build side's keys");
+        dynamic.mark_complete();
+
+        let first = scan
+            .chosen_scan()
+            .await
+            .expect("the first partition's scan");
+        dynamic
+            .update(tenant_in_list(&column, &[1]))
+            .expect("the same keys, a later generation");
+        let second = scan
+            .chosen_scan()
+            .await
+            .expect("the second partition's scan");
+
+        assert_eq!(
+            planned_files(&first),
+            vec!["table/snapshot/a.vortex".to_string()],
+            "the index narrows the scan to the file holding key 1"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second partition ran a separately narrowed scan, which reads {:?} again",
+            planned_files(&second)
         );
     }
 

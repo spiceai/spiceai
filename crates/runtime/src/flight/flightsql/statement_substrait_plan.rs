@@ -30,11 +30,13 @@ use arrow_flight::{
 };
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
+use datafusion_substrait::extensions::Extensions;
+use datafusion_substrait::logical_plan::consumer::from_substrait_plan_with_consumer;
 use datafusion_substrait::substrait::proto::Plan;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
+use super::substrait_consumer::SpiceSubstraitConsumer;
 use crate::datafusion::query::QueryBuilder;
 use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::datafusion::sql_validator::validate_sql_query_read_only;
@@ -81,7 +83,15 @@ async fn decode_plan(
     let (proto, cache_key) = decode_plan_proto(cmd)?;
 
     let session = datafusion.ctx.state();
-    let plan = from_substrait_plan(&session, &proto)
+    let extensions = Extensions::try_from(&proto.extensions).map_err(map_substrait_error)?;
+    // `from_substrait_plan` refuses these too; the consumer below cannot see them.
+    if !extensions.type_variations.is_empty() {
+        return Err(map_substrait_error(DataFusionError::NotImplemented(
+            "Type variation extensions are not supported".to_string(),
+        )));
+    }
+    let consumer = SpiceSubstraitConsumer::new(&extensions, &session);
+    let plan = from_substrait_plan_with_consumer(&consumer, &proto)
         .await
         .map_err(map_substrait_error)?;
 
@@ -108,7 +118,7 @@ fn map_substrait_error(e: DataFusionError) -> Status {
         DataFusionError::NotImplemented(msg) => {
             Status::unimplemented(format!("Substrait feature not supported: {msg}"))
         }
-        other => handle_datafusion_error(other),
+        other => handle_datafusion_error(&other),
     }
 }
 
@@ -133,7 +143,10 @@ pub(crate) async fn get_flight_info(
     }
 
     let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion)).build();
-    let (dataset_schema, _) = query.get_schema().await.map_err(handle_datafusion_error)?;
+    let (dataset_schema, _) = query
+        .get_schema()
+        .await
+        .map_err(|e| handle_datafusion_error(&e))?;
     let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
 
     let fd = request.into_inner();
@@ -222,7 +235,7 @@ mod tests {
 
         let df = Arc::new(
             DataFusion::builder(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
                 tokio::runtime::Handle::current(),
             )
@@ -268,6 +281,268 @@ mod tests {
             Arc::new(arrow::array::StringArray::from(vec!["EUROPE"])) as arrow::array::ArrayRef,
         )])?;
         assert_eq!(batches, vec![expected]);
+        Ok(())
+    }
+
+    /// Guards the spiceai/datafusion patch that reads a Substrait string field
+    /// over a string column of any width (`docs/dev/fork_patches.md`). Spice
+    /// serves a file dataset's strings as `LargeUtf8`, and a producer other than
+    /// `DataFusion` declares them `string` or `varchar` with no width; without the
+    /// patch, `decode_plan` refuses every such plan, because the declared `Utf8`
+    /// field differs from the table's `LargeUtf8` column.
+    #[tokio::test]
+    async fn decode_plan_reads_a_large_string_column_a_plan_declares_as_string()
+    -> Result<(), anyhow::Error> {
+        use arrow::array::{ArrayRef, Int32Array, LargeStringArray, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use datafusion_substrait::{
+            logical_plan::producer::to_substrait_plan,
+            substrait::proto::{
+                ReadRel, Rel,
+                plan_rel::RelType as PlanRelType,
+                rel::RelType,
+                r#type::{Kind, VarChar},
+            },
+        };
+
+        fn region(names: ArrayRef) -> Result<Arc<MemTable>, anyhow::Error> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("r_regionkey", DataType::Int32, false),
+                Field::new("r_name", names.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![0, 1, 3])), names],
+            )?;
+            Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        }
+
+        fn read_rel(rel: &mut Rel) -> Option<&mut ReadRel> {
+            match rel.rel_type.as_mut()? {
+                RelType::Read(read) => Some(read),
+                RelType::Project(project) => read_rel(project.input.as_mut()?),
+                RelType::Filter(filter) => read_rel(filter.input.as_mut()?),
+                _ => None,
+            }
+        }
+
+        // The producer's catalog declares `r_name` as `Utf8`, which DataFusion
+        // writes as a Substrait `string` with no width.
+        let producer = SessionContext::new();
+        producer.register_table(
+            "region",
+            region(Arc::new(StringArray::from(vec![
+                "AFRICA", "AMERICA", "EUROPE",
+            ])))?,
+        )?;
+        let plan = producer
+            .sql("SELECT r_name FROM region WHERE r_regionkey = 3")
+            .await?
+            .into_optimized_plan()?;
+        let as_string = *to_substrait_plan(&plan, &producer.state())?;
+
+        // The same plan as Isthmus writes it: `r_name` declared `varchar(25)`.
+        let mut as_varchar = as_string.clone();
+        let Some(PlanRelType::Root(root)) = as_varchar.relations[0].rel_type.as_mut() else {
+            panic!("expected a root relation");
+        };
+        let read = root
+            .input
+            .as_mut()
+            .and_then(read_rel)
+            .expect("the plan reads region");
+        let schema = read.base_schema.as_mut().expect("a read has a base schema");
+        let r_name = schema
+            .names
+            .iter()
+            .position(|name| name == "r_name")
+            .expect("the base schema names r_name");
+        let r_name_type = &mut schema
+            .r#struct
+            .as_mut()
+            .expect("the base schema has a struct")
+            .types[r_name];
+        let Some(Kind::String(string)) = r_name_type.kind.as_ref() else {
+            panic!("expected r_name as a Substrait string, got {r_name_type:?}");
+        };
+        r_name_type.kind = Some(Kind::Varchar(VarChar {
+            length: 25,
+            type_variation_reference: 0,
+            nullability: string.nullability,
+        }));
+
+        // Spice serves the same table with `LargeUtf8` strings.
+        let df = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        df.ctx.register_table(
+            "region",
+            region(Arc::new(LargeStringArray::from(vec![
+                "AFRICA", "AMERICA", "EUROPE",
+            ])))?,
+        )?;
+
+        let expected = RecordBatch::try_from_iter([(
+            "r_name",
+            Arc::new(LargeStringArray::from(vec!["EUROPE"])) as ArrayRef,
+        )])?;
+        for (declared, proto) in [("string", as_string), ("varchar", as_varchar)] {
+            let (decoded, _) = decode_plan(
+                &cmd(Some(SubstraitPlan {
+                    plan: Bytes::from(proto.encode_to_vec()),
+                    version: "0.62.0".to_string(),
+                })),
+                &df,
+            )
+            .await
+            .map_err(|status| anyhow::anyhow!("r_name declared {declared}: {status}"))?;
+            let batches = df
+                .ctx
+                .execute_logical_plan(decoded)
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(
+                batches,
+                vec![expected.clone()],
+                "r_name declared {declared}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The session registers `datafusion-spark`'s `like` and `ilike`, and
+    /// `datafusion-substrait` resolves a Substrait `like` to a same-named UDF
+    /// first. Unless `decode_plan` lowers it to `Expr::Like`, the unparser sends
+    /// a `DuckDB` acceleration `like(a, b)`, which `DuckDB` has no function for
+    /// (regression test for #15290). A pattern with a backslash must also carry
+    /// `ESCAPE '\'`: `DuckDB` has no default escape character, so without it the
+    /// pushed-down `LIKE` matches different rows than `DataFusion` evaluates.
+    #[tokio::test]
+    async fn decode_plan_lowers_a_substrait_like_to_a_like_expression() -> Result<(), anyhow::Error>
+    {
+        use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::sql::unparser::{Unparser, dialect::DuckDBDialect};
+        use datafusion_substrait::logical_plan::producer::to_substrait_plan;
+
+        let df = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p_type", DataType::Utf8, false),
+            Field::new("p_size", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "LARGE BRASS",
+                    "SMALL TIN",
+                    "PROMO brass",
+                    "a_b",
+                    r"a\_b",
+                    "50%",
+                    "50x",
+                ])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![15, 15, 3, 4, 5, 6, 7])),
+            ],
+        )?;
+        df.ctx.register_table(
+            "part",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
+
+        // (query, expected rows, whether the `DuckDB` SQL must name the escape)
+        let queries = [
+            (
+                "SELECT p_type FROM part WHERE p_size = 15 AND p_type LIKE '%BRASS' ORDER BY p_type",
+                "+-------------+\n| p_type      |\n+-------------+\n| LARGE BRASS |\n+-------------+",
+                false,
+            ),
+            (
+                "SELECT sum(CASE WHEN p_type LIKE 'PROMO%' THEN p_size ELSE 0 END) AS promo FROM part",
+                "+-------+\n| promo |\n+-------+\n| 3     |\n+-------+",
+                false,
+            ),
+            (
+                "SELECT p_type FROM part WHERE p_type ILIKE '%brass' AND p_type NOT LIKE 'LARGE%' ORDER BY p_type",
+                "+-------------+\n| p_type      |\n+-------------+\n| PROMO brass |\n+-------------+",
+                false,
+            ),
+            (
+                "SELECT p_type FROM part WHERE p_size IN (SELECT p_size FROM part WHERE p_type LIKE 'L%') ORDER BY p_type",
+                "+-------------+\n| p_type      |\n+-------------+\n| LARGE BRASS |\n| SMALL TIN   |\n+-------------+",
+                false,
+            ),
+            (
+                r"SELECT p_type FROM part WHERE p_type LIKE '%a\_b%' ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| a_b    |\n+--------+",
+                true,
+            ),
+            (
+                r"SELECT p_type FROM part WHERE p_type LIKE '50\%' ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
+                true,
+            ),
+            // The bytes of `50\%`: a cast pattern is not known to be backslash-free.
+            (
+                "SELECT p_type FROM part WHERE p_type LIKE CAST(X'35305C25' AS VARCHAR) ORDER BY p_type",
+                "+--------+\n| p_type |\n+--------+\n| 50%    |\n+--------+",
+                true,
+            ),
+        ];
+        for (sql, expected, names_escape) in queries {
+            let plan = df.ctx.sql(sql).await?.into_unoptimized_plan();
+            let proto = to_substrait_plan(&plan, &df.ctx.state())?;
+            let (decoded, _) = decode_plan(
+                &cmd(Some(SubstraitPlan {
+                    plan: Bytes::from(proto.encode_to_vec()),
+                    version: "0.63.0".to_string(),
+                })),
+                &df,
+            )
+            .await
+            .map_err(|status| anyhow::anyhow!("{sql}: {status}"))?;
+
+            let duckdb_sql = Unparser::new(&DuckDBDialect::new())
+                .plan_to_sql(&decoded)?
+                .to_string();
+            assert!(
+                !duckdb_sql.contains("like(") && duckdb_sql.contains("LIKE"),
+                "{sql} unparsed for DuckDB as: {duckdb_sql}"
+            );
+            assert_eq!(
+                duckdb_sql.contains(r"ESCAPE '\'"),
+                names_escape,
+                "{sql} unparsed for DuckDB as: {duckdb_sql}"
+            );
+
+            let batches = df
+                .ctx
+                .execute_logical_plan(decoded)
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+                expected,
+                "{sql}"
+            );
+        }
         Ok(())
     }
 

@@ -145,10 +145,15 @@ fn main() {
         return;
     }
 
+    // Before the runtime opens a listener or an acceleration file, so every file
+    // and connection it holds counts against the raised limit. Logged by `run`
+    // once its subscriber, and the verbosity it is configured with, is installed.
+    args.open_file_limit = spiced::open_file_limit::raise();
+
     // Nothing may log before this: the banner dates the run and names the build, so
     // a line above it belongs to a build the reader cannot identify. Anything that
-    // resolves earlier — the crash-handler attach above, the spicepod, the CPU
-    // budget — reports here or later.
+    // resolves earlier — the crash-handler attach above, the open file limit, the
+    // spicepod, the CPU budget — reports here or later.
     in_tracing_context(|| {
         log_startup_banner();
         if let Err(err) = &crash_reporting {
@@ -169,6 +174,10 @@ fn main() {
     // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");
+    // Last, so the fatal error above and `Goodbye!` reach the OpenTelemetry
+    // endpoint too: log export runs on its own runtime, which outlives the
+    // query runtime that `load_and_run` has already dropped.
+    spiced::otel_logs::shutdown();
     if runtime_failed {
         // Preserve startup and runtime failures in the process status observed
         // by the foreground launcher or supervisor.

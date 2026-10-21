@@ -985,6 +985,7 @@ mod tests {
     use datafusion::arrow::array::record_batch;
     use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::datatypes::Schema;
+    use datafusion::arrow::datatypes::TimeUnit;
     use datafusion::arrow::datatypes::UInt32Type;
     use datafusion::arrow::util::display::FormatOptions;
     use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
@@ -2542,6 +2543,94 @@ mod tests {
                 (Some(100), false, 3),
                 (Some(100), true, 0),
             ]
+        );
+        Ok(())
+    }
+
+    /// A `TopK` dynamic filter over a view
+    /// that casts a `timestamp[ms]` column to `TIMESTAMP` reaches the scan as
+    /// `CAST(ts AS Timestamp(ns)) >= <ns literal>` once another `UNION` branch has
+    /// filled it. Vortex has no kernel for a timestamp unit change, so pushing that
+    /// conjunct into the scan failed the whole query while building zone pruning. The
+    /// conjunct must stay above the scan, where `DataFusion` evaluates it, and the scan
+    /// must return every row.
+    ///
+    /// The identity cast and the cast to the stored integer are controls: Vortex
+    /// evaluates both, so the scan filters.
+    #[rstest]
+    #[case::unit_change(
+        "kept_above",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ScalarValue::TimestampNanosecond(Some(2_000_000_000), None)
+    )]
+    #[case::unit_change_keeping_timezone(
+        "kept_above",
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        ScalarValue::TimestampNanosecond(Some(2_000_000_000), Some(Arc::from("UTC")))
+    )]
+    #[case::timezone_change(
+        "kept_above",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        ScalarValue::TimestampMillisecond(Some(2_000), None)
+    )]
+    #[case::identity(
+        "pushed_down",
+        DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        ScalarValue::TimestampMillisecond(Some(2_000), Some(Arc::from("UTC")))
+    )]
+    #[case::stored_integer("pushed_down", DataType::Int64, ScalarValue::Int64(Some(2_000)))]
+    #[tokio::test]
+    async fn dynamic_filter_casting_a_timestamp(
+        #[case] expected: &str,
+        #[case] target: DataType,
+        #[case] threshold: ScalarValue,
+    ) -> anyhow::Result<()> {
+        use datafusion::arrow::array::Array as _;
+        use datafusion::arrow::array::TimestampMillisecondArray;
+
+        let column = TimestampMillisecondArray::from(vec![Some(1_000), None, Some(3_000)])
+            .with_timezone("UTC");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                column.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(column)],
+        )?;
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "/path/timestamps.vortex";
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::builder(batch.schema()).build();
+
+        let ts = Arc::new(df_expr::Column::new("ts", 0)) as PhysicalExprRef;
+        let current = Arc::new(df_expr::BinaryExpr::new(
+            Arc::new(df_expr::CastExpr::new(Arc::clone(&ts), target, None)),
+            Operator::GtEq,
+            Arc::new(df_expr::Literal::new(threshold)),
+        )) as PhysicalExprRef;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![ts],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter.update(current)?;
+
+        let opener = make_opener(
+            object_store,
+            table_schema,
+            Some(dynamic_filter as PhysicalExprRef),
+        );
+        let batches = opener
+            .open(PartitionedFile::new(file_path.to_string(), data_size))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let format_options = FormatOptions::default().with_null("NULL");
+        assert_snapshot!(
+            format!("dynamic_filter_casting_a_timestamp_{expected}"),
+            pretty_format_batches_with_options(&batches, &format_options)?.to_string()
         );
         Ok(())
     }

@@ -371,8 +371,9 @@ pub fn rewrite_data_type(dt: &DataType, rules: &[&dyn TypeRewriteRule]) -> DataT
 /// `ARROW:extension:*` keys are permitted, since none of them changes how a value is read — except
 /// that a nested field going nullable → non-nullable is refused unless the child it describes
 /// provably holds no logical null, since a schema that understates its nulls is read as fact by
-/// the planner. Also returns an `ArrowError` when `target_type` does not describe the layout
-/// `data` holds.
+/// the planner, and except beneath a nested field that carries an extension type, whose storage
+/// layout is part of the extension's definition and so has to match exactly. Also returns an
+/// `ArrowError` when `target_type` does not describe the layout `data` holds.
 pub fn relabel_array_data(
     data: ArrayData,
     target_type: &DataType,
@@ -962,6 +963,11 @@ fn ensure_relabel_is_metadata_only(source: &DataType, target: &DataType) -> Resu
 /// across schemas whose fields differ in exactly that way — rejecting all metadata differences
 /// would refuse a correct relabel to guard something that is not a reinterpretation.
 ///
+/// A field that carries an extension type also owns the storage type beneath it: the extension
+/// is declared over one layout, nested field names and nullability included, so under a kept
+/// label the storage has to match exactly — the renames and nullability changes the walk admits
+/// for a bare type are refused there (#13456).
+///
 /// A field's `dict_is_ordered` is checked here for the same reason and needs checking *here*
 /// specifically: it claims the dictionary's values carry an order, which is a statement about what
 /// the same key buffer means, exactly as `Map`'s `sorted` flag is. It lives on the field rather
@@ -1010,7 +1016,41 @@ fn ensure_field_relabel_is_metadata_only(source: &Field, target: &Field) -> Resu
             ));
         }
     }
+
+    // The walk above admits renames, nullability flips and descriptive metadata below this field,
+    // which is wrong under a kept extension label (see the doc comment). No caller relabels under
+    // an extension type today, so every storage change is refused rather than some registry of
+    // per-extension exceptions; `DataType`'s `PartialEq` compares nested fields whole (name,
+    // type, nullability, metadata), which is exactly the comparison that needs to hold.
+    if let Some(extension) = source.extension_type_name()
+        && source.data_type() != target.data_type()
+    {
+        return Err(relabel_changes_extension_storage(source, target, extension));
+    }
     Ok(())
+}
+
+/// The error [`ensure_field_relabel_is_metadata_only`] reports when a field keeps its extension
+/// type while the storage type under it changes.
+fn relabel_changes_extension_storage(
+    source: &Field,
+    target: &Field,
+    extension: &str,
+) -> ArrowError {
+    // Field names, the extension name and the rendered storage types (which embed nested field
+    // names) all come from the schema, so escape them: an embedded newline would break the
+    // one-line contract this error is read under, and split one log record into two.
+    ArrowError::InvalidArgumentError(format!(
+        "Cannot relabel the Arrow field '{}' as '{}': both carry the extension type `{}`, but the \
+         storage type under it differs ({} vs {}), which would republish the same values as that \
+         extension over a storage layout it does not define. Convert the values instead of \
+         relabelling them.",
+        source.name().escape_debug(),
+        target.name().escape_debug(),
+        extension.escape_debug(),
+        source.data_type().to_string().escape_debug(),
+        target.data_type().to_string().escape_debug(),
+    ))
 }
 
 /// The error [`ensure_field_relabel_is_metadata_only`] reports for a changed `dict_is_ordered`.
@@ -1101,11 +1141,11 @@ pub(crate) fn target_child_types(target_type: &DataType) -> Vec<&DataType> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow::array::{
-        Array, ArrayRef, DictionaryArray, Int32Array, ListArray, RunArray, StringArray,
-        StructArray, UnionArray,
+        Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, ListArray, RunArray,
+        StringArray, StructArray, UnionArray,
     };
     use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
     use arrow::datatypes::Int32Type;
@@ -2062,6 +2102,106 @@ mod tests {
         );
     }
 
+    /// The storage struct an extension type such as `arrow.timestamp_with_offset` is declared
+    /// over: two non-nullable children, named as the extension defines them. Shared with the
+    /// record-batch cast tests, which route the same shape away from the relabel path.
+    pub(crate) fn extension_storage(first_name: &str, first_nullable: bool) -> DataType {
+        DataType::Struct(Fields::from(vec![
+            Field::new(first_name, DataType::Int64, first_nullable),
+            Field::new("offset_minutes", DataType::Int16, false),
+        ]))
+    }
+
+    /// A nullable list item field labelled `arrow.timestamp_with_offset` over `storage`, with a
+    /// descriptive `comment` beside the label when one is given.
+    pub(crate) fn extension_item(storage: DataType, comment: Option<&str>) -> Arc<Field> {
+        let mut metadata = std::collections::HashMap::from([(
+            EXTENSION_TYPE_NAME_KEY.to_owned(),
+            "arrow.timestamp_with_offset".to_owned(),
+        )]);
+        if let Some(comment) = comment {
+            metadata.insert("comment".to_owned(), comment.to_owned());
+        }
+        Arc::new(Field::new("item", storage, true).with_metadata(metadata))
+    }
+
+    /// A `List<item: Struct<timestamp, offset_minutes>>` whose item field carries an extension
+    /// type over that struct, plus a target that keeps the extension type and `comment` metadata
+    /// as given over `target_storage`.
+    fn list_of_extension_structs(
+        source_comment: Option<&str>,
+        target_storage: DataType,
+        target_comment: Option<&str>,
+    ) -> (ArrayData, DataType) {
+        let source_item = extension_item(extension_storage("timestamp", false), source_comment);
+        let DataType::Struct(fields) = source_item.data_type() else {
+            unreachable!("the storage is built as a struct above")
+        };
+        let values = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int16Array::from(vec![60, -30])) as ArrayRef,
+            ],
+            None,
+        );
+        let list = ListArray::new(
+            source_item,
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(values),
+            None,
+        );
+        (
+            list.to_data(),
+            DataType::List(extension_item(target_storage, target_comment)),
+        )
+    }
+
+    /// An extension type's storage layout is part of its definition, so a field that keeps its
+    /// extension label cannot have the storage under it renamed or loosened: the array would still
+    /// be labelled as the extension while its storage no longer satisfies it (#13456). The
+    /// data-type walk alone admits both changes — they are metadata-only for a bare struct.
+    #[test]
+    fn relabel_refuses_a_storage_change_under_an_extension_type() {
+        for (change, target_storage) in [
+            ("renamed child", extension_storage("ts", false)),
+            ("loosened child", extension_storage("timestamp", true)),
+        ] {
+            let (data, target) = list_of_extension_structs(None, target_storage, None);
+            let err = relabel_array_data(data, &target).expect_err(
+                "a storage change under a field that keeps its extension type must be refused: \
+                 the extension's storage layout is part of what the label claims",
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("arrow.timestamp_with_offset")
+                    && message.contains("'item'")
+                    && message.contains("storage"),
+                "the error for a {change} must name the field, the extension type and the \
+                 storage disagreement, got: {message}"
+            );
+        }
+    }
+
+    /// The guard above must not over-reject: with the storage identical, a change to the
+    /// extension-typed field's own descriptive metadata is still carried, as it is for any field.
+    #[test]
+    fn relabel_still_carries_descriptive_metadata_on_an_extension_typed_field() {
+        let (data, target) = list_of_extension_structs(
+            Some("physical"),
+            extension_storage("timestamp", false),
+            Some("logical"),
+        );
+        let relabelled = relabel_array_data(data, &target)
+            .expect("identical storage under the same extension type is metadata-only");
+        assert_eq!(relabelled.data_type(), &target);
+        assert_eq!(
+            relabelled.child_data()[0].child_data()[0].buffers(),
+            Int64Array::from(vec![1, 2]).to_data().buffers(),
+            "the storage buffers must be carried over untouched"
+        );
+    }
+
     /// `dict_is_ordered` claims the dictionary's values carry an order, so republishing unordered
     /// keys under it is the same class of reinterpretation as `Map`'s `sorted` flag, which this
     /// guard already refuses. It hides better: the flag lives on `Field` rather than in
@@ -2214,6 +2354,18 @@ mod tests {
         assert!(
             !err.contains('\n'),
             "the field name, the metadata key and the value are all schema-controlled, got: {err}"
+        );
+
+        let err = relabel_changes_extension_storage(
+            &Field::new(hostile, nested(hostile), true),
+            &Field::new("item", nested("item"), true),
+            "arrow.json\nvalue",
+        )
+        .to_string();
+        assert!(
+            !err.contains('\n'),
+            "the field name, the extension name and the rendered storage types are all \
+             schema-controlled, got: {err}"
         );
     }
 

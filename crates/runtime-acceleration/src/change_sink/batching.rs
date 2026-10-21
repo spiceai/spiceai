@@ -17,22 +17,80 @@ limitations under the License.
 //! Compatible CDC burst preparation for the table owner. Source acknowledgement
 //! and source control remain outside this module.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch};
+use arrow::compute::kernels::cmp::not_distinct;
+use arrow::compute::{cast, filter_record_batch};
+use arrow::datatypes::{DataType, Float64Type, SchemaRef};
+use arrow::util::display::array_value_to_string;
 use data_components::cdc::{self, ChangeOperation};
-use datafusion::common::TableReference;
+use datafusion::common::{ScalarValue, TableReference};
 use datafusion::error::{DataFusionError, Result};
 use opentelemetry::KeyValue;
 use runtime_metrics::acceleration as metrics;
 
 use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
-    ChangeBatch, ChangeCapabilities, ChangePayload, Recovery, SchemaEvolutionSupport, WriteOptions,
+    ChangeBatch, ChangeCapabilities, ChangePayload, Recovery, SchemaEvolutionSupport, ScopedInput,
+    SetKey, WriteOptions,
 };
+
+/// Refuse a change whose numeric values the accelerated table's column types
+/// cannot hold exactly.
+///
+/// A change proceeds without evolving the table when the source schema widened
+/// but the policy or the engine does not evolve it mid-stream, and it is then
+/// cast to the table's current types. A cast that rounds or overflows (`1.5` into
+/// an `Int32` column) would store a value the source does not hold and
+/// acknowledge the change. Refusing keeps the source position instead, so the
+/// change is applied once the table is evolved, at the next restart.
+///
+/// Each numeric column whose type differs from the target's is cast to the
+/// target type and back; every value must come back unchanged. `-0.0` stored as
+/// `0` counts as unchanged, as in every SQL cast to an integer.
+fn ensure_numbers_cast_exactly(data: &RecordBatch, target: &SchemaRef) -> Result<()> {
+    for (index, field) in data.schema().fields().iter().enumerate() {
+        let Ok(target_field) = target.field_with_name(field.name()) else {
+            continue;
+        };
+        let (from, to) = (field.data_type(), target_field.data_type());
+        if from == to || !from.is_numeric() || !to.is_numeric() {
+            continue;
+        }
+        let column = data.column(index);
+        let restored = cast(&cast(column, to)?, from)?;
+        let unchanged = not_distinct(column, &restored)?;
+        if unchanged.true_count() == unchanged.len() {
+            continue;
+        }
+        // `not_distinct` orders floats totally, so `-0.0` restored as `0.0`
+        // reads as changed; it is the one difference an integer cast may make.
+        let is_zero = |array: &ArrayRef, row: usize| -> Result<bool> {
+            let value = cast(&array.slice(row, 1), &DataType::Float64)?;
+            let value = value.as_primitive::<Float64Type>();
+            Ok(value.is_valid(0) && value.value(0) == 0.0)
+        };
+        let zero_kept = |row: usize| -> Result<bool> {
+            Ok(from.is_floating() && is_zero(column, row)? && is_zero(&restored, row)?)
+        };
+        for row in (0..unchanged.len()).filter(|&row| !unchanged.value(row)) {
+            if zero_kept(row)? {
+                continue;
+            }
+            let value = array_value_to_string(column, row)?;
+            return Err(DataFusionError::Execution(format!(
+                "Failed to apply a change to column '{}': its value {value} ({from}) cannot be stored in the accelerated column's type {to} without loss, so the change is refused rather than stored rounded. The source column's type changed and the acceleration has not adopted it: with `on_schema_change: sync_all_columns`, restart Spice to apply the schema change. See: https://spiceai.org/docs/features/data-acceleration",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CoalescingLimits {
@@ -77,6 +135,84 @@ pub(crate) struct AppendBurst {
     ingress: Arc<AppendIngress>,
     count: usize,
     bytes: usize,
+    scopes: BurstScopes,
+}
+
+/// The scopes of one coalesced Rows burst. The backend deletes every replaced
+/// scope before it appends any row, which equals applying the members in
+/// arrival order only while no replaced scope can hold another member's rows.
+/// A member that could overlap a replaced scope starts the next burst instead.
+#[derive(Default)]
+struct BurstScopes {
+    /// The column set shared by every indexed scope.
+    columns: Option<Vec<usize>>,
+    appended: HashSet<Vec<ScalarValue>>,
+    replaced: HashSet<Vec<ScalarValue>>,
+    /// An append scope that cannot be indexed may overlap a later replacement.
+    unindexed_append: bool,
+    /// A replacement that cannot be indexed admits no later member.
+    closed: bool,
+}
+
+impl BurstScopes {
+    /// Admit all scoped inputs of `batch`, or none of them.
+    fn admit(&mut self, batch: &ChangeBatch) -> bool {
+        let inputs = batch.scoped_inputs();
+        if self.closed
+            || (inputs.len() > 1
+                && (!self.replaced.is_empty() || inputs.iter().any(ScopedInput::replaces)))
+            || !inputs.iter().all(|input| self.permits(input))
+        {
+            return false;
+        }
+        for input in inputs {
+            self.record(input);
+        }
+        true
+    }
+
+    fn permits(&self, input: &ScopedInput) -> bool {
+        let values = self.indexed_values(input.scope());
+        if input.replaces() {
+            values.is_some_and(|values| {
+                !self.unindexed_append
+                    && !self.appended.contains(&values)
+                    && !self.replaced.contains(&values)
+            })
+        } else {
+            self.replaced.is_empty()
+                || values.is_some_and(|values| !self.replaced.contains(&values))
+        }
+    }
+
+    /// The scope's values when it hashes exactly and shares the burst's columns.
+    fn indexed_values(&self, scope: &SetKey) -> Option<Vec<ScalarValue>> {
+        let (columns, values) = scope.hash_identity()?;
+        self.columns
+            .as_ref()
+            .is_none_or(|shared| *shared == columns)
+            .then_some(values)
+    }
+
+    fn record(&mut self, input: &ScopedInput) {
+        match input.scope().hash_identity() {
+            Some((columns, values))
+                if self
+                    .columns
+                    .as_ref()
+                    .is_none_or(|shared| *shared == columns) =>
+            {
+                self.columns.get_or_insert(columns);
+                if input.replaces() {
+                    self.replaced.insert(values);
+                } else {
+                    self.appended.insert(values);
+                }
+            }
+            _ if input.replaces() => self.closed = true,
+            _ => self.unindexed_append = true,
+        }
+    }
 }
 
 impl AppendBurst {
@@ -90,12 +226,17 @@ impl AppendBurst {
             ));
         }
         let bytes = batch.estimated_bytes();
+        let mut scopes = BurstScopes::default();
+        for input in batch.scoped_inputs() {
+            scopes.record(input);
+        }
         Ok(Self {
             batch,
             options,
             ingress,
             count: 1,
             bytes,
+            scopes,
         })
     }
 
@@ -135,6 +276,8 @@ impl CoalescingBurst for AppendBurst {
                 .append_ingress()
                 .is_some_and(|ingress| Arc::ptr_eq(&self.ingress, ingress))
             || self.bytes.saturating_add(bytes) > self.ingress.limits.max_bytes.max(1)
+            || !self.batch.can_merge_append(&next)
+            || !self.scopes.admit(&next)
         {
             return ControlFlow::Break(next);
         }
@@ -415,7 +558,7 @@ impl CdcBurst {
             inputs
                 .into_iter()
                 .map(|batch| {
-                    let (ChangePayload::Cdc(rows), None) = batch.into_parts() else {
+                    let ChangePayload::Cdc(rows) = batch.into_payload() else {
                         return Err(DataFusionError::Internal(
                             "Non-CDC input in a CDC burst".into(),
                         ));
@@ -506,6 +649,35 @@ impl CdcBurst {
                 && capabilities.schema_evolution == SchemaEvolutionSupport::Live
             {
                 target = Arc::clone(&plan.evolved_schema);
+            }
+            if upserts
+                && matches!(schema, SchemaDecision::Proceed)
+                && !batch
+                    .data_schema()
+                    .fields()
+                    .iter()
+                    .zip(target.fields().iter())
+                    .all(|(incoming, current)| {
+                        incoming.name() == current.name()
+                            && incoming.data_type() == current.data_type()
+                    })
+            {
+                // A delete applies by primary key, which is never widened in
+                // place, so only the rows that write their values are checked.
+                let writes: BooleanArray = (0..batch.record.num_rows())
+                    .map(|row| {
+                        Some(matches!(
+                            batch.op(row),
+                            ChangeOperation::Create
+                                | ChangeOperation::Update
+                                | ChangeOperation::Read
+                        ))
+                    })
+                    .collect();
+                ensure_numbers_cast_exactly(
+                    &filter_record_batch(&batch.data_batch(), &writes)?,
+                    &target,
+                )?;
             }
             let mut options = self.options;
             if requires_durable_path(&batch, capabilities.deferred_deletes) {
@@ -605,4 +777,112 @@ fn concat(mut batches: Vec<cdc::ChangeBatch>) -> Result<cdc::ChangeBatch> {
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+
+    use super::*;
+
+    fn check(source: ArrayRef, target: DataType) -> Result<(), String> {
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "k",
+                source.data_type().clone(),
+                true,
+            )])),
+            vec![source],
+        )
+        .expect("batch");
+        let target = Arc::new(Schema::new(vec![Field::new("k", target, true)]));
+        ensure_numbers_cast_exactly(&data, &target).map_err(|e| e.to_string())
+    }
+
+    /// Regression test for #14718: a change cast to a narrower accelerated
+    /// column type is refused when the cast would change a value.
+    #[test]
+    fn a_change_proceeds_only_when_every_value_casts_exactly() {
+        let f64s = |v: Vec<Option<f64>>| -> ArrayRef { Arc::new(Float64Array::from(v)) };
+        assert_eq!(
+            check(
+                f64s(vec![Some(2.0), None, Some(-0.0), Some(-7.0)]),
+                DataType::Int32
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                Arc::new(Int64Array::from(vec![i64::from(i32::MIN)])),
+                DataType::Int32
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(Arc::new(Int32Array::from(vec![1, -1])), DataType::Int64),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                Arc::new(Int64Array::from(vec![12_345])),
+                DataType::Decimal128(10, 2)
+            ),
+            Ok(())
+        );
+
+        for (source, target, value, from) in [
+            (
+                f64s(vec![Some(2.0), Some(1.5)]),
+                DataType::Int32,
+                "1.5",
+                "Float64",
+            ),
+            (
+                f64s(vec![Some(f64::NAN)]),
+                DataType::Int32,
+                "NaN",
+                "Float64",
+            ),
+            (
+                f64s(vec![Some(f64::INFINITY)]),
+                DataType::Int64,
+                "inf",
+                "Float64",
+            ),
+            (
+                Arc::new(Int64Array::from(vec![i64::from(i32::MAX) + 1])) as ArrayRef,
+                DataType::Int32,
+                "2147483648",
+                "Int64",
+            ),
+            (
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_993])) as ArrayRef,
+                DataType::Float64,
+                "9007199254740993",
+                "Int64",
+            ),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![12_345])
+                        .with_precision_and_scale(10, 2)
+                        .expect("decimal"),
+                ) as ArrayRef,
+                DataType::Decimal128(10, 1),
+                "123.45",
+                "Decimal128(10, 2)",
+            ),
+        ] {
+            let to = target.to_string();
+            let message = check(source, target).expect_err("lossy cast is refused");
+            assert!(
+                message.contains(&format!(
+                    "Failed to apply a change to column 'k': its value {value} ({from}) cannot be stored in the accelerated column's type {to} without loss"
+                )),
+                "{message}"
+            );
+        }
+    }
 }

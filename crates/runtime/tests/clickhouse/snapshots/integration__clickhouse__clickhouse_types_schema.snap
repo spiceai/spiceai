@@ -1,0 +1,21 @@
+---
+source: crates/runtime/tests/clickhouse/mod.rs
+expression: schema
+---
+id: UInt32
+lc: Utf8
+lc_nullable: Utf8
+dt64_3: Timestamp(ms)
+dt64_tokyo: Timestamp(ns)
+dt_utc: Timestamp(s)
+arr: List(Utf8)
+map: Map("entries": non-null Struct("keys": non-null Utf8, "values": Int32), unsorted)
+tuple: Struct("1": Int32, "2": Utf8)
+named_tuple: Struct("id": Int64, "label": Utf8)
+enum8: Utf8
+enum16: Utf8
+u128: Decimal256(39, 0)
+i128: Decimal256(39, 0)
+ipv4: Utf8
+ipv6: Utf8
+nested: List(Struct("id": Int32, "tags": Map("entries": non-null Struct("keys": non-null Utf8, "values": List(Int32)), unsorted)))

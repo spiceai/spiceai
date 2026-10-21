@@ -38,6 +38,8 @@ use crate::{
     status,
 };
 use app::App;
+#[cfg(not(windows))]
+use runtime_acceleration::CayenneAccelerationDemand;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
 use runtime_metrics as metrics;
 use spicepod::component::caching::CacheKeyType;
@@ -45,12 +47,16 @@ use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
+use spicepod::component::runtime::{RENAMED_RUNTIME_TUNING_PARAMS, renamed_runtime_param_warning};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
+
+// Re-exported so `runtime::builder::CayenneWorkload` keeps resolving for downstream users.
+pub use runtime_acceleration::CayenneWorkload;
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -61,21 +67,6 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
-
-/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
-/// `runtime.params` and overridden per-dataset via the matching
-/// `acceleration.params` key (see `accelerator_cayenne`). `cayenne_goal_qph`
-/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
-/// is global-only and a per-dataset value is ignored. Declared here so the keys
-/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
-/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
-/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
-/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
-/// knob), not a target outcome, so it stays a per-dataset advanced override.
-const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
-const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
-const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
-const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -123,10 +114,6 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
-    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
-    CAYENNE_GOAL_FRESHNESS_PARAM,
-    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
-    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -158,9 +145,11 @@ fn known_runtime_params() -> Vec<&'static str> {
             + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
+            + spicepod::component::runtime::TUNING_TARGET_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(spicepod::component::runtime::TUNING_TARGET_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
@@ -344,6 +333,14 @@ impl RuntimeBuilder {
             tracing::warn!(
                 "Failed to initialize DataFusion tracer: {e}. Span context may not propagate correctly across async boundaries."
             );
+        }
+
+        // A cluster executor lends a task's slot while all of the task waits on
+        // remote I/O marked with `io_wait()`. Outside an executor task the hook
+        // does nothing. Process-wide, so a runtime built later in the same
+        // process keeps the hook the first one set.
+        match datafusion::common::runtime::set_io_wait_hook(&ballista_executor::VcoreHook) {
+            Ok(()) | Err(datafusion::common::runtime::IoWaitHookError::AlreadySet) => {}
         }
 
         // Cayenne compaction shutdown state is process-global. Reset it when a
@@ -642,12 +639,28 @@ impl RuntimeBuilder {
             Some(ClusterRole::Executor)
         );
 
+        // Every instance with `runtime.state` checks its location at startup. The
+        // features that keep state there write only once the check has passed.
+        let state_location_check = spicepod_rt
+            .state
+            .as_ref()
+            .map(|state| runtime_state_location::StateLocationCheck::new(&state.location));
+        if let Some(check) = &state_location_check
+            && self
+                .app
+                .as_deref()
+                .is_some_and(crate::state_location::snapshots_use_runtime_state)
+        {
+            check.record_feature(runtime_state_location::StateFeature::Snapshots);
+        }
+
         // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
         let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
         let http_rate_control_registry = build_http_rate_control_registry(
             spicepod_rt.source_rate_control.as_ref(),
             spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -656,6 +669,7 @@ impl RuntimeBuilder {
         let results_cache_warmer = crate::datafusion::query::build_results_cache_warmer(
             results_cache_warmup_enabled,
             spicepod_rt.state.as_ref(),
+            state_location_check.as_ref(),
             Arc::clone(&secrets),
             io_runtime.clone(),
         )
@@ -673,18 +687,17 @@ impl RuntimeBuilder {
         {
             Some(ClusterRole::Scheduler) => {
                 // For a real object store, cluster_state.bootstrap() is called by start_scheduler_registry.
-                if let Some(scheduler_config) = shared_app
+                if let Some(scheduler_state) = shared_app
                     .read()
                     .await
                     .as_ref()
-                    .and_then(|app| app.runtime.resolved_scheduler())
-                    && let Some(state_location) = scheduler_config.state_location.as_deref()
+                    .and_then(|app| app.runtime.scheduler_state())
                 {
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
                         io_runtime.clone(),
-                        state_location,
-                        &scheduler_config,
+                        &scheduler_state,
+                        state_location_check.as_ref(),
                     )
                     .await
                     {
@@ -774,6 +787,7 @@ impl RuntimeBuilder {
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                assignment_updates: Arc::default(),
                 outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
@@ -795,10 +809,17 @@ impl RuntimeBuilder {
         .temp_directory(query.temp_directory)
         .spill_compression(query.spill_compression)
         .with_task_history(task_history)
+        .with_query_error_logging(query.log_errors)
         .with_output_preview(output_preview)
         .with_caching(caching)
         .with_results_cache_warmup_enabled(results_cache_warmup_enabled)
         .with_results_cache_warmer(results_cache_warmer)
+        .with_runtime_state_location(
+            spicepod_rt
+                .state
+                .as_ref()
+                .map(|state| state.location.clone()),
+        )
         .with_metrics(metrics)
         .with_resource_monitor(resource_monitor.clone())
         .with_url_tables(url_tables_enabled)
@@ -889,9 +910,16 @@ impl RuntimeBuilder {
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             dataset_loads: Arc::default(),
+            model_loads: Arc::default(),
+            view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),
+            state_location_check: state_location_check.clone(),
         };
+
+        if let (Some(state), Some(check)) = (spicepod_rt.state.clone(), state_location_check) {
+            crate::state_location::spawn_check(&rt, state, check);
+        }
 
         // Executors: register cluster status before any concurrent
         // `load_components` / `start_servers` race so readiness cannot pass on
@@ -961,10 +989,16 @@ impl Default for RuntimeBuilder {
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (source_rate_control, &secrets, &io_runtime);
+    let _ = (
+        source_rate_control,
+        state_location_check,
+        &secrets,
+        &io_runtime,
+    );
     // `runtime.state` also serves the scheduler and results-cache warmup, so
     // setting it is not a request for cluster rate control: no warning.
     if runtime_state.is_some() {
@@ -982,6 +1016,7 @@ async fn build_http_rate_control_registry(
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
     runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    state_location_check: Option<&Arc<runtime_state_location::StateLocationCheck>>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
@@ -993,16 +1028,21 @@ async fn build_http_rate_control_registry(
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_state_location::build_object_store(
         secrets,
         io_runtime,
-        &state.location,
-        state.params.as_ref(),
-        "rate-control state",
+        &state.into(),
+        runtime_state_location::StateFeature::RateControl,
     )
     .await
     {
         Ok((store, base_prefix)) => {
+            let store = match state_location_check {
+                Some(check) => {
+                    check.guard(runtime_state_location::StateFeature::RateControl, store)
+                }
+                None => store,
+            };
             tracing::info!(
                 "Initialized persisted HTTP governor rate-control state with location: {}",
                 state.location
@@ -1181,6 +1221,15 @@ fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
         if known.contains(&key.as_str()) {
             continue;
         }
+        // A renamed key gets one message naming its replacement, not a second
+        // "not recognized" one.
+        if let Some((old, new)) = RENAMED_RUNTIME_TUNING_PARAMS
+            .iter()
+            .find(|(old, _)| *old == key.as_str())
+        {
+            tracing::warn!("{}", renamed_runtime_param_warning(old, new));
+            continue;
+        }
         if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
             tracing::warn!(
                 "runtime.params.{key} is not a recognized runtime parameter; did you mean '{suggestion}'? Ignoring."
@@ -1205,60 +1254,6 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
             );
             None
         }
-    }
-}
-
-/// What the Cayenne accelerations configured in a Spicepod will demand of the host,
-/// aggregated over every enabled one. Decides how much memory the runtime reserves
-/// outside the query pool and which dedicated thread pools it brings up.
-///
-/// Both flags are unions, so one CDC table in a pod of full-refresh tables still
-/// gets the full CDC-shaped reservation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CayenneWorkload {
-    /// Any enabled Cayenne acceleration at all.
-    configured: bool,
-    /// Any table on a profile that can hold rows in the off-pool in-memory CDC
-    /// tier. Gates the coordinated host-memory partition — the reduced query-pool
-    /// default and the global mem-tier byte budget — which exists solely to leave
-    /// room for that tier. A pod without one cannot fill it
-    /// (`cdc_durability` is forced to `file` off the small-write profile), so
-    /// fencing ~20% of host for it would shrink the query pool for nothing.
-    ///
-    /// Deliberately NOT narrowed to a file acceleration mode, unlike
-    /// `needs_compaction`: a `mode: memory` table holds its whole dataset in that
-    /// tier permanently, so it is the case that most needs the room reserved.
-    uses_cdc_tier: bool,
-    /// Any table that accumulates Vortex files for compaction to consolidate — a
-    /// file acceleration mode on a profile that is not a whole-table replace (see
-    /// `compacts_into_carved_pool`). Gates the dedicated compaction runtime and its
-    /// carved memory pool.
-    needs_compaction: bool,
-}
-
-impl CayenneWorkload {
-    #[must_use]
-    pub const fn is_configured(self) -> bool {
-        self.configured
-    }
-
-    #[must_use]
-    pub const fn uses_cdc_tier(self) -> bool {
-        self.uses_cdc_tier
-    }
-
-    #[must_use]
-    pub const fn needs_compaction(self) -> bool {
-        self.needs_compaction
-    }
-
-    /// Whether bringing up the dedicated compaction runtime is worthwhile. True
-    /// unless no configured Cayenne acceleration can produce files to compact — a
-    /// pod with no Cayenne at all still gets one, because a table created later by
-    /// DDL may compact and would otherwise fall back to the ambient runtime.
-    #[must_use]
-    pub const fn may_compact(self) -> bool {
-        !self.configured || self.needs_compaction
     }
 }
 
@@ -1360,12 +1355,10 @@ fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
         return CayenneWorkload::default();
     };
     cayenne_accelerations(app).fold(CayenneWorkload::default(), |workload, (accel, profile)| {
-        CayenneWorkload {
-            configured: true,
-            uses_cdc_tier: workload.uses_cdc_tier || profile.uses_cdc_tier,
-            needs_compaction: workload.needs_compaction
-                || compacts_into_carved_pool(&accel, profile),
-        }
+        workload.with_acceleration(CayenneAccelerationDemand {
+            uses_cdc_tier: profile.uses_cdc_tier,
+            needs_compaction: compacts_into_carved_pool(&accel, profile),
+        })
     })
 }
 
@@ -3656,6 +3649,7 @@ mod test {
             .iter()
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(spicepod::component::runtime::TUNING_TARGET_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {
             assert!(
@@ -3672,6 +3666,18 @@ mod test {
             known.len(),
             "duplicate keys in known_runtime_params()"
         );
+    }
+
+    #[test]
+    fn renamed_tuning_params_are_not_known_runtime_params() {
+        let known = known_runtime_params();
+        for (old, new) in RENAMED_RUNTIME_TUNING_PARAMS {
+            assert!(
+                !known.contains(old),
+                "`{old}` is no longer read, so it must not be recognized"
+            );
+            assert!(known.contains(new), "`{new}` must be recognized");
+        }
     }
 
     #[test]

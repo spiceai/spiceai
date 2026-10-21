@@ -104,7 +104,9 @@ use runtime_datafusion::{
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_metrics::telemetry::track_bytes_processed;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use spicepod::component::runtime::{CteMaterialization, SpillCompression as SpiceSpillCompression};
+use spicepod::component::runtime::{
+    CteMaterialization, QueryErrorLogging, SpillCompression as SpiceSpillCompression,
+};
 use spicepod::metric::Metrics;
 use tokio::{
     runtime::Handle,
@@ -357,11 +359,13 @@ pub struct DataFusionBuilder {
     accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
     query_admission_semaphore: Option<Arc<Semaphore>>,
     task_history_enabled: bool,
+    query_error_logging: QueryErrorLogging,
     output_preview: OutputPreview,
     caching: Option<Arc<Caching>>,
     results_cache_warmup_store: Option<std::path::PathBuf>,
     results_cache_warmup_enabled: bool,
     results_cache_warmer: Option<super::query::ResultsCacheWarmer>,
+    runtime_state_location: Option<String>,
     spill_compression: Option<SpillCompression>,
     cluster_config: Option<Arc<ResolvedClusterConfig>>,
     metrics: Option<Metrics>,
@@ -375,7 +379,7 @@ pub struct DataFusionBuilder {
     /// memory pool. `Some` only when dedicated thread pools are enabled AND at
     /// least one enabled Cayenne acceleration can compact into it — a file
     /// acceleration mode on a profile that accumulates files (set by the Runtime
-    /// builder; see [`crate::builder::CayenneWorkload::needs_compaction`]). `None`
+    /// builder; see [`runtime_acceleration::CayenneWorkload::needs_compaction`]). `None`
     /// leaves the full budget to queries and gives compaction no separate pool; it
     /// then accounts against the query pool, as it does with no Cayenne at all.
     compaction_memory_fraction: Option<f64>,
@@ -388,7 +392,7 @@ pub struct DataFusionBuilder {
     /// What the pod's Cayenne accelerations demand of the host, classified by the
     /// Runtime builder from the Spicepod. Gates the coordinated host-memory
     /// partition, which exists solely to leave room for the in-memory CDC tier.
-    cayenne_workload: crate::builder::CayenneWorkload,
+    cayenne_workload: runtime_acceleration::CayenneWorkload,
     /// Whether `runtime.params.dedicated_thread_pool` leaves the dedicated pools on
     /// (set by the Runtime builder; the default is on). The in-memory CDC tier
     /// budget is installed by `install_cayenne_global_budgets`, which `spiced` only
@@ -488,11 +492,13 @@ impl DataFusionBuilder {
             accelerated_refresh_semaphore: None,
             query_admission_semaphore: None,
             task_history_enabled: true,
+            query_error_logging: QueryErrorLogging::default(),
             output_preview: OutputPreview::Build,
             caching: None,
             results_cache_warmup_store: None,
             results_cache_warmup_enabled: false,
             results_cache_warmer: None,
+            runtime_state_location: None,
             spill_compression: None,
             cluster_config: None,
             metrics: None,
@@ -504,7 +510,7 @@ impl DataFusionBuilder {
             cayenne_footer_cache_mb: None,
             compaction_memory_fraction: None,
             cayenne_reservation_bytes: 0,
-            cayenne_workload: crate::builder::CayenneWorkload::default(),
+            cayenne_workload: runtime_acceleration::CayenneWorkload::default(),
             dedicated_thread_pools_enabled: true,
             duckdb_query_pool_cap: None,
             cayenne_optimizer_rules: CayenneOptimizerRules::default(),
@@ -518,6 +524,13 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_task_history(mut self, task_history: bool) -> Self {
         self.task_history_enabled = task_history;
+        self
+    }
+
+    /// Which failed queries are logged; `runtime.query.log_errors`.
+    #[must_use]
+    pub fn with_query_error_logging(mut self, query_error_logging: QueryErrorLogging) -> Self {
+        self.query_error_logging = query_error_logging;
         self
     }
 
@@ -544,6 +557,14 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_results_cache_warmup_enabled(mut self, enabled: bool) -> Self {
         self.results_cache_warmup_enabled = enabled;
+        self
+    }
+
+    /// The spicepod's `runtime.state.location`, which snapshot notifications
+    /// route by.
+    #[must_use]
+    pub fn with_runtime_state_location(mut self, location: Option<String>) -> Self {
+        self.runtime_state_location = location;
         self
     }
 
@@ -729,7 +750,7 @@ impl DataFusionBuilder {
     /// What the pod's Cayenne accelerations demand of the host. Gates the
     /// coordinated host-memory partition; see the field docs.
     #[must_use]
-    pub fn cayenne_workload(mut self, workload: crate::builder::CayenneWorkload) -> Self {
+    pub fn cayenne_workload(mut self, workload: runtime_acceleration::CayenneWorkload) -> Self {
         self.cayenne_workload = workload;
         self
     }
@@ -1172,7 +1193,7 @@ impl DataFusionBuilder {
             if let Some(registry) = &self.executor_registry {
                 let reg = Arc::clone(registry);
                 let addresses: ExecutorAddressProvider =
-                    Arc::new(move || reg.ready_executor_ids_sync());
+                    Arc::new(move || reg.ready_executor_addresses_sync());
                 // The primary gate is the scale-invariant cost test
                 // (dim_rows × executors < fact_rows); this is the absolute cap
                 // on the broadcast dimension's row count to bound per-executor
@@ -1345,7 +1366,10 @@ impl DataFusionBuilder {
                 // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                    Arc::new(AcceleratedPartitionProvider::from_registry(
+                        Arc::clone(executor_registry),
+                        self.partition_service.as_ref().map(|service| Arc::clone(&service.app)),
+                    ))
                         as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
@@ -1434,6 +1458,7 @@ impl DataFusionBuilder {
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
             change_generations: super::change_generations::ChangeGenerations::default(),
             bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_writers: parking_lot::Mutex::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
@@ -1445,16 +1470,20 @@ impl DataFusionBuilder {
             write_stats_notify: tokio::sync::Notify::new(),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
             snapshot_notifications: Arc::new(
-                runtime_acceleration::snapshot::notifications::SnapshotNotifications::default(),
+                runtime_acceleration::snapshot::notifications::SnapshotNotifications::new(
+                    self.runtime_state_location,
+                ),
             ),
             dataset_placements: dashmap::DashMap::new(),
             accelerator_engine_registry: self.accelerator_engine_registry,
             acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
             query_admission_semaphore: self.query_admission_semaphore,
             task_history_enabled: self.task_history_enabled,
+            query_error_logging: self.query_error_logging,
             task_history_captured_output: self.output_preview == OutputPreview::Build,
             temp_directory: self.temp_directory.clone(),
             cpu_runtime: OnceLock::new(),
+            interactive_runtime: OnceLock::new(),
             refresh_runtime: OnceLock::new(),
             cdc_apply_runtime: OnceLock::new(),
             compaction_runtime: OnceLock::new(),
@@ -1518,7 +1547,9 @@ fn with_spice_logical_optimizers(
         let _ = cte_materialization;
     }
     optimizer_rules.extend(trailing_rules);
-    state.with_optimizer_rules(optimizer_rules)
+    // Leaf-expression pushdown would move a model call below the filters that decide
+    // which rows it runs on; the decision functions' own rule runs last and places it.
+    state.with_optimizer_rules(runtime_decide::guard_async_calls(optimizer_rules))
 }
 
 #[cfg(not(windows))]
@@ -2474,10 +2505,10 @@ mod tests {
         SPARK_WINDOW_COLLISIONS, names_already_registered,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
-    use crate::status;
     #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
     use runtime_object_store::registry::SpiceObjectStoreRegistry;
+    use runtime_status as status;
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -4323,6 +4354,7 @@ mod tests {
                 "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",
+                "exact_float_literal_decimal_cast",
                 "spice_ddl_rewrite",
             ],
             "Analyzer rule list or ordering has changed"

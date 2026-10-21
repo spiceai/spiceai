@@ -403,6 +403,10 @@ impl<'a> AppendMutationWriter<'a> {
                         // on-conflict validation against the single index — keeping
                         // conflict semantics intact without a second sharded apply.
                         let _write_guard = write_guard;
+                        let _checkpoint_guard = self
+                            .table
+                            .lock_mem_tier_checkpoint_for_durable_write()
+                            .await;
                         let raw = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                             .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
                         let prepared = self.table.prepare_stream_for_insert(raw).await?;
@@ -472,6 +476,14 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             (data, write_guard)
         };
+        // Held from the validation's primary-key index checkout until this write's
+        // decisions about where replaced rows live are published (the synchronous
+        // and inline paths) or staged (the pipelined path, which then releases it
+        // with `write_lock`).
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
@@ -515,6 +527,7 @@ impl<'a> AppendMutationWriter<'a> {
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
+            let _checkpoint_guard = checkpoint_guard;
             let rows = self
                 .write_prepared_stream(
                     prepared_stream,
@@ -572,6 +585,7 @@ impl<'a> AppendMutationWriter<'a> {
                     self.table
                         .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
                 }
+                drop(checkpoint_guard);
                 tracing::debug!(
                     table = self.table.table_name(),
                     rows,
@@ -776,6 +790,7 @@ impl<'a> AppendMutationWriter<'a> {
                     &validated_keys,
                 );
                 drop(held_write_guard);
+                drop(checkpoint_guard);
 
                 tracing::debug!(
                     table = self.table.table_name(),
@@ -1180,6 +1195,14 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
+        // Held for the whole write: its validation decides from the primary-key
+        // index whether each replaced row is inline or in a file, and its
+        // publication acts on those decisions. A streaming append hands it to
+        // that publication, which outlives a cancelled caller.
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
@@ -1207,10 +1230,12 @@ impl<'a> AppendMutationWriter<'a> {
             && let Some(resolver) = self.table.key_resolver()?
         {
             return self
-                .write_resolving_repeats_after(data, resolver, write_guard)
+                .write_resolving_repeats_after(data, resolver, write_guard, checkpoint_guard)
                 .await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
+        #[cfg(test)]
+        self.table.run_test_post_prepare_hook().await;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
@@ -1240,6 +1265,7 @@ impl<'a> AppendMutationWriter<'a> {
         data: SendableRecordBatchStream,
         resolver: super::key_conflicts::KeyResolver,
         write_guard: OwnedMutexGuard<()>,
+        checkpoint_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         // A writer's row versions order a key's copies only against the copies this
         // write holds, which are all of them only in a load into an empty table.
@@ -1251,15 +1277,21 @@ impl<'a> AppendMutationWriter<'a> {
                 )),
             });
         }
+        let (write_policy, scope) = if self.into_empty_table {
+            (
+                crate::provider::delta_encoding::WritePolicy::BULK_LOAD,
+                super::append_stage::ValidationScope::Empty,
+            )
+        } else {
+            (
+                crate::provider::delta_encoding::WritePolicy::DELTA,
+                super::append_stage::ValidationScope::Locked,
+            )
+        };
         let write = super::overwrite::WriteShape {
             target_size_bytes: self.context.target_file_size_bytes(),
             target_partitions: self.task_context.session_config().target_partitions(),
-            write_policy: crate::provider::delta_encoding::WritePolicy::DELTA,
-        };
-        let scope = if self.into_empty_table {
-            super::append_stage::ValidationScope::Empty
-        } else {
-            super::append_stage::ValidationScope::Locked
+            write_policy,
         };
         let super::append_stage::StagedAppend {
             new_snapshot_id: snapshot_id,
@@ -1268,6 +1300,7 @@ impl<'a> AppendMutationWriter<'a> {
             stats,
             row_count: rows,
             superseded: superseded_rows,
+            first_load_pk_bloom,
         } = self
             .table
             .stage_resolved_append(data, resolver, write, scope)
@@ -1282,6 +1315,7 @@ impl<'a> AppendMutationWriter<'a> {
             table: self.table.clone_for_write(),
             context: Arc::clone(self.context),
             _write_guard: write_guard,
+            _checkpoint_guard: Some(checkpoint_guard),
             snapshot_id,
             rows,
             stats,
@@ -1289,6 +1323,7 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
             superseded: superseded_rows,
             into_empty_table: self.into_empty_table,
+            first_load_pk_bloom,
         }
         .commit()
         .await
@@ -1355,6 +1390,8 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                     post_validation,
                 } => {
+                    #[cfg(test)]
+                    self.table.run_test_post_inline_publish_hook().await;
                     let record_seq = self.table.sequence_high_water().await;
                     self.table
                         .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
@@ -1533,6 +1570,8 @@ impl<'a> AppendMutationWriter<'a> {
         } = take_post_validation(post_validation);
 
         let superseded = on_conflict_deletions.total_superseded();
+        #[cfg(test)]
+        self.table.run_test_pre_staged_publish_hook().await;
         self.publish_written_snapshot(&new_snapshot_id, rows, on_conflict_deletions)
             .await?;
         Ok((rows, stats_acc, validated_keys, superseded))

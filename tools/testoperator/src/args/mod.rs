@@ -32,7 +32,8 @@ pub mod dispatch;
 use dispatch::DispatchArgs;
 
 mod search;
-pub use search::{SearchDatasetArg, SearchTestArgs};
+pub use search::SearchTestArgs;
+pub(crate) use search::SqlPipelineArg;
 
 mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;

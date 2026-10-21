@@ -382,7 +382,7 @@ impl BedrockConverse {
                 json_schema:
                     ResponseFormatJsonSchema {
                         name,
-                        schema: Some(schema),
+                        schema,
                         description,
                         strict: _,
                     },
@@ -557,7 +557,7 @@ impl BedrockConverse {
         Ok(bldr)
     }
 
-    #[expect(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
+    #[expect(clippy::cast_possible_truncation, deprecated)]
     fn convert_converse_output(
         &self,
         output: ConverseOutput,
@@ -570,15 +570,12 @@ impl BedrockConverse {
                 let Message { role, content, .. } =
                     o.as_message().map_err(|e| to_api_error(format!("{e:?}")))?;
 
-                let data: Vec<(
-                    (Option<String>, Option<String>),
-                    Option<ChatCompletionMessageToolCall>,
-                )> = content
+                let (texts, tool_calls): (Vec<_>, Vec<_>) = content
                     .iter()
                     .map(extract_from_content_block)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let (content_and_refusal, tool_calls): (Vec<_>, Vec<_>) = data.into_iter().unzip();
-                let (content, refusals): (Vec<_>, Vec<_>) = content_and_refusal.into_iter().unzip();
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .unzip();
 
                 // Convert tool_calls from Vec<ChatCompletionMessageToolCall> to Vec<ChatCompletionMessageToolCalls>
                 let tool_calls_enum: Vec<ChatCompletionMessageToolCalls> = tool_calls
@@ -591,8 +588,10 @@ impl BedrockConverse {
                     index: 0,
                     message: ChatCompletionResponseMessage {
                         reasoning_content: None,
-                        content: Some(content.into_iter().flatten().join("\n")),
-                        refusal: Some(refusals.into_iter().flatten().join("\n")),
+                        content: Some(texts.into_iter().flatten().join("\n")),
+                        // Converse has no refusal: a guardrail or content filter that stops the
+                        // reply is reported through `finish_reason`.
+                        refusal: None,
                         tool_calls: if tool_calls_enum.is_empty() {
                             None
                         } else {

@@ -18,8 +18,8 @@ pub mod catalogs;
 pub mod cdc;
 pub mod chat;
 pub mod datasets;
+pub mod decisions;
 pub mod embeddings;
-pub mod evaluate;
 pub mod functions;
 pub mod iceberg;
 pub mod responses;
@@ -27,6 +27,7 @@ pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
+pub mod otlp;
 pub mod packages;
 pub mod queries;
 pub mod query;
@@ -51,13 +52,15 @@ use crate::{
         },
     },
     egress::EgressAccount,
+    http::server_timing::ServerTiming,
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
 use async_stream::try_stream;
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
@@ -83,6 +86,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 
+use crate::datafusion::error::is_partitions_unavailable;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
@@ -118,18 +122,21 @@ pub(crate) async fn current_principal_requires_read_only() -> bool {
         .is_some_and(|principal| !principal_has_write_access(principal))
 }
 
-pub(crate) async fn require_write_access() -> Option<Response> {
+/// Route layer for routes that need a principal with write access.
+///
+/// It must sit inside the authentication layer, which sets the principal, and run as a
+/// layer rather than inside the handler: a handler's body extractors reject a request
+/// (415, 422) before the handler body runs, which would tell a read-only caller the
+/// route's request schema instead of answering 403.
+pub(crate) async fn require_write_access(req: Request<Body>, next: Next) -> Response {
     if current_principal_requires_read_only().await {
-        Some(
-            (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({ "message": "API key does not allow write access" })),
-            )
-                .into_response(),
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "API key does not allow write access" })),
         )
-    } else {
-        None
+            .into_response();
     }
+    next.run(req).await
 }
 
 fn status_for_sql_error(message: &str) -> StatusCode {
@@ -341,7 +348,7 @@ async fn query_stream_to_http_response(
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
-    (StatusCode::OK, headers, body).into_response()
+    streamed_response(headers, body)
 }
 
 /// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
@@ -411,6 +418,9 @@ enum SqlErrorKind {
     /// separately so it can be logged as the operator-actionable condition it
     /// is and answered with a retriable status.
     ResourcesExhausted,
+    /// A cluster scheduler cannot yet reach executors that hold the data the
+    /// query reads; a retry can succeed.
+    Unavailable,
 }
 
 impl SqlErrorKind {
@@ -418,6 +428,13 @@ impl SqlErrorKind {
         match e {
             QueryError::QueryCancelled { .. } => Self::Cancellation,
             QueryError::QueryTimedOut { .. } => Self::Timeout,
+            QueryError::UnableToExecuteQuery { source }
+            | QueryError::UnableToCreateMemoryStream { source }
+            | QueryError::UnableToCollectResults { source }
+                if is_partitions_unavailable(source) =>
+            {
+                Self::Unavailable
+            }
             _ => Self::General,
         }
     }
@@ -429,6 +446,8 @@ impl SqlErrorKind {
             Self::Timeout
         } else if ErrorCode::from(e) == ErrorCode::ResourcesExhausted {
             Self::ResourcesExhausted
+        } else if is_partitions_unavailable(e) {
+            Self::Unavailable
         } else {
             Self::General
         }
@@ -457,7 +476,9 @@ fn sql_error_response(message: String, kind: SqlErrorKind) -> Response {
         // a hard failure for a query that would likely succeed on another
         // replica. Flight already reports the same failure as the retriable
         // `RESOURCE_EXHAUSTED`.
-        SqlErrorKind::ResourcesExhausted => StatusCode::SERVICE_UNAVAILABLE,
+        SqlErrorKind::ResourcesExhausted | SqlErrorKind::Unavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         SqlErrorKind::General => status_for_sql_error(&message),
     };
     (status, message).into_response()
@@ -511,7 +532,15 @@ async fn query_raw_stream_to_http_response(
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_from_batches(first, data_stream, account));
-    (StatusCode::OK, headers, body).into_response()
+    streamed_response(headers, body)
+}
+
+/// A `200 OK` whose body streams, marked so its `Server-Timing` total is sent
+/// as a trailer: the total is not known until the body ends.
+fn streamed_response(headers: HeaderMap, body: Body) -> Response {
+    let mut response = (StatusCode::OK, headers, body).into_response();
+    response.extensions_mut().insert(ServerTiming::Trailer);
+    response
 }
 
 trait SqlJsonBatch: Send + 'static {
@@ -837,6 +866,16 @@ mod tests {
         status::RuntimeStatus,
     };
 
+    /// A query the results cache refuses (e.g. one calling `random()` or
+    /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
+    /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
+    #[test]
+    fn disabled_results_cache_emits_no_cache_status_headers() {
+        assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert!(CacheStatus::CacheDisabled.to_header_string().is_none());
+        assert_eq!(CacheStatus::CacheHit.to_header_string(), Some("HIT"));
+    }
+
     /// `/v1/sql` must let clients distinguish outcomes by status code: a
     /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a
     /// client-initiated cancel to 499, and both classifications must hold for
@@ -884,6 +923,39 @@ mod tests {
             SqlErrorKind::of_datafusion_error(&stream_cancel),
         );
         assert_eq!(response.status().as_u16(), 499);
+    }
+
+    /// A query a cluster scheduler cannot route yet is answered 503, which
+    /// clients and load balancers retry: from the planning error the query
+    /// API returns and from a streamed error alike.
+    #[test]
+    fn sql_error_response_classifies_unavailable_partitions() {
+        let unavailable = || {
+            datafusion::error::DataFusionError::Context(
+                "partitioned_table_scan_rewrite".to_string(),
+                Box::new(datafusion::error::DataFusionError::External(
+                    crate::datafusion::error::SpiceExternalError::partitions_unavailable(
+                        "Cannot query t: no ready executor serves 1 of its 2 partitions; retry the query"
+                            .to_string(),
+                    ),
+                )),
+            )
+        };
+        let planning = QueryError::UnableToExecuteQuery {
+            source: unavailable(),
+        };
+        let response = sql_error_response(
+            planning.to_string(),
+            SqlErrorKind::of_query_error(&planning),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let streamed = unavailable();
+        let response = sql_error_response(
+            streamed.to_string(),
+            SqlErrorKind::of_datafusion_error(&streamed),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A memory-pool refusal has to be told apart from the cancellation and

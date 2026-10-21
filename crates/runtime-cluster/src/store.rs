@@ -56,6 +56,15 @@ pub enum Error {
 
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
+
+    #[snafu(display(
+        "Failed to move the partitions assigned to executor {from} to {to}: {source}"
+    ))]
+    MoveAssignments {
+        from: String,
+        to: String,
+        source: Box<MutateError>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -81,6 +90,19 @@ pub struct AssignmentRequest {
     pub table: TableReference,
     pub partition_value: PartitionValue,
     pub executor_id: String,
+}
+
+/// What [`PartitionStore::apply_discovery`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryChanges {
+    /// Whether the table's entry was created.
+    pub created: bool,
+    /// How many partitions were added.
+    pub added: usize,
+    /// How many partitions were removed.
+    pub removed_count: usize,
+    /// Per executor, the removed partitions that were assigned to it.
+    pub removed: HashMap<String, Vec<PartitionValue>>,
 }
 
 /// Partition metadata store bound to one [`PartitionScope`] of the
@@ -280,6 +302,53 @@ impl PartitionStore {
         Ok(())
     }
 
+    /// Moves every partition assigned to executor `from` to executor `to`, in one
+    /// cluster-document write, and returns how many partitions moved. Used when an
+    /// executor identified by its advertise address (`from`) starts identifying
+    /// itself by its instance identity (`to`), so its assignments follow it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn move_assignments(&self, from: &str, to: &str) -> Result<usize> {
+        let scope = self.scope;
+        let mut moved = 0;
+        self.cluster
+            .mutate(|state| {
+                moved = 0;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                for metadata in scope.map_mut(state).values_mut() {
+                    let mut changed = false;
+                    for partition in &mut metadata.partitions {
+                        if partition.is_assigned_to(from) {
+                            partition.unassign_from(from);
+                            partition.assign_to(to.to_string(), now_ms);
+                            moved += 1;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        metadata.updated_at = now_ms;
+                    }
+                }
+                if moved == 0 {
+                    MutationOutcome::NoChange
+                } else {
+                    MutationOutcome::Apply
+                }
+            })
+            .await
+            .map_err(|e| Error::MoveAssignments {
+                from: from.to_string(),
+                to: to.to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(moved)
+    }
+
     /// Atomically apply many `(table, partition, executor)` assignments
     /// in a single cluster-document write. Existing assignments to the
     /// same `(table, partition)` are overwritten with the new executor.
@@ -384,29 +453,279 @@ impl PartitionStore {
         }
     }
 
-    /// Adds new partitions to a table's metadata and assigns each to
-    /// its respective executor in a single OCC write.
+    /// Assigns each partition of `assignments` to its executor in one
+    /// cluster-document write, adding the partitions the table does not list
+    /// yet. A partition an executor already holds keeps it, so writers that
+    /// race to assign a new partition agree on one executor. Returns the
+    /// executor that holds each partition after the write, in the order of
+    /// `assignments`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the cluster state mutation fails (see [`Self::apply_assignments`]).
+    /// Returns an error if the table has no metadata or the cluster state
+    /// mutation fails.
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
         assignments: &[(&PartitionValue, &str)],
-    ) -> Result<()> {
-        if assignments.is_empty() {
-            return Ok(());
+    ) -> Result<Vec<String>> {
+        self.assign_partitions(table, None, assignments).await
+    }
+
+    /// [`Self::add_and_assign_partitions`] that also creates the table's entry,
+    /// partitioned by `partition_expressions`, when it has none, in the same
+    /// write: a reader sees either no entry or one listing these partitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn create_and_assign_partitions(
+        &self,
+        table: &TableReference,
+        partition_expressions: &[String],
+        assignments: &[(&PartitionValue, &str)],
+    ) -> Result<Vec<String>> {
+        self.assign_partitions(table, Some(partition_expressions), assignments)
+            .await
+    }
+
+    async fn assign_partitions(
+        &self,
+        table: &TableReference,
+        create_with: Option<&[String]>,
+        assignments: &[(&PartitionValue, &str)],
+    ) -> Result<Vec<String>> {
+        if assignments.is_empty() && create_with.is_none() {
+            return Ok(Vec::new());
         }
-        let requests: Vec<AssignmentRequest> = assignments
-            .iter()
-            .map(|(pv, executor)| AssignmentRequest {
-                table: table.clone(),
-                partition_value: (*pv).clone(),
-                executor_id: (*executor).to_string(),
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut owners: Vec<String> = Vec::new();
+        let mut missing = false;
+        self.cluster
+            .mutate(|state| {
+                owners.clear();
+                missing = false;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let mut changed = false;
+                if let Some(partition_expressions) = create_with
+                    && !map.contains_key(&key)
+                {
+                    map.insert(
+                        key.clone(),
+                        TablePartitionMetadata::new(table, now_ms, partition_expressions.to_vec()),
+                    );
+                    changed = true;
+                }
+                let Some(metadata) = map.get_mut(&key) else {
+                    missing = true;
+                    return MutationOutcome::NoChange;
+                };
+                for (partition_value, executor_id) in assignments {
+                    let position = if let Some(position) = metadata
+                        .partitions
+                        .iter()
+                        .position(|p| p.partition_value == **partition_value)
+                    {
+                        position
+                    } else {
+                        metadata.add_partition(PartitionMetadata::new((*partition_value).clone()));
+                        metadata.partitions.len() - 1
+                    };
+                    let partition = &mut metadata.partitions[position];
+                    if !partition.is_assigned() {
+                        partition.assign_to((*executor_id).to_string(), now_ms);
+                        changed = true;
+                    }
+                    owners.push(partition.assigned_executors[0].clone());
+                }
+                if changed {
+                    metadata.updated_at = now_ms;
+                    MutationOutcome::Apply
+                } else {
+                    MutationOutcome::NoChange
+                }
             })
-            .collect();
-        self.apply_assignments(&requests).await
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        if missing {
+            return Err(Error::TableMetadataNotFound { table: key });
+        }
+        Ok(owners)
+    }
+
+    /// Records one complete discovery of `table` in one cluster-document write:
+    /// creates the table's entry if it has none, adds each of `new` it does not
+    /// have yet, unassigned, and removes each of `removed`. A reader therefore
+    /// sees either no entry or the discovered partition set, never an entry
+    /// that lists only part of it.
+    ///
+    /// The change is computed from the document each write attempt reads, so a
+    /// concurrent change to the same table is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn apply_discovery(
+        &self,
+        table: &TableReference,
+        partition_expressions: &[String],
+        new: &[PartitionValue],
+        removed: &[PartitionValue],
+    ) -> Result<DiscoveryChanges> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let mut changes = DiscoveryChanges::default();
+        self.cluster
+            .mutate(|state| {
+                changes = DiscoveryChanges::default();
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let metadata = scope.map_mut(state).entry(key.clone()).or_insert_with(|| {
+                    changes.created = true;
+                    TablePartitionMetadata::new(table, now_ms, partition_expressions.to_vec())
+                });
+                for partition_value in new {
+                    if !metadata
+                        .partitions
+                        .iter()
+                        .any(|p| p.partition_value == *partition_value)
+                    {
+                        metadata.add_partition(PartitionMetadata::new(partition_value.clone()));
+                        changes.added += 1;
+                    }
+                }
+                for partition_value in removed {
+                    if let Some(pos) = metadata
+                        .partitions
+                        .iter()
+                        .position(|p| p.partition_value == *partition_value)
+                    {
+                        let partition = metadata.partitions.remove(pos);
+                        for executor_id in partition.assigned_executors {
+                            changes
+                                .removed
+                                .entry(executor_id)
+                                .or_default()
+                                .push(partition_value.clone());
+                        }
+                        changes.removed_count += 1;
+                    }
+                }
+                if !changes.created && changes.added == 0 && changes.removed_count == 0 {
+                    return MutationOutcome::NoChange;
+                }
+                metadata.updated_at = now_ms;
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| mutate_error(&key, e))?;
+        Ok(changes)
+    }
+
+    /// Assigns each partition of `assignments` to its executor in one
+    /// cluster-document write, but only a partition the table still lists and
+    /// no executor holds. Returns the assignments that hold after the write: the
+    /// ones made here and the ones already in place. A partition another
+    /// scheduler assigned first keeps its executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn assign_unassigned(
+        &self,
+        assignments: &[AssignmentRequest],
+    ) -> Result<Vec<AssignmentRequest>> {
+        if assignments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = self.scope;
+        let mut held: Vec<AssignmentRequest> = Vec::new();
+        self.cluster
+            .mutate(|state| {
+                held.clear();
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let mut changed = false;
+                for assignment in assignments {
+                    let Some(metadata) = map.get_mut(&normalized_table_name(&assignment.table))
+                    else {
+                        continue;
+                    };
+                    let Some(partition) = metadata
+                        .partitions
+                        .iter_mut()
+                        .find(|p| p.partition_value == assignment.partition_value)
+                    else {
+                        continue;
+                    };
+                    if !partition.is_assigned() {
+                        partition.assign_to(assignment.executor_id.clone(), now_ms);
+                        metadata.updated_at = now_ms;
+                        changed = true;
+                    } else if !partition.is_assigned_to(&assignment.executor_id) {
+                        continue;
+                    }
+                    held.push(assignment.clone());
+                }
+                if changed {
+                    MutationOutcome::Apply
+                } else {
+                    MutationOutcome::NoChange
+                }
+            })
+            .await
+            .map_err(|e| mutate_error("<batch>", e))?;
+        Ok(held)
+    }
+
+    /// Unassigns every partition `executor_id` holds, in one cluster-document
+    /// write, and returns how many partitions it held.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
+    pub async fn unassign_executor(&self, executor_id: &str) -> Result<usize> {
+        let scope = self.scope;
+        let mut unassigned = 0;
+        self.cluster
+            .mutate(|state| {
+                unassigned = 0;
+                let now_ms = match crate::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                for metadata in scope.map_mut(state).values_mut() {
+                    let mut changed = false;
+                    for partition in &mut metadata.partitions {
+                        if partition.is_assigned_to(executor_id) {
+                            partition.unassign_from(executor_id);
+                            unassigned += 1;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        metadata.updated_at = now_ms;
+                    }
+                }
+                if unassigned == 0 {
+                    MutationOutcome::NoChange
+                } else {
+                    MutationOutcome::Apply
+                }
+            })
+            .await
+            .map_err(|e| mutate_error("<executor>", e))?;
+        Ok(unassigned)
     }
 
     /// Replace this table's metadata wholesale (atomic OCC write). Used
@@ -535,6 +854,18 @@ impl PartitionStore {
     }
 }
 
+fn mutate_error(table: &str, err: MutateError) -> Error {
+    match err {
+        MutateError::ConcurrentModification { .. } => Error::ConcurrentModification {
+            table: table.to_string(),
+        },
+        other => Error::MetadataAccess {
+            table: table.to_string(),
+            source: Box::new(other),
+        },
+    }
+}
+
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -615,6 +946,102 @@ mod tests {
         let p2_meta = find_partition("2");
         assert!(p2_meta.is_assigned_to("executor-1"));
         assert!(!p2_meta.is_assigned_to("executor-2"));
+    }
+
+    /// An executor that starts identifying itself by its instance identity
+    /// takes over the partitions assigned to its advertise address; other
+    /// executors' partitions stay where they are.
+    #[tokio::test]
+    async fn assignments_move_from_the_advertise_address_to_the_identity() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+        pm.initialize_metadata(&tbl, vec!["bucket(3, id)".to_string()])
+            .await
+            .expect("init");
+        let p0 = partition_value("bucket(3, id)", "0");
+        let p1 = partition_value("bucket(3, id)", "1");
+        let p2 = partition_value("bucket(3, id)", "2");
+        pm.add_and_assign_partitions(
+            &tbl,
+            &[
+                (&p0, "127.0.0.1:50062"),
+                (&p1, "exec-b"),
+                (&p2, "127.0.0.1:50062"),
+            ],
+        )
+        .await
+        .expect("add and assign");
+
+        let moved = pm
+            .move_assignments("127.0.0.1:50062", "exec-a")
+            .await
+            .expect("move assignments");
+        assert_eq!(moved, 2);
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+        let owners = |val: &str| {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&Some(val.to_string())))
+                .expect("partition not found")
+                .assigned_executors
+                .clone()
+        };
+        assert_eq!(owners("0"), ["exec-a"]);
+        assert_eq!(owners("1"), ["exec-b"]);
+        assert_eq!(owners("2"), ["exec-a"]);
+        assert_eq!(
+            pm.move_assignments("127.0.0.1:50062", "exec-a")
+                .await
+                .expect("move again"),
+            0
+        );
+    }
+
+    /// Two writers that each assign a new partition to a different executor
+    /// agree on the first one's executor.
+    #[tokio::test]
+    async fn a_partition_another_writer_assigned_keeps_its_executor() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+        pm.initialize_metadata(&tbl, vec!["region".to_string()])
+            .await
+            .expect("init");
+        let east = partition_value("region", "'east'");
+        let west = partition_value("region", "'west'");
+
+        let first = pm
+            .add_and_assign_partitions(&tbl, &[(&east, "executor-1")])
+            .await
+            .expect("first writer");
+        let second = pm
+            .add_and_assign_partitions(&tbl, &[(&east, "executor-2"), (&west, "executor-2")])
+            .await
+            .expect("second writer");
+
+        assert_eq!(first, ["executor-1"]);
+        assert_eq!(second, ["executor-1", "executor-2"]);
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+        let owners = |value: &PartitionValue| {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value == *value)
+                .expect("partition")
+                .assigned_executors
+                .clone()
+        };
+        assert_eq!(owners(&east), ["executor-1"]);
+        assert_eq!(owners(&west), ["executor-2"]);
     }
 
     #[tokio::test]
