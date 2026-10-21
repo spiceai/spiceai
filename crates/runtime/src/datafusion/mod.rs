@@ -186,6 +186,7 @@ pub mod tool_udf;
 pub mod udf;
 pub mod udtf;
 
+pub(crate) use runtime_datafusion::resolve_table_reference;
 pub use runtime_datafusion::{
     SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_EVAL_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA, SPICE_SCP_SCHEMA, is_spice_internal_dataset, is_spice_internal_schema,
@@ -1509,6 +1510,10 @@ pub struct DataFusion {
     pub(crate) task_history_captured_output: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    // Small runtime for queries that read a bounded set of rows by primary key
+    // (`point_lookup::is_bounded_key_lookup`), so a lookup does not queue behind
+    // analytical work on `cpu_runtime`.
+    interactive_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated, DEFAULT-priority (nice 0) runtime for the CDC changes-apply loop
@@ -1543,7 +1548,7 @@ pub struct DataFusion {
     // What the pod's Cayenne accelerations demand of the host, classified from the
     // Spicepod in the Runtime builder. Retained so `spiced` can decide which
     // dedicated thread pools are worth bringing up without re-reading the app.
-    cayenne_workload: crate::builder::CayenneWorkload,
+    cayenne_workload: runtime_acceleration::CayenneWorkload,
     // Cgroup-aware total memory, captured once at build time. `get_total_memory`
     // rebuilds a sysinfo System on every call, so the budget installers read this
     // rather than re-probing.
@@ -2361,6 +2366,26 @@ impl DataFusion {
         self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
     }
 
+    /// Set the runtime that queries reading a bounded set of rows by primary key
+    /// run on, apart from the analytical queries on [`Self::cpu_runtime`]. Used
+    /// only while a CPU runtime is set too.
+    pub fn set_interactive_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.interactive_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set interactive tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// The runtime bounded key lookups run on; see [`Self::set_interactive_runtime`].
+    #[must_use]
+    pub fn interactive_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.interactive_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+    }
+
     /// Set the dedicated refresh runtime for acceleration refresh workers.
     /// This runtime is isolated from the query runtime to prevent refresh workloads from impacting query latency.
     pub fn set_refresh_runtime(&self, handle: ManagedTokioRuntime) {
@@ -2701,7 +2726,7 @@ impl DataFusion {
     /// Spicepod at build time). `spiced` reads this to skip bringing up dedicated
     /// thread pools nothing in the pod can use.
     #[must_use]
-    pub fn cayenne_workload(&self) -> crate::builder::CayenneWorkload {
+    pub fn cayenne_workload(&self) -> runtime_acceleration::CayenneWorkload {
         self.cayenne_workload
     }
 
@@ -7319,12 +7344,6 @@ pub fn is_schema_mismatch(error: &runtime_query_engine::query_engine::Error) -> 
         .is_some_and(|e| matches!(e, Error::SchemaMismatch { .. }))
 }
 
-/// Normalizes a table reference to a full table reference with catalog, schema, and table name
-/// so it can be used for comparison.
-pub(crate) fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
-    table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-}
-
 impl Drop for DataFusion {
     fn drop(&mut self) {
         tracing::debug!("DataFusion resources cleanup");
@@ -9131,7 +9150,7 @@ mod tests {
 
         fn test_df() -> DataFusion {
             DataFusionBuilder::new(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 Arc::new(AcceleratorEngineRegistry::default()),
                 tokio::runtime::Handle::current(),
             )

@@ -47,7 +47,7 @@ const AGG_SQL: &str = "SELECT COUNT(*) AS row_count, SUM(n) AS sum_n, MIN(n) AS 
 const JOIN_SQL: &str = "SELECT a.id AS id, a.n AS left_n, b.label AS right_label FROM test_table AS a INNER JOIN test_table AS b ON a.id = b.id";
 
 #[derive(Clone, Copy)]
-enum RefreshCase {
+pub(crate) enum RefreshCase {
     Append,
     Full,
 }
@@ -108,15 +108,32 @@ async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error>
 }
 
 async fn test_refresh_matches_source(engine: &str, mode: RefreshCase) -> Result<(), anyhow::Error> {
+    refresh_matches_postgres_source(engine, mode, |port| {
+        let acceleration_params =
+            (engine == "postgres").then(|| get_postgres_acceleration_params(port));
+        acceleration_for(engine, mode, acceleration_params)
+    })
+    .await
+}
+
+/// Append or full refresh of `engine` against the labeled `PostgreSQL` source.
+///
+/// `configure` builds the acceleration after the container port is known. The
+/// comparison is the projection, one aggregation, and one self-join, each as a
+/// schema and a row multiset. `created_at` is UTC epoch milliseconds. None of
+/// the statements order rows or divide integers.
+pub(crate) async fn refresh_matches_postgres_source(
+    engine: &str,
+    mode: RefreshCase,
+    configure: impl FnOnce(usize) -> Acceleration,
+) -> Result<(), anyhow::Error> {
     test_request_context()
-        .scope(async {
+        .scope(async move {
             let running_container = common::start_postgres_docker_container().await?;
             let port = usize::from(running_container.host_port(5432)?);
             let (db_conn, instants) = initialize_postgres_labeled(port).await?;
 
-            let acceleration_params =
-                (engine == "postgres").then(|| get_postgres_acceleration_params(port));
-            let acceleration_config = acceleration_for(engine, mode, acceleration_params);
+            let acceleration_config = configure(port);
             let rt = start_test_runtime(port, acceleration_config).await?;
             let mode_name = mode.label();
 
@@ -340,9 +357,11 @@ fn assert_same_multiset(
         sorted_rows(postgres),
     );
     eprintln!(
-        "compared engine={engine} mode={mode} stage={stage} query={query_name} rows={} columns={:?}",
+        "compared engine={engine} mode={mode} stage={stage} query={query_name} rows={} columns={:?} spice={:?} postgres={:?}",
         spice.rows.len(),
-        spice.columns
+        spice.columns,
+        sorted_rows(spice),
+        sorted_rows(postgres),
     );
 }
 

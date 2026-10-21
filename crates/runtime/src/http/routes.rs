@@ -20,7 +20,7 @@ use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
 use crate::request::DatabricksAuthExtension;
-use crate::status::RuntimeStatus;
+use runtime_status::RuntimeStatus;
 
 use crate::Runtime;
 use crate::cluster::ExecutorRegistry;
@@ -139,6 +139,9 @@ use tower_http::limit::RequestBodyLimitLayer;
         DatasetQueryParams,
         DatasetFilter,
         Format,
+        // `async_openai`'s `CompoundFilter` is `no_recursion` (it contains itself through
+        // `Filter`), so `utoipa` does not collect the schemas of its fields.
+        async_openai::types::responses::CompoundType,
         evaluate_api::openai::DecisionRequest,
         evaluate_api::openai::DecisionInput,
         evaluate_api::openai::DecisionInputMessage,

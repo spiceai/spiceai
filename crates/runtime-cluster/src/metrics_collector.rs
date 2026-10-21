@@ -504,7 +504,14 @@ mod tests {
         let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
             .with_resource(opentelemetry_sdk::Resource::builder().build())
             .with_reader(
-                crate::prometheus_reader(registry.clone()).expect("to build the prometheus reader"),
+                opentelemetry_prometheus::exporter()
+                    .with_registry(registry.clone())
+                    .without_scope_info()
+                    .without_units()
+                    .without_counter_suffixes()
+                    .without_target_info()
+                    .build()
+                    .expect("to build the prometheus reader"),
             )
             .build();
         opentelemetry::global::set_meter_provider(provider);
