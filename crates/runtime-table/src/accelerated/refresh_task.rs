@@ -25,11 +25,12 @@ use crate::accelerated::timestamp_metrics_utils::with_find_max_timestamp_in_stre
 use crate::federated::FederatedTable;
 use crate::filter_converter::TimestampFilterConvert;
 use crate::filter_converter::create_timestamp_filter_convert;
-use arrow::compute::{SortOptions, filter_record_batch};
+use arrow::compute::filter_record_batch;
 use arrow::{
-    array::{Array, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray},
     datatypes::DataType,
     error::ArrowError,
+    row::{RowConverter, Rows, SortField},
 };
 use arrow_schema::SchemaRef;
 use arrow_tools::record_batch::{slice_memory_size, try_cast_to};
@@ -95,10 +96,11 @@ use snafu::{OptionExt, ResultExt};
 use spice_table::{LayerWalk, SpiceTable};
 use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
-use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use std::{sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
     runtime::Handle,
@@ -2807,10 +2809,9 @@ impl RefreshTask {
         // appends of rows that have NULL in the time_column (a real consistency
         // bug on retry / repeated refresh / source re-emit), we additionally
         // collect *all* rows where the time column IS NULL. These "timeless"
-        // rows are then available to the exact-row StructArray comparator in
-        // filter_records, which treats two nulls in the same position as Equal
-        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
-        // rows are now correctly filtered.
+        // rows are then available to the exact-row comparison in `OverlapIndex`,
+        // whose row encoding treats two nulls in the same position as equal.
+        // Exact duplicate NULL-time rows are now correctly filtered.
         //
         // Devil's advocate / remaining edge case (being really sure):
         // This loads the *entire historical set* of NULL-time rows on every
@@ -2924,18 +2925,26 @@ impl RefreshTask {
         // and account for it. The normalized batches exist only for comparison: use their
         // de-duplication predicate to filter the original batch, then let the ordinary write
         // path perform its normal source-to-engine cast.
+        //
+        // The index is built with the first incoming batch, so an append that brings no
+        // rows does not encode the stored ones, and a stored column of the wrong type
+        // fails the refresh where the comparison would have. The stored batches are
+        // released once encoded: only the index reads them after that.
+        let mut index: Option<OverlapIndex> = None;
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&output_schema), {
             stream! {
                 while let Some(batch) = update.data.next().await {
                     let source_batch = batch?;
                     let normalized_batch = try_cast_to(source_batch.clone(), Arc::clone(&filter_schema))
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let predicates = dedup_predicates(
-                        &normalized_batch,
-                        &existing_records,
-                        &filter_schema,
-                        &mut used,
-                    )
+                    let built = match index.take() {
+                        Some(built) => built,
+                        None => OverlapIndex::try_new(&std::mem::take(&mut existing_records), &filter_schema)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                    };
+                    let predicates = index
+                        .insert(built)
+                        .predicates(&normalized_batch, &filter_schema, &mut used)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     let batch = filter_record_batch(&source_batch, &predicates.into())
                         .context(super::FailedToFilterUpdatesSnafu)
@@ -3741,9 +3750,9 @@ fn include_source_to_table_name(name: &TableReference, source: Option<&str>) -> 
     }
 }
 
-/// `StructArray::from` panics when a column's data type does not match the filter
-/// schema field (e.g. a source type widening between the accelerated rows and the
-/// incoming update); surface it as a proper refresh error instead.
+/// Encoding a column whose data type does not match the filter schema field panics
+/// (e.g. a source type widening between the accelerated rows and the incoming update);
+/// surface it as a proper refresh error instead.
 fn ensure_dedup_column_type(
     name: &str,
     expected: &DataType,
@@ -3785,19 +3794,29 @@ fn filter_records(
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<RecordBatch> {
-    let predicates = dedup_predicates(update_data, existing_records, filter_schema, used)?;
+    let predicates = OverlapIndex::try_new(existing_records, filter_schema)?.predicates(
+        update_data,
+        filter_schema,
+        used,
+    )?;
 
     filter_record_batch(update_data, &predicates.into()).context(super::FailedToFilterUpdatesSnafu)
 }
 
 /// Produces the rows in `update_data` that are absent from `existing_records`, while consuming
-/// each matching existing row at most once across the append overlap stream.
+/// each matching existing row at most once across the append overlap stream, by comparing
+/// every incoming row with every existing row. [`OverlapIndex`] computes the same result;
+/// this is the oracle its differential test compares it with.
+#[cfg(test)]
 fn dedup_predicates(
     update_data: &RecordBatch,
     existing_records: &[RecordBatch],
     filter_schema: &SchemaRef,
     used: &mut [Vec<bool>],
 ) -> super::Result<Vec<bool>> {
+    use arrow::array::{StructArray, make_comparator};
+    use std::cmp::Ordering;
+
     let mut predicates = vec![];
     let mut comparators = vec![];
 
@@ -3839,32 +3858,13 @@ fn dedup_predicates(
             make_comparator(
                 &update_struct_array,
                 &existing_struct_array,
-                SortOptions::default(),
+                arrow::compute::SortOptions::default(),
             )
             .context(super::FailedToFilterUpdatesSnafu)?,
         ));
     }
 
-    // The caller builds `used` from these same batches, so a mismatch is a bug here rather
-    // than bad input - but it must not be a silent one. Too few sets and the `zip` below
-    // would skip existing batches, under-subtracting; a set longer than its batch would
-    // hand the comparator a row index that batch does not have.
-    if used.len() != comparators.len()
-        || comparators
-            .iter()
-            .zip(used.iter())
-            .any(|((rows, _), used_rows)| *rows != used_rows.len())
-    {
-        return Err(ArrowError::ComputeError(format!(
-            "append de-duplication state does not describe the rows being compared: \
-             {} existing batches holding {} rows, against {} sets of {} claim flags",
-            comparators.len(),
-            comparators.iter().map(|(rows, _)| rows).sum::<usize>(),
-            used.len(),
-            used.iter().map(Vec::len).sum::<usize>(),
-        )))
-        .context(super::FailedToFilterUpdatesSnafu);
-    }
+    ensure_claim_flags(comparators.iter().map(|(rows, _)| *rows), used)?;
 
     for i in 0..update_data.num_rows() {
         let mut not_matched = true;
@@ -3885,6 +3885,174 @@ fn dedup_predicates(
     }
 
     Ok(predicates)
+}
+
+/// The columns of `batch` that the de-duplication compares, in `filter_schema` order,
+/// each checked to hold the type the update stream was normalized to.
+fn dedup_columns(batch: &RecordBatch, filter_schema: &SchemaRef) -> super::Result<Vec<ArrayRef>> {
+    filter_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column_idx = batch
+                .schema()
+                .index_of(field.name())
+                .context(super::FailedToFilterUpdatesSnafu)?;
+            let column = batch.column(column_idx);
+            ensure_dedup_column_type(field.name(), field.data_type(), column.data_type())?;
+            Ok(Arc::clone(column))
+        })
+        .collect()
+}
+
+/// Checks that `used` holds one claim flag per stored row, batch by batch. The caller
+/// builds it from the same batches, so a mismatch is a bug here rather than bad input -
+/// but it must not be a silent one: too few sets would skip stored batches and
+/// under-subtract, and a set longer than its batch would index a row it does not have.
+fn ensure_claim_flags(
+    stored_rows: impl Iterator<Item = usize> + Clone,
+    used: &[Vec<bool>],
+) -> super::Result<()> {
+    if stored_rows.clone().count() == used.len()
+        && stored_rows
+            .clone()
+            .zip(used)
+            .all(|(rows, flags)| rows == flags.len())
+    {
+        return Ok(());
+    }
+    Err(ArrowError::ComputeError(format!(
+        "append de-duplication state does not describe the rows being compared: \
+         {} existing batches holding {} rows, against {} sets of {} claim flags",
+        stored_rows.clone().count(),
+        stored_rows.sum::<usize>(),
+        used.len(),
+        used.iter().map(Vec::len).sum::<usize>(),
+    )))
+    .context(super::FailedToFilterUpdatesSnafu)
+}
+
+/// The stored rows of an append's overlap window, indexed so that an incoming row is
+/// compared only with the stored rows that encode the same, rather than with every one.
+///
+/// Each row is encoded with one [`RowConverter`]: two rows encode to equal bytes exactly
+/// when they are equal as whole rows, with nulls equal to nulls and floats compared by
+/// their total order. The stored rows are grouped by the hash of their encoding, which
+/// turns the subtraction from one comparison per (incoming, stored) pair - it never
+/// finished for a 600k-row load against 600k stored rows (#15329) - into one hash lookup
+/// per incoming row.
+///
+/// The subtraction is a **multiset** (bag) subtraction: each stored row cancels at most
+/// one incoming row, across every batch of the update stream, recorded in the caller's
+/// `used` flags. Within a group the stored rows stay in stored order, and an incoming
+/// row claims the first unclaimed one that encodes equal.
+struct OverlapIndex {
+    converter: RowConverter,
+    hasher: RandomState,
+    /// The encoded rows of each stored batch, in `existing_records` order.
+    rows: Vec<Rows>,
+    /// Every stored row as (batch, row), grouped by encoding hash, in stored order
+    /// within each group.
+    positions: Vec<(usize, usize)>,
+    groups: HashMap<u64, OverlapGroup>,
+}
+
+/// One hash's run of `OverlapIndex::positions`.
+struct OverlapGroup {
+    /// Every position of the group before this one has been claimed, so a run of
+    /// identical rows is not rescanned from the start for each incoming copy.
+    first_unclaimed: usize,
+    end: usize,
+}
+
+impl OverlapIndex {
+    fn try_new(existing_records: &[RecordBatch], filter_schema: &SchemaRef) -> super::Result<Self> {
+        let fields: Vec<SortField> = filter_schema
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect();
+        let converter = RowConverter::new(fields).context(super::FailedToFilterUpdatesSnafu)?;
+        let hasher = RandomState::new();
+        let total_rows = existing_records.iter().map(RecordBatch::num_rows).sum();
+        let mut rows = Vec::with_capacity(existing_records.len());
+        let mut by_hash: Vec<(u64, usize, usize)> = Vec::with_capacity(total_rows);
+        for (batch_idx, existing) in existing_records.iter().enumerate() {
+            let encoded = converter
+                .convert_columns(&dedup_columns(existing, filter_schema)?)
+                .context(super::FailedToFilterUpdatesSnafu)?;
+            by_hash.extend(
+                (0..encoded.num_rows())
+                    .map(|row_idx| (hasher.hash_one(encoded.row(row_idx)), batch_idx, row_idx)),
+            );
+            rows.push(encoded);
+        }
+        // A stable sort, so each group keeps its rows in stored order.
+        by_hash.sort_by_key(|&(hash, _, _)| hash);
+
+        let mut groups: HashMap<u64, OverlapGroup> = HashMap::new();
+        for (idx, &(hash, _, _)) in by_hash.iter().enumerate() {
+            groups
+                .entry(hash)
+                .and_modify(|group| group.end = idx + 1)
+                .or_insert(OverlapGroup {
+                    first_unclaimed: idx,
+                    end: idx + 1,
+                });
+        }
+        let positions = by_hash
+            .into_iter()
+            .map(|(_, batch_idx, row_idx)| (batch_idx, row_idx))
+            .collect();
+        Ok(Self {
+            converter,
+            hasher,
+            rows,
+            positions,
+            groups,
+        })
+    }
+
+    /// The incoming rows of `update_data` to keep: `false` for each one a still-unclaimed
+    /// stored row cancels, which that row's flag in `used` then records as claimed.
+    fn predicates(
+        &mut self,
+        update_data: &RecordBatch,
+        filter_schema: &SchemaRef,
+        used: &mut [Vec<bool>],
+    ) -> super::Result<Vec<bool>> {
+        ensure_claim_flags(self.rows.iter().map(Rows::num_rows), used)?;
+        let incoming = self
+            .converter
+            .convert_columns(&dedup_columns(update_data, filter_schema)?)
+            .context(super::FailedToFilterUpdatesSnafu)?;
+        let mut predicates = Vec::with_capacity(incoming.num_rows());
+        for row in &incoming {
+            let claimed = self
+                .groups
+                .get_mut(&self.hasher.hash_one(row))
+                .and_then(|group| {
+                    while group.first_unclaimed < group.end {
+                        let (batch_idx, row_idx) = self.positions[group.first_unclaimed];
+                        if !used[batch_idx][row_idx] {
+                            break;
+                        }
+                        group.first_unclaimed += 1;
+                    }
+                    self.positions[group.first_unclaimed..group.end]
+                        .iter()
+                        .copied()
+                        .find(|&(batch_idx, row_idx)| {
+                            !used[batch_idx][row_idx] && self.rows[batch_idx].row(row_idx) == row
+                        })
+                });
+            if let Some((batch_idx, row_idx)) = claimed {
+                used[batch_idx][row_idx] = true;
+            }
+            predicates.push(claimed.is_none());
+        }
+        Ok(predicates)
+    }
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
@@ -6073,9 +6241,9 @@ mod tests {
             .expect("collecting filtered data should succeed for NULL-time edge case test");
 
         // After the ACID fix (collecting time IS NULL rows into existing_records for the
-        // StructArray comparator): the exact duplicate (ts=NULL, id=99) is now correctly
-        // filtered out because make_comparator returns Equal for two nulls in the time
-        // position + matching id. Only the genuinely new higher-time row remains.
+        // exact-row comparison): the exact duplicate (ts=NULL, id=99) is now correctly
+        // filtered out because the row encoding makes two nulls in the time position
+        // equal and the ids match. Only the genuinely new higher-time row remains.
         // This is the comprehensive regression test for the nullable time_column edge
         // case in append refresh dedup. Devil's advocate: we also need to consider
         // whether large numbers of NULL-time rows could cause memory pressure — in
@@ -6244,7 +6412,7 @@ mod tests {
         );
     }
 
-    /// `make_comparator` reports two NULLs in the same position as equal, so a NULL-bearing
+    /// The row encoding makes two NULLs in the same position equal, so a NULL-bearing
     /// row takes part in the subtraction like any other - cancelled once, not once per copy.
     #[test]
     fn filter_records_subtracts_a_null_bearing_row_once() {
@@ -6283,6 +6451,110 @@ mod tests {
         let split = dedup_surviving_ids_streamed(&[&[(1, 1)], &[(1, 1), (1, 1)]], existing);
         assert_eq!(one_batch, vec![1], "two stored copies cancel two of three");
         assert_eq!(split, one_batch, "batching must not change the result");
+    }
+
+    /// Differential test for #15329: the indexed subtraction keeps exactly the incoming
+    /// rows the pairwise comparison keeps, and claims exactly the same stored rows, over
+    /// seeded streams that repeat rows and mix nulls, `-0.0` and `0.0`, `NaN`, dictionary
+    /// values whose keys differ from batch to batch, and empty, null and null-holding lists.
+    #[test]
+    fn overlap_index_matches_the_pairwise_comparison() {
+        use arrow::array::{DictionaryArray, ListArray};
+        use arrow::datatypes::Int32Type;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new(
+                "tag",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new(
+                "items",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+        let names = [Some("a"), Some("b"), Some(""), None];
+        let scores = [Some(0.0), Some(-0.0), Some(f64::NAN), Some(1.5), None];
+
+        let (mut kept_total, mut cancelled_total) = (0_usize, 0_usize);
+        for seed in 1..=200_u64 {
+            let mut state = seed;
+            let mut next = move |bound: usize| {
+                // xorshift64
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                usize::try_from(state % u64::try_from(bound).expect("bound fits u64"))
+                    .expect("the remainder fits usize")
+            };
+            let batch = |next: &mut dyn FnMut(usize) -> usize| {
+                let rows = next(12);
+                let ids: Vec<Option<i32>> = (0..rows)
+                    .map(|_| match next(4) {
+                        0 => None,
+                        n => Some(i32::try_from(n).expect("small id")),
+                    })
+                    .collect();
+                let row_names: Vec<Option<&str>> =
+                    (0..rows).map(|_| names[next(names.len())]).collect();
+                let row_scores: Vec<Option<f64>> =
+                    (0..rows).map(|_| scores[next(scores.len())]).collect();
+                // Each batch builds its own dictionary, so equal values carry different
+                // keys in different batches.
+                let tags: DictionaryArray<Int32Type> =
+                    (0..rows).map(|_| names[next(names.len())]).collect();
+                let items = ListArray::from_iter_primitive::<Int32Type, _, _>((0..rows).map(
+                    |_| match next(4) {
+                        0 => None,
+                        1 => Some(vec![]),
+                        2 => Some(vec![Some(1), None]),
+                        _ => Some(vec![Some(1)]),
+                    },
+                ));
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int32Array::from(ids)),
+                        Arc::new(StringArray::from(row_names)),
+                        Arc::new(Float64Array::from(row_scores)),
+                        Arc::new(tags),
+                        Arc::new(items),
+                    ],
+                )
+                .expect("batch")
+            };
+            let existing: Vec<RecordBatch> = (0..3).map(|_| batch(&mut next)).collect();
+            let incoming: Vec<RecordBatch> = (0..4).map(|_| batch(&mut next)).collect();
+
+            let fresh = || -> Vec<Vec<bool>> {
+                existing.iter().map(|b| vec![false; b.num_rows()]).collect()
+            };
+            let (mut used_pairwise, mut used_indexed) = (fresh(), fresh());
+            let mut index = OverlapIndex::try_new(&existing, &schema).expect("index builds");
+            for update in &incoming {
+                let pairwise = dedup_predicates(update, &existing, &schema, &mut used_pairwise)
+                    .expect("pairwise");
+                let indexed = index
+                    .predicates(update, &schema, &mut used_indexed)
+                    .expect("indexed");
+                assert_eq!(indexed, pairwise, "kept rows differ for seed {seed}");
+                kept_total += pairwise.iter().filter(|keep| **keep).count();
+                cancelled_total += pairwise.iter().filter(|keep| !**keep).count();
+            }
+            assert_eq!(
+                used_indexed, used_pairwise,
+                "claimed stored rows differ for seed {seed}"
+            );
+        }
+        assert!(
+            kept_total > 0 && cancelled_total > 0,
+            "the streams must both keep and cancel rows to compare anything: \
+             kept {kept_total}, cancelled {cancelled_total}"
+        );
     }
 
     /// End-to-end regression test for #12499 through the append dedup path: the accelerator
