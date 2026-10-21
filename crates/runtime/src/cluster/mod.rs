@@ -780,7 +780,7 @@ impl ClusterTlsConfig {
 }
 
 /// Logged when a cluster node is started with `--allow-insecure-connections`.
-const INSECURE_CONNECTIONS_DEPRECATION_WARNING: &str = "`--allow-insecure-connections` is deprecated and no longer allows insecure cluster connections: without cluster mTLS, cluster RPCs are refused, so executors cannot join a scheduler. Set `--node-mtls-ca-certificate-file`, `--node-mtls-certificate-file` and `--node-mtls-key-file`; create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`. The flag will be removed in a future release.";
+const INSECURE_CONNECTIONS_WARNING: &str = "Cluster connections are not authenticated or encrypted because `--allow-insecure-connections` is set. Use only on a trusted network for local development and testing. For secure clusters, create certificates with `spice cluster tls init` and `spice cluster tls add <node-name>` and set the `--node-mtls-*` flags.";
 
 fn io_other<E: std::fmt::Display>(err: E) -> io::Error {
     io::Error::other(err.to_string())
@@ -881,7 +881,7 @@ impl ResolvedClusterConfig {
 
             if !missing_flags.is_empty() {
                 let certificate_hint = if tls_config.is_none() {
-                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`."
+                    " Create cluster certificates with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use `--allow-insecure-connections` for local development and testing."
                 } else {
                     ""
                 };
@@ -894,8 +894,8 @@ impl ResolvedClusterConfig {
                 ));
             }
 
-            if config.allow_insecure_connections {
-                tracing::warn!("{INSECURE_CONNECTIONS_DEPRECATION_WARNING}");
+            if tls_config.is_none() && config.allow_insecure_connections {
+                tracing::warn!("{INSECURE_CONNECTIONS_WARNING}");
             }
         }
 
@@ -2682,16 +2682,16 @@ mod tests {
                 err.to_string(),
                 "Cluster mode requires the following flags: --node-mtls-ca-certificate-file, \
                  --node-mtls-certificate-file, --node-mtls-key-file. Create cluster certificates \
-                 with `spice cluster tls init` and `spice cluster tls add <node-name>`.",
+                 with `spice cluster tls init` and `spice cluster tls add <node-name>`, or use \
+                 `--allow-insecure-connections` for local development and testing.",
                 "{node}"
             );
         }
     }
 
-    /// The deprecated flag still parses and still lets a node start without cluster mTLS
-    /// files; the node then refuses every cluster RPC.
+    /// Local development nodes can explicitly opt out of cluster mTLS.
     #[test]
-    fn deprecated_insecure_connections_flag_still_starts_a_node() {
+    fn insecure_connections_flag_starts_a_node_without_mtls() {
         use super::ResolvedClusterConfig;
         use crate::config::{ClusterConfig, ClusterRole};
         use clap::Parser;
@@ -2704,12 +2704,12 @@ mod tests {
             "127.0.0.1",
             "--allow-insecure-connections",
         ])
-        .expect("--allow-insecure-connections should still parse");
+        .expect("--allow-insecure-connections should parse");
         assert!(config.allow_insecure_connections);
         assert_eq!(config.role, Some(ClusterRole::Scheduler));
 
         let resolved = ResolvedClusterConfig::try_new(config)
-            .expect("a node started with the deprecated flag should still start");
+            .expect("a node started with the insecure flag should start");
         assert!(!resolved.tls_enabled());
     }
 

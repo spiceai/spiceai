@@ -17,6 +17,7 @@ limitations under the License.
 use app::AppBuilder;
 
 use arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
+use ballista_core::extension::SessionConfigExt;
 use ballista_scheduler::state::executor_manager::ExecutorManager;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -38,6 +39,81 @@ use crate::{
 };
 
 const NAMES_CSV: &str = include_str!("../acceleration/data/names.csv");
+
+/// A local cluster without certificates or executor API keys must register its
+/// executors and fetch shuffle results through their Flight servers.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_insecure_cluster_distributed_queries() -> Result<(), anyhow::Error> {
+    use super::harness::ClusterHarness;
+
+    crate::utils::require_process_per_test(
+        "this test installs the process-global meter provider to observe shuffle transfers",
+    );
+    let registry = &*crate::utils::PROMETHEUS;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    configure_test_datafusion();
+
+    test_request_context()
+        .scope(async {
+            let tempdir = tempfile::tempdir()?;
+            let csv = tempdir.path().join("names.csv");
+            std::fs::write(&csv, NAMES_CSV)?;
+            let mut app = AppBuilder::new("insecure_cluster")
+                .with_dataset(Dataset::new(format!("file:{}", csv.display()), "names"))
+                .build();
+            app.runtime
+                .caching
+                .sql_results
+                .get_or_insert_default()
+                .enabled = false;
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(2)
+                .without_mtls()
+                .start()
+                .await?;
+            harness.wait_for_executors(Duration::from_secs(30)).await?;
+            assert_eq!(harness.registered_executors().await?.len(), 2);
+
+            // All nodes share a filesystem in this harness. Require Flight reads
+            // so a local file read cannot hide a broken shuffle connection.
+            {
+                let state = harness.scheduler.datafusion().ctx.state_ref();
+                let mut state = state.write();
+                let config = state.config_mut();
+                *config = config
+                    .clone()
+                    .with_ballista_shuffle_reader_force_remote_read(true);
+            }
+
+            for (index, sql) in [
+                "SELECT id, name, age, city, score FROM names ORDER BY id",
+                "SELECT city, count(*) AS n, sum(score) AS total FROM names GROUP BY city ORDER BY city",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let expected = harness.query(sql).await?;
+                let actual = harness
+                    .query_distributed(sql, &format!("insecure_query_{index}"))
+                    .await?;
+                assert!(expected.iter().map(RecordBatch::num_rows).sum::<usize>() > 0);
+                assert_eq!(
+                    arrow::util::pretty::pretty_format_batches(&actual)?.to_string(),
+                    arrow::util::pretty::pretty_format_batches(&expected)?.to_string(),
+                    "{sql}"
+                );
+            }
+
+            assert!(
+                crate::utils::metric_value(registry, "executor_shuffle_read_remote_rows", &[]) > 0.0,
+                "executors must fetch nonempty shuffle partitions through Flight"
+            );
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
 
 /// Replace the temp path in `RecordBatch` string columns before formatting,
 /// so that `pretty_format_batches` produces consistent column widths
