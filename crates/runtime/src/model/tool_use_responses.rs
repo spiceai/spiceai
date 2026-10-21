@@ -962,7 +962,7 @@ fn make_responses_stream(
                         requested,
                     );
                     let runnable = model.runnable_spice_call_ids(&response.output);
-                    let mut outcomes = HashMap::new();
+                    let mut outcomes: HashMap<String, ToolOutcome> = HashMap::new();
                     for event in held {
                         let ended_call = match &event {
                             ResponseStreamEvent::ResponseOutputItemDone(done)
@@ -979,13 +979,20 @@ fn make_responses_stream(
                         };
                         let events = match ended_call {
                             Some((call, output_index)) => {
-                                let outcome = model
-                                    .run_spice_tool_call_if_runnable(call, &runnable, requested)
-                                    .await;
-                                let events =
-                                    client_stream.tool_call_ended(call, output_index, &outcome);
-                                outcomes.insert(call.call_id.clone(), outcome);
-                                events
+                                // The runnable set records which call ids may run, not how many
+                                // times. A repeated `output_item.done` for an id already run in
+                                // this round, including a later item that reuses the id, reuses
+                                // that outcome instead of running the tool again.
+                                let outcome = if let Some(outcome) = outcomes.get(&call.call_id) {
+                                    outcome.clone()
+                                } else {
+                                    let outcome = model
+                                        .run_spice_tool_call_if_runnable(call, &runnable, requested)
+                                        .await;
+                                    outcomes.insert(call.call_id.clone(), outcome.clone());
+                                    outcome
+                                };
+                                client_stream.tool_call_ended(call, output_index, &outcome)
                             }
                             None => client_stream.events(event, is_spice),
                         };
@@ -2003,14 +2010,26 @@ mod tests {
     struct DoneOrderResponses {
         calls: usize,
         done_indexes: Vec<usize>,
+        /// When set, item `index`'s `call_id` is `call_0_{index % cycle}` rather than
+        /// `call_0_{index}`.
+        id_cycle: Option<usize>,
         requests: Mutex<Vec<CreateResponse>>,
     }
 
     impl DoneOrderResponses {
         fn new(calls: usize, done_indexes: Vec<usize>) -> Arc<Self> {
+            Self::with_id_cycle(calls, done_indexes, None)
+        }
+
+        fn with_id_cycle(
+            calls: usize,
+            done_indexes: Vec<usize>,
+            id_cycle: Option<usize>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 calls,
                 done_indexes,
+                id_cycle,
                 requests: Mutex::new(Vec::new()),
             })
         }
@@ -2036,7 +2055,7 @@ mod tests {
             drop(requests);
             let events = if round == 0 {
                 let names = vec!["list_datasets"; self.calls];
-                done_order_events(0, &names, &self.done_indexes)
+                done_order_events(0, &names, &self.done_indexes, self.id_cycle)
             } else {
                 round_events(round, &["message"])
             };
@@ -2053,19 +2072,55 @@ mod tests {
             } else {
                 vec!["message"]
             };
+            let output_items: Vec<Value> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| item_call(round, index, name, "completed", self.id_cycle))
+                .collect();
             Ok(
-                serde_json::from_value(response(round, "completed", &output(round, &names)))
+                serde_json::from_value(response(round, "completed", &output_items))
                     .expect("a valid response"),
             )
         }
     }
 
+    /// `call_{round}_{index}`, or `call_{round}_{index % cycle}` when `id_cycle` is set.
+    fn call_id_for(round: usize, index: usize, id_cycle: Option<usize>) -> String {
+        let n = match id_cycle {
+            Some(cycle) => index % cycle,
+            None => index,
+        };
+        format!("call_{round}_{n}")
+    }
+
+    /// [`item`] with `call_id` from [`call_id_for`].
+    fn item_call(
+        round: usize,
+        index: usize,
+        name: &str,
+        status: &str,
+        id_cycle: Option<usize>,
+    ) -> Value {
+        let mut value = item(round, index, name, status);
+        if let Some(object) = value.as_object_mut()
+            && object.contains_key("call_id")
+        {
+            object.insert(
+                "call_id".to_string(),
+                Value::String(call_id_for(round, index, id_cycle)),
+            );
+        }
+        value
+    }
+
     /// Round `round`'s stream: every item is added first, then `output_item.done` for
     /// `done_indexes` in that order. The completed response still lists every item.
+    /// `id_cycle` reuses `call_id`s across items.
     fn done_order_events(
         round: usize,
         items: &[&str],
         done_indexes: &[usize],
+        id_cycle: Option<usize>,
     ) -> Vec<ResponseStreamEvent> {
         let mut events = vec![json!({
             "type": "response.created", "response": response(round, "in_progress", &[]),
@@ -2074,7 +2129,7 @@ mod tests {
             let item_id = item(round, index, name, "completed")["id"].clone();
             events.push(json!({
                 "type": "response.output_item.added", "output_index": index,
-                "item": item(round, index, name, "in_progress"),
+                "item": item_call(round, index, name, "in_progress", id_cycle),
             }));
             events.extend([
                 json!({
@@ -2090,12 +2145,17 @@ mod tests {
         for index in done_indexes {
             events.push(json!({
                 "type": "response.output_item.done", "output_index": index,
-                "item": item(round, *index, items[*index], "completed"),
+                "item": item_call(round, *index, items[*index], "completed", id_cycle),
             }));
         }
+        let output_items: Vec<Value> = items
+            .iter()
+            .enumerate()
+            .map(|(index, name)| item_call(round, index, name, "completed", id_cycle))
+            .collect();
         events.push(json!({
             "type": "response.completed",
-            "response": response(round, "completed", &output(round, items)),
+            "response": response(round, "completed", &output_items),
         }));
         events
             .into_iter()
@@ -2186,5 +2246,95 @@ mod tests {
                 "done order {done_indexes:?}"
             );
         }
+    }
+
+    /// Runs `provider`'s stream and returns how many times `list_datasets` ran, plus the next
+    /// round's function outputs by `call_id`.
+    async fn streamed_list_datasets(
+        provider: &Arc<DoneOrderResponses>,
+    ) -> (usize, HashMap<String, String>) {
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+        let events = collect_events(
+            ToolUsingResponses::new(
+                Arc::clone(provider) as Arc<dyn Responses>,
+                vec![],
+                vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+                None,
+            )
+            .responses_stream(request(true))
+            .await
+            .expect("a response stream"),
+        )
+        .await;
+        assert!(
+            events
+                .last()
+                .is_some_and(|event| event["type"] == "response.completed"),
+            "the stream did not finish"
+        );
+        (
+            tool.0.load(Ordering::SeqCst),
+            function_outputs(&provider.input(1)),
+        )
+    }
+
+    /// A repeated `output_item.done`, or a later item that reuses an admitted `call_id`, does not
+    /// run the tool again.
+    #[tokio::test]
+    async fn streamed_tool_calls_do_not_rerun_a_reused_call_id() {
+        let cycle = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
+        let ran = "[\"taxi_trips\"]";
+
+        // 65 distinct calls. Each of the first 64 done events is repeated, then call 64's once.
+        let repeated_dones: Vec<usize> = (0..cycle)
+            .cycle()
+            .take(cycle * 16)
+            .chain(std::iter::once(cycle))
+            .collect();
+        let (ran_count, outputs) =
+            streamed_list_datasets(&DoneOrderResponses::new(cycle + 1, repeated_dones)).await;
+        let skipped = tool_call_not_run_message(cycle + 1);
+        assert_eq!(ran_count, cycle, "repeated done events");
+        assert_eq!(
+            outputs.get("call_0_0").map(String::as_str),
+            Some(ran),
+            "repeated done events"
+        );
+        assert_eq!(
+            outputs
+                .get(&format!("call_0_{}", cycle - 1))
+                .map(String::as_str),
+            Some(ran),
+            "repeated done events"
+        );
+        assert_eq!(
+            outputs.get(&format!("call_0_{cycle}")).map(String::as_str),
+            Some(skipped.as_str()),
+            "repeated done events"
+        );
+
+        // Four times as many items as the cap, call ids cycling through the first 64, one done
+        // event each. Every item's id is in the runnable set; only the first use of each runs.
+        let reused = cycle * 4;
+        let (ran_count, outputs) = streamed_list_datasets(&DoneOrderResponses::with_id_cycle(
+            reused,
+            (0..reused).collect(),
+            Some(cycle),
+        ))
+        .await;
+        assert_eq!(ran_count, cycle, "reused call ids");
+        assert_eq!(outputs.len(), cycle, "reused call ids");
+        assert_eq!(
+            outputs.get("call_0_0").map(String::as_str),
+            Some(ran),
+            "reused call ids"
+        );
+        assert_eq!(
+            outputs
+                .get(&format!("call_0_{}", cycle - 1))
+                .map(String::as_str),
+            Some(ran),
+            "reused call ids"
+        );
     }
 }
