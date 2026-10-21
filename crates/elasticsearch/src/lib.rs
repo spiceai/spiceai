@@ -204,6 +204,23 @@ pub struct Hit {
     pub sort: Option<Vec<serde_json::Value>>,
     #[serde(default, rename = "_source")]
     pub source: serde_json::Value,
+    /// The document's sequence number, returned when the search asks for
+    /// `seq_no_primary_term`.
+    #[serde(default, rename = "_seq_no")]
+    pub seq_no: Option<i64>,
+    /// The primary term `seq_no` was assigned under, returned alongside it.
+    #[serde(default, rename = "_primary_term")]
+    pub primary_term: Option<i64>,
+}
+
+/// A document as one write left it: any later write to the same `_id` assigns a new
+/// `(seq_no, primary_term)`, so a delete conditioned on this pair removes the document only
+/// if nothing has rewritten it since.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentVersion {
+    pub id: String,
+    pub seq_no: i64,
+    pub primary_term: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -624,6 +641,46 @@ impl Client {
         .await
     }
 
+    /// Delete each document in `docs` via `POST /_bulk`, but only while it is still at the
+    /// given version (`if_seq_no` / `if_primary_term`). A document rewritten since is reported
+    /// with a per-item `409` version conflict and left in place; the bulk response is returned
+    /// for the caller to inspect.
+    pub async fn bulk_delete_if_unchanged(
+        &self,
+        index: &str,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/_bulk", self.base_url);
+        let mut ndjson = String::new();
+        for doc in docs {
+            let action = serde_json::json!({"delete": {
+                "_index": index,
+                "_id": doc.id,
+                "if_seq_no": doc.seq_no,
+                "if_primary_term": doc.primary_term,
+            }});
+            ndjson.push_str(&serde_json::to_string(&action).context(JsonSerializeSnafu)?);
+            ndjson.push('\n');
+        }
+        let url_ref = &url;
+        let ndjson_bytes = Bytes::from(ndjson);
+        let ndjson_ref = &ndjson_bytes;
+        // Safe to retry: a delete that already applied reports `404` on the retry, and one
+        // whose document was rewritten in between reports `409`; neither removes anything new.
+        self.with_retry("bulk_delete_if_unchanged", |c| async move {
+            let resp = c
+                .auth(c.http.post(url_ref))
+                .header(CONTENT_TYPE, "application/x-ndjson")
+                .body(ndjson_ref.clone())
+                .send()
+                .await
+                .context(HttpRequestSnafu)?;
+            let resp = check_status_without_body(resp).await?;
+            resp.json().await.context(JsonParseSnafu)
+        })
+        .await
+    }
+
     /// Delete every document matching `query` via `POST /<index>/_delete_by_query`.
     pub async fn delete_by_query(
         &self,
@@ -808,6 +865,11 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         query: &serde_json::Value,
     ) -> Result<serde_json::Value>;
+    async fn bulk_delete_if_unchanged(
+        &self,
+        index: &str,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value>;
 }
 
 #[async_trait::async_trait]
@@ -899,6 +961,14 @@ impl Elasticsearch for Client {
         query: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         Client::delete_by_query(self, index, query).await
+    }
+
+    async fn bulk_delete_if_unchanged(
+        &self,
+        index: &str,
+        docs: &[DocumentVersion],
+    ) -> Result<serde_json::Value> {
+        Client::bulk_delete_if_unchanged(self, index, docs).await
     }
 }
 

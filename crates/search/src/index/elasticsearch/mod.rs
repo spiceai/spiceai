@@ -37,7 +37,7 @@ use datafusion::datasource::DefaultTableSource;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
-use elasticsearch::Elasticsearch;
+use elasticsearch::{DocumentVersion, Elasticsearch};
 use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
 use spice_table::{GroupPruning, Index, WriteWindow};
@@ -213,6 +213,13 @@ pub(super) mod unused_client {
         ) -> Result<serde_json::Value> {
             Self::refuse("delete_by_query")
         }
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _: &str,
+            _: &[elasticsearch::DocumentVersion],
+        ) -> Result<serde_json::Value> {
+            Self::refuse("bulk_delete_if_unchanged")
+        }
     }
 }
 
@@ -226,6 +233,208 @@ pub struct ElasticsearchIndexWriteOptions {
     pub force_merge_segments: Option<u32>,
 }
 
+/// How long Elasticsearch keeps a replacing write's snapshot open between two uses of it.
+const REPLACE_SNAPSHOT_KEEP_ALIVE: &str = "5m";
+
+/// How often a replacing write renews its snapshot's keep-alive while rows are still being
+/// written, well inside [`REPLACE_SNAPSHOT_KEEP_ALIVE`] so one slow renewal does not lose it.
+const REPLACE_SNAPSHOT_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Documents read from the snapshot, and conditionally deleted, per request.
+const REPLACE_RECONCILE_PAGE_SIZE: usize = 1000;
+
+/// The documents an Elasticsearch index held when a replacing write (a `refresh_mode: full`
+/// refresh) started, kept as a point-in-time reader.
+///
+/// A replacing write removes a row by not sending it again, so its document has to be found
+/// and deleted once the write is done. Every document the write *did* send was rewritten and
+/// carries a new `(seq_no, primary_term)`; a document still at the version this snapshot
+/// recorded is one the write left out. Deleting each snapshot document conditionally on that
+/// version removes exactly those, and leaves anything written since — by this write or a
+/// concurrent one — in place, without a second copy of the index or an alias swap. Readers
+/// keep seeing the dropped rows until the write completes, never an empty index.
+#[derive(Debug)]
+struct ReplaceSnapshot {
+    /// Elasticsearch may hand back a new id on any search against the reader, so the renewal
+    /// task and the reconcile both read and update the latest one here.
+    pit_id: Arc<parking_lot::Mutex<String>>,
+    renewal: tokio::task::JoinHandle<()>,
+}
+
+impl ReplaceSnapshot {
+    /// `None` when the index does not exist yet: it holds no documents the write could drop.
+    async fn open(
+        client: &Arc<dyn Elasticsearch>,
+        es_index: &str,
+    ) -> Result<Option<Self>, DataFusionError> {
+        // A point-in-time reader sees only searchable documents, so make every earlier write
+        // searchable first; one still inside `refresh_interval` would otherwise be missing
+        // from the snapshot and never reconciled.
+        let snapshot = async {
+            client.refresh_index(es_index).await?;
+            client
+                .open_point_in_time(es_index, REPLACE_SNAPSHOT_KEEP_ALIVE)
+                .await
+        };
+        let pit_id = match snapshot.await {
+            Ok(pit_id) => pit_id,
+            Err(elasticsearch::Error::ElasticsearchError { status: 404, .. }) => return Ok(None),
+            Err(e) => {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to snapshot the search index '{es_index}' (elasticsearch) before a full refresh, so documents for rows the refresh drops cannot be found afterwards and searches will keep returning those rows. Cause: {e}"
+                )));
+            }
+        };
+        let pit_id = Arc::new(parking_lot::Mutex::new(pit_id));
+        let renewal = tokio::spawn(Self::renew(Arc::clone(client), Arc::clone(&pit_id)));
+        Ok(Some(Self { pit_id, renewal }))
+    }
+
+    /// Renews the reader's keep-alive until the write finishes, however long it runs. Stops
+    /// at the first failed renewal: the reader is gone, and the reconcile reports that.
+    async fn renew(client: Arc<dyn Elasticsearch>, pit_id: Arc<parking_lot::Mutex<String>>) {
+        loop {
+            tokio::time::sleep(REPLACE_SNAPSHOT_RENEW_INTERVAL).await;
+            let id = pit_id.lock().clone();
+            let body = serde_json::json!({
+                "pit": { "id": id, "keep_alive": REPLACE_SNAPSHOT_KEEP_ALIVE },
+                "size": 0,
+                "track_total_hits": false,
+            });
+            match client.search_point_in_time(&body).await {
+                Ok(resp) => {
+                    if let Some(new_id) = resp.pit_id {
+                        *pit_id.lock() = new_id;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Stopped renewing a full-refresh snapshot: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Deletes every snapshot document the write did not rewrite, page by page, and closes
+    /// the reader. Returns how many documents were deleted.
+    async fn delete_unrewritten(
+        self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<u64, DataFusionError> {
+        self.renewal.abort();
+        let mut pit_id = self.pit_id.lock().clone();
+        let result = Self::delete_pages(client, es_index, &mut pit_id).await;
+        if let Err(e) = client.close_point_in_time(&pit_id).await {
+            tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
+        }
+        result.map_err(|cause| {
+            DataFusionError::Execution(format!(
+                "Failed to remove the documents for rows a full refresh dropped from the search index '{es_index}' (elasticsearch), so searches can return rows the dataset no longer has until the next full refresh succeeds. Cause: {cause}"
+            ))
+        })
+    }
+
+    async fn delete_pages(
+        client: &dyn Elasticsearch,
+        es_index: &str,
+        pit_id: &mut String,
+    ) -> Result<u64, String> {
+        let mut search_after: Option<Vec<serde_json::Value>> = None;
+        let mut deleted = 0;
+        loop {
+            let mut body = serde_json::json!({
+                "pit": { "id": *pit_id, "keep_alive": REPLACE_SNAPSHOT_KEEP_ALIVE },
+                "size": REPLACE_RECONCILE_PAGE_SIZE,
+                "_source": false,
+                "seq_no_primary_term": true,
+                "track_total_hits": false,
+                "sort": [{ "_shard_doc": "asc" }],
+            });
+            if let Some(after) = search_after.take() {
+                body["search_after"] = serde_json::Value::Array(after);
+            }
+            let page = client
+                .search_point_in_time(&body)
+                .await
+                .map_err(|e| format!("reading the snapshot failed: {e}"))?;
+            if let Some(new_id) = page.pit_id {
+                *pit_id = new_id;
+            }
+            let hits = page.hits.hits;
+            let Some(last) = hits.last() else {
+                return Ok(deleted);
+            };
+            search_after = Some(last.sort.clone().ok_or_else(|| {
+                "the snapshot returned a document without sort values, so it cannot be paged"
+                    .to_string()
+            })?);
+            let full_page = hits.len() == REPLACE_RECONCILE_PAGE_SIZE;
+            let versions = hits
+                .into_iter()
+                .map(|hit| match (hit.seq_no, hit.primary_term) {
+                    (Some(seq_no), Some(primary_term)) => Ok(DocumentVersion {
+                        id: hit.id,
+                        seq_no,
+                        primary_term,
+                    }),
+                    _ => Err(format!(
+                        "the snapshot returned document '{}' without its sequence number",
+                        hit.id
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let response = client
+                .bulk_delete_if_unchanged(es_index, &versions)
+                .await
+                .map_err(|e| format!("the delete request failed: {e}"))?;
+            deleted += count_conditional_deletes(&response)?;
+            if !full_page {
+                return Ok(deleted);
+            }
+        }
+    }
+}
+
+impl Drop for ReplaceSnapshot {
+    fn drop(&mut self) {
+        self.renewal.abort();
+    }
+}
+
+/// Counts the documents a conditional bulk delete removed. A `409` is a document rewritten
+/// since the snapshot and a `404` one already deleted; both are expected and left alone. Any
+/// other per-item failure is an error, since that document may still be served.
+fn count_conditional_deletes(response: &serde_json::Value) -> Result<u64, String> {
+    let items = response
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("the bulk response carries no `items`: {response}"))?;
+    let mut deleted = 0;
+    for item in items {
+        let outcome = item.get("delete").unwrap_or(item);
+        match outcome.get("status").and_then(serde_json::Value::as_u64) {
+            Some(200) => deleted += 1,
+            Some(404 | 409) => {}
+            status => {
+                let id = outcome
+                    .get("_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unknown>");
+                let error = outcome.get("error").map_or_else(
+                    || "no error detail".to_string(),
+                    serde_json::Value::to_string,
+                );
+                return Err(format!(
+                    "deleting document '{id}' failed with status {}: {error}",
+                    status.map_or_else(|| "<none>".to_string(), |s| s.to_string())
+                ));
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 /// Stateful helper shared by Elasticsearch-backed indexes that write to the same ES index.
 #[derive(Debug)]
 pub struct ElasticsearchIndexWriteMaintenance {
@@ -233,6 +442,8 @@ pub struct ElasticsearchIndexWriteMaintenance {
     write_cycle_active: AtomicBool,
     refresh_interval_overridden: AtomicBool,
     previous_refresh_interval: Mutex<PreviousRefreshInterval>,
+    /// Set for the length of a replacing write; see [`ReplaceSnapshot`].
+    replace_snapshot: parking_lot::Mutex<Option<ReplaceSnapshot>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,6 +468,38 @@ impl ElasticsearchIndexWriteMaintenance {
             write_cycle_active: AtomicBool::new(false),
             refresh_interval_overridden: AtomicBool::new(false),
             previous_refresh_interval: Mutex::new(PreviousRefreshInterval::default()),
+            replace_snapshot: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Starts a write cycle for `window`. A [`WriteWindow::ReplaceAll`] write first snapshots
+    /// the index (see [`ReplaceSnapshot`]), so [`Self::on_write_complete`] can delete the
+    /// documents of every row the write dropped.
+    ///
+    /// The snapshot is taken only by the call that opens the cycle: a later call in the same
+    /// cycle may come after rows were already written, and a snapshot taken then would miss
+    /// documents the write is about to leave out.
+    pub async fn on_write_window_start(
+        &self,
+        client: &Arc<dyn Elasticsearch>,
+        es_index: &str,
+        window: WriteWindow,
+    ) -> Result<(), DataFusionError> {
+        match window {
+            WriteWindow::Append => self.on_write_start(client.as_ref(), es_index).await,
+            WriteWindow::ReplaceAll => {
+                if self.write_cycle_active.swap(true, Ordering::AcqRel) {
+                    return Ok(());
+                }
+                match ReplaceSnapshot::open(client, es_index).await {
+                    Ok(snapshot) => *self.replace_snapshot.lock() = snapshot,
+                    Err(e) => {
+                        self.abandon_write_cycle();
+                        return Err(e);
+                    }
+                }
+                self.tune_refresh_interval(client.as_ref(), es_index).await
+            }
         }
     }
 
@@ -269,7 +512,14 @@ impl ElasticsearchIndexWriteMaintenance {
         if !first_start {
             return Ok(());
         }
+        self.tune_refresh_interval(client, es_index).await
+    }
 
+    async fn tune_refresh_interval(
+        &self,
+        client: &dyn Elasticsearch,
+        es_index: &str,
+    ) -> Result<(), DataFusionError> {
         let Some(refresh_interval) = self.options.refresh_interval_during_write.as_deref() else {
             return Ok(());
         };
@@ -313,6 +563,9 @@ impl ElasticsearchIndexWriteMaintenance {
     /// cycle stays open forever and every later write's start short-circuits as a
     /// second-batch no-op, silently dropping the `refresh_interval` tuning.
     fn abandon_write_cycle(&self) {
+        // Dropping the snapshot stops its renewal; Elasticsearch releases the reader once
+        // its keep-alive lapses.
+        self.replace_snapshot.lock().take();
         self.refresh_interval_overridden
             .store(false, Ordering::Release);
         self.write_cycle_active.store(false, Ordering::Release);
@@ -326,6 +579,16 @@ impl ElasticsearchIndexWriteMaintenance {
         if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
+        // A failed write proves nothing about which rows the source still has, so delete
+        // nothing; the next full refresh reconciles the index.
+        let snapshot = self.replace_snapshot.lock().take();
+        if let Some(snapshot) = snapshot {
+            snapshot.renewal.abort();
+            let pit_id = snapshot.pit_id.lock().clone();
+            if let Err(e) = client.close_point_in_time(&pit_id).await {
+                tracing::debug!("Could not close a full-refresh snapshot of '{es_index}': {e}");
+            }
+        }
         self.restore_refresh_interval(client, es_index).await?;
         Ok(())
     }
@@ -338,6 +601,18 @@ impl ElasticsearchIndexWriteMaintenance {
         if !self.write_cycle_active.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
+
+        // Delete before the refresh below, so it publishes the deletions with the write.
+        // A failure still restores the refresh interval before it is reported.
+        let snapshot = self.replace_snapshot.lock().take();
+        let reconciled = match snapshot {
+            Some(snapshot) => snapshot.delete_unrewritten(client, es_index).await.map(|n| {
+                tracing::debug!(
+                    "Removed {n} document(s) for rows a full refresh dropped from Elasticsearch index '{es_index}'."
+                );
+            }),
+            None => Ok(()),
+        };
 
         let restored_refresh_interval = self.restore_refresh_interval(client, es_index).await?;
         if restored_refresh_interval || self.options.force_merge_segments.is_some() {
@@ -357,7 +632,7 @@ impl ElasticsearchIndexWriteMaintenance {
             );
         }
 
-        Ok(())
+        reconciled
     }
 
     async fn restore_refresh_interval(
@@ -568,14 +843,12 @@ impl Index for ElasticsearchIndex {
             .await
     }
 
-    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
-        // The refresh-interval override applies to any write window. Clearing the index for
-        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
-        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
-        // or half-populated index to readers for the length of the refresh. It needs an
-        // atomic index-per-refresh alias swap, tracked separately in #12413.
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        // Clearing the index up front for `WriteWindow::ReplaceAll` would serve an empty or
+        // half-populated index for the length of the refresh; the documents of dropped rows
+        // are removed when the write completes instead (see `ReplaceSnapshot`).
         self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
+            .on_write_window_start(&self.client, &self.es_index, window)
             .await
     }
 
@@ -859,14 +1132,12 @@ impl Index for ElasticsearchTextIndex {
             .await
     }
 
-    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
-        // The refresh-interval override applies to any write window. Clearing the index for
-        // `WriteWindow::ReplaceAll` cannot be an in-place delete — Elasticsearch has no
-        // deferred window to hide it, so a `_delete_by_query` + reindex would serve an empty
-        // or half-populated index to readers for the length of the refresh. It needs an
-        // atomic index-per-refresh alias swap, tracked separately in #12413.
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        // Clearing the index up front for `WriteWindow::ReplaceAll` would serve an empty or
+        // half-populated index for the length of the refresh; the documents of dropped rows
+        // are removed when the write completes instead (see `ReplaceSnapshot`).
         self.write_maintenance
-            .on_write_start(self.client.as_ref(), &self.es_index)
+            .on_write_window_start(&self.client, &self.es_index, window)
             .await
     }
 
@@ -1060,6 +1331,13 @@ mod write_maintenance_tests {
             &self,
             _: &str,
             _: &serde_json::Value,
+        ) -> elasticsearch::Result<serde_json::Value> {
+            unimplemented!()
+        }
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _: &str,
+            _: &[elasticsearch::DocumentVersion],
         ) -> elasticsearch::Result<serde_json::Value> {
             unimplemented!()
         }
@@ -1614,6 +1892,14 @@ mod chunked_group_pruning_tests {
 
     #[async_trait::async_trait]
     impl ElasticsearchTrait for StoreClient {
+        async fn bulk_delete_if_unchanged(
+            &self,
+            _index: &str,
+            _docs: &[elasticsearch::DocumentVersion],
+        ) -> EsResult<serde_json::Value> {
+            Err(unexpected("bulk_delete_if_unchanged"))
+        }
+
         async fn bulk_index(
             &self,
             _index: &str,
