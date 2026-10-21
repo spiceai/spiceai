@@ -21,11 +21,8 @@ limitations under the License.
 //! file-based scheduler state.
 //!
 //! This wrapper intercepts `PutMode::Update` requests and implements them by
-//! hashing the current bytes under a file-backed advisory lock, then writing
-//! with `PutMode::Overwrite` if that hash is the expected `ETag`. The token is
-//! a content hash because a local file's own `ETag` is its inode, modification
-//! time, and size: a rewrite of the same size can reuse an inode inside one
-//! timestamp and hand a stale writer a token that matches again.
+//! checking the current `ETag` under a file-backed advisory lock, then writing
+//! with `PutMode::Overwrite` if the `ETag` matches.
 //!
 //! **Concurrency model**: each conditional write takes an advisory lock for the
 //! object's directory. Two clients whose roots and keys name the same file
@@ -52,22 +49,19 @@ use futures::{StreamExt, TryStreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
-    Attributes, CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions,
 };
 
 /// Wraps a [`LocalFileSystem`] to add `PutMode::Update` support.
 ///
 /// For `PutMode::Update`, it:
 /// 1. Acquires the directory advisory lock
-/// 2. Reads the object and hashes its bytes
-/// 3. Compares that hash with the expected `ETag` from the [`UpdateVersion`]
+/// 2. Reads the current `ETag` of the target file via `head()`
+/// 3. Compares with the expected `ETag` from the [`UpdateVersion`]
 /// 4. Writes with `PutMode::Overwrite` if they match
 /// 5. Releases the advisory lock
-///
-/// `ETag`s this store returns are that same hash, including from `put`, `get`,
-/// `head`, and listings.
 ///
 /// Other operations are delegated. The directory lock path is not an object.
 ///
@@ -109,43 +103,6 @@ fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> 
         .map_err(worker_error)?;
     file.lock().map_err(worker_error)?;
     Ok(file)
-}
-
-/// Hash of the object bytes. This is the conditional-write token.
-fn content_etag(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
-}
-
-fn payload_etag(payload: &PutPayload) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for chunk in payload {
-        hasher.update(chunk);
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
-async fn stored_etag(inner: &LocalFileSystem, location: &Path) -> Result<String, ObjectStoreError> {
-    let bytes = inner.get(location).await?.bytes().await?;
-    Ok(content_etag(&bytes))
-}
-
-fn bytes_result(
-    meta: ObjectMeta,
-    attributes: Attributes,
-    bytes: bytes::Bytes,
-) -> Result<GetResult, ObjectStoreError> {
-    let len = u64::try_from(bytes.len()).map_err(|_| ObjectStoreError::Generic {
-        store: "LocalConditionalPut",
-        source: "object is larger than a u64 length".into(),
-    })?;
-    Ok(GetResult {
-        payload: GetResultPayload::Stream(
-            futures::stream::once(async move { Ok::<_, ObjectStoreError>(bytes) }).boxed(),
-        ),
-        meta,
-        range: 0..len,
-        attributes,
-    })
 }
 
 fn reserved_lock_error(location: &Path) -> ObjectStoreError {
@@ -207,29 +164,23 @@ fn conditional_write(
     let _directory_guard = lock_file(&directory_path)?;
     // No async executor task owns these guards: every filesystem operation runs
     // to completion on this thread before its file descriptor releases the lock.
-    let etag = payload_etag(&payload);
     futures::executor::block_on(async {
         if let PutMode::Update(expected) = &options.mode {
-            let current = inner.get(location).await?.bytes().await?;
-            let found = content_etag(&current);
-            // Compare the bytes, not the filesystem ETag. inode + mtime + size
-            // can recur for a same-size rewrite, and a stale writer would then
-            // overwrite every update that landed in between.
-            if expected.e_tag.as_deref() != Some(found.as_str()) {
+            let current = inner.head(location).await?;
+            // LocalFileSystem supplies ETags but no object version IDs.
+            if current.e_tag != expected.e_tag {
                 return Err(ObjectStoreError::Precondition {
                     path: location.to_string(),
                     source: format!(
-                        "ETag mismatch: expected {:?}, found {found}",
-                        expected.e_tag
+                        "ETag mismatch: expected {:?}, found {:?}",
+                        expected.e_tag, current.e_tag
                     )
                     .into(),
                 });
             }
             options.mode = PutMode::Overwrite;
         }
-        let mut written = inner.put_opts(location, payload, options).await?;
-        written.e_tag = Some(etag);
-        Ok(written)
+        inner.put_opts(location, payload, options).await
     })
 }
 
@@ -300,10 +251,7 @@ impl ObjectStore for LocalConditionalPut {
                 .map_err(|_| worker_error(io::Error::other("local state writer stopped")))?;
             result.await.map_err(worker_error)?
         } else {
-            let etag = payload_etag(&payload);
-            let mut written = self.inner.put_opts(location, payload, opts).await?;
-            written.e_tag = Some(etag);
-            Ok(written)
+            self.inner.put_opts(location, payload, opts).await
         }
     }
 
@@ -329,44 +277,16 @@ impl ObjectStore for LocalConditionalPut {
                 source: "reserved for the conditional-write lock".into(),
             });
         }
-        // Preconditions name the content hash this store publishes. The inner
-        // store would judge them against its inode/mtime/size ETag instead.
-        let mut passthrough = options.clone();
-        passthrough.if_match = None;
-        passthrough.if_none_match = None;
-        passthrough.if_modified_since = None;
-        passthrough.if_unmodified_since = None;
-        let whole_body = passthrough.range.is_none() && !passthrough.head;
-        let mut result = self.inner.get_opts(location, passthrough).await?;
-        if whole_body {
-            let attributes = result.attributes.clone();
-            let mut meta = result.meta.clone();
-            let bytes = result.bytes().await?;
-            meta.e_tag = Some(content_etag(&bytes));
-            options.check_preconditions(&meta)?;
-            return bytes_result(meta, attributes, bytes);
-        }
-        let full = self.inner.get(location).await?.bytes().await?;
-        result.meta.e_tag = Some(content_etag(&full));
-        options.check_preconditions(&result.meta)?;
-        Ok(result)
+        self.inner.get_opts(location, options).await
     }
 
     fn list(
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, ObjectStoreError>> {
-        let inner = Arc::clone(&self.inner);
         self.inner
             .list(prefix)
             .try_filter(|meta| futures::future::ready(!is_publication_lock(&meta.location)))
-            .and_then(move |mut meta| {
-                let inner = Arc::clone(&inner);
-                async move {
-                    meta.e_tag = Some(stored_etag(&inner, &meta.location).await?);
-                    Ok(meta)
-                }
-            })
             .boxed()
     }
 
@@ -389,9 +309,6 @@ impl ObjectStore for LocalConditionalPut {
         result
             .objects
             .retain(|meta| !is_publication_lock(&meta.location));
-        for meta in &mut result.objects {
-            meta.e_tag = Some(stored_etag(&self.inner, &meta.location).await?);
-        }
         Ok(result)
     }
 
