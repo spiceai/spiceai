@@ -1070,9 +1070,9 @@ mod tests {
     use super::*;
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::datafusion::builder::DataFusionBuilder;
-    use crate::status;
     use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
+    use runtime_status as status;
 
     #[tokio::test]
     async fn registry_runner_basic_register_and_shutdown() {

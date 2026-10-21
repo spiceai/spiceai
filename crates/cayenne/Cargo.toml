@@ -536,6 +536,10 @@ name = "scan_view_reuse_qps"
 harness = false
 name = "listing_after_overwrite"
 
+[[bench]]
+harness = false
+name = "protected_snapshot_scan_capture"
+
 [lints]
 workspace = true
 
