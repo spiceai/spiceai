@@ -124,6 +124,7 @@ members = [
     "tools/spiceschema",
     "tools/spicepod-validator",
     "tools/spidapter",
+    "tools/spicescript",
     "tools/testoperator",
     "tools/chbench-driver",
     "tools/parsley",
