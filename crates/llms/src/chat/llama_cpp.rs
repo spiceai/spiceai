@@ -121,7 +121,7 @@ struct Loaded {
 struct Sampling {
     temperature: Option<f32>,
     top_p: Option<f32>,
-    seed: Option<u32>,
+    seed: u32,
 }
 
 struct Job {
@@ -264,7 +264,7 @@ impl LlamaCpp {
             sampling: Sampling {
                 temperature: req.temperature,
                 top_p: req.top_p,
-                seed: req.seed.and_then(|seed| u32::try_from(seed).ok()),
+                seed: rand::random(),
             },
             stop: match &req.stop {
                 Some(StopConfiguration::String(s)) => vec![s.clone()],
@@ -417,7 +417,7 @@ fn render(
     messages: Vec<IndexMap<String, MessageContent>>,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<TemplateReasoningEffort>,
-) -> anyhow::Result<String> {
+) -> std::result::Result<String, String> {
     apply_chat_template_to(
         messages,
         true,
@@ -429,6 +429,7 @@ fn render(
         None,
         Vec::new(),
     )
+    .map_err(|e| e.to_string())
 }
 
 /// The decode thread: loads the model, reports readiness, then runs jobs in order.
@@ -567,7 +568,7 @@ fn sampler(sampling: Sampling) -> LlamaSampler {
         Some(t) if t > 0.0 => LlamaSampler::chain_simple([
             LlamaSampler::top_p(sampling.top_p.unwrap_or(1.0), 1),
             LlamaSampler::temp(t),
-            LlamaSampler::dist(sampling.seed.unwrap_or(0)),
+            LlamaSampler::dist(sampling.seed),
         ]),
         _ => LlamaSampler::greedy(),
     }
