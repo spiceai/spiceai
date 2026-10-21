@@ -30,8 +30,10 @@ limitations under the License.
 //! A column that no scanned file carries is reported:
 //!
 //! - in a scan that feeds an acceleration refresh (the refresh session carries
-//!   [`AccelerationRefreshScan`]), the scan fails, so the refresh fails and keeps the last
-//!   loaded data;
+//!   [`AccelerationRefreshScan`]) that reads every file, the scan fails, so the refresh
+//!   fails and keeps the last loaded data. A refresh narrowed to some files (a partition
+//!   filter in `refresh_sql`, say) only warns, because the files it selects may predate the
+//!   column;
 //! - in any other scan, a `WARN` names the dataset and the columns once per change, and the
 //!   query still returns `NULL` for them.
 
@@ -51,6 +53,7 @@ use datafusion::{
     error::{DataFusionError, Result as DFResult},
     execution::{config::SessionConfig, object_store::ObjectStoreUrl},
     physical_plan::ExecutionPlan,
+    prelude::Expr,
 };
 use datafusion_datasource::{file_scan_config::FileScanConfig, source::DataSourceExec};
 use object_store::ObjectMeta;
@@ -154,6 +157,7 @@ impl FileSchemaDriftGuard {
         state: &dyn Session,
         table_schema: &SchemaRef,
         projection: Option<&[usize]>,
+        selects_all_files: bool,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> DFResult<()> {
         let columns = self.projected_file_columns(table_schema, projection);
@@ -226,7 +230,10 @@ impl FileSchemaDriftGuard {
             return Ok(());
         };
 
-        if is_acceleration_refresh(state) {
+        // A scan narrowed to some files (a partition filter, a `_location` predicate, a
+        // limit) can legitimately read only older files that predate a column, so only a scan
+        // of every file proves the column gone.
+        if selects_all_files && is_acceleration_refresh(state) {
             return Err(DataFusionError::Plan(refresh_error_message(
                 &self.dataset_name,
                 &drift,
@@ -249,6 +256,21 @@ impl FileSchemaDriftGuard {
             guard_state.warned.extend(report.missing);
         }
         Ok(())
+    }
+
+    /// Whether a scan with `filters` and `limit` reads every file of the dataset. Only
+    /// predicates on partition or metadata columns (columns not stored in the files) and a
+    /// limit can drop files before the scan; predicates on file columns prune row groups
+    /// inside each file, not files.
+    #[must_use]
+    pub fn scan_selects_all_files(&self, filters: &[Expr], limit: Option<usize>) -> bool {
+        limit.is_none()
+            && filters.iter().all(|filter| {
+                filter
+                    .column_refs()
+                    .iter()
+                    .all(|c| self.file_schema.field_with_name(&c.name).is_ok())
+            })
     }
 
     /// The registered file columns `projection` selects from `table_schema`, in table order.
@@ -464,9 +486,18 @@ impl TableLayer for FileSchemaDriftLayer {
         args: ScanArgs<'a>,
     ) -> DFResult<ScanResult> {
         let projection = args.projection();
+        let selects_all_files = self
+            .guard
+            .scan_selects_all_files(args.filters().unwrap_or_default(), args.limit());
         let result = below.scan_with_args(state, args).await?;
         self.guard
-            .check_scan(state, &below.schema(), projection, result.plan())
+            .check_scan(
+                state,
+                &below.schema(),
+                projection,
+                selects_all_files,
+                result.plan(),
+            )
             .await?;
         Ok(result)
     }
@@ -693,6 +724,76 @@ mod tests {
             .await
             .expect_err("drift must be found without merging unrelated column types");
         assert!(err.to_string().contains("'amount_cents'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refresh_scan_of_an_older_partition_only_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("p=1")).expect("p=1");
+        std::fs::create_dir_all(dir.path().join("p=2")).expect("p=2");
+        write_parquet(&dir.path().join("p=1/a.parquet"), &["id"], &[1]);
+        write_parquet(
+            &dir.path().join("p=2/b.parquet"),
+            &["id", "amount_cents"],
+            &[2],
+        );
+
+        let schema = registered_schema(&["id", "amount_cents"]);
+        let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
+        let url = ListingTableUrl::parse(format!("file://{}/", dir.path().display())).expect("url");
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(
+                ListingOptions::new(Arc::clone(&format))
+                    .with_file_extension(".parquet")
+                    .with_table_partition_cols(vec![("p".to_string(), DataType::Int64)]),
+            )
+            .with_schema(Arc::clone(&schema));
+        let listing: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("listing table"));
+        let layer = Arc::new(FileSchemaDriftLayer::new(FileSchemaDriftGuard::new(
+            "base", schema, format,
+        )));
+        let table = Guarded {
+            table: SpiceTable::over(Arc::clone(&layer) as Arc<dyn TableLayer>, listing),
+            layer,
+        };
+
+        let batches = query(
+            &table,
+            true,
+            "SELECT sum(amount_cents) FROM base WHERE p = 1",
+        )
+        .await
+        .expect("an older partition that predates the column is not drift");
+        assert_eq!(single_value(&batches), None);
+        assert!(
+            table
+                .layer
+                .guard
+                .state
+                .lock()
+                .warned
+                .contains("amount_cents")
+        );
+
+        let batches = query(&table, true, "SELECT sum(amount_cents) FROM base")
+            .await
+            .expect("the full scan finds the column in the newer partition");
+        assert_eq!(single_value(&batches), Some(2));
+    }
+
+    #[test]
+    fn only_unfiltered_unlimited_scans_select_all_files() {
+        use datafusion::prelude::{col, lit};
+        let guard = FileSchemaDriftGuard::new(
+            "base",
+            registered_schema(&["id", "amount_cents"]),
+            Arc::new(ParquetFormat::default()),
+        );
+        assert!(guard.scan_selects_all_files(&[], None));
+        assert!(guard.scan_selects_all_files(&[col("id").gt(lit(1))], None));
+        assert!(!guard.scan_selects_all_files(&[col("p").eq(lit(1))], None));
+        assert!(!guard.scan_selects_all_files(&[], Some(10)));
     }
 
     #[tokio::test]

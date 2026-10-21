@@ -157,7 +157,8 @@ impl S3SingleFileCached {
             return Ok(());
         };
         let checked = guard
-            .check_scan(state, &self.inner.schema(), projection, plan)
+            // A single file: no predicate or limit can leave a file out of the scan.
+            .check_scan(state, &self.inner.schema(), projection, true, plan)
             .await;
         if checked.is_err() {
             self.reset_skip_state().await;
