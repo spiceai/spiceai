@@ -77,16 +77,47 @@ mod test {
 
     #[test]
     fn test_get_user_agent() {
-        let matching_regex = regex::Regex::new(
-            r"repl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
-        )
+        // `uname -r` is not a dotted token: a Linux tree that is not a clean
+        // tag appends `+`, and distro releases also use `~`, `-`, and `_`.
+        // Darwin and Windows versions are numeric and do not share that shape.
+        // The version token stops at the delimiters of `OS/version arch`, so
+        // the assertion still requires `repl/<version> (<OS>/<os version> <arch>)`.
+        let matching_regex = regex::Regex::new(concat!(
+            r"^repl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? ",
+            r"\((Linux|Windows|Darwin)/[^\s/)]+ (x86_64|aarch64|i386)\)$"
+        ))
         .expect("regex should be constructed");
 
         let user_agent = get_user_agent();
-        let agent_matches = matching_regex.is_match(&user_agent);
         assert!(
-            agent_matches,
+            matching_regex.is_match(&user_agent),
             "expected user agent to match regex, but got {user_agent}"
         );
+
+        for agent in [
+            "repl/2.4.0-unstable (Linux/6.12.94+ x86_64)",
+            "repl/2.4.0 (Linux/6.1.0-21-amd64~bpo+1 aarch64)",
+            "repl/1.2.3-rc.1 (Linux/6.8.0-45-generic i386)",
+            "repl/1.0.0 (Darwin/24.5.0 aarch64)",
+            "repl/1.0.0 (Windows/10.0.22631 x86_64)",
+        ] {
+            assert!(
+                matching_regex.is_match(agent),
+                "expected a legitimate user agent to match, but rejected {agent}"
+            );
+        }
+
+        for agent in [
+            "repl/2.4.0-unstable (Linux/6.12.94+ x86_64) extra",
+            "repl/2.4.0 Linux/6.12.94+ x86_64",
+            "repl/2.4.0 (FreeBSD/14.1 x86_64)",
+            "repl/2.4.0 (Linux/ x86_64)",
+            "not a user agent",
+        ] {
+            assert!(
+                !matching_regex.is_match(agent),
+                "expected a malformed user agent to be rejected, but accepted {agent}"
+            );
+        }
     }
 }
