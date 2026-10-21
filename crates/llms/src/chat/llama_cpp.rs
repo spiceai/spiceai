@@ -70,7 +70,9 @@ use mistralrs_core::{
 use tokio::sync::{mpsc, oneshot};
 
 use super::mistral::{ReasoningControls, ReasoningSupport, opens_reasoning, reasoning_controls};
-use super::{Chat, Error as ChatError, LocalModelOptions, Result, message_to_mistral, nsql::SqlGeneration};
+use super::{
+    Chat, Error as ChatError, LocalModelOptions, Result, message_to_mistral, nsql::SqlGeneration,
+};
 use crate::streaming_utils::generate_stream_id;
 
 /// Tokens decoded per forward pass while reading the prompt.
@@ -168,7 +170,8 @@ impl LlamaCpp {
         }
         // An MTP head ships as its own GGUF (`mtp-*.gguf`); it drafts for the model, so it is
         // loaded beside it rather than as one of its shards.
-        let (drafts, trunk): (Vec<_>, Vec<_>) = weights.iter().cloned().partition(|w| is_mtp_head(w));
+        let (drafts, trunk): (Vec<_>, Vec<_>) =
+            weights.iter().cloned().partition(|w| is_mtp_head(w));
         let first = first_shard(&trunk).ok_or_else(|| ChatError::LocalModelNotFound {
             expected_path: String::new(),
         })?;
@@ -184,10 +187,14 @@ impl LlamaCpp {
         thread::Builder::new()
             .name("llama-cpp".to_string())
             .spawn(move || serve(&first, draft.as_deref(), n_ctx, ready_tx, &jobs_rx))
-            .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?;
+            .map_err(|e| ChatError::FailedToLoadModel {
+                source: Box::new(e),
+            })?;
         let loaded = ready_rx
             .await
-            .map_err(|e| ChatError::FailedToLoadModel { source: Box::new(e) })?
+            .map_err(|e| ChatError::FailedToLoadModel {
+                source: Box::new(e),
+            })?
             .map_err(|message| ChatError::FailedToLoadModel {
                 source: message.into(),
             })?;
@@ -197,7 +204,9 @@ impl LlamaCpp {
             .template
             .or_else(|| options.chat_template_literal.map(ToString::to_string))
             .ok_or_else(|| ChatError::FailedToLoadModel {
-                source: "the GGUF file carries no chat template, and the model sets no `chat_template`".into(),
+                source:
+                    "the GGUF file carries no chat template, and the model sets no `chat_template`"
+                        .into(),
             })?;
 
         let model_name = options.reasoning.model_name.to_string();
@@ -247,7 +256,9 @@ impl LlamaCpp {
             reasoning.enable_thinking,
             reasoning.reasoning_effort,
         )
-        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}")))
+        .map_err(|e| {
+            OpenAIError::InvalidArgument(format!("Failed to render the chat template: {e}"))
+        })
     }
 
     /// Validates `req`, renders its prompt and queues it on the decode thread.
@@ -285,7 +296,9 @@ impl LlamaCpp {
             },
             events,
         };
-        self.jobs.send(job).map_err(|_| api_error("the llama.cpp decode thread has stopped"))?;
+        self.jobs
+            .send(job)
+            .map_err(|_| api_error("the llama.cpp decode thread has stopped"))?;
         Ok((rx, reasons))
     }
 
@@ -332,7 +345,15 @@ impl Chat for LlamaCpp {
                 let item = match event {
                     Some(Event::Token(piece)) => {
                         let (_, content) = state.split.push(&piece);
-                        Ok(chunk(&id, &model, created, first, non_empty(content), None, None))
+                        Ok(chunk(
+                            &id,
+                            &model,
+                            created,
+                            first,
+                            non_empty(content),
+                            None,
+                            None,
+                        ))
                     }
                     Some(Event::Done(outcome)) => {
                         state.done = true;
@@ -353,7 +374,9 @@ impl Chat for LlamaCpp {
                     }
                     None => {
                         state.done = true;
-                        Err(api_error("the llama.cpp decode thread stopped mid-response"))
+                        Err(api_error(
+                            "the llama.cpp decode thread stopped mid-response",
+                        ))
                     }
                 };
                 Some((item, state))
@@ -362,7 +385,10 @@ impl Chat for LlamaCpp {
         Ok(Box::pin(stream) as Pin<Box<dyn Stream<Item = _> + Send>>)
     }
 
-    #[expect(deprecated, reason = "`function_call` and `system_fingerprint` are deprecated fields of the response")]
+    #[expect(
+        deprecated,
+        reason = "`function_call` and `system_fingerprint` are deprecated fields of the response"
+    )]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
@@ -384,7 +410,11 @@ impl Chat for LlamaCpp {
                     break outcome;
                 }
                 Some(Event::Failed(message)) => return Err(api_error(&message)),
-                None => return Err(api_error("the llama.cpp decode thread stopped mid-response")),
+                None => {
+                    return Err(api_error(
+                        "the llama.cpp decode thread stopped mid-response",
+                    ));
+                }
             }
         };
         let message = ChatCompletionResponseMessage {
@@ -474,8 +504,12 @@ fn serve(
         let params = LlamaModelParams::default()
             .with_n_gpu_layers(u32::MAX)
             .with_load_mtp(true);
-        LlamaModel::load_from_file(backend, d, &params)
-            .map_err(|e| format!("llama.cpp could not load the MTP head '{}': {e}", d.display()))
+        LlamaModel::load_from_file(backend, d, &params).map_err(|e| {
+            format!(
+                "llama.cpp could not load the MTP head '{}': {e}",
+                d.display()
+            )
+        })
     }) {
         Some(Err(message)) => {
             let _ = ready.send(Err(message));
@@ -485,10 +519,18 @@ fn serve(
         None => None,
     };
     // The contexts borrow the models, so all of them live in this frame for the thread's
-    // lifetime.
+    // lifetime. With a draft head, verification rolls back up to `MTP_DRAFT` rejected tokens,
+    // and a hybrid model's recurrent layers can roll back only as many tokens as the context
+    // keeps state snapshots for, so it keeps that many, as llama.cpp's server sizes it.
+    let snapshots = if draft_model.is_some() {
+        u32::try_from(MTP_DRAFT).unwrap_or(0)
+    } else {
+        0
+    };
     let context_params = LlamaContextParams::default()
         .with_n_ctx(n_ctx)
-        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX));
+        .with_n_batch(u32::try_from(PROMPT_BATCH).unwrap_or(u32::MAX))
+        .with_n_rs_seq(snapshots);
     let context = match model.new_context(backend, context_params) {
         Ok(context) => context,
         Err(e) => {
@@ -623,10 +665,15 @@ fn read_prompt<'m>(
         batch.clear();
         for (j, &token) in chunk.iter().enumerate() {
             let last = i + 1 == chunks && j + 1 == chunk.len();
-            batch.add(token, pos, &[0], last).map_err(|e| e.to_string())?;
+            batch
+                .add(token, pos, &[0], last)
+                .map_err(|e| e.to_string())?;
             pos += 1;
         }
-        target.context_mut().decode(&mut batch).map_err(|e| e.to_string())?;
+        target
+            .context_mut()
+            .decode(&mut batch)
+            .map_err(|e| e.to_string())?;
         target.decoded(&batch)?;
     }
     Ok((tokens, batch))
@@ -674,8 +721,9 @@ impl Output {
 
     /// Tokens the budget still allows.
     fn remaining(&self) -> usize {
-        self.limit
-            .map_or(usize::MAX, |limit| limit.saturating_sub(self.produced as usize))
+        self.limit.map_or(usize::MAX, |limit| {
+            limit.saturating_sub(self.produced as usize)
+        })
     }
 
     fn finish(mut self, finish: FinishReason, prompt_tokens: usize) -> Outcome {
@@ -711,7 +759,9 @@ fn generate(
             break FinishReason::Length;
         }
         batch.clear();
-        batch.add(token, pos, &[0], true).map_err(|e| e.to_string())?;
+        batch
+            .add(token, pos, &[0], true)
+            .map_err(|e| e.to_string())?;
         pos += 1;
         context.decode(&mut batch).map_err(|e| e.to_string())?;
     };
@@ -727,9 +777,10 @@ fn generate_mtp(
 ) -> std::result::Result<Outcome, String> {
     let (prompt, sampling, mut out) = Output::new(job);
     spec.draft_context_mut().clear_kv_cache();
-    let prompt_tokens = model.vocab().tokenize(prompt.as_bytes(), false, true);
-    spec.begin(&prompt_tokens).map_err(|e| e.to_string())?;
+    // `read_prompt` hands every decoded prompt batch to the head, which needs the target's
+    // hidden state at each prompt position before `begin`.
     let (tokens, mut batch) = read_prompt(model, spec, &prompt)?;
+    spec.begin(&tokens).map_err(|e| e.to_string())?;
     let n_ctx = usize::try_from(spec.target_context().n_ctx()).unwrap_or(usize::MAX);
     let mut history = tokens.clone();
     let mut n_past = i32::try_from(tokens.len()).map_err(|e| e.to_string())?;
@@ -743,16 +794,29 @@ fn generate_mtp(
         if past + 1 >= n_ctx {
             break FinishReason::Length;
         }
-        let mut draft = spec.draft(n_past, id, &history).map_err(|e| e.to_string())?;
+        let mut draft = spec
+            .draft(n_past, id, &history)
+            .map_err(|e| e.to_string())?;
+        // `accept` is owed exactly when the head drafted something.
+        let drafted = !draft.is_empty();
         draft.truncate(out.remaining().min(n_ctx - past - 1));
+        // Drafting wrote its positions into the head's cache, and processing the verify batch
+        // writes them again, so they go first.
+        truncate_cache(spec.draft_context_mut(), n_past)?;
 
         batch.clear();
-        batch.add(id, n_past, &[0], true).map_err(|e| e.to_string())?;
+        batch
+            .add(id, n_past, &[0], true)
+            .map_err(|e| e.to_string())?;
         for (i, &token) in draft.iter().enumerate() {
             let at = n_past + 1 + i32::try_from(i).map_err(|e| e.to_string())?;
-            batch.add(token, at, &[0], true).map_err(|e| e.to_string())?;
+            batch
+                .add(token, at, &[0], true)
+                .map_err(|e| e.to_string())?;
         }
-        spec.target_context_mut().decode(&mut batch).map_err(|e| e.to_string())?;
+        spec.target_context_mut()
+            .decode(&mut batch)
+            .map_err(|e| e.to_string())?;
         spec.process(&batch).map_err(|e| e.to_string())?;
         history.push(id);
 
@@ -771,15 +835,30 @@ fn generate_mtp(
             }
         };
         n_past += 1 + i32::try_from(accepted).map_err(|e| e.to_string())?;
-        // Drop the rejected drafts' cache entries, then let the head roll back its own.
-        spec.target_context_mut()
-            .clear_kv_cache_seq(Some(0), u32::try_from(n_past).ok(), None)
-            .map_err(|e| e.to_string())?;
-        spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
-            .map_err(|e| e.to_string())?;
+        if drafted {
+            spec.accept(u16::try_from(accepted).unwrap_or(u16::MAX))
+                .map_err(|e| e.to_string())?;
+        }
+        // The rejected drafts leave both caches.
+        truncate_cache(spec.target_context_mut(), n_past)?;
+        truncate_cache(spec.draft_context_mut(), n_past)?;
         id = next;
     };
     Ok(out.finish(finish, tokens.len()))
+}
+
+/// Removes sequence 0's cache entries from position `from` on. A context that cannot roll
+/// back that far, such as a recurrent layer with too few state snapshots, fails the request
+/// instead of decoding on from a state that still holds the removed tokens.
+fn truncate_cache(context: &mut LlamaContext<'_>, from: i32) -> std::result::Result<(), String> {
+    let from = u32::try_from(from).map_err(|e| e.to_string())?;
+    match context.clear_kv_cache_seq(Some(0), Some(from), None) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "llama.cpp could not roll its cache back to position {from}"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Greedy at temperature 0 or unset, as the mistral.rs engine's deterministic default;
@@ -865,7 +944,12 @@ impl StopMatcher {
             return (text.to_string(), false);
         }
         self.held.push_str(text);
-        if let Some(at) = self.stops.iter().filter_map(|s| self.held.find(s.as_str())).min() {
+        if let Some(at) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.held.find(s.as_str()))
+            .min()
+        {
             let emit = self.held[..at].to_string();
             self.held.clear();
             return (emit, true);
@@ -919,7 +1003,11 @@ impl ThinkSplit {
         self.held.push_str(text);
         let (mut reasoning, mut content) = (String::new(), String::new());
         loop {
-            let tag = if self.in_think { THINK_CLOSE } else { THINK_OPEN };
+            let tag = if self.in_think {
+                THINK_CLOSE
+            } else {
+                THINK_OPEN
+            };
             if let Some(at) = self.held.find(tag) {
                 let before: String = self.held.drain(..at).collect();
                 self.held.drain(..tag.len());
@@ -960,7 +1048,10 @@ fn completion_limit(req: &CreateChatCompletionRequest) -> Option<usize> {
         .and_then(|limit| usize::try_from(limit).ok())
 }
 
-#[expect(deprecated, reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk")]
+#[expect(
+    deprecated,
+    reason = "`function_call` and `system_fingerprint` are deprecated fields of a chunk"
+)]
 fn chunk(
     id: &str,
     model: &str,
@@ -1033,7 +1124,10 @@ mod tests {
     fn a_split_tag_is_held_until_it_completes() {
         let mut split = ThinkSplit::new(true);
         assert_eq!(split.push("plan</th"), ("plan".to_string(), String::new()));
-        assert_eq!(split.push("ink>\n\nanswer"), (String::new(), "\n\nanswer".to_string()));
+        assert_eq!(
+            split.push("ink>\n\nanswer"),
+            (String::new(), "\n\nanswer".to_string())
+        );
         assert_eq!(split.finish(), (String::new(), String::new()));
     }
 
