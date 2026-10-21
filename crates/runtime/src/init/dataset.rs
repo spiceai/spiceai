@@ -69,6 +69,7 @@ use crate::{
     tracing_util::dataset_registered_trace,
 };
 use app::App;
+use data_components::incremental_append::incremental_append_source;
 use datafusion::common::{ResolvedTableReference, TableReference};
 use futures::StreamExt;
 use futures::future::join_all;
@@ -1585,6 +1586,7 @@ impl Runtime {
             return Err(err);
         }
 
+        let mut overlap_warning = None;
         if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
             let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
             let dataset_name = ds.name.to_string();
@@ -1604,10 +1606,10 @@ impl Runtime {
                 && refresh_mode == RefreshMode::Append
                 && acceleration.refresh_append_overlap.is_none()
             {
-                tracing::warn!(
-                    "{}",
-                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
-                );
+                overlap_warning = Some(newest_by_time_without_overlap_warning(
+                    &dataset_name,
+                    time_column,
+                ));
             }
         }
 
@@ -1708,6 +1710,15 @@ impl Runtime {
             )
             .await?;
         ds = resolved_ds;
+
+        // A source that follows its commits (Iceberg) loads late rows without an overlap.
+        if let Some(warning) = overlap_warning
+            && federated_table
+                .try_table_provider_sync_ref()
+                .is_none_or(|provider| incremental_append_source(provider.as_ref()).is_none())
+        {
+            tracing::warn!("{warning}");
+        }
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
@@ -3388,7 +3399,7 @@ fn deprecated_on_conflict_warning(
 }
 
 /// Warning for an append that keeps the newest version of each key by `time_column`
-/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+/// but has no `refresh_append_overlap` and reads by time, so it never re-reads a late row.
 fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
     format!(
         "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
