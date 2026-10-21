@@ -612,6 +612,8 @@ flowchart TB
 
 The `RowConverter` that produces those key bytes is a **Cayenne-vendored, versioned** format (the `row_converter/` module; `RowFormatVersion::V1` is byte-identical to `arrow-row` 58.3.0), not Arrow's directly. This matters because the encoded bytes are persisted durably and byte-compared on read — the `row_key` of a key-based deletion-vector file, `cayenne_insert_record.pk_bytes`, and inline-delete blobs — so pinning the format decouples that durable key layout from `arrow-rs`'s release cadence: a future Arrow bump can no longer silently change the persisted key bytes and break key-based delete/upsert matching. The decoders return an `ArrowError` on truncated or malformed input rather than panicking.
 
+**A table without a primary key deletes inline rows in place and keeps one vector per data file.** Its deletes run through the same `InlineAwareDeletionSink` as a key delete. The inline rows the predicate matches are rewritten out of their entries — exactly the rows it is true for, since there is no key to widen the match to — and file rows get position deletion vectors, both in one catalog commit. The inline corpus is never flushed to a Vortex file to make a delete possible, so a stream of small replacements (the shape caching mode writes) does not leave one small file per delete for every later scan and position delete to open. Each position vector holds every deleted position of its data file, so the same commit drops the file's earlier vector rows and their files are removed once it lands; a full rewrite that clears every vector row removes their files the same way.
+
 ### The fused tombstone — one probe answers two questions
 
 The clever bit is the **fused** index entry. Each key maps to a single `TombstoneEntry`:

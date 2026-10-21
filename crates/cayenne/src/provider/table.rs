@@ -6699,7 +6699,49 @@ impl CayenneTableProvider {
 
     /// Atomically commit a snapshot rewrite to the catalog, clearing exactly the
     /// state the rewrite materialized (see [`RewriteScope`]).
+    ///
+    /// A scope that clears every delete-file row also removes those rows' files
+    /// once the commit succeeds: no row names them afterwards, and nothing else
+    /// would. Such a rewrite excludes writers, so the rows read before the commit
+    /// are the rows it clears.
     pub(crate) async fn commit_snapshot_rewrite(
+        &self,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+        scope: &RewriteScope,
+    ) -> CatalogResult<()> {
+        let cleared_delete_files = match scope {
+            RewriteScope::All | RewriteScope::AllTombstonesFoldedSnapshots { .. } => {
+                self.catalog
+                    .get_table_delete_files(&self.table_metadata.table_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        // The commit does not depend on this read; without it the
+                        // cleared rows' files stay on disk.
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            %error,
+                            "Could not list the deletion vectors a snapshot rewrite clears; their files stay on disk"
+                        );
+                        Vec::new()
+                    })
+            }
+            RewriteScope::Fenced { .. } => Vec::new(),
+        };
+        let committed = self
+            .commit_snapshot_rewrite_catalog(replaced_snapshot_id, new_snapshot_id, scope)
+            .await;
+        if committed.is_ok() {
+            super::delete::remove_dropped_deletion_vector_files(
+                cleared_delete_files,
+                Arc::clone(&self.file_deletion_fence),
+            );
+        }
+        committed
+    }
+
+    async fn commit_snapshot_rewrite_catalog(
         &self,
         replaced_snapshot_id: &str,
         new_snapshot_id: &str,
@@ -30336,9 +30378,14 @@ impl CayenneTableProvider {
                 self.clear_cached_pk_keyset();
             }
             if self.pk_deletion_strategy.is_position_based() {
+                // The sink published each file's whole deletion vector under the
+                // write lock. Reloading the cache now, without it, could overwrite a
+                // vector a later delete published, and the delete after that would
+                // build its vector from the stale bitmap and replace the newer row.
                 self.clear_scan_file_statistics_cache();
+            } else {
+                self.refresh_deletion_cache().await?;
             }
-            self.refresh_deletion_cache().await?;
         }
 
         Ok(RetentionPass::Deleted(deleted_count))
@@ -38529,9 +38576,9 @@ impl CayenneTableProvider {
     /// callers — the file-based retention delete (gated by
     /// `file_based_deletes_preferred`, which requires a `time_retention_filter_builder`,
     /// i.e. `has_retention_delete_filters()`, which BLOCKS inline upserts in
-    /// `mutation_writer::write_all_append`) and the position-based delete (whose tables
-    /// don't support upserts) — cannot coexist with a staged inline-conflict tombstone
-    /// on the same table.
+    /// `mutation_writer::write_all_append`) and the `MERGE` key-probe delete of a table
+    /// with no primary key (whose tables don't support upserts) — cannot coexist with a
+    /// staged inline-conflict tombstone on the same table.
     ///
     /// That argument does NOT extend to the third caller, the background retention pass
     /// (`apply_retention_filters`): the pipelined CDC path inlines without consulting
@@ -38561,14 +38608,21 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Rewrite the inline corpus without the rows `filters` delete: the entries
+    /// that keep rows are replaced by their survivors and the ones that keep none
+    /// are removed. Returns that rewrite, which the caller commits together with
+    /// the delete's file-side deletion vectors, and how many rows it deletes.
+    ///
+    /// A table with a primary key deletes every inline version of each key a
+    /// matched row holds, so the key's superseded copies go with it. A table with
+    /// none deletes exactly the rows the predicate is true for: there is no key
+    /// to widen the match to, and no row positions an inline row could be
+    /// tombstoned by.
     pub(crate) async fn prepare_inlined_rows_matching_filters(
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<(InlinedDataRewrite, u64)> {
-        if self.pk_deletion_strategy.is_position_based() {
-            return Ok((InlinedDataRewrite::default(), 0));
-        }
-
+        let position_based = self.pk_deletion_strategy.is_position_based();
         let inlined_data = self
             .catalog
             .get_inlined_data(&self.table_metadata.table_id)
@@ -38583,12 +38637,17 @@ impl CayenneTableProvider {
             return Ok((InlinedDataRewrite::default(), 0));
         }
 
-        let legacy_inlined_deletions = self.load_inlined_deletion_maps().await.map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to read inlined delete metadata for delete on table {}: {e}",
-                self.table_metadata.table_name
-            ))
-        })?;
+        // Inline tombstones are keyed by primary key, so a table with none has none.
+        let legacy_inlined_deletions = if position_based {
+            InlinedDeletionMaps::default()
+        } else {
+            self.load_inlined_deletion_maps().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined delete metadata for delete on table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?
+        };
 
         let coerced_filters = self.coerce_filters_for_inlined_delete(filters)?;
         let physical_filters = self.build_physical_filters_for_inlined_delete(&coerced_filters)?;
@@ -38623,6 +38682,17 @@ impl CayenneTableProvider {
                 else {
                     continue;
                 };
+
+                if position_based {
+                    let (kept, removed_rows) =
+                        self.remove_inlined_rows_matching(visible_batch, &physical_filters)?;
+                    entry_matched_rows += removed_rows;
+                    if let Some(batch) = kept {
+                        remaining_rows += batch.num_rows();
+                        rewritten_batches.push(batch);
+                    }
+                    continue;
+                }
 
                 let filtered_batch =
                     self.apply_inlined_delete_filters(visible_batch.clone(), &physical_filters)?;
@@ -38725,6 +38795,35 @@ impl CayenneTableProvider {
             Some(matched) => Ok(arrow::compute::filter_record_batch(&batch, &matched)?),
             None => Ok(batch),
         }
+    }
+
+    /// Split `batch` into the rows a delete by `physical_filters` keeps and the
+    /// number it removes: a row is removed only where every filter is true, so a
+    /// NULL result keeps it, as SQL `DELETE` does. No filters remove every row.
+    /// The kept rows are `None` when none remain.
+    fn remove_inlined_rows_matching(
+        &self,
+        batch: RecordBatch,
+        physical_filters: &[Arc<dyn PhysicalExpr>],
+    ) -> datafusion_common::Result<(Option<RecordBatch>, usize)> {
+        let rows = batch.num_rows();
+        let Some(matched) = self.delete_match_mask(&batch, physical_filters)? else {
+            return Ok((None, rows));
+        };
+        let removed = matched.true_count();
+        if removed == 0 {
+            return Ok((Some(batch), 0));
+        }
+        if removed == rows {
+            return Ok((None, rows));
+        }
+        // `matched` holds no NULLs (`delete_match_mask` folds them to false), so
+        // its negation is exactly the rows the delete keeps.
+        let kept = arrow::compute::not(&matched)?;
+        Ok((
+            Some(arrow::compute::filter_record_batch(&batch, &kept)?),
+            removed,
+        ))
     }
 
     fn extract_primary_keys_from_batch(
@@ -42998,27 +43097,23 @@ impl TableProvider for CayenneTableProvider {
             return self.delete_using_files(&filters);
         }
 
-        if self.pk_deletion_strategy.is_position_based() {
-            // Position-based deletion vectors target file-local row positions,
-            // so no-PK inline rows must still be materialized before deletion.
-            {
-                let _guard = self.write_lock.lock().await;
-                self.checkpoint_inlined_data_if_present_for_delete().await?;
-            }
-
-            return self.delete_using_deletion_vectors(&filters).await;
-        }
-
-        // Key-based deletion-vector path. The sink scans main, the protected
-        // snapshots and the cold tier — every durable tier — and never the
-        // in-memory CDC tier, and its liveness probe reads the durable deletion
-        // index alone. A predicate that matches only a RAM-resident row would
-        // leave it alive, and one that matches the durable version an
-        // un-checkpointed upsert has superseded would tombstone the KEY and take
-        // the live RAM replacement with it — the shape #13574 closed for protected
-        // snapshots, one tier over. Materialize the tier, exactly as the two
-        // branches above materialize inline rows; once durable, the rows are
-        // subject to the sink's own tier-aware liveness rule.
+        // Deletion-vector path, for key and position deletes alike. Inline rows
+        // the predicate matches are removed from the inline corpus in the same
+        // catalog commit as the file-side vectors
+        // (`prepare_inlined_rows_matching_filters`), so a delete never has to turn
+        // the corpus into a Vortex file first. On a table with no primary key that
+        // flush would write one small file per delete, which every later scan and
+        // position delete then reads.
+        //
+        // The sink scans main, the protected snapshots and the cold tier — every
+        // durable tier — and never the in-memory CDC tier, and a key delete's
+        // liveness probe reads the durable deletion index alone. A predicate that
+        // matches only a RAM-resident row would leave it alive, and one that
+        // matches the durable version an un-checkpointed upsert has superseded
+        // would tombstone the KEY and take the live RAM replacement with it — the
+        // shape #13574 closed for protected snapshots, one tier over. Materialize
+        // the tier, as the file-based branch above materializes inline rows; once
+        // durable, the rows are subject to the sink's own tier-aware liveness rule.
         //
         // The checkpoint and the scan-source capture belong in the hold the DELETE
         // itself runs under, so both are deferred to
@@ -43250,28 +43345,6 @@ impl CayenneTableProvider {
         })
     }
 
-    /// Main deletion-vector path via [`CayenneDeletionSink`].
-    async fn delete_using_deletion_vectors(
-        &self,
-        filters: &[Expr],
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let sink: Arc<dyn DeletionSink> = Arc::new(
-            self.build_deletion_vector_sink(
-                filters,
-                Some(Arc::clone(&self.write_lock)),
-                DeletionRequestSource::User,
-            )
-            .await?,
-        );
-        Ok(Arc::new(DeletionExec::new(self.taint_row_count_exactness(
-            Arc::new(PkKeysetInvalidatingDeletionSink {
-                table: self.clone_for_write(),
-                inner: sink,
-                filters: filters.to_vec(),
-            }),
-        ))))
-    }
-
     /// Build a `ListingTable` per distinct live cold-file directory (storage-
     /// cascade bottom tier), so a key-based DELETE scan finds cold-resident keys
     /// and records their tombstones. Empty when the cold tier is disabled/empty.
@@ -43427,6 +43500,7 @@ impl CayenneTableProvider {
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
         .with_scan_input_version(Arc::clone(&self.scan_input_version))
         .with_capture_locks(capture_locks)
+        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence))
         .with_exact_count(source.requires_exact_count());
 
         Ok(sink)
@@ -43535,7 +43609,8 @@ impl CayenneTableProvider {
             Arc::clone(&self.seq_allocator),
         )
         .with_publication_outcome_fence(Arc::clone(&self.publication_outcome_unknown))
-        .with_scan_input_version(Arc::clone(&self.scan_input_version));
+        .with_scan_input_version(Arc::clone(&self.scan_input_version))
+        .with_file_deletion_fence(Arc::clone(&self.file_deletion_fence));
 
         let deleted = sink
             .delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
@@ -78261,6 +78336,15 @@ mod tests {
             id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
         )
         .await;
+        // Move the rows into a file: a delete of inline rows rewrites the corpus
+        // and leaves no position bitmap.
+        {
+            let _write = provider.write_lock.lock().await;
+            provider
+                .checkpoint_inlined_data()
+                .await
+                .expect("checkpoint inline rows");
+        }
         provider
             .flush_pending_maintenance()
             .await
