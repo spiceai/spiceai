@@ -769,11 +769,12 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
             // A `/Predictor` (or `/P`) in DecodeParms inserts PNG-style row
             // tags between Flate stages that we do not reverse, so a nested
             // Flate chain can under-count. Fail closed when a predictor is
-            // declared; other DecodeParms values are skipped as usual.
+            // declared or cannot be ruled out; other DecodeParms values are
+            // skipped as usual.
             b"DecodeParms" | b"DP" => {
                 let value_start = i;
                 let value_len = skip_value(&data[i..], depth + 1)?;
-                if decode_parms_has_predictor(&data[value_start..value_start + value_len]) {
+                if decode_parms_may_predict(&data[value_start..value_start + value_len]) {
                     filters = Some(vec![PdfFilter::Unbounded]);
                 }
                 i += value_len;
@@ -785,16 +786,50 @@ fn parse_dictionary(data: &[u8], depth: usize) -> Option<ParsedDict> {
     }
 }
 
-/// True when a `/DecodeParms` value (a dictionary, or an array of them)
-/// declares `/Predictor` or `/P`. Those keys insert PNG-style row tags that
-/// this scanner does not reverse.
-fn decode_parms_has_predictor(data: &[u8]) -> bool {
+/// True unless a `/DecodeParms` value is provably predictor-free: a direct
+/// dictionary, `null`, or an array of those, with no `/Predictor` or `/P`.
+/// Those keys insert PNG-style row tags that this scanner does not reverse.
+/// An indirect reference (`5 0 R`) is not resolved, so it fails closed, as
+/// does anything that does not parse.
+fn decode_parms_may_predict(data: &[u8]) -> bool {
+    if data.first() != Some(&b'[') {
+        return decode_parms_entry_may_predict(data);
+    }
+    let mut i = 1;
+    loop {
+        i += ws_len(&data[i..]);
+        match data.get(i) {
+            Some(b']') => return false,
+            None => return true,
+            Some(_) => {
+                if decode_parms_entry_may_predict(&data[i..]) {
+                    return true;
+                }
+                match skip_value(&data[i..], 1) {
+                    Some(len) => i += len,
+                    None => return true,
+                }
+            }
+        }
+    }
+}
+
+fn decode_parms_entry_may_predict(data: &[u8]) -> bool {
+    if data.starts_with(b"null") && token_ends(data, 4) {
+        return false;
+    }
+    if !data.starts_with(b"<<") {
+        return true;
+    }
     decode_parms_has_predictor_at(data, 0)
 }
 
+/// True when `data` holds a `/Predictor` or `/P` key, searching nested
+/// dictionaries and arrays. Parse failures and excessive nesting count as a
+/// predictor so the caller fails closed.
 fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
     if depth > MAX_VALUE_DEPTH {
-        return false;
+        return true;
     }
     match data.first() {
         Some(b'<') if data.get(1) == Some(&b'<') => {
@@ -805,7 +840,7 @@ fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
                     return false;
                 }
                 if data.get(i) != Some(&b'/') {
-                    return false;
+                    return true;
                 }
                 let (name, name_len) = read_name(&data[i + 1..]);
                 i += 1 + name_len;
@@ -819,7 +854,7 @@ fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
                 }
                 match skip_value(&data[i..], depth + 1) {
                     Some(len) => i += len,
-                    None => return false,
+                    None => return true,
                 }
             }
         }
@@ -828,14 +863,15 @@ fn decode_parms_has_predictor_at(data: &[u8], depth: usize) -> bool {
             loop {
                 i += ws_len(&data[i..]);
                 match data.get(i) {
-                    Some(b']') | None => return false,
+                    Some(b']') => return false,
+                    None => return true,
                     Some(_) => {
                         if decode_parms_has_predictor_at(&data[i..], depth + 1) {
                             return true;
                         }
                         match skip_value(&data[i..], depth + 1) {
                             Some(len) => i += len,
-                            None => return false,
+                            None => return true,
                         }
                     }
                 }
@@ -2025,6 +2061,41 @@ mod tests {
             &data,
         );
         assert_eq!(pdf_too_large_reason(&pdf), UNVERIFIABLE_REASON);
+    }
+
+    /// A predictor reached through an indirect `/DecodeParms` reference, alone
+    /// or inside a parameter array, is not resolved, so the stream fails
+    /// closed instead of feeding predictor-tagged bytes to the second Flate.
+    #[test]
+    fn rejects_a_predictor_bomb_behind_indirect_decode_parms() {
+        // PNG predictor with `/Columns 1`: each byte gets a `0` (None) tag.
+        let predicted: Vec<u8> = flate_bomb().into_iter().flat_map(|b| [0, b]).collect();
+        let data = deflate(&predicted);
+        for decode_parms in [b"5 0 R".as_slice(), b"[5 0 R null]".as_slice()] {
+            let mut decl = b"[/FlateDecode /FlateDecode] /DecodeParms ".to_vec();
+            decl.extend_from_slice(decode_parms);
+            let pdf = loadable_pdf_with_content_stream(&decl, &data);
+            assert_eq!(
+                pdf_too_large_reason(&pdf),
+                UNVERIFIABLE_REASON,
+                "/DecodeParms {}",
+                String::from_utf8_lossy(decode_parms)
+            );
+        }
+    }
+
+    /// `null` entries and direct predictor-free dictionaries, even ones with an
+    /// indirect non-predictor value, still have their expansion budgeted.
+    #[test]
+    fn still_budgets_with_predictor_free_decode_parms() {
+        let pdf = loadable_pdf_with_content_stream(
+            b"/FlateDecode /DecodeParms [null << /Columns 5 0 R >>]",
+            &flate_bomb(),
+        );
+        assert_eq!(
+            pdf_too_large_reason(&pdf),
+            "its compressed streams decompress to more than 256 MiB, the per-document limit"
+        );
     }
 
     /// A Catalog string that contains the bytes of a fake `N 0 obj` /Length
