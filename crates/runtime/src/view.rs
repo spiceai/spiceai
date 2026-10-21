@@ -14,17 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    component::view::View, embeddings::index::table::wrap_table_as_index,
-    search::full_text::table::add_full_text_search_to_table,
+    component::view::View, dataaccelerator::spice_sys::dataset_checkpointer,
+    embeddings::index::table::wrap_table_as_index,
+    search::full_text::table::add_full_text_search_to_table, status::RuntimeStatus,
 };
 use ::datafusion::sql::parser;
+use async_trait::async_trait;
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     datasource::ViewTable,
     error::{DataFusionError, Result},
     prelude::SessionContext,
 };
+use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::sidecar::OpenOption;
+use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_component::dataset::acceleration::RefreshMode;
 use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_results};
+use runtime_table::refresh_source::{RefreshSource, RefreshSourceError};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
 use std::sync::Arc;
@@ -98,4 +106,76 @@ pub(crate) async fn prepare_view(
     }
 
     Ok(tbl_provider)
+}
+
+/// The source of an accelerated view registered from its existing acceleration
+/// before the tables it reads have loaded: the view's own plan, built once every
+/// table it reads is ready. `read_provider` waits for them rather than failing, so
+/// the plan resolves as soon as they are ready instead of at the next backoff step.
+pub(crate) struct ViewRefreshSource {
+    ctx: Arc<SessionContext>,
+    statement: parser::Statement,
+    view: Arc<View>,
+    reads: Vec<TableReference>,
+    status: Arc<RuntimeStatus>,
+}
+
+impl ViewRefreshSource {
+    pub(crate) fn new_arc(
+        ctx: Arc<SessionContext>,
+        statement: parser::Statement,
+        view: Arc<View>,
+        reads: Vec<TableReference>,
+        status: Arc<RuntimeStatus>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            ctx,
+            statement,
+            view,
+            reads,
+            status,
+        })
+    }
+}
+
+impl std::fmt::Debug for ViewRefreshSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewRefreshSource")
+            .field("view", &self.view.name)
+            .field("reads", &self.reads)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl RefreshSource for ViewRefreshSource {
+    fn resolve_refresh_mode(&self, _requested: Option<RefreshMode>) -> RefreshMode {
+        // `ViewBuilder::try_from` rejects every refresh mode but `full`.
+        RefreshMode::Full
+    }
+
+    async fn read_provider(
+        &self,
+    ) -> std::result::Result<Arc<dyn TableProvider>, RefreshSourceError> {
+        crate::datafusion::wait_until_dependent_tables_are_ready(
+            &self.view.name,
+            &self.reads,
+            &self.status,
+        )
+        .await;
+        prepare_view(&self.ctx, &self.statement, &self.view)
+            .await
+            .map_err(|e| Box::new(e) as RefreshSourceError)
+    }
+
+    async fn checkpointer(&self) -> Option<Arc<dyn DatasetCheckpointer>> {
+        dataset_checkpointer(
+            self.view.as_ref(),
+            self.view.runtime.accelerator_engine_registry(),
+            OpenOption::OpenExisting,
+            SnapshotBehavior::Disabled,
+        )
+        .await
+        .ok()
+    }
 }

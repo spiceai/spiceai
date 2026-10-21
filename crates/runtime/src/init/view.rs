@@ -226,7 +226,10 @@ impl Runtime {
     /// which is what every view did before. Each dataset the view reads only in
     /// a subquery also gets up to a minute to be registered once its load has
     /// ended, as `register_view` waits for a missing `FROM` table. A view a
-    /// Spicepod change has already taken over is left to that change.
+    /// Spicepod change has already taken over is left to that change. An
+    /// accelerated view with an existing acceleration to serve from waits for
+    /// nothing: it registers from that acceleration, and refreshes once what it
+    /// reads is ready.
     ///
     /// Returns the tasks loading the views.
     pub(crate) fn load_views(
@@ -375,7 +378,8 @@ impl Runtime {
                         .dedup()
                         .collect()
                 };
-                if !pending().is_empty() {
+                let served_from_acceleration = view.existing_acceleration_schema().await.is_some();
+                if !served_from_acceleration && !pending().is_empty() {
                     runtime
                         .status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
@@ -414,15 +418,19 @@ impl Runtime {
                 // registered: a Spicepod change that replaces it stops the load and
                 // registers the replacement itself. Planning the view before then
                 // fails it for good, so give each dataset it reads only in a
-                // subquery its own minute to be registered.
-                for table in &subquery_datasets {
-                    let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
-                    while !runtime.df.table_exists(table) && tokio::time::Instant::now() < deadline
-                    {
-                        tokio::select! {
-                            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                            () = shutdown.cancelled() => return,
-                            () = superseded.cancelled() => return,
+                // subquery its own minute to be registered. A view served from its
+                // acceleration builds its plan only once what it reads is ready.
+                if !served_from_acceleration {
+                    for table in &subquery_datasets {
+                        let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
+                        while !runtime.df.table_exists(table)
+                            && tokio::time::Instant::now() < deadline
+                        {
+                            tokio::select! {
+                                () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                                () = shutdown.cancelled() => return,
+                                () = superseded.cancelled() => return,
+                            }
                         }
                     }
                 }

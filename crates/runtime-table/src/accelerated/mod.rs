@@ -97,6 +97,10 @@ pub use refresh_completion::{
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
 
+/// The `federated_source` of an accelerated view, whose status is reported as a
+/// view's even before its plan is built.
+pub const VIEW_FEDERATED_SOURCE: &str = "view";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -1653,6 +1657,8 @@ impl AcceleratedTable {
         self.begin_changes_drain().wait().await
     }
 
+    /// `federated_source` names where the rows come from: the connector, or
+    /// [`VIEW_FEDERATED_SOURCE`] for an accelerated view.
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,

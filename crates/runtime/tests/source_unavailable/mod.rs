@@ -620,6 +620,7 @@ mod served_from_acceleration {
     use spicepod::{
         acceleration::{Acceleration, Mode, RefreshMode},
         component::dataset::{Dataset as SpicepodDataset, ReadyState},
+        component::view::View,
         param::Params,
         semantic::Column,
     };
@@ -737,9 +738,15 @@ mod served_from_acceleration {
     }
 
     async fn start(dataset: SpicepodDataset) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
-        let app = AppBuilder::new("source_unavailable")
-            .with_dataset(dataset)
-            .build();
+        start_app(
+            AppBuilder::new("source_unavailable")
+                .with_dataset(dataset)
+                .build(),
+        )
+        .await
+    }
+
+    async fn start_app(app: app::App) -> (Arc<Runtime>, tokio::task::JoinHandle<()>) {
         configure_test_datafusion();
         let rt = Arc::new(Runtime::builder().with_app(app).build().await);
         let loader = tokio::spawn({
@@ -948,6 +955,102 @@ mod served_from_acceleration {
             ),
             "the Error clears once the source is reached ({:?})",
             dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        Ok(())
+    }
+
+    /// `orders` federated from `prefix`, and `orders_view` reading it, accelerated in
+    /// the `DuckDB` file `duckdb_file` and refreshed every second.
+    fn federated_orders_and_accelerated_view(prefix: &str, duckdb_file: &Path) -> app::App {
+        let mut view = View::new("orders_view".to_string());
+        view.sql = Some("SELECT id, v FROM orders".to_string());
+        view.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            mode: Mode::File,
+            refresh_check_interval: Some("1s".to_string()),
+            params: Some(Params::from_string_map(HashMap::from([(
+                "duckdb_file".to_string(),
+                duckdb_file.to_string_lossy().to_string(),
+            )]))),
+            ..Default::default()
+        });
+        AppBuilder::new("source_unavailable")
+            .with_dataset(SpicepodDataset::new(format!("{prefix}://orders"), "orders"))
+            .with_view(view)
+            .build()
+    }
+
+    fn view_status(rt: &Runtime) -> Option<ComponentStatus> {
+        rt.status().get_component_status("view:orders_view")
+    }
+
+    /// An accelerated view whose source is down at startup is served from its
+    /// existing acceleration, as an accelerated dataset is, instead of staying
+    /// unregistered until the dataset it reads loads; once the source is back the
+    /// refresh brings the view up to date.
+    #[tokio::test]
+    async fn an_accelerated_view_is_served_while_the_dataset_it_reads_is_down()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("view-served-while-down").await?;
+        let source = &fixture.source;
+        let app = || {
+            federated_orders_and_accelerated_view(
+                source.prefix,
+                &fixture.dir.path().join("orders_view.duckdb"),
+            )
+        };
+        let view_sum_and_count =
+            |rt: Arc<Runtime>| async move { query_table_sum_and_count(&rt, "orders_view").await };
+
+        source.bring_up();
+        let (rt, loader) = start_app(app()).await;
+        let seeded = wait_until_true(Duration::from_secs(30), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((3, 3))
+                && view_status(&rt) == Some(ComponentStatus::Ready)
+        })
+        .await;
+        let observed = view_sum_and_count(Arc::clone(&rt)).await;
+        stop(rt, loader).await;
+        anyhow::ensure!(seeded, "seeding the view's acceleration, got {observed:?}");
+
+        source.take_down();
+        source.set_value(2);
+        let (rt, loader) = start_app(app()).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((3, 3))
+        })
+        .await;
+        assert!(
+            served,
+            "the view must be served from its existing acceleration, got {:?} ({:?})",
+            view_sum_and_count(Arc::clone(&rt)).await,
+            view_status(&rt)
+        );
+        assert_eq!(
+            view_status(&rt),
+            Some(ComponentStatus::Ready),
+            "a view served from its acceleration is ready"
+        );
+
+        source.bring_up();
+        let refreshed = wait_until_true(Duration::from_secs(60), || async {
+            view_sum_and_count(Arc::clone(&rt)).await == Ok((6, 3))
+        })
+        .await;
+        assert!(
+            refreshed,
+            "the refresh must bring the view up to date once its source is back, got {:?} ({:?})",
+            view_sum_and_count(Arc::clone(&rt)).await,
+            view_status(&rt)
+        );
+        assert_eq!(view_status(&rt), Some(ComponentStatus::Ready));
+        assert_eq!(
+            dataset_status(&rt, "orders_view"),
+            None,
+            "the view's refreshes report its status as a view's, not a dataset's"
         );
         stop(rt, loader).await;
         Ok(())
