@@ -21,12 +21,11 @@ limitations under the License.
 //! applies is also published to Drasi.
 
 pub mod connector;
-pub(crate) mod dead_letter;
 #[cfg(test)]
 mod forward_metrics_tests;
 pub(crate) mod internal;
-pub(crate) mod queue;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +37,7 @@ use runtime_drasi::{
     DrasiChangeRows, DrasiSink, DrasiSinkConfig, ElementMapping, OnDeliveryError, TransportConfig,
 };
 
-use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path};
+use runtime_drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore};
 
 /// The policy every sink behind a [`DeliveryQueue`] is built with.
 ///
@@ -48,7 +47,7 @@ use crate::drasi::dead_letter::{DEFAULT_MAX_BATCHES, DeadLetterStore, store_path
 /// queue would then treat a lost batch as delivered and never retain it, which
 /// made the dead-letter store dead code on every path that used it.
 pub(crate) const QUEUED_SINK_POLICY: OnDeliveryError = OnDeliveryError::Fail;
-use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
+use runtime_drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 use spicepod::drasi::{Drasi as DrasiSpec, DrasiTransport as DrasiTransportSpec};
 
 use crate::component::dataset::Dataset;
@@ -104,6 +103,26 @@ pub(crate) async fn sink_for_dataset(
             )))
         }
     })
+}
+
+/// The directory a component's dead-letter store lives in.
+fn store_path(component: &str) -> PathBuf {
+    // Component names are table references (`runtime.task_history`, `orders`),
+    // which can contain characters a path should not take verbatim.
+    let sanitized: String = component
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    PathBuf::from(data_accelerator_api::spice_data_base_path())
+        .join("drasi")
+        .join(sanitized)
 }
 
 /// Opens the durable store that retains what Drasi will not accept.
@@ -412,7 +431,7 @@ pub(crate) async fn forward_change_envelope(
                             .collect(),
                         data: data.clone(),
                         source_commit_ts_ms: batch.source_commit_ts_ms(),
-                        queued_at_ms: queue::now_ms(),
+                        queued_at_ms: runtime_drasi::queue::now_ms(),
                     })
                     .await;
             }
@@ -507,5 +526,17 @@ mod tests {
         )]);
         request_timeout_or("orders", &bad, DEFAULT_REQUEST_TIMEOUT)
             .expect_err("an unparseable duration is rejected");
+    }
+
+    #[test]
+    fn store_path_sanitizes_a_qualified_table_name() {
+        let path = store_path("runtime.task_history");
+        assert!(path.ends_with("drasi/runtime.task_history"), "{path:?}");
+
+        let path = store_path("weird/../name");
+        assert!(
+            path.ends_with("drasi/weird_.._name"),
+            "a path separator must not escape the store directory: {path:?}"
+        );
     }
 }

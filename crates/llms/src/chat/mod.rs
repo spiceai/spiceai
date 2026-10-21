@@ -36,7 +36,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContent, ReasoningEffort,
 };
 
 #[cfg(feature = "local_llm")]
@@ -356,6 +356,7 @@ pub fn message_to_mistral(
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
 /// `distributed` optionally runs the model tensor-parallel across multiple nodes.
+/// `reasoning` names the model and its `reasoning_effort` default for the load-time check.
 #[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
@@ -364,6 +365,7 @@ pub async fn create_hf_model(
     hf_token_literal: Option<&SecretString>,
     chat_template_literal: Option<&str>,
     distributed: Option<DistributedConfig>,
+    reasoning: ReasoningDefault<'_>,
 ) -> Result<Arc<dyn Chat>> {
     // Configure multi-node distributed (ring) inference before loading: the
     // loader reads `RING_CONFIG` from the environment while building the
@@ -385,6 +387,7 @@ pub async fn create_hf_model(
         from_gguf,
         chat_template_literal,
         ring_config,
+        reasoning,
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
@@ -404,6 +407,18 @@ pub struct LocalModelOptions<'a> {
     pub context_length: Option<usize>,
     /// Attention implementation to request from the engine.
     pub paged_attention: PagedAttentionMode,
+    /// The model's name and `reasoning_effort` default, checked against its chat template.
+    pub reasoning: ReasoningDefault<'a>,
+}
+
+/// A local model's Spicepod name and its `reasoning_effort` default. The loader checks the
+/// default against the model's chat template, so a default the template can't honor fails
+/// the load instead of every request. The name is what the refusal names.
+#[cfg(feature = "local_llm")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReasoningDefault<'a> {
+    pub model_name: &'a str,
+    pub effort: Option<&'a ReasoningEffort>,
 }
 
 #[cfg(feature = "local_llm")]
