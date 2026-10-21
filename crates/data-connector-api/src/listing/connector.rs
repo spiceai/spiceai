@@ -2550,7 +2550,12 @@ async fn probe_json_column_count(
     let bytes = store.get(&object.location).await.ok()?.bytes().await.ok()?;
     let compression = compression.unwrap_or(FileCompressionType::UNCOMPRESSED);
     let mut reader = compression.convert_read(std::io::Cursor::new(bytes)).ok()?;
-    let value: serde_json::Value = serde_json::from_reader(&mut reader).ok()?;
+    // `from_reader` rejects trailing bytes, so a second JSONL record would skip
+    // this probe. Take the first value and leave the rest unread.
+    let value = serde_json::Deserializer::from_reader(&mut reader)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
     json_value_width(&value)
 }
 
@@ -2916,7 +2921,10 @@ mod tests {
             }
             line.push_str(&format!("\"k{index}\":1"));
         }
-        line.push_str("}\n");
+        // A second record must not make the probe treat the file as one JSON
+        // document. Its keys are a subset, so the merged schema stays the width
+        // of the first record.
+        line.push_str("}\n{\"k0\":1}\n");
         line
     }
 
