@@ -116,11 +116,19 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to read the response from {endpoint} for {dataset}: {source}. Request less \
-        data per call, for example by paging the endpoint or narrowing each request with \
-        filters. See: https://spiceai.org/docs/components/data-connectors/https"
+        "Failed to read the response from {endpoint} for {dataset}: {source}. Ask the \
+        endpoint for an uncompressed response by adding `Accept-Encoding: identity` to \
+        `http_headers`, or request less data per call. \
+        See: https://spiceai.org/docs/components/data-connectors/https"
     ))]
-    ResponseTooLarge {
+    CompressionRatio {
+        endpoint: String,
+        dataset: String,
+        source: http_body_limit::Error,
+    },
+
+    #[snafu(display("Failed to read the response from {endpoint} for {dataset}: {source}"))]
+    ResponseDecode {
         endpoint: String,
         dataset: String,
         source: http_body_limit::Error,
@@ -128,6 +136,15 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// How a message refers to the dataset: by name when there is one, and by a phrase that
+/// still reads as a sentence when there is not.
+fn dataset_subject(dataset_name: Option<&str>) -> String {
+    dataset_name.map_or_else(
+        || "this dataset".to_string(),
+        |name| format!("dataset '{name}'"),
+    )
+}
 
 /// The part of a *configured* endpoint that is safe to put in an error or a log line:
 /// scheme, host and port, and nothing else.
@@ -146,13 +163,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// theirs to keep. Nothing is lost that the reader needs: every message built from this
 /// also names the dataset, which identifies the endpoint uniquely and is what an operator
 /// looks up to fix it.
-fn dataset_subject(dataset_name: Option<&str>) -> String {
-    dataset_name.map_or_else(
-        || "this dataset".to_string(),
-        |name| format!("dataset '{name}'"),
-    )
-}
-
 fn endpoint_label(url: &Url) -> String {
     // `Origin::ascii_serialization` renders scheme, host and a non-default port and can
     // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
@@ -339,8 +349,11 @@ impl From<Error> for DataFusionError {
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
-            // `Plan`, so a refresh does not re-ask: the response will be as large again.
-            err @ Error::ResponseTooLarge { .. } => DataFusionError::Plan(err.to_string()),
+            // `Plan`, so a refresh does not re-ask: the response will expand as far again.
+            err @ Error::CompressionRatio { .. } => DataFusionError::Plan(err.to_string()),
+            err @ Error::ResponseDecode { .. } => {
+                DataFusionError::External(Box::new(std::io::Error::other(err.to_string())))
+            }
             Error::Pagination { message } => {
                 DataFusionError::External(Box::new(std::io::Error::other(message)))
             }
@@ -2119,27 +2132,37 @@ impl HttpTableProvider {
         // the retriable-error classification in `graphql/mod.rs`, which groups
         // is_timeout/is_connect/is_body/is_decode together as transient.
         //
-        // The body is read under a cap on its *decoded* size, and refused as soon as it
-        // passes it: with transparent decompression a few hundred kilobytes on the wire
-        // can expand to gigabytes. Too large is permanent — asking again gets the same
-        // body.
-        let response = http_body_limit::buffer(response, http_body_limit::MAX_RESPONSE_BODY_BYTES)
+        // A compressed body is decoded here rather than by `reqwest` (the client is built
+        // with `http_body_limit::decode_manually`), so it can be refused as soon as it
+        // expands past the compression ratio a real response never reaches: a few hundred
+        // kilobytes of gzip would otherwise decode to gigabytes. That refusal is permanent
+        // — asking again gets the same body. An uncompressed body is read as it always was.
+        let response = http_body_limit::buffer(response, http_body_limit::Limit::CompressionRatio)
             .io_wait()
             .await
             .map_err(|e| match e {
                 http_body_limit::Error::Read { source } => {
                     RetryError::transient(Error::http_request(endpoint, source))
                 }
-                too_large @ http_body_limit::Error::TooLarge { .. } => {
-                    RetryError::Permanent(Error::ResponseTooLarge {
+                source @ http_body_limit::Error::Decode { .. } => {
+                    RetryError::transient(Error::ResponseDecode {
                         endpoint: endpoint_label(endpoint),
                         dataset: dataset_subject(dataset_name),
-                        source: too_large,
+                        source,
+                    })
+                }
+                source @ (http_body_limit::Error::CompressionRatio { .. }
+                | http_body_limit::Error::TooLarge { .. }) => {
+                    RetryError::Permanent(Error::CompressionRatio {
+                        endpoint: endpoint_label(endpoint),
+                        dataset: dataset_subject(dataset_name),
+                        source,
                     })
                 }
             })?;
         let content = response
             .text()
+            .io_wait()
             .await
             .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! A dynamic HTTP dataset reads the body its origin sends under a cap on the
-//! *decoded* size, so a small compressed response cannot expand into an
-//! unbounded allocation.
+//! A dynamic HTTP dataset refuses a compressed response that expands like a
+//! compression bomb, as soon as it does, and reads every other response — compressed
+//! at a realistic ratio or not compressed at all — at any size.
 #![expect(
     clippy::expect_used,
     reason = "test helpers fail the test with a message when setup fails"
@@ -28,38 +28,70 @@ use std::sync::Arc;
 use arrow::array::Array;
 use data_components::http::provider::HttpTableProvider;
 use datafusion::prelude::*;
-use http_body_limit::MAX_RESPONSE_BODY_BYTES;
+use http_body_limit::{DECODE_BLOCK_BYTES, MAX_COMPRESSION_RATIO, RATIO_CHECK_FLOOR_BYTES};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const MIB: usize = 1024 * 1024;
 
-/// A JSON object `{"a":"AAAA…"}` of `len` bytes in total, gzip-compressed a block at a
-/// time so the plain text is never held whole.
-fn gzip_json(len: usize) -> Vec<u8> {
+/// Past the 128 MiB every response was once capped at, so a response this size
+/// is read only because no such cap applies.
+const LARGE_RESPONSE_BYTES: usize = 136 * MIB;
+
+/// A JSON object `{"a":"…"}` of `len` bytes in total, whose string is `fill(i)` for
+/// each of its bytes, built a block at a time so the whole is never held twice.
+fn json_object(len: usize, fill: fn(usize) -> u8, mut sink: impl FnMut(&[u8])) {
     let (head, tail) = (br#"{"a":""#, br#""}"#);
-    let block = vec![b'A'; MIB];
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    encoder.write_all(head).expect("compress");
+    sink(head);
+    let mut offset = 0;
     let mut remaining = len - head.len() - tail.len();
     while remaining > 0 {
-        let n = remaining.min(block.len());
-        encoder.write_all(&block[..n]).expect("compress");
+        let n = remaining.min(MIB);
+        let block: Vec<u8> = (offset..offset + n).map(fill).collect();
+        sink(&block);
+        offset += n;
         remaining -= n;
     }
-    encoder.write_all(tail).expect("compress");
+    sink(tail);
+}
+
+fn same_byte(_: usize) -> u8 {
+    b'A'
+}
+
+/// Zero-padded ascending eight-digit numbers separated by spaces, like an id column:
+/// text that compresses a few times over, as real data does.
+fn ids(i: usize) -> u8 {
+    let (number, position) = (i / 9, i % 9);
+    if position == 8 {
+        return b' ';
+    }
+    let place = 10usize.pow(u32::try_from(7 - position).expect("a digit place"));
+    b"0123456789"[number / place % 10]
+}
+
+fn gzip_json(len: usize, fill: fn(usize) -> u8, level: flate2::Compression) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), level);
+    json_object(len, fill, |block| {
+        encoder.write_all(block).expect("compress");
+    });
     encoder.finish().expect("finish gzip")
 }
 
-async fn origin(encoding: &str, body: Vec<u8>) -> MockServer {
+fn plain_json(len: usize, fill: fn(usize) -> u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(len);
+    json_object(len, fill, |block| body.extend_from_slice(block));
+    body
+}
+
+async fn origin(encoding: Option<&str>, body: Vec<u8>) -> MockServer {
     let server = MockServer::start().await;
+    let mut response = ResponseTemplate::new(200).insert_header("content-type", "application/json");
+    if let Some(encoding) = encoding {
+        response = response.insert_header("content-encoding", encoding);
+    }
     Mock::given(method("GET"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .insert_header("content-encoding", encoding)
-                .set_body_bytes(body),
-        )
+        .respond_with(response.set_body_bytes(body))
         .mount(&server)
         .await;
     server
@@ -68,8 +100,10 @@ async fn origin(encoding: &str, body: Vec<u8>) -> MockServer {
 async fn query_content(server: &MockServer) -> datafusion::error::Result<Vec<String>> {
     let provider = HttpTableProvider::new(
         url::Url::parse(&server.uri()).expect("valid URL"),
-        // Transparent decompression is on, as on the connector's own client.
-        reqwest::Client::new(),
+        // Decoding is left to the provider, as on the connector's own client.
+        http_body_limit::decode_manually(reqwest::Client::builder())
+            .build()
+            .expect("build client"),
         "json".to_string(),
         false,
     );
@@ -96,50 +130,107 @@ async fn query_content(server: &MockServer) -> datafusion::error::Result<Vec<Str
         .collect())
 }
 
+async fn requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .len()
+}
+
+/// The decoded and received byte counts a compression ratio refusal reports.
+fn refused_at(message: &str) -> (usize, usize) {
+    let counts = message
+        .split_once("when decoded (")
+        .and_then(|(_, rest)| rest.split_once(" received)"))
+        .map(|(counts, _)| counts)
+        .unwrap_or_else(|| panic!("no byte counts in {message}"));
+    let (decoded, received) = counts
+        .split_once(" bytes from ")
+        .unwrap_or_else(|| panic!("malformed byte counts in {message}"));
+    (
+        decoded.parse().expect("decoded byte count"),
+        received.parse().expect("received byte count"),
+    )
+}
+
 #[tokio::test]
-async fn compressed_response_past_the_limit_fails_the_query_without_retrying() {
-    let body = gzip_json(MAX_RESPONSE_BODY_BYTES + MIB);
-    assert!(body.len() < MIB, "the response is small on the wire");
-    let server = origin("gzip", body).await;
+async fn compression_bomb_is_refused_just_past_the_floor_without_retrying() {
+    let len = RATIO_CHECK_FLOOR_BYTES + 64 * MIB;
+    let body = gzip_json(len, same_byte, flate2::Compression::default());
+    assert!(
+        body.len() * MAX_COMPRESSION_RATIO < len,
+        "the response expands past the ratio: {} bytes on the wire",
+        body.len()
+    );
+    let server = origin(Some("gzip"), body).await;
 
     let error = match query_content(&server).await {
         Err(error) => error,
         Ok(rows) => panic!(
-            "a response that decodes past the limit fails the query, but it returned rows \
-             of {:?} bytes",
+            "a compression bomb fails the query, but it returned rows of {:?} bytes",
             rows.iter().map(String::len).collect::<Vec<_>>()
         ),
     };
     let message = error.to_string();
     assert!(
         message.contains(&format!(
-            "Failed to read the response from {} for this dataset: the response body is \
-             larger than the 128 MiB that is read from one HTTP response.",
+            "Failed to read the response from {} for this dataset: the gzip-compressed \
+             response body expanded more than 100:1 when decoded (",
             server.uri()
-        )),
+        )) && message.contains(
+            "received), which is refused once a body passes 64 MiB decoded. Ask the endpoint \
+             for an uncompressed response by adding `Accept-Encoding: identity` to \
+             `http_headers`, or request less data per call. \
+             See: https://spiceai.org/docs/components/data-connectors/https"
+        ),
         "{message}"
     );
 
-    // Too large is permanent: the origin is asked once, not once per retry.
-    let requests = server
-        .received_requests()
-        .await
-        .expect("request recording is on");
-    assert_eq!(requests.len(), 1, "requests made: {}", requests.len());
+    // Refused as soon as it passed the floor: never more than one decode block past it.
+    let (decoded, received) = refused_at(&message);
+    assert!(
+        decoded > RATIO_CHECK_FLOOR_BYTES && decoded <= RATIO_CHECK_FLOOR_BYTES + DECODE_BLOCK_BYTES,
+        "refused at {decoded} decoded bytes"
+    );
+    assert!(decoded > received * MAX_COMPRESSION_RATIO);
+
+    // The refusal is permanent: the origin is asked once, not once per retry.
+    assert_eq!(requests(&server).await, 1);
 }
 
 #[tokio::test]
-async fn compressed_response_under_the_limit_is_decoded() {
-    let body = gzip_json(3 * MIB);
-    let server = origin("gzip", body).await;
+async fn large_compressed_response_at_a_realistic_ratio_is_read_in_full() {
+    // The fastest level keeps the test quick, and compresses the least.
+    let body = gzip_json(LARGE_RESPONSE_BYTES, ids, flate2::Compression::fast());
+    let ratio = LARGE_RESPONSE_BYTES / body.len();
+    assert!(
+        (2..MAX_COMPRESSION_RATIO).contains(&ratio),
+        "the response compresses {ratio}:1"
+    );
+    let server = origin(Some("gzip"), body).await;
 
     let content = query_content(&server)
         .await
-        .expect("a compressed response under the limit is read");
+        .expect("a large compressed response at a realistic ratio is read");
     assert_eq!(content.len(), 1);
     let row = &content[0];
-    assert_eq!(row.len(), 3 * MIB);
-    assert!(row.starts_with(r#"{"a":"AAAA"#) && row.ends_with(r#"AAAA"}"#));
+    assert_eq!(row.len(), LARGE_RESPONSE_BYTES);
+    assert_eq!(row.as_bytes(), plain_json(LARGE_RESPONSE_BYTES, ids));
+    assert_eq!(requests(&server).await, 1);
+}
+
+#[tokio::test]
+async fn large_uncompressed_response_is_read_in_full() {
+    let server = origin(None, plain_json(LARGE_RESPONSE_BYTES, ids)).await;
+
+    let content = query_content(&server)
+        .await
+        .expect("a large uncompressed response is read");
+    assert_eq!(content.len(), 1);
+    let row = &content[0];
+    assert_eq!(row.len(), LARGE_RESPONSE_BYTES);
+    assert_eq!(row.as_bytes(), plain_json(LARGE_RESPONSE_BYTES, ids));
 }
 
 #[tokio::test]
@@ -150,7 +241,7 @@ async fn brotli_response_is_decoded() {
         let mut encoder = brotli::CompressorWriter::new(&mut body, 4096, 11, 22);
         encoder.write_all(json).expect("compress");
     }
-    let server = origin("br", body).await;
+    let server = origin(Some("br"), body).await;
 
     let content = query_content(&server)
         .await

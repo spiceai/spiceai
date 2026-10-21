@@ -1016,7 +1016,9 @@ impl Https {
             builder = builder.use_rustls_tls().identity(identity);
         }
 
-        builder
+        // The provider decodes compressed bodies itself, so it can refuse one that
+        // expands like a compression bomb before it is held in memory.
+        http_body_limit::decode_manually(builder)
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
