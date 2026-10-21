@@ -269,10 +269,12 @@ const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
 /// # Errors
 ///
 /// Returns [`Error::UndecodableStream`] for a stream that does not decode — including one too
-/// short to hold the schema message it claims, or one whose schema message cannot be relabelled
-/// in place — and [`Error::MapEntriesContainNulls`] for the one map shape no relabelling can
-/// repair.
+/// short to hold the schema message it claims, one declaring a message longer than the bytes
+/// that remain (refused before anything is allocated for it, see
+/// [`crate::ipc::check_stream_framing`]), or one whose schema message cannot be relabelled in
+/// place — and [`Error::MapEntriesContainNulls`] for the one map shape no relabelling can repair.
 pub fn read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
+    crate::ipc::check_stream_framing(bytes).context(UndecodableStreamSnafu)?;
     let reader = StreamReader::try_new(Cursor::new(bytes), None).context(UndecodableStreamSnafu)?;
     let declared = reader.schema();
     let normalizer = MapEntriesNormalizer::for_schema(&declared);

@@ -36,14 +36,13 @@ use datafusion::sql::sqlparser::{
     parser::{Parser, ParserError},
 };
 use futures::StreamExt;
-use postcard::{from_bytes, to_stdvec};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::DecodableSchema;
+use super::{DecodableSchema, prepared_statement_handle};
 use crate::{
     datafusion::{
         query::{run_transaction, schema_statement, transaction_statements},
@@ -254,7 +253,7 @@ pub(crate) async fn do_action_create_prepared_statement(
         parameter_schema: None,
     };
 
-    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
+    let handle = prepared_statement_handle::seal(&stmt)?;
 
     Ok(sql::ActionCreatePreparedStatementResult {
         prepared_statement_handle: handle.into(),
@@ -278,7 +277,7 @@ pub(crate) async fn get_flight_info(
         query: sql,
         parameters,
         parameter_schema,
-    } = from_bytes(&handle.prepared_statement_handle).map_err(error_to_status)?;
+    } = prepared_statement_handle::open(&handle.prepared_statement_handle)?;
 
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
@@ -297,9 +296,7 @@ pub(crate) async fn get_flight_info(
         Some(param_values) if transaction_statements(&sql).is_none() => {
             let sql_to_plan = match &parameter_schema {
                 Some(schema_bytes) => {
-                    let reader =
-                        StreamReader::try_new(&schema_bytes[..], None).map_err(error_to_status)?;
-                    rewrite_sql_with_type_casts(&sql, &reader.schema())
+                    rewrite_sql_with_type_casts(&sql, &decode_parameter_schema(schema_bytes)?)
                 }
                 None => sql.clone(),
             };
@@ -367,7 +364,7 @@ pub(crate) async fn do_get(
         query: sql,
         parameters,
         parameter_schema,
-    } = from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
+    } = prepared_statement_handle::open(&query.prepared_statement_handle)?;
 
     tracing::debug!(
         "do_get: Query: {}, Parameters length: {}",
@@ -408,12 +405,7 @@ pub(crate) async fn do_get(
     let sql_to_execute = if let Some(schema_bytes) = &parameter_schema {
         tracing::debug!("do_get: Have parameter schema, attempting to rewrite SQL with type casts");
 
-        // Decode the parameter schema
-        let schema = {
-            let reader = arrow::ipc::reader::StreamReader::try_new(&schema_bytes[..], None)
-                .map_err(error_to_status)?;
-            reader.schema()
-        };
+        let schema = decode_parameter_schema(schema_bytes)?;
 
         tracing::debug!("do_get: Parameter schema: {:?}", schema);
 
@@ -498,11 +490,10 @@ pub(crate) async fn do_put_query(
         bytes
     };
 
-    let mut stmt: PreparedStatement =
-        from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
+    let mut stmt = prepared_statement_handle::open(&query.prepared_statement_handle)?;
     stmt.parameters = parameters;
     stmt.parameter_schema = Some(schema_bytes);
-    let handle = to_stdvec(&stmt).map_err(error_to_status)?;
+    let handle = prepared_statement_handle::seal(&stmt)?;
 
     let result = DoPutPreparedStatementResult {
         prepared_statement_handle: Some(handle.into()),
@@ -552,6 +543,11 @@ pub(super) async fn encode_single_row_parameters(
         }
     }
     encoder.finish().map_err(error_to_status)?;
+    if parameters.len() > MAX_PARAMETER_BYTES {
+        return Err(param_error_to_status(oversized_parameters_error(
+            parameters.len(),
+        )));
+    }
     Ok(parameters)
 }
 
@@ -575,6 +571,50 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
     ))
 }
 
+/// The most bytes of Arrow IPC a prepared statement's bound parameters may occupy.
+///
+/// Parameters are a single row, so this is room for a large value — a document or blob bound
+/// to an `INSERT` — not for a table. The bound stream travels in the handle, so it is also
+/// bounded by the Flight message size limit (100 MiB by default); this keeps what one request
+/// can make the decoder build well below that, whatever that limit is configured to.
+pub(super) const MAX_PARAMETER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Refuses a parameter stream before any of it is decoded, unless it is no larger than
+/// [`MAX_PARAMETER_BYTES`], every length its messages declare fits inside it, and its bodies
+/// are uncompressed — the form `encode_single_row_parameters` writes. A compressed buffer
+/// declares an uncompressed length the decoder reserves up front, which no input size bounds.
+fn check_parameter_stream(bytes: &[u8]) -> Result<(), datafusion::error::DataFusionError> {
+    if bytes.len() > MAX_PARAMETER_BYTES {
+        return Err(oversized_parameters_error(bytes.len()));
+    }
+    let framing = arrow_tools::ipc::check_stream_framing(bytes)?;
+    if framing.compressed {
+        return Err(datafusion::error::DataFusionError::Execution(
+            "Failed to read the query parameters sent to the Flight SQL server: the Arrow IPC stream uses body compression, so the query cannot run. \
+             Bind the parameters with an uncompressed Arrow IPC stream. \
+             See: https://spiceai.org/docs/api/arrow-flight-sql"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn oversized_parameters_error(len: usize) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::Execution(format!(
+        "Failed to bind the query parameters sent to the Flight SQL server: they occupy {len} bytes, more than the {MAX_PARAMETER_BYTES} bytes allowed for one row of parameters, so the query cannot run. \
+         Bind smaller values, or load large values with a bulk ingest instead. \
+         See: https://spiceai.org/docs/api/arrow-flight-sql"
+    ))
+}
+
+/// Reads the parameter schema a `DoPut` stored in a handle.
+fn decode_parameter_schema(bytes: &[u8]) -> Result<SchemaRef, Status> {
+    check_parameter_stream(bytes).map_err(param_error_to_status)?;
+    Ok(StreamReader::try_new(bytes, None)
+        .map_err(error_to_status)?
+        .schema())
+}
+
 // Decode parameter ipc stream as ParamValues
 pub(super) fn decode_param_values(
     parameters: &[u8],
@@ -582,6 +622,7 @@ pub(super) fn decode_param_values(
     if parameters.is_empty() {
         return Ok(None);
     }
+    check_parameter_stream(parameters)?;
     let declared = StreamReader::try_new(parameters, None)?.schema();
     // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
     // forbids — and which the decode itself now refuses, over the one part of the column that
@@ -707,6 +748,7 @@ mod tests {
     use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use postcard::{from_bytes, to_stdvec};
     use std::sync::Arc;
 
     /// Helper to encode a `RecordBatch` into Arrow IPC format for parameters
@@ -898,6 +940,198 @@ mod tests {
         } else {
             panic!("Expected Some parameters");
         }
+    }
+
+    /// Rewrites the `bodyLength` the record batch message of a one-batch parameter stream
+    /// declares. The field is found by value: each occurrence of the current length in the
+    /// batch's metadata is tried, and the one that changes what the parsed message reports wins.
+    fn with_declared_batch_body_length(bytes: &[u8], declared: i64) -> Vec<u8> {
+        let message_at = |at: usize| {
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes"));
+            let metadata = at + 8..at + 8 + len as usize;
+            let body = arrow_ipc::root_as_message(&bytes[metadata.clone()])
+                .expect("writer metadata parses")
+                .bodyLength();
+            (metadata, body)
+        };
+        let (schema_metadata, schema_body) = message_at(0);
+        let (metadata, body) =
+            message_at(schema_metadata.end + usize::try_from(schema_body).expect("non-negative"));
+        let current = body.to_le_bytes();
+        for at in metadata.start..=metadata.end - current.len() {
+            if bytes[at..at + current.len()] != current {
+                continue;
+            }
+            let mut patched = bytes.to_vec();
+            patched[at..at + current.len()].copy_from_slice(&declared.to_le_bytes());
+            if arrow_ipc::root_as_message(&patched[metadata.clone()])
+                .is_ok_and(|message| message.bodyLength() == declared)
+            {
+                return patched;
+            }
+        }
+        panic!("the batch message has no bodyLength field holding its body length");
+    }
+
+    fn one_int_parameter() -> Vec<u8> {
+        encode_params_to_bytes(&one_col_batch(&int64_schema(), vec![42])).expect("encode params")
+    }
+
+    /// A parameter stream declaring a body far larger than itself is refused before the decoder
+    /// zero-fills a buffer of the declared size, which at this size aborts the process.
+    #[test]
+    fn decode_param_values_refuses_an_over_declared_body_without_allocating_it() {
+        let declared = 500_000_000_000_i64;
+        let bytes = with_declared_batch_body_length(&one_int_parameter(), declared);
+        let status = param_error_to_status(
+            decode_param_values(&bytes).expect_err("an over-declared body must be refused"),
+        );
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains(&format!("message 1 declares a {declared} byte body")),
+            "{}",
+            status.message()
+        );
+    }
+
+    #[test]
+    fn decode_param_values_refuses_parameters_over_the_size_limit() {
+        let bytes = vec![0_u8; MAX_PARAMETER_BYTES + 1];
+        let status = param_error_to_status(
+            decode_param_values(&bytes).expect_err("oversized parameters must be refused"),
+        );
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.message(),
+            format!(
+                "Execution error: Failed to bind the query parameters sent to the Flight SQL server: they occupy {} bytes, more than the {MAX_PARAMETER_BYTES} bytes allowed for one row of parameters, so the query cannot run. \
+                 Bind smaller values, or load large values with a bulk ingest instead. \
+                 See: https://spiceai.org/docs/api/arrow-flight-sql",
+                MAX_PARAMETER_BYTES + 1
+            )
+        );
+    }
+
+    #[test]
+    fn decode_param_values_refuses_compressed_parameters() {
+        let batch = one_col_batch(&int64_schema(), vec![42]);
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(arrow::ipc::CompressionType::LZ4_FRAME))
+            .expect("lz4 is available");
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+            Vec::new(),
+            &batch.schema(),
+            options,
+        )
+        .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.finish().expect("finish");
+        let bytes = writer.into_inner().expect("bytes");
+
+        let err = decode_param_values(&bytes).expect_err("compressed parameters must be refused");
+        assert!(err.to_string().contains("uses body compression"), "{err}");
+    }
+
+    #[test]
+    fn decode_parameter_schema_refuses_an_over_declared_body() {
+        let schema_only = {
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &int64_schema())
+                .expect("writer");
+            writer.finish().expect("finish");
+            writer.into_inner().expect("bytes")
+        };
+        assert_eq!(
+            decode_parameter_schema(&schema_only).expect("a written schema decodes"),
+            int64_schema()
+        );
+
+        let mut over_declared = schema_only.clone();
+        over_declared[4..8].copy_from_slice(&i32::MAX.to_le_bytes());
+        let status = decode_parameter_schema(&over_declared)
+            .expect_err("an over-declared metadata length must be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status.message().contains(&format!(
+                "message 0 declares {} bytes of metadata",
+                i32::MAX
+            )),
+            "{}",
+            status.message()
+        );
+    }
+
+    #[test]
+    fn decode_param_values_accepts_parameters_at_the_size_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )]));
+        let overhead = encode_params_to_bytes(
+            &RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::BinaryArray::from_iter([Some(
+                    &b""[..],
+                )]))],
+            )
+            .expect("batch"),
+        )
+        .expect("encode")
+        .len();
+        let value = vec![0x5a_u8; MAX_PARAMETER_BYTES - overhead - 64];
+        let bytes = encode_params_to_bytes(
+            &RecordBatch::try_new(
+                schema,
+                vec![Arc::new(arrow::array::BinaryArray::from_iter([Some(
+                    value.as_slice(),
+                )]))],
+            )
+            .expect("batch"),
+        )
+        .expect("encode");
+        assert!(bytes.len() <= MAX_PARAMETER_BYTES, "{}", bytes.len());
+
+        let Some(ParamValues::Map(named)) =
+            decode_param_values(&bytes).expect("parameters within the limit decode")
+        else {
+            panic!("a named parameter batch decodes to a map of parameters");
+        };
+        assert_eq!(
+            named.get("blob").map(|param| &param.value),
+            Some(&datafusion::scalar::ScalarValue::Binary(Some(value)))
+        );
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_refuses_a_row_over_the_size_limit() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "blob",
+            DataType::Binary,
+            false,
+        )]));
+        let value = vec![0x5a_u8; MAX_PARAMETER_BYTES + 1];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::BinaryArray::from_iter([Some(
+                value.as_slice(),
+            )]))],
+        )
+        .expect("batch");
+        let (mut decoder, schema_ref) = decoder_for(vec![batch]).await;
+        let err = encode_single_row_parameters(
+            &mut decoder,
+            &MapEntriesNormalizer::for_schema(&schema_ref),
+        )
+        .await
+        .expect_err("a row over the limit must be refused when it is bound");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("more than the 16777216 bytes"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]
