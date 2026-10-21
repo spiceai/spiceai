@@ -34,7 +34,7 @@ use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -244,10 +244,36 @@ impl ToolUsingResponses {
         self.call_tool(call).await
     }
 
+    /// The `call_id`s Spice runs from `output`: the first
+    /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] Spice tool calls, in the order `output` lists them.
+    fn runnable_spice_call_ids(&self, output: &[OutputItem]) -> HashSet<String> {
+        self.spice_tool_calls(output)
+            .into_iter()
+            .take(MAX_SPICE_TOOL_CALLS_PER_RESPONSE)
+            .map(|call| call.call_id.clone())
+            .collect()
+    }
+
+    /// Runs `call` when `runnable` contains its `call_id`. A call that it does not contain does
+    /// not run, and fails with [`tool_call_not_run_message`]. `requested` is how many Spice tool
+    /// calls the round made.
+    async fn run_spice_tool_call_if_runnable(
+        &self,
+        call: &FunctionToolCall,
+        runnable: &HashSet<String>,
+        requested: usize,
+    ) -> ToolOutcome {
+        if !runnable.contains(&call.call_id) {
+            return ToolOutcome::Failed(tool_call_not_run_message(requested));
+        }
+        self.run_spice_tool_call(call).await
+    }
+
     /// Runs `call`, a call to one of Spice's tools, if `runs_left` allows one more run in its
     /// round, which made `requested` Spice tool calls. A call past the round's
     /// [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`] does not run, and fails with
-    /// [`tool_call_not_run_message`].
+    /// [`tool_call_not_run_message`]. The caller walks the round's Spice calls in output order,
+    /// so the calls that run are the first [`MAX_SPICE_TOOL_CALLS_PER_RESPONSE`].
     async fn run_spice_tool_call_within_limit(
         &self,
         call: &FunctionToolCall,
@@ -927,13 +953,15 @@ fn make_responses_stream(
                     };
 
                     // Run each call as the client reaches its end, then send the round's events
-                    // that followed it.
-                    let requested = model.spice_tool_calls(&response.output).len();
+                    // that followed it. Which calls run is fixed by output order, not by the
+                    // order those end events arrived: a later call can finish streaming first.
+                    let spice_calls = model.spice_tool_calls(&response.output);
+                    let requested = spice_calls.len();
                     warn_if_over_tool_call_limit(
                         req.model.as_deref().unwrap_or_default(),
                         requested,
                     );
-                    let mut runs_left = MAX_SPICE_TOOL_CALLS_PER_RESPONSE;
+                    let runnable = model.runnable_spice_call_ids(&response.output);
                     let mut outcomes = HashMap::new();
                     for event in held {
                         let ended_call = match &event {
@@ -952,11 +980,7 @@ fn make_responses_stream(
                         let events = match ended_call {
                             Some((call, output_index)) => {
                                 let outcome = model
-                                    .run_spice_tool_call_within_limit(
-                                        call,
-                                        &mut runs_left,
-                                        requested,
-                                    )
+                                    .run_spice_tool_call_if_runnable(call, &runnable, requested)
                                     .await;
                                 let events =
                                     client_stream.tool_call_ended(call, output_index, &outcome);
@@ -969,12 +993,12 @@ fn make_responses_stream(
                             return;
                         }
                     }
-                    // A call whose end the round did not stream runs too: the next round needs
-                    // every call's result.
-                    for call in model.spice_tool_calls(&response.output) {
+                    // A call whose end the round did not stream runs too, under the same
+                    // output-order selection: the next round needs every call's result.
+                    for call in spice_calls {
                         if !outcomes.contains_key(&call.call_id) {
                             let outcome = model
-                                .run_spice_tool_call_within_limit(call, &mut runs_left, requested)
+                                .run_spice_tool_call_if_runnable(call, &runnable, requested)
                                 .await;
                             outcomes.insert(call.call_id.clone(), outcome);
                         }
@@ -1970,6 +1994,197 @@ mod tests {
             allowed_tools(ToolChoiceAllowedMode::Auto),
         ] {
             assert_eq!(next_round_tool_choice(Some(unforced.clone())), unforced);
+        }
+    }
+
+    /// A provider whose first round is `calls` Spice tool calls. It streams `output_item.done`
+    /// for `done_indexes` only, in that order, after every call has been added. Later rounds are
+    /// a message. It records every request.
+    struct DoneOrderResponses {
+        calls: usize,
+        done_indexes: Vec<usize>,
+        requests: Mutex<Vec<CreateResponse>>,
+    }
+
+    impl DoneOrderResponses {
+        fn new(calls: usize, done_indexes: Vec<usize>) -> Arc<Self> {
+            Arc::new(Self {
+                calls,
+                done_indexes,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn input(&self, round: usize) -> Value {
+            serde_json::to_value(&self.requests.lock()[round].input).expect("a serializable input")
+        }
+    }
+
+    #[async_trait]
+    impl Responses for DoneOrderResponses {
+        async fn health(&self) -> Result<(), ResponsesError> {
+            Ok(())
+        }
+
+        async fn responses_stream(
+            &self,
+            req: CreateResponse,
+        ) -> Result<ResponseStream, OpenAIError> {
+            let mut requests = self.requests.lock();
+            let round = requests.len();
+            requests.push(req);
+            drop(requests);
+            let events = if round == 0 {
+                let names = vec!["list_datasets"; self.calls];
+                done_order_events(0, &names, &self.done_indexes)
+            } else {
+                round_events(round, &["message"])
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
+            let mut requests = self.requests.lock();
+            let round = requests.len();
+            requests.push(req);
+            drop(requests);
+            let names = if round == 0 {
+                vec!["list_datasets"; self.calls]
+            } else {
+                vec!["message"]
+            };
+            Ok(
+                serde_json::from_value(response(round, "completed", &output(round, &names)))
+                    .expect("a valid response"),
+            )
+        }
+    }
+
+    /// Round `round`'s stream: every item is added first, then `output_item.done` for
+    /// `done_indexes` in that order. The completed response still lists every item.
+    fn done_order_events(
+        round: usize,
+        items: &[&str],
+        done_indexes: &[usize],
+    ) -> Vec<ResponseStreamEvent> {
+        let mut events = vec![json!({
+            "type": "response.created", "response": response(round, "in_progress", &[]),
+        })];
+        for (index, name) in items.iter().enumerate() {
+            let item_id = item(round, index, name, "completed")["id"].clone();
+            events.push(json!({
+                "type": "response.output_item.added", "output_index": index,
+                "item": item(round, index, name, "in_progress"),
+            }));
+            events.extend([
+                json!({
+                    "type": "response.function_call_arguments.delta", "item_id": item_id,
+                    "output_index": index, "delta": "{}",
+                }),
+                json!({
+                    "type": "response.function_call_arguments.done", "item_id": item_id,
+                    "output_index": index, "arguments": "{}",
+                }),
+            ]);
+        }
+        for index in done_indexes {
+            events.push(json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": item(round, *index, items[*index], "completed"),
+            }));
+        }
+        events.push(json!({
+            "type": "response.completed",
+            "response": response(round, "completed", &output(round, items)),
+        }));
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(sequence_number, mut event)| {
+                event["sequence_number"] = json!(sequence_number);
+                serde_json::from_value(event).expect("a valid stream event")
+            })
+            .collect()
+    }
+
+    fn function_outputs(input: &Value) -> HashMap<String, String> {
+        input
+            .as_array()
+            .expect("the next round's input is a list")
+            .iter()
+            .filter_map(|item| {
+                if item["type"] != "function_call_output" {
+                    return None;
+                }
+                Some((
+                    item["call_id"].as_str()?.to_string(),
+                    item["output"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// A streamed round runs the first 64 Spice calls in output order even when their
+    /// `output_item.done` events arrive in another order, or when an early call's end is not
+    /// streamed.
+    #[tokio::test]
+    async fn streamed_tool_calls_past_the_limit_follow_output_order() {
+        let calls = MAX_SPICE_TOOL_CALLS_PER_RESPONSE + 1;
+        // Done events for calls 1..=64, then call 0: arrival order would run call 64 and skip
+        // call 0. Output order runs call 0 and skips call 64.
+        let reordered: Vec<usize> = (1..calls).chain(std::iter::once(0)).collect();
+        // Call 0's end is not streamed. The fallback still runs it, and still skips call 64.
+        let missing_first: Vec<usize> = (1..calls).collect();
+
+        for done_indexes in [reordered, missing_first] {
+            let provider = DoneOrderResponses::new(calls, done_indexes.clone());
+            let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+            let events = collect_events(
+                ToolUsingResponses::new(
+                    Arc::clone(&provider) as Arc<dyn Responses>,
+                    vec![],
+                    vec![Arc::clone(&tool) as Arc<dyn SpiceModelTool>],
+                    None,
+                )
+                .responses_stream(request(true))
+                .await
+                .expect("a response stream"),
+            )
+            .await;
+            assert!(
+                events
+                    .last()
+                    .is_some_and(|event| event["type"] == "response.completed"),
+                "done order {done_indexes:?} did not finish the stream"
+            );
+
+            let outputs = function_outputs(&provider.input(1));
+            let ran = "[\"taxi_trips\"]";
+            let skipped = tool_call_not_run_message(calls);
+            assert_eq!(
+                outputs.get("call_0_0").map(String::as_str),
+                Some(ran),
+                "done order {done_indexes:?}"
+            );
+            assert_eq!(
+                outputs
+                    .get(&format!("call_0_{}", MAX_SPICE_TOOL_CALLS_PER_RESPONSE - 1))
+                    .map(String::as_str),
+                Some(ran),
+                "done order {done_indexes:?}"
+            );
+            assert_eq!(
+                outputs
+                    .get(&format!("call_0_{MAX_SPICE_TOOL_CALLS_PER_RESPONSE}"))
+                    .map(String::as_str),
+                Some(skipped.as_str()),
+                "done order {done_indexes:?}"
+            );
+            assert_eq!(
+                tool.0.load(Ordering::SeqCst),
+                MAX_SPICE_TOOL_CALLS_PER_RESPONSE,
+                "done order {done_indexes:?}"
+            );
         }
     }
 }
