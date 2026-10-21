@@ -39,9 +39,6 @@ pub enum Error {
     #[snafu(display("Failed to parse JSON response: {source}"))]
     JsonParse { source: reqwest::Error },
 
-    #[snafu(display("Failed to read the Elasticsearch response: {source}"))]
-    ResponseBody { source: http_body_limit::Error },
-
     #[snafu(display("Elasticsearch error (HTTP {status}): {message}"))]
     ElasticsearchError { status: u16, message: String },
 
@@ -447,7 +444,8 @@ impl Client {
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
-        let body = error_text(resp)
+        let body = resp
+            .text()
             .await
             .unwrap_or_default()
             .replace(['\n', '\r'], " ");
@@ -649,7 +647,8 @@ impl Client {
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     if resp.status().is_client_error() || resp.status().is_server_error() {
         let status = resp.status();
-        let body = error_text(resp)
+        let body = resp
+            .text()
             .await
             .unwrap_or_default()
             .replace(['\n', '\r'], " ");
@@ -658,30 +657,7 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
             message: body.trim().to_string(),
         });
     }
-    buffer_body(resp).await
-}
-
-/// Read a successful response's body into memory under
-/// [`http_body_limit::MAX_RESPONSE_BODY_BYTES`], so decoding it cannot allocate without
-/// bound. A failed read is reported as `JsonParse`, as decoding the body directly would.
-async fn buffer_body(resp: reqwest::Response) -> Result<reqwest::Response> {
-    http_body_limit::buffer(resp, http_body_limit::MAX_RESPONSE_BODY_BYTES)
-        .await
-        .map_err(|e| match e {
-            http_body_limit::Error::Read { source } => Error::JsonParse { source },
-            source @ http_body_limit::Error::TooLarge { .. } => Error::ResponseBody { source },
-        })
-}
-
-/// The text of an error response, or `None` when it cannot be read whole under
-/// [`http_body_limit::MAX_RESPONSE_BODY_BYTES`].
-async fn error_text(resp: reqwest::Response) -> Option<String> {
-    http_body_limit::buffer(resp, http_body_limit::MAX_RESPONSE_BODY_BYTES)
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()
+    Ok(resp)
 }
 
 /// Longest `error.type` this client will echo. Elasticsearch exception class names are
@@ -738,18 +714,18 @@ fn error_class_from_body(body: &str) -> Option<String> {
 /// shape, are all that survive.
 async fn check_status_without_body(resp: reqwest::Response) -> Result<reqwest::Response> {
     if !(resp.status().is_client_error() || resp.status().is_server_error()) {
-        return buffer_body(resp).await;
+        return Ok(resp);
     }
 
     let status = resp.status().as_u16();
     // Nothing derived from `body` other than the exception class escapes this scope.
-    let class = match error_text(resp).await {
-        Some(body) => error_class_from_body(&body),
-        // The body could not be read — a truncated or interrupted response, or one past the
-        // size limit. The status is still the actionable signal, and there is nothing left
-        // to classify; surfacing the read error instead would reclassify an HTTP-status
-        // failure as a transport one and change how `is_transient` treats it.
-        None => None,
+    let class = match resp.text().await {
+        Ok(body) => error_class_from_body(&body),
+        // The body could not be read — a truncated or interrupted response. The status is
+        // still the actionable signal, and there is nothing left to classify; surfacing the
+        // transport error instead would reclassify an HTTP-status failure as a transport one
+        // and change how `is_transient` treats it.
+        Err(_) => None,
     };
 
     Err(Error::ElasticsearchError {
@@ -1070,6 +1046,46 @@ mod tests {
     }
 
     // ── The HTTP paths ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_response_larger_than_128_mib_is_read_in_full() {
+        const HITS: usize = 140_000;
+        let filler = "x".repeat(1000);
+        let mut body = String::from(r#"{"hits":{"total":{"value":140000},"hits":["#);
+        for i in 0..HITS {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                r#"{{"_id":"doc-{i}","_score":1.0,"_source":{{"n":{i},"text":"{filler}"}}}}"#
+            ));
+        }
+        body.push_str("]}}");
+        assert!(body.len() > 136 * 1024 * 1024, "{} bytes", body.len());
+        let (url, hits) = spawn_stub("200 OK", body, 1);
+
+        // A long timeout: an unoptimized build takes seconds to parse this much JSON.
+        let opts = ClientOptions {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(300),
+            retry: RetryConfig {
+                max_retries: 0,
+                initial_backoff: Duration::from_millis(1),
+            },
+        };
+        let response = Client::new_with_options(&url, None, None, &opts)
+            .expect("build the stub client")
+            .search_raw("idx", &serde_json::json!({}))
+            .await
+            .expect("a large search response is read");
+
+        assert_eq!(response.hits.hits.len(), HITS);
+        let last = &response.hits.hits[HITS - 1];
+        assert_eq!(last.id, format!("doc-{}", HITS - 1));
+        assert_eq!(last.source["n"], serde_json::json!(HITS - 1));
+        assert_eq!(last.source["text"], serde_json::json!(filler));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn bulk_index_4xx_reports_the_class_and_not_the_body() {
