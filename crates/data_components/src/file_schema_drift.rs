@@ -165,26 +165,25 @@ impl FileSchemaDriftGuard {
             .as_ref()
             .filter(|(fp, _)| *fp == fingerprint)
             .map(|(_, drift)| drift.clone());
-        let drift = match cached {
-            Some(drift) => drift,
-            None => {
-                // Newest first: the registered schema was inferred from the newest file, so
-                // it normally carries every column and ends the probe after one footer.
-                files.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
-                let store = match state.runtime_env().object_store(&store_url) {
-                    Ok(store) => store,
-                    Err(e) => {
-                        tracing::debug!(
-                            "Dataset '{}': skipping the missing-column check, the object store is not available: {e}",
-                            self.dataset_name
-                        );
-                        return Ok(());
-                    }
-                };
-                let drift = self.find_drift(state, &store, columns, &files).await?;
-                self.state.lock().last_check = Some((fingerprint, drift.clone()));
-                drift
-            }
+        let drift = if let Some(drift) = cached {
+            drift
+        } else {
+            // Newest first: the registered schema was inferred from the newest file, so
+            // it normally carries every column and ends the probe after one footer.
+            files.sort_by_key(|f| std::cmp::Reverse(f.last_modified));
+            let store = match state.runtime_env().object_store(&store_url) {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::debug!(
+                        "Dataset '{}': skipping the missing-column check, the object store is not available: {e}",
+                        self.dataset_name
+                    );
+                    return Ok(());
+                }
+            };
+            let drift = self.find_drift(state, &store, columns, &files).await?;
+            self.state.lock().last_check = Some((fingerprint, drift.clone()));
+            drift
         };
 
         let Some(drift) = drift else {
