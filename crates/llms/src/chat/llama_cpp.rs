@@ -471,7 +471,10 @@ fn serve(
         }
     };
     let draft_model = match draft.map(|d| {
-        LlamaModel::load_from_file(backend, d, &params.clone().with_load_mtp(true))
+        let params = LlamaModelParams::default()
+            .with_n_gpu_layers(u32::MAX)
+            .with_load_mtp(true);
+        LlamaModel::load_from_file(backend, d, &params)
             .map_err(|e| format!("llama.cpp could not load the MTP head '{}': {e}", d.display()))
     }) {
         Some(Err(message)) => {

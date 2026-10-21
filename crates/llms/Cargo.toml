@@ -53,7 +53,8 @@ util = { path = "../util", features = ["datafusion"] }
 mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "489244bc3c5ec3b8703390e15c1c6ffbb941e45d", optional = true } # branch: lukim/export-chat-template (spiceai/mistral.rs#49 plus the exported chat-template renderer)
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "489244bc3c5ec3b8703390e15c1c6ffbb941e45d", package = "mistralrs-core", optional = true } # branch: lukim/export-chat-template (spiceai/mistral.rs#49 plus the exported chat-template renderer)
 rand.workspace = true
-llama-cpp-2 = { version = "0.1.160", optional = true, default-features = false }
+# `common` builds llama.cpp's common library, which MTP speculative decoding runs through.
+llama-cpp-2 = { version = "0.1.160", optional = true, default-features = false, features = ["common"] }
 
 tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ac4e457936bc11c9b4fee453f2be33133d3146d8", features = [
     "candle",
