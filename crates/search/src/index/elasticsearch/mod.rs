@@ -281,7 +281,7 @@ impl ReplaceSnapshot {
             Err(elasticsearch::Error::ElasticsearchError { status: 404, .. }) => return Ok(None),
             Err(e) => {
                 return Err(DataFusionError::Execution(format!(
-                    "Failed to snapshot the search index '{es_index}' (elasticsearch) before a full refresh, so documents for rows the refresh drops cannot be found afterwards and searches will keep returning those rows. Cause: {e}"
+                    "Failed to snapshot the search index '{es_index}' (elasticsearch) before a full refresh, so documents for rows the refresh drops cannot be found afterwards and searches will keep returning those rows until a full refresh can snapshot it. Check that the Elasticsearch credentials can read the index. Cause: {e}. See: https://spiceai.org/docs/features/search"
                 )));
             }
         };
@@ -329,7 +329,7 @@ impl ReplaceSnapshot {
         self.close(client, es_index).await;
         result.map_err(|cause| {
             DataFusionError::Execution(format!(
-                "Failed to remove the documents for rows a full refresh dropped from the search index '{es_index}' (elasticsearch), so searches can return rows the dataset no longer has until the next full refresh succeeds. Cause: {cause}"
+                "Failed to remove the documents for rows a full refresh dropped from the search index '{es_index}' (elasticsearch), so searches can return rows the dataset no longer has until the next full refresh succeeds. Cause: {cause}. See: https://spiceai.org/docs/features/search"
             ))
         })
     }
@@ -377,10 +377,9 @@ impl ReplaceSnapshot {
                         seq_no,
                         primary_term,
                     }),
-                    _ => Err(format!(
-                        "the snapshot returned document '{}' without its sequence number",
-                        hit.id
-                    )),
+                    _ => Err(
+                        "the snapshot returned a document without its sequence number".to_string(),
+                    ),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let response = client
@@ -487,8 +486,10 @@ impl ElasticsearchIndexWriteMaintenance {
     /// without `on_write_failed`) predates that write's rows and would keep a row it rewrote
     /// from being deleted.
     ///
-    /// A failed start leaves no cycle open: the caller does not call `on_write_failed` on an
-    /// index whose own start failed, so the next write would otherwise skip the tuning.
+    /// A failed start that opened the cycle leaves no cycle open: the caller does not call
+    /// `on_write_failed` on an index whose own start failed, so the next write would otherwise
+    /// skip the tuning. A failed start inside a cycle an earlier start opened drops only its
+    /// snapshot, so that cycle's `on_write_complete` still restores what it overrode.
     pub async fn on_write_start(
         &self,
         client: &Arc<dyn Elasticsearch>,
@@ -507,7 +508,13 @@ impl ElasticsearchIndexWriteMaintenance {
             }
             Ok(())
         };
-        started.await.inspect_err(|_| self.abandon_write_cycle())
+        started.await.inspect_err(|_| {
+            if first_start {
+                self.abandon_write_cycle();
+            } else {
+                self.replace_snapshot.lock().take();
+            }
+        })
     }
 
     async fn tune_refresh_interval(
@@ -1194,6 +1201,8 @@ mod write_maintenance_tests {
         /// When set, every `put_index_settings` call fails — the shape of an ES cluster that
         /// rejects the `refresh_interval` override `on_write_start` applies.
         fail_put_settings: bool,
+        /// When set, `open_point_in_time` fails, so a replacing write cannot snapshot the index.
+        fail_open_point_in_time: bool,
     }
 
     #[async_trait::async_trait]
@@ -1259,7 +1268,14 @@ mod write_maintenance_tests {
             unimplemented!()
         }
         async fn open_point_in_time(&self, _: &str, _: &str) -> elasticsearch::Result<String> {
-            unimplemented!()
+            assert!(
+                self.fail_open_point_in_time,
+                "open_point_in_time is only expected where it fails"
+            );
+            Err(elasticsearch::Error::ElasticsearchError {
+                status: 503,
+                message: "snapshot unavailable".to_string(),
+            })
         }
         async fn search_point_in_time(
             &self,
@@ -1408,6 +1424,41 @@ mod write_maintenance_tests {
             healthy.put_settings_calls.load(Ordering::Relaxed),
             1,
             "the write after a failed start must still override refresh_interval"
+        );
+    }
+
+    /// A refresh dropped mid-write leaves its cycle open with `refresh_interval` overridden. A
+    /// replacing write that then fails to snapshot must not abandon that cycle: abandoning it
+    /// forgets the override, so `on_write_complete` would never restore `refresh_interval` and
+    /// the index would stay at the write-time value (`-1` stops refreshing it altogether).
+    #[tokio::test]
+    async fn a_failed_snapshot_inside_an_open_cycle_still_restores_refresh_interval() {
+        let client = Arc::new(MockElasticsearch {
+            refresh_interval: std::sync::Mutex::new(Some("30s".to_string())),
+            fail_open_point_in_time: true,
+            ..Default::default()
+        });
+        let m = make_maintenance(ElasticsearchIndexWriteOptions {
+            refresh_interval_during_write: Some("-1".to_string()),
+            force_merge_segments: None,
+        });
+
+        // A write opens the cycle and overrides `refresh_interval`, then is dropped.
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::Append)
+            .await
+            .expect("start");
+        // The next, replacing write cannot snapshot the index; the sink carries on with it.
+        m.on_write_start(&dyn_es(&client), "my-index", WriteWindow::ReplaceAll)
+            .await
+            .expect_err("the snapshot was refused");
+        m.on_write_complete(client.as_ref(), "my-index")
+            .await
+            .expect("complete");
+
+        assert_eq!(
+            client.put_settings_calls.load(Ordering::Relaxed),
+            2,
+            "refresh_interval must be overridden once and restored once"
         );
     }
 
