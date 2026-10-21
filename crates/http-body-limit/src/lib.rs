@@ -23,7 +23,10 @@ limitations under the License.
 //! `Content-Encoding`: once it has decoded past [`RATIO_CHECK_FLOOR_BYTES`], it is
 //! refused as soon as it has expanded more than [`MAX_COMPRESSION_RATIO`] times the
 //! bytes received for it. The check runs as each block is decoded, so a refused body
-//! never holds much more than the floor.
+//! holds at most one block more than the larger of the floor and that ratio times the
+//! bytes received. The ratio is over the whole body, so bytes sent early that compress
+//! poorly delay the refusal of a run that compresses well: a sender gets past the floor
+//! only by sending one byte for every [`MAX_COMPRESSION_RATIO`] it makes spiced hold.
 //!
 //! Counting the bytes received needs the body before it is decoded, which `reqwest`'s
 //! transparent decompression does not expose. A client whose bodies are checked is
@@ -53,7 +56,8 @@ use tokio_util::io::StreamReader;
 ///
 /// Below it, any ratio is accepted: a small response that compresses extremely well
 /// (a page of identical rows) is ordinary, and costs little however small it was on
-/// the wire. It is also roughly the most a refused body holds before it is refused.
+/// the wire. A body refused for its ratio holds no more than one block past the larger
+/// of this and [`MAX_COMPRESSION_RATIO`] times the bytes received for it.
 pub const RATIO_CHECK_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 
 /// The most a compressed body may expand, decoded bytes per byte received, once it has
@@ -606,6 +610,53 @@ mod tests {
             .expect("a small body is read at any ratio");
         assert_eq!(decoded.len(), 8 * MIB);
         assert!(decoded.iter().all(|&b| b == b'A'));
+    }
+
+    /// Byte `i` of a body that compresses poorly for its first `PADDING` bytes and
+    /// extremely well after them.
+    fn padded_bomb(i: usize) -> u8 {
+        const PADDING: usize = MIB;
+        if i >= PADDING {
+            return b'A';
+        }
+        // SplitMix64 of the offset: incompressible, and the same on every run.
+        let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)).to_le_bytes()[0]
+    }
+
+    #[tokio::test]
+    async fn bytes_received_early_delay_the_refusal_only_by_the_ratio() {
+        let len = 5 * RATIO_CHECK_FLOOR_BYTES;
+        let body = compressed(Encoding::Gzip, len, padded_bomb);
+        assert!(
+            body.len() * MAX_COMPRESSION_RATIO < len,
+            "the body expands past the ratio overall: {} bytes on the wire",
+            body.len()
+        );
+        let url = serve("Content-Encoding: gzip\r\n", body).await;
+
+        let error = read_bytes(get(&url).await, Limit::CompressionRatio)
+            .await
+            .expect_err("a body that expands past the ratio is refused");
+        let Error::CompressionRatio {
+            decoded, received, ..
+        } = error
+        else {
+            panic!("expected a compression ratio error, got {error:?}");
+        };
+        // The padding lets the body decode well past the floor, but never past the ratio
+        // times what was received by more than the block that crossed it.
+        assert!(
+            decoded > 2 * RATIO_CHECK_FLOOR_BYTES,
+            "refused at {decoded} bytes"
+        );
+        assert!(decoded > received * MAX_COMPRESSION_RATIO);
+        assert!(
+            decoded <= received * MAX_COMPRESSION_RATIO + DECODE_BLOCK_BYTES,
+            "refused at {decoded} bytes from {received} received"
+        );
     }
 
     #[tokio::test]
