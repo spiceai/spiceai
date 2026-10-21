@@ -1,7 +1,7 @@
-# writeReleaseNotes evals
+# write-release-notes evals
 
-Regression tests for the `writeReleaseNotes` skill
-(`.github/prompts/writeReleaseNotes.prompt.md`).
+Regression tests for the `write-release-notes` skill
+(`.agents/skills/write-release-notes/SKILL.md`).
 
 Release notes are prose, so most of the quality is a judgement call. These evals
 cover the part that is not: whether the authored prose follows the
@@ -24,7 +24,7 @@ moves and the scorer can assert exact PR coverage.
 3. Score it:
 
    ```bash
-   python3 .github/prompts/evals/score_eval.py \
+   python3 .agents/skills/write-release-notes/evals/score_eval.py \
      --eval create-patch-release --output /path/to/output-dir
    ```
 

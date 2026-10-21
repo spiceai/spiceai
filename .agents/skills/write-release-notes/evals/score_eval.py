@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2024-2026 The Spice.ai OSS Authors
 #
-# Scores a writeReleaseNotes eval run against its assertions.
+# Scores a write-release-notes eval run against its assertions.
 #
 # Every assertion here is objectively checkable from the produced file, so a run
 # can be graded the same way every time instead of by reading it. Assertions
@@ -15,8 +15,8 @@
 #     the failure mode worth catching.
 #
 # Usage:
-#   python3 .github/prompts/evals/score_eval.py --eval create-patch-release \
-#       --output <dir-or-file> [--json]
+#   python3 .agents/skills/write-release-notes/evals/score_eval.py \
+#       --eval create-patch-release --output <dir-or-file> [--json]
 
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROMPTS = os.path.dirname(HERE)
-CHECK_STE = os.path.join(PROMPTS, "scripts", "check_ste.py")
+SKILL_DIR = os.path.dirname(HERE)
+CHECK_STE = os.path.join(SKILL_DIR, "scripts", "check_ste.py")
 FIXTURES = os.path.join(HERE, "fixtures")
 
 REQUIRED_SECTIONS = [
@@ -430,7 +430,7 @@ def resolve_output(path: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Score a writeReleaseNotes eval run.")
+    parser = argparse.ArgumentParser(description="Score a write-release-notes eval run.")
     parser.add_argument("--eval", required=True, choices=sorted(SCORERS))
     parser.add_argument("--output", required=True, help="Output file or directory")
     parser.add_argument("--json", action="store_true")

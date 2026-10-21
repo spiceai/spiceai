@@ -262,7 +262,7 @@ facts and version numbers are unchanged.
 ## The checker
 
 ```bash
-python3 .github/prompts/scripts/check_ste.py docs/release_notes/v<version>.md
+python3 .agents/skills/write-release-notes/scripts/check_ste.py docs/release_notes/v<version>.md
 ```
 
 The script reads only the prose sections listed in
@@ -275,4 +275,4 @@ The script reads only the prose sections listed in
   actor is fine.
 
 `--json` prints the metrics, which is how the evals in
-`.github/prompts/evals/` score a run.
+`.agents/skills/write-release-notes/evals/` score a run.
