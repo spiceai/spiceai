@@ -3387,19 +3387,12 @@ mod tests {
 
     #[test]
     fn a_user_install_needs_the_accounts_own_manager() {
-        // Asking for a user service where this account cannot have one has to
-        // fail before anything is written, naming the path that does work. A
-        // host with systemd but no user manager names `spice cloud service
-        // install`. A host where systemd is not running refuses one step
-        // earlier and names that instead.
+        // Asking for a user service on a host with no user manager has to fail
+        // before anything is written, naming the path that does work.
         let failure = preflight(ServiceScope::User);
         if let Err(failure) = failure {
             let message = Error::from(failure).to_string();
-            assert!(
-                message.contains("spice cloud service install")
-                    || message.contains("systemd is not running"),
-                "{message}"
-            );
+            assert!(message.contains("spice cloud service install"), "{message}");
         }
     }
 
