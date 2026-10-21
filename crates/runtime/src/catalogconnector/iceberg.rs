@@ -74,7 +74,9 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::fmt::Write;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use url::Url;
 
@@ -705,8 +707,9 @@ const STORAGE_ENDPOINT_PROPS: [&str; 5] = [
 ];
 
 /// A `StorageFactory` that refuses storage endpoints a REST catalog supplies in
-/// its responses when they target a private, loopback, or link-local host, and
-/// refuses `file://` table and metadata locations the catalog supplies.
+/// its responses when they target a private, loopback, or link-local host
+/// (including a hostname that resolves to one), and refuses `file://` table and
+/// metadata locations the catalog supplies.
 ///
 /// A REST catalog's `LoadTableResult.config` (and `/v1/config` defaults and
 /// overrides) is merged into the table's `FileIO` properties, and supplies any
@@ -757,17 +760,28 @@ impl VendedEndpointGuard {
 #[typetag::serde(name = "SpiceVendedEndpointGuard")]
 impl StorageFactory for VendedEndpointGuard {
     fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+        let allow_private_hosts = url_table::allow_private_hosts();
         check_vended_endpoints(
             config.props(),
             &self.operator_endpoints,
             &self.component,
-            url_table::allow_private_hosts(),
+            allow_private_hosts,
         )?;
+        // Literal addresses and blocked names are refused above. A domain still
+        // has to be resolved, and that lookup waits on the network, so it runs
+        // on the async storage path before the inner client is used.
+        let endpoints_to_resolve = vended_domains_to_resolve(
+            config.props(),
+            &self.operator_endpoints,
+            allow_private_hosts,
+        );
         let inner = self.inner.build(config)?;
         Ok(Arc::new(GuardedStorage {
             inner,
             operator_file_root: self.operator_file_root.clone(),
             component: self.component.clone(),
+            endpoints_to_resolve,
+            dns_decision: Arc::new(tokio::sync::OnceCell::new()),
         }))
     }
 }
@@ -781,6 +795,22 @@ struct GuardedStorage {
     inner: Arc<dyn Storage>,
     operator_file_root: Option<String>,
     component: String,
+    /// Catalog endpoints whose host is a domain. Resolved before the first
+    /// storage call. Empty when every endpoint was a literal address or was set
+    /// by the operator.
+    endpoints_to_resolve: Vec<VendedDomainEndpoint>,
+    /// `Some(message)` once a vended domain has been refused. `None` once every
+    /// vended domain has resolved to public addresses.
+    #[serde(skip)]
+    dns_decision: Arc<tokio::sync::OnceCell<Option<String>>>,
+}
+
+/// A catalog-supplied endpoint whose host still has to be resolved.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VendedDomainEndpoint {
+    key: String,
+    value: String,
+    domain: String,
 }
 
 impl GuardedStorage {
@@ -792,55 +822,97 @@ impl GuardedStorage {
             url_table::allow_private_hosts(),
         )
     }
+
+    async fn before_io(&self, location: &str) -> iceberg::Result<()> {
+        self.refuse_local(location)?;
+        self.refuse_resolved_endpoints().await
+    }
+
+    /// Resolves catalog-supplied domain endpoints and refuses an internal address.
+    ///
+    /// The storage client resolves the hostname again when it connects, so this
+    /// does not pin the socket to the address checked here. A name that resolves
+    /// to an internal address on this lookup is still refused before that call.
+    async fn refuse_resolved_endpoints(&self) -> iceberg::Result<()> {
+        if self.endpoints_to_resolve.is_empty() || url_table::allow_private_hosts() {
+            return Ok(());
+        }
+        let message = self
+            .dns_decision
+            .get_or_init(|| self.dns_refusal_message())
+            .await;
+        match message {
+            Some(message) => Err(iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                message.clone(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    async fn dns_refusal_message(&self) -> Option<String> {
+        for endpoint in &self.endpoints_to_resolve {
+            let resolved = resolve_vended_host(endpoint.domain.clone()).await;
+            if let Some(message) = refusal_message_for_resolution(
+                &self.component,
+                &endpoint.key,
+                &endpoint.value,
+                resolved,
+            ) {
+                return Some(message);
+            }
+        }
+        None
+    }
 }
 
 #[typetag::serde(name = "SpiceGuardedStorage")]
 #[async_trait]
 impl Storage for GuardedStorage {
     async fn exists(&self, path: &str) -> iceberg::Result<bool> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.exists(path).await
     }
 
     async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.metadata(path).await
     }
 
     async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.read(path).await
     }
 
     async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.reader(path).await
     }
 
     async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.write(path, bs).await
     }
 
     async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.writer(path).await
     }
 
     async fn delete(&self, path: &str) -> iceberg::Result<()> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.delete(path).await
     }
 
     async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
-        self.refuse_local(path)?;
+        self.before_io(path).await?;
         self.inner.delete_prefix(path).await
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> iceberg::Result<()> {
         let mut collected = Vec::new();
         while let Some(path) = paths.next().await {
-            self.refuse_local(&path)?;
+            self.before_io(&path).await?;
             collected.push(path);
         }
         self.inner
@@ -893,9 +965,36 @@ fn check_vended_endpoints(
     Ok(())
 }
 
+/// How long a vended-endpoint lookup may block the caller. The lookup itself
+/// runs on the blocking pool. This matches the bound the URL-table guard uses.
+const VENDED_ENDPOINT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Test stand-in for [`resolve_host_blocking`]. Production builds always use
+/// the system resolver.
+#[cfg(test)]
+static VENDED_ENDPOINT_RESOLVER_OVERRIDE: parking_lot::Mutex<
+    Option<HashMap<String, Result<Vec<IpAddr>, String>>>,
+> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn set_vended_endpoint_resolver_override(host: &str, result: Result<Vec<IpAddr>, String>) {
+    VENDED_ENDPOINT_RESOLVER_OVERRIDE
+        .lock()
+        .get_or_insert_with(HashMap::new)
+        .insert(host.to_ascii_lowercase(), result);
+}
+
+#[cfg(test)]
+fn clear_vended_endpoint_resolver_override() {
+    *VENDED_ENDPOINT_RESOLVER_OVERRIDE.lock() = None;
+}
+
 /// Whether `endpoint` (a URL, or a bare `host[:port]` that the storage backends
 /// treat as `https://host[:port]`) has a literal internal IP, a well-known
 /// internal hostname, or no host that can be classified.
+///
+/// A domain that is not a blocked name is classified later, after DNS, by
+/// [`refusal_message_for_resolution`].
 fn endpoint_targets_internal_host(endpoint: &str) -> bool {
     let parsed = Url::parse(endpoint)
         .ok()
@@ -910,6 +1009,101 @@ fn endpoint_targets_internal_host(endpoint: &str) -> bool {
         }
         None => true,
     }
+}
+
+/// Catalog domain endpoints that still need a DNS lookup. Operator-set values
+/// and values the synchronous check already refuses are omitted.
+fn vended_domains_to_resolve(
+    props: &HashMap<String, String>,
+    operator_endpoints: &HashMap<String, String>,
+    allow_private_hosts: bool,
+) -> Vec<VendedDomainEndpoint> {
+    if allow_private_hosts {
+        return Vec::new();
+    }
+    let mut endpoints = Vec::new();
+    for key in STORAGE_ENDPOINT_PROPS {
+        let Some(value) = props.get(key) else {
+            continue;
+        };
+        if operator_endpoints.get(key) == Some(value) {
+            continue;
+        }
+        let Some(domain) = endpoint_domain(value) else {
+            continue;
+        };
+        if url_table::is_blocked_internal_hostname(&domain) {
+            continue;
+        }
+        endpoints.push(VendedDomainEndpoint {
+            key: key.to_string(),
+            value: value.clone(),
+            domain,
+        });
+    }
+    endpoints
+}
+
+/// The domain of `endpoint`, lowercased and without a trailing dot.
+///
+/// `None` when `endpoint` is not a URL with a domain host (a literal address,
+/// or a value the synchronous check refuses as unclassifiable).
+fn endpoint_domain(endpoint: &str) -> Option<String> {
+    let parsed = Url::parse(endpoint)
+        .ok()
+        .filter(Url::has_host)
+        .or_else(|| Url::parse(&format!("https://{endpoint}")).ok());
+    match parsed.as_ref().and_then(Url::host) {
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            (!domain.is_empty()).then_some(domain)
+        }
+        _ => None,
+    }
+}
+
+fn refusal_message_for_resolution(
+    component: &str,
+    key: &str,
+    value: &str,
+    resolved: Result<Vec<IpAddr>, String>,
+) -> Option<String> {
+    match resolved {
+        Ok(addrs) if addrs.iter().any(|ip| url_table::is_internal_ip(*ip)) => {
+            Some(vended_endpoint_refused_message(component, key, value))
+        }
+        Ok(addrs) if !addrs.is_empty() => None,
+        Ok(_) | Err(_) => Some(vended_endpoint_unresolved_message(component, key, value)),
+    }
+}
+
+async fn resolve_vended_host(host: String) -> Result<Vec<IpAddr>, String> {
+    let lookup = tokio::task::spawn_blocking(move || resolve_host_blocking(&host));
+    match tokio::time::timeout(VENDED_ENDPOINT_DNS_TIMEOUT, lookup).await {
+        Err(_) => Err(format!(
+            "timed out after {}s",
+            VENDED_ENDPOINT_DNS_TIMEOUT.as_secs()
+        )),
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => Err(err.to_string()),
+    }
+}
+
+fn resolve_host_blocking(host: &str) -> Result<Vec<IpAddr>, String> {
+    #[cfg(test)]
+    {
+        let overrides = VENDED_ENDPOINT_RESOLVER_OVERRIDE.lock();
+        if let Some(result) = overrides
+            .as_ref()
+            .and_then(|map| map.get(&host.to_ascii_lowercase()))
+        {
+            return result.clone();
+        }
+    }
+    (host, 0_u16)
+        .to_socket_addrs()
+        .map(|iter| iter.map(|addr| addr.ip()).collect())
+        .map_err(|err| err.to_string())
 }
 
 /// Returns an error when `location` is a `file://` URL the catalog supplied.
@@ -1000,14 +1194,26 @@ fn vended_file_location_refused_message(component: &str, location: &str) -> Stri
     )
 }
 
-fn vended_endpoint_refused_message(component: &str, key: &str, value: &str) -> String {
-    let param_hint = if key == S3_ENDPOINT {
+fn endpoint_param_hint(key: &str) -> &'static str {
+    if key == S3_ENDPOINT {
         "set the `s3_endpoint` parameter to it"
     } else {
         "configure it in the Spicepod"
-    };
+    }
+}
+
+fn vended_endpoint_refused_message(component: &str, key: &str, value: &str) -> String {
+    let param_hint = endpoint_param_hint(key);
     format!(
         "The Iceberg catalog for {component} set `{key}` to {value:?}, a private, loopback, or link-local address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+        url_table::ALLOW_PRIVATE_HOSTS_ENV
+    )
+}
+
+fn vended_endpoint_unresolved_message(component: &str, key: &str, value: &str) -> String {
+    let param_hint = endpoint_param_hint(key);
+    format!(
+        "The Iceberg catalog for {component} set `{key}` to {value:?}, and its host could not be resolved to a public address, so no storage request is sent to it and the table cannot be read. If this endpoint is trusted, {param_hint}, or set `{}=true`. See: https://spiceai.org/docs/components/data-connectors/iceberg",
         url_table::ALLOW_PRIVATE_HOSTS_ENV
     )
 }
@@ -1490,7 +1696,9 @@ mod tests {
     mod vended_storage_endpoint {
         use super::super::{
             GCS_SERVICE_HOST, S3_ENDPOINT, STORAGE_ENDPOINT_PROPS, check_vended_endpoints,
-            check_vended_file_location, get_rest_catalog, vended_endpoint_refused_message,
+            check_vended_file_location, clear_vended_endpoint_resolver_override, get_rest_catalog,
+            refusal_message_for_resolution, set_vended_endpoint_resolver_override,
+            vended_endpoint_refused_message, vended_endpoint_unresolved_message,
             vended_file_location_refused_message,
         };
         use std::collections::HashMap;
@@ -1700,6 +1908,88 @@ mod tests {
                 );
             }
             assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        /// Drops the process-wide resolver override when the test ends.
+        struct ResolverOverride;
+
+        impl ResolverOverride {
+            fn set(host: &str, result: Result<Vec<std::net::IpAddr>, String>) -> Self {
+                set_vended_endpoint_resolver_override(host, result);
+                Self
+            }
+        }
+
+        impl Drop for ResolverOverride {
+            fn drop(&mut self) {
+                clear_vended_endpoint_resolver_override();
+            }
+        }
+
+        #[tokio::test]
+        async fn catalog_vended_hostname_resolving_to_loopback_is_refused_without_connecting() {
+            let sentinel = start_sentinel().await;
+            let _override = ResolverOverride::set(
+                "loopback.vended.test",
+                Ok(vec![std::net::Ipv6Addr::LOCALHOST.into()]),
+            );
+            let endpoint = "http://loopback.vended.test:9000";
+            let catalog_uri = start_rest_catalog(&vended_config(endpoint)).await;
+            let err = read_manifest_list(catalog_uri, HashMap::new())
+                .await
+                .expect_err("a hostname that resolves to loopback must not be read");
+            assert_eq!(err.kind(), iceberg::ErrorKind::DataInvalid);
+            assert_eq!(
+                err.message(),
+                vended_endpoint_refused_message("dataset 't'", S3_ENDPOINT, endpoint)
+            );
+            assert_eq!(*sentinel.requests.lock(), Vec::<String>::new());
+        }
+
+        #[test]
+        fn resolved_endpoint_classification() {
+            let value = "http://minio.example.com:9000";
+            assert!(
+                refusal_message_for_resolution(
+                    "dataset 't'",
+                    S3_ENDPOINT,
+                    value,
+                    Ok(vec![std::net::IpAddr::from([1, 1, 1, 1])]),
+                )
+                .is_none(),
+                "a public address is not a refusal"
+            );
+            assert_eq!(
+                refusal_message_for_resolution(
+                    "dataset 't'",
+                    S3_ENDPOINT,
+                    value,
+                    Ok(vec![
+                        std::net::IpAddr::from([1, 1, 1, 1]),
+                        std::net::IpAddr::from([10, 1, 2, 3]),
+                    ]),
+                )
+                .as_deref(),
+                Some(vended_endpoint_refused_message("dataset 't'", S3_ENDPOINT, value).as_str()),
+                "one internal address among public ones is refused"
+            );
+            assert_eq!(
+                refusal_message_for_resolution(
+                    "dataset 't'",
+                    S3_ENDPOINT,
+                    "http://loopback.vended.test:9000",
+                    Err("no such host".to_string()),
+                )
+                .as_deref(),
+                Some(
+                    vended_endpoint_unresolved_message(
+                        "dataset 't'",
+                        S3_ENDPOINT,
+                        "http://loopback.vended.test:9000",
+                    )
+                    .as_str()
+                )
+            );
         }
 
         #[tokio::test]
