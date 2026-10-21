@@ -34,8 +34,9 @@ use runtime_parameters_typed::PassthroughParam;
 pub const DEPRECATED_MESSAGE: &str = "The `openai_<param>` language model overrides parameter is deprecated and will be removed in a future release. Please use `<model_prefix>_<param>` parameter name instead.";
 
 /// Deprecation note for an override set without the provider's prefix on a provider whose
-/// documented form is `<model_prefix>_<param>`. The runtime still applies it.
-pub const UNPREFIXED_DEPRECATED_MESSAGE: &str = "It still applies, but the documented name has the model provider's prefix, `<model_prefix>_<param>` (for example `hf_temperature`). See: https://spiceai.org/docs/components/models#model-provider-prefix";
+/// documented form is `<model_prefix>_<param>`. The runtime reads it as it reads the
+/// documented name, which takes precedence when both are set.
+pub const UNPREFIXED_DEPRECATED_MESSAGE: &str = "Use the documented name, `<model_prefix>_<param>` (for example `hf_temperature`). Until then it is read the same way, and the documented name takes precedence when both are set. See: https://spiceai.org/docs/components/models#model-provider-prefix";
 
 /// Runtime tunables every provider accepts (unprefixed), shared by both tables.
 const RUNTIME_TUNABLES: [PassthroughParam; 6] = [

@@ -857,20 +857,25 @@ fn parse_context_length(params: &FileModelParams) -> Result<Option<usize>, LlmEr
 
 // Get OpenAI compatible request parameter overrides.
 // Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
+/// The model's `params` value for the request default `key`, by the documented spelling
+/// first: unprefixed for OpenAI, `{prefix}_` for every other provider. The other spellings
+/// are deprecated aliases, read only when it is absent. Chat completions and the Responses
+/// API both read their defaults through this, so the two agree on which value applies.
+pub(crate) fn request_default<'a>(model: &'a Model, prefix: &str, key: &str) -> Option<&'a Value> {
+    let prefixed = format!("{prefix}_{key}");
+    let legacy = format!("openai_{key}");
+    let spellings = if prefix == ModelSource::OpenAi.short_name() {
+        [key, legacy.as_str(), legacy.as_str()]
+    } else {
+        [prefixed.as_str(), key, legacy.as_str()]
+    };
+    spellings.iter().find_map(|name| model.params.get(*name))
+}
+
 pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
     let mut request_overrides: HashMap<String, Value> = HashMap::new();
     for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
-        // The documented spelling wins: unprefixed for OpenAI, `{prefix}_` for every
-        // other provider. The other spellings are deprecated aliases, read only when
-        // it is absent.
-        let prefixed = format!("{prefix}_{key}");
-        let legacy = format!("openai_{key}");
-        let spellings = if prefix == ModelSource::OpenAi.short_name() {
-            [key, legacy.as_str(), legacy.as_str()]
-        } else {
-            [prefixed.as_str(), key, legacy.as_str()]
-        };
-        if let Some(v) = spellings.iter().find_map(|name| model.params.get(*name)) {
+        if let Some(v) = request_default(model, prefix, key) {
             request_overrides.insert(key.to_string(), v.clone());
         }
     }
