@@ -89,9 +89,15 @@ class SelectionTest(unittest.TestCase):
     def test_matchers(self) -> None:
         self.assertEqual(tests_of(run("binary(~integration) & package(=spice)")), ["cli_integration", "cloud_integration"])
         self.assertEqual(tests_of(run("binary(#cli_*)")), ["cli_integration"])
-        self.assertEqual(tests_of(run("binary(/^acid_(test)$/)")), ["acid_test"])
+        self.assertEqual(tests_of(run("package(=cayenne) & binary(/^acid_(test)$/)")),
+                         ["acid_test", "odd_name", "vs_duckdb"])
         self.assertEqual(tests_of(run("binary_id(=runtime::metrics)")), ["metrics"])
         self.assertEqual(tests_of(run("package(spic*) & binary(=cli_integration)")), ["cli_integration"])
+
+    def test_a_regex_python_reads_differently_still_builds_its_targets(self) -> None:
+        self.assertEqual(tests_of(run("package(/^[[:alpha:]_-]+$/) & kind(=test)")), sorted(
+            ["integration", "metrics", "cli_integration", "cloud_integration", "dispatch",
+             "acid_test", "odd_name", "vs_duckdb"]))
 
     def test_extra_filter_intersection_narrows(self) -> None:
         self.assertEqual(tests_of(run("(kind(=test)) & (not package(cayenne))")), sorted(
