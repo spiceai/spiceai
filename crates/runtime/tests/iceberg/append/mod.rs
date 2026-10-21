@@ -1105,7 +1105,7 @@ fn key_vals(rows: Rows) -> Vec<(String, String)> {
     rows.into_iter().map(|(key, _, val)| (key, val)).collect()
 }
 
-/// Regression test for #15273: DuckDB and SQLite with `on_conflict: upsert` read by time,
+/// Regression test for #15273: `DuckDB` and `SQLite` with `on_conflict: upsert` read by time,
 /// so a late older version does not overwrite the newer stored one. A late row below the
 /// window start is not loaded, unlike on Cayenne.
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
