@@ -19,6 +19,8 @@ use crate::{
     search::full_text::table::add_full_text_search_to_table, status::RuntimeStatus,
 };
 use ::datafusion::sql::parser;
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_difference;
 use async_trait::async_trait;
 use datafusion::{
     catalog::TableProvider,
@@ -35,7 +37,10 @@ use runtime_search::embeddings::{table::EmbeddingTable, warm_index_on_zero_resul
 use runtime_table::refresh_source::{RefreshSource, RefreshSourceError};
 use snafu::ResultExt;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 pub(crate) use runtime_datafusion::dependent_tables::get_dependent_table_names;
 
@@ -108,16 +113,33 @@ pub(crate) async fn prepare_view(
     Ok(tbl_provider)
 }
 
+/// How [`crate::datafusion::DataFusion::register_view`] may start an accelerated view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewStart {
+    /// Serve its existing acceleration, if it has one, while its plan is built.
+    ExistingAcceleration,
+    /// Build its plan first: its existing acceleration was built from another
+    /// definition.
+    Definition,
+}
+
 /// The source of an accelerated view registered from its existing acceleration
 /// before the tables it reads have loaded: the view's own plan, built once every
 /// table it reads is ready. `read_provider` waits for them rather than failing, so
 /// the plan resolves as soon as they are ready instead of at the next backoff step.
+///
+/// A plan whose schema is not the acceleration's means the view was redefined since
+/// the acceleration was built: the view is registered again from its definition, and
+/// this source never resolves.
 pub(crate) struct ViewRefreshSource {
     ctx: Arc<SessionContext>,
     statement: parser::Statement,
     view: Arc<View>,
     reads: Vec<TableReference>,
     status: Arc<RuntimeStatus>,
+    served_schema: SchemaRef,
+    redefined: AtomicBool,
+    registered: tokio::sync::watch::Sender<bool>,
 }
 
 impl ViewRefreshSource {
@@ -127,6 +149,7 @@ impl ViewRefreshSource {
         view: Arc<View>,
         reads: Vec<TableReference>,
         status: Arc<RuntimeStatus>,
+        served_schema: SchemaRef,
     ) -> Arc<Self> {
         Arc::new(Self {
             ctx,
@@ -134,7 +157,17 @@ impl ViewRefreshSource {
             view,
             reads,
             status,
+            served_schema,
+            redefined: AtomicBool::new(false),
+            registered: tokio::sync::watch::Sender::new(false),
         })
+    }
+
+    /// Records that the view is registered against this source. A redefined view is
+    /// registered again only after that, so the new registration replaces this one
+    /// rather than being replaced by it.
+    pub(crate) fn mark_registered(&self) {
+        self.registered.send_replace(true);
     }
 }
 
@@ -163,9 +196,25 @@ impl RefreshSource for ViewRefreshSource {
             &self.status,
         )
         .await;
-        prepare_view(&self.ctx, &self.statement, &self.view)
+        let provider = prepare_view(&self.ctx, &self.statement, &self.view)
             .await
-            .map_err(|e| Box::new(e) as RefreshSourceError)
+            .map_err(|e| Box::new(e) as RefreshSourceError)?;
+        if schema_difference(&self.served_schema, &provider.schema()).is_some() {
+            if !self.redefined.swap(true, Ordering::SeqCst)
+                && self.registered.subscribe().wait_for(|r| *r).await.is_ok()
+            {
+                tracing::info!(
+                    "View {} was redefined since its acceleration was built; rebuilding the acceleration from its definition.",
+                    self.view.name
+                );
+                tokio::spawn(
+                    Arc::clone(&self.view.runtime)
+                        .reregister_view_from_definition(Arc::clone(&self.view)),
+                );
+            }
+            std::future::pending::<()>().await;
+        }
+        Ok(provider)
     }
 
     async fn checkpointer(&self) -> Option<Arc<dyn DatasetCheckpointer>> {

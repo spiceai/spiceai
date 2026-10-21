@@ -6393,6 +6393,7 @@ impl DataFusion {
         self: &Arc<Self>,
         view: Arc<View>,
         secrets: Arc<TokioRwLock<Secrets>>,
+        start: crate::view::ViewStart,
     ) -> Result<JoinHandle<Option<ViewRegistration>>> {
         tracing::info!("Initializing view {}", &view.name);
         if self.ctx.table_exist(view.name.clone()).unwrap_or(false) {
@@ -6421,7 +6422,9 @@ impl DataFusion {
         tracing::debug!("Creating view {table} with dependent tables {dependent_table_names:?}");
 
         let register_task: JoinHandle<Option<ViewRegistration>> = spawn(async move {
-            if let Some(checkpoint_schema) = view.existing_acceleration_schema().await {
+            if start == crate::view::ViewStart::ExistingAcceleration
+                && let Some(checkpoint_schema) = view.existing_acceleration_schema().await
+            {
                 return match df_ref
                     .create_accelerated_view_from_existing(
                         &view,
@@ -6573,7 +6576,9 @@ impl DataFusion {
     /// with `checkpoint_schema`, without waiting for the tables it reads (`reads`):
     /// queries are served from the acceleration, and the view's plan is built in the
     /// background once those tables are ready, when its refreshes resume. This is how
-    /// an accelerated dataset is served before its source answers.
+    /// an accelerated dataset is served before its source answers. A plan that no
+    /// longer matches the acceleration registers the view again from its definition
+    /// (see [`crate::view::ViewRefreshSource`]).
     async fn create_accelerated_view_from_existing(
         self: &Arc<Self>,
         view: &Arc<View>,
@@ -6585,21 +6590,30 @@ impl DataFusion {
         let mut spec = DatasetSpec::new(String::new(), view.name.clone());
         spec.metadata.clone_from(&view.metadata);
         spec.columns.clone_from(&view.columns);
+        let served_schema =
+            runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key(
+                Arc::clone(&checkpoint_schema),
+            );
+        let source = crate::view::ViewRefreshSource::new_arc(
+            Arc::clone(&self.ctx),
+            statement,
+            Arc::clone(view),
+            reads,
+            self.runtime_status(),
+            served_schema,
+        );
         let federated = FederatedTable::new_deferred(
             Arc::new(spec),
-            crate::view::ViewRefreshSource::new_arc(
-                Arc::clone(&self.ctx),
-                statement,
-                Arc::clone(view),
-                reads,
-                self.runtime_status(),
-            ),
+            Arc::clone(&source) as Arc<dyn runtime_table::refresh_source::RefreshSource>,
             checkpoint_schema,
             self.runtime_status().shutdown_token(),
         );
         let schema = federated.schema();
-        self.register_accelerated_view(view, federated, schema, None, secrets)
-            .await
+        let registration = self
+            .register_accelerated_view(view, federated, schema, None, secrets)
+            .await?;
+        source.mark_registered();
+        Ok(registration)
     }
 
     /// Registers `view` accelerated, refreshed from `federated` and serving `schema`.
