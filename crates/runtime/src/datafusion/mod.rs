@@ -41,6 +41,7 @@ use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::dataset_checkpointer;
 use crate::dataaccelerator::{self, AccelerationSource, BootstrapStatus};
 use crate::dataaccelerator::{AcceleratorEngineRegistry, get_acceleration_layout};
+use crate::dataconnector::column_limit::read_provider_within_column_limit;
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::parameters::RuntimeConnectorContext;
@@ -2819,10 +2820,10 @@ impl DataFusion {
             });
         if let Some((dataset, connector)) = registration {
             let context = RuntimeConnectorContext::for_dataset(&dataset);
-            let read_provider = connector
-                .read_provider(&context, &dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?;
+            let read_provider =
+                read_provider_within_column_limit(connector.as_ref(), &context, &dataset)
+                    .await
+                    .context(UnableToResolveTableProviderSnafu)?;
             permit
                 .drain_previous()
                 .await
@@ -3127,10 +3128,10 @@ impl DataFusion {
 
         let sink_connector = Arc::new(SinkConnector::new(schema)) as Arc<dyn DataConnector>;
         let context = RuntimeConnectorContext::for_dataset(&dataset);
-        let read_provider = sink_connector
-            .read_provider(&context, &dataset)
-            .await
-            .context(UnableToResolveTableProviderSnafu)?;
+        let read_provider =
+            read_provider_within_column_limit(sink_connector.as_ref(), &context, &dataset)
+                .await
+                .context(UnableToResolveTableProviderSnafu)?;
 
         tracing::info!("Dataset {} loading data...", dataset.name);
         // Returning early leaves the registration in the slot, so the next write retries it.
@@ -5608,13 +5609,13 @@ impl DataFusion {
                 // do not acquire the schema lock or another generation permit.
                 let sink_connector = Arc::new(SinkConnector::new(Arc::clone(&plan.evolved_schema)))
                     as Arc<dyn DataConnector>;
-                let read_provider = sink_connector
-                    .read_provider(
-                        &RuntimeConnectorContext::for_dataset(dataset),
-                        dataset.as_ref(),
-                    )
-                    .await
-                    .context(UnableToResolveTableProviderSnafu)?;
+                let read_provider = read_provider_within_column_limit(
+                    sink_connector.as_ref(),
+                    &RuntimeConnectorContext::for_dataset(dataset),
+                    dataset.as_ref(),
+                )
+                .await
+                .context(UnableToResolveTableProviderSnafu)?;
                 let federated_table = FederatedTable::new_unchecked(read_provider);
                 // Discard the readiness notifier: sink datasets never fire it, and the
                 // provider is registered synchronously before this returns.

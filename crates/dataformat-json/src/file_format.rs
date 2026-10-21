@@ -363,6 +363,10 @@ impl FileFormat for SpiceJsonFormat {
                 }
             };
 
+            // `Schema::try_merge` costs `O(n²)` in the column count, so refuse a file
+            // too wide to merge before it runs.
+            arrow_tools::column_limit::ensure_within_column_limit(schema.fields().len())
+                .map_err(|err| DataFusionError::External(Box::new(err)))?;
             schemas.push(schema);
             if records_to_read == 0 {
                 break;
@@ -701,6 +705,59 @@ fn infer_json_schema_for_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn infer_json_width(columns: usize) -> datafusion::error::Result<SchemaRef> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"[{");
+        for index in 0..columns {
+            if index > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(format!("\"k{index}\":1").as_bytes());
+        }
+        body.extend_from_slice(b"}]");
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let location = object_store::path::Path::from("wide.json");
+        store
+            .put(&location, body.into())
+            .await
+            .expect("store the document");
+        let meta = store.head(&location).await.expect("object metadata");
+        let store: Arc<dyn ObjectStore> = store;
+        let ctx = datafusion::execution::context::SessionContext::new();
+        let state = ctx.state();
+        SpiceJsonFormat::default()
+            .infer_schema(&state, &store, std::slice::from_ref(&meta))
+            .await
+    }
+
+    #[tokio::test]
+    async fn infer_schema_refuses_a_document_wider_than_the_column_limit() {
+        let columns = arrow_tools::column_limit::MAX_SCHEMA_COLUMNS + 1;
+        let err = infer_json_width(columns).await.expect_err(
+            "a document past the column limit must be refused before its schema is merged",
+        );
+        let datafusion::error::DataFusionError::External(source) = err else {
+            panic!("the limit is reported as the external error, got {err}");
+        };
+        let too_many = source
+            .downcast_ref::<arrow_tools::column_limit::TooManyColumns>()
+            .expect("the external error is TooManyColumns");
+        assert_eq!(too_many.columns, columns);
+        assert_eq!(
+            too_many.limit,
+            arrow_tools::column_limit::MAX_SCHEMA_COLUMNS
+        );
+    }
+
+    #[tokio::test]
+    async fn infer_schema_accepts_a_document_within_the_column_limit() {
+        let schema = infer_json_width(2)
+            .await
+            .expect("two columns is within the limit");
+        assert_eq!(schema.fields().len(), 2);
+    }
 
     #[test]
     fn test_format_parse_jsonl() {

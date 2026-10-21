@@ -41,6 +41,7 @@ limitations under the License.
 //! is the deferred path: a placeholder is registered up-front and the
 //! real provider is materialized on first reference.
 
+use crate::dataconnector::column_limit::read_provider_within_column_limit;
 use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
@@ -277,18 +278,21 @@ impl DatasetInitialization {
                 }
 
                 let context = RuntimeConnectorContext::for_dataset(&dataset);
-                let federated_provider = match connector.read_provider(&context, &dataset).await {
-                    Ok(provider) => provider,
-                    Err(e) => {
-                        return Err(report_deferred_failure(
-                            &runtime,
-                            &dataset,
-                            RuntimeError::UnableToInitializeDataConnector {
-                                source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
-                            },
-                        ));
-                    }
-                };
+                let federated_provider =
+                    match read_provider_within_column_limit(connector.as_ref(), &context, &dataset)
+                        .await
+                    {
+                        Ok(provider) => provider,
+                        Err(e) => {
+                            return Err(report_deferred_failure(
+                                &runtime,
+                                &dataset,
+                                RuntimeError::UnableToInitializeDataConnector {
+                                    source: Box::new(e) as Box<dyn std::error::Error + Send + Sync>,
+                                },
+                            ));
+                        }
+                    };
 
                 // Validate that the resolved provider's schema matches
                 // the declared/static schema. Mismatch is a config bug

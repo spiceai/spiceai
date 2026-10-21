@@ -39,6 +39,7 @@ use datafusion::datasource::file_format::{
 use datafusion::datasource::listing::{
     ListingFileFilter, ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::error::DataFusionError;
 use datafusion::execution::cache::TableScopedPath;
 use datafusion::execution::cache::cache_manager::{
@@ -51,7 +52,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::{FileExtensions, PartitionedFile, TableSchema};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
@@ -1609,7 +1610,9 @@ pub trait ListingTableConnector: DataConnector {
 
         let ctx: SessionContext = self.get_session_context();
 
-        let (schema_infer_url, schema_infer_meta) =
+        // `width_probe_object` is the one file the schema is inferred from, when there is
+        // exactly one; `ensure_inferred_width_within_limit` measures it first.
+        let (schema_infer_url, schema_infer_meta, width_probe_object) =
             if table_path.is_collection() && listing_extension_is_orc(extension) {
                 // Infer from the scan path. `schema_source_path` only replaces
                 // `infer_listing_url` and would publish a prefix schema while
@@ -1625,6 +1628,7 @@ pub trait ListingTableConnector: DataConnector {
                 .await?;
                 (
                     SensitiveListingTableUrl::new(table_path.clone(), url.clone()),
+                    None,
                     None,
                 )
             } else if let Some(url) = dataset.params.get("schema_source_path") {
@@ -1644,9 +1648,11 @@ pub trait ListingTableConnector: DataConnector {
                     &object_store,
                 )
                 .await?;
+                let width_probe_object = schema_infer_meta.clone();
                 (
                     SensitiveListingTableUrl::new(schema_infer_url, url),
                     schema_infer_meta,
+                    width_probe_object,
                 )
             } else {
                 // Get the last modified object for the provided ObjectStore to infer the schema.
@@ -1669,6 +1675,7 @@ pub trait ListingTableConnector: DataConnector {
                         &format!("{self}"),
                     )?,
                     None,
+                    Some(last_modified_or_added),
                 )
             };
 
@@ -1689,6 +1696,12 @@ pub trait ListingTableConnector: DataConnector {
                     datafusion::parquet::arrow::async_reader::ObjectVersionType::Version
                 }
             }));
+
+        if let Some(object) = &width_probe_object {
+            ensure_inferred_width_within_limit(&ctx.state(), &object_store, object, &file_format)
+                .await
+                .map_err(|err| crate::column_limit::too_many_columns_error(dataset, err))?;
+        }
 
         let infer_listing_url = schema_infer_url.expose_sensitive_url();
         let resolved_schema =
@@ -1714,6 +1727,12 @@ pub trait ListingTableConnector: DataConnector {
                         connector_component: ConnectorComponent::from(dataset),
                         message,
                     }
+                }
+                DataFusionError::External(ref source)
+                    if let Some(err) =
+                        source.downcast_ref::<crate::column_limit::TooManyColumns>() =>
+                {
+                    crate::column_limit::too_many_columns_error(dataset, *err)
                 }
                 e => crate::DataConnectorError::UnableToConnectInternal {
                     dataconnector: format!("{self}"),
@@ -2451,6 +2470,68 @@ impl ListingFileFilter for FormatSelectedDataFiles {
     }
 }
 
+/// Fails when `object` has more columns than a dataset can have, measured without
+/// inferring its full schema.
+///
+/// [`FileFormat::infer_schema`] ends in `Schema::try_merge`, which costs `O(n²)` in the
+/// column count even for one file, so the width must be known before it runs. Only
+/// formats that can report it cheaply and exactly are measured here — CSV/TSV from the
+/// header and first record, Parquet from the footer (through the session's metadata
+/// cache, which the inference that follows reads from) — and any failure to measure is
+/// left for the inference to report. Every other format is checked once its schema is
+/// resolved, by [`crate::column_limit::read_provider_within_column_limit`].
+async fn ensure_inferred_width_within_limit(
+    state: &dyn Session,
+    store: &Arc<dyn ObjectStore>,
+    object: &ObjectMeta,
+    file_format: &Arc<dyn FileFormat>,
+) -> Result<(), crate::column_limit::TooManyColumns> {
+    match probe_column_count(state, store, object, file_format).await {
+        Some(columns) => arrow_tools::column_limit::ensure_within_column_limit(columns),
+        None => Ok(()),
+    }
+}
+
+async fn probe_column_count(
+    state: &dyn Session,
+    store: &Arc<dyn ObjectStore>,
+    object: &ObjectMeta,
+    file_format: &Arc<dyn FileFormat>,
+) -> Option<usize> {
+    let format = file_format.as_ref() as &dyn std::any::Any;
+    if let Some(csv) = format.downcast_ref::<CsvFormat>() {
+        let stream = store
+            .get(&object.location)
+            .await
+            .ok()?
+            .into_stream()
+            .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
+            .boxed();
+        let chunks = csv.read_to_delimited_chunks_from_stream(stream);
+        let (schema, _) = csv.infer_schema_from_stream(state, 1, chunks).await.ok()?;
+        return Some(schema.fields().len());
+    }
+    if let Some(parquet) = format.downcast_ref::<ParquetFormat>() {
+        let metadata = DFParquetMetadata::new(store.as_ref(), object)
+            .with_metadata_size_hint(parquet.metadata_size_hint())
+            .with_file_metadata_cache(Some(
+                state.runtime_env().cache_manager.get_file_metadata_cache(),
+            ))
+            .fetch_metadata()
+            .await
+            .ok()?;
+        return Some(
+            metadata
+                .file_metadata()
+                .schema_descr()
+                .root_schema()
+                .get_fields()
+                .len(),
+        );
+    }
+    None
+}
+
 /// List matching `ORC` objects and merge their footers. Used instead of
 /// [`ListingOptions::infer_schema`] on a collection so format-selected
 /// listings (`*.orc`) skip job-marker files and so a last-modified-only
@@ -2756,6 +2837,106 @@ mod tests {
             connector,
             DatasetSpec::new(path, TableReference::bare("test")),
         )
+    }
+
+    fn write_flat_parquet(path: &std::path::Path, columns: usize) {
+        let fields = (0..columns)
+            .map(|index| {
+                arrow_schema::Field::new(format!("c{index}"), arrow_schema::DataType::Int64, true)
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let column =
+            Arc::new(arrow::array::Int64Array::from(vec![1_i64])) as arrow::array::ArrayRef;
+        let mut arrays = Vec::with_capacity(columns);
+        for _ in 0..columns {
+            arrays.push(Arc::clone(&column));
+        }
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .expect("one row of the requested width");
+        let file = std::fs::File::create(path).expect("create the parquet file");
+        let mut writer = datafusion::parquet::arrow::ArrowWriter::try_new(file, schema, None)
+            .expect("parquet writer");
+        writer.write(&batch).expect("write the row");
+        writer.close().expect("finish the parquet file");
+    }
+
+    fn csv_of_width(columns: usize) -> String {
+        let mut header = String::new();
+        let mut row = String::new();
+        for index in 0..columns {
+            if index > 0 {
+                header.push(',');
+                row.push(',');
+            }
+            header.push_str(&format!("c{index}"));
+            row.push('1');
+        }
+        format!("{header}\n{row}\n")
+    }
+
+    /// Resolves a single flat file through the listing schema path and returns its
+    /// column count, or the error the path refused it with.
+    async fn inferred_listing_width(
+        file_format: &str,
+        columns: usize,
+    ) -> Result<usize, DataConnectorError> {
+        let dir = tempfile::tempdir().expect("temporary directory for a wide file");
+        let path = dir.path().join(format!("wide.{file_format}"));
+        match file_format {
+            "csv" => std::fs::write(&path, csv_of_width(columns)).expect("write the csv"),
+            "parquet" => write_flat_parquet(&path, columns),
+            other => panic!("this test only covers csv and parquet, not {other}"),
+        }
+        let url = Url::from_file_path(&path).expect("a file URL");
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), file_format.to_string());
+        let (connector, dataset) = setup_connector(url.to_string(), params);
+        let (format, extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("the file format resolves");
+        let format = format.expect("csv and parquet are structured formats");
+        match connector
+            .listing_table_template(&dataset, &url, &extension, format)
+            .await
+        {
+            Ok(template) => Ok(template.file_schema().fields().len()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn assert_too_many_columns(err: DataConnectorError, columns: usize) {
+        let DataConnectorError::TooManyColumns { source, .. } = err else {
+            panic!("a file past the column limit must be refused as too wide, got {err}");
+        };
+        let too_many = source
+            .downcast_ref::<crate::column_limit::TooManyColumns>()
+            .expect("the source is TooManyColumns");
+        assert_eq!(too_many.columns, columns);
+        assert_eq!(too_many.limit, crate::column_limit::MAX_SCHEMA_COLUMNS);
+    }
+
+    #[tokio::test]
+    async fn a_file_past_the_column_limit_is_refused_before_its_schema_is_merged() {
+        let columns = crate::column_limit::MAX_SCHEMA_COLUMNS + 1;
+        for file_format in ["csv", "parquet"] {
+            let err = inferred_listing_width(file_format, columns)
+                .await
+                .expect_err("a file past the column limit must be refused");
+            assert_too_many_columns(err, columns);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_at_the_column_limit_still_resolves() {
+        let columns = crate::column_limit::MAX_SCHEMA_COLUMNS;
+        for file_format in ["csv", "parquet"] {
+            let inferred = inferred_listing_width(file_format, columns)
+                .await
+                .expect("a file at the column limit must still resolve");
+            assert_eq!(inferred, columns, "{file_format}");
+        }
     }
 
     #[tokio::test]

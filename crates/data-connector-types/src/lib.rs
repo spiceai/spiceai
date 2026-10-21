@@ -291,6 +291,15 @@ pub enum DataConnectorError {
         connector_component: ConnectorComponent,
     },
 
+    // Permanent (not retriable): the source reports the same width on every attempt.
+    // The source is `arrow_tools::column_limit::TooManyColumns`, which carries the fix.
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
+    TooManyColumns {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
     ))]
@@ -339,6 +348,7 @@ impl DataConnectorError {
                 | Self::OdbcNotInstalled { .. }
                 | Self::ConnectorNotInBuild { .. }
                 | Self::UseOfProtectedKeyword { .. }
+                | Self::TooManyColumns { .. }
         )
     }
 }

@@ -30,6 +30,7 @@ limitations under the License.
 //! connector names one crate rather than two.
 
 pub mod accelerated;
+pub mod column_limit;
 mod connector;
 pub mod federated;
 pub mod listing;

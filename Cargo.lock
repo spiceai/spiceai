@@ -6555,6 +6555,7 @@ name = "dataformat-json"
 version = "2.4.0-unstable"
 dependencies = [
  "arrow",
+ "arrow_tools",
  "async-trait",
  "bytes",
  "datafusion",

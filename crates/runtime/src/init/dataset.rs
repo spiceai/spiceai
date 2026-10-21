@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dataconnector::column_limit::read_provider_within_column_limit;
 use crate::dataconnector::parameters::RuntimeConnectorContext;
 use crate::datafusion::resolve_table_reference;
 use std::{
@@ -1392,7 +1393,7 @@ impl Runtime {
 
         let read_result = {
             let context = RuntimeConnectorContext::for_dataset(&ds);
-            data_connector.read_provider(&context, &ds).await
+            read_provider_within_column_limit(data_connector.as_ref(), &context, &ds).await
         };
 
         match read_result {
@@ -2166,15 +2167,18 @@ impl Runtime {
         connector: Arc<dyn DataConnector>,
         bootstrap: AcceleratorBootstrap,
     ) -> Result<()> {
-        let read_table = connector
-            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
-            .await
-            .map_err(|_| {
-                UnableToLoadDatasetConnectorSnafu {
-                    dataset: ds.name.clone(),
-                }
-                .build()
-            })?;
+        let read_table = read_provider_within_column_limit(
+            connector.as_ref(),
+            &RuntimeConnectorContext::for_dataset(&ds),
+            &ds,
+        )
+        .await
+        .map_err(|_| {
+            UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .build()
+        })?;
         // Same recreate-bypass as the initial-load gate. Previously this honored only
         // `file_update`, so a reloaded `on_schema_change: drop_and_recreate` dataset would not
         // recreate on an incompatible source change; the shared helper fixes that.
@@ -5024,6 +5028,179 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
                 .expect("empty MemTable with a single column"),
         )
+    }
+
+    /// A source whose schema is as wide as the number after `column_width:`.
+    #[derive(Debug)]
+    struct ColumnWidthConnector;
+
+    #[async_trait]
+    impl DataConnector for ColumnWidthConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        async fn read_provider(
+            &self,
+            _context: &dyn crate::dataconnector::ConnectorContext,
+            dataset: &DatasetSpec,
+        ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+            let columns = dataset
+                .from
+                .rsplit_once(':')
+                .and_then(|(_, raw)| raw.parse::<usize>().ok())
+                .expect("the dataset names its column count");
+            let fields = (0..columns)
+                .map(|index| {
+                    arrow_schema::Field::new(
+                        format!("c{index}"),
+                        arrow_schema::DataType::Int64,
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(arrow_schema::Schema::new(fields));
+            let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]])
+                .expect("an empty table of the requested width");
+            Ok(Arc::new(table))
+        }
+    }
+
+    struct ColumnWidthConnectorFactory;
+
+    impl DataConnectorFactory for ColumnWidthConnectorFactory {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn create<'a>(
+            &'a self,
+            _params: ConnectorParams,
+            _context: &'a dyn crate::dataconnector::ConnectorContext,
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send + 'a>> {
+            Box::pin(async { Ok(Arc::new(ColumnWidthConnector) as Arc<dyn DataConnector>) })
+        }
+
+        fn prefix(&self) -> &'static str {
+            "column_width"
+        }
+
+        fn parameters(&self) -> &'static [ParameterSpec] {
+            &[]
+        }
+    }
+
+    async fn column_width_dataset(
+        columns: usize,
+        name: &str,
+    ) -> (Arc<crate::Runtime>, Arc<Dataset>) {
+        register_connector_factory("column_width", Arc::new(ColumnWidthConnectorFactory)).await;
+        let dataset = spicepod_dataset(&format!("column_width:{columns}"), name);
+        let app = app::AppBuilder::new(name)
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = Arc::new(
+            DatasetBuilder::try_from(dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(&runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        );
+        (runtime, ds)
+    }
+
+    async fn refreshed_width(ds: &Arc<Dataset>) -> std::result::Result<usize, String> {
+        let source = crate::dataconnector::refresh_source::ConnectorRefreshSource::new_arc(
+            Arc::new(ColumnWidthConnector),
+            Arc::clone(ds),
+        );
+        match source.read_provider().await {
+            Ok(provider) => Ok(provider.schema().fields().len()),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    fn assert_column_limit_message(message: &str, columns: usize) {
+        let expected = format!(
+            "The source schema has {columns} columns, more than the {} columns a dataset can have.",
+            crate::dataconnector::column_limit::MAX_SCHEMA_COLUMNS
+        );
+        assert!(
+            message.contains(&expected),
+            "the refusal must name the width, the limit, and the fix: {message}"
+        );
+        assert!(
+            message.contains("https://spiceai.org/docs/components/data-connectors"),
+            "the refusal must link the connector docs: {message}"
+        );
+    }
+
+    /// A source wider than the column limit never registers, on the initial load or
+    /// on a refresh, and the dataset is left in an error status.
+    #[tokio::test]
+    async fn a_source_past_the_column_limit_fails_the_load_without_registering() {
+        let columns = crate::dataconnector::column_limit::MAX_SCHEMA_COLUMNS + 1;
+        let (runtime, ds) = column_width_dataset(columns, "over_column_limit").await;
+
+        let refresh = refreshed_width(&ds)
+            .await
+            .expect_err("a refresh must refuse a source past the column limit");
+        assert_column_limit_message(&refresh, columns);
+
+        let err = runtime
+            .try_load_dataset_once(Arc::clone(&ds), BootstrapStatus::None, None)
+            .await
+            .expect_err("the load must refuse a source past the column limit");
+        assert!(
+            matches!(err, Error::PermanentDatasetFailure { .. }),
+            "the refusal is permanent, so the load is not retried: {err}"
+        );
+        assert_column_limit_message(&err.to_string(), columns);
+
+        let status = runtime
+            .status
+            .get_dataset_status(&ds.name)
+            .expect("the refused load reports a status");
+        let crate::status::ComponentStatus::Error(Some(message)) = status else {
+            panic!("a refused load must report an error status, got {status:?}");
+        };
+        assert_column_limit_message(&message, columns);
+        assert!(
+            !runtime.df.table_exists(&ds.name),
+            "a refused source must not be registered"
+        );
+    }
+
+    /// The limit is inclusive: a source of exactly that width still loads, and a
+    /// refresh of it still resolves.
+    #[tokio::test]
+    async fn a_source_at_the_column_limit_loads() {
+        let columns = crate::dataconnector::column_limit::MAX_SCHEMA_COLUMNS;
+        let (runtime, ds) = column_width_dataset(columns, "at_column_limit").await;
+
+        let refreshed = refreshed_width(&ds)
+            .await
+            .expect("a refresh must resolve a source at the column limit");
+        assert_eq!(refreshed, columns);
+
+        runtime
+            .try_load_dataset_once(Arc::clone(&ds), BootstrapStatus::None, None)
+            .await
+            .expect("a source at the column limit must load");
+        assert!(
+            runtime.df.table_exists(&ds.name),
+            "a source at the column limit must be registered"
+        );
+        assert!(
+            !matches!(
+                runtime.status.get_dataset_status(&ds.name),
+                Some(crate::status::ComponentStatus::Error(_))
+            ),
+            "a source at the column limit must not be in error: {:?}",
+            runtime.status.get_dataset_status(&ds.name)
+        );
     }
 
     /// Regression test for #12862: `apply_dataset_diff` awaited each added

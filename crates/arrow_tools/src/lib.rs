@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod batch_bytes;
+pub mod column_limit;
 pub mod decimal;
 pub mod format;
 pub mod ipc;

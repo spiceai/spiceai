@@ -24,6 +24,7 @@ limitations under the License.
 //! `runtime_table::refresh_source` for why, and for how this adapter
 //! retires once `DataConnector` itself moves down.
 
+use crate::dataconnector::column_limit::read_provider_within_column_limit;
 use crate::dataconnector::parameters::RuntimeConnectorContext;
 use std::sync::Arc;
 
@@ -68,13 +69,13 @@ impl RefreshSource for ConnectorRefreshSource {
     }
 
     async fn read_provider(&self) -> Result<Arc<dyn TableProvider>, RefreshSourceError> {
-        self.connector
-            .read_provider(
-                &RuntimeConnectorContext::for_dataset(&self.dataset),
-                &self.dataset,
-            )
-            .await
-            .map_err(|source| Box::new(source) as RefreshSourceError)
+        read_provider_within_column_limit(
+            self.connector.as_ref(),
+            &RuntimeConnectorContext::for_dataset(&self.dataset),
+            &self.dataset,
+        )
+        .await
+        .map_err(|source| Box::new(source) as RefreshSourceError)
     }
 
     async fn checkpointer(&self) -> Option<Arc<dyn DatasetCheckpointer>> {
